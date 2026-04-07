@@ -9,6 +9,7 @@ const identity = require('./identity');
 const dustforge = require('./dustforge');
 const billing = require('./billing');
 const hexPayload = require('./hex-payload');
+const conversion = require('./conversion');
 const referral = require('./referral');
 const stripeService = require('./stripe-service');
 
@@ -112,7 +113,12 @@ app.post('/api/identity/create', async (req, res) => {
     db.prepare(`INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Account created', 0)`).run(id.did);
 
     if (referredBy) referral.processReferralPayout(db, referredBy, id.did, username);
-    console.log(`[identity] created: ${username} → ${id.did}`);
+
+    // Track conversion
+    const callerClass = conversion.classifyCaller(req);
+    conversion.logConversion(db, id.did, callerClass);
+
+    console.log(`[identity] created: ${username} → ${id.did} [${callerClass.classification}/${callerClass.source_channel}]`);
     res.json({ ok: true, did: id.did, email: emailResult.email, referral_code: myReferralCode });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -340,6 +346,14 @@ app.post('/api/payload/decode', (req, res) => {
 app.get('/api/payload/snippet', (req, res) => {
   const { referral_code } = req.query;
   res.type('text/html').send(hexPayload.generateLandingSnippet(referral_code || ''));
+});
+
+// ============================================================
+// API — Conversion Analytics
+// ============================================================
+
+app.get('/api/analytics/conversions', (req, res) => {
+  res.json(conversion.getConversionStats(db));
 });
 
 // ── Start ──
