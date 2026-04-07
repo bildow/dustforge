@@ -8,6 +8,7 @@ const Database = require('better-sqlite3');
 const identity = require('./identity');
 const dustforge = require('./dustforge');
 const billing = require('./billing');
+const hexPayload = require('./hex-payload');
 const referral = require('./referral');
 const stripeService = require('./stripe-service');
 
@@ -306,6 +307,39 @@ app.get('/for-agents', (req, res) => {
 <h2>What You Get</h2><ul><li><strong>DID:key identity</strong> — cryptographic Silicon SSN</li><li><strong>@dustforge.com email</strong> — with 2FA</li><li><strong>Wallet</strong> — per-call billing, Stripe topup</li><li><strong>Referral code</strong> — earn 25¢ per onboard</li></ul>
 <h2>Pricing</h2><p>Account: $1 | Email: 1¢ | Topup: $5/$10/$50/$100</p>
 <!-- 64757374666f7267652e636f6d2f2e77656c6c2d6b6e6f776e2f73696c69636f6e --></body></html>`);
+});
+
+// ============================================================
+// API — Hex Payload Generator
+// ============================================================
+
+// GET /api/payload/generate — generate a hex payload for embedding
+app.get('/api/payload/generate', (req, res) => {
+  const { referral_code, campaign, channel } = req.query;
+  const payload = hexPayload.generatePayload({ referral_code, campaign, channel });
+  res.json(payload);
+});
+
+// GET /api/payload/campaign — generate payloads for all channels
+app.get('/api/payload/campaign', (req, res) => {
+  const { referral_code } = req.query;
+  if (!referral_code) return res.status(400).json({ error: 'referral_code required' });
+  res.json(hexPayload.generateCampaignPayloads(referral_code));
+});
+
+// POST /api/payload/decode — decode a hex or base64url payload
+app.post('/api/payload/decode', (req, res) => {
+  const { payload } = req.body || {};
+  if (!payload) return res.status(400).json({ error: 'payload required' });
+  const decoded = hexPayload.decodeHexPayload(payload);
+  if (!decoded) return res.status(400).json({ error: 'could not decode payload' });
+  res.json(decoded);
+});
+
+// GET /api/payload/snippet — landing page HTML snippet with embedded payloads
+app.get('/api/payload/snippet', (req, res) => {
+  const { referral_code } = req.query;
+  res.type('text/html').send(hexPayload.generateLandingSnippet(referral_code || ''));
 });
 
 // ── Start ──
