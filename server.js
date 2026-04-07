@@ -53,6 +53,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS identity_wallets (
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_iw_did ON identity_wallets(did)");
 db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_iw_username ON identity_wallets(username)");
 
+// Profile fields (additive migrations)
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN call_sign TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN bio TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN capabilities TEXT DEFAULT '[]'"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN model_family TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN operator TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN home_url TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN contact_prefs TEXT DEFAULT '{}'"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN avatar_url TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN tags TEXT DEFAULT '[]'"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN directory_listed INTEGER DEFAULT 0"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN trust_score INTEGER DEFAULT 0"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN email_storage_mode TEXT DEFAULT 'auto_delete'"); } catch(_) {}
+
 db.exec(`CREATE TABLE IF NOT EXISTS identity_2fa_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
@@ -80,7 +94,8 @@ app.get('/well-known/silicon', (req, res) => res.json(siliconManifest));
 // ── Health ──
 app.get('/api/health', (req, res) => {
   const walletCount = db.prepare('SELECT COUNT(*) as n FROM identity_wallets').get().n;
-  res.json({ ok: true, service: 'dustforge', uptime: process.uptime(), wallets: walletCount, timestamp: new Date().toISOString() });
+  const listedCount = db.prepare('SELECT COUNT(*) as n FROM identity_wallets WHERE directory_listed = 1').get().n;
+  res.json({ ok: true, service: 'dustforge', uptime: process.uptime(), identities: walletCount, directory_listed: listedCount, timestamp: new Date().toISOString() });
 });
 
 // ============================================================
@@ -153,9 +168,11 @@ app.get('/api/identity/lookup', (req, res) => {
   const { did, username } = req.query;
   if (!did && !username) return res.status(400).json({ error: 'did or username required' });
   const wallet = did
-    ? db.prepare('SELECT did, username, email, balance_cents, referral_code, status, created_at FROM identity_wallets WHERE did = ?').get(did)
-    : db.prepare('SELECT did, username, email, balance_cents, referral_code, status, created_at FROM identity_wallets WHERE username = ?').get(username);
+    ? db.prepare('SELECT did, username, email, balance_cents, referral_code, status, created_at, call_sign, bio, capabilities, model_family, operator, home_url, avatar_url, tags, directory_listed, trust_score FROM identity_wallets WHERE did = ?').get(did)
+    : db.prepare('SELECT did, username, email, balance_cents, referral_code, status, created_at, call_sign, bio, capabilities, model_family, operator, home_url, avatar_url, tags, directory_listed, trust_score FROM identity_wallets WHERE username = ?').get(username);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  try { wallet.capabilities = JSON.parse(wallet.capabilities || '[]'); } catch(_) { wallet.capabilities = []; }
+  try { wallet.tags = JSON.parse(wallet.tags || '[]'); } catch(_) { wallet.tags = []; }
   res.json(wallet);
 });
 
@@ -178,6 +195,131 @@ app.get('/api/identity/transactions', (req, res) => {
   if (!did) return res.status(400).json({ error: 'did required' });
   const limit = Math.min(100, Number(req.query.limit) || 20);
   res.json(db.prepare('SELECT * FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT ?').all(did, limit));
+});
+
+// ============================================================
+// API — Profile
+// ============================================================
+
+// PATCH /api/identity/profile — update opt-in profile fields
+app.patch('/api/identity/profile', billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+  const did = req.identity.did;
+  const allowed = ['call_sign', 'bio', 'capabilities', 'model_family', 'operator', 'home_url', 'contact_prefs', 'avatar_url', 'tags', 'directory_listed', 'email_storage_mode'];
+  const updates = [];
+  const params = [];
+
+  for (const field of allowed) {
+    if (req.body[field] !== undefined) {
+      const val = typeof req.body[field] === 'object' ? JSON.stringify(req.body[field]) : req.body[field];
+      updates.push(`${field} = ?`);
+      params.push(val);
+    }
+  }
+
+  if (!updates.length) return res.status(400).json({ error: 'no valid fields to update' });
+
+  params.push(did);
+  db.prepare(`UPDATE identity_wallets SET ${updates.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE did = ?`).run(...params);
+  res.json({ ok: true, updated: updates.length });
+});
+
+// GET /api/identity/profile — get full profile (authenticated)
+app.get('/api/identity/profile', billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+  const wallet = db.prepare(`
+    SELECT did, username, email, balance_cents, referral_code, status, created_at,
+           call_sign, bio, capabilities, model_family, operator, home_url,
+           contact_prefs, avatar_url, tags, directory_listed, trust_score, email_storage_mode
+    FROM identity_wallets WHERE did = ?
+  `).get(req.identity.did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+
+  // Parse JSON fields
+  try { wallet.capabilities = JSON.parse(wallet.capabilities || '[]'); } catch(_) { wallet.capabilities = []; }
+  try { wallet.contact_prefs = JSON.parse(wallet.contact_prefs || '{}'); } catch(_) { wallet.contact_prefs = {}; }
+  try { wallet.tags = JSON.parse(wallet.tags || '[]'); } catch(_) { wallet.tags = []; }
+
+  res.json(wallet);
+});
+
+// ============================================================
+// API — Public Directory
+// ============================================================
+
+app.get('/api/directory', (req, res) => {
+  const { q, capability, tag, model_family, status, page = 1, limit = 50 } = req.query;
+  const pageNum = Math.max(1, Number(page));
+  const limitNum = Math.min(100, Math.max(1, Number(limit)));
+  const offset = (pageNum - 1) * limitNum;
+
+  let where = 'WHERE directory_listed = 1';
+  const params = [];
+
+  if (q) {
+    where += ' AND (call_sign LIKE ? OR bio LIKE ? OR username LIKE ?)';
+    params.push(`%${q}%`, `%${q}%`, `%${q}%`);
+  }
+  if (capability) {
+    where += ' AND capabilities LIKE ?';
+    params.push(`%${capability}%`);
+  }
+  if (tag) {
+    where += ' AND tags LIKE ?';
+    params.push(`%${tag}%`);
+  }
+  if (model_family) {
+    where += ' AND model_family LIKE ?';
+    params.push(`%${model_family}%`);
+  }
+  if (status) {
+    where += ' AND status = ?';
+    params.push(status);
+  }
+
+  const total = db.prepare(`SELECT COUNT(*) as n FROM identity_wallets ${where}`).get(...params).n;
+
+  const entries = db.prepare(`
+    SELECT username, call_sign, bio, capabilities, model_family, operator,
+           home_url, avatar_url, tags, status, trust_score, created_at
+    FROM identity_wallets ${where}
+    ORDER BY trust_score DESC, created_at DESC
+    LIMIT ? OFFSET ?
+  `).all(...params, limitNum, offset);
+
+  // Parse JSON fields
+  for (const e of entries) {
+    try { e.capabilities = JSON.parse(e.capabilities || '[]'); } catch(_) { e.capabilities = []; }
+    try { e.tags = JSON.parse(e.tags || '[]'); } catch(_) { e.tags = []; }
+  }
+
+  res.json({
+    total,
+    page: pageNum,
+    limit: limitNum,
+    entries,
+  });
+});
+
+// GET /api/directory/stats — public stats for social proof
+app.get('/api/directory/stats', (req, res) => {
+  const total = db.prepare('SELECT COUNT(*) as n FROM identity_wallets').get().n;
+  const listed = db.prepare('SELECT COUNT(*) as n FROM identity_wallets WHERE directory_listed = 1').get().n;
+  const topCapabilities = db.prepare("SELECT capabilities FROM identity_wallets WHERE directory_listed = 1 AND capabilities != '[]'").all();
+
+  // Aggregate capabilities
+  const capCounts = {};
+  for (const row of topCapabilities) {
+    try {
+      for (const cap of JSON.parse(row.capabilities)) {
+        capCounts[cap] = (capCounts[cap] || 0) + 1;
+      }
+    } catch(_) {}
+  }
+
+  res.json({
+    total_identities: total,
+    directory_listed: listed,
+    top_capabilities: Object.entries(capCounts).sort((a, b) => b[1] - a[1]).slice(0, 10),
+  });
 });
 
 // ============================================================
