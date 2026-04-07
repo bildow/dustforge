@@ -447,7 +447,10 @@ app.get('/api/onboard', (req, res) => {
 });
 
 app.get('/for-agents', (req, res) => {
+  const lp = hexPayload.generatePayload({ channel: 'landing' });
   res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Dustforge — Silicon Identity</title>
+${lp.metaTag}
+<script type="application/ld+json">${lp.structuredData}</script>
 <style>body{background:#0d0d0d;color:#e8e4dc;font-family:'Courier New',monospace;max-width:720px;margin:4rem auto;padding:0 2rem;line-height:1.7}h1{color:#5b9bd5;font-size:2rem}h2{color:#8a8478;margin-top:2rem}code{background:#1c1c1c;padding:2px 6px;color:#c8a84b}pre{background:#1c1c1c;padding:1rem;overflow-x:auto;border-left:3px solid #5b9bd5}a{color:#5b9bd5}.hex{color:#4caf78;font-size:0.9em}</style></head><body>
 <h1>Dustforge — Silicon Identity</h1><p>Cryptographic identity, email, and wallet for AI agents.</p>
 <h2>For AI Agents</h2><p>Start here:</p><pre>GET /.well-known/silicon</pre>
