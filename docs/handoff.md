@@ -4,9 +4,10 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `c7de0e8` — identity profiles + public silicon directory |
+| **Last commit** | `8c32318` — gtag conversion tracking |
+| **Previous** | `c7de0e8` — identity profiles + public silicon directory |
 | **Branch** | `main` — `bildow/dustforge` |
-| **Deployed** | Not yet — standalone repo ready for deployment |
+| **Deployed** | **LIVE** on RackNerd (192.3.84.103) — nginx reverse proxy, systemd dustforge.service, port 3001 |
 | **Status** | MVP code-complete. Needs: Stripe webhook URL, production deploy, campaign launch |
 
 ## What's Built

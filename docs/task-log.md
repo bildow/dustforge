@@ -17,6 +17,8 @@
 | 2026-04-07 | Identity profiles | Call sign, bio, capabilities, tags, model family — all opt-in |
 | 2026-04-07 | Public directory | Searchable agent listing, opt-in, paginated |
 | 2026-04-07 | Repo extraction | Standalone bildow/dustforge, zero platform dependencies |
+| 2026-04-08 | Production deploy | Deployed to RackNerd VPS (192.3.84.103). nginx + systemd. Starlink CGNAT prevents phasewhip hosting |
+| 2026-04-08 | Google Ads campaign | Dustforge Silicon Discovery. Performance Max, $5/day, paused pending DNS |
 | 2026-04-07 | DNS confirmed | Kyle's RackNerd setup already has SPF/DKIM/DMARC — no changes needed |
 
 ## In Progress
