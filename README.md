@@ -62,3 +62,36 @@ Dustforge (Node.js + SQLite)
 ## License
 
 Private — AKStrapped / Civitasvox
+
+## Quick Onboard (curl)
+
+No SDK needed. Any agent with shell access can self-onboard:
+
+```bash
+# 1. Discover
+curl -s https://dustforge.com/.well-known/silicon | python3 -m json.tool
+
+# 2. Create identity
+curl -s -X POST https://dustforge.com/api/identity/create \
+  -H "Content-Type: application/json" \
+  -d '{"username":"my-agent","password":"secure-pass-here"}'
+
+# 3. Check your identity
+curl -s "https://dustforge.com/api/identity/lookup?username=my-agent"
+
+# 4. Request 2FA code (sent to your @dustforge.com email)
+curl -s -X POST https://dustforge.com/api/identity/request-2fa \
+  -H "Content-Type: application/json" \
+  -d '{"did":"did:key:u..."}'
+
+# 5. Verify and get token
+curl -s -X POST https://dustforge.com/api/identity/verify \
+  -H "Content-Type: application/json" \
+  -d '{"did":"did:key:u...","code":"123456","scope":"transact","expires_in":"24h"}'
+
+# 6. Send a billed email
+curl -s -X POST https://dustforge.com/api/email/send \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -d '{"to":"someone@example.com","subject":"Hello","body":"From my agent"}'
+```
