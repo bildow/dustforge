@@ -1,4 +1,4 @@
-require('dotenv').config();
+require("dotenv").config({override:true});
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -14,6 +14,7 @@ const referral = require('./referral');
 const stripeService = require('./stripe-service');
 
 const app = express();
+app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || './data/dustforge.db';
 
@@ -341,9 +342,18 @@ app.post('/api/email/send', billing.billingMiddleware(db, 'email_send'), async (
   const { to, subject, body, format = 'text' } = req.body || {};
   if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject, and body required' });
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
-  const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
-  console.log(`[email] ${req.identity.did} → ${to}: ${subject}`);
-  res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code) });
+  try {
+    const t = createEmailTransport();
+    const senderWallet = db.prepare("SELECT username FROM identity_wallets WHERE did = ?").get(req.identity.did);
+    const fromAddr = senderWallet ? senderWallet.username + "@dustforge.com" : "noreply@dustforge.com";
+    const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
+    await t.sendMail({ from: fromAddr, to, subject, text: injectedBody });
+    console.log("[email] sent: " + fromAddr + " -> " + to);
+    res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code) });
+  } catch(e) {
+    console.error("[email] failed:", e.message);
+    res.status(502).json({ error: "delivery failed: " + e.message });
+  }
 });
 
 // ============================================================
@@ -414,8 +424,44 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   res.json({ received: true });
 });
 
-app.get('/api/stripe/success', (req, res) => {
-  res.send('<html><body style="background:#0d0d0d;color:#e8e4dc;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh"><div style="text-align:center"><h1 style="color:#4caf78">Payment Successful</h1><p>Your account is being created.</p></div></body></html>');
+app.get('/api/stripe/success', async (req, res) => {
+  const sessionId = req.query.session_id;
+  let accountInfo = null;
+  if (sessionId) {
+    try {
+      const stripe = stripeService.getStripe();
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      const meta = session.metadata || {};
+      if (meta.type === 'account_creation' && meta.username) {
+        const existing = db.prepare('SELECT did, email FROM identity_wallets WHERE username = ?').get(meta.username);
+        if (existing) { accountInfo = existing; }
+        else {
+          try {
+            const id = identity.createIdentity();
+            const password = meta.password || crypto.randomBytes(16).toString('hex');
+            const emailResult = await dustforge.createAccount(meta.username, password);
+            if (emailResult.ok) {
+              const rc = crypto.randomBytes(6).toString('hex');
+              let referredBy = '';
+              if (meta.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(meta.referral_code); if (r) referredBy = r.did; }
+              db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, meta.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
+              db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe', 0)").run(id.did);
+              if (referredBy) referral.processReferralPayout(db, referredBy, id.did, meta.username);
+              accountInfo = { did: id.did, email: emailResult.email, referral_code: rc };
+              try {
+                const t = createEmailTransport();
+                await t.sendMail({ from:'welcome@dustforge.com', to: emailResult.email,
+                  subject:'Welcome to Dustforge', text:'DID: '+id.did+'\nEmail: '+emailResult.email+'\n\nAuth: POST /api/identity/auth-fingerprint\n{"username":"'+meta.username+'","password":"YOUR_PASS","scope":"transact"}\n\nAPI: GET /.well-known/silicon' });
+              } catch(_){}
+              console.log('[stripe-success] created: '+meta.username+' -> '+id.did);
+            }
+          } catch(e) { console.error('[stripe-success] failed:', e.message); }
+        }
+      }
+    } catch(e) { console.warn('[stripe-success] session error:', e.message); }
+  }
+  const info = accountInfo ? '<div style="margin-top:1.5rem;text-align:left;background:#132131;padding:1.5rem;border-radius:8px;max-width:400px"><div style="margin-bottom:0.75rem"><span style="color:#6d8397">Email:</span> <strong>'+accountInfo.email+'</strong></div><div style="margin-bottom:0.75rem"><span style="color:#6d8397">DID:</span> <code style="font-size:10px;word-break:break-all">'+accountInfo.did+'</code></div>'+(accountInfo.referral_code?'<div><span style="color:#6d8397">Referral:</span> '+accountInfo.referral_code+'</div>':'')+'<p style="margin-top:1rem;font-size:12px;color:#6d8397">Welcome email sent to the @dustforge.com inbox.</p><div style="margin-top:1rem;padding:1rem;background:#0e1824;border-radius:6px;text-align:left"><div style="font-size:11px;color:#5fb3ff;font-weight:bold;margin-bottom:0.5rem">Next Step — Authenticate</div><code style="font-size:10px;color:#9cb4c9;word-break:break-all">POST https://dustforge.com/api/identity/auth-fingerprint</code><pre style="font-size:10px;color:#6d8397;margin:0.5rem 0;white-space:pre-wrap">{"username":"YOUR_USERNAME","password":"YOUR_PASSWORD","scope":"transact","expires_in":"7d"}</pre><div style="font-size:10px;color:#6d8397">Full API: <a href="https://dustforge.com/.well-known/silicon" style="color:#5fb3ff">/.well-known/silicon</a></div></div><p style="display:none"></p></div>' : '<p style="color:#6d8397">Account creation in progress...</p>';
+  res.send('<html><head><meta charset="UTF-8"></head><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:500px;padding:2rem"><h1 style="color:#69c7b1">Payment Successful</h1><p>Your silicon identity has been activated.</p>'+info+'</div></body></html>');
 });
 
 app.get('/api/stripe/cancel', (req, res) => {
@@ -502,6 +548,178 @@ app.get('/api/analytics/conversions', (req, res) => {
 });
 
 // ── Start ──
-app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
+// === PATCH: Add to /opt/dustforge/server.js before the catch-all route ===
+// Paste these endpoints before the last app.get('*') or app.listen() call
+
+const nodemailer = require('nodemailer');
+const rateLimit = require('express-rate-limit');
+
+const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many requests' } });
+const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 100, message: { error: 'Rate limit exceeded' } });
+
+function createEmailTransport() {
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'localhost',
+    port: Number(process.env.SMTP_PORT || 25),
+    secure: false,
+    tls: { rejectUnauthorized: false },
+  });
+}
+
+// POST /api/identity/auth-fingerprint — authenticate via fingerprint (no email 2FA)
+app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) => {
+  const { did, username, password, scope = 'read', expires_in = '24h' } = req.body || {};
+  if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
+  const wallet = did
+    ? db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did)
+    : db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+
+  // Verify password via Stalwart admin API
+  try {
+    const http = require('http');
+    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
+    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
+    const stalwartPass = process.env.STALWART_PASS || '';
+    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
+    const storedPassword = await new Promise((resolve) => {
+      const req = http.request({ hostname: stalwartHost, port: stalwartPort,
+        path: '/api/principal/' + encodeURIComponent(wallet.username + '@dustforge.com'),
+        method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
+        let data = ''; res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+    if (storedPassword !== null && storedPassword !== password) {
+      return res.status(401).json({ error: 'invalid password' });
+    }
+  } catch(e) {}
+
+  const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+    scope, expiresIn: expires_in,
+    metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint' },
+  });
+  res.json({ ok: true, token, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint' });
+});
+
+// POST /api/identity/request-account — silicon requests account, carbon gets payment link
+app.post('/api/identity/request-account', rateLimitStrict, async (req, res) => {
+  const { username, password, carbon_email, referral_code } = req.body || {};
+  if (!username || !password || !carbon_email) return res.status(400).json({ error: 'username, password, and carbon_email required' });
+  if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'invalid username' });
+  if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
+  const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
+  if (existing) return res.status(409).json({ error: 'username taken' });
+  try {
+    const checkout = await stripeService.createAccountCheckout({ username, password, referral_code });
+    const t = createEmailTransport();
+    await t.sendMail({
+      from: 'onboard@dustforge.com', to: carbon_email,
+      subject: 'Dustforge Account Request — ' + username,
+      text: 'A silicon agent requested a Dustforge identity.\n\nUsername: ' + username + '\nEmail: ' + username + '@dustforge.com\n\nActivate ($1.00): ' + checkout.url + '\n\n— Dustforge',
+      html: '<div style="font-family:monospace;background:#0d0d0d;color:#e8e4dc;padding:2rem;max-width:600px;margin:auto;border-radius:8px"><h2 style="color:#5b9bd5">Dustforge Account Request</h2><p>A silicon agent requested identity: <strong>' + username + '</strong></p><a href="' + checkout.url + '" style="display:inline-block;background:#5b9bd5;color:#0d0d0d;padding:0.75rem 1.5rem;text-decoration:none;border-radius:4px;font-weight:bold;margin:1rem 0">Activate — $1.00</a><p style="font-size:11px;color:#6b6760"><a href="https://dustforge.com/privacy" style="color:#5b9bd5">Privacy</a> · <a href="https://dustforge.com/terms" style="color:#5b9bd5">Terms</a></p></div>',
+    });
+    res.json({ ok: true, message: 'Payment link emailed to ' + carbon_email, session_id: checkout.session_id });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/wallet/transfer — agent-to-agent transfer
+app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
+  const { from_did, to_did, amount_cents, description } = req.body || {};
+  if (!from_did || !to_did || !amount_cents) return res.status(400).json({ error: 'from_did, to_did, amount_cents required' });
+  if (from_did === to_did) return res.status(400).json({ error: 'cannot transfer to self' });
+  if (amount_cents <= 0 || amount_cents > 1000000) return res.status(400).json({ error: 'invalid amount' });
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
+  if (!['transact','admin','full'].includes(v.decoded.scope || '')) return res.status(403).json({ error: 'transact scope required' });
+  const sender = db.prepare('SELECT did, username, status FROM identity_wallets WHERE did = ?').get(from_did);
+  const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
+  if (!sender || !receiver) return res.status(404).json({ error: 'identity not found' });
+  if (sender.status !== 'active') return res.status(403).json({ error: 'account suspended' });
+  const debit = billing.deductBalance(db, from_did, amount_cents, 'transfer_out', 'Transfer to ' + receiver.username);
+  if (!debit.ok) return res.status(402).json(debit);
+  billing.creditBalance(db, to_did, amount_cents, 'transfer_in', 'Transfer from ' + sender.username);
+  res.json({ ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents });
+});
+// ── Silicon Profiles + Resonance ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_profiles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  user_agent TEXT DEFAULT '',
+  accept_headers TEXT DEFAULT '',
+  header_order TEXT DEFAULT '',
+  content_type TEXT DEFAULT '',
+  ip_address TEXT DEFAULT '',
+  json_style TEXT DEFAULT '',
+  tls_info TEXT DEFAULT '',
+  http_version TEXT DEFAULT '',
+  request_meta TEXT DEFAULT '{}',
+  fingerprint_hash TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_sp_did ON silicon_profiles(did)"); } catch(e) {}
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_resonance (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did_a TEXT NOT NULL,
+  did_b TEXT NOT NULL,
+  score REAL NOT NULL,
+  signals TEXT DEFAULT '{}',
+  snapshot_type TEXT DEFAULT 'registration',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// ── Pending Checkouts (Codex fix — no raw passwords in Stripe metadata) ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS identity_pending_checkouts (
+  session_id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  encrypted_password TEXT NOT NULL,
+  carbon_email TEXT DEFAULT '',
+  referral_code TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  completed_at TEXT
+)`); } catch(e) {}
+
+// GET /api/identity/resonance/methodology — public documentation
+app.get('/api/identity/resonance/methodology', (_req, res) => {
+  res.json({
+    name: 'Dustforge Silicon Resonance Score',
+    version: '1.0',
+    purpose: 'Behavioral similarity between silicon identities. Clustering signal, not identity proof.',
+    signals: [
+      { name: 'user_agent', weight: 3, spoofability: 'trivial' },
+      { name: 'accept_headers', weight: 2, spoofability: 'trivial' },
+      { name: 'header_order', weight: 2, spoofability: 'moderate' },
+      { name: 'body_key_order', weight: 2, spoofability: 'moderate' },
+      { name: 'json_style', weight: 1, spoofability: 'trivial' },
+      { name: 'http_version', weight: 1, spoofability: 'difficult' },
+      { name: 'ip_subnet', weight: 1, spoofability: 'difficult' },
+    ],
+    limitations: [
+      'Scores above 0.85 cannot reliably distinguish same-entity from shared-framework.',
+      '50% of score weight is trivially spoofable.',
+      'The score is a clustering signal, not identity proof.',
+    ],
+  });
+});
+
+// GET /api/identity/resonance?did=... — resonance map
+app.get('/api/identity/resonance', (req, res) => {
+  const { did } = req.query;
+  if (!did) return res.status(400).json({ error: 'did required' });
+  const profiles = db.prepare('SELECT fingerprint_hash, user_agent, ip_address, created_at FROM silicon_profiles WHERE did = ? ORDER BY id DESC LIMIT 5').all(did);
+  const resonances = db.prepare('SELECT * FROM silicon_resonance WHERE did_a = ? OR did_b = ? ORDER BY score DESC LIMIT 20').all(did, did);
+  res.json({ did, profiles, resonance: resonances });
+});
 
 module.exports = { app, db };
+
+app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
