@@ -1,0 +1,37 @@
+[build]
+  publish = "public"
+
+# Redirect /for-agents to /for-agents.html
+[[redirects]]
+  from = "/for-agents"
+  to = "/for-agents.html"
+  status = 200
+
+[[redirects]]
+  from = "/privacy"
+  to = "/privacy.html"
+  status = 200
+
+[[redirects]]
+  from = "/terms"
+  to = "/terms.html"
+  status = 200
+
+# API calls proxy to RackNerd
+[[redirects]]
+  from = "/api/*"
+  to = "https://api.dustforge.com/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/.well-known/silicon"
+  to = "/well-known/silicon"
+  status = 200
+
+# Headers
+[[headers]]
+  for = "/.well-known/*"
+  [headers.values]
+    Content-Type = "application/json"
+    Access-Control-Allow-Origin = "*"

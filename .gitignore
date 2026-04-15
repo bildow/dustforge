@@ -4,3 +4,6 @@ data/
 *.pem
 *.key
 IDENTITY_MASTER_KEY
+
+# Local Netlify folder
+.netlify
