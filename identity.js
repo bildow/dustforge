@@ -9,10 +9,13 @@
  */
 
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
 
 // Master encryption key from environment — NEVER hardcode
-const MASTER_KEY = process.env.IDENTITY_MASTER_KEY || crypto.randomBytes(32).toString('hex');
+const MASTER_KEY = process.env.IDENTITY_MASTER_KEY;
+if (!MASTER_KEY) {
+  console.error('[FATAL] IDENTITY_MASTER_KEY environment variable is required. Refusing to start with random key — encrypted data would be unrecoverable after restart.');
+  process.exit(1);
+}
 const ENCRYPTION_ALGO = 'aes-256-gcm';
 
 // ── Key Generation ──
@@ -235,5 +238,5 @@ module.exports = {
   didToPublicKey,
   encryptPrivateKey,
   decryptPrivateKey,
-  MASTER_KEY, // Only for initial setup logging — remove in production
+  // MASTER_KEY removed from exports — never expose the encryption key
 };

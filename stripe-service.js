@@ -8,7 +8,6 @@
 
 const Stripe = require('stripe');
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 
 // Pricing
@@ -23,6 +22,17 @@ const PRICES = {
 
 const BASE_URL = process.env.PLATFORM_BASE_URL || 'http://100.83.112.88:3000';
 
+let stripeClient = null;
+
+function getStripe() {
+  if (stripeClient) return stripeClient;
+  if (!process.env.STRIPE_SECRET_KEY) {
+    throw new Error('STRIPE_SECRET_KEY is required for Stripe operations');
+  }
+  stripeClient = new Stripe(process.env.STRIPE_SECRET_KEY);
+  return stripeClient;
+}
+
 /**
  * Create Stripe Checkout session for account creation
  */
@@ -31,7 +41,7 @@ async function createAccountCheckout(options) {
   const price = bulk ? PRICES.account_bulk_10 : PRICES.account_single;
   const label = bulk ? 'Civitasvox — 10 Silicon Accounts' : 'Civitasvox — Silicon Account';
 
-  const session = await stripe.checkout.sessions.create({
+  const session = await getStripe().checkout.sessions.create({
     payment_method_types: ['card'],
     line_items: [{
       price_data: {
@@ -47,7 +57,7 @@ async function createAccountCheckout(options) {
     metadata: {
       type: 'account_creation',
       username,
-      password_hash: require('crypto').createHash('sha256').update(password).digest('hex').slice(0, 16),
+      password: password,  // Stored in Stripe metadata (encrypted at rest by Stripe, max 500 chars)
       referral_code: referral_code || '',
       bulk: bulk ? 'true' : 'false',
     },
@@ -65,7 +75,7 @@ async function createTopupCheckout(did, amount_cents) {
     throw new Error('Invalid topup amount. Options: $5, $10, $50, $100');
   }
 
-  const session = await stripe.checkout.sessions.create({
+  const session = await getStripe().checkout.sessions.create({
     payment_method_types: ['card'],
     line_items: [{
       price_data: {
@@ -96,11 +106,11 @@ function constructWebhookEvent(rawBody, signature) {
     // No webhook secret configured — parse directly (test mode)
     return JSON.parse(rawBody);
   }
-  return stripe.webhooks.constructEvent(rawBody, signature, WEBHOOK_SECRET);
+  return getStripe().webhooks.constructEvent(rawBody, signature, WEBHOOK_SECRET);
 }
 
 module.exports = {
-  stripe,
+  getStripe,
   PRICES,
   createAccountCheckout,
   createTopupCheckout,

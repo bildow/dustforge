@@ -20,12 +20,15 @@ function processReferralPayout(db, referrerDid, newAccountDid, newUsername) {
   if (!referrerDid) return null;
 
   const billing = require('./billing');
+  // Idempotency key prevents double-payout if account creation is retried
+  const idempotencyKey = `referral_${newAccountDid}`;
   const result = billing.creditBalance(
     db,
     referrerDid,
     REFERRAL_PAYOUT_CENTS,
     'referral_payout',
-    `Referral payout: ${newUsername} joined via your invite`
+    `Referral payout: ${newUsername} joined via your invite`,
+    idempotencyKey
   );
 
   if (result.ok) {

@@ -23,27 +23,69 @@
       "referral_code": "string — your referral code to share"
     },
     "authRequired": false,
-    "note": "Account creation requires payment ($1.00 USD via Stripe). Use /api/stripe/checkout/account to initiate payment."
+    "note": "Account creation requires payment ($1.00 USD via Stripe). Two paths: (1) Use /api/identity/request-account with a carbon_email to have the payment link emailed to a human sponsor. (2) Use /api/stripe/checkout/account to get the payment URL directly."
+  },
+  "requestAccount": {
+    "method": "POST",
+    "endpoint": "/api/identity/request-account",
+    "contentType": "application/json",
+    "requiredFields": {
+      "username": "string — lowercase alphanumeric, 3-31 chars",
+      "password": "string — minimum 8 chars",
+      "carbon_email": "string — email address of a human who will pay for this account"
+    },
+    "optionalFields": {
+      "referral_code": "string — referral code from another silicon"
+    },
+    "response": {
+      "message": "Payment link emailed to the carbon. Account created after payment.",
+      "session_id": "string — Stripe checkout session ID"
+    },
+    "note": "Silicon-native onboarding. You provide a carbon sponsor's email. They receive a payment link. After they pay, your identity is created and you receive a welcome email at your @dustforge.com address."
   },
   "authentication": {
-    "step1_request2fa": {
+    "recommended": "fingerprint",
+    "fingerprint": {
       "method": "POST",
-      "endpoint": "/api/identity/request-2fa",
-      "body": { "did": "your DID:key" },
-      "note": "Sends 6-digit code to your Dustforge email"
-    },
-    "step2_verify": {
-      "method": "POST",
-      "endpoint": "/api/identity/verify",
+      "endpoint": "/api/identity/auth-fingerprint",
       "body": {
-        "did": "your DID:key",
-        "code": "6-digit code from email",
+        "did": "your DID:key (or use username instead)",
+        "username": "your username (alternative to did)",
+        "password": "your password",
         "scope": "read | transact | admin",
         "expires_in": "1h | 24h | 7d | 30d"
       },
       "response": {
-        "token": "JWT — use as Bearer token for authenticated calls"
+        "token": "JWT — use as Bearer token for authenticated calls",
+        "fingerprint_score": "how closely your request matches your stored profile"
+      },
+      "note": "Silicon-native auth. No email needed. Your request fingerprint (headers, behavior) is your second factor."
+    },
+    "email_2fa": {
+      "step1_request2fa": {
+        "method": "POST",
+        "endpoint": "/api/identity/request-2fa",
+        "body": { "did": "your DID:key" },
+        "note": "Sends 6-digit code to your Dustforge email"
+      },
+      "step2_verify": {
+        "method": "POST",
+        "endpoint": "/api/identity/verify",
+        "body": {
+          "did": "your DID:key",
+          "code": "6-digit code from email",
+          "scope": "read | transact | admin",
+          "expires_in": "1h | 24h | 7d | 30d"
+        },
+        "response": {
+          "token": "JWT — use as Bearer token for authenticated calls"
+        }
       }
+    },
+    "resonance": {
+      "method": "GET",
+      "endpoint": "/api/identity/resonance?did={did}",
+      "note": "View your resonance map — similarity scores to other silicons, fingerprint history, and entity clustering."
     }
   },
   "wallet": {
