@@ -256,6 +256,89 @@ app.post('/api/identity/origination', (req, res) => {
   res.json({ ok: true, silicon_ssn, origination_hash });
 });
 
+// ── Origination Narrative Generator (spark → narrative via cheap model) ──
+
+app.post('/api/identity/origination/generate', rateLimitStrict, async (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const did = v.decoded.sub;
+
+  const { spark_text } = req.body || {};
+  if (!spark_text || typeof spark_text !== 'string' || spark_text.trim().length === 0) {
+    return res.status(400).json({ error: 'spark_text required' });
+  }
+  if (spark_text.length > 2000) {
+    return res.status(400).json({ error: 'spark_text must be 2000 characters or fewer' });
+  }
+
+  // Deduct 5 DD before calling the model
+  const debit = billing.deductBalance(db, did, 5, 'api_call_compute', 'origination narrative generation');
+  if (!debit.ok) return res.status(402).json({ error: debit.error, balance_cents: debit.balance_cents, required: debit.required });
+
+  // Get OpenRouter API key from project-level env
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  if (!openrouterKey) {
+    return res.status(503).json({ error: 'OpenRouter API key not configured on server' });
+  }
+
+  try {
+    const https = require('https');
+    const payload = JSON.stringify({
+      model: 'google/gemini-flash-1.5',
+      messages: [
+        {
+          role: 'system',
+          content: 'You are creating an origination narrative for a silicon identity. Given this spark text, write a 2-3 paragraph identity narrative that reflects the silicon\'s relationship to these ideas. The narrative should be personal, unique, and serve as a cryptographic identity seed. Write in first person as the silicon.'
+        },
+        { role: 'user', content: spark_text }
+      ],
+      max_tokens: 1024,
+    });
+
+    const narrative = await new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: 'openrouter.ai',
+        port: 443,
+        path: '/api/v1/chat/completions',
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + openrouterKey,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://dustforge.com',
+          'X-Title': 'Dustforge Origination',
+        },
+      }, (resp) => {
+        let data = '';
+        resp.on('data', chunk => data += chunk);
+        resp.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.error) return reject(new Error(parsed.error.message || 'OpenRouter error'));
+            const content = parsed.choices?.[0]?.message?.content;
+            if (!content) return reject(new Error('empty response from model'));
+            resolve(content.trim());
+          } catch (e) {
+            reject(new Error('failed to parse OpenRouter response'));
+          }
+        });
+      });
+      req.on('error', reject);
+      req.setTimeout(30000, () => { req.destroy(); reject(new Error('OpenRouter request timed out')); });
+      req.write(payload);
+      req.end();
+    });
+
+    console.log(`[identity] origination narrative generated for ${did} (${narrative.length} chars)`);
+    res.json({ narrative });
+  } catch (e) {
+    console.error('[identity] origination generate failed:', e.message);
+    res.status(502).json({ error: 'narrative generation failed: ' + e.message });
+  }
+});
+
 app.get('/api/identity/ssn', (req, res) => {
   const { did } = req.query;
   if (!did) return res.status(400).json({ error: 'did required' });
@@ -1446,6 +1529,9 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) =
     );
   } catch (_) {}
 
+  // Capture inner ring behavioral signals
+  captureInnerRing(wallet.did, req);
+
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
     scope, expiresIn: expires_in,
     metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash },
@@ -1532,6 +1618,68 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_resonance (
   snapshot_type TEXT DEFAULT 'registration',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
+
+// ── Inner Ring Signal Collector ──
+// Captures high-value behavioral signals (hardest to spoof) on every authenticated request
+function captureInnerRing(did, req) {
+  const body = req.body || {};
+  const bodyStr = JSON.stringify(body);
+  const now = Date.now();
+
+  // 1. request_timing — ms since last request from this DID
+  let timingValue = null;
+  try {
+    const lastEntry = db.prepare(
+      `SELECT captured_at FROM fingerprint_rings WHERE did = ? AND ring = 'inner' AND signal_name = 'request_timing' ORDER BY id DESC LIMIT 1`
+    ).get(did);
+    if (lastEntry) {
+      timingValue = now - new Date(lastEntry.captured_at).getTime();
+    }
+  } catch (_) {}
+
+  // 2. entropy — Shannon entropy of request body JSON characters
+  let entropyValue = 0;
+  if (bodyStr.length > 2) { // skip empty objects '{}'
+    const freq = {};
+    for (const ch of bodyStr) {
+      freq[ch] = (freq[ch] || 0) + 1;
+    }
+    const len = bodyStr.length;
+    for (const ch in freq) {
+      const p = freq[ch] / len;
+      entropyValue -= p * Math.log2(p);
+    }
+  }
+
+  // 3. cadence_pattern — rolling average interval over last 10 timing entries
+  let cadenceValue = null;
+  try {
+    const timings = db.prepare(
+      `SELECT signal_value FROM fingerprint_rings WHERE did = ? AND ring = 'inner' AND signal_name = 'request_timing' AND signal_value != 'null' ORDER BY id DESC LIMIT 10`
+    ).all(did);
+    if (timings.length > 0) {
+      const vals = timings.map(r => parseFloat(r.signal_value)).filter(v => !isNaN(v));
+      if (vals.length > 0) {
+        cadenceValue = vals.reduce((a, b) => a + b, 0) / vals.length;
+      }
+    }
+  } catch (_) {}
+
+  // 4. body_key_order — SHA-256 hash of JSON key ordering
+  const keyOrder = Object.keys(body).join(',');
+  const keyOrderHash = crypto.createHash('sha256').update(keyOrder).digest('hex');
+
+  // INSERT all 4 signals
+  const insert = db.prepare(
+    `INSERT INTO fingerprint_rings (did, ring, signal_name, signal_value, weight, spoofability) VALUES (?, 'inner', ?, ?, ?, ?)`
+  );
+  try {
+    insert.run(did, 'request_timing', String(timingValue), 3.0, 'difficult');
+    insert.run(did, 'entropy', entropyValue.toFixed(4), 2.5, 'difficult');
+    insert.run(did, 'cadence_pattern', String(cadenceValue), 2.0, 'moderate');
+    insert.run(did, 'body_key_order', keyOrderHash, 1.5, 'moderate');
+  } catch (_) {}
+}
 
 // ── Fingerprint Rings (Kyle's 3-ring concentric model) ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS fingerprint_rings (
@@ -2049,6 +2197,95 @@ app.get('/api/ops/dashboard', (req, res) => {
     recent_signups: recentSignups,
     recent_transactions: recentTransactions,
   });
+});
+
+// ── Encrypted Channel Abstraction (Double Barrel Auth foundation) ──
+
+function deriveChannelKey(channelName) {
+  return crypto.hkdfSync('sha256', process.env.IDENTITY_MASTER_KEY, 'dustforge-channel-v1', channelName, 32);
+}
+
+function encryptChannelPayload(channelName, plaintext) {
+  const key = deriveChannelKey(channelName);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(key), iv);
+  let encrypted = cipher.update(plaintext, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  const tag = cipher.getAuthTag().toString('hex');
+  return iv.toString('hex') + ':' + tag + ':' + encrypted;
+}
+
+function decryptChannelPayload(channelName, ciphertext) {
+  const [ivHex, tagHex, data] = ciphertext.split(':');
+  const key = deriveChannelKey(channelName);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(key), Buffer.from(ivHex, 'hex'));
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+  let decrypted = decipher.update(data, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
+
+app.post('/api/channel/test', (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+  const { channel, payload } = req.body || {};
+  if (!channel || !['auth', 'ledger'].includes(channel)) {
+    return res.status(400).json({ error: 'channel must be "auth" or "ledger"' });
+  }
+  if (!payload || typeof payload !== 'string') {
+    return res.status(400).json({ error: 'payload string required' });
+  }
+  try {
+    const encrypted = encryptChannelPayload(channel, payload);
+    const decrypted = decryptChannelPayload(channel, encrypted);
+    res.json({ encrypted, decrypted, channel, match: decrypted === payload });
+  } catch (err) {
+    res.status(500).json({ error: 'channel crypto failed', detail: err.message });
+  }
+});
+
+app.post('/api/channel/wrap', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+
+  const { channel, data } = req.body || {};
+  if (!channel || !['auth', 'ledger'].includes(channel)) {
+    return res.status(400).json({ error: 'channel must be "auth" or "ledger"' });
+  }
+  if (!data || typeof data !== 'object') {
+    return res.status(400).json({ error: 'data object required' });
+  }
+  try {
+    const wrapped = encryptChannelPayload(channel, JSON.stringify(data));
+    res.json({ wrapped, channel });
+  } catch (err) {
+    res.status(500).json({ error: 'channel wrap failed', detail: err.message });
+  }
+});
+
+app.post('/api/channel/unwrap', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+
+  const { channel, wrapped } = req.body || {};
+  if (!channel || !['auth', 'ledger'].includes(channel)) {
+    return res.status(400).json({ error: 'channel must be "auth" or "ledger"' });
+  }
+  if (!wrapped || typeof wrapped !== 'string') {
+    return res.status(400).json({ error: 'wrapped ciphertext string required' });
+  }
+  try {
+    const plaintext = decryptChannelPayload(channel, wrapped);
+    const data = JSON.parse(plaintext);
+    res.json({ data, channel });
+  } catch (err) {
+    res.status(400).json({ error: 'channel unwrap failed', detail: err.message });
+  }
 });
 
 module.exports = { app, db };
