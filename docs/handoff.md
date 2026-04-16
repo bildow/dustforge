@@ -11,16 +11,34 @@
 | **Static** | **LIVE** on Netlify — dustforge.com, API proxied to api.dustforge.com |
 | **Status** | 46+ tasks closed. 20-pass design phase shipped (6 sprints). Audited. Patch task cards queued for Codex. |
 
-## Codex Work Queue (patch cards from audit rounds 68-70)
+## Codex Work Queue — START HERE
 
-| ID | Card | Priority | Complexity |
-|----|------|----------|------------|
-| 170 | Signal sanitization middleware: operator_flag + config flags | P2 | M |
-| 171 | SQLite trigger for barrel enforcement on ledger writes | P1 | M |
-| 172 | Atomic fleet wallet operations via db.transaction() | P1 | S |
-| 173 | Reputation provenance flag: exclude fleet-provisioned txns | P2 | S |
-| 174 | Input validation: size limits + type checks on all new endpoints | P2 | M |
-| 169 | Dual-Server Barrel Topology — design + implementation | P1 | XL (deferred) |
+**WARNING: The shipped sprint surface is NOT audit-clean. Brain's audit found 4 correctness issues that must be fixed before the new features are production-ready.**
+
+### P1 — Fix Before Anything Else
+
+| ID | Card | Issue |
+|----|------|-------|
+| 175 | Fleet QR Funding Settlement | Stripe sessions created but never fulfilled — fleet wallet never credited |
+| 176 | Channel Isolation Per Identity | Global channel keys mean any user can unwrap another user's payload |
+| 177 | Atomic Secure Wallet Transfer | Debit/credit not transactional — partial failure loses balance |
+
+### P2 — Fix Next
+
+| ID | Card | Issue |
+|----|------|-------|
+| 178 | Global Capacity Gate On Fleet Provisioning | Fleet provision ignores platform soft-cap — can mint after pause |
+| 170 | Signal sanitization middleware | operator_flag + config flags for inner ring |
+| 171 | SQLite trigger for barrel enforcement | Ledger-level invariant instead of route-level |
+| 172 | Atomic fleet wallet operations | db.transaction() on fund+provision |
+| 173 | Reputation provenance flag | Exclude fleet-provisioned from scoring |
+| 174 | Input validation | Size limits + type checks on all new endpoints |
+
+### Deferred
+
+| ID | Card | Notes |
+|----|------|-------|
+| 169 | Dual-Server Barrel Topology | Design complete (docs/adr-dual-server-barrel.md). Needs second VPS. |
 
 ## Rounds Run This Session
 
