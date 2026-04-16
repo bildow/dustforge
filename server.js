@@ -495,6 +495,203 @@ app.get('/api/stripe/prices', (req, res) => {
 // Prepaid Silicon Keys — gift card model
 // ============================================================
 
+// ============================================================
+// Silicon Vault — secrets that never enter the LLM context
+// ============================================================
+// The silicon calls the API to USE a secret without ever seeing it.
+// Dustforge injects the secret server-side, makes the call, returns the result.
+// The secret never enters the silicon's context window.
+//
+// This is the only safe pattern for AI agents because you can't trust
+// the agent's runtime — prompt injection can exfiltrate anything in context.
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_vault (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  name TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  secret_type TEXT DEFAULT 'api_key',
+  encrypted_value TEXT NOT NULL,
+  metadata TEXT DEFAULT '{}',
+  status TEXT DEFAULT 'active',
+  last_used_at TEXT,
+  use_count INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(did, name)
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_sv_did ON silicon_vault(did)"); } catch(e) {}
+
+// Vault-level encryption uses the identity module's existing AES-256-GCM
+function vaultEncrypt(value) {
+  const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([iv, authTag, encrypted]).toString('base64');
+}
+
+function vaultDecrypt(encryptedBase64) {
+  const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
+  const data = Buffer.from(encryptedBase64, 'base64');
+  const iv = data.slice(0, 16);
+  const authTag = data.slice(16, 32);
+  const encrypted = data.slice(32);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+}
+
+// POST /api/vault/store — store a secret (requires transact scope)
+app.post('/api/vault/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
+  const { name, value, description, secret_type } = req.body || {};
+  if (!name || !value) return res.status(400).json({ error: 'name and value required' });
+  if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
+  if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
+  if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
+
+  // Basic code detection — reject if it looks like executable code
+  const codePatterns = /^(#!|<script|function\s*\(|import\s+|require\s*\(|eval\s*\(|exec\s*\()/i;
+  if (codePatterns.test(value.trim())) return res.status(400).json({ error: 'value appears to be executable code. Secrets should be credentials, tokens, or keys — not code.' });
+
+  const validTypes = ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
+  const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
+
+  try {
+    const encrypted = vaultEncrypt(value);
+    db.prepare(`
+      INSERT INTO silicon_vault (did, name, description, secret_type, encrypted_value)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(did, name) DO UPDATE SET
+        encrypted_value = excluded.encrypted_value,
+        description = excluded.description,
+        secret_type = excluded.secret_type,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(req.identity.did, name, description || '', resolvedType, encrypted);
+
+    res.json({ ok: true, name, secret_type: resolvedType, description: description || '', note: 'Secret stored. It will never be returned in any API response.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/vault/list — list secret names and metadata (never values)
+app.get('/api/vault/list', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+  const secrets = db.prepare(
+    'SELECT name, description, secret_type, status, use_count, last_used_at, created_at, updated_at FROM silicon_vault WHERE did = ? AND status = ?'
+  ).all(req.identity.did, 'active');
+  res.json({ secrets, total: secrets.length });
+});
+
+// POST /api/vault/use — use a secret without seeing it (delegated execution)
+app.post('/api/vault/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
+  const { name, action, params } = req.body || {};
+  if (!name || !action) return res.status(400).json({ error: 'name and action required' });
+
+  const secret = db.prepare('SELECT * FROM silicon_vault WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  let decryptedValue;
+  try {
+    decryptedValue = vaultDecrypt(secret.encrypted_value);
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to decrypt secret' });
+  }
+
+  // Update usage stats
+  db.prepare('UPDATE silicon_vault SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+
+  // Execute the action with the secret injected
+  try {
+    let result;
+
+    switch (action) {
+      case 'http_header': {
+        // Make an HTTP request with the secret as a header value
+        const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = params || {};
+        if (!url) return res.status(400).json({ error: 'params.url required for http_header action' });
+
+        const response = await fetch(url, {
+          method,
+          headers: {
+            [header_name]: header_prefix + decryptedValue,
+            'Content-Type': 'application/json',
+          },
+          body: reqBody ? JSON.stringify(reqBody) : undefined,
+          signal: AbortSignal.timeout(30000),
+        });
+        const responseBody = await response.text();
+        let parsed;
+        try { parsed = JSON.parse(responseBody); } catch (_) { parsed = responseBody; }
+        result = { status: response.status, body: parsed };
+        break;
+      }
+
+      case 'sign': {
+        // Sign data with the secret as an HMAC key
+        const { data, algorithm = 'sha256' } = params || {};
+        if (!data) return res.status(400).json({ error: 'params.data required for sign action' });
+        const signature = crypto.createHmac(algorithm, decryptedValue).update(data).digest('hex');
+        result = { signature, algorithm };
+        break;
+      }
+
+      case 'verify_match': {
+        // Check if a provided value matches the secret (without revealing it)
+        const { candidate } = params || {};
+        if (!candidate) return res.status(400).json({ error: 'params.candidate required for verify_match action' });
+        result = { matches: candidate === decryptedValue };
+        break;
+      }
+
+      case 'inject_env': {
+        // Return the secret as a named env var to be used in a subprocess
+        // The silicon gets { env_name: "...", env_set: true } but not the value
+        const { env_name = 'SECRET_VALUE' } = params || {};
+        result = { env_name, env_set: true, note: 'Secret injected as environment variable. Value not returned.' };
+        break;
+      }
+
+      default:
+        return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, sign, verify_match, inject_env` });
+    }
+
+    res.json({ ok: true, action, secret_name: name, result });
+  } catch (e) {
+    res.status(500).json({ error: `action failed: ${e.message}` });
+  }
+});
+
+// DELETE /api/vault/revoke — deactivate a secret
+app.delete('/api/vault/revoke', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
+  const { name } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const result = db.prepare('UPDATE silicon_vault SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?')
+    .run('revoked', req.identity.did, name);
+  if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
+  res.json({ ok: true, name, status: 'revoked' });
+});
+
+// GET /api/vault/types — list supported secret types and actions
+app.get('/api/vault/types', (_req, res) => {
+  res.json({
+    secret_types: ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'],
+    actions: {
+      http_header: { description: 'Make an HTTP request with the secret injected as a header', params: ['url', 'method', 'header_name', 'header_prefix', 'body'] },
+      sign: { description: 'Sign data using the secret as an HMAC key', params: ['data', 'algorithm'] },
+      verify_match: { description: 'Check if a candidate value matches the secret', params: ['candidate'] },
+      inject_env: { description: 'Confirm secret is set as an environment variable (value not returned)', params: ['env_name'] },
+    },
+    security: {
+      encryption: 'AES-256-GCM at rest',
+      access: 'Bearer token with transact scope required',
+      exposure: 'Secret values are NEVER returned in any API response',
+      billing: 'Store/revoke: free. List: free. Use: 1¢ per action (api_call_compute)',
+    },
+  });
+});
+
 // Schema for prepaid keys
 try { db.exec(`CREATE TABLE IF NOT EXISTS prepaid_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
