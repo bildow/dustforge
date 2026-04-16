@@ -15,11 +15,11 @@ Last updated: 2026-04-08
 |------|--------|----------|
 | Privacy Policy | [x] | `http://100.83.112.88:3000/privacy` (platform) |
 | Terms of Service | [x] | `http://100.83.112.88:3000/terms` (platform) |
-| Dustforge privacy (standalone) | [ ] | Needs deploy to `dustforge.com/privacy` (RackNerd) |
-| Dustforge terms (standalone) | [ ] | Needs deploy to `dustforge.com/terms` (RackNerd) |
+| Dustforge privacy (standalone) | [x] | `dustforge.com/privacy` / `privacy.html` in repo |
+| Dustforge terms (standalone) | [x] | `dustforge.com/terms` / `terms.html` in repo |
 | akstrapped.com legal pages | [ ] | Bluehost — currently empty default pages |
 
-**Action needed:** When RackNerd SSH is available, add `/privacy` and `/terms` routes to Dustforge's server.js. Can mirror the platform pages or link to them.
+**Action needed:** Keep Dustforge legal pages updated alongside product changes and Stripe/legal dashboard settings.
 
 ---
 
@@ -37,7 +37,7 @@ Last updated: 2026-04-08
 **Action needed:**
 1. Get SSL cert on dustforge.com (needs RackNerd SSH)
 2. Add privacy/terms URLs to Stripe Dashboard → Settings → Branding → Legal
-3. Consider adding `consent_collection: { terms_of_service: 'required' }` to Checkout sessions
+3. Add `consent_collection: { terms_of_service: 'required' }` to Checkout sessions
 
 ---
 
