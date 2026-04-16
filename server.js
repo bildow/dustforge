@@ -496,7 +496,7 @@ app.get('/api/stripe/prices', (req, res) => {
 // ============================================================
 
 // ============================================================
-// Silicon Vault — secrets that never enter the LLM context
+// Blindkey — secrets that never enter the LLM context
 // ============================================================
 // The silicon calls the API to USE a secret without ever seeing it.
 // Dustforge injects the secret server-side, makes the call, returns the result.
@@ -505,7 +505,7 @@ app.get('/api/stripe/prices', (req, res) => {
 // This is the only safe pattern for AI agents because you can't trust
 // the agent's runtime — prompt injection can exfiltrate anything in context.
 
-try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_vault (
+try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_secrets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
   name TEXT NOT NULL,
@@ -520,10 +520,10 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_vault (
   updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(did, name)
 )`); } catch(e) {}
-try { db.exec("CREATE INDEX IF NOT EXISTS idx_sv_did ON silicon_vault(did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_sv_did ON blindkey_secrets(did)"); } catch(e) {}
 
-// Vault-level encryption uses the identity module's existing AES-256-GCM
-function vaultEncrypt(value) {
+// Blindkey-level encryption uses the identity module's existing AES-256-GCM
+function blindkeyEncrypt(value) {
   const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
   const iv = crypto.randomBytes(16);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -532,7 +532,7 @@ function vaultEncrypt(value) {
   return Buffer.concat([iv, authTag, encrypted]).toString('base64');
 }
 
-function vaultDecrypt(encryptedBase64) {
+function blindkeyDecrypt(encryptedBase64) {
   const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
   const data = Buffer.from(encryptedBase64, 'base64');
   const iv = data.slice(0, 16);
@@ -543,8 +543,8 @@ function vaultDecrypt(encryptedBase64) {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
 }
 
-// POST /api/vault/store — store a secret (requires transact scope)
-app.post('/api/vault/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
+// POST /api/blindkey/store — store a secret (requires transact scope)
+app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
   const { name, value, description, secret_type } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
   if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
@@ -559,9 +559,9 @@ app.post('/api/vault/store', rateLimitStandard, billing.billingMiddleware(db, 'a
   const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
 
   try {
-    const encrypted = vaultEncrypt(value);
+    const encrypted = blindkeyEncrypt(value);
     db.prepare(`
-      INSERT INTO silicon_vault (did, name, description, secret_type, encrypted_value)
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value)
       VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(did, name) DO UPDATE SET
         encrypted_value = excluded.encrypted_value,
@@ -576,31 +576,31 @@ app.post('/api/vault/store', rateLimitStandard, billing.billingMiddleware(db, 'a
   }
 });
 
-// GET /api/vault/list — list secret names and metadata (never values)
-app.get('/api/vault/list', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+// GET /api/blindkey/list — list secret names and metadata (never values)
+app.get('/api/blindkey/list', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
   const secrets = db.prepare(
-    'SELECT name, description, secret_type, status, use_count, last_used_at, created_at, updated_at FROM silicon_vault WHERE did = ? AND status = ?'
+    'SELECT name, description, secret_type, status, use_count, last_used_at, created_at, updated_at FROM blindkey_secrets WHERE did = ? AND status = ?'
   ).all(req.identity.did, 'active');
   res.json({ secrets, total: secrets.length });
 });
 
-// POST /api/vault/use — use a secret without seeing it (delegated execution)
-app.post('/api/vault/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
+// POST /api/blindkey/use — use a secret without seeing it (delegated execution)
+app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
   const { name, action, params } = req.body || {};
   if (!name || !action) return res.status(400).json({ error: 'name and action required' });
 
-  const secret = db.prepare('SELECT * FROM silicon_vault WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
+  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
   let decryptedValue;
   try {
-    decryptedValue = vaultDecrypt(secret.encrypted_value);
+    decryptedValue = blindkeyDecrypt(secret.encrypted_value);
   } catch (e) {
     return res.status(500).json({ error: 'failed to decrypt secret' });
   }
 
   // Update usage stats
-  db.prepare('UPDATE silicon_vault SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
 
   // Execute the action with the secret injected
   try {
@@ -663,18 +663,18 @@ app.post('/api/vault/use', rateLimitStandard, billing.billingMiddleware(db, 'api
   }
 });
 
-// DELETE /api/vault/revoke — deactivate a secret
-app.delete('/api/vault/revoke', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
+// DELETE /api/blindkey/revoke — deactivate a secret
+app.delete('/api/blindkey/revoke', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
   const { name } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
-  const result = db.prepare('UPDATE silicon_vault SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?')
+  const result = db.prepare('UPDATE blindkey_secrets SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?')
     .run('revoked', req.identity.did, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
   res.json({ ok: true, name, status: 'revoked' });
 });
 
-// GET /api/vault/types — list supported secret types and actions
-app.get('/api/vault/types', (_req, res) => {
+// GET /api/blindkey/types — list supported secret types and actions
+app.get('/api/blindkey/types', (_req, res) => {
   res.json({
     secret_types: ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'],
     actions: {
