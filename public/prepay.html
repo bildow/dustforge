@@ -84,9 +84,13 @@
           <input type="radio" name="pkg" value="26" onchange="selectPkg(26,2000)">
           <div><strong style="color:var(--text)">26 keys</strong> <span style="color:var(--text3)">— $20.00</span> <span style="color:var(--green);font-size:0.75rem;font-weight:600">save 23%</span></div>
         </label>
-        <label style="display:flex;align-items:center;gap:0.75rem;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.75rem;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400">
-          <input type="radio" name="pkg" value="140" onchange="selectPkg(140,10000)">
-          <div><strong style="color:var(--text)">140 keys</strong> <span style="color:var(--text3)">— $100.00</span> <span style="color:var(--green);font-size:0.75rem;font-weight:600">save 29%</span></div>
+        <label id="founding-tier" style="display:flex;align-items:center;gap:0.75rem;background:var(--card);border:2px solid var(--warm);border-radius:8px;padding:0.75rem;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400;position:relative">
+          <input type="radio" name="pkg" value="30" onchange="selectPkg(30,2000)">
+          <div><strong style="color:var(--warm)">30 keys — FOUNDING TIER</strong> <span style="color:var(--text3)">— $20.00</span> <span style="color:var(--green);font-size:0.75rem;font-weight:600">save 33%</span><br><span style="font-size:0.7rem;color:var(--text3)" id="founding-remaining">Limited — loading...</span></div>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.75rem;background:var(--card);border:2px solid var(--accent);border-radius:8px;padding:0.75rem;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400">
+          <input type="radio" name="pkg" value="140" onchange="selectPkg(140,8800)">
+          <div><strong style="color:var(--accent)">140 keys — PARTNERSHIP</strong> <span style="color:var(--text3)">— $88.00</span> <span style="color:var(--green);font-size:0.75rem;font-weight:600">save 37%</span><br><span style="font-size:0.7rem;color:var(--text3)">Includes WhisperHook + Sightless beta keys (May 2026)</span></div>
         </label>
       </div>
     </div>
@@ -137,6 +141,20 @@ const API = 'https://api.dustforge.com';
 let qty = 1;
 let priceCents = 100;
 let verificationToken = null;
+
+// Check founding tier availability
+fetch(API + '/api/capacity').then(r => r.json()).then(d => {
+  const el = document.getElementById('founding-remaining');
+  const tier = document.getElementById('founding-tier');
+  if (d.founding_tier && d.founding_tier.remaining > 0) {
+    el.textContent = d.founding_tier.remaining + ' of 100 remaining';
+  } else {
+    el.textContent = 'SOLD OUT';
+    tier.style.opacity = '0.4';
+    tier.style.pointerEvents = 'none';
+    tier.querySelector('input').disabled = true;
+  }
+}).catch(() => {});
 
 function selectPkg(q, cents) {
   qty = q;

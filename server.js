@@ -696,7 +696,8 @@ app.get('/api/stripe/prices', (req, res) => {
       '1_key': { keys: 1, price_dd: 100, price_usd: '$1.00' },
       '12_keys': { keys: 12, price_dd: 1000, price_usd: '$10.00', savings: '17%' },
       '26_keys': { keys: 26, price_dd: 2000, price_usd: '$20.00', savings: '23%' },
-      '140_keys': { keys: 140, price_dd: 10000, price_usd: '$100.00', savings: '29%' },
+      '30_keys_founding': { keys: 30, price_dd: 2000, price_usd: '$20.00', savings: '33%', note: 'Founding tier — limited to 100 purchases', remaining: (() => { try { const sold = db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n; return Math.max(0, 100 - sold); } catch(_) { return 100; } })() },
+      '140_keys_partnership': { keys: 140, price_dd: 8800, price_usd: '$88.00', savings: '37%', note: 'Partnership package — includes WhisperHook + Sightless beta keys (May 2026)' },
     },
     topup_options: [
       { dd: 500, usd: '$5.00' },
@@ -1026,7 +1027,16 @@ app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
 
   const qty = Number(quantity) || 1;
   // Package pricing: 1=$1, 12=$10, 26=$20, 140=$100
-  const PACKAGES = { 1: 100, 12: 1000, 26: 2000, 140: 10000 };
+  // Founding tier: 30 keys for $20 (limited to 100 purchases), 140 keys for $88 (partnership)
+  const FOUNDING_30_LIMIT = 100;
+  const founding30Sold = db.prepare("SELECT COUNT(*) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT DISTINCT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n / 30;
+  const PACKAGES = { 1: 100, 12: 1000, 26: 2000, 140: 8800 };
+  // Founding tier: 30 keys for $20 while supply lasts
+  if (qty === 30 && founding30Sold < FOUNDING_30_LIMIT) {
+    PACKAGES[30] = 2000;
+  } else if (qty === 30) {
+    return res.status(410).json({ error: 'Founding tier sold out. Use 26 keys for $20 instead.' });
+  }
   const totalCents = PACKAGES[qty] || (qty * 100); // fallback to $1/key for non-standard quantities
   if (qty > 140) return res.status(400).json({ error: 'maximum 140 keys per purchase' });
 
@@ -1463,6 +1473,179 @@ app.get('/api/identity/resonance', (req, res) => {
   const profiles = db.prepare('SELECT fingerprint_hash, user_agent, ip_address, created_at FROM silicon_profiles WHERE did = ? ORDER BY id DESC LIMIT 5').all(did);
   const resonances = db.prepare('SELECT * FROM silicon_resonance WHERE did_a = ? OR did_b = ? ORDER BY score DESC LIMIT 20').all(did, did);
   res.json({ did, profiles, resonance: resonances });
+});
+
+// ============================================================
+// Capacity + Waiting List
+// ============================================================
+
+// Backend capacity: single SQLite + 2GB RAM RackNerd = ~5000 identities comfortably
+// Beyond that, WAL contention + memory pressure becomes real
+const CAPACITY_HARD_CAP = 5000;
+const CAPACITY_SOFT_CAP = 1000; // open waiting list at this point
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS waiting_list (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE,
+  name TEXT DEFAULT '',
+  type TEXT DEFAULT 'carbon',
+  referral_code TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+app.get('/api/capacity', (req, res) => {
+  const total = db.prepare('SELECT COUNT(*) as n FROM identity_wallets').get().n;
+  const keysUnredeemed = db.prepare("SELECT COUNT(*) as n FROM prepaid_keys WHERE status = 'active'").get().n;
+  const waitingCount = db.prepare('SELECT COUNT(*) as n FROM waiting_list').get().n;
+  const founding30Sold = (() => { try { return db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n; } catch(_) { return 0; } })();
+
+  res.json({
+    identities: total,
+    capacity: CAPACITY_HARD_CAP,
+    utilization: (total / CAPACITY_HARD_CAP * 100).toFixed(1) + '%',
+    accepting_signups: total < CAPACITY_SOFT_CAP,
+    waiting_list_active: total >= CAPACITY_SOFT_CAP,
+    waiting_list_count: waitingCount,
+    unredeemed_keys: keysUnredeemed,
+    founding_tier: {
+      sold: founding30Sold,
+      limit: 100,
+      remaining: Math.max(0, 100 - founding30Sold),
+      available: founding30Sold < 100,
+    },
+  });
+});
+
+app.post('/api/waiting-list', rateLimitStrict, (req, res) => {
+  const { email, name, type, referral_code } = req.body || {};
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return res.status(400).json({ error: 'valid email required' });
+
+  try {
+    db.prepare('INSERT INTO waiting_list (email, name, type, referral_code) VALUES (?, ?, ?, ?)').run(
+      email, name || '', type || 'carbon', referral_code || ''
+    );
+    res.json({ ok: true, message: 'You\'re on the list. We\'ll email you when capacity opens.' });
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) return res.json({ ok: true, message: 'Already on the list.' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================================
+// Security Bounty Program
+// ============================================================
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS bounty_submissions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reporter_email TEXT NOT NULL,
+  reporter_name TEXT DEFAULT '',
+  severity TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  reproduction_steps TEXT DEFAULT '',
+  status TEXT DEFAULT 'open',
+  payout_cents INTEGER DEFAULT 0,
+  hall_of_fame INTEGER DEFAULT 0,
+  response TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  resolved_at TEXT
+)`); } catch(e) {}
+
+const BOUNTY_TIERS = {
+  critical: { label: 'Critical (P0)', min_payout: 500, max_payout: 5000, description: 'Auth bypass, RCE, data exfiltration, Blindkey secret leakage' },
+  high:     { label: 'High (P1)', min_payout: 200, max_payout: 1000, description: 'Privilege escalation, wallet manipulation, identity impersonation' },
+  medium:   { label: 'Medium (P2)', min_payout: 50, max_payout: 500, description: 'Information disclosure, rate limit bypass, relay abuse' },
+  low:      { label: 'Low (P3)', min_payout: 10, max_payout: 100, description: 'UI issues, minor info leaks, hardening suggestions' },
+};
+
+app.get('/api/bounty/program', (_req, res) => {
+  res.json({
+    name: 'Dustforge Security Bounty',
+    status: 'active',
+    scope: [
+      'api.dustforge.com — all endpoints',
+      'dustforge.com — static site',
+      'Authentication (fingerprint, token, Blindkey)',
+      'Billing/wallet (Diamond Dust ledger)',
+      'Email system (send, relay, forward)',
+      'Prepaid key system',
+      'Stripe integration',
+    ],
+    out_of_scope: [
+      'Denial of service',
+      'Social engineering of Dustforge personnel',
+      'Physical attacks',
+      'Third-party services (Stripe, Netlify)',
+    ],
+    tiers: BOUNTY_TIERS,
+    payout_currency: 'USD (via PayPal, Stripe, or Diamond Dust at 1 DD = $0.01)',
+    rules: [
+      'Do not access or modify other users\' data beyond proof of concept.',
+      'Report first, disclose later. 90-day disclosure window.',
+      'One submission per vulnerability. Duplicates credited to first reporter.',
+      'Silicons ARE eligible. AI agents can earn bounties.',
+    ],
+    submit_url: '/api/bounty/submit',
+    hall_of_fame_url: '/api/bounty/hall-of-fame',
+  });
+});
+
+app.post('/api/bounty/submit', rateLimitStrict, (req, res) => {
+  const { reporter_email, reporter_name, severity, title, description, reproduction_steps } = req.body || {};
+  if (!reporter_email || !severity || !title || !description) {
+    return res.status(400).json({ error: 'reporter_email, severity, title, and description required' });
+  }
+  if (!BOUNTY_TIERS[severity]) return res.status(400).json({ error: 'severity must be: critical, high, medium, low' });
+
+  try {
+    const result = db.prepare(
+      'INSERT INTO bounty_submissions (reporter_email, reporter_name, severity, title, description, reproduction_steps) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(reporter_email, reporter_name || '', severity, title, description, reproduction_steps || '');
+
+    // Notify admin
+    try {
+      const t = createEmailTransport();
+      t.sendMail({
+        from: 'bounty@dustforge.com',
+        to: 'aaronlsr42@gmail.com',
+        subject: `[BOUNTY ${severity.toUpperCase()}] ${title}`,
+        text: `New bounty submission #${result.lastInsertRowid}\n\nSeverity: ${severity}\nTitle: ${title}\nReporter: ${reporter_name || 'anonymous'} <${reporter_email}>\n\n${description}\n\nSteps:\n${reproduction_steps || 'N/A'}`,
+      });
+    } catch (_) {}
+
+    res.json({ ok: true, submission_id: result.lastInsertRowid, message: 'Received. We will review within 72 hours.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/bounty/hall-of-fame', (_req, res) => {
+  const entries = db.prepare(
+    "SELECT reporter_name, severity, title, payout_cents, resolved_at FROM bounty_submissions WHERE hall_of_fame = 1 AND status = 'resolved' ORDER BY payout_cents DESC, resolved_at DESC"
+  ).all();
+
+  const totalPaid = db.prepare(
+    "SELECT COALESCE(SUM(payout_cents), 0) as total FROM bounty_submissions WHERE status = 'resolved'"
+  ).get().total;
+
+  const totalResolved = db.prepare(
+    "SELECT COUNT(*) as n FROM bounty_submissions WHERE status = 'resolved'"
+  ).get().n;
+
+  res.json({
+    hall_of_fame: entries.map(e => ({
+      name: e.reporter_name || 'Anonymous',
+      severity: e.severity,
+      title: e.title,
+      payout: '$' + (e.payout_cents / 100).toFixed(2),
+      date: e.resolved_at,
+    })),
+    stats: {
+      total_paid_usd: '$' + (totalPaid / 100).toFixed(2),
+      total_resolved: totalResolved,
+      program_status: 'active',
+    },
+  });
 });
 
 module.exports = { app, db };

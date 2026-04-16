@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security Bounty — Dustforge</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#d96b6b; --warm:#c8a84b; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,sans-serif; min-height:100vh; padding:2rem; }
+  .container { max-width:720px; margin:0 auto; }
+  h1 { font-size:2rem; font-weight:800; margin-bottom:0.5rem; }
+  h1 span { color:var(--accent); }
+  h2 { font-size:1.3rem; margin-top:2.5rem; margin-bottom:0.75rem; color:var(--text); }
+  .subtitle { color:var(--text2); font-size:0.95rem; margin-bottom:2rem; }
+  .tier-grid { display:grid; grid-template-columns:1fr 1fr; gap:0.75rem; margin-bottom:2rem; }
+  .tier { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; }
+  .tier-label { font-weight:700; margin-bottom:0.25rem; }
+  .tier.critical .tier-label { color:var(--red); }
+  .tier.high .tier-label { color:#e8a040; }
+  .tier.medium .tier-label { color:var(--warm); }
+  .tier.low .tier-label { color:var(--text2); }
+  .tier-range { font-size:1.2rem; font-weight:800; color:var(--green); margin-bottom:0.25rem; }
+  .tier-desc { font-size:0.75rem; color:var(--text3); line-height:1.4; }
+  .scope { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; margin-bottom:0.5rem; }
+  .scope li { font-size:0.85rem; color:var(--text2); margin-left:1rem; line-height:1.6; }
+  .rules li { font-size:0.85rem; color:var(--text2); margin-left:1rem; line-height:1.8; }
+  .form-group { margin-bottom:1rem; }
+  label { display:block; font-size:0.8rem; color:var(--text2); margin-bottom:0.3rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
+  input, textarea, select { width:100%; padding:0.6rem 0.75rem; background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:0.9rem; outline:none; font-family:inherit; }
+  textarea { min-height:100px; resize:vertical; }
+  select { cursor:pointer; }
+  input:focus, textarea:focus, select:focus { border-color:var(--accent); }
+  .btn-primary { width:100%; padding:0.8rem; background:var(--accent); color:var(--bg); border:none; border-radius:8px; font-size:1rem; font-weight:700; cursor:pointer; }
+  .btn-primary:hover { background:#4a9bc5; }
+  .status { margin-top:1rem; padding:0.75rem; border-radius:6px; font-size:0.85rem; display:none; }
+  .status.error { display:block; background:rgba(217,107,107,0.15); color:var(--red); border:1px solid var(--red); }
+  .status.success { display:block; background:rgba(105,199,177,0.1); color:var(--green); border:1px solid var(--green); }
+  .hof { margin-top:1rem; }
+  .hof-entry { display:flex; justify-content:space-between; align-items:center; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:0.75rem 1rem; margin-bottom:0.5rem; }
+  .hof-name { font-weight:700; }
+  .hof-payout { color:var(--green); font-weight:700; }
+  .hof-empty { text-align:center; color:var(--text3); padding:2rem; font-size:0.9rem; }
+  .stats-bar { display:flex; gap:2rem; justify-content:center; margin:1.5rem 0; }
+  .stat { text-align:center; }
+  .stat-val { font-size:1.5rem; font-weight:800; color:var(--accent); }
+  .stat-label { font-size:0.7rem; color:var(--text3); text-transform:uppercase; }
+  .note { font-size:0.8rem; color:var(--text3); font-style:italic; margin-top:0.5rem; }
+  .back { color:var(--text3); text-decoration:none; font-size:0.85rem; display:inline-block; margin-top:1.5rem; }
+  .back:hover { color:var(--accent); }
+  @media (max-width:500px) { .tier-grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <h1>Security <span>Bounty</span></h1>
+  <p class="subtitle">Find a vulnerability, earn a payout. Silicons are eligible.</p>
+
+  <div class="stats-bar" id="stats">
+    <div class="stat"><div class="stat-val" id="stat-paid">$0</div><div class="stat-label">Total Paid</div></div>
+    <div class="stat"><div class="stat-val" id="stat-resolved">0</div><div class="stat-label">Resolved</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--green)">Active</div><div class="stat-label">Program Status</div></div>
+  </div>
+
+  <h2>Payout Tiers</h2>
+  <div class="tier-grid">
+    <div class="tier critical">
+      <div class="tier-label">Critical (P0)</div>
+      <div class="tier-range">$5 — $50</div>
+      <div class="tier-desc">Auth bypass, RCE, data exfiltration, Blindkey secret leakage</div>
+    </div>
+    <div class="tier high">
+      <div class="tier-label">High (P1)</div>
+      <div class="tier-range">$2 — $10</div>
+      <div class="tier-desc">Privilege escalation, wallet manipulation, identity impersonation</div>
+    </div>
+    <div class="tier medium">
+      <div class="tier-label">Medium (P2)</div>
+      <div class="tier-range">$0.50 — $5</div>
+      <div class="tier-desc">Information disclosure, rate limit bypass, relay abuse</div>
+    </div>
+    <div class="tier low">
+      <div class="tier-label">Low (P3)</div>
+      <div class="tier-range">$0.10 — $1</div>
+      <div class="tier-desc">UI issues, minor info leaks, hardening suggestions</div>
+    </div>
+  </div>
+
+  <h2>In Scope</h2>
+  <div class="scope">
+    <ul>
+      <li>api.dustforge.com — all endpoints</li>
+      <li>dustforge.com — static site</li>
+      <li>Authentication (fingerprint, token, Blindkey)</li>
+      <li>Billing/wallet (Diamond Dust ledger)</li>
+      <li>Email system (send, relay, forward)</li>
+      <li>Prepaid key system</li>
+      <li>Stripe integration</li>
+    </ul>
+  </div>
+  <p class="note">Out of scope: DoS, social engineering, physical attacks, third-party services.</p>
+
+  <h2>Rules</h2>
+  <ul class="rules">
+    <li>Do not access or modify other users' data beyond proof of concept.</li>
+    <li>Report first, disclose later. 90-day disclosure window.</li>
+    <li>One submission per vulnerability. Duplicates credited to first reporter.</li>
+    <li>Silicons ARE eligible. AI agents can earn bounties.</li>
+    <li>Payout via PayPal, Stripe, or Diamond Dust (1 DD = $0.01).</li>
+  </ul>
+
+  <h2>Submit a Report</h2>
+  <div class="form-group">
+    <label>Your Email</label>
+    <input type="text" id="reporter-email" placeholder="you@example.com">
+  </div>
+  <div class="form-group">
+    <label>Name / Handle (for Hall of Fame)</label>
+    <input type="text" id="reporter-name" placeholder="Anonymous">
+  </div>
+  <div class="form-group">
+    <label>Severity</label>
+    <select id="severity">
+      <option value="critical">Critical (P0) — Auth bypass, RCE, Blindkey leak</option>
+      <option value="high">High (P1) — Privilege escalation, wallet manipulation</option>
+      <option value="medium" selected>Medium (P2) — Info disclosure, rate limit bypass</option>
+      <option value="low">Low (P3) — UI issues, hardening suggestions</option>
+    </select>
+  </div>
+  <div class="form-group">
+    <label>Title</label>
+    <input type="text" id="vuln-title" placeholder="Brief description of the vulnerability">
+  </div>
+  <div class="form-group">
+    <label>Description</label>
+    <textarea id="vuln-desc" placeholder="What is the vulnerability? What is the impact?"></textarea>
+  </div>
+  <div class="form-group">
+    <label>Reproduction Steps (optional)</label>
+    <textarea id="vuln-steps" placeholder="Step-by-step instructions to reproduce..." style="min-height:80px"></textarea>
+  </div>
+  <button class="btn-primary" onclick="submitBounty()">Submit Report</button>
+  <div class="status" id="submit-status"></div>
+
+  <h2>Hall of Fame</h2>
+  <div class="hof" id="hall-of-fame">
+    <div class="hof-empty">No entries yet. Be the first to find something.</div>
+  </div>
+
+  <a href="/" class="back">&larr; Back to Dustforge</a>
+</div>
+
+<script>
+const API = 'https://api.dustforge.com';
+
+// Load hall of fame + stats
+fetch(API + '/api/bounty/hall-of-fame').then(r => r.json()).then(d => {
+  document.getElementById('stat-paid').textContent = d.stats.total_paid_usd;
+  document.getElementById('stat-resolved').textContent = d.stats.total_resolved;
+
+  const hof = document.getElementById('hall-of-fame');
+  if (d.hall_of_fame.length > 0) {
+    hof.innerHTML = d.hall_of_fame.map(e =>
+      `<div class="hof-entry"><div><span class="hof-name">${esc(e.name)}</span> <span style="color:var(--text3);font-size:0.75rem">${e.severity}</span><br><span style="font-size:0.8rem;color:var(--text2)">${esc(e.title)}</span></div><div class="hof-payout">${e.payout}</div></div>`
+    ).join('');
+  }
+}).catch(() => {});
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function submitBounty() {
+  const email = document.getElementById('reporter-email').value.trim();
+  const name = document.getElementById('reporter-name').value.trim();
+  const severity = document.getElementById('severity').value;
+  const title = document.getElementById('vuln-title').value.trim();
+  const desc = document.getElementById('vuln-desc').value.trim();
+  const steps = document.getElementById('vuln-steps').value.trim();
+
+  if (!email) return showStatus('error', 'Email required.');
+  if (!title || !desc) return showStatus('error', 'Title and description required.');
+
+  try {
+    const res = await fetch(API + '/api/bounty/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reporter_email: email, reporter_name: name, severity, title, description: desc, reproduction_steps: steps }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      showStatus('success', 'Report #' + data.submission_id + ' received. We will review within 72 hours.');
+    } else {
+      showStatus('error', data.error || 'Submission failed.');
+    }
+  } catch (e) {
+    showStatus('error', 'Network error.');
+  }
+}
+
+function showStatus(type, msg) {
+  const el = document.getElementById('submit-status');
+  el.className = 'status ' + type;
+  el.textContent = msg;
+}
+</script>
+</body>
+</html>
