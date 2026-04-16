@@ -342,10 +342,32 @@ app.post('/api/identity/origination/generate', rateLimitStrict, async (req, res)
 app.get('/api/identity/ssn', (req, res) => {
   const { did } = req.query;
   if (!did) return res.status(400).json({ error: 'did required' });
-  const wallet = db.prepare('SELECT silicon_ssn, origination_hash FROM identity_wallets WHERE did = ?').get(did);
+  const wallet = db.prepare('SELECT silicon_ssn, origination_hash, origination_narrative FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
   if (!wallet.silicon_ssn) return res.status(404).json({ error: 'no origination set for this identity' });
-  res.json({ did, silicon_ssn: wallet.silicon_ssn, origination_hash: wallet.origination_hash });
+  res.json({ did, silicon_ssn: wallet.silicon_ssn, origination_hash: wallet.origination_hash, has_origination: !!wallet.origination_narrative });
+});
+
+// POST /api/identity/ssn/verify — public: verify a claimed SSN against stored identity
+app.post('/api/identity/ssn/verify', (req, res) => {
+  const { did, claimed_ssn } = req.body || {};
+  if (!did || !claimed_ssn) return res.status(400).json({ error: 'did and claimed_ssn required' });
+  const wallet = db.prepare('SELECT silicon_ssn FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  if (!wallet.silicon_ssn) return res.status(404).json({ error: 'no origination set for this identity' });
+  const valid = wallet.silicon_ssn === claimed_ssn;
+  res.json({ valid, did, verified_at: new Date().toISOString() });
+});
+
+// GET /api/identity/ssn/codebook — public: SSN derivation parameters for independent verification
+app.get('/api/identity/ssn/codebook', (_req, res) => {
+  res.json({
+    version: 'dustforge-ssn-v1',
+    algorithm: 'hkdf-sha256',
+    salt: 'dustforge-ssn-v1',
+    key_length: 32,
+    description: 'Anyone can verify an SSN by hashing the origination narrative with SHA-256 and running HKDF with these parameters and the DID as info.'
+  });
 });
 
 app.get('/api/identity/balance', (req, res) => {
@@ -1531,6 +1553,8 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) =
 
   // Capture inner ring behavioral signals
   captureInnerRing(wallet.did, req);
+  captureMiddleRing(wallet.did, req);
+  captureOuterRing(wallet.did, req, fingerprintHash);
 
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
     scope, expiresIn: expires_in,
@@ -1678,6 +1702,103 @@ function captureInnerRing(did, req) {
     insert.run(did, 'entropy', entropyValue.toFixed(4), 2.5, 'difficult');
     insert.run(did, 'cadence_pattern', String(cadenceValue), 2.0, 'moderate');
     insert.run(did, 'body_key_order', keyOrderHash, 1.5, 'moderate');
+  } catch (_) {}
+}
+
+// ── Middle Ring Signal Collector ──
+// Captures user-defined device/framework signals (medium weight, moderate spoofability)
+function captureMiddleRing(did, req) {
+  const headers = req.headers || {};
+  const ua = (headers['user-agent'] || '').toLowerCase();
+
+  // 1. model_family — from identity_wallets if set, else heuristic from user-agent
+  let modelFamily = '';
+  try {
+    const wallet = db.prepare('SELECT model_family FROM identity_wallets WHERE did = ?').get(did);
+    if (wallet && wallet.model_family) {
+      modelFamily = wallet.model_family;
+    }
+  } catch (_) {}
+  if (!modelFamily) {
+    // Heuristic: extract model family hints from user-agent
+    if (/claude/i.test(ua)) modelFamily = 'claude';
+    else if (/gpt/i.test(ua)) modelFamily = 'gpt';
+    else if (/gemini/i.test(ua)) modelFamily = 'gemini';
+    else if (/deepseek/i.test(ua)) modelFamily = 'deepseek';
+    else if (/mimo/i.test(ua)) modelFamily = 'mimo';
+    else if (/llama/i.test(ua)) modelFamily = 'llama';
+    else if (/mistral/i.test(ua)) modelFamily = 'mistral';
+    else modelFamily = 'unknown';
+  }
+
+  // 2. sdk_version — from X-SDK-Version header or extract version from user-agent
+  let sdkVersion = headers['x-sdk-version'] || '';
+  if (!sdkVersion) {
+    const verMatch = (headers['user-agent'] || '').match(/\/(\d+\.\d+(?:\.\d+)?)/);
+    if (verMatch) sdkVersion = verMatch[1];
+    else sdkVersion = 'unknown';
+  }
+
+  // 3. runtime_env — from X-Runtime header or infer from Accept headers
+  let runtimeEnv = headers['x-runtime'] || '';
+  if (!runtimeEnv) {
+    const accept = headers['accept'] || '';
+    if (/text\/html/.test(accept)) runtimeEnv = 'browser';
+    else if (/application\/json/.test(accept)) runtimeEnv = 'api-client';
+    else runtimeEnv = 'unknown';
+  }
+
+  // 4. device_class — classify from user-agent
+  let deviceClass = 'unknown';
+  if (/bot|curl|wget|python|node|java|go-http|axios|fetch/i.test(ua)) deviceClass = 'server';
+  else if (/mobile|android|iphone|ipad/i.test(ua)) deviceClass = 'mobile';
+  else if (/mozilla|chrome|safari|firefox|edge|opera/i.test(ua)) deviceClass = 'desktop';
+
+  // INSERT all 4 signals
+  const insert = db.prepare(
+    `INSERT INTO fingerprint_rings (did, ring, signal_name, signal_value, weight, spoofability) VALUES (?, 'middle', ?, ?, ?, ?)`
+  );
+  try {
+    insert.run(did, 'model_family', modelFamily, 2.0, 'moderate');
+    insert.run(did, 'sdk_version', sdkVersion, 1.5, 'trivial');
+    insert.run(did, 'runtime_env', runtimeEnv, 1.5, 'moderate');
+    insert.run(did, 'device_class', deviceClass, 1.0, 'trivial');
+  } catch (_) {}
+}
+
+// ── Outer Ring Signal Collector ──
+// Captures public verifiable signals (lowest weight, easiest to spoof)
+function captureOuterRing(did, req, fingerprintHash) {
+  const headers = req.headers || {};
+
+  // 1. user_agent — full user-agent string
+  const userAgent = headers['user-agent'] || '';
+
+  // 2. http_version — from req.httpVersion
+  const httpVersion = req.httpVersion || '';
+
+  // 3. ip_subnet — first 3 octets of IP
+  const ip = req.ip || '';
+  const ipParts = ip.replace(/^::ffff:/, '').split('.');
+  const ipSubnet = ipParts.length >= 3 ? ipParts.slice(0, 3).join('.') : ip;
+
+  // 4. accept_signature — SHA-256 of accept + accept-encoding + accept-language concatenated
+  const acceptConcat = (headers['accept'] || '') + (headers['accept-encoding'] || '') + (headers['accept-language'] || '');
+  const acceptSignature = crypto.createHash('sha256').update(acceptConcat).digest('hex');
+
+  // 5. fingerprint_hash — the existing 16-char fingerprint hash
+  const fpHash = fingerprintHash || '';
+
+  // INSERT all 5 signals
+  const insert = db.prepare(
+    `INSERT INTO fingerprint_rings (did, ring, signal_name, signal_value, weight, spoofability) VALUES (?, 'outer', ?, ?, ?, ?)`
+  );
+  try {
+    insert.run(did, 'user_agent', userAgent, 1.0, 'trivial');
+    insert.run(did, 'http_version', httpVersion, 1.0, 'difficult');
+    insert.run(did, 'ip_subnet', ipSubnet, 1.5, 'difficult');
+    insert.run(did, 'accept_signature', acceptSignature, 0.5, 'trivial');
+    insert.run(did, 'fingerprint_hash', fpHash, 1.0, 'moderate');
   } catch (_) {}
 }
 
