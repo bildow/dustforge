@@ -1750,6 +1750,207 @@ app.get('/api/bounty/hall-of-fame', (_req, res) => {
   });
 });
 
+// ============================================================
+// Bulk Provisioning API [122]
+// ============================================================
+
+app.post('/api/identity/bulk-create', rateLimitStrict, async (req, res) => {
+  const { admin_key, count, prefix, password } = req.body || {};
+  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin_key required' });
+  if (!count || count < 1 || count > 50) return res.status(400).json({ error: 'count must be 1-50' });
+  if (!prefix || !/^[a-z0-9]{2,20}$/.test(prefix)) return res.status(400).json({ error: 'prefix must be 2-20 chars, lowercase alphanumeric' });
+  if (!password || password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
+
+  if (isSoftCapReached()) return res.status(409).json(capacityGateResponse('Bulk creation paused — capacity limit reached.'));
+
+  const created = [];
+  const errors = [];
+  for (let i = 0; i < count; i++) {
+    const username = `${prefix}-${String(i + 1).padStart(3, '0')}`;
+    try {
+      const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
+      if (existing) { errors.push({ username, error: 'already exists' }); continue; }
+      const id = identity.createIdentity();
+      const referralCode = crypto.randomBytes(6).toString('hex');
+      db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, referral_code, status)
+        VALUES (?, ?, ?, ?, ?, 'active')`).run(id.did, username, `${username}@dustforge.com`, id.encrypted_private_key, referralCode);
+      db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Bulk provisioned', 0)").run(id.did);
+      created.push({ username, did: id.did, email: `${username}@dustforge.com`, referral_code: referralCode });
+    } catch (e) {
+      errors.push({ username, error: e.message });
+    }
+  }
+  res.json({ ok: true, created: created.length, identities: created, errors });
+});
+
+// ============================================================
+// Attestation API [135] — time-limited signed verification tokens
+// ============================================================
+
+app.post('/api/identity/attest', rateLimitStandard, (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+
+  const { purpose, expires_in, audience } = req.body || {};
+  if (!purpose) return res.status(400).json({ error: 'purpose required (e.g. "api_access", "identity_proof", "payment_auth")' });
+
+  const ttlSeconds = parseDuration(expires_in || '5m');
+  const attestation = {
+    type: 'dustforge_attestation',
+    version: 1,
+    did: v.decoded.sub,
+    purpose,
+    audience: audience || '*',
+    issued_at: new Date().toISOString(),
+    expires_at: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+    nonce: crypto.randomBytes(8).toString('hex'),
+  };
+
+  // Sign the attestation with HMAC using IDENTITY_MASTER_KEY
+  const payload = JSON.stringify(attestation);
+  const sig = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY).update(payload).digest('hex');
+
+  res.json({ attestation, signature: sig });
+});
+
+app.post('/api/identity/verify-attestation', rateLimitStandard, (req, res) => {
+  const { attestation, signature } = req.body || {};
+  if (!attestation || !signature) return res.status(400).json({ error: 'attestation and signature required' });
+
+  const payload = JSON.stringify(attestation);
+  const expected = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY).update(payload).digest('hex');
+
+  if (signature !== expected) return res.json({ valid: false, error: 'signature mismatch' });
+  if (new Date(attestation.expires_at) < new Date()) return res.json({ valid: false, error: 'attestation expired' });
+
+  const wallet = db.prepare('SELECT username, status FROM identity_wallets WHERE did = ?').get(attestation.did);
+  res.json({
+    valid: true,
+    did: attestation.did,
+    username: wallet?.username,
+    purpose: attestation.purpose,
+    audience: attestation.audience,
+    expires_at: attestation.expires_at,
+    identity_status: wallet?.status || 'unknown',
+  });
+});
+
+function parseDuration(str) {
+  const m = String(str).match(/^(\d+)(s|m|h|d)$/);
+  if (!m) return 300;
+  const n = Number(m[1]);
+  switch (m[2]) {
+    case 's': return n;
+    case 'm': return n * 60;
+    case 'h': return n * 3600;
+    case 'd': return n * 86400;
+    default: return 300;
+  }
+}
+
+// ============================================================
+// Identity States + Revocation [136]
+// ============================================================
+
+app.get('/api/identity/status', rateLimitStandard, (req, res) => {
+  const { did, username } = req.query;
+  if (!did && !username) return res.status(400).json({ error: 'did or username required' });
+  const wallet = did
+    ? db.prepare('SELECT did, username, status, created_at, updated_at FROM identity_wallets WHERE did = ?').get(did)
+    : db.prepare('SELECT did, username, status, created_at, updated_at FROM identity_wallets WHERE username = ?').get(username);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  res.json({
+    did: wallet.did,
+    username: wallet.username,
+    status: wallet.status,
+    valid_statuses: ['active', 'flagged', 'frozen', 'revoked'],
+    created_at: wallet.created_at,
+    updated_at: wallet.updated_at,
+  });
+});
+
+app.patch('/api/identity/status', rateLimitStrict, (req, res) => {
+  const { admin_key, did, status, reason } = req.body || {};
+  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin_key required' });
+  if (!did || !status) return res.status(400).json({ error: 'did and status required' });
+  const validStatuses = ['active', 'flagged', 'frozen', 'revoked'];
+  if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
+
+  const wallet = db.prepare('SELECT did, username, status FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  if (wallet.status === 'revoked' && status !== 'revoked') return res.status(400).json({ error: 'revoked identities cannot be reactivated' });
+
+  const prev = wallet.status;
+  db.prepare('UPDATE identity_wallets SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(status, did);
+  db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'status_change', ?, 0)")
+    .run(did, `Status: ${prev} → ${status}. Reason: ${reason || 'admin action'}`);
+
+  res.json({ ok: true, did, username: wallet.username, previous_status: prev, new_status: status, reason: reason || 'admin action' });
+});
+
+// ============================================================
+// Backend Operations Dashboard [79]
+// ============================================================
+
+app.get('/api/ops/dashboard', (req, res) => {
+  const { admin_key } = req.query;
+  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin_key required' });
+
+  const identities = db.prepare('SELECT COUNT(*) as n FROM identity_wallets').get().n;
+  const activeIdentities = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'active'").get().n;
+  const flaggedIdentities = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'flagged'").get().n;
+  const frozenIdentities = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'frozen'").get().n;
+  const revokedIdentities = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'revoked'").get().n;
+
+  const totalDD = db.prepare("SELECT COALESCE(SUM(amount_cents), 0) as n FROM identity_transactions WHERE type IN ('account_created','topup','referral_payout','prepaid_redeemed','transfer_in')").get().n;
+  const totalSpent = db.prepare("SELECT COALESCE(SUM(ABS(amount_cents)), 0) as n FROM identity_transactions WHERE amount_cents < 0").get().n;
+  const totalTransactions = db.prepare('SELECT COUNT(*) as n FROM identity_transactions').get().n;
+
+  const prepaidKeysTotal = db.prepare('SELECT COUNT(*) as n FROM prepaid_keys').get().n;
+  const prepaidKeysActive = db.prepare("SELECT COUNT(*) as n FROM prepaid_keys WHERE status = 'active'").get().n;
+  const prepaidKeysRedeemed = db.prepare("SELECT COUNT(*) as n FROM prepaid_keys WHERE status = 'redeemed'").get().n;
+
+  const blindkeySecrets = db.prepare('SELECT COUNT(*) as n FROM blindkey_secrets').get().n;
+  const blindkeyUses = db.prepare('SELECT COALESCE(SUM(use_count), 0) as n FROM blindkey_secrets').get().n;
+
+  const relays = db.prepare('SELECT COUNT(*) as n FROM forward_relays').get().n;
+  const profiles = db.prepare('SELECT COUNT(*) as n FROM silicon_profiles').get().n;
+
+  const waitingList = db.prepare('SELECT COUNT(*) as n FROM waiting_list').get().n;
+  const bountyOpen = db.prepare("SELECT COUNT(*) as n FROM bounty_submissions WHERE status = 'open'").get().n;
+  const bountyResolved = db.prepare("SELECT COUNT(*) as n FROM bounty_submissions WHERE status = 'resolved'").get().n;
+
+  const recentSignups = db.prepare("SELECT username, created_at FROM identity_wallets ORDER BY created_at DESC LIMIT 5").all();
+  const recentTransactions = db.prepare("SELECT did, amount_cents, type, description, created_at FROM identity_transactions ORDER BY created_at DESC LIMIT 10").all();
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    uptime_seconds: Math.floor(process.uptime()),
+    capacity: {
+      identities, active: activeIdentities, flagged: flaggedIdentities, frozen: frozenIdentities, revoked: revokedIdentities,
+      hard_cap: CAPACITY_HARD_CAP, soft_cap: CAPACITY_SOFT_CAP,
+      utilization: (identities / CAPACITY_HARD_CAP * 100).toFixed(1) + '%',
+    },
+    financials: {
+      total_dd_credited: totalDD,
+      total_dd_spent: totalSpent,
+      net_dd_circulation: totalDD - totalSpent,
+      total_transactions: totalTransactions,
+    },
+    prepaid: { total: prepaidKeysTotal, active: prepaidKeysActive, redeemed: prepaidKeysRedeemed },
+    blindkey: { secrets_stored: blindkeySecrets, total_uses: blindkeyUses },
+    relays: relays,
+    fingerprint_profiles: profiles,
+    waiting_list: waitingList,
+    bounty: { open: bountyOpen, resolved: bountyResolved },
+    recent_signups: recentSignups,
+    recent_transactions: recentTransactions,
+  });
+});
+
 module.exports = { app, db };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
