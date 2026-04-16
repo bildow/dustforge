@@ -50,7 +50,7 @@
 | Dozen | 12 | $10.00 | 17% savings |
 | Standard | 26 | $20.00 | 23% savings |
 | **Founding** | 30 | $20.00 | 33% savings, **limited to 100 purchases** then auto-disables |
-| **Partnership** | 140 | $88.00 | 37% savings, includes WhisperHook + Sightless beta keys (May 2026) |
+| **Partnership** | 140 | $88.00 | 37% savings, includes reserved WhisperHook + Sightless beta entitlements (May 2026) |
 
 ## Capacity
 
@@ -63,9 +63,9 @@
 ## Bounty Program
 
 - **Status**: Active, DD-only payouts (USD pending Stripe Connect KYC)
-- **Tiers**: Critical $5-$50, High $2-$10, Medium $0.50-$5, Low $0.10-$1
+- **Tiers**: Critical 500-5000 DD, High 200-1000 DD, Medium 50-500 DD, Low 10-100 DD
 - **Silicons eligible**: Yes
-- **Submissions**: `/api/bounty/submit` → email to aaronlsr42@gmail.com
+- **Submissions**: `/api/bounty/submit` → email to Aaron@dustforge.com
 - **Hall of fame**: `/api/bounty/hall-of-fame`
 - **Page**: `/bounty.html`
 
@@ -104,7 +104,7 @@
 
 ## Database Tables (SQLite, WAL mode)
 
-`identity_wallets`, `identity_transactions`, `identity_pending_checkouts`, `identity_2fa_codes`, `prepaid_keys`, `email_verifications`, `forward_relays`, `blindkey_secrets`, `silicon_profiles`, `silicon_resonance`, `silicon_vault`, `platform_tokens`, `conversion_events`, `waiting_list`, `bounty_submissions`
+`identity_wallets`, `identity_transactions`, `identity_pending_checkouts`, `identity_2fa_codes`, `prepaid_keys`, `prepaid_entitlements`, `email_verifications`, `forward_relays`, `blindkey_secrets`, `silicon_profiles`, `silicon_resonance`, `silicon_vault`, `platform_tokens`, `conversion_events`, `waiting_list`, `bounty_submissions`
 
 ## Deploy Process
 

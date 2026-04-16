@@ -79,7 +79,7 @@ npm start
 | Dozen | 12 | $10.00 | 17% |
 | Standard | 26 | $20.00 | 23% |
 | **Founding** | 30 | $20.00 | 33% (limited to 100 purchases) |
-| **Partnership** | 140 | $88.00 | 37% (includes WhisperHook + Sightless beta) |
+| **Partnership** | 140 | $88.00 | 37% (includes reserved WhisperHook + Sightless beta entitlements) |
 
 ## Quick Onboard (curl)
 

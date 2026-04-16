@@ -125,6 +125,9 @@ app.post('/api/identity/create', async (req, res) => {
 
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
   if (existing) return res.status(409).json({ error: 'username already taken' });
+  if (isSoftCapReached()) {
+    return res.status(409).json(capacityGateResponse('Identity creation is paused while the waiting list is active. Use /api/waiting-list or sponsored onboarding once capacity opens.'));
+  }
 
   try {
     const id = identity.createIdentity();
@@ -495,6 +498,9 @@ app.post('/api/stripe/checkout/account', async (req, res) => {
   if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
   if (existing) return res.status(409).json({ error: 'username already taken' });
+  if (isSoftCapReached()) {
+    return res.status(409).json(capacityGateResponse('Paid activations are paused while the waiting list is active. Join /api/waiting-list or use sponsored onboarding once capacity opens.'));
+  }
   try {
     const checkout = await stripeService.createAccountCheckout({ username, password, referral_code, bulk: Boolean(bulk) });
     // Store password server-side (encrypted), not in Stripe metadata
@@ -697,7 +703,7 @@ app.get('/api/stripe/prices', (req, res) => {
       '12_keys': { keys: 12, price_dd: 1000, price_usd: '$10.00', savings: '17%' },
       '26_keys': { keys: 26, price_dd: 2000, price_usd: '$20.00', savings: '23%' },
       '30_keys_founding': { keys: 30, price_dd: 2000, price_usd: '$20.00', savings: '33%', note: 'Founding tier — limited to 100 purchases', remaining: (() => { try { const sold = db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n; return Math.max(0, 100 - sold); } catch(_) { return 100; } })() },
-      '140_keys_partnership': { keys: 140, price_dd: 8800, price_usd: '$88.00', savings: '37%', note: 'Partnership package — includes WhisperHook + Sightless beta keys (May 2026)' },
+      '140_keys_partnership': { keys: 140, price_dd: 8800, price_usd: '$88.00', savings: '37%', note: 'Partnership package — includes reserved WhisperHook + Sightless beta entitlements (May 2026)' },
     },
     topup_options: [
       { dd: 500, usd: '$5.00' },
@@ -1010,6 +1016,18 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS prepaid_keys (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_code ON prepaid_keys(key_code)"); } catch(e) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS prepaid_entitlements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  stripe_session_id TEXT NOT NULL,
+  sponsor_email TEXT NOT NULL,
+  package_code TEXT NOT NULL,
+  benefit_code TEXT NOT NULL,
+  benefit_description TEXT NOT NULL,
+  status TEXT DEFAULT 'granted',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(stripe_session_id, benefit_code)
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_prepaid_entitlements_session ON prepaid_entitlements(stripe_session_id)"); } catch(e) {}
 
 // POST /api/prepaid/purchase — carbon buys a prepaid key (requires verified email)
 app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
@@ -1099,6 +1117,13 @@ app.get('/api/prepaid/success', async (req, res) => {
         stmt.run(keyCode, meta.sponsor_email, sessionId);
         keys.push(keyCode);
       }
+      if (qty === 140) {
+        const entitlementStmt = db.prepare(
+          'INSERT OR IGNORE INTO prepaid_entitlements (stripe_session_id, sponsor_email, package_code, benefit_code, benefit_description) VALUES (?, ?, ?, ?, ?)'
+        );
+        entitlementStmt.run(sessionId, meta.sponsor_email, '140_keys_partnership', 'whisperhook_beta', 'WhisperHook beta key reservation on release (May 2026)');
+        entitlementStmt.run(sessionId, meta.sponsor_email, '140_keys_partnership', 'sightless_beta', 'Sightless beta key reservation on release (May 2026)');
+      }
 
       // Email the keys to the sponsor
       try {
@@ -1119,6 +1144,14 @@ app.get('/api/prepaid/success', async (req, res) => {
             '',
             'By purchasing this key, you accepted responsibility for the silicon',
             'agent that redeems it and any actions it takes on the platform.',
+            ...(qty === 140
+              ? [
+                '',
+                'Partnership package entitlement recorded:',
+                '  - WhisperHook beta key reservation (May 2026)',
+                '  - Sightless beta key reservation (May 2026)',
+              ]
+              : []),
             '',
             '— Dustforge Identity Platform',
           ].join('\n'),
@@ -1130,6 +1163,9 @@ app.get('/api/prepaid/success', async (req, res) => {
 
     // Show the keys
     const keyCards = keys.map(k => `<div style="background:#132131;border:1px solid #27445f;border-radius:8px;padding:1rem;margin:0.5rem 0;font-family:monospace;font-size:1.1rem;text-align:center;color:#c8a84b;letter-spacing:0.1em;user-select:all">${k}</div>`).join('');
+    const entitlementNote = (Number(meta.quantity) || 1) === 140
+      ? '<div style="margin-top:1rem;background:#132131;border:1px solid #27445f;border-radius:8px;padding:1rem;color:#9cb4c9"><strong style="color:#69c7b1">Partnership package recorded</strong><br>WhisperHook beta and Sightless beta entitlements have been reserved for ' + meta.sponsor_email + ' for May 2026 release delivery.</div>'
+      : '';
 
     res.send(`<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
@@ -1137,6 +1173,7 @@ app.get('/api/prepaid/success', async (req, res) => {
   <h1 style="color:#69c7b1;font-size:1.8rem">Keys Generated</h1>
   <p style="color:#9cb4c9">Your prepaid silicon key${keys.length > 1 ? 's' : ''}:</p>
   ${keyCards}
+  ${entitlementNote}
   <p style="font-size:0.85rem;color:#6d8397;margin-top:1.5rem">Give this key to a silicon agent to onboard. A copy has been emailed to ${meta.sponsor_email}.</p>
   <p style="font-size:0.75rem;color:#6d8397;margin-top:1rem">By purchasing, you accepted responsibility for the silicon agent that redeems this key.</p>
   <p style="margin-top:1.5rem"><a href="/" style="color:#5fb3ff">Back to Dustforge</a></p>
@@ -1152,6 +1189,9 @@ app.post('/api/prepaid/redeem', rateLimitStrict, async (req, res) => {
   if (!key_code || !username || !password) return res.status(400).json({ error: 'key_code, username, and password required' });
   if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'invalid username (3-31 chars, lowercase alphanumeric)' });
   if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
+  if (isSoftCapReached()) {
+    return res.status(409).json(capacityGateResponse('Prepaid key redemption is paused while the waiting list is active. Hold the key and try again when activations reopen.'));
+  }
 
   // Validate key
   const key = db.prepare('SELECT * FROM prepaid_keys WHERE key_code = ?').get(key_code);
@@ -1368,6 +1408,15 @@ app.post('/api/identity/request-account', rateLimitStrict, async (req, res) => {
   if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
   if (existing) return res.status(409).json({ error: 'username taken' });
+  if (isSoftCapReached()) {
+    addToWaitingList(carbon_email, username, 'carbon', referral_code || '');
+    return res.status(202).json({
+      ok: true,
+      waiting_list: true,
+      message: 'Activation capacity is paused. The sponsor email has been added to the waiting list.',
+      capacity: getCapacitySnapshot(),
+    });
+  }
   try {
     const checkout = await stripeService.createAccountCheckout({ username, password, referral_code });
     const t = createEmailTransport();
@@ -1493,11 +1542,64 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS waiting_list (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 
+function getIdentityCount() {
+  return db.prepare('SELECT COUNT(*) as n FROM identity_wallets').get().n;
+}
+
+function getWaitingListCount() {
+  return db.prepare('SELECT COUNT(*) as n FROM waiting_list').get().n;
+}
+
+function getFoundingTierSold() {
+  try {
+    return db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function getCapacitySnapshot() {
+  const identities = getIdentityCount();
+  return {
+    identities,
+    capacity: CAPACITY_HARD_CAP,
+    utilization: (identities / CAPACITY_HARD_CAP * 100).toFixed(1) + '%',
+    accepting_signups: identities < CAPACITY_SOFT_CAP,
+    waiting_list_active: identities >= CAPACITY_SOFT_CAP,
+    waiting_list_count: getWaitingListCount(),
+  };
+}
+
+function isSoftCapReached() {
+  return getIdentityCount() >= CAPACITY_SOFT_CAP;
+}
+
+function capacityGateResponse(message) {
+  return {
+    error: message,
+    waiting_list_active: true,
+    waiting_list_url: '/api/waiting-list',
+    capacity: getCapacitySnapshot(),
+  };
+}
+
+function addToWaitingList(email, name, type, referralCode) {
+  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return;
+  try {
+    db.prepare('INSERT OR IGNORE INTO waiting_list (email, name, type, referral_code) VALUES (?, ?, ?, ?)').run(
+      email,
+      name || '',
+      type || 'carbon',
+      referralCode || ''
+    );
+  } catch (_) {}
+}
+
 app.get('/api/capacity', (req, res) => {
-  const total = db.prepare('SELECT COUNT(*) as n FROM identity_wallets').get().n;
+  const total = getIdentityCount();
   const keysUnredeemed = db.prepare("SELECT COUNT(*) as n FROM prepaid_keys WHERE status = 'active'").get().n;
-  const waitingCount = db.prepare('SELECT COUNT(*) as n FROM waiting_list').get().n;
-  const founding30Sold = (() => { try { return db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n; } catch(_) { return 0; } })();
+  const waitingCount = getWaitingListCount();
+  const founding30Sold = getFoundingTierSold();
 
   res.json({
     identities: total,
@@ -1607,7 +1709,7 @@ app.post('/api/bounty/submit', rateLimitStrict, (req, res) => {
       const t = createEmailTransport();
       t.sendMail({
         from: 'bounty@dustforge.com',
-        to: 'aaronlsr42@gmail.com',
+        to: 'Aaron@dustforge.com',
         subject: `[BOUNTY ${severity.toUpperCase()}] ${title}`,
         text: `New bounty submission #${result.lastInsertRowid}\n\nSeverity: ${severity}\nTitle: ${title}\nReporter: ${reporter_name || 'anonymous'} <${reporter_email}>\n\n${description}\n\nSteps:\n${reproduction_steps || 'N/A'}`,
       });
@@ -1637,11 +1739,11 @@ app.get('/api/bounty/hall-of-fame', (_req, res) => {
       name: e.reporter_name || 'Anonymous',
       severity: e.severity,
       title: e.title,
-      payout: '$' + (e.payout_cents / 100).toFixed(2),
+      payout: e.payout_cents + ' DD',
       date: e.resolved_at,
     })),
     stats: {
-      total_paid_usd: '$' + (totalPaid / 100).toFixed(2),
+      total_paid_dd: totalPaid + ' DD',
       total_resolved: totalResolved,
       program_status: 'active',
     },

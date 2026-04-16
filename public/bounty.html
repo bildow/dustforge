@@ -156,7 +156,7 @@ const API = 'https://api.dustforge.com';
 
 // Load hall of fame + stats
 fetch(API + '/api/bounty/hall-of-fame').then(r => r.json()).then(d => {
-  document.getElementById('stat-paid').textContent = d.stats.total_paid_usd;
+  document.getElementById('stat-paid').textContent = d.stats.total_paid_dd;
   document.getElementById('stat-resolved').textContent = d.stats.total_resolved;
 
   const hof = document.getElementById('hall-of-fame');
