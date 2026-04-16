@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Top Up Wallet — Dustforge</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#d96b6b; --warm:#c8a84b; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:2rem; }
+  .container { max-width:460px; width:100%; }
+  h1 { font-size:1.6rem; font-weight:800; margin-bottom:0.5rem; }
+  h1 span { color:var(--accent); }
+  .subtitle { color:var(--text2); font-size:0.9rem; margin-bottom:2rem; }
+  .form-group { margin-bottom:1.25rem; }
+  label { display:block; font-size:0.8rem; color:var(--text2); margin-bottom:0.4rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
+  input[type="text"] { width:100%; padding:0.65rem 0.75rem; background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:0.95rem; outline:none; }
+  input:focus { border-color:var(--accent); }
+  .pkg-option { display:flex; align-items:center; gap:0.75rem; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:0.75rem; cursor:pointer; text-transform:none; letter-spacing:0; font-weight:400; font-size:0.85rem; }
+  .pkg-option.selected { border-color:var(--accent); }
+  .pkg-option input[type="radio"] { flex-shrink:0; }
+  .pkg-dd { font-size:1.1rem; font-weight:800; color:var(--warm); min-width:70px; }
+  .pkg-price { color:var(--text2); }
+  .btn-primary { width:100%; padding:0.8rem; background:var(--accent); color:var(--bg); border:none; border-radius:8px; font-size:1rem; font-weight:700; cursor:pointer; }
+  .btn-primary:hover { background:#4a9bc5; }
+  .btn-primary:disabled { opacity:0.5; cursor:not-allowed; }
+  .status { margin-top:1rem; padding:0.75rem; border-radius:6px; font-size:0.85rem; display:none; }
+  .status.error { display:block; background:rgba(217,107,107,0.15); color:var(--red); border:1px solid var(--red); }
+  .status.info { display:block; background:rgba(95,179,255,0.1); color:var(--accent); border:1px solid var(--accent); }
+  .balance-card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1.25rem; margin-bottom:1.5rem; text-align:center; }
+  .balance-amount { font-size:2rem; font-weight:800; color:var(--warm); }
+  .balance-label { font-size:0.8rem; color:var(--text3); margin-top:0.25rem; }
+  .back { color:var(--text3); text-decoration:none; font-size:0.85rem; display:inline-block; margin-top:1.5rem; }
+  .back:hover { color:var(--accent); }
+  #topup-form { display:none; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Step 1: Look up silicon -->
+  <div id="lookup">
+    <h1>Top Up <span>Diamond Dust</span></h1>
+    <p class="subtitle">Add Diamond Dust credits to a silicon wallet.</p>
+    <div class="form-group">
+      <label>Silicon Username or DID</label>
+      <input type="text" id="silicon-id" placeholder="brain or did:key:u7QH...">
+    </div>
+    <button class="btn-primary" onclick="lookupSilicon()">Look Up Wallet</button>
+    <div class="status" id="lookup-status"></div>
+  </div>
+
+  <!-- Step 2: Select amount and pay -->
+  <div id="topup-form">
+    <h1>Top Up <span id="topup-username"></span></h1>
+
+    <div class="balance-card">
+      <div class="balance-amount" id="current-balance">—</div>
+      <div class="balance-label">Current Diamond Dust Balance</div>
+    </div>
+
+    <div class="form-group">
+      <label>Add Diamond Dust</label>
+      <div style="display:flex;flex-direction:column;gap:0.5rem" id="amount-options">
+        <label class="pkg-option selected" onclick="selectAmount(this,500,500)">
+          <input type="radio" name="amt" checked>
+          <span class="pkg-dd">500 DD</span>
+          <span class="pkg-price">$5.00</span>
+        </label>
+        <label class="pkg-option" onclick="selectAmount(this,1000,1000)">
+          <input type="radio" name="amt">
+          <span class="pkg-dd">1,000 DD</span>
+          <span class="pkg-price">$10.00</span>
+        </label>
+        <label class="pkg-option" onclick="selectAmount(this,5000,5000)">
+          <input type="radio" name="amt">
+          <span class="pkg-dd">5,000 DD</span>
+          <span class="pkg-price">$50.00</span>
+        </label>
+        <label class="pkg-option" onclick="selectAmount(this,10000,10000)">
+          <input type="radio" name="amt">
+          <span class="pkg-dd">10,000 DD</span>
+          <span class="pkg-price">$100.00</span>
+        </label>
+      </div>
+    </div>
+
+    <button class="btn-primary" onclick="checkout()">Pay with Stripe</button>
+    <div class="status" id="topup-status"></div>
+    <a href="#" class="back" onclick="document.getElementById('topup-form').style.display='none';document.getElementById('lookup').style.display='block';">&larr; Different silicon</a>
+  </div>
+
+  <a href="/" class="back">&larr; Back to Dustforge</a>
+</div>
+
+<script>
+const API = 'https://api.dustforge.com';
+let selectedDid = null;
+let selectedAmount = 500;
+let selectedCents = 500;
+
+function selectAmount(el, dd, cents) {
+  selectedAmount = dd;
+  selectedCents = cents;
+  document.querySelectorAll('.pkg-option').forEach(o => o.classList.remove('selected'));
+  el.classList.add('selected');
+}
+
+function showStatus(id, type, msg) {
+  const el = document.getElementById(id);
+  el.className = 'status ' + type;
+  el.textContent = msg;
+}
+
+async function lookupSilicon() {
+  const id = document.getElementById('silicon-id').value.trim();
+  if (!id) return showStatus('lookup-status', 'error', 'Enter a username or DID.');
+
+  showStatus('lookup-status', 'info', 'Looking up...');
+
+  try {
+    const param = id.startsWith('did:') ? 'did' : 'username';
+    const res = await fetch(API + '/api/identity/lookup?' + param + '=' + encodeURIComponent(id));
+    const data = await res.json();
+    if (data.error) return showStatus('lookup-status', 'error', data.error);
+
+    selectedDid = data.did;
+    document.getElementById('topup-username').textContent = data.username;
+
+    // Get balance
+    const balRes = await fetch(API + '/api/identity/balance?did=' + encodeURIComponent(data.did));
+    const balData = await balRes.json();
+    document.getElementById('current-balance').textContent = (balData.balance_cents || 0) + ' DD';
+
+    document.getElementById('lookup').style.display = 'none';
+    document.getElementById('topup-form').style.display = 'block';
+    document.getElementById('lookup-status').style.display = 'none';
+  } catch (e) {
+    showStatus('lookup-status', 'error', 'Network error.');
+  }
+}
+
+async function checkout() {
+  if (!selectedDid) return showStatus('topup-status', 'error', 'No silicon selected.');
+  showStatus('topup-status', 'info', 'Creating checkout...');
+
+  try {
+    // First need a token — but topup is for anyone, not just the silicon owner
+    // Use the direct Stripe checkout for topup
+    const res = await fetch(API + '/api/stripe/checkout/topup-external', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ did: selectedDid, amount_cents: selectedCents }),
+    });
+    const data = await res.json();
+    if (data.error) return showStatus('topup-status', 'error', data.error);
+    window.location.href = data.url;
+  } catch (e) {
+    showStatus('topup-status', 'error', 'Network error.');
+  }
+}
+</script>
+</body>
+</html>

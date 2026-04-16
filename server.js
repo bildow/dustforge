@@ -505,6 +505,83 @@ app.post('/api/stripe/checkout/topup', billing.billingMiddleware(db, 'api_call_r
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
+// POST /api/stripe/checkout/topup-external — anyone can top up any silicon (no auth)
+app.post('/api/stripe/checkout/topup-external', rateLimitStandard, async (req, res) => {
+  const { did, amount_cents } = req.body || {};
+  if (!did || !amount_cents) return res.status(400).json({ error: 'did and amount_cents required' });
+
+  const validAmounts = [500, 1000, 5000, 10000];
+  if (!validAmounts.includes(Number(amount_cents))) return res.status(400).json({ error: 'amount must be 500, 1000, 5000, or 10000' });
+
+  const wallet = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'silicon not found' });
+
+  try {
+    const stripe = stripeService.getStripe();
+    const ddAmount = Number(amount_cents);
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `${ddAmount} Diamond Dust for ${wallet.username}`,
+            description: `Top up ${wallet.username}@dustforge.com wallet with ${ddAmount} DD`,
+          },
+          unit_amount: Number(amount_cents),
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/topup-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/cancel`,
+      metadata: { type: 'wallet_topup', did, amount_cents: String(amount_cents), username: wallet.username },
+    });
+    res.json({ ok: true, url: session.url, session_id: session.id, dd: ddAmount, username: wallet.username });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/stripe/topup-success — handle topup completion
+app.get('/api/stripe/topup-success', async (req, res) => {
+  const sessionId = req.query.session_id;
+  if (!sessionId) return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Missing session</h1></body></html>');
+
+  try {
+    const stripe = stripeService.getStripe();
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const meta = session.metadata || {};
+
+    if (meta.type !== 'wallet_topup' || session.payment_status !== 'paid') {
+      return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not confirmed</h1></body></html>');
+    }
+
+    const amount = Number(meta.amount_cents);
+    const idempotencyKey = `topup_${sessionId}`;
+    const result = billing.creditBalance(db, meta.did, amount, 'stripe_topup', `${amount} Diamond Dust via Stripe`, idempotencyKey);
+
+    const newBalance = billing.getDerivedBalance(db, meta.did);
+
+    res.send(`<html><head><meta charset="UTF-8"></head>
+<body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+<div style="text-align:center;max-width:400px;padding:2rem">
+  <h1 style="color:#69c7b1;font-size:1.8rem">Wallet Topped Up</h1>
+  <p style="color:#9cb4c9">${meta.username}@dustforge.com</p>
+  <div style="background:#132131;border:1px solid #27445f;border-radius:8px;padding:1.5rem;margin:1.5rem 0">
+    <div style="font-size:1rem;color:#6d8397">Added</div>
+    <div style="font-size:2.5rem;font-weight:800;color:#c8a84b">${amount} DD</div>
+    <div style="margin-top:1rem;font-size:1rem;color:#6d8397">New Balance</div>
+    <div style="font-size:1.5rem;font-weight:700;color:#69c7b1">${newBalance} DD</div>
+  </div>
+  ${result.idempotent ? '<p style="font-size:0.8rem;color:#6d8397">Already credited (idempotent).</p>' : ''}
+  <a href="/" style="color:#5fb3ff;text-decoration:none;font-size:0.9rem">Back to Dustforge</a>
+</div></body></html>`);
+  } catch (e) {
+    res.status(500).send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Error: ' + e.message + '</h1></body></html>');
+  }
+});
+
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
   try { event = stripeService.constructWebhookEvent(req.body, req.headers['stripe-signature']); }
