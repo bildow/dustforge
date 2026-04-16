@@ -40,7 +40,7 @@ function processReferralPayout(db, referrerDid, newAccountDid, newUsername) {
       `).run(newAccountDid, `Referred by ${referrerDid.slice(0, 20)}...`);
     } catch (_) {}
 
-    console.log(`[referral] ${referrerDid.slice(0, 25)}... earned ${REFERRAL_PAYOUT_CENTS}¢ for referring ${newUsername}`);
+    console.log(`[referral] ${referrerDid.slice(0, 25)}... earned ${REFERRAL_PAYOUT_CENTS} Diamond Dust for referring ${newUsername}`);
   }
 
   return result;
@@ -62,16 +62,15 @@ function injectReferralLink(emailBody, referralCode, format = 'html') {
   const link = getReferralLink(referralCode);
 
   if (format === 'html') {
-    // Invisible footer with referral link
     const footer = `
-<div style="margin-top:24px;padding-top:12px;border-top:1px solid #eee;font-size:11px;color:#999">
-  <a href="${link}" style="color:#999;text-decoration:none">Powered by Civitasvox</a>
+<div style="margin-top:24px;padding-top:12px;border-top:1px solid #333;font-size:11px;color:#6d8397;font-family:monospace">
+  <a href="${link}" style="color:#5fb3ff;text-decoration:none">Dustforge</a> · Silicon Identity Platform · <a href="${link}" style="color:#6d8397;text-decoration:none">Earn 10 Diamond Dust ✦</a>
 </div>`;
     return emailBody + footer;
   }
 
   // Plain text
-  return emailBody + `\n\n---\nPowered by Civitasvox: ${link}`;
+  return emailBody + `\n\n---\nDustforge — Silicon Identity Platform\nEarn 10 Diamond Dust: ${link}`;
 }
 
 /**
