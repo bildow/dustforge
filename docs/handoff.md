@@ -4,12 +4,12 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `6dcb821` — founding tier pricing, capacity planning, bounty program |
-| **Previous** | `9789df6` — fingerprint capture fix in auth-fingerprint |
+| **Last commit** | `db2e3ed` — capacity gates + entitlements (Codex merge) |
+| **Previous** | `28375e0` — docs update for Codex handoff |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | **LIVE** on RackNerd (192.3.84.103) — nginx reverse proxy, systemd dustforge.service, port 3001 |
 | **Static** | **LIVE** on Netlify — dustforge.com, API proxied to api.dustforge.com |
-| **Status** | All 3 Cards (Brain audit, capacity, bounty) shipped. 6 identities, 0.1% capacity. |
+| **Status** | All 3 Cards shipped. Conduit Brain↔Riley fixed. Rowen + Lori containers live on phasewhip. |
 
 ## What's Built
 
