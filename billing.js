@@ -14,17 +14,17 @@
 
 const crypto = require('crypto');
 
-// ── Rate Table (cents) ──
+// ── Rate Table (Diamond Dust — 1 DD = 1¢ = $0.01) ──
 const RATE_TABLE = {
   // Identity actions
-  'identity_create':      100,  // $1.00 — account creation fee
+  'identity_create':      100,  // 100 DD ($1.00) — account creation fee
   'identity_verify':        0,  // free — 2FA verification
   'identity_lookup':        0,  // free — public lookup
   'identity_token':         0,  // free — token verification
 
   // Email actions (via Dustforge)
-  'email_send':             1,  // $0.01 per email sent
-  'email_send_bulk':        1,  // $0.01 per email in bulk (per-email)
+  'email_send':             1,  // 1 DD per email sent
+  'email_send_bulk':        1,  // 1 DD per email in bulk (per-email)
 
   // API calls (per-call billing)
   'api_call_read':          0,  // free — read operations

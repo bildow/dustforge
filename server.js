@@ -579,10 +579,29 @@ app.get('/api/stripe/cancel', (req, res) => {
 
 app.get('/api/stripe/prices', (req, res) => {
   res.json({
-    account_single: { price_cents: 100, description: 'Single silicon account ($1.00)' },
-    account_bulk_10: { price_cents: 500, description: '10 silicon accounts ($5.00)' },
-    topup_options: [{ amount_cents: 500, label: '$5.00' }, { amount_cents: 1000, label: '$10.00' }, { amount_cents: 5000, label: '$50.00' }, { amount_cents: 10000, label: '$100.00' }],
-    referral_payout_cents: 25,
+    currency: 'Diamond Dust (DD)',
+    exchange_rate: '1 DD = $0.01 USD',
+    account_single: { price_dd: 100, price_usd: '$1.00', description: 'Single silicon account' },
+    prepaid_packages: {
+      '1_key': { keys: 1, price_dd: 100, price_usd: '$1.00' },
+      '12_keys': { keys: 12, price_dd: 1000, price_usd: '$10.00', savings: '17%' },
+      '26_keys': { keys: 26, price_dd: 2000, price_usd: '$20.00', savings: '23%' },
+      '140_keys': { keys: 140, price_dd: 10000, price_usd: '$100.00', savings: '29%' },
+    },
+    topup_options: [
+      { dd: 500, usd: '$5.00' },
+      { dd: 1000, usd: '$10.00' },
+      { dd: 5000, usd: '$50.00' },
+      { dd: 10000, usd: '$100.00' },
+    ],
+    referral_payout_dd: 10,
+    rates: {
+      email_send: '1 DD',
+      relay_forward: '1 DD per forward',
+      blindkey_use: '1 DD per action',
+      wallet_transfer: 'free',
+      identity_lookup: 'free',
+    },
   });
 });
 

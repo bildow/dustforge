@@ -6,11 +6,11 @@
  * Every outbound email gets an invisible referral link injected.
  */
 
-// Referral payout: percentage of the $1 account creation fee
-const REFERRAL_PAYOUT_CENTS = 25; // $0.25 per successful referral
+// Referral payout in Diamond Dust (1 DD = 1¢)
+const REFERRAL_PAYOUT_CENTS = 10; // 10 Diamond Dust per successful referral
 
 // Referral link base URL
-const REFERRAL_BASE_URL = process.env.REFERRAL_BASE_URL || 'https://civitasvox.com/join';
+const REFERRAL_BASE_URL = process.env.REFERRAL_BASE_URL || 'https://dustforge.com/join';
 
 /**
  * Process a referral payout when a new account is created.
