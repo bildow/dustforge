@@ -492,10 +492,17 @@ app.get('/api/referral/link', (req, res) => {
 app.post('/api/stripe/checkout/account', async (req, res) => {
   const { username, password, referral_code, bulk } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
   if (existing) return res.status(409).json({ error: 'username already taken' });
   try {
-    res.json(await stripeService.createAccountCheckout({ username, password, referral_code, bulk: Boolean(bulk) }));
+    const checkout = await stripeService.createAccountCheckout({ username, password, referral_code, bulk: Boolean(bulk) });
+    // Store password server-side (encrypted), not in Stripe metadata
+    const encryptedPw = identity.encryptPrivateKey(Buffer.from(password, 'utf8'));
+    db.prepare('INSERT OR REPLACE INTO identity_pending_checkouts (session_id, username, encrypted_password, referral_code, status) VALUES (?, ?, ?, ?, ?)').run(
+      checkout.session_id, username, encryptedPw, referral_code || '', 'pending'
+    );
+    res.json(checkout);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -593,62 +600,86 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     const session = event.data.object;
     const meta = session.metadata || {};
     if (meta.type === 'account_creation') {
+      // CANONICAL fulfillment path: use identity_pending_checkouts, not Stripe metadata
       try {
-        const id = identity.createIdentity();
-        const emailResult = await dustforge.createAccount(meta.username, `stripe_${meta.password_hash || 'default'}`);
-        if (!emailResult.ok) return res.json({ received: true, error: 'email failed' });
-        const myReferralCode = crypto.randomBytes(6).toString('hex');
-        let referredBy = '';
-        if (meta.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(meta.referral_code); if (r) referredBy = r.did; }
-        db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)`).run(id.did, meta.username, emailResult.email, id.encrypted_private_key, myReferralCode, referredBy, emailResult.stalwart_id);
-        db.prepare(`INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Account created via Stripe', 0)`).run(id.did);
-        if (referredBy) referral.processReferralPayout(db, referredBy, id.did, meta.username);
-        console.log(`[stripe] account: ${meta.username} → ${id.did}`);
-      } catch (e) { console.error('[stripe] error:', e.message); }
+        const pending = db.prepare('SELECT * FROM identity_pending_checkouts WHERE session_id = ?').get(session.id);
+        if (!pending) { console.warn('[stripe-webhook] no pending checkout for session', session.id); }
+        else if (pending.status === 'completed') { console.log('[stripe-webhook] already fulfilled:', pending.username); }
+        else {
+          const password = identity.decryptPrivateKey(pending.encrypted_password).toString('utf8');
+          const id = identity.createIdentity();
+          const emailResult = await dustforge.createAccount(pending.username, password);
+          if (!emailResult.ok) { console.error('[stripe-webhook] email failed:', emailResult.error); }
+          else {
+            const rc = crypto.randomBytes(6).toString('hex');
+            let referredBy = '';
+            if (pending.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(pending.referral_code); if (r) referredBy = r.did; }
+            db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
+            db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe webhook', 0)").run(id.did);
+            if (referredBy) referral.processReferralPayout(db, referredBy, id.did, pending.username);
+            db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', session.id);
+            console.log('[stripe-webhook] fulfilled:', pending.username, '->', id.did);
+          }
+        }
+      } catch (e) { console.error('[stripe-webhook] error:', e.message); }
     } else if (meta.type === 'wallet_topup') {
-      billing.creditBalance(db, meta.did, Number(meta.amount_cents), 'stripe_topup', `Stripe topup`);
+      const idempotencyKey = `stripe_${event.id || session.id}`;
+      billing.creditBalance(db, meta.did, Number(meta.amount_cents), 'stripe_topup', 'Stripe topup', idempotencyKey);
     }
   }
   res.json({ received: true });
 });
 
+// Success page — STATUS ONLY, no account creation. Webhook is the canonical fulfillment path.
+// If webhook hasn't fired yet (Tailscale-only), we trigger fulfillment here as a fallback
+// but ONLY from the pending_checkouts table, never from Stripe metadata.
 app.get('/api/stripe/success', async (req, res) => {
   const sessionId = req.query.session_id;
   let accountInfo = null;
+
   if (sessionId) {
-    try {
-      const stripe = stripeService.getStripe();
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
-      const meta = session.metadata || {};
-      if (meta.type === 'account_creation' && meta.username) {
-        const existing = db.prepare('SELECT did, email FROM identity_wallets WHERE username = ?').get(meta.username);
-        if (existing) { accountInfo = existing; }
-        else {
-          try {
-            const id = identity.createIdentity();
-            const password = meta.password || crypto.randomBytes(16).toString('hex');
-            const emailResult = await dustforge.createAccount(meta.username, password);
-            if (emailResult.ok) {
-              const rc = crypto.randomBytes(6).toString('hex');
-              let referredBy = '';
-              if (meta.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(meta.referral_code); if (r) referredBy = r.did; }
-              db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, meta.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
-              db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe', 0)").run(id.did);
-              if (referredBy) referral.processReferralPayout(db, referredBy, id.did, meta.username);
-              accountInfo = { did: id.did, email: emailResult.email, referral_code: rc };
-              try {
-                const t = createEmailTransport();
-                await t.sendMail({ from:'welcome@dustforge.com', to: emailResult.email,
-                  subject:'Welcome to Dustforge', text:'DID: '+id.did+'\nEmail: '+emailResult.email+'\n\nAuth: POST /api/identity/auth-fingerprint\n{"username":"'+meta.username+'","password":"YOUR_PASS","scope":"transact"}\n\nAPI: GET /.well-known/silicon' });
-              } catch(_){}
-              console.log('[stripe-success] created: '+meta.username+' -> '+id.did);
-            }
-          } catch(e) { console.error('[stripe-success] failed:', e.message); }
+    // Check if already fulfilled
+    const pending = db.prepare('SELECT * FROM identity_pending_checkouts WHERE session_id = ?').get(sessionId);
+
+    if (pending && pending.status === 'completed') {
+      // Already created — show the info
+      const wallet = db.prepare('SELECT did, email, referral_code FROM identity_wallets WHERE username = ?').get(pending.username);
+      if (wallet) accountInfo = wallet;
+    } else if (pending && pending.status === 'pending') {
+      // Not yet fulfilled — verify payment and fulfill from server-side pending record
+      try {
+        const stripe = stripeService.getStripe();
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        if (session.payment_status === 'paid') {
+          // Decrypt password from server-side storage (never from Stripe metadata)
+          const password = identity.decryptPrivateKey(pending.encrypted_password).toString('utf8');
+          const id = identity.createIdentity();
+          const emailResult = await dustforge.createAccount(pending.username, password);
+          if (emailResult.ok) {
+            const rc = crypto.randomBytes(6).toString('hex');
+            let referredBy = '';
+            if (pending.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(pending.referral_code); if (r) referredBy = r.did; }
+            db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
+            db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe', 0)").run(id.did);
+            if (referredBy) referral.processReferralPayout(db, referredBy, id.did, pending.username);
+            db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', sessionId);
+            accountInfo = { did: id.did, email: emailResult.email, referral_code: rc };
+            try {
+              const t = createEmailTransport();
+              await t.sendMail({ from:'welcome@dustforge.com', to: emailResult.email,
+                subject:'Welcome to Dustforge', text:'DID: '+id.did+'\nEmail: '+emailResult.email+'\nReferral: '+rc+'\n\nAuth: POST https://api.dustforge.com/api/identity/auth-fingerprint\n\n— Dustforge' });
+            } catch(_){}
+            console.log('[stripe-success] fulfilled from pending: '+pending.username+' -> '+id.did);
+          }
         }
-      }
-    } catch(e) { console.warn('[stripe-success] session error:', e.message); }
+      } catch(e) { console.warn('[stripe-success] fulfillment error:', e.message); }
+    }
   }
-  const info = accountInfo ? '<div style="margin-top:1.5rem;text-align:left;background:#132131;padding:1.5rem;border-radius:8px;max-width:400px"><div style="margin-bottom:0.75rem"><span style="color:#6d8397">Email:</span> <strong>'+accountInfo.email+'</strong></div><div style="margin-bottom:0.75rem"><span style="color:#6d8397">DID:</span> <code style="font-size:10px;word-break:break-all">'+accountInfo.did+'</code></div>'+(accountInfo.referral_code?'<div><span style="color:#6d8397">Referral:</span> '+accountInfo.referral_code+'</div>':'')+'<p style="margin-top:1rem;font-size:12px;color:#6d8397">Welcome email sent to the @dustforge.com inbox.</p><div style="margin-top:1rem;padding:1rem;background:#0e1824;border-radius:6px;text-align:left"><div style="font-size:11px;color:#5fb3ff;font-weight:bold;margin-bottom:0.5rem">Next Step — Authenticate</div><code style="font-size:10px;color:#9cb4c9;word-break:break-all">POST https://dustforge.com/api/identity/auth-fingerprint</code><pre style="font-size:10px;color:#6d8397;margin:0.5rem 0;white-space:pre-wrap">{"username":"YOUR_USERNAME","password":"YOUR_PASSWORD","scope":"transact","expires_in":"7d"}</pre><div style="font-size:10px;color:#6d8397">Full API: <a href="https://dustforge.com/.well-known/silicon" style="color:#5fb3ff">/.well-known/silicon</a></div></div><p style="display:none"></p></div>' : '<p style="color:#6d8397">Account creation in progress...</p>';
+
+  const info = accountInfo
+    ? '<div style="margin-top:1.5rem;text-align:left;background:#132131;padding:1.5rem;border-radius:8px;max-width:400px"><div style="margin-bottom:0.75rem"><span style="color:#6d8397">Email:</span> <strong>'+accountInfo.email+'</strong></div><div style="margin-bottom:0.75rem"><span style="color:#6d8397">DID:</span> <code style="font-size:10px;word-break:break-all">'+accountInfo.did+'</code></div>'+(accountInfo.referral_code?'<div><span style="color:#6d8397">Referral:</span> '+accountInfo.referral_code+'</div>':'')+'<p style="margin-top:1rem;font-size:12px;color:#6d8397">Welcome email sent to your @dustforge.com inbox.</p></div>'
+    : '<p style="color:#6d8397">Account creation in progress. Check your @dustforge.com inbox shortly.</p>';
+
   res.send('<html><head><meta charset="UTF-8"></head><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:500px;padding:2rem"><h1 style="color:#69c7b1">Payment Successful</h1><p>Your silicon identity has been activated.</p>'+info+'</div></body></html>');
 });
 

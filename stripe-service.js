@@ -57,7 +57,8 @@ async function createAccountCheckout(options) {
     metadata: {
       type: 'account_creation',
       username,
-      password: password,  // Stored in Stripe metadata (encrypted at rest by Stripe, max 500 chars)
+      // SECURITY: password is NOT stored in Stripe metadata.
+      // It is stored server-side in identity_pending_checkouts (encrypted).
       referral_code: referral_code || '',
       bulk: bulk ? 'true' : 'false',
     },
