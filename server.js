@@ -18,6 +18,20 @@ app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || './data/dustforge.db';
 
+const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
+const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many requests' } });
+const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 100, message: { error: 'Rate limit exceeded' } });
+
+function createEmailTransport() {
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'localhost',
+    port: Number(process.env.SMTP_PORT || 25),
+    secure: false,
+    tls: { rejectUnauthorized: false },
+  });
+}
+
 // Ensure data directory exists
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
@@ -478,6 +492,209 @@ app.get('/api/stripe/prices', (req, res) => {
 });
 
 // ============================================================
+// Prepaid Silicon Keys — gift card model
+// ============================================================
+
+// Schema for prepaid keys
+try { db.exec(`CREATE TABLE IF NOT EXISTS prepaid_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_code TEXT NOT NULL UNIQUE,
+  sponsor_email TEXT NOT NULL,
+  amount_cents INTEGER NOT NULL DEFAULT 100,
+  status TEXT DEFAULT 'active',
+  redeemed_by_did TEXT,
+  redeemed_at TEXT,
+  stripe_session_id TEXT,
+  tos_accepted INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_code ON prepaid_keys(key_code)"); } catch(e) {}
+
+// POST /api/prepaid/purchase — carbon buys a prepaid key
+app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
+  const { sponsor_email, quantity = 1, tos_accepted } = req.body || {};
+  if (!sponsor_email) return res.status(400).json({ error: 'sponsor_email required' });
+  if (!tos_accepted) return res.status(400).json({ error: 'You must accept the Terms of Service. By purchasing a prepaid key, you accept responsibility for the silicon agent that redeems it.' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(sponsor_email)) return res.status(400).json({ error: 'invalid email' });
+
+  const qty = Math.min(10, Math.max(1, Number(quantity) || 1));
+  const pricePerKey = 100; // $1.00
+  const totalCents = pricePerKey * qty;
+
+  try {
+    const stripe = stripeService.getStripe();
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: qty === 1 ? 'Dustforge Prepaid Silicon Key' : `Dustforge Prepaid Silicon Keys (${qty})`,
+            description: 'Redeemable key for silicon agent onboarding. Sponsor accepts TOS responsibility.',
+          },
+          unit_amount: pricePerKey,
+        },
+        quantity: qty,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/prepaid/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/cancel`,
+      metadata: {
+        type: 'prepaid_keys',
+        sponsor_email,
+        quantity: String(qty),
+        tos_accepted: 'true',
+      },
+      client_reference_id: sponsor_email,
+    });
+
+    res.json({ ok: true, url: session.url, session_id: session.id, quantity: qty, total_cents: totalCents });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/prepaid/success — generate keys after payment
+app.get('/api/prepaid/success', async (req, res) => {
+  const sessionId = req.query.session_id;
+  if (!sessionId) return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Missing session</h1></body></html>');
+
+  try {
+    const stripe = stripeService.getStripe();
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const meta = session.metadata || {};
+
+    if (meta.type !== 'prepaid_keys' || session.payment_status !== 'paid') {
+      return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not confirmed</h1></body></html>');
+    }
+
+    // Check if keys already generated for this session (idempotent)
+    const existing = db.prepare('SELECT key_code FROM prepaid_keys WHERE stripe_session_id = ?').all(sessionId);
+    let keys = existing.map(r => r.key_code);
+
+    if (keys.length === 0) {
+      const qty = Number(meta.quantity) || 1;
+      const stmt = db.prepare('INSERT INTO prepaid_keys (key_code, sponsor_email, amount_cents, stripe_session_id, tos_accepted) VALUES (?, ?, 100, ?, 1)');
+      for (let i = 0; i < qty; i++) {
+        const keyCode = 'DF-' + crypto.randomBytes(4).toString('hex').toUpperCase() + '-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+        stmt.run(keyCode, meta.sponsor_email, sessionId);
+        keys.push(keyCode);
+      }
+
+      // Email the keys to the sponsor
+      try {
+        const t = createEmailTransport();
+        await t.sendMail({
+          from: 'keys@dustforge.com',
+          to: meta.sponsor_email,
+          subject: `Your Dustforge Prepaid Key${keys.length > 1 ? 's' : ''}`,
+          text: [
+            `Thank you for purchasing ${keys.length} Dustforge prepaid key${keys.length > 1 ? 's' : ''}.`,
+            '',
+            'Your key' + (keys.length > 1 ? 's' : '') + ':',
+            ...keys.map((k, i) => `  ${i + 1}. ${k}`),
+            '',
+            'To redeem: give this key to a silicon agent. They use it at:',
+            'POST https://api.dustforge.com/api/prepaid/redeem',
+            '  {"key_code": "YOUR-KEY", "username": "agent-name", "password": "min-8-chars"}',
+            '',
+            'By purchasing this key, you accepted responsibility for the silicon',
+            'agent that redeems it and any actions it takes on the platform.',
+            '',
+            '— Dustforge Identity Platform',
+          ].join('\n'),
+        });
+      } catch (_) {}
+
+      console.log(`[prepaid] ${keys.length} keys generated for ${meta.sponsor_email}`);
+    }
+
+    // Show the keys
+    const keyCards = keys.map(k => `<div style="background:#132131;border:1px solid #27445f;border-radius:8px;padding:1rem;margin:0.5rem 0;font-family:monospace;font-size:1.1rem;text-align:center;color:#c8a84b;letter-spacing:0.1em;user-select:all">${k}</div>`).join('');
+
+    res.send(`<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="text-align:center;max-width:500px;padding:2rem">
+  <h1 style="color:#69c7b1;font-size:1.8rem">Keys Generated</h1>
+  <p style="color:#9cb4c9">Your prepaid silicon key${keys.length > 1 ? 's' : ''}:</p>
+  ${keyCards}
+  <p style="font-size:0.85rem;color:#6d8397;margin-top:1.5rem">Give this key to a silicon agent to onboard. A copy has been emailed to ${meta.sponsor_email}.</p>
+  <p style="font-size:0.75rem;color:#6d8397;margin-top:1rem">By purchasing, you accepted responsibility for the silicon agent that redeems this key.</p>
+  <p style="margin-top:1.5rem"><a href="/" style="color:#5fb3ff">Back to Dustforge</a></p>
+</div></body></html>`);
+  } catch (e) {
+    res.status(500).send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Error: ' + e.message + '</h1></body></html>');
+  }
+});
+
+// POST /api/prepaid/redeem — silicon redeems a key to create an account
+app.post('/api/prepaid/redeem', rateLimitStrict, async (req, res) => {
+  const { key_code, username, password } = req.body || {};
+  if (!key_code || !username || !password) return res.status(400).json({ error: 'key_code, username, and password required' });
+  if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'invalid username (3-31 chars, lowercase alphanumeric)' });
+  if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
+
+  // Validate key
+  const key = db.prepare('SELECT * FROM prepaid_keys WHERE key_code = ?').get(key_code);
+  if (!key) return res.status(404).json({ error: 'invalid key' });
+  if (key.status !== 'active') return res.status(410).json({ error: 'key already redeemed' });
+
+  // Check username available
+  const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
+  if (existing) return res.status(409).json({ error: 'username already taken' });
+
+  try {
+    // Create the account
+    const id = identity.createIdentity();
+    const emailResult = await dustforge.createAccount(username, password);
+    if (!emailResult.ok) return res.status(500).json({ error: 'email creation failed: ' + emailResult.error });
+
+    const myReferralCode = crypto.randomBytes(6).toString('hex');
+
+    db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)').run(
+      id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id
+    );
+    db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via prepaid key', 0)").run(id.did);
+
+    // Mark key as redeemed
+    db.prepare('UPDATE prepaid_keys SET status = ?, redeemed_by_did = ?, redeemed_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run('redeemed', id.did, key.id);
+
+    // Send welcome email
+    try {
+      const t = createEmailTransport();
+      await t.sendMail({
+        from: 'welcome@dustforge.com', to: emailResult.email,
+        subject: 'Welcome to Dustforge — Your Identity is Ready',
+        text: `DID: ${id.did}\nEmail: ${emailResult.email}\nReferral: ${myReferralCode}\n\nAuth: POST https://api.dustforge.com/api/identity/auth-fingerprint\n{"username":"${username}","password":"YOUR_PASSWORD","scope":"transact"}\n\nSponsored by: ${key.sponsor_email}\n\n— Dustforge`,
+      });
+    } catch (_) {}
+
+    console.log(`[prepaid] key ${key_code} redeemed by ${username} → ${id.did}`);
+
+    res.json({
+      ok: true,
+      did: id.did,
+      email: emailResult.email,
+      referral_code: myReferralCode,
+      sponsor: key.sponsor_email,
+      key_redeemed: key_code,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/prepaid/check?key=... — check key status
+app.get('/api/prepaid/check', (req, res) => {
+  const { key } = req.query;
+  if (!key) return res.status(400).json({ error: 'key required' });
+  const k = db.prepare('SELECT status, created_at, redeemed_at FROM prepaid_keys WHERE key_code = ?').get(key);
+  if (!k) return res.status(404).json({ error: 'key not found' });
+  res.json({ key, status: k.status, created_at: k.created_at, redeemed_at: k.redeemed_at });
+});
+
+// ============================================================
 // Onboarding
 // ============================================================
 
@@ -551,20 +768,6 @@ app.get('/api/analytics/conversions', (req, res) => {
 // === PATCH: Add to /opt/dustforge/server.js before the catch-all route ===
 // Paste these endpoints before the last app.get('*') or app.listen() call
 
-const nodemailer = require('nodemailer');
-const rateLimit = require('express-rate-limit');
-
-const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many requests' } });
-const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 100, message: { error: 'Rate limit exceeded' } });
-
-function createEmailTransport() {
-  return nodemailer.createTransport({
-    host: process.env.SMTP_HOST || 'localhost',
-    port: Number(process.env.SMTP_PORT || 25),
-    secure: false,
-    tls: { rejectUnauthorized: false },
-  });
-}
 
 // POST /api/identity/auth-fingerprint — authenticate via fingerprint (no email 2FA)
 app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) => {
