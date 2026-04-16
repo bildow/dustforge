@@ -786,9 +786,11 @@ app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
     if (!verified) return res.status(401).json({ error: 'email not verified. Complete the verification step first.' });
   }
 
-  const qty = Math.min(10, Math.max(1, Number(quantity) || 1));
-  const pricePerKey = 100; // $1.00
-  const totalCents = pricePerKey * qty;
+  const qty = Number(quantity) || 1;
+  // Package pricing: 1=$1, 12=$10, 26=$20, 140=$100
+  const PACKAGES = { 1: 100, 12: 1000, 26: 2000, 140: 10000 };
+  const totalCents = PACKAGES[qty] || (qty * 100); // fallback to $1/key for non-standard quantities
+  if (qty > 140) return res.status(400).json({ error: 'maximum 140 keys per purchase' });
 
   try {
     const stripe = stripeService.getStripe();
@@ -799,11 +801,11 @@ app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
           currency: 'usd',
           product_data: {
             name: qty === 1 ? 'Dustforge Prepaid Silicon Key' : `Dustforge Prepaid Silicon Keys (${qty})`,
-            description: 'Redeemable key for silicon agent onboarding. Sponsor accepts TOS responsibility.',
+            description: `${qty} key${qty > 1 ? 's' : ''} for silicon agent onboarding. Sponsor accepts TOS.`,
           },
-          unit_amount: pricePerKey,
+          unit_amount: totalCents,
         },
-        quantity: qty,
+        quantity: 1,
       }],
       mode: 'payment',
       success_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/prepaid/success?session_id={CHECKOUT_SESSION_ID}`,

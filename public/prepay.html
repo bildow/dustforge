@@ -70,12 +70,24 @@
       <input type="email" id="sponsor-email" placeholder="you@example.com">
     </div>
     <div class="form-group">
-      <label>Quantity</label>
-      <div class="qty-row">
-        <button class="qty-btn" onclick="adjustQty(-1)">-</button>
-        <span class="qty-display" id="qty">1</span>
-        <button class="qty-btn" onclick="adjustQty(1)">+</button>
-        <span class="total" id="total-display">$1.00</span>
+      <label>Package</label>
+      <div style="display:flex;flex-direction:column;gap:0.5rem" id="pkg-options">
+        <label style="display:flex;align-items:center;gap:0.75rem;background:var(--card);border:1px solid var(--accent);border-radius:8px;padding:0.75rem;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400">
+          <input type="radio" name="pkg" value="1" checked onchange="selectPkg(1,100)">
+          <div><strong style="color:var(--text)">1 key</strong> <span style="color:var(--text3)">— $1.00</span></div>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.75rem;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.75rem;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400">
+          <input type="radio" name="pkg" value="12" onchange="selectPkg(12,1000)">
+          <div><strong style="color:var(--text)">12 keys</strong> <span style="color:var(--text3)">— $10.00</span> <span style="color:var(--green);font-size:0.75rem;font-weight:600">save 17%</span></div>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.75rem;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.75rem;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400">
+          <input type="radio" name="pkg" value="26" onchange="selectPkg(26,2000)">
+          <div><strong style="color:var(--text)">26 keys</strong> <span style="color:var(--text3)">— $20.00</span> <span style="color:var(--green);font-size:0.75rem;font-weight:600">save 23%</span></div>
+        </label>
+        <label style="display:flex;align-items:center;gap:0.75rem;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.75rem;cursor:pointer;text-transform:none;letter-spacing:0;font-weight:400">
+          <input type="radio" name="pkg" value="140" onchange="selectPkg(140,10000)">
+          <div><strong style="color:var(--text)">140 keys</strong> <span style="color:var(--text3)">— $100.00</span> <span style="color:var(--green);font-size:0.75rem;font-weight:600">save 29%</span></div>
+        </label>
       </div>
     </div>
     <div class="tos">
@@ -123,12 +135,15 @@
 <script>
 const API = 'https://api.dustforge.com';
 let qty = 1;
+let priceCents = 100;
 let verificationToken = null;
 
-function adjustQty(delta) {
-  qty = Math.max(1, Math.min(10, qty + delta));
-  document.getElementById('qty').textContent = qty;
-  document.getElementById('total-display').textContent = '$' + (qty * 1).toFixed(2);
+function selectPkg(q, cents) {
+  qty = q;
+  priceCents = cents;
+  // Highlight selected
+  document.querySelectorAll('#pkg-options label').forEach(l => l.style.borderColor = 'var(--border)');
+  event.target.closest('label').style.borderColor = 'var(--accent)';
 }
 
 function codeNav(el, idx) {
@@ -193,9 +208,9 @@ async function submitCode() {
     verificationToken = data.token;
     document.getElementById('step2').style.display = 'none';
     document.getElementById('step3').style.display = 'block';
-    document.getElementById('summary-qty').textContent = qty;
+    document.getElementById('summary-qty').textContent = qty + ' keys';
     document.getElementById('summary-email').textContent = email;
-    document.getElementById('summary-total').textContent = '$' + (qty * 1).toFixed(2);
+    document.getElementById('summary-total').textContent = '$' + (priceCents / 100).toFixed(2);
   } catch (e) {
     showStatus('step2-status', 'error', 'Network error. Try again.');
   }
