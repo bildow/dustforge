@@ -1316,11 +1316,38 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) =
     return res.status(503).json({ error: 'password verification temporarily unavailable' });
   }
 
+  // Capture fingerprint profile on every auth
+  const headers = req.headers || {};
+  const stableSignals = [
+    headers['user-agent'] || '',
+    [headers['accept'], headers['accept-encoding'], headers['accept-language']].filter(Boolean).join('|'),
+    Object.keys(headers).join(','),
+    headers['content-type'] || '',
+    req.httpVersion || '',
+  ].join('::');
+  const fingerprintHash = crypto.createHash('sha256').update(stableSignals).digest('hex').slice(0, 16);
+
+  try {
+    db.prepare(`INSERT INTO silicon_profiles (did, user_agent, accept_headers, header_order, content_type, ip_address, json_style, http_version, request_meta, fingerprint_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      wallet.did,
+      headers['user-agent'] || '',
+      [headers['accept'], headers['accept-encoding'], headers['accept-language']].filter(Boolean).join('|'),
+      Object.keys(headers).join(','),
+      headers['content-type'] || '',
+      req.ip || '',
+      'compact',
+      req.httpVersion || '',
+      JSON.stringify({ method: req.method, path: req.path, body_keys: Object.keys(req.body || {}).join(',') }),
+      fingerprintHash
+    );
+  } catch (_) {}
+
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
     scope, expiresIn: expires_in,
-    metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint' },
+    metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash },
   });
-  res.json({ ok: true, token, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint' });
+  res.json({ ok: true, token, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
 });
 
 // POST /api/identity/request-account — silicon requests account, carbon gets payment link
