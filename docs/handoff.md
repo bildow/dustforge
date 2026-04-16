@@ -1,24 +1,46 @@
 # Dustforge — Session Handoff
 
-## Codex Sandbox Addendum
-
-- Branch: `codex-sandbox-admin-auth-fixes-2026-04-16`
-- Base branch: `main`
-- Latest sandbox commits:
-  - `e82a58f` — split admin auth away from `IDENTITY_MASTER_KEY`, fix bulk provisioning, cap attestation TTL
-  - pending in this branch: Stripe success page reduced to status-only; webhook remains canonical
-- Merge intent: this branch is a security hardening follow-up, not a product feature branch.
-
 ## Machine Brief
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `1a8a874` — bulk provisioning, attestation API, identity states, ops dashboard |
-| **Previous** | `aca6b26` — .well-known/silicon RFC proposal |
+| **Last commit** | `034fd14` — separate Progressive Barrel Auth from Dual-Server Barrel Topology |
+| **Previous** | `643bdc9` — Sprint 6 complete (bulk fleet provisioning, QR funding, analytics) |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | **LIVE** on RackNerd (192.3.84.103) — nginx reverse proxy, systemd dustforge.service, port 3001 |
 | **Static** | **LIVE** on Netlify — dustforge.com, API proxied to api.dustforge.com |
-| **Status** | 29 tasks closed this session. 9 identities live. Rowen + Lori containers on phasewhip. All Conduit paths verified. |
+| **Status** | 46+ tasks closed. 20-pass design phase shipped (6 sprints). Audited. Patch task cards queued for Codex. |
+
+## Codex Work Queue (patch cards from audit rounds 68-70)
+
+| ID | Card | Priority | Complexity |
+|----|------|----------|------------|
+| 170 | Signal sanitization middleware: operator_flag + config flags | P2 | M |
+| 171 | SQLite trigger for barrel enforcement on ledger writes | P1 | M |
+| 172 | Atomic fleet wallet operations via db.transaction() | P1 | S |
+| 173 | Reputation provenance flag: exclude fleet-provisioned txns | P2 | S |
+| 174 | Input validation: size limits + type checks on all new endpoints | P2 | M |
+| 169 | Dual-Server Barrel Topology — design + implementation | P1 | XL (deferred) |
+
+## Rounds Run This Session
+
+| Round | Type | Result |
+|-------|------|--------|
+| 67 | Ideation | Design phase-slice → 6-sprint plan, 20 passes |
+| 68 | Audit | Sprints 1-2 → 3 findings (tasks 162-164) |
+| 69 | Audit | Sprints 3-6 → 4 findings (tasks 165-168) |
+| 70 | Ideation | Patch strategies → 5 task cards (170-174) |
+
+## Design Docs Added
+
+| Doc | Status |
+|-----|--------|
+| `docs/adr-progressive-barrel-auth.md` | Accepted — security confidence slider (implemented) |
+| `docs/adr-dual-server-barrel.md` | Proposed — jurisdictional failsafe (design only) |
+| `docs/security-architecture.md` | Published |
+| `docs/security-stance.md` | Published |
+| `docs/competitive-shipping.md` | Published |
+| `docs/well-known-ai-identity-proposal.md` | Draft |
 
 ## What's Built
 
