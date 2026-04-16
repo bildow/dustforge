@@ -2893,6 +2893,224 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
   }
 });
 
+// ── F4: Bulk Fleet Provisioning + QR Funding ──
+
+// POST /api/fleet/:slug/provision/bulk — bulk-create fleet agents (owner/admin only)
+app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const { prefix, count, password } = req.body || {};
+  if (!prefix || !/^[a-z0-9][a-z0-9-]{0,18}[a-z0-9]$/.test(prefix)) return res.status(400).json({ error: 'prefix must be 2-20 chars, lowercase alphanumeric and hyphens' });
+  if (!count || typeof count !== 'number' || count < 1 || count > 20) return res.status(400).json({ error: 'count must be 1-20' });
+  if (!password || password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
+
+  const fleet = db.prepare('SELECT id, wallet_did, max_agents, slug FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  if (!fleet.wallet_did) return res.status(400).json({ error: 'fleet has no wallet' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+    return res.status(403).json({ error: 'owner or admin role required' });
+  }
+
+  // Check max_agents capacity
+  const currentCount = db.prepare('SELECT COUNT(*) as count FROM fleet_members WHERE fleet_id = ?').get(fleet.id).count;
+  if (currentCount + count > fleet.max_agents) {
+    return res.status(403).json({ error: `fleet would exceed capacity (${currentCount}/${fleet.max_agents} members, requested ${count})` });
+  }
+
+  // Deduct total cost upfront from fleet wallet
+  const PROVISION_COST = 100;
+  const totalCost = count * PROVISION_COST;
+  const debit = billing.deductBalance(db, fleet.wallet_did, totalCost, 'fleet_bulk_provision', `Bulk provision ${count} agents for fleet ${fleet.slug}`);
+  if (!debit.ok) return res.status(402).json({ error: 'insufficient fleet wallet balance', detail: debit.error, required: totalCost });
+
+  const created = [];
+  const errors = [];
+  let refundAmount = 0;
+
+  for (let i = 0; i < count; i++) {
+    const username = `${prefix}-${String(i + 1).padStart(3, '0')}`;
+    try {
+      const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
+      if (existing) { errors.push({ username, error: 'already exists' }); refundAmount += PROVISION_COST; continue; }
+
+      const id = identity.createIdentity();
+      const emailResult = await dustforge.createAccount(username, password);
+      if (!emailResult.ok) {
+        errors.push({ username, error: `email creation failed: ${emailResult.error}` });
+        refundAmount += PROVISION_COST;
+        continue;
+      }
+
+      const myReferralCode = crypto.randomBytes(6).toString('hex');
+      db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
+        .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id || 0);
+      db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', ?, 0)")
+        .run(id.did, `Fleet bulk-provisioned by ${fleet.slug}`);
+
+      // Add as fleet member
+      db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
+        .run(fleet.id, id.did, 'agent');
+
+      created.push({ username, did: id.did, email: emailResult.email });
+    } catch (e) {
+      errors.push({ username, error: e.message });
+      refundAmount += PROVISION_COST;
+    }
+  }
+
+  // Refund for any that failed
+  if (refundAmount > 0) {
+    billing.creditBalance(db, fleet.wallet_did, refundAmount, 'fleet_bulk_provision_refund', `Refund ${refundAmount} DD for ${errors.length} failed provisions`);
+  }
+
+  console.log(`[fleet] bulk provisioned ${created.length}/${count} agents in ${fleet.slug} by ${caller_did}`);
+  res.json({ ok: true, created, errors, total_cost_dd: totalCost - refundAmount });
+});
+
+// POST /api/fleet/:slug/fund/qr — generate Stripe checkout for fleet wallet topup
+app.post('/api/fleet/:slug/fund/qr', async (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const { amount_cents } = req.body || {};
+  if (!amount_cents || typeof amount_cents !== 'number' || amount_cents <= 0) {
+    return res.status(400).json({ error: 'amount_cents must be a positive number' });
+  }
+
+  const fleet = db.prepare('SELECT id, wallet_did, slug FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  if (!fleet.wallet_did) return res.status(400).json({ error: 'fleet has no wallet' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership) return res.status(403).json({ error: 'not a member of this fleet' });
+
+  try {
+    const stripe = stripeService.getStripe();
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `${amount_cents} Diamond Dust for fleet ${fleet.slug}`,
+            description: `Top up fleet ${fleet.slug} wallet with ${amount_cents} DD`,
+          },
+          unit_amount: Number(amount_cents),
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/topup-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/cancel`,
+      metadata: { type: 'fleet_topup', fleet_slug: fleet.slug, fleet_wallet_did: fleet.wallet_did, amount_cents: String(amount_cents), did: fleet.wallet_did },
+    });
+
+    console.log(`[fleet] QR funding session created for ${fleet.slug} by ${caller_did}: ${session.id}`);
+    res.json({ ok: true, url: session.url, qr_data: session.url });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── F5: Fleet Analytics Dashboard ──
+
+// GET /api/fleet/:slug/analytics — fleet analytics (members only)
+app.get('/api/fleet/:slug/analytics', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const fleet = db.prepare('SELECT id, owner_did, name, slug, tier, wallet_did, max_agents, status, created_at FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership) return res.status(403).json({ error: 'not a member of this fleet' });
+
+  // Fleet info
+  const memberCount = db.prepare('SELECT COUNT(*) as count FROM fleet_members WHERE fleet_id = ?').get(fleet.id).count;
+
+  // Wallet info
+  const wallet = db.prepare('SELECT balance_cents FROM identity_wallets WHERE did = ?').get(fleet.wallet_did);
+  const walletBalance = wallet ? wallet.balance_cents : 0;
+  const fundedRow = db.prepare("SELECT COALESCE(SUM(amount_cents), 0) as total FROM identity_transactions WHERE did = ? AND amount_cents > 0").get(fleet.wallet_did);
+  const spentRow = db.prepare("SELECT COALESCE(SUM(ABS(amount_cents)), 0) as total FROM identity_transactions WHERE did = ? AND amount_cents < 0").get(fleet.wallet_did);
+
+  // Members with details
+  const members = db.prepare('SELECT member_did, role, joined_at FROM fleet_members WHERE fleet_id = ?').all(fleet.id);
+  const memberDetails = members.map(m => {
+    const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(m.member_did);
+    const txCount = db.prepare('SELECT COUNT(*) as n FROM identity_transactions WHERE did = ?').get(m.member_did).n;
+    const lastAuthRow = db.prepare('SELECT created_at FROM silicon_profiles WHERE did = ? ORDER BY created_at DESC LIMIT 1').get(m.member_did);
+    const rep = computeReputation(m.member_did);
+    return {
+      did: m.member_did,
+      username: w ? w.username : null,
+      role: m.role,
+      reputation_score: rep ? rep.score : 0,
+      transaction_count: txCount,
+      last_auth: lastAuthRow ? lastAuthRow.created_at : null,
+      joined_at: m.joined_at,
+    };
+  });
+
+  // Member DIDs for activity queries
+  const memberDids = members.map(m => m.member_did);
+  const didPlaceholders = memberDids.map(() => '?').join(',');
+
+  // Activity stats
+  let transactions_24h = 0, transactions_7d = 0, emails_sent_24h = 0, blindkey_uses_24h = 0;
+  if (memberDids.length > 0) {
+    transactions_24h = db.prepare(`SELECT COUNT(*) as n FROM identity_transactions WHERE did IN (${didPlaceholders}) AND created_at >= datetime('now', '-1 day')`).get(...memberDids).n;
+    transactions_7d = db.prepare(`SELECT COUNT(*) as n FROM identity_transactions WHERE did IN (${didPlaceholders}) AND created_at >= datetime('now', '-7 days')`).get(...memberDids).n;
+    emails_sent_24h = db.prepare(`SELECT COUNT(*) as n FROM identity_transactions WHERE did IN (${didPlaceholders}) AND type = 'email_send' AND created_at >= datetime('now', '-1 day')`).get(...memberDids).n;
+    blindkey_uses_24h = db.prepare(`SELECT COALESCE(SUM(CASE WHEN last_used_at >= datetime('now', '-1 day') THEN 1 ELSE 0 END), 0) as n FROM blindkey_secrets WHERE did IN (${didPlaceholders})`).get(...memberDids).n;
+  }
+
+  // Top 5 agents by transaction count
+  const top_agents = [...memberDetails]
+    .sort((a, b) => b.transaction_count - a.transaction_count)
+    .slice(0, 5)
+    .map(a => ({ did: a.did, username: a.username, transaction_count: a.transaction_count, reputation_score: a.reputation_score }));
+
+  // Fingerprint health
+  let agents_with_inner_ring = 0, agents_with_all_rings = 0, totalReputation = 0;
+  for (const m of memberDetails) {
+    totalReputation += m.reputation_score;
+    const rep = computeReputation(m.did);
+    if (rep) {
+      if (rep.ring_completeness.inner > 0) agents_with_inner_ring++;
+      if (rep.ring_completeness.inner > 0 && rep.ring_completeness.middle > 0 && rep.ring_completeness.outer > 0) agents_with_all_rings++;
+    }
+  }
+
+  res.json({
+    fleet: { name: fleet.name, slug: fleet.slug, tier: fleet.tier, member_count: memberCount, max_agents: fleet.max_agents },
+    wallet: { balance_dd: walletBalance, total_funded_dd: fundedRow.total, total_spent_dd: spentRow.total },
+    members: memberDetails,
+    activity: { transactions_24h, transactions_7d, emails_sent_24h, blindkey_uses_24h },
+    top_agents,
+    fingerprint_health: {
+      agents_with_inner_ring,
+      agents_with_all_rings,
+      average_reputation: memberDetails.length > 0 ? Math.round((totalReputation / memberDetails.length) * 100) / 100 : 0,
+    },
+  });
+});
+
 // ── Auth Channel (D3) — fingerprint auth with channel encryption ──
 
 app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req, res) => {
