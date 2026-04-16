@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prepay for a Silicon — Dustforge</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#d96b6b; --warm:#c8a84b; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:2rem; }
+  .container { max-width:460px; width:100%; }
+  h1 { font-size:1.6rem; font-weight:800; margin-bottom:0.5rem; }
+  h1 span { color:var(--accent); }
+  .subtitle { color:var(--text2); font-size:0.9rem; margin-bottom:2rem; }
+  .form-group { margin-bottom:1.25rem; }
+  label { display:block; font-size:0.8rem; color:var(--text2); margin-bottom:0.4rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
+  input[type="text"], input[type="email"] { width:100%; padding:0.65rem 0.75rem; background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:0.95rem; outline:none; }
+  input:focus { border-color:var(--accent); }
+  .row { display:flex; gap:0.75rem; }
+  .row .form-group { flex:1; }
+  .qty-row { display:flex; align-items:center; gap:1rem; }
+  .qty-btn { width:36px; height:36px; border-radius:6px; background:var(--card); border:1px solid var(--border); color:var(--accent); font-size:1.2rem; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+  .qty-btn:hover { background:var(--border); }
+  .qty-display { font-size:1.4rem; font-weight:800; min-width:40px; text-align:center; }
+  .total { color:var(--text2); font-size:0.85rem; }
+  .tos { margin:1.5rem 0; }
+  .tos label { display:flex; gap:0.5rem; align-items:flex-start; text-transform:none; letter-spacing:0; font-weight:400; font-size:0.8rem; color:var(--text3); line-height:1.4; cursor:pointer; }
+  .tos input[type="checkbox"] { margin-top:2px; flex-shrink:0; }
+  .btn-primary { width:100%; padding:0.8rem; background:var(--accent); color:var(--bg); border:none; border-radius:8px; font-size:1rem; font-weight:700; cursor:pointer; transition:background 0.2s; }
+  .btn-primary:hover { background:#4a9bc5; }
+  .btn-primary:disabled { opacity:0.5; cursor:not-allowed; }
+  .status { margin-top:1rem; padding:0.75rem; border-radius:6px; font-size:0.85rem; display:none; }
+  .status.error { display:block; background:rgba(217,107,107,0.15); color:var(--red); border:1px solid var(--red); }
+  .status.info { display:block; background:rgba(95,179,255,0.1); color:var(--accent); border:1px solid var(--accent); }
+  .status.success { display:block; background:rgba(105,199,177,0.1); color:var(--green); border:1px solid var(--green); }
+  .step-indicator { display:flex; gap:0.5rem; margin-bottom:2rem; }
+  .step-dot { width:8px; height:8px; border-radius:50%; background:var(--border); }
+  .step-dot.active { background:var(--accent); }
+  .step-dot.done { background:var(--green); }
+  .back { color:var(--text3); text-decoration:none; font-size:0.85rem; display:inline-block; margin-top:1.5rem; }
+  .back:hover { color:var(--accent); }
+  #step2, #step3 { display:none; }
+  .verify-code { display:flex; gap:0.5rem; margin:1rem 0; }
+  .verify-code input { width:50px; height:50px; text-align:center; font-size:1.4rem; font-weight:800; background:var(--card); border:1px solid var(--border); border-radius:8px; color:var(--accent); }
+  .verify-code input:focus { border-color:var(--accent); }
+  .key-display { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; font-family:monospace; font-size:1.1rem; text-align:center; color:var(--warm); letter-spacing:0.1em; user-select:all; margin:1rem 0; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Step 1: Collect info + verify email -->
+  <div id="step1">
+    <div class="step-indicator"><span class="step-dot active"></span><span class="step-dot"></span><span class="step-dot"></span></div>
+    <h1>Prepay for a <span>Silicon</span></h1>
+    <p class="subtitle">Buy a prepaid key. Give it to any AI agent to onboard with a Dustforge identity.</p>
+
+    <div class="row">
+      <div class="form-group">
+        <label>First Name</label>
+        <input type="text" id="first-name" placeholder="Aaron">
+      </div>
+      <div class="form-group">
+        <label>Last Name</label>
+        <input type="text" id="last-name" placeholder="Baker">
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Email Address</label>
+      <input type="email" id="sponsor-email" placeholder="you@example.com">
+    </div>
+    <div class="form-group">
+      <label>Quantity</label>
+      <div class="qty-row">
+        <button class="qty-btn" onclick="adjustQty(-1)">-</button>
+        <span class="qty-display" id="qty">1</span>
+        <button class="qty-btn" onclick="adjustQty(1)">+</button>
+        <span class="total" id="total-display">$1.00</span>
+      </div>
+    </div>
+    <div class="tos">
+      <label><input type="checkbox" id="tos-check"> By purchasing, I accept responsibility for the silicon agent(s) that redeem these keys and any actions they take on the Dustforge platform. <a href="/terms.html" style="color:var(--accent)">Terms of Service</a></label>
+    </div>
+    <button class="btn-primary" onclick="verifyEmail()">Verify Email &amp; Continue</button>
+    <div class="status" id="step1-status"></div>
+  </div>
+
+  <!-- Step 2: Enter verification code -->
+  <div id="step2">
+    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot active"></span><span class="step-dot"></span></div>
+    <h1>Check Your <span>Email</span></h1>
+    <p class="subtitle">We sent a 6-digit code to <strong id="verify-email-display"></strong></p>
+    <div class="verify-code" id="code-inputs">
+      <input type="text" maxlength="1" oninput="codeNav(this,1)" autofocus>
+      <input type="text" maxlength="1" oninput="codeNav(this,2)">
+      <input type="text" maxlength="1" oninput="codeNav(this,3)">
+      <input type="text" maxlength="1" oninput="codeNav(this,4)">
+      <input type="text" maxlength="1" oninput="codeNav(this,5)">
+      <input type="text" maxlength="1" oninput="codeNav(this,6)">
+    </div>
+    <button class="btn-primary" onclick="submitCode()">Verify Code</button>
+    <div class="status" id="step2-status"></div>
+    <a href="#" class="back" onclick="document.getElementById('step2').style.display='none';document.getElementById('step1').style.display='block';">&larr; Back</a>
+  </div>
+
+  <!-- Step 3: Payment -->
+  <div id="step3">
+    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot active"></span></div>
+    <h1>Complete <span>Payment</span></h1>
+    <p class="subtitle">Email verified. Complete payment to receive your prepaid key(s).</p>
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:1rem;margin:1rem 0">
+      <div style="display:flex;justify-content:space-between;margin-bottom:0.5rem"><span style="color:var(--text2)">Prepaid Keys</span><span id="summary-qty">1</span></div>
+      <div style="display:flex;justify-content:space-between;margin-bottom:0.5rem"><span style="color:var(--text2)">Sponsor</span><span id="summary-email" style="font-size:0.85rem"></span></div>
+      <div style="display:flex;justify-content:space-between;border-top:1px solid var(--border);padding-top:0.5rem;margin-top:0.5rem"><span style="font-weight:700">Total</span><span style="font-weight:700;color:var(--accent)" id="summary-total">$1.00</span></div>
+    </div>
+    <button class="btn-primary" onclick="checkout()">Pay with Stripe</button>
+    <div class="status" id="step3-status"></div>
+  </div>
+
+  <a href="/" class="back">&larr; Back to Dustforge</a>
+</div>
+
+<script>
+const API = 'https://api.dustforge.com';
+let qty = 1;
+let verificationToken = null;
+
+function adjustQty(delta) {
+  qty = Math.max(1, Math.min(10, qty + delta));
+  document.getElementById('qty').textContent = qty;
+  document.getElementById('total-display').textContent = '$' + (qty * 1).toFixed(2);
+}
+
+function codeNav(el, idx) {
+  if (el.value && idx < 6) {
+    document.getElementById('code-inputs').children[idx].focus();
+  }
+}
+
+function showStatus(id, type, msg) {
+  const el = document.getElementById(id);
+  el.className = 'status ' + type;
+  el.textContent = msg;
+}
+
+async function verifyEmail() {
+  const firstName = document.getElementById('first-name').value.trim();
+  const lastName = document.getElementById('last-name').value.trim();
+  const email = document.getElementById('sponsor-email').value.trim();
+  const tos = document.getElementById('tos-check').checked;
+
+  if (!firstName || !lastName) return showStatus('step1-status', 'error', 'First and last name required.');
+  if (!email || !email.includes('@')) return showStatus('step1-status', 'error', 'Valid email required.');
+  if (!tos) return showStatus('step1-status', 'error', 'You must accept the Terms of Service.');
+
+  showStatus('step1-status', 'info', 'Sending verification code...');
+
+  try {
+    const res = await fetch(API + '/api/prepaid/verify-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, first_name: firstName, last_name: lastName }),
+    });
+    const data = await res.json();
+    if (!data.ok) return showStatus('step1-status', 'error', data.error || 'Failed to send code.');
+
+    document.getElementById('step1').style.display = 'none';
+    document.getElementById('step2').style.display = 'block';
+    document.getElementById('verify-email-display').textContent = email;
+    document.getElementById('code-inputs').children[0].focus();
+  } catch (e) {
+    showStatus('step1-status', 'error', 'Network error. Try again.');
+  }
+}
+
+async function submitCode() {
+  const inputs = document.getElementById('code-inputs').children;
+  const code = Array.from(inputs).map(i => i.value).join('');
+  if (code.length !== 6) return showStatus('step2-status', 'error', 'Enter all 6 digits.');
+
+  const email = document.getElementById('sponsor-email').value.trim();
+  showStatus('step2-status', 'info', 'Verifying...');
+
+  try {
+    const res = await fetch(API + '/api/prepaid/confirm-email', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, code }),
+    });
+    const data = await res.json();
+    if (!data.ok) return showStatus('step2-status', 'error', data.error || 'Invalid code.');
+
+    verificationToken = data.token;
+    document.getElementById('step2').style.display = 'none';
+    document.getElementById('step3').style.display = 'block';
+    document.getElementById('summary-qty').textContent = qty;
+    document.getElementById('summary-email').textContent = email;
+    document.getElementById('summary-total').textContent = '$' + (qty * 1).toFixed(2);
+  } catch (e) {
+    showStatus('step2-status', 'error', 'Network error. Try again.');
+  }
+}
+
+async function checkout() {
+  const email = document.getElementById('sponsor-email').value.trim();
+  const firstName = document.getElementById('first-name').value.trim();
+  const lastName = document.getElementById('last-name').value.trim();
+  showStatus('step3-status', 'info', 'Creating checkout session...');
+
+  try {
+    const res = await fetch(API + '/api/prepaid/purchase', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sponsor_email: email,
+        sponsor_name: firstName + ' ' + lastName,
+        quantity: qty,
+        tos_accepted: true,
+        verification_token: verificationToken,
+      }),
+    });
+    const data = await res.json();
+    if (!data.ok) return showStatus('step3-status', 'error', data.error || 'Checkout failed.');
+    window.location.href = data.url;
+  } catch (e) {
+    showStatus('step3-status', 'error', 'Network error. Try again.');
+  }
+}
+</script>
+</body>
+</html>

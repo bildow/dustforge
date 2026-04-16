@@ -692,6 +692,72 @@ app.get('/api/blindkey/types', (_req, res) => {
   });
 });
 
+// ── Email verification for prepaid purchases ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS email_verifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL,
+  code TEXT NOT NULL,
+  first_name TEXT DEFAULT '',
+  last_name TEXT DEFAULT '',
+  token TEXT,
+  verified INTEGER DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// POST /api/prepaid/verify-email — send 6-digit code to sponsor email
+app.post('/api/prepaid/verify-email', rateLimitStrict, async (req, res) => {
+  const { email, first_name, last_name } = req.body || {};
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'valid email required' });
+
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+  db.prepare('INSERT INTO email_verifications (email, code, first_name, last_name, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .run(email, code, first_name || '', last_name || '', expiresAt);
+
+  try {
+    const t = createEmailTransport();
+    await t.sendMail({
+      from: 'verify@dustforge.com',
+      to: email,
+      subject: `Dustforge Verification Code: ${code}`,
+      text: `Your Dustforge verification code is: ${code}\n\nThis code expires in 15 minutes.\n\n— Dustforge`,
+      html: `<div style="font-family:monospace;background:#08111a;color:#e7f1fb;padding:2rem;max-width:400px;margin:auto;border-radius:8px;text-align:center">
+        <h2 style="color:#5fb3ff;margin-top:0">Dustforge</h2>
+        <p style="color:#9cb4c9">Your verification code:</p>
+        <div style="font-size:2.5rem;font-weight:800;color:#c8a84b;letter-spacing:0.3em;margin:1rem 0">${code}</div>
+        <p style="font-size:0.8rem;color:#6d8397">Expires in 15 minutes.</p>
+      </div>`,
+    });
+    console.log(`[verify] code sent to ${email}`);
+    res.json({ ok: true, expires_in: 900 });
+  } catch (e) {
+    console.error(`[verify] email failed: ${e.message}`);
+    res.status(502).json({ error: 'failed to send verification email' });
+  }
+});
+
+// POST /api/prepaid/confirm-email — verify code, return token
+app.post('/api/prepaid/confirm-email', rateLimitStrict, (req, res) => {
+  const { email, code } = req.body || {};
+  if (!email || !code) return res.status(400).json({ error: 'email and code required' });
+
+  const record = db.prepare(`
+    SELECT * FROM email_verifications
+    WHERE email = ? AND code = ? AND verified = 0 AND expires_at > datetime('now')
+    ORDER BY id DESC LIMIT 1
+  `).get(email, code);
+
+  if (!record) return res.status(401).json({ error: 'invalid or expired code' });
+
+  // Mark as verified and generate a token
+  const token = crypto.randomBytes(32).toString('hex');
+  db.prepare('UPDATE email_verifications SET verified = 1, token = ? WHERE id = ?').run(token, record.id);
+
+  res.json({ ok: true, token, email, name: `${record.first_name} ${record.last_name}`.trim() });
+});
+
 // Schema for prepaid keys
 try { db.exec(`CREATE TABLE IF NOT EXISTS prepaid_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -707,12 +773,18 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS prepaid_keys (
 )`); } catch(e) {}
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_code ON prepaid_keys(key_code)"); } catch(e) {}
 
-// POST /api/prepaid/purchase — carbon buys a prepaid key
+// POST /api/prepaid/purchase — carbon buys a prepaid key (requires verified email)
 app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
-  const { sponsor_email, quantity = 1, tos_accepted } = req.body || {};
+  const { sponsor_email, sponsor_name, quantity = 1, tos_accepted, verification_token } = req.body || {};
   if (!sponsor_email) return res.status(400).json({ error: 'sponsor_email required' });
-  if (!tos_accepted) return res.status(400).json({ error: 'You must accept the Terms of Service. By purchasing a prepaid key, you accept responsibility for the silicon agent that redeems it.' });
+  if (!tos_accepted) return res.status(400).json({ error: 'You must accept the Terms of Service.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(sponsor_email)) return res.status(400).json({ error: 'invalid email' });
+
+  // Verify the email was confirmed
+  if (verification_token) {
+    const verified = db.prepare('SELECT id FROM email_verifications WHERE email = ? AND token = ? AND verified = 1').get(sponsor_email, verification_token);
+    if (!verified) return res.status(401).json({ error: 'email not verified. Complete the verification step first.' });
+  }
 
   const qty = Math.min(10, Math.max(1, Number(quantity) || 1));
   const pricePerKey = 100; // $1.00
