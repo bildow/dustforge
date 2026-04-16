@@ -659,55 +659,43 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   res.json({ received: true });
 });
 
-// Success page — STATUS ONLY, no account creation. Webhook is the canonical fulfillment path.
-// If webhook hasn't fired yet (Tailscale-only), we trigger fulfillment here as a fallback
-// but ONLY from the pending_checkouts table, never from Stripe metadata.
+// Success page — STATUS ONLY. Webhook is the canonical fulfillment path.
+// This route may check Stripe session status for display, but it must never create accounts.
 app.get('/api/stripe/success', async (req, res) => {
   const sessionId = req.query.session_id;
   let accountInfo = null;
+  let statusMessage = 'Account creation in progress. Check your @dustforge.com inbox shortly.';
 
   if (sessionId) {
-    // Check if already fulfilled
     const pending = db.prepare('SELECT * FROM identity_pending_checkouts WHERE session_id = ?').get(sessionId);
 
     if (pending && pending.status === 'completed') {
-      // Already created — show the info
       const wallet = db.prepare('SELECT did, email, referral_code FROM identity_wallets WHERE username = ?').get(pending.username);
       if (wallet) accountInfo = wallet;
+      else statusMessage = 'Payment completed, but local account details are not available yet. Check your @dustforge.com inbox shortly.';
     } else if (pending && pending.status === 'pending') {
-      // Not yet fulfilled — verify payment and fulfill from server-side pending record
       try {
         const stripe = stripeService.getStripe();
         const session = await stripe.checkout.sessions.retrieve(sessionId);
         if (session.payment_status === 'paid') {
-          // Decrypt password from server-side storage (never from Stripe metadata)
-          const password = identity.decryptPrivateKey(pending.encrypted_password).toString('utf8');
-          const id = identity.createIdentity();
-          const emailResult = await dustforge.createAccount(pending.username, password);
-          if (emailResult.ok) {
-            const rc = crypto.randomBytes(6).toString('hex');
-            let referredBy = '';
-            if (pending.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(pending.referral_code); if (r) referredBy = r.did; }
-            db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
-            db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe', 0)").run(id.did);
-            if (referredBy) referral.processReferralPayout(db, referredBy, id.did, pending.username);
-            db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', sessionId);
-            accountInfo = { did: id.did, email: emailResult.email, referral_code: rc };
-            try {
-              const t = createEmailTransport();
-              await t.sendMail({ from:'welcome@dustforge.com', to: emailResult.email,
-                subject:'Welcome to Dustforge', text:'DID: '+id.did+'\nEmail: '+emailResult.email+'\nReferral: '+rc+'\n\nAuth: POST https://api.dustforge.com/api/identity/auth-fingerprint\n\n— Dustforge' });
-            } catch(_){}
-            console.log('[stripe-success] fulfilled from pending: '+pending.username+' -> '+id.did);
-          }
+          statusMessage = 'Payment confirmed. Account creation is waiting for webhook fulfillment. Check your @dustforge.com inbox shortly.';
+        } else {
+          statusMessage = 'Payment is not confirmed yet. Refresh shortly or contact support if the charge completed.';
         }
-      } catch(e) { console.warn('[stripe-success] fulfillment error:', e.message); }
+      } catch(e) {
+        console.warn('[stripe-success] status lookup error:', e.message);
+        statusMessage = 'Payment completed, but account status could not be checked right now. Check your @dustforge.com inbox shortly.';
+      }
+    } else if (pending) {
+      statusMessage = `Checkout status: ${pending.status}. If this does not resolve, contact support with session ${sessionId}.`;
+    } else {
+      statusMessage = `Unknown checkout session. If you were charged, contact support with session ${sessionId}.`;
     }
   }
 
   const info = accountInfo
     ? '<div style="margin-top:1.5rem;text-align:left;background:#132131;padding:1.5rem;border-radius:8px;max-width:400px"><div style="margin-bottom:0.75rem"><span style="color:#6d8397">Email:</span> <strong>'+accountInfo.email+'</strong></div><div style="margin-bottom:0.75rem"><span style="color:#6d8397">DID:</span> <code style="font-size:10px;word-break:break-all">'+accountInfo.did+'</code></div>'+(accountInfo.referral_code?'<div><span style="color:#6d8397">Referral:</span> '+accountInfo.referral_code+'</div>':'')+'<p style="margin-top:1rem;font-size:12px;color:#6d8397">Welcome email sent to your @dustforge.com inbox.</p></div>'
-    : '<p style="color:#6d8397">Account creation in progress. Check your @dustforge.com inbox shortly.</p>';
+    : '<p style="color:#6d8397">'+statusMessage+'</p>';
 
   res.send('<html><head><meta charset="UTF-8"></head><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center;max-width:500px;padding:2rem"><h1 style="color:#69c7b1">Payment Successful</h1><p>Your silicon identity has been activated.</p>'+info+'</div></body></html>');
 });

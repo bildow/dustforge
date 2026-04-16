@@ -1,5 +1,14 @@
 # Dustforge — Session Handoff
 
+## Codex Sandbox Addendum
+
+- Branch: `codex-sandbox-admin-auth-fixes-2026-04-16`
+- Base branch: `main`
+- Latest sandbox commits:
+  - `e82a58f` — split admin auth away from `IDENTITY_MASTER_KEY`, fix bulk provisioning, cap attestation TTL
+  - pending in this branch: Stripe success page reduced to status-only; webhook remains canonical
+- Merge intent: this branch is a security hardening follow-up, not a product feature branch.
+
 ## Machine Brief
 
 | Field | Value |
@@ -126,6 +135,7 @@
 
 - Admin-only endpoints now require `DUSTFORGE_ADMIN_KEY` and should be called with the `x-admin-key` header or `admin_key` in the POST body. They no longer reuse `IDENTITY_MASTER_KEY`.
 - Portable attestations are capped by `DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS` (default `3600`).
+- `/api/stripe/success` is status-only in the sandbox hardening branch. Account fulfillment must come from `POST /api/stripe/webhook`.
 
 ## Deploy Process
 
