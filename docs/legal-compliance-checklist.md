@@ -1,6 +1,6 @@
 # AKStrapped LLC — Legal & Compliance Checklist
 
-Last updated: 2026-04-08
+Last updated: 2026-04-16
 
 ## Status Key
 - [x] Done
@@ -122,15 +122,21 @@ Last updated: 2026-04-08
 | Rate limiting | [x] | Three-tier express-rate-limit (strict/standard/relaxed) — shipped 2026-04-12 |
 | Wallet double-entry validation | [x] | Double-entry bookkeeping, balance=SUM(transactions), idempotency keys — shipped 2026-04-12 |
 | Database backups | [x] | Daily at 2 AM on RackNerd, 14-day retention — shipped 2026-04-08 |
+| Blindkey host whitelist | [x] | Only known API providers allowed — shipped 2026-04-15 |
+| Auth fail-closed | [x] | Stalwart lookup failure returns 503, not token — shipped 2026-04-15 |
+| Fingerprint capture | [x] | auth-fingerprint now INSERTs silicon_profiles — shipped 2026-04-16 |
+| Bounty program | [x] | /bounty.html + /api/bounty/* — DD-only payouts until Stripe Connect KYC — shipped 2026-04-16 |
+| Capacity planning | [x] | /api/capacity, soft cap 1000, hard cap 5000, waiting list — shipped 2026-04-16 |
 | Token/credential rotation plan | [ ] | npm token expires Jul 7 2026 — task #87 |
 | Silicon conversion tracking disclosure | [ ] | Not disclosed in privacy policy |
 
 **Action needed:**
-1. CRITICAL: Set up automated daily database backups on RackNerd
-2. Back up IDENTITY_MASTER_KEY to secure location
-3. Add rate limiting (express-rate-limit) to all endpoints
+1. ~~CRITICAL: Set up automated daily database backups on RackNerd~~ — DONE 2026-04-08
+2. Back up IDENTITY_MASTER_KEY to secure location (cold storage)
+3. ~~Add rate limiting (express-rate-limit) to all endpoints~~ — DONE 2026-04-12
 4. Add silicon conversion tracking disclosure to privacy policy
-5. Audit wallet billing for double-debit vulnerabilities
+5. ~~Audit wallet billing for double-debit vulnerabilities~~ — DONE 2026-04-12
+6. Stripe Connect KYC for bounty USD payouts (blocked — DD-only for now)
 
 ---
 

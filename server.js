@@ -1578,7 +1578,7 @@ app.get('/api/bounty/program', (_req, res) => {
       'Third-party services (Stripe, Netlify)',
     ],
     tiers: BOUNTY_TIERS,
-    payout_currency: 'USD (via PayPal, Stripe, or Diamond Dust at 1 DD = $0.01)',
+    payout_currency: 'Diamond Dust (1 DD = $0.01 USD). USD payouts pending Stripe Connect KYC onboarding.',
     rules: [
       'Do not access or modify other users\' data beyond proof of concept.',
       'Report first, disclose later. 90-day disclosure window.',

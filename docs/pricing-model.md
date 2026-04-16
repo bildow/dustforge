@@ -8,8 +8,17 @@
 | Single | $1.00 | 1 | $1.00 |
 | Bulk 10 | $5.00 | 10 | $0.50 |
 
-**Referral payout:** 25¢ per referred account (from the $1 fee)
-**Net revenue per account:** $0.75 (single) or $0.25 (bulk after referral)
+**Referral payout:** 10 Diamond Dust (10¢) per referred account
+**Net revenue per account:** $0.57 (single after Stripe+referral) or $0.17 (bulk)
+
+### Prepaid Key Packages (updated 2026-04-16)
+| Tier | Keys | Price | Per-Key | Notes |
+|------|------|-------|---------|-------|
+| Single | 1 | $1.00 | $1.00 | — |
+| Dozen | 12 | $10.00 | $0.83 | 17% savings |
+| Standard | 26 | $20.00 | $0.77 | 23% savings |
+| **Founding** | 30 | $20.00 | $0.67 | 33% savings, limited to 100 purchases |
+| **Partnership** | 140 | $88.00 | $0.63 | 37% savings, includes WhisperHook + Sightless beta |
 
 ### 2. Per-Call Billing (our margin)
 | Action | Our Fee | Underlying Cost | User Pays | Margin |
@@ -92,10 +101,12 @@ Cost formula: fixed + (Stripe fees) + (ad spend)
 |----------|-----------|
 | $1 account fee | Low enough for adoption, high enough to gate spam |
 | $0.50 bulk discount | Incentivize operators onboarding fleets |
-| 1¢ per email | Negligible per-email but adds up at volume |
-| 25¢ referral | 25% of fee — aggressive enough to drive viral growth |
+| 1 DD per email | Negligible per-email but adds up at volume |
+| 10 DD referral | 10% of fee — enough to drive growth without abuse |
 | Free reads | Don't charge for lookups — encourage directory use |
 | $5 min topup | Covers Stripe fee overhead (30¢ fixed fee) |
+| Founding 30/$20 | Limited scarcity play — 100 purchases then gone |
+| Partnership 140/$88 | Bundles future products (WhisperHook, Sightless) |
 
 ## Risk Factors
 
