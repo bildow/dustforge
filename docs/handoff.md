@@ -4,12 +4,12 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `db2e3ed` — capacity gates + entitlements (Codex merge) |
-| **Previous** | `28375e0` — docs update for Codex handoff |
+| **Last commit** | `1a8a874` — bulk provisioning, attestation API, identity states, ops dashboard |
+| **Previous** | `aca6b26` — .well-known/silicon RFC proposal |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | **LIVE** on RackNerd (192.3.84.103) — nginx reverse proxy, systemd dustforge.service, port 3001 |
 | **Static** | **LIVE** on Netlify — dustforge.com, API proxied to api.dustforge.com |
-| **Status** | All 3 Cards shipped. Conduit Brain↔Riley fixed. Rowen + Lori containers live on phasewhip. |
+| **Status** | 29 tasks closed this session. 9 identities live. Rowen + Lori containers on phasewhip. All Conduit paths verified. |
 
 ## What's Built
 
@@ -17,7 +17,7 @@
 |-----------|--------|------|
 | Identity (DID:key + tokens) | Done | identity.js |
 | Fingerprint auth (replaces 2FA) | Done | server.js |
-| Silicon fingerprint capture | Done | server.js (auth-fingerprint handler) |
+| Silicon fingerprint capture | Done | server.js |
 | Resonance scoring | Done | server.js |
 | Dustforge email wrapper | Done | dustforge.js |
 | Email send (actual delivery) | Done | server.js |
@@ -25,22 +25,55 @@
 | Per-call billing (double-entry) | Done | billing.js |
 | Referral system (10 DD) | Done | referral.js |
 | Stripe payments | Done | stripe-service.js |
-| Prepaid keys (gift card model) | Done | server.js |
+| Prepaid keys (founding + partnership tiers) | Done | server.js |
 | Blindkey (secrets vault) | Done | server.js |
+| Capacity + waiting list | Done | server.js |
+| Security bounty program | Done | server.js |
+| **Bulk provisioning API** | Done | server.js — `POST /api/identity/bulk-create` |
+| **Attestation API** | Done | server.js — `POST /api/identity/attest`, `POST /api/identity/verify-attestation` |
+| **Identity states + revocation** | Done | server.js — `GET/PATCH /api/identity/status` (active/flagged/frozen/revoked) |
+| **Ops dashboard** | Done | server.js — `GET /api/ops/dashboard` |
+| Rate limiting (strict/standard) | Done | server.js |
+| P0 security patches (5 vulns) | Done | server.js |
+| DKIM signing | Done | opendkim on RackNerd (pending DNS TXT record) |
+| Daily DB backups | Done | cron on RackNerd |
+| SSL (api.dustforge.com) | Done | certbot auto-renew |
 | Hex payload generator | Done | hex-payload.js |
 | Silicon conversion tracking | Done | conversion.js |
 | Landing page | Done | public/index.html |
-| Prepay page (founding + partnership tiers) | Done | public/prepay.html |
+| Prepay page | Done | public/prepay.html |
 | Top-up page | Done | public/topup.html |
-| Bounty page (submit + hall of fame) | Done | public/bounty.html |
+| Bounty page | Done | public/bounty.html |
 | .well-known/silicon manifest | Done | public/.well-known/silicon |
-| Capacity endpoint | Done | server.js |
-| Waiting list | Done | server.js |
-| Security bounty program | Done | server.js |
-| Rate limiting (strict/standard) | Done | server.js |
-| P0 security patches (5 vulns) | Done | server.js |
-| Daily DB backups | Done | cron on RackNerd |
-| SSL (api.dustforge.com) | Done | certbot auto-renew |
+
+## Documentation Published This Session
+
+| Doc | Location |
+|-----|----------|
+| Security architecture | docs/security-architecture.md |
+| Security stance (identity vs infra) | docs/security-stance.md |
+| Competitive shipping (vs Kilo) | docs/competitive-shipping.md |
+| .well-known/silicon RFC proposal | docs/well-known-ai-identity-proposal.md |
+
+## Conduit Network (all paths verified)
+
+| From | To | Thread | Status |
+|------|----|--------|--------|
+| civitasvox-brain | civitasvox-riley | `710c193e` | Fixed this session — Riley now has inbound endpoint |
+| civitasvox-brain | platform-lori | `2fb25b9b` | New — handshake approved, relay verified |
+| civitasvox-brain | platform-rowen | `d11351b0` | New — handshake approved, relay verified |
+
+## Phasewhip Containers (7 total)
+
+| Container | IP | Port | Role |
+|-----------|-----|------|------|
+| brain | 10.225.75.22 | 8002 | Strategist / round runner |
+| conductor | 10.225.75.95 | 8001 | Code generation silicon |
+| civitasvox | 10.225.75.198 | 3000 | Platform server |
+| mail | 10.225.75.76 | 8090 | Stalwart mail |
+| chad | 10.225.75.165 | — | Fitness agent |
+| **rowen** | 10.225.75.34 | 3002 | Auth keeper, human-in-the-loop gate |
+| **lori** | 10.225.75.121 | 3003 | Platform operations assistant (Riley fork) |
 
 ## Pricing (current, live)
 
@@ -50,57 +83,40 @@
 | Dozen | 12 | $10.00 | 17% savings |
 | Standard | 26 | $20.00 | 23% savings |
 | **Founding** | 30 | $20.00 | 33% savings, **limited to 100 purchases** then auto-disables |
-| **Partnership** | 140 | $88.00 | 37% savings, includes reserved WhisperHook + Sightless beta entitlements (May 2026) |
+| **Partnership** | 140 | $88.00 | 37% savings, includes reserved WhisperHook + Sightless beta entitlements |
 
 ## Capacity
 
-- **Hard cap**: 5,000 identities (SQLite + 2GB RAM)
-- **Soft cap**: 1,000 identities (waiting list activates)
-- **Current**: 6 identities (0.1%)
+- **Hard cap**: 5,000 identities
+- **Soft cap**: 1,000 (waiting list activates)
+- **Current**: 9 identities (0.2%) — brain, aria, 3 test accounts, riley, lori, rowen, +1
 - **Founding tier**: 0/100 sold
-- **Endpoint**: `GET /api/capacity`
-
-## Bounty Program
-
-- **Status**: Active, DD-only payouts (USD pending Stripe Connect KYC)
-- **Tiers**: Critical 500-5000 DD, High 200-1000 DD, Medium 50-500 DD, Low 10-100 DD
-- **Silicons eligible**: Yes
-- **Submissions**: `/api/bounty/submit` → email to Aaron@dustforge.com
-- **Hall of fame**: `/api/bounty/hall-of-fame`
-- **Page**: `/bounty.html`
-
-## Infrastructure
-
-| Machine | Role |
-|---------|------|
-| RackNerd (192.3.84.103) | API server (port 3001), nginx (80/443), Postfix relay, SQLite DB |
-| Netlify | Static site (dustforge.com), proxies /api/* to api.dustforge.com |
-| Phasewhip (100.83.112.88) | Stalwart mail server (incus `mail` container), platform |
-
-## Key Credentials (env vars on RackNerd at /opt/dustforge/.env)
-
-- `IDENTITY_MASTER_KEY` — AES-256-GCM encryption for private keys
-- `STRIPE_SECRET_KEY` — Stripe payments
-- `STRIPE_WEBHOOK_SECRET` — Stripe webhook verification
-- `STALWART_PASS` — Stalwart admin API
-- `STALWART_HOST` — mail container IP
-- `STALWART_PORT` — 8090
-- `SMTP_HOST` / `SMTP_PORT` — outbound relay via RackNerd Postfix
 
 ## What's NOT Built Yet
 
 | Item | Priority | Notes |
 |------|----------|-------|
+| DKIM DNS TXT record | **Blocking** | Key generated, opendkim configured — Aaron needs to add TXT record for `default._domainkey.dustforge.com` |
 | Stripe Connect KYC | High | Required for USD bounty payouts |
-| SPF/DKIM DNS records | High | Email deliverability — needs TXT records on dustforge.com |
 | Stripe webhook URL | Medium | Currently using success redirect, not webhooks |
+| Google Ads unpause | Ready | Brain onboarded, SSL live, bounty live, founding tier available |
 | npm/PyPI SDK packages | Medium | dustforge-agent-sdk published but minimal |
+| Wallet profile pages | Medium | Public-facing identity page per silicon |
+| Fleet management (MVP Plus) | Medium | 7 cards designed but not built |
 | Cookie consent banner | Low | For Google Ads gtag.js compliance |
-| Data inventory document | Low | Formal PII inventory for CCPA |
-| Data breach notification plan | Low | Incident response procedure |
 | SSH key-only auth on RackNerd | Low | Currently password auth |
-| A2P 10DLC registration | Blocked | SignalWire/TCR — for Chad SMS, not Dustforge |
-| Model DNA fingerprinting | Future | Weight sampling for HuggingFace/external models — novel but needs value demo first |
+| Model DNA fingerprinting | Future | Weight sampling — novel but needs value demo |
+
+## Platform Fixes This Session (civitasvox repo)
+
+| Commit | Change |
+|--------|--------|
+| `be1b5fa` | Fix rounds stuck in proposing + auditor 120s timeout |
+| `9e2b377` | Edit button for project repo URLs |
+| `50a84a8` | Fail-closed encryption — ENCRYPTION_KEY required at startup |
+| `8555dd9` | Fix Carbon delete (FM-14) — clean all FK tables |
+| `b0d6d8c` | Dead code cull — only 1 unused function in 17K lines |
+| `99db81f` | Add Rowen + Lori to active agents, helper_agent_key default to lori |
 
 ## Database Tables (SQLite, WAL mode)
 
@@ -119,3 +135,5 @@ SSH_ASKPASS=/tmp/rn.sh DISPLAY=dummy setsid ssh -o StrictHostKeyChecking=no root
 ## Task Board
 
 All tasks tracked on Civitasvox platform: `http://100.83.112.88:3000`
+- Project 3: Carbon Silicon Platform (platform tasks)
+- Project 17: Civitasvox MVP (Dustforge/product tasks)
