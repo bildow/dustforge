@@ -17,6 +17,8 @@ const app = express();
 app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || './data/dustforge.db';
+const ADMIN_API_KEY = process.env.DUSTFORGE_ADMIN_KEY || '';
+const MAX_ATTESTATION_TTL_SECONDS = Number(process.env.DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS || 3600);
 
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
@@ -30,6 +32,27 @@ function createEmailTransport() {
     secure: false,
     tls: { rejectUnauthorized: false },
   });
+}
+
+function safeSecretEqual(provided, expected) {
+  if (!provided || !expected) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(String(expected));
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
+
+function requireAdminAccess(req, res) {
+  if (!ADMIN_API_KEY) {
+    res.status(503).json({ error: 'admin controls not configured' });
+    return false;
+  }
+  const provided = req.headers['x-admin-key'] || req.body?.admin_key || '';
+  if (!safeSecretEqual(provided, ADMIN_API_KEY)) {
+    res.status(403).json({ error: 'admin access required' });
+    return false;
+  }
+  return true;
 }
 
 // Ensure data directory exists
@@ -348,8 +371,8 @@ app.get('/api/billing/rates', (req, res) => res.json(billing.RATE_TABLE));
 
 // INTERNAL ONLY — requires admin key. Never expose publicly.
 app.post('/api/billing/topup', (req, res) => {
-  const { did, amount_cents, source = 'manual', admin_key } = req.body || {};
-  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin access required' });
+  const { did, amount_cents, source = 'manual' } = req.body || {};
+  if (!requireAdminAccess(req, res)) return;
   if (!did || !amount_cents) return res.status(400).json({ error: 'did and amount_cents required' });
   if (amount_cents <= 0 || amount_cents > 100000) return res.status(400).json({ error: 'amount must be 1-100000 cents' });
   const result = billing.creditBalance(db, did, Number(amount_cents), 'topup', `Topup via ${source}`);
@@ -1755,8 +1778,8 @@ app.get('/api/bounty/hall-of-fame', (_req, res) => {
 // ============================================================
 
 app.post('/api/identity/bulk-create', rateLimitStrict, async (req, res) => {
-  const { admin_key, count, prefix, password } = req.body || {};
-  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin_key required' });
+  const { count, prefix, password } = req.body || {};
+  if (!requireAdminAccess(req, res)) return;
   if (!count || count < 1 || count > 50) return res.status(400).json({ error: 'count must be 1-50' });
   if (!prefix || !/^[a-z0-9]{2,20}$/.test(prefix)) return res.status(400).json({ error: 'prefix must be 2-20 chars, lowercase alphanumeric' });
   if (!password || password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
@@ -1771,11 +1794,16 @@ app.post('/api/identity/bulk-create', rateLimitStrict, async (req, res) => {
       const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
       if (existing) { errors.push({ username, error: 'already exists' }); continue; }
       const id = identity.createIdentity();
+      const emailResult = await dustforge.createAccount(username, password);
+      if (!emailResult.ok) {
+        errors.push({ username, error: `email creation failed: ${emailResult.error}` });
+        continue;
+      }
       const referralCode = crypto.randomBytes(6).toString('hex');
-      db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, referral_code, status)
-        VALUES (?, ?, ?, ?, ?, 'active')`).run(id.did, username, `${username}@dustforge.com`, id.encrypted_private_key, referralCode);
+      db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, referral_code, stalwart_id, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'active')`).run(id.did, username, emailResult.email, id.encrypted_private_key, referralCode, emailResult.stalwart_id || 0);
       db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Bulk provisioned', 0)").run(id.did);
-      created.push({ username, did: id.did, email: `${username}@dustforge.com`, referral_code: referralCode });
+      created.push({ username, did: id.did, email: emailResult.email, referral_code: referralCode });
     } catch (e) {
       errors.push({ username, error: e.message });
     }
@@ -1797,7 +1825,7 @@ app.post('/api/identity/attest', rateLimitStandard, (req, res) => {
   const { purpose, expires_in, audience } = req.body || {};
   if (!purpose) return res.status(400).json({ error: 'purpose required (e.g. "api_access", "identity_proof", "payment_auth")' });
 
-  const ttlSeconds = parseDuration(expires_in || '5m');
+  const ttlSeconds = parseAttestationDuration(expires_in || '5m');
   const attestation = {
     type: 'dustforge_attestation',
     version: 1,
@@ -1851,6 +1879,13 @@ function parseDuration(str) {
   }
 }
 
+function parseAttestationDuration(str) {
+  const parsed = parseDuration(str);
+  const minTtl = 60;
+  if (!Number.isFinite(parsed) || parsed < minTtl) return minTtl;
+  return Math.min(parsed, MAX_ATTESTATION_TTL_SECONDS);
+}
+
 // ============================================================
 // Identity States + Revocation [136]
 // ============================================================
@@ -1873,8 +1908,8 @@ app.get('/api/identity/status', rateLimitStandard, (req, res) => {
 });
 
 app.patch('/api/identity/status', rateLimitStrict, (req, res) => {
-  const { admin_key, did, status, reason } = req.body || {};
-  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin_key required' });
+  const { did, status, reason } = req.body || {};
+  if (!requireAdminAccess(req, res)) return;
   if (!did || !status) return res.status(400).json({ error: 'did and status required' });
   const validStatuses = ['active', 'flagged', 'frozen', 'revoked'];
   if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
@@ -1896,8 +1931,7 @@ app.patch('/api/identity/status', rateLimitStrict, (req, res) => {
 // ============================================================
 
 app.get('/api/ops/dashboard', (req, res) => {
-  const { admin_key } = req.query;
-  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin_key required' });
+  if (!requireAdminAccess(req, res)) return;
 
   const identities = db.prepare('SELECT COUNT(*) as n FROM identity_wallets').get().n;
   const activeIdentities = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'active'").get().n;

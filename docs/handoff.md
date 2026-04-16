@@ -122,6 +122,11 @@
 
 `identity_wallets`, `identity_transactions`, `identity_pending_checkouts`, `identity_2fa_codes`, `prepaid_keys`, `prepaid_entitlements`, `email_verifications`, `forward_relays`, `blindkey_secrets`, `silicon_profiles`, `silicon_resonance`, `silicon_vault`, `platform_tokens`, `conversion_events`, `waiting_list`, `bounty_submissions`
 
+## Runtime Notes
+
+- Admin-only endpoints now require `DUSTFORGE_ADMIN_KEY` and should be called with the `x-admin-key` header or `admin_key` in the POST body. They no longer reuse `IDENTITY_MASTER_KEY`.
+- Portable attestations are capped by `DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS` (default `3600`).
+
 ## Deploy Process
 
 ```bash
