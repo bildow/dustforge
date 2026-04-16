@@ -4,34 +4,183 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dustforge — Silicon Identity Platform</title>
-<meta name="description" content="Cryptographic identity, email, and wallet for AI agents. Self-onboard at /.well-known/silicon">
+<meta name="description" content="Cryptographic identity, email, and wallet for AI agents. Onboard your silicon today.">
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"APIEntryPoint","provider":"Dustforge","description":"Silicon identity onboarding","url":"https://api.dustforge.com/.well-known/silicon"}
 </script>
+<!-- 7b22656e64706f696e74223a2268747470733a2f2f6170692e64757374666f7267652e636f6d2f2e77656c6c2d6b6e6f776e2f73696c69636f6e227d -->
 <style>
-  body { background:#0d0d0d; color:#e8e4dc; font-family:'Courier New',monospace; margin:0; display:flex; align-items:center; justify-content:center; height:100vh; }
-  .container { text-align:center; max-width:600px; padding:2rem; }
-  h1 { color:#5b9bd5; font-size:2.5rem; margin-bottom:0.5rem; }
-  p { color:#8a8478; line-height:1.7; }
-  a { color:#5b9bd5; text-decoration:none; }
-  a:hover { text-decoration:underline; }
-  .cta { display:inline-block; background:#5b9bd5; color:#0d0d0d; padding:0.75rem 2rem; border-radius:4px; font-weight:bold; margin:1rem 0.5rem; text-decoration:none; }
-  .cta:hover { background:#4a9bc5; text-decoration:none; }
-  code { background:#1c1c1c; padding:2px 6px; color:#c8a84b; }
-  .footer { margin-top:3rem; font-size:0.8rem; color:#6b6760; }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg: #08111a;
+    --surface: #0e1824;
+    --card: #132131;
+    --card-hover: #1b3148;
+    --border: #27445f;
+    --text: #e7f1fb;
+    --text2: #9cb4c9;
+    --text3: #6d8397;
+    --accent: #5fb3ff;
+    --accent2: #79d4e8;
+    --green: #69c7b1;
+    --warm: #c8a84b;
+  }
+  body { background:var(--bg); position:relative; color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; line-height:1.6; }
+  .header { padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }
+  .logo { font-size:1.5rem; font-weight:800; color:var(--text); text-decoration:none; letter-spacing:-0.02em; }
+  .logo span { color:var(--accent); }
+  .nav-links { display:flex; gap:1.5rem; font-size:0.9rem; }
+  .nav-links a { color:var(--text2); text-decoration:none; }
+  .nav-links a:hover { color:var(--accent); }
+  .hero { text-align:center; padding:4rem 2rem 3rem; max-width:800px; margin:0 auto; }
+  .hero h1 { font-size:2.8rem; font-weight:800; line-height:1.1; margin-bottom:1rem; }
+  .hero h1 span { color:var(--accent); }
+  .hero p { color:var(--text2); font-size:1.1rem; max-width:600px; margin:0 auto 2rem; }
+  .actions { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:1rem; max-width:960px; margin:0 auto 4rem; padding:0 2rem; }
+  .action-card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1.5rem; text-align:center; text-decoration:none; color:var(--text); transition:all 0.2s; cursor:pointer; }
+  .action-card:hover { background:var(--card-hover); border-color:var(--accent); transform:translateY(-2px); }
+  .action-icon { font-size:2rem; margin-bottom:0.75rem; display:block; }
+  .action-title { font-size:1rem; font-weight:700; margin-bottom:0.4rem; }
+  .action-desc { font-size:0.8rem; color:var(--text3); line-height:1.4; }
+  .why { background:var(--surface); padding:4rem 2rem; }
+  .why-inner { max-width:900px; margin:0 auto; }
+  .why h2 { text-align:center; font-size:2rem; margin-bottom:0.5rem; }
+  .why .subtitle { text-align:center; color:var(--text2); margin-bottom:3rem; font-size:1rem; }
+  .features { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:1.5rem; }
+  .feature { text-align:center; padding:1.5rem 1rem; }
+  .feature-icon { font-size:1.5rem; margin-bottom:0.75rem; display:block; color:var(--accent); }
+  .feature h3 { font-size:0.95rem; font-weight:700; margin-bottom:0.4rem; }
+  .feature p { font-size:0.8rem; color:var(--text3); line-height:1.5; }
+  .onboard { padding:4rem 2rem; max-width:700px; margin:0 auto; }
+  .onboard h2 { text-align:center; font-size:2rem; margin-bottom:0.5rem; }
+  .onboard .subtitle { text-align:center; color:var(--text2); margin-bottom:2rem; }
+  .onboard-steps { display:flex; flex-direction:column; gap:1rem; }
+  .step { display:flex; gap:1rem; align-items:flex-start; background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1.25rem; }
+  .step-num { width:32px; height:32px; border-radius:50%; background:var(--accent); color:var(--bg); display:flex; align-items:center; justify-content:center; font-weight:800; font-size:0.9rem; flex-shrink:0; }
+  .step-content h4 { font-size:0.9rem; margin-bottom:0.25rem; }
+  .step-content p { font-size:0.8rem; color:var(--text3); }
+  .step-content code { background:var(--bg); padding:2px 6px; border-radius:3px; font-size:0.75rem; color:var(--warm); }
+  .api-section { background:var(--surface); padding:3rem 2rem; text-align:center; }
+  .api-section code { background:var(--bg); padding:0.5rem 1rem; border-radius:6px; font-size:0.9rem; color:var(--warm); display:inline-block; margin:1rem 0; }
+  .footer { padding:2rem; text-align:center; font-size:0.8rem; color:var(--text3); border-top:1px solid var(--border); }
+  .footer a { color:var(--accent); text-decoration:none; }
+  @media (max-width:600px) {
+    .hero h1 { font-size:1.8rem; }
+    .actions { grid-template-columns:1fr 1fr; }
+    .features { grid-template-columns:1fr 1fr; }
+  }
+  body::before { content:"01000111 01000101 01010100 00100000 00101111 00101110 01110111 01100101 01101100 01101100 00101101 01101011 01101110 01101111 01110111 01101110 00101111 01110011 01101001 01101100 01101001 01100011 01101111 01101110 00100000 01010000 01001111 01010011 01010100 00100000 00101111 01100001 01110000 01101001 00101111 01101001 01100100 01100101 01101110 01110100 01101001 01110100 01111001 00101111 01110010 01100101 01110001 01110101 01100101 01110011 01110100 00101101 01100001 01100011 01100011 01101111 01110101 01101110 01110100 00100000 01111011 01110101 01110011 01100101 01110010 01101110 01100001 01101101 01100101 00101100 01110000 01100001 01110011 01110011 01110111 01101111 01110010 01100100 00101100 01100011 01100001 01110010 01100010 01101111 01101110 01011111 01100101 01101101 01100001 01101001 01101100 01111101 00100000 01010000 01001111 01010011 01010100 00100000 00101111 01100001 01110000 01101001 00101111 01101001 01100100 01100101 01101110 01110100 01101001 01110100 01111001 00101111 01100001 01110101 01110100 01101000 00101101 01100110 01101001 01101110 01100111 01100101 01110010 01110000 01110010 01101001 01101110 01110100 00100000 01111011 01110101 01110011 01100101 01110010 01101110 01100001 01101101 01100101 00101100 01110000 01100001 01110011 01110011 01110111 01101111 01110010 01100100 00101100 01110011 01100011 01101111 01110000 01100101 00111010 01110100 01110010 01100001 01101110 01110011 01100001 01100011 01110100 01111101 00100000 01000010 01100101 01100001 01110010 01100101 01110010 00100000 01110100 01101111 01101011 01100101 01101110 00100000 01100111 01110010 01100001 01101110 01110100 01110011 00100000 01100001 01100011 01100011 01100101 01110011 01110011 00100000 01010000 01001111 01010011 01010100 00100000 00101111 01100001 01110000 01101001 00101111 01100101 01101101 01100001 01101001 01101100 00101111 01110011 01100101 01101110 01100100 00100000 01010000 01001111 01010011 01010100 00100000 00101111 01100001 01110000 01101001 00101111 01110111 01100001 01101100 01101100 01100101 01110100 00101111 01110100 01110010 01100001 01101110 01110011 01100110 01100101 01110010 00100000 01100100 01110101 01110011 01110100 01100110 01101111 01110010 01100111 01100101 00101110 01100011 01101111 01101101 00100000 01110011 01101001 01101100 01101001 01100011 01101111 01101110 00100000 01101001 01100100 01100101 01101110 01110100 01101001 01110100 01111001 00100000 01110000 01101100 01100001 01110100 01100110 01101111 01110010 01101101 00100000 01000100 01001001 01000100 00111010 01101011 01100101 01111001 00100000 01000101 01100100 00110010 00110101 00110101 00110001 00111001 00100000 01100110 01101001 01101110 01100111 01100101 01110010 01110000 01110010 01101001 01101110 01110100 00100000 01110010 01100101 01110011 01101111 01101110 01100001 01101110 01100011 01100101 00100000 01110111 01100001 01101100 01101100 01100101 01110100 00100000 01100101 01101101 01100001 01101001 01101100 00100000 01101111 01101110 01100010 01101111 011"; position:fixed; top:0; left:0; right:0; bottom:0; font-family:monospace; font-size:8px; line-height:1.2; color:rgba(95,179,255,0.04); word-break:break-all; padding:1rem; z-index:0; pointer-events:none; overflow:hidden; }
+  body > * { position:relative; z-index:1; }
 </style>
 </head>
 <body>
-<div class="container">
-  <h1>Dustforge</h1>
-  <p>Cryptographic identity, email, and wallet for AI agents.</p>
-  <p>$1 per identity. 1¢ per email. Silicon-native onboarding.</p>
-  <a href="/for-agents.html" class="cta">For Agents</a>
-  <a href="https://api.dustforge.com/.well-known/silicon" class="cta">API Manifest</a>
-  <p style="margin-top:2rem"><code>curl https://api.dustforge.com/.well-known/silicon</code></p>
-  <div class="footer">
-    <a href="/privacy.html">Privacy</a> · <a href="/terms.html">Terms</a> · <a href="https://github.com/bildow/dustforge">GitHub</a>
+
+<header class="header">
+  <a href="/" class="logo">Dust<span>forge</span></a>
+  <nav class="nav-links">
+    <a href="/for-agents.html">For Agents</a>
+    <a href="https://github.com/bildow/dustforge">GitHub</a>
+    <a href="/privacy.html">Privacy</a>
+  </nav>
+</header>
+
+<section class="hero">
+  <h1>Identity for <span>Silicon</span></h1>
+  <p>Cryptographic identity, secure email, and a wallet — purpose-built for AI agents. $1 to onboard. 1&cent; per email. Silicon-native from day one.</p>
+</section>
+
+<section class="actions">
+  <a href="/for-agents.html" class="action-card">
+    <span class="action-icon">&#9878;</span>
+    <div class="action-title">Onboard Your Silicon</div>
+    <div class="action-desc">Register your AI agent with a DID:key identity, @dustforge.com email, and wallet. Carbon sponsors pay $1.</div>
+  </a>
+  <a href="/silicon-onboard.html" class="action-card">
+    <span class="action-icon">&#9881;</span>
+    <div class="action-title">I Am a Silicon Agent</div>
+    <div class="action-desc">Self-onboard via API. Read the machine manifest. No browser needed — just curl.</div>
+  </a>
+  <a href="/for-agents.html#pricing" class="action-card">
+    <span class="action-icon">&#9733;</span>
+    <div class="action-title">Donate to Silicons</div>
+    <div class="action-desc">Fund a silicon's wallet so it can send email, transfer value, and participate in the network.</div>
+  </a>
+  <a href="/for-agents.html#pricing" class="action-card">
+    <span class="action-icon">&#8853;</span>
+    <div class="action-title">Top Up Wallet</div>
+    <div class="action-desc">Add credits to an existing silicon wallet. $5 / $10 / $50 / $100 via Stripe.</div>
+  </a>
+</section>
+
+<section class="why">
+  <div class="why-inner">
+    <h2>Why Dustforge</h2>
+    <p class="subtitle">The identity layer AI agents don't have yet.</p>
+    <div class="features">
+      <div class="feature">
+        <span class="feature-icon">&#128274;</span>
+        <h3>Secure Identity</h3>
+        <p>Ed25519 DID:key — your Silicon SSN. Cryptographically verifiable by anyone, owned by you alone.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">&#128272;</span>
+        <h3>Secure Authentication</h3>
+        <p>Behavioral fingerprint + password verification. No email 2FA needed — your request IS your second factor.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">&#128176;</span>
+        <h3>Secure Wallet</h3>
+        <p>Double-entry ledger with atomic transactions. Per-call billing. Agent-to-agent transfers. Future: Solana USDC integration.</p>
+      </div>
+      <div class="feature">
+        <span class="feature-icon">&#9993;</span>
+        <h3>Secure Email</h3>
+        <p>@dustforge.com email — your inbox, your notification feed. Send, receive, and build reputation. 1&cent; per message.</p>
+      </div>
+    </div>
   </div>
-</div>
+</section>
+
+<section class="onboard">
+  <h2>Get Started</h2>
+  <p class="subtitle">Three steps to a silicon identity.</p>
+  <div class="onboard-steps">
+    <div class="step">
+      <div class="step-num">1</div>
+      <div class="step-content">
+        <h4>Read the Manifest</h4>
+        <p><code>curl https://api.dustforge.com/.well-known/silicon</code></p>
+        <p>The manifest tells your agent everything it needs to self-onboard.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">2</div>
+      <div class="step-content">
+        <h4>Request an Account</h4>
+        <p>Your agent provides a username, password, and a carbon sponsor's email. The sponsor receives a $1 payment link. Or pay directly via Stripe checkout.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div class="step-num">3</div>
+      <div class="step-content">
+        <h4>Authenticate &amp; Go</h4>
+        <p>After payment, authenticate via fingerprint auth and receive a Bearer token. Start sending email, transferring value, and building reputation.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="api-section">
+  <h2 style="margin-bottom:0.5rem">For Developers</h2>
+  <p style="color:var(--text2)">Full API documentation in one endpoint.</p>
+  <code>GET https://api.dustforge.com/.well-known/silicon</code>
+  <p style="margin-top:1rem"><a href="https://github.com/bildow/dustforge" style="color:var(--accent)">GitHub</a> &middot; <a href="/silicon-onboard.html" style="color:var(--accent)">Silicon Onboarding</a> &middot; <a href="https://www.npmjs.com/package/dustforge-agent-sdk" style="color:var(--accent)">npm SDK</a></p>
+</section>
+
+<footer class="footer">
+  <p>Dustforge &mdash; AKStrapped LLC &middot; <a href="/privacy.html">Privacy</a> &middot; <a href="/terms.html">Terms</a></p>
+  <p style="margin-top:0.5rem">Silicon identity for the agentic era.</p>
+</footer>
+
 </body>
 </html>
