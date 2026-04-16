@@ -1992,6 +1992,58 @@ app.get('/api/identity/barrel', (req, res) => {
 });
 
 // ============================================================
+// K6 — Reputation Scorer
+// ============================================================
+
+function computeReputation(did) {
+  const wallet = db.prepare('SELECT created_at FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return null;
+
+  const transaction_count = db.prepare('SELECT COUNT(*) as n FROM identity_transactions WHERE did = ?').get(did).n;
+  const volumeRow = db.prepare('SELECT SUM(ABS(amount_cents)) as v FROM identity_transactions WHERE did = ?').get(did);
+  const transaction_volume_dd = (volumeRow.v || 0);
+
+  const fingerprint_consistency = db.prepare('SELECT COUNT(DISTINCT fingerprint_hash) as n FROM silicon_profiles WHERE did = ?').get(did).n;
+
+  const inner = db.prepare(`SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'inner'`).get(did).n;
+  const middle = db.prepare(`SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'middle'`).get(did).n;
+  const outer = db.prepare(`SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'outer'`).get(did).n;
+
+  const createdAt = new Date(wallet.created_at + (wallet.created_at.endsWith('Z') ? '' : 'Z'));
+  const account_age_days = Math.floor((Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24));
+
+  const factors = [];
+  const txScore = transaction_count * 2;
+  factors.push(`transactions: ${txScore}`);
+  const fpScore = fingerprint_consistency <= 2 ? 20 : 0;
+  factors.push(`fingerprint_consistency: ${fpScore}`);
+  const ageScore = account_age_days * 0.5;
+  factors.push(`account_age: ${ageScore}`);
+  const ringScore = inner * 5 + middle * 3 + outer * 1;
+  factors.push(`ring_completeness: ${ringScore}`);
+
+  const score = Math.min(100, txScore + fpScore + ageScore + ringScore);
+
+  return {
+    score,
+    transaction_count,
+    transaction_volume_dd,
+    fingerprint_consistency,
+    ring_completeness: { inner, middle, outer },
+    account_age_days,
+    factors,
+  };
+}
+
+app.get('/api/identity/reputation', (req, res) => {
+  const { did } = req.query;
+  if (!did) return res.status(400).json({ error: 'did required' });
+  const reputation = computeReputation(did);
+  if (!reputation) return res.status(404).json({ error: 'identity not found' });
+  res.json(reputation);
+});
+
+// ============================================================
 // Capacity + Waiting List
 // ============================================================
 
@@ -2677,6 +2729,170 @@ app.get('/api/my/fleets', (req, res) => {
   res.json({ ok: true, fleets });
 });
 
+// ── F2: Developer Tier ──
+
+const TIER_LIMITS = { free: 5, developer: 20, enterprise: 100 };
+const TIER_FEATURES = {
+  free: ['5 agents', 'basic fleet'],
+  developer: ['20 agents', 'fleet wallet', 'bulk provisioning', 'analytics'],
+  enterprise: ['100 agents', 'priority support', 'custom namespace', 'dedicated relay'],
+};
+
+// POST /api/fleet/:slug/upgrade — upgrade fleet tier (owner only)
+app.post('/api/fleet/:slug/upgrade', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const { tier } = req.body || {};
+  if (!tier || !['developer', 'enterprise'].includes(tier)) {
+    return res.status(400).json({ error: 'tier must be "developer" or "enterprise"' });
+  }
+
+  const fleet = db.prepare('SELECT id, owner_did, tier FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  if (fleet.owner_did !== caller_did) return res.status(403).json({ error: 'only the fleet owner can upgrade' });
+
+  const max_agents = TIER_LIMITS[tier];
+  try {
+    db.prepare('UPDATE fleets SET tier = ?, max_agents = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(tier, max_agents, fleet.id);
+    console.log(`[fleet] ${req.params.slug} upgraded to ${tier} by ${caller_did}`);
+    res.json({ ok: true, slug: req.params.slug, tier, max_agents });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/fleet/:slug/tier — public tier info
+app.get('/api/fleet/:slug/tier', (req, res) => {
+  const fleet = db.prepare('SELECT slug, tier, max_agents FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  res.json({ slug: fleet.slug, tier: fleet.tier, max_agents: fleet.max_agents, features: TIER_FEATURES });
+});
+
+// ── F3: Fleet Wallet + Onboarding ──
+
+// POST /api/fleet/:slug/fund — transfer DD from personal wallet to fleet wallet
+app.post('/api/fleet/:slug/fund', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const { amount_cents } = req.body || {};
+  if (!amount_cents || typeof amount_cents !== 'number' || amount_cents <= 0) {
+    return res.status(400).json({ error: 'amount_cents must be a positive number' });
+  }
+
+  const fleet = db.prepare('SELECT id, wallet_did FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  if (!fleet.wallet_did) return res.status(400).json({ error: 'fleet has no wallet' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership) return res.status(403).json({ error: 'not a member of this fleet' });
+
+  // Deduct from personal wallet
+  const debit = billing.deductBalance(db, caller_did, amount_cents, 'fleet_fund', `Fund fleet ${req.params.slug}`);
+  if (!debit.ok) return res.status(402).json(debit);
+
+  // Credit fleet wallet
+  billing.creditBalance(db, fleet.wallet_did, amount_cents, 'fleet_fund_in', `Funded by ${caller_did}`);
+
+  const fleetBalance = db.prepare('SELECT balance_cents FROM identity_wallets WHERE did = ?').get(fleet.wallet_did);
+  res.json({ ok: true, fleet_balance: fleetBalance ? fleetBalance.balance_cents : 0, personal_balance_after: debit.balance_after });
+});
+
+// GET /api/fleet/:slug/balance — fleet wallet balance (members only)
+app.get('/api/fleet/:slug/balance', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const fleet = db.prepare('SELECT id, wallet_did FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership) return res.status(403).json({ error: 'not a member of this fleet' });
+
+  const wallet = db.prepare('SELECT balance_cents FROM identity_wallets WHERE did = ?').get(fleet.wallet_did);
+  res.json({ ok: true, balance_cents: wallet ? wallet.balance_cents : 0 });
+});
+
+// POST /api/fleet/:slug/provision — create a fleet-funded identity (owner/admin only)
+app.post('/api/fleet/:slug/provision', async (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'username must be 3-31 chars, lowercase alphanumeric' });
+  if (password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
+
+  const fleet = db.prepare('SELECT id, wallet_did, max_agents, slug FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  if (!fleet.wallet_did) return res.status(400).json({ error: 'fleet has no wallet' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+    return res.status(403).json({ error: 'owner or admin role required' });
+  }
+
+  // Check max_agents limit
+  const currentCount = db.prepare('SELECT COUNT(*) as count FROM fleet_members WHERE fleet_id = ?').get(fleet.id).count;
+  if (currentCount >= fleet.max_agents) {
+    return res.status(403).json({ error: `fleet is at capacity (${fleet.max_agents} members)` });
+  }
+
+  // Check username availability
+  const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
+  if (existing) return res.status(409).json({ error: 'username already taken' });
+
+  // Deduct 100 DD from fleet wallet
+  const PROVISION_COST = 100;
+  const debit = billing.deductBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
+  if (!debit.ok) return res.status(402).json({ error: 'insufficient fleet wallet balance', detail: debit.error, balance_cents: debit.balance_cents, required: PROVISION_COST });
+
+  try {
+    const id = identity.createIdentity();
+    const emailResult = await dustforge.createAccount(username, password);
+    if (!emailResult.ok) {
+      // Refund the fleet wallet on email creation failure
+      billing.creditBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision_refund', `Refund failed provision of ${username}`);
+      return res.status(500).json({ error: `email creation failed: ${emailResult.error}` });
+    }
+
+    const myReferralCode = crypto.randomBytes(6).toString('hex');
+    db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
+      .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id);
+    db.prepare('INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, ?, ?, 0)')
+      .run(id.did, 'account_created', `Fleet-provisioned by ${fleet.slug}`);
+
+    // Add as fleet member with role='agent'
+    db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
+      .run(fleet.id, id.did, 'agent');
+
+    console.log(`[fleet] provisioned ${username} (${id.did}) in ${fleet.slug} by ${caller_did}`);
+    res.json({ ok: true, did: id.did, email: emailResult.email, fleet_id: Number(fleet.id) });
+  } catch (e) {
+    // Refund on any other failure
+    billing.creditBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision_refund', `Refund failed provision of ${username}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Auth Channel (D3) — fingerprint auth with channel encryption ──
 
 app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req, res) => {
@@ -2765,6 +2981,75 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req,
 
   // Fallback: plaintext token (backward compatible)
   res.json({ ok: true, token, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash, barrel_tier: barrelTier });
+});
+
+// ── D5: Critical Re-Auth Gate ──
+
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN last_critical_auth TEXT DEFAULT ''"); } catch(_) {}
+
+app.post('/api/identity/auth-critical', rateLimitStandard, async (req, res) => {
+  const { username, password, scope } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  if (scope !== 'critical') return res.status(400).json({ error: "scope must be 'critical'" });
+
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+
+  // Verify password via Stalwart admin API
+  try {
+    const http = require('http');
+    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
+    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
+    const stalwartPass = process.env.STALWART_PASS || '';
+    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
+    const storedPassword = await new Promise((resolve) => {
+      const req = http.request({ hostname: stalwartHost, port: stalwartPort,
+        path: '/api/principal/' + encodeURIComponent(wallet.username),
+        method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
+        let data = ''; res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+    if (storedPassword === null) {
+      return res.status(503).json({ error: 'password verification temporarily unavailable' });
+    }
+    if (storedPassword !== password) {
+      return res.status(401).json({ error: 'invalid password' });
+    }
+  } catch(e) {
+    return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  }
+
+  // Must already be at 'double' tier minimum
+  const barrel = computeBarrelTier(wallet.did);
+  const currentIndex = BARREL_TIERS.indexOf(barrel.tier);
+  const doubleIndex = BARREL_TIERS.indexOf('double');
+  if (currentIndex < doubleIndex) {
+    return res.status(403).json({
+      error: 'double barrel tier required for critical auth',
+      current_tier: barrel.tier,
+      upgrade_hint: !barrel.wallet_bound
+        ? 'fund your wallet to unlock double barrel'
+        : 'accumulate more fingerprint ring signals via repeated auth',
+    });
+  }
+
+  // Issue critical-scoped JWT — 5 minutes, hardcoded, cannot be overridden
+  const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+    scope: 'critical', expiresIn: '5m',
+    metadata: { email: wallet.email, username: wallet.username, auth_method: 'critical_reauth' },
+  });
+
+  // Update last_critical_auth timestamp
+  db.prepare('UPDATE identity_wallets SET last_critical_auth = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE did = ?')
+    .run(wallet.did);
+
+  const valid_until = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  console.log(`[identity] critical auth issued: ${wallet.username} → ${wallet.did} (valid until ${valid_until})`);
+  res.json({ token, barrel_tier: 'critical', expires_in: '5m', valid_until });
 });
 
 // ── Ledger Channel (D4) — encrypted wallet transfer ──
