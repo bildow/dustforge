@@ -1,4 +1,4 @@
-# ADR: Double Barrel Authentication Topology
+# ADR: Progressive Barrel Authentication
 
 - **Status**: Accepted
 - **Date**: 2026-04-16
@@ -6,9 +6,9 @@
 
 ## Context
 
-Dustforge currently authenticates silicons through a single-server flow: fingerprint capture, password verification against Stalwart, and JWT issuance all happen on one server behind one TLS endpoint. This works for reads, lookups, and low-value wallet operations, but high-value operations (large transfers, key export, identity mutations) need stronger assurance than a single authentication channel provides.
+Dustforge authenticates silicons through fingerprint capture, password verification against Stalwart, and JWT issuance. This works for reads, lookups, and low-value wallet operations, but high-value operations (large transfers, key export, identity mutations) need stronger assurance than a single authentication event provides.
 
-The original Double Barrel concept (Aaron and Kyle, 2026-04-11) envisioned two physically separate authentication servers in different jurisdictions. This ADR adapts that vision into an incremental architecture: two logical channels on the same server today, with a clean separation boundary that allows splitting to two servers later without changing the client protocol.
+Progressive Barrel Auth is a security confidence slider: the more identity assurance a silicon provides, the more operations it unlocks. Each tier builds on the previous, gating access by the strength of the authentication evidence.
 
 ## Decision
 
@@ -32,7 +32,7 @@ Introduce two logical authentication channels and a tiered barrel model that gat
 
 Both channels run on the same server process for now. They are separated at the code layer (distinct key material, distinct middleware stacks, distinct token validation paths) so that splitting them onto separate servers later requires only infrastructure changes, not protocol changes.
 
-### Barrel Model
+### Barrel Model — The Confidence Slider
 
 Three assurance tiers, each building on the previous:
 
@@ -85,10 +85,8 @@ Each day produces a working system. Single barrel works after D3. Double barrel 
 
 **5-minute critical window.** Short enough to limit replay risk, long enough that a silicon can complete a multi-step critical operation without re-authing mid-flow. If operations routinely exceed 5 minutes, this window may need adjustment.
 
-**Jurisdictional arbitrage deferred.** The original vision places each channel in a different legal jurisdiction so no single government can compel both halves. This requires two servers, two hosting providers, two legal entities. Deferred until the threat model warrants it or the user base crosses a scale threshold that justifies the operational cost.
-
 ## References
 
 - [Security Architecture](security-architecture.md) — current auth, crypto, and threat model
-- [Identity Architecture notes](project_identity_architecture.md) — original Double Barrel ideation (2026-04-11)
 - [Silicon Fingerprint spec](project_silicon_fingerprint.md) — three-layer identity model (SSN + Profile + Resonance)
+- Related: [docs/adr-dual-server-barrel.md](adr-dual-server-barrel.md) — Dual-Server Barrel Topology (jurisdictional failsafe, distinct from Progressive Barrel Auth)

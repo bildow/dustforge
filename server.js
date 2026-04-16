@@ -1902,7 +1902,14 @@ app.get('/api/identity/fingerprint/rings', (req, res) => {
 });
 
 // ============================================================
-// Progressive Barrel Authentication
+// Progressive Barrel Auth — security confidence slider
+// Single barrel: fingerprint only (reads, lookups, email)
+// Double barrel: fingerprint + wallet binding (transfers > 100 DD)
+// Critical barrel: double + fresh re-auth within 5 min (key export, deletion)
+//
+// NOTE: This is distinct from Dual-Server Barrel Topology (jurisdictional
+// failsafe). See docs/adr-dual-server-barrel.md for the session topology
+// that prevents single-jurisdiction data capture.
 // ============================================================
 
 function computeBarrelTier(did) {
@@ -2481,7 +2488,7 @@ app.get('/api/ops/dashboard', (req, res) => {
   });
 });
 
-// ── Encrypted Channel Abstraction (Double Barrel Auth foundation) ──
+// ── Encrypted Channel Abstraction (Progressive Barrel Auth foundation) ──
 
 function deriveChannelKey(channelName) {
   return crypto.hkdfSync('sha256', process.env.IDENTITY_MASTER_KEY, 'dustforge-channel-v1', channelName, 32);
@@ -3287,7 +3294,7 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
-  // Double barrel: require transact/admin/full scope for secure transfers
+  // Progressive Barrel: require transact/admin/full scope for secure transfers (double barrel tier)
   if (!['transact', 'admin', 'full'].includes(v.decoded.scope || '')) return res.status(403).json({ error: 'transact scope required (double barrel)' });
   const sender = db.prepare('SELECT did, username, balance_cents, status FROM identity_wallets WHERE did = ?').get(from_did);
   const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
