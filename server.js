@@ -371,6 +371,101 @@ app.post('/api/email/send', billing.billingMiddleware(db, 'email_send'), async (
 });
 
 // ============================================================
+// API — Forward Relay (email forwarding)
+// ============================================================
+// Silicon sets up forwarding rules: all mail or specific senders
+// get relayed to an external address. 1¢ per forwarded message.
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS forward_relays (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  forward_to TEXT NOT NULL,
+  filter_from TEXT DEFAULT '*',
+  label TEXT DEFAULT '',
+  status TEXT DEFAULT 'active',
+  forwarded_count INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(did, forward_to, filter_from)
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fr_did ON forward_relays(did)"); } catch(e) {}
+
+// POST /api/relay/create — set up a forwarding rule
+app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
+  const { forward_to, filter_from = '*', label } = req.body || {};
+  if (!forward_to) return res.status(400).json({ error: 'forward_to email required' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(forward_to)) return res.status(400).json({ error: 'invalid forward_to email' });
+
+  // Max 5 forwarding rules per silicon
+  const count = db.prepare('SELECT COUNT(*) as n FROM forward_relays WHERE did = ? AND status = ?').get(req.identity.did, 'active').n;
+  if (count >= 5) return res.status(400).json({ error: 'maximum 5 active forwarding rules' });
+
+  try {
+    db.prepare('INSERT INTO forward_relays (did, forward_to, filter_from, label) VALUES (?, ?, ?, ?) ON CONFLICT(did, forward_to, filter_from) DO UPDATE SET status = ?, label = ?, forwarded_count = 0')
+      .run(req.identity.did, forward_to, filter_from, label || '', 'active', label || '');
+    res.json({ ok: true, forward_to, filter_from, label: label || '', note: 'Forwarding active. Each forwarded email costs 1¢.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/relay/list — list forwarding rules
+app.get('/api/relay/list', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+  const rules = db.prepare('SELECT id, forward_to, filter_from, label, status, forwarded_count, created_at FROM forward_relays WHERE did = ?').all(req.identity.did);
+  res.json({ rules, total: rules.length });
+});
+
+// DELETE /api/relay/remove — deactivate a forwarding rule
+app.delete('/api/relay/remove', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ error: 'rule id required' });
+  const result = db.prepare('UPDATE forward_relays SET status = ? WHERE id = ? AND did = ?').run('inactive', id, req.identity.did);
+  if (result.changes === 0) return res.status(404).json({ error: 'rule not found' });
+  res.json({ ok: true, status: 'inactive' });
+});
+
+// POST /api/relay/forward — trigger forwarding for a message (called internally or by silicon)
+app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+  const { subject, body, original_from } = req.body || {};
+  if (!subject || !body) return res.status(400).json({ error: 'subject and body required' });
+
+  const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(req.identity.did);
+  const rules = db.prepare('SELECT * FROM forward_relays WHERE did = ? AND status = ?').all(req.identity.did, 'active');
+
+  if (rules.length === 0) return res.status(404).json({ error: 'no active forwarding rules' });
+
+  const fromAddr = wallet ? wallet.username + '@dustforge.com' : 'relay@dustforge.com';
+  const t = createEmailTransport();
+  const results = [];
+
+  for (const rule of rules) {
+    // Check filter
+    if (rule.filter_from !== '*' && original_from && !original_from.includes(rule.filter_from)) continue;
+
+    try {
+      await t.sendMail({
+        from: fromAddr,
+        to: rule.forward_to,
+        subject: `[Fwd: ${wallet?.username || 'silicon'}] ${subject}`,
+        text: `Forwarded from ${fromAddr}\nOriginal sender: ${original_from || 'unknown'}\n\n${body}`,
+      });
+
+      db.prepare('UPDATE forward_relays SET forwarded_count = forwarded_count + 1 WHERE id = ?').run(rule.id);
+
+      // Bill 1¢ per forward (already billed via middleware for first, additional forwards deducted here)
+      if (results.length > 0) {
+        billing.deductBalance(db, req.identity.did, 1, 'relay_forward', `Forward to ${rule.forward_to}`);
+      }
+
+      results.push({ forward_to: rule.forward_to, status: 'sent' });
+    } catch (e) {
+      results.push({ forward_to: rule.forward_to, status: 'failed', error: e.message });
+    }
+  }
+
+  res.json({ ok: true, forwarded: results.length, results, billed: results.length });
+});
+
+// ============================================================
 // API — Referral
 // ============================================================
 
