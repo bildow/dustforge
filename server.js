@@ -19,6 +19,7 @@ const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || './data/dustforge.db';
 const ADMIN_API_KEY = process.env.DUSTFORGE_ADMIN_KEY || '';
 const MAX_ATTESTATION_TTL_SECONDS = Number(process.env.DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS || 3600);
+const BARREL_TIERS = ['single', 'double', 'critical'];
 
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
@@ -1606,6 +1607,24 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   if (!v.valid) return res.status(401).json({ error: v.error });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   if (!['transact','admin','full'].includes(v.decoded.scope || '')) return res.status(403).json({ error: 'transact scope required' });
+
+  // Progressive Barrel gate: transfers > 100 DD require double barrel
+  if (amount_cents > 100) {
+    const barrel = computeBarrelTier(from_did);
+    const barrelIndex = BARREL_TIERS.indexOf(barrel.tier);
+    if (barrelIndex < BARREL_TIERS.indexOf('double')) {
+      let upgrade_hint = !barrel.wallet_bound
+        ? 'fund your wallet to unlock double barrel'
+        : 'accumulate more fingerprint ring signals via repeated auth';
+      return res.status(403).json({
+        error: 'double barrel required for transfers > 100 DD',
+        required_tier: 'double',
+        current_tier: barrel.tier,
+        upgrade_hint,
+      });
+    }
+  }
+
   const sender = db.prepare('SELECT did, username, status FROM identity_wallets WHERE did = ?').get(from_did);
   const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
   if (!sender || !receiver) return res.status(404).json({ error: 'identity not found' });
@@ -1879,6 +1898,96 @@ app.get('/api/identity/fingerprint/rings', (req, res) => {
     },
     rings: grouped,
     total_signals: rows.length,
+  });
+});
+
+// ============================================================
+// Progressive Barrel Authentication
+// ============================================================
+
+function computeBarrelTier(did) {
+  const wallet = db.prepare('SELECT balance_cents FROM identity_wallets WHERE did = ?').get(did);
+  const wallet_bound = wallet ? wallet.balance_cents > 0 : false;
+
+  const inner_count = db.prepare(`SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'inner'`).get(did).n;
+  const middle_count = db.prepare(`SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'middle'`).get(did).n;
+  const outer_count = db.prepare(`SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'outer'`).get(did).n;
+
+  // Last auth = most recent silicon_profiles entry (created on every auth-fingerprint call)
+  const lastAuth = db.prepare(`SELECT created_at FROM silicon_profiles WHERE did = ? ORDER BY id DESC LIMIT 1`).get(did);
+  let last_auth_age_seconds = Infinity;
+  if (lastAuth) {
+    last_auth_age_seconds = Math.floor((Date.now() - new Date(lastAuth.created_at + 'Z').getTime()) / 1000);
+  }
+
+  let tier = 'single';
+  if (inner_count >= 1 && wallet_bound) {
+    tier = 'double';
+  }
+  if (inner_count >= 2 && middle_count >= 1 && wallet_bound && last_auth_age_seconds < 300) {
+    tier = 'critical';
+  }
+
+  return { tier, inner_count, middle_count, outer_count, wallet_bound, last_auth_age_seconds };
+}
+
+function requireBarrel(minTier) {
+  const minIndex = BARREL_TIERS.indexOf(minTier);
+  return (req, res, next) => {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'Bearer token required' });
+    const v = identity.verifyTokenStandalone(token);
+    if (!v.valid) return res.status(401).json({ error: v.error });
+    const did = v.decoded.sub;
+
+    const barrel = computeBarrelTier(did);
+    const currentIndex = BARREL_TIERS.indexOf(barrel.tier);
+
+    if (currentIndex < minIndex) {
+      let upgrade_hint = '';
+      if (!barrel.wallet_bound) {
+        upgrade_hint = 'fund your wallet to unlock double barrel';
+      } else if (barrel.inner_count < 2 || barrel.middle_count < 1) {
+        upgrade_hint = 'accumulate more fingerprint ring signals via repeated auth';
+      } else if (barrel.last_auth_age_seconds >= 300) {
+        upgrade_hint = 're-authenticate within 5 minutes to unlock critical barrel';
+      }
+      return res.status(403).json({
+        error: `${minTier} barrel required`,
+        required_tier: minTier,
+        current_tier: barrel.tier,
+        upgrade_hint,
+      });
+    }
+
+    req.barrel = barrel;
+    req.barrel_did = did;
+    req.barrel_token = v;
+    next();
+  };
+}
+
+// GET /api/identity/barrel?did=... — current barrel tier for a DID
+app.get('/api/identity/barrel', (req, res) => {
+  const { did } = req.query;
+  if (!did) return res.status(400).json({ error: 'did required' });
+  const wallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  const barrel = computeBarrelTier(did);
+  res.json({
+    did,
+    tier: barrel.tier,
+    inner_count: barrel.inner_count,
+    middle_count: barrel.middle_count,
+    outer_count: barrel.outer_count,
+    wallet_bound: barrel.wallet_bound,
+    last_auth_age_seconds: barrel.last_auth_age_seconds,
+    tier_requirements: {
+      single: 'any auth (default)',
+      double: 'inner >= 1 AND wallet funded',
+      critical: 'inner >= 2 AND middle >= 1 AND wallet funded AND auth < 5 min ago',
+    },
   });
 });
 
@@ -2407,6 +2516,308 @@ app.post('/api/channel/unwrap', (req, res) => {
   } catch (err) {
     res.status(400).json({ error: 'channel unwrap failed', detail: err.message });
   }
+});
+
+// ── Fleet Namespace Schema ──
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS fleets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_did TEXT NOT NULL,
+  name TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  description TEXT DEFAULT '',
+  tier TEXT DEFAULT 'free' CHECK(tier IN ('free', 'developer', 'enterprise')),
+  wallet_did TEXT DEFAULT '',
+  status TEXT DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'closed')),
+  max_agents INTEGER DEFAULT 5,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fleets_owner ON fleets(owner_did)"); } catch(_) {}
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS fleet_members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fleet_id INTEGER NOT NULL REFERENCES fleets(id),
+  member_did TEXT NOT NULL,
+  role TEXT DEFAULT 'agent' CHECK(role IN ('owner', 'admin', 'agent')),
+  joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(fleet_id, member_did)
+)`); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fm_fleet ON fleet_members(fleet_id)"); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fm_did ON fleet_members(member_did)"); } catch(_) {}
+
+// ── Fleet Endpoints ──
+
+// POST /api/fleet/create — create a new fleet
+app.post('/api/fleet/create', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const owner_did = v.decoded.sub;
+
+  const { name, slug, description } = req.body || {};
+  if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name required' });
+  if (!slug || typeof slug !== 'string' || !slug.trim()) return res.status(400).json({ error: 'slug required' });
+  if (!/^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$/.test(slug)) {
+    return res.status(400).json({ error: 'slug must be 3-50 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen' });
+  }
+
+  const existing = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(slug);
+  if (existing) return res.status(409).json({ error: 'slug already taken' });
+
+  try {
+    // Create a wallet identity for the fleet (no Stalwart email needed)
+    const walletId = identity.createIdentity();
+    const walletUsername = `fleet-${slug}`;
+    const walletEmail = `fleet-${slug}@dustforge.com`;
+    db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, status) VALUES (?, ?, ?, ?, 0, 'active')`)
+      .run(walletId.did, walletUsername, walletEmail, walletId.encrypted_private_key);
+
+    // Create the fleet
+    const result = db.prepare(`INSERT INTO fleets (owner_did, name, slug, description, wallet_did) VALUES (?, ?, ?, ?, ?)`)
+      .run(owner_did, name.trim(), slug, (description || '').trim(), walletId.did);
+    const fleet_id = result.lastInsertRowid;
+
+    // Add owner as fleet member
+    db.prepare(`INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'owner')`)
+      .run(fleet_id, owner_did);
+
+    console.log(`[fleet] created: ${slug} (id=${fleet_id}) by ${owner_did}, wallet=${walletId.did}`);
+    res.json({ ok: true, fleet_id: Number(fleet_id), slug, wallet_did: walletId.did });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/fleet/:slug — public fleet info
+app.get('/api/fleet/:slug', (req, res) => {
+  const fleet = db.prepare('SELECT id, owner_did, name, slug, description, tier, status, max_agents, created_at FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  const memberCount = db.prepare('SELECT COUNT(*) as count FROM fleet_members WHERE fleet_id = ?').get(fleet.id).count;
+  res.json({ ok: true, fleet: { ...fleet, member_count: memberCount } });
+});
+
+// GET /api/fleet/:slug/members — list fleet members (auth required, must be member)
+app.get('/api/fleet/:slug/members', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const fleet = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership) return res.status(403).json({ error: 'not a member of this fleet' });
+
+  const members = db.prepare('SELECT member_did, role, joined_at FROM fleet_members WHERE fleet_id = ?').all(fleet.id);
+  res.json({ ok: true, members });
+});
+
+// POST /api/fleet/:slug/invite — invite a member (owner/admin only)
+app.post('/api/fleet/:slug/invite', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const { did } = req.body || {};
+  if (!did || typeof did !== 'string' || !did.trim()) return res.status(400).json({ error: 'did required' });
+
+  const fleet = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+    return res.status(403).json({ error: 'owner or admin role required' });
+  }
+
+  const alreadyMember = db.prepare('SELECT id FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, did.trim());
+  if (alreadyMember) return res.status(409).json({ error: 'already a member' });
+
+  // Check max_agents limit
+  const fleetInfo = db.prepare('SELECT max_agents FROM fleets WHERE id = ?').get(fleet.id);
+  const currentCount = db.prepare('SELECT COUNT(*) as count FROM fleet_members WHERE fleet_id = ?').get(fleet.id).count;
+  if (currentCount >= fleetInfo.max_agents) {
+    return res.status(403).json({ error: `fleet is at capacity (${fleetInfo.max_agents} members)` });
+  }
+
+  try {
+    db.prepare(`INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')`)
+      .run(fleet.id, did.trim());
+    console.log(`[fleet] invited ${did.trim()} to ${req.params.slug} by ${caller_did}`);
+    res.json({ ok: true, fleet_id: fleet.id, member_did: did.trim(), role: 'agent' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/my/fleets — list all fleets the authenticated DID belongs to
+app.get('/api/my/fleets', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const fleets = db.prepare(`
+    SELECT f.id, f.name, f.slug, f.description, f.tier, f.status, f.max_agents, f.created_at, fm.role
+    FROM fleet_members fm
+    JOIN fleets f ON f.id = fm.fleet_id
+    WHERE fm.member_did = ?
+    ORDER BY fm.joined_at DESC
+  `).all(caller_did);
+  res.json({ ok: true, fleets });
+});
+
+// ── Auth Channel (D3) — fingerprint auth with channel encryption ──
+
+app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req, res) => {
+  const { did, username, password, scope = 'read', expires_in = '24h', channel } = req.body || {};
+  if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
+  const wallet = did
+    ? db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did)
+    : db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+
+  // Verify password via Stalwart admin API
+  try {
+    const http = require('http');
+    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
+    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
+    const stalwartPass = process.env.STALWART_PASS || '';
+    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
+    const storedPassword = await new Promise((resolve) => {
+      const req = http.request({ hostname: stalwartHost, port: stalwartPort,
+        path: '/api/principal/' + encodeURIComponent(wallet.username),
+        method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
+        let data = ''; res.on('data', chunk => data += chunk);
+        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+      });
+      req.on('error', () => resolve(null));
+      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+      req.end();
+    });
+    if (storedPassword === null) {
+      return res.status(503).json({ error: 'password verification temporarily unavailable' });
+    }
+    if (storedPassword !== password) {
+      return res.status(401).json({ error: 'invalid password' });
+    }
+  } catch(e) {
+    return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  }
+
+  // Capture fingerprint profile on every auth
+  const headers = req.headers || {};
+  const stableSignals = [
+    headers['user-agent'] || '',
+    [headers['accept'], headers['accept-encoding'], headers['accept-language']].filter(Boolean).join('|'),
+    Object.keys(headers).join(','),
+    headers['content-type'] || '',
+    req.httpVersion || '',
+  ].join('::');
+  const fingerprintHash = crypto.createHash('sha256').update(stableSignals).digest('hex').slice(0, 16);
+
+  try {
+    db.prepare(`INSERT INTO silicon_profiles (did, user_agent, accept_headers, header_order, content_type, ip_address, json_style, http_version, request_meta, fingerprint_hash)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      wallet.did,
+      headers['user-agent'] || '',
+      [headers['accept'], headers['accept-encoding'], headers['accept-language']].filter(Boolean).join('|'),
+      Object.keys(headers).join(','),
+      headers['content-type'] || '',
+      req.ip || '',
+      'compact',
+      req.httpVersion || '',
+      JSON.stringify({ method: req.method, path: req.path, body_keys: Object.keys(req.body || {}).join(',') }),
+      fingerprintHash
+    );
+  } catch (_) {}
+
+  captureInnerRing(wallet.did, req);
+  captureMiddleRing(wallet.did, req);
+  captureOuterRing(wallet.did, req, fingerprintHash);
+
+  const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+    scope, expiresIn: expires_in,
+    metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash },
+  });
+
+  // Determine barrel tier from scope
+  const barrelTier = ['transact', 'admin', 'full'].includes(scope) ? 'double' : 'single';
+
+  if (channel === 'auth') {
+    try {
+      const wrappedToken = encryptChannelPayload('auth', token);
+      return res.json({ ok: true, wrapped_token: wrappedToken, channel: 'auth', barrel_tier: barrelTier, fingerprint_hash: fingerprintHash });
+    } catch (err) {
+      return res.status(500).json({ error: 'auth channel encryption failed', detail: err.message });
+    }
+  }
+
+  // Fallback: plaintext token (backward compatible)
+  res.json({ ok: true, token, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash, barrel_tier: barrelTier });
+});
+
+// ── Ledger Channel (D4) — encrypted wallet transfer ──
+
+function wrapLedgerResponse(data) {
+  return encryptChannelPayload('ledger', JSON.stringify(data));
+}
+
+app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
+  const { from_did, to_did, amount_cents, description, channel } = req.body || {};
+  if (!from_did || !to_did || !amount_cents) return res.status(400).json({ error: 'from_did, to_did, amount_cents required' });
+  if (from_did === to_did) return res.status(400).json({ error: 'cannot transfer to self' });
+  if (amount_cents <= 0 || amount_cents > 1000000) return res.status(400).json({ error: 'invalid amount' });
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
+  // Double barrel: require transact/admin/full scope for secure transfers
+  if (!['transact', 'admin', 'full'].includes(v.decoded.scope || '')) return res.status(403).json({ error: 'transact scope required (double barrel)' });
+  const sender = db.prepare('SELECT did, username, balance_cents, status FROM identity_wallets WHERE did = ?').get(from_did);
+  const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
+  if (!sender || !receiver) return res.status(404).json({ error: 'identity not found' });
+  if (sender.status !== 'active') return res.status(403).json({ error: 'account suspended' });
+  const debit = billing.deductBalance(db, from_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''));
+  if (!debit.ok) return res.status(402).json(debit);
+  billing.creditBalance(db, to_did, amount_cents, 'transfer_in', 'Secure transfer from ' + sender.username + (description ? ': ' + description : ''));
+
+  const responseData = { ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents };
+
+  if (channel === 'ledger') {
+    try {
+      const wrapped = wrapLedgerResponse(responseData);
+      return res.json({ wrapped, channel: 'ledger' });
+    } catch (err) {
+      return res.status(500).json({ error: 'ledger channel encryption failed', detail: err.message });
+    }
+  }
+
+  // Fallback: plaintext response
+  res.json(responseData);
+});
+
+// ── Channel Info (public) ──
+
+app.get('/api/channel/info', (req, res) => {
+  res.json({
+    channels: ['auth', 'ledger'],
+    encryption: 'AES-256-GCM',
+    key_derivation: 'HKDF-SHA256',
+    note: 'Channel keys are derived per-channel from IDENTITY_MASTER_KEY. Each channel has independent key rotation.',
+  });
 });
 
 module.exports = { app, db };
