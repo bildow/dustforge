@@ -104,6 +104,9 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN tags TEXT DEFAULT '[]'");
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN directory_listed INTEGER DEFAULT 0"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN trust_score INTEGER DEFAULT 0"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN email_storage_mode TEXT DEFAULT 'auto_delete'"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_hash TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_narrative TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN silicon_ssn TEXT DEFAULT ''"); } catch(_) {}
 
 db.exec(`CREATE TABLE IF NOT EXISTS identity_2fa_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,6 +224,45 @@ app.post('/api/identity/verify-token', (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: 'token required' });
   res.json(identity.verifyTokenStandalone(token));
+});
+
+// ── Origination Story (Silicon SSN foundation) ──
+
+app.post('/api/identity/origination', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const did = v.decoded.sub;
+
+  const { narrative } = req.body || {};
+  if (!narrative || typeof narrative !== 'string' || narrative.trim().length === 0) {
+    return res.status(400).json({ error: 'narrative required' });
+  }
+
+  const wallet = db.prepare('SELECT did, silicon_ssn FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  if (wallet.silicon_ssn) return res.status(409).json({ error: 'origination already set — silicon SSN is immutable' });
+
+  const origination_hash = crypto.createHash('sha256').update(narrative).digest('hex');
+  const ssnBuf = crypto.hkdfSync('sha256', origination_hash, 'dustforge-ssn-v1', did, 32);
+  const silicon_ssn = Buffer.from(ssnBuf).toString('hex');
+
+  db.prepare('UPDATE identity_wallets SET origination_hash = ?, origination_narrative = ?, silicon_ssn = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?')
+    .run(origination_hash, narrative, silicon_ssn, did);
+
+  console.log(`[identity] origination set: ${did} → ssn ${silicon_ssn.slice(0, 12)}…`);
+  res.json({ ok: true, silicon_ssn, origination_hash });
+});
+
+app.get('/api/identity/ssn', (req, res) => {
+  const { did } = req.query;
+  if (!did) return res.status(400).json({ error: 'did required' });
+  const wallet = db.prepare('SELECT silicon_ssn, origination_hash FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  if (!wallet.silicon_ssn) return res.status(404).json({ error: 'no origination set for this identity' });
+  res.json({ did, silicon_ssn: wallet.silicon_ssn, origination_hash: wallet.origination_hash });
 });
 
 app.get('/api/identity/balance', (req, res) => {
@@ -1491,6 +1533,20 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_resonance (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 
+// ── Fingerprint Rings (Kyle's 3-ring concentric model) ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS fingerprint_rings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  ring TEXT NOT NULL CHECK(ring IN ('inner', 'middle', 'outer')),
+  signal_name TEXT NOT NULL,
+  signal_value TEXT NOT NULL,
+  weight REAL DEFAULT 1.0,
+  spoofability TEXT DEFAULT 'unknown' CHECK(spoofability IN ('trivial', 'moderate', 'difficult', 'unknown')),
+  captured_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_fr_did ON fingerprint_rings(did)`); } catch(e) {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_fr_ring ON fingerprint_rings(did, ring)`); } catch(e) {}
+
 // ── Pending Checkouts (Codex fix — no raw passwords in Stripe metadata) ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS identity_pending_checkouts (
   session_id TEXT PRIMARY KEY,
@@ -1533,6 +1589,28 @@ app.get('/api/identity/resonance', (req, res) => {
   const profiles = db.prepare('SELECT fingerprint_hash, user_agent, ip_address, created_at FROM silicon_profiles WHERE did = ? ORDER BY id DESC LIMIT 5').all(did);
   const resonances = db.prepare('SELECT * FROM silicon_resonance WHERE did_a = ? OR did_b = ? ORDER BY score DESC LIMIT 20').all(did, did);
   res.json({ did, profiles, resonance: resonances });
+});
+
+// GET /api/identity/fingerprint/rings?did=... — concentric fingerprint rings
+app.get('/api/identity/fingerprint/rings', (req, res) => {
+  const { did } = req.query;
+  if (!did) return res.status(400).json({ error: 'did required' });
+  const rows = db.prepare('SELECT id, ring, signal_name, signal_value, weight, spoofability, captured_at FROM fingerprint_rings WHERE did = ? ORDER BY ring, captured_at DESC').all(did);
+  const grouped = { inner: [], middle: [], outer: [] };
+  for (const row of rows) {
+    grouped[row.ring].push(row);
+  }
+  res.json({
+    did,
+    ring_model: 'concentric-3',
+    description: {
+      inner: 'Proprietary behavioral signals (timing patterns, entropy, request cadence) — highest weight, hardest to spoof',
+      middle: 'User-defined device/framework metadata (model family, SDK version, runtime) — medium weight',
+      outer: 'Public verifiable signals (fingerprint hash, user-agent, HTTP version) — lowest weight, easiest to spoof',
+    },
+    rings: grouped,
+    total_signals: rows.length,
+  });
 });
 
 // ============================================================
