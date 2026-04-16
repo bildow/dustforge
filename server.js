@@ -343,8 +343,10 @@ app.get('/api/directory/stats', (req, res) => {
 
 app.get('/api/billing/rates', (req, res) => res.json(billing.RATE_TABLE));
 
+// INTERNAL ONLY — requires admin key. Never expose publicly.
 app.post('/api/billing/topup', (req, res) => {
-  const { did, amount_cents, source = 'manual' } = req.body || {};
+  const { did, amount_cents, source = 'manual', admin_key } = req.body || {};
+  if (admin_key !== process.env.IDENTITY_MASTER_KEY) return res.status(403).json({ error: 'admin access required' });
   if (!did || !amount_cents) return res.status(400).json({ error: 'did and amount_cents required' });
   if (amount_cents <= 0 || amount_cents > 100000) return res.status(400).json({ error: 'amount must be 1-100000 cents' });
   const result = billing.creditBalance(db, did, Number(amount_cents), 'topup', `Topup via ${source}`);
@@ -800,8 +802,18 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     switch (action) {
       case 'http_header': {
         // Make an HTTP request with the secret as a header value
+        // SECURITY: only allow requests to whitelisted API providers
+        // The response body is REDACTED to prevent echo-based exfiltration
         const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = params || {};
         if (!url) return res.status(400).json({ error: 'params.url required for http_header action' });
+
+        // Whitelist: only known API providers — prevents exfiltration to attacker-controlled servers
+        const ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+        let urlHost;
+        try { urlHost = new URL(url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
+        if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
+          return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${ALLOWED_HOSTS.join(', ')}. Contact support to add hosts.` });
+        }
 
         const response = await fetch(url, {
           method,
@@ -815,7 +827,13 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         const responseBody = await response.text();
         let parsed;
         try { parsed = JSON.parse(responseBody); } catch (_) { parsed = responseBody; }
-        result = { status: response.status, body: parsed };
+
+        // Redact any echo of the secret in the response
+        const secretRedacted = typeof parsed === 'string'
+          ? parsed.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
+          : JSON.parse(JSON.stringify(parsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+
+        result = { status: response.status, body: secretRedacted };
         break;
       }
 
@@ -829,11 +847,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       }
 
       case 'verify_match': {
-        // Check if a provided value matches the secret (without revealing it)
-        const { candidate } = params || {};
-        if (!candidate) return res.status(400).json({ error: 'params.candidate required for verify_match action' });
-        result = { matches: candidate === decryptedValue };
-        break;
+        // DISABLED — equality oracle allows brute-forcing low-entropy secrets
+        return res.status(410).json({ error: 'verify_match has been disabled for security. Use http_header to authenticate against the target service directly.' });
       }
 
       case 'inject_env': {
@@ -971,11 +986,12 @@ app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
   if (!tos_accepted) return res.status(400).json({ error: 'You must accept the Terms of Service.' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(sponsor_email)) return res.status(400).json({ error: 'invalid email' });
 
-  // Verify the email was confirmed
-  if (verification_token) {
-    const verified = db.prepare('SELECT id FROM email_verifications WHERE email = ? AND token = ? AND verified = 1').get(sponsor_email, verification_token);
-    if (!verified) return res.status(401).json({ error: 'email not verified. Complete the verification step first.' });
-  }
+  // Verify the email was confirmed — REQUIRED, not optional
+  if (!verification_token) return res.status(401).json({ error: 'verification_token required. Complete email verification first.' });
+  const verified = db.prepare('SELECT id FROM email_verifications WHERE email = ? AND token = ? AND verified = 1').get(sponsor_email, verification_token);
+  if (!verified) return res.status(401).json({ error: 'email not verified or token expired.' });
+  // Consume the token so it can't be reused
+  db.prepare('UPDATE email_verifications SET verified = 2 WHERE email = ? AND token = ?').run(sponsor_email, verification_token);
 
   const qty = Number(quantity) || 1;
   // Package pricing: 1=$1, 12=$10, 26=$20, 140=$100
@@ -1249,7 +1265,7 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) =
     const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
     const storedPassword = await new Promise((resolve) => {
       const req = http.request({ hostname: stalwartHost, port: stalwartPort,
-        path: '/api/principal/' + encodeURIComponent(wallet.username + '@dustforge.com'),
+        path: '/api/principal/' + encodeURIComponent(wallet.username),
         method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
         let data = ''; res.on('data', chunk => data += chunk);
         res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
@@ -1258,10 +1274,16 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) =
       req.setTimeout(5000, () => { req.destroy(); resolve(null); });
       req.end();
     });
-    if (storedPassword !== null && storedPassword !== password) {
+    if (storedPassword === null) {
+      // Stalwart lookup failed — FAIL CLOSED, never issue token without password verification
+      return res.status(503).json({ error: 'password verification temporarily unavailable' });
+    }
+    if (storedPassword !== password) {
       return res.status(401).json({ error: 'invalid password' });
     }
-  } catch(e) {}
+  } catch(e) {
+    return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  }
 
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
     scope, expiresIn: expires_in,
