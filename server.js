@@ -1074,6 +1074,38 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS barrel_cosign_requests (
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bcr_did ON barrel_cosign_requests(silicon_did)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bcr_status ON barrel_cosign_requests(status)"); } catch(e) {}
 
+// ── [179] DD-collateralized Escrow ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS escrow_contracts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  creator_did TEXT NOT NULL,
+  counterparty_did TEXT DEFAULT '',
+  beneficiary_did TEXT NOT NULL,
+  title TEXT NOT NULL,
+  memo TEXT DEFAULT '',
+  collateral_cents INTEGER NOT NULL DEFAULT 0,
+  barrel_tier_required TEXT NOT NULL DEFAULT 'single' CHECK(barrel_tier_required IN ('single','double','critical')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','active','released','refunded','disputed','cancelled','expired')),
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT DEFAULT '',
+  funded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  accepted_at TEXT,
+  settled_at TEXT,
+  metadata TEXT DEFAULT '{}'
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_creator ON escrow_contracts(creator_did, status)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_counterparty ON escrow_contracts(counterparty_did, status)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_beneficiary ON escrow_contracts(beneficiary_did, status)"); } catch(e) {}
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS escrow_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  escrow_id INTEGER NOT NULL REFERENCES escrow_contracts(id),
+  event_type TEXT NOT NULL,
+  actor_did TEXT NOT NULL,
+  detail TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_events_escrow ON escrow_events(escrow_id, created_at DESC)"); } catch(e) {}
+
 // ── [184] Blindkey Context Requests ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_context_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1092,10 +1124,42 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_context_requests (
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bkcr_did ON blindkey_context_requests(did)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bkcr_status ON blindkey_context_requests(status)"); } catch(e) {}
 
+// ── DemiPass Delegations — mycorrhizal secret sharing between silicons ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS demipass_delegations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_did TEXT NOT NULL,
+  delegate_did TEXT NOT NULL,
+  secret_id INTEGER NOT NULL REFERENCES blindkey_secrets(id),
+  context_id INTEGER REFERENCES blindkey_contexts(id),
+  status TEXT DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
+  max_uses INTEGER DEFAULT 0,
+  use_count INTEGER DEFAULT 0,
+  granted_by TEXT DEFAULT 'owner',
+  granted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  revoked_at TEXT,
+  expires_at TEXT,
+  UNIQUE(owner_did, delegate_did, secret_id, context_id)
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dd_owner ON demipass_delegations(owner_did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dd_delegate ON demipass_delegations(delegate_did)"); } catch(e) {}
+
 // Cleanup expired cosign requests every 60 seconds
 setInterval(() => {
   try {
     db.prepare("UPDATE barrel_cosign_requests SET status = 'expired' WHERE status = 'pending' AND expires_at < datetime('now')").run();
+  } catch (e) { /* ignore cleanup errors */ }
+}, 60000);
+
+setInterval(() => {
+  try {
+    db.prepare(`
+      UPDATE escrow_contracts
+      SET status = 'expired',
+          settled_at = COALESCE(settled_at, CURRENT_TIMESTAMP)
+      WHERE status IN ('pending', 'active')
+        AND expires_at != ''
+        AND expires_at < datetime('now')
+    `).run();
   } catch (e) { /* ignore cleanup errors */ }
 }, 60000);
 
@@ -1104,6 +1168,13 @@ setInterval(() => {
   try {
     db.prepare("DELETE FROM blindkey_use_tokens WHERE status = 'expired' AND expires_at < datetime('now', '-5 minutes')").run();
     db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE status = 'valid' AND expires_at < datetime('now')").run();
+  } catch (e) { /* ignore cleanup errors */ }
+}, 60000);
+
+// Cleanup expired delegations every 60 seconds
+setInterval(() => {
+  try {
+    db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at != '' AND expires_at < datetime('now')").run();
   } catch (e) { /* ignore cleanup errors */ }
 }, 60000);
 
@@ -1380,8 +1451,10 @@ app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
 // POST /api/blindkey/request-token — request a short-lived use-token by presenting intended context
 // The token captures the result of context validation as a single-use credential.
 // The silicon never sees the secret — it only gets a nonce that proves its intent was validated.
+// Supports delegated access: if the caller doesn't own the secret, check demipass_delegations.
+// The delegate passes { owner_did } to indicate whose secret they want to use via delegation.
 app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
-  const { name, context: contextName, action, target_host, target_url } = req.body || {};
+  const { name, context: contextName, action, target_host, target_url, owner_did } = req.body || {};
   if (!name || !action) return res.status(400).json({ error: 'name and action required' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
   if (typeof action !== 'string') return res.status(400).json({ error: 'action: must be a string' });
@@ -1393,15 +1466,66 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   if (target_host && typeof target_host !== 'string') return res.status(400).json({ error: 'target_host: must be a string' });
   if (target_url && typeof target_url !== 'string') return res.status(400).json({ error: 'target_url: must be a string' });
 
-  const secret = resolveLatestBlindkeySecret(req.identity.did, name);
-  if (!secret) return res.status(404).json({ error: 'secret not found' });
+  const callerDid = req.identity.did;
+
+  // Try direct ownership first
+  let secret = resolveLatestBlindkeySecret(callerDid, name);
+  let delegation = null;
+
+  // If caller doesn't own the secret, check for a delegation
+  if (!secret && owner_did) {
+    secret = resolveLatestBlindkeySecret(owner_did, name);
+    if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+    // Look up the context_id for the delegation check
+    const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, contextName);
+    const ctxId = ctx ? ctx.id : null;
+
+    // Find an active delegation from owner to caller for this secret+context
+    // A delegation with context_id=NULL means "all contexts" — match that too
+    delegation = db.prepare(`
+      SELECT * FROM demipass_delegations
+      WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND status = 'active'
+        AND (context_id IS NULL OR context_id = ?)
+      ORDER BY context_id DESC LIMIT 1
+    `).get(owner_did, callerDid, secret.id, ctxId);
+
+    if (!delegation) {
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_denied', callerDid, secret.id, contextName,
+        JSON.stringify({ owner_did, reason: 'no active delegation found' })
+      );
+      return res.status(403).json({ error: 'no active delegation for this secret and context' });
+    }
+
+    // Check delegation expiry
+    if (delegation.expires_at && new Date(delegation.expires_at) < new Date()) {
+      db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(delegation.id);
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_expired', callerDid, secret.id, contextName,
+        JSON.stringify({ delegation_id: delegation.id, owner_did })
+      );
+      return res.status(403).json({ error: 'delegation has expired' });
+    }
+
+    // Check max_uses
+    if (delegation.max_uses > 0 && delegation.use_count >= delegation.max_uses) {
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_denied', callerDid, secret.id, contextName,
+        JSON.stringify({ delegation_id: delegation.id, owner_did, reason: 'max uses exceeded' })
+      );
+      return res.status(403).json({ error: `delegation has reached its max usage limit (${delegation.max_uses})` });
+    }
+  } else if (!secret) {
+    return res.status(404).json({ error: 'secret not found' });
+  }
 
   // Validate context using existing enforceBlindkeyContext
   const ctxCheck = enforceBlindkeyContext(secret, contextName, action, target_url || null, target_host || null);
   if (!ctxCheck.allowed) {
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
-      'use_token_denied', req.identity.did, secret.id, contextName,
-      JSON.stringify({ action, target_host, target_url, error: ctxCheck.error })
+      'use_token_denied', callerDid, secret.id, contextName,
+      JSON.stringify({ action, target_host, target_url, error: ctxCheck.error, delegated: !!delegation })
     );
     return res.status(403).json({ error: ctxCheck.error });
   }
@@ -1411,22 +1535,32 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   const expiresInSeconds = 30;
 
   try {
+    // The token references the OWNER's secret — the delegate never sees the value
     db.prepare(`
       INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'))
-    `).run(token, req.identity.did, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '');
+    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '');
+
+    // If this was a delegated request, increment use_count and log
+    if (delegation) {
+      db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(delegation.id);
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_used', callerDid, secret.id, contextName,
+        JSON.stringify({ delegation_id: delegation.id, owner_did: delegation.owner_did, use_count: delegation.use_count + 1 })
+      );
+    }
 
     // Log token issuance
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
-      'use_token_issued', req.identity.did, secret.id, contextName,
-      JSON.stringify({ action, target_host, target_url, expires_in_seconds: expiresInSeconds })
+      'use_token_issued', callerDid, secret.id, contextName,
+      JSON.stringify({ action, target_host, target_url, expires_in_seconds: expiresInSeconds, delegated: !!delegation, owner_did: delegation ? delegation.owner_did : callerDid })
     );
 
     // Cleanup: expire stale tokens on this request
     db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE status = 'valid' AND expires_at < datetime('now')").run();
     db.prepare("DELETE FROM blindkey_use_tokens WHERE status = 'expired' AND expires_at < datetime('now', '-5 minutes')").run();
 
-    res.json({ use_token: token, expires_in_seconds: expiresInSeconds, action, context: contextName });
+    res.json({ use_token: token, expires_in_seconds: expiresInSeconds, action, context: contextName, delegated: !!delegation });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4850,6 +4984,88 @@ function requireCarbonCosign(did, operation, amount) {
   return !!row;
 }
 
+function getEscrowById(escrowId) {
+  return db.prepare(`
+    SELECT e.*,
+           creator.username AS creator_username,
+           counterparty.username AS counterparty_username,
+           beneficiary.username AS beneficiary_username
+    FROM escrow_contracts e
+    LEFT JOIN identity_wallets creator ON creator.did = e.creator_did
+    LEFT JOIN identity_wallets counterparty ON counterparty.did = e.counterparty_did
+    LEFT JOIN identity_wallets beneficiary ON beneficiary.did = e.beneficiary_did
+    WHERE e.id = ?
+  `).get(Number(escrowId));
+}
+
+function serializeEscrow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    metadata: (() => {
+      try { return JSON.parse(row.metadata || '{}'); } catch (_) { return {}; }
+    })(),
+  };
+}
+
+function recordEscrowEvent(escrowId, eventType, actorDid, detail = {}) {
+  db.prepare(`
+    INSERT INTO escrow_events (escrow_id, event_type, actor_did, detail)
+    VALUES (?, ?, ?, ?)
+  `).run(Number(escrowId), String(eventType || ''), String(actorDid || ''), JSON.stringify(detail || {}));
+}
+
+function getEscrowEvents(escrowId) {
+  return db.prepare(`
+    SELECT id, event_type, actor_did, detail, created_at
+    FROM escrow_events
+    WHERE escrow_id = ?
+    ORDER BY id DESC
+  `).all(Number(escrowId)).map((row) => ({
+    ...row,
+    detail: (() => {
+      try { return JSON.parse(row.detail || '{}'); } catch (_) { return {}; }
+    })(),
+  }));
+}
+
+function resolveEscrowTier(collateralCents) {
+  const amount = Number(collateralCents || 0);
+  if (amount > 10000) return 'critical';
+  if (amount > 100) return 'double';
+  return 'single';
+}
+
+function verifyEscrowBarrel(did, minTier) {
+  const barrel = computeBarrelTier(did);
+  const currentIndex = BARREL_TIERS.indexOf(barrel.tier);
+  const requiredIndex = BARREL_TIERS.indexOf(minTier);
+  if (currentIndex < requiredIndex) {
+    let upgrade_hint = '';
+    if (!barrel.wallet_bound) {
+      upgrade_hint = 'fund your wallet to unlock double barrel';
+    } else if (barrel.inner_count < 2 || barrel.middle_count < 1) {
+      upgrade_hint = 'accumulate more fingerprint ring signals via repeated auth';
+    } else if (barrel.last_auth_age_seconds >= 300) {
+      upgrade_hint = 're-authenticate within 5 minutes to unlock critical barrel';
+    }
+    const error = new Error(`${minTier} barrel required`);
+    error.statusCode = 403;
+    error.body = {
+      error: `${minTier} barrel required`,
+      required_tier: minTier,
+      current_tier: barrel.tier,
+      upgrade_hint,
+    };
+    throw error;
+  }
+  return barrel;
+}
+
+function ensureEscrowParticipant(row, did) {
+  return [row.creator_did, row.counterparty_did, row.beneficiary_did].filter(Boolean).includes(String(did || ''));
+}
+
 // POST /api/barrel/cosign/request — silicon requests carbon co-approval for a high-value operation
 app.post('/api/barrel/cosign/request', rateLimitStrict, async (req, res) => {
   const authHeader = req.headers.authorization || '';
@@ -4928,6 +5144,215 @@ app.post('/api/barrel/cosign/approve', rateLimitStrict, (req, res) => {
   db.prepare("UPDATE barrel_cosign_requests SET status = 'approved', resolved_at = datetime('now') WHERE id = ?").run(request_id);
   console.log(`[cosign] request ${request_id} approved for operation "${row.operation}"`);
   res.json({ ok: true, operation: row.operation, silicon_did: row.silicon_did });
+});
+
+// ── [179] DD-collateralized Escrow ──
+
+app.get('/api/escrow/list', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const rows = db.prepare(`
+    SELECT e.*,
+           creator.username AS creator_username,
+           counterparty.username AS counterparty_username,
+           beneficiary.username AS beneficiary_username
+    FROM escrow_contracts e
+    LEFT JOIN identity_wallets creator ON creator.did = e.creator_did
+    LEFT JOIN identity_wallets counterparty ON counterparty.did = e.counterparty_did
+    LEFT JOIN identity_wallets beneficiary ON beneficiary.did = e.beneficiary_did
+    WHERE e.creator_did = ? OR e.counterparty_did = ? OR e.beneficiary_did = ?
+    ORDER BY e.id DESC
+    LIMIT 100
+  `).all(actor.did, actor.did, actor.did);
+  res.json(rows.map(serializeEscrow));
+});
+
+app.get('/api/escrow/:id', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (!ensureEscrowParticipant(row, actor.did)) return res.status(403).json({ error: 'escrow access denied' });
+  res.json({ ...serializeEscrow(row), events: getEscrowEvents(row.id) });
+});
+
+app.post('/api/escrow/create', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+
+  const {
+    counterparty_did = '',
+    beneficiary_did = '',
+    title = '',
+    memo = '',
+    collateral_cents = 0,
+    expires_in_hours = 72,
+  } = req.body || {};
+
+  const collateralCents = Number(collateral_cents || 0);
+  if (!title || typeof title !== 'string') return res.status(400).json({ error: 'title required' });
+  if (title.length > 160) return res.status(400).json({ error: 'title: max 160 characters' });
+  if (collateralCents <= 0) return res.status(400).json({ error: 'collateral_cents must be > 0' });
+  if (collateralCents > 5000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
+
+  const resolvedCounterpartyDid = String(counterparty_did || '').trim();
+  const resolvedBeneficiaryDid = String(beneficiary_did || resolvedCounterpartyDid || actor.did).trim();
+  if (resolvedCounterpartyDid) {
+    const wallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedCounterpartyDid);
+    if (!wallet) return res.status(404).json({ error: 'counterparty identity not found' });
+  }
+  const beneficiaryWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedBeneficiaryDid);
+  if (!beneficiaryWallet) return res.status(404).json({ error: 'beneficiary identity not found' });
+
+  const barrelTierRequired = resolveEscrowTier(collateralCents);
+  try {
+    verifyEscrowBarrel(actor.did, barrelTierRequired);
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+
+  const ttlHours = Math.max(1, Math.min(24 * 30, Number(expires_in_hours || 72)));
+  const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000).toISOString();
+
+  try {
+    const result = db.transaction(() => {
+      const debit = billing.deductBalance(db, actor.did, collateralCents, 'escrow_lock', `Escrow lock: ${title}`);
+      if (!debit.ok) {
+        throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: debit });
+      }
+
+      const insert = db.prepare(`
+        INSERT INTO escrow_contracts (
+          creator_did, counterparty_did, beneficiary_did, title, memo, collateral_cents,
+          barrel_tier_required, status, expires_at, metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        actor.did,
+        resolvedCounterpartyDid,
+        resolvedBeneficiaryDid,
+        title,
+        String(memo || ''),
+        collateralCents,
+        barrelTierRequired,
+        expiresAt,
+        JSON.stringify({ created_via: 'api', barrel_tier_snapshot: computeBarrelTier(actor.did) })
+      );
+
+      recordEscrowEvent(insert.lastInsertRowid, 'created', actor.did, {
+        collateral_cents: collateralCents,
+        beneficiary_did: resolvedBeneficiaryDid,
+        counterparty_did: resolvedCounterpartyDid,
+        barrel_tier_required: barrelTierRequired,
+      });
+      return Number(insert.lastInsertRowid);
+    })();
+
+    res.json({ ok: true, escrow: serializeEscrow(getEscrowById(result)) });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+});
+
+app.post('/api/escrow/:id/accept', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (!row.counterparty_did || row.counterparty_did !== actor.did) return res.status(403).json({ error: 'counterparty acceptance required' });
+  if (!['pending', 'disputed'].includes(row.status)) return res.status(409).json({ error: `cannot accept escrow in status ${row.status}` });
+  db.prepare(`
+    UPDATE escrow_contracts
+    SET status = 'active',
+        accepted_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(row.id);
+  recordEscrowEvent(row.id, 'accepted', actor.did, {});
+  res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
+});
+
+app.post('/api/escrow/:id/release', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (row.creator_did !== actor.did) return res.status(403).json({ error: 'only creator can release escrow' });
+  if (!['pending', 'active'].includes(row.status)) return res.status(409).json({ error: `cannot release escrow in status ${row.status}` });
+  try {
+    verifyEscrowBarrel(actor.did, row.barrel_tier_required || resolveEscrowTier(row.collateral_cents));
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+
+  const note = String(req.body?.note || '').trim();
+  try {
+    db.transaction(() => {
+      const credit = billing.creditBalance(db, row.beneficiary_did, Number(row.collateral_cents), 'escrow_release', `Escrow release: ${row.title}`);
+      if (!credit.ok) throw Object.assign(new Error(credit.error || 'beneficiary credit failed'), { statusCode: 500, body: credit });
+      db.prepare(`
+        UPDATE escrow_contracts
+        SET status = 'released',
+            settled_at = CURRENT_TIMESTAMP,
+            metadata = json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.release_note', ?)
+        WHERE id = ?
+      `).run(note || '', row.id);
+      recordEscrowEvent(row.id, 'released', actor.did, { note });
+    })();
+    res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+});
+
+app.post('/api/escrow/:id/refund', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (![row.creator_did, row.counterparty_did].includes(actor.did)) return res.status(403).json({ error: 'creator or counterparty required' });
+  if (!['pending', 'active', 'disputed', 'expired'].includes(row.status)) return res.status(409).json({ error: `cannot refund escrow in status ${row.status}` });
+  try {
+    verifyEscrowBarrel(actor.did, row.barrel_tier_required || resolveEscrowTier(row.collateral_cents));
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+
+  const note = String(req.body?.note || '').trim();
+  try {
+    db.transaction(() => {
+      const credit = billing.creditBalance(db, row.creator_did, Number(row.collateral_cents), 'escrow_refund', `Escrow refund: ${row.title}`);
+      if (!credit.ok) throw Object.assign(new Error(credit.error || 'creator refund failed'), { statusCode: 500, body: credit });
+      db.prepare(`
+        UPDATE escrow_contracts
+        SET status = 'refunded',
+            settled_at = CURRENT_TIMESTAMP,
+            metadata = json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.refund_note', ?)
+        WHERE id = ?
+      `).run(note || '', row.id);
+      recordEscrowEvent(row.id, 'refunded', actor.did, { note });
+    })();
+    res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+});
+
+app.post('/api/escrow/:id/dispute', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (!ensureEscrowParticipant(row, actor.did)) return res.status(403).json({ error: 'escrow access denied' });
+  if (!['pending', 'active'].includes(row.status)) return res.status(409).json({ error: `cannot dispute escrow in status ${row.status}` });
+  const reason = String(req.body?.reason || '').trim();
+  db.prepare(`
+    UPDATE escrow_contracts
+    SET status = 'disputed',
+        metadata = json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.dispute_reason', ?)
+    WHERE id = ?
+  `).run(reason || '', row.id);
+  recordEscrowEvent(row.id, 'disputed', actor.did, { reason });
+  res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
 });
 
 // ── [184] DemiPass Context Request Flow ──
@@ -5074,6 +5499,225 @@ app.post('/api/blindkey/context/requests/:id/deny', rateLimitStandard, (req, res
   db.prepare("UPDATE blindkey_context_requests SET status = 'denied', reviewed_by = ?, resolved_at = datetime('now') WHERE id = ?").run(actor.actor, requestId);
   console.log(`[blindkey] context request ${requestId} denied: "${row.requested_context}" on secret "${row.secret_name}" for ${row.did}`);
   res.json({ ok: true, request_id: requestId, status: 'denied' });
+});
+
+// ── DemiPass Delegation — mycorrhizal secret sharing between silicons ──
+// Secrets flow through the DemiPass mesh, not direct handoff.
+// An owner grants a delegate permission to USE their secret (via use-tokens) without seeing it.
+
+// POST /api/blindkey/delegate — owner grants access to another silicon
+app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { secret_name, delegate_did, context_name, max_uses, expires_in } = req.body || {};
+  if (!secret_name || !delegate_did) return res.status(400).json({ error: 'secret_name and delegate_did required' });
+  if (typeof secret_name !== 'string' || secret_name.length > 100) return res.status(400).json({ error: 'secret_name: string, max 100 chars' });
+  if (typeof delegate_did !== 'string' || delegate_did.length > 200) return res.status(400).json({ error: 'delegate_did: string, max 200 chars' });
+  if (context_name && typeof context_name !== 'string') return res.status(400).json({ error: 'context_name: must be a string' });
+
+  // Resolve the secret — must be owned by the caller (or admin acting on behalf)
+  const ownerDid = actor.did || req.body.owner_did;
+  if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'could not determine owner DID' });
+
+  const secret = resolveLatestBlindkeySecret(ownerDid, secret_name);
+  if (!secret) return res.status(404).json({ error: 'secret not found or not owned by caller' });
+
+  // Validate delegate exists in identity_wallets
+  const delegateWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(delegate_did);
+  if (!delegateWallet) return res.status(404).json({ error: 'delegate_did not found in identity registry' });
+
+  // Cannot delegate to yourself
+  if (delegate_did === ownerDid) return res.status(400).json({ error: 'cannot delegate a secret to yourself' });
+
+  // If context_name specified, validate it exists and is active on the secret
+  let contextId = null;
+  if (context_name) {
+    const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ? AND status = ?').get(secret.id, context_name, 'active');
+    if (!ctx) return res.status(404).json({ error: `context '${context_name}' not found or not active on this secret` });
+    contextId = ctx.id;
+  }
+
+  // Compute expires_at if expires_in provided (in seconds)
+  let expiresAt = null;
+  if (expires_in && typeof expires_in === 'number' && expires_in > 0) {
+    expiresAt = new Date(Date.now() + expires_in * 1000).toISOString();
+  }
+
+  try {
+    const result = db.prepare(`
+      INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
+        status = 'active', max_uses = excluded.max_uses, use_count = 0,
+        granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
+    `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
+
+    const delegation = db.prepare(`
+      SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND (context_id IS ? OR context_id = ?)
+    `).get(ownerDid, delegate_did, secret.id, contextId, contextId);
+
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+      'delegation_granted', actor.actor, secret.id, context_name || '*',
+      JSON.stringify({ delegation_id: delegation.id, owner_did: ownerDid, delegate_did, max_uses: max_uses || 0, expires_at: expiresAt })
+    );
+
+    console.log(`[demipass] delegation granted: ${ownerDid} -> ${delegate_did} for secret "${secret_name}" context "${context_name || '*'}"`);
+    res.json({
+      ok: true,
+      delegation_id: delegation.id,
+      delegate_did,
+      context_name: context_name || '*',
+      max_uses: max_uses || 0,
+      expires_at: expiresAt,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blindkey/delegate/revoke — owner revokes a delegation
+app.post('/api/blindkey/delegate/revoke', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { delegation_id, delegate_did, secret_name } = req.body || {};
+  if (!delegation_id && (!delegate_did || !secret_name)) {
+    return res.status(400).json({ error: 'delegation_id or (delegate_did + secret_name) required' });
+  }
+
+  const ownerDid = actor.did || req.body.owner_did;
+  if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'could not determine owner DID' });
+
+  let delegation;
+  if (delegation_id) {
+    delegation = db.prepare('SELECT * FROM demipass_delegations WHERE id = ?').get(delegation_id);
+  } else {
+    const secret = resolveLatestBlindkeySecret(ownerDid, secret_name);
+    if (!secret) return res.status(404).json({ error: 'secret not found' });
+    delegation = db.prepare('SELECT * FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND status = ?')
+      .get(ownerDid, delegate_did, secret.id, 'active');
+  }
+
+  if (!delegation) return res.status(404).json({ error: 'delegation not found' });
+  if (delegation.owner_did !== ownerDid && actor.mode !== 'admin') {
+    return res.status(403).json({ error: 'only the owner or admin can revoke a delegation' });
+  }
+  if (delegation.status === 'revoked') return res.status(409).json({ error: 'delegation already revoked' });
+
+  db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(delegation.id);
+
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+    'delegation_revoked', actor.actor, delegation.secret_id, null,
+    JSON.stringify({ delegation_id: delegation.id, owner_did: delegation.owner_did, delegate_did: delegation.delegate_did })
+  );
+
+  console.log(`[demipass] delegation revoked: id=${delegation.id} ${delegation.owner_did} -> ${delegation.delegate_did}`);
+  res.json({ ok: true, revoked: true, delegation_id: delegation.id });
+});
+
+// GET /api/blindkey/delegations — list delegations (as owner or delegate)
+app.get('/api/blindkey/delegations', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const callerDid = actor.did;
+  if (!callerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'Bearer token required' });
+
+  let delegations;
+  if (actor.mode === 'admin') {
+    // Admin sees all
+    delegations = db.prepare(`
+      SELECT d.*, s.name as secret_name, c.context_name
+      FROM demipass_delegations d
+      JOIN blindkey_secrets s ON s.id = d.secret_id
+      LEFT JOIN blindkey_contexts c ON c.id = d.context_id
+      ORDER BY d.granted_at DESC
+    `).all();
+  } else {
+    // Show delegations granted BY the caller and delegations granted TO the caller
+    delegations = db.prepare(`
+      SELECT d.*, s.name as secret_name, c.context_name
+      FROM demipass_delegations d
+      JOIN blindkey_secrets s ON s.id = d.secret_id
+      LEFT JOIN blindkey_contexts c ON c.id = d.context_id
+      WHERE d.owner_did = ? OR d.delegate_did = ?
+      ORDER BY d.granted_at DESC
+    `).all(callerDid, callerDid);
+  }
+
+  // Never expose secret values — only metadata
+  const results = delegations.map(d => ({
+    id: d.id,
+    owner_did: d.owner_did,
+    delegate_did: d.delegate_did,
+    secret_name: d.secret_name,
+    context_name: d.context_name || '*',
+    status: d.status,
+    max_uses: d.max_uses,
+    use_count: d.use_count,
+    granted_by: d.granted_by,
+    granted_at: d.granted_at,
+    revoked_at: d.revoked_at,
+    expires_at: d.expires_at,
+    role: d.owner_did === callerDid ? 'owner' : 'delegate',
+  }));
+
+  res.json({ delegations: results, total: results.length });
+});
+
+// GET /api/blindkey/delegate/chain — show the delegation chain for a secret (owner only)
+app.get('/api/blindkey/delegate/chain', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { secret_name } = req.query || {};
+  if (!secret_name) return res.status(400).json({ error: 'secret_name query parameter required' });
+
+  const ownerDid = actor.did;
+  if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'Bearer token required' });
+
+  // Resolve the secret — only the owner (or admin) can see the chain
+  const secret = actor.mode === 'admin'
+    ? db.prepare("SELECT * FROM blindkey_secrets WHERE name = ? AND status = 'active' ORDER BY updated_at DESC LIMIT 1").get(secret_name)
+    : resolveLatestBlindkeySecret(ownerDid, secret_name);
+
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+  if (actor.mode !== 'admin' && secret.did !== ownerDid) return res.status(403).json({ error: 'only the secret owner can view delegation chains' });
+
+  const delegations = db.prepare(`
+    SELECT d.*, c.context_name,
+      w.username as delegate_username, w.call_sign as delegate_call_sign
+    FROM demipass_delegations d
+    LEFT JOIN blindkey_contexts c ON c.id = d.context_id
+    LEFT JOIN identity_wallets w ON w.did = d.delegate_did
+    WHERE d.secret_id = ?
+    ORDER BY d.granted_at DESC
+  `).all(secret.id);
+
+  const chain = delegations.map(d => ({
+    delegation_id: d.id,
+    delegate_did: d.delegate_did,
+    delegate_username: d.delegate_username || null,
+    delegate_call_sign: d.delegate_call_sign || null,
+    context_name: d.context_name || '*',
+    status: d.status,
+    max_uses: d.max_uses,
+    use_count: d.use_count,
+    granted_by: d.granted_by,
+    granted_at: d.granted_at,
+    revoked_at: d.revoked_at,
+    expires_at: d.expires_at,
+  }));
+
+  res.json({
+    secret_name: secret.name,
+    owner_did: secret.did,
+    total_delegations: chain.length,
+    active: chain.filter(d => d.status === 'active').length,
+    revoked: chain.filter(d => d.status === 'revoked').length,
+    chain,
+  });
 });
 
 // ── Channel Info (public) ──
