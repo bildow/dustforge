@@ -76,7 +76,7 @@
 | Stripe payments | Done | stripe-service.js |
 | Prepaid keys (founding + partnership tiers) | Done | server.js |
 | DemiPass (DemiVault) | Done | server.js |
-| DemiPass Console + history/requests surface | Git-ready | public/deposit.html + server.js |
+| DemiPass Console + history/requests surface | Sandbox | `codex-sandbox-demipass-console-2026-04-17` @ `44851fc` |
 | Capacity + waiting list | Done | server.js |
 | Security bounty program | Done | server.js |
 | **Bulk provisioning API** | Done | server.js — `POST /api/identity/bulk-create` |
@@ -177,6 +177,12 @@
 - Admin-only endpoints now require `DUSTFORGE_ADMIN_KEY` and should be called with the `x-admin-key` header or `admin_key` in the POST body. They no longer reuse `IDENTITY_MASTER_KEY`.
 - Portable attestations are capped by `DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS` (default `3600`).
 - `/api/stripe/success` is status-only in the sandbox hardening branch. Account fulfillment must come from `POST /api/stripe/webhook`.
+- DemiPass sandbox branch `codex-sandbox-demipass-console-2026-04-17` adds:
+  - Carbon-facing `DemiPass Console` at `/deposit.html`
+  - DemiPass history route
+  - owner/admin-safe context request review
+  - Rowen ingest and deliver controls in the operator surface
+  - target lookup by username for secret deposit
 
 ## Deploy Process
 

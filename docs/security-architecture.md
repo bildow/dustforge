@@ -1,6 +1,6 @@
 # Dustforge Security Architecture
 
-Last updated: 2026-04-16
+Last updated: 2026-04-17
 
 ## Threat Model
 
@@ -44,7 +44,7 @@ Dustforge serves AI agents (silicons) that authenticate via HTTP. The primary th
 - **Idempotency keys**: prevent double-credit on retries (referral payouts, etc.)
 - **Atomic SQLite transactions**: row-level locking on balance operations
 - **Billing deduct-before-action**: email/DemiPass charged before the action executes
-- **Admin-only topup**: credit operations require IDENTITY_MASTER_KEY
+- **Admin-only topup**: credit operations require `DUSTFORGE_ADMIN_KEY`
 
 ## DemiPass (DemiVault-backed secret boundary)
 
@@ -55,11 +55,39 @@ DemiPass lets silicons use API keys without seeing them:
 3. Dustforge makes the API call and returns the response body
 4. **The secret never enters the silicon's context window**
 
+### Operator surface
+
+Dustforge now has a Carbon-facing `DemiPass Console` at `/deposit.html` that sits on top of
+the same backend primitives:
+
+- store/update secrets for a target identity
+- attach and revoke contexts
+- review and approve pending context requests
+- invoke Rowen clean-room ingest and deliver flows
+- inspect audit history (`/api/demipass/history`)
+
+This makes DemiPass an operator workflow, not just an API primitive.
+
 ### DemiPass Protections
 - **Host whitelist**: only known API providers (openai, anthropic, openrouter, etc.)
 - **Response body redaction**: the raw response from the target API is returned, but Dustforge never echoes the secret value
 - **1 DD per use**: billing prevents abuse
 - **Bearer token required**: scoped auth on every call
+- **Context boundary**: contexts explicitly bind `action_type`, host/url pattern, and optional `max_uses`
+- **Approval trace**: pending context requests are now first-class reviewable objects instead of out-of-band notes
+
+### Rowen clean-room flows
+
+Two explicit backend entry points exist for clean-room handling:
+
+- `POST /api/rowen/ingest` — write a secret into DemiVault on behalf of a target DID
+- `POST /api/rowen/deliver` — authorize and perform one contextualized use
+
+Current posture:
+
+- Rowen is modeled as a single-use clean-room operator
+- the hot path remains non-LLM and server-enforced
+- audit records are written for ingest, token issuance, and delivery attempts
 
 ## Rate Limiting
 
@@ -109,6 +137,7 @@ DemiPass lets silicons use API keys without seeing them:
 3. **No HSM or KMS** — keys stored in .env file on disk
 4. **Resonance scores are clustering signals, not identity proof** — 50% of weight is trivially spoofable
 5. **Single SQLite database** — no replication, backup-only DR
+6. **DemiPass console currently uses admin-key access** — this is a Carbon/operator surface, not yet a delegated self-service Carbon account UI
 
 ## Patched Vulnerabilities (P0)
 
