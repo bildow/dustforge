@@ -85,6 +85,7 @@
 | Prepaid keys (founding + partnership tiers) | Done | server.js |
 | DemiPass (DemiVault) | Done | server.js |
 | DemiPass Console + history/requests surface | Done | `public/deposit.html`, `server.js` — merged via `c302211`, hardened in `076a35f` |
+| DD-collateralized escrow | Sandbox | `server.js` — `codex-sandbox-escrow-179-clean` |
 | Capacity + waiting list | Done | server.js |
 | Security bounty program | Done | server.js |
 | **Bulk provisioning API** | Done | server.js — `POST /api/identity/bulk-create` |
@@ -180,6 +181,10 @@
 
 `identity_wallets`, `identity_transactions`, `identity_pending_checkouts`, `identity_2fa_codes`, `prepaid_keys`, `prepaid_entitlements`, `email_verifications`, `forward_relays`, `blindkey_secrets` (legacy DemiVault schema), `silicon_profiles`, `silicon_resonance`, `silicon_vault`, `platform_tokens`, `conversion_events`, `waiting_list`, `bounty_submissions`
 
+Sandbox additions pending merge:
+- `escrow_contracts`
+- `escrow_events`
+
 ## Runtime Notes
 
 - Admin-only endpoints now require `DUSTFORGE_ADMIN_KEY` and should be called with the `x-admin-key` header or `admin_key` in the POST body. Query-string admin auth is no longer accepted.
@@ -192,6 +197,10 @@
   - Rowen ingest and deliver controls in the operator surface
   - target lookup by username for secret deposit
   - CORS allowance for `x-admin-key` so the console can reach `api.dustforge.com`
+- Codex sandbox branch `codex-sandbox-escrow-179-clean` adds task `179` groundwork:
+  - DD-collateralized escrow contracts with event history
+  - barrel-tier enforcement on escrow create/release/refund
+  - explicit accept / release / refund / dispute endpoints
 
 ## Deploy Process
 

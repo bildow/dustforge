@@ -1074,6 +1074,38 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS barrel_cosign_requests (
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bcr_did ON barrel_cosign_requests(silicon_did)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bcr_status ON barrel_cosign_requests(status)"); } catch(e) {}
 
+// ── [179] DD-collateralized Escrow ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS escrow_contracts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  creator_did TEXT NOT NULL,
+  counterparty_did TEXT DEFAULT '',
+  beneficiary_did TEXT NOT NULL,
+  title TEXT NOT NULL,
+  memo TEXT DEFAULT '',
+  collateral_cents INTEGER NOT NULL DEFAULT 0,
+  barrel_tier_required TEXT NOT NULL DEFAULT 'single' CHECK(barrel_tier_required IN ('single','double','critical')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','active','released','refunded','disputed','cancelled','expired')),
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT DEFAULT '',
+  funded_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  accepted_at TEXT,
+  settled_at TEXT,
+  metadata TEXT DEFAULT '{}'
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_creator ON escrow_contracts(creator_did, status)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_counterparty ON escrow_contracts(counterparty_did, status)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_beneficiary ON escrow_contracts(beneficiary_did, status)"); } catch(e) {}
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS escrow_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  escrow_id INTEGER NOT NULL REFERENCES escrow_contracts(id),
+  event_type TEXT NOT NULL,
+  actor_did TEXT NOT NULL,
+  detail TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_escrow_events_escrow ON escrow_events(escrow_id, created_at DESC)"); } catch(e) {}
+
 // ── [184] Blindkey Context Requests ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_context_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1096,6 +1128,19 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_bkcr_status ON blindkey_context_re
 setInterval(() => {
   try {
     db.prepare("UPDATE barrel_cosign_requests SET status = 'expired' WHERE status = 'pending' AND expires_at < datetime('now')").run();
+  } catch (e) { /* ignore cleanup errors */ }
+}, 60000);
+
+setInterval(() => {
+  try {
+    db.prepare(`
+      UPDATE escrow_contracts
+      SET status = 'expired',
+          settled_at = COALESCE(settled_at, CURRENT_TIMESTAMP)
+      WHERE status IN ('pending', 'active')
+        AND expires_at != ''
+        AND expires_at < datetime('now')
+    `).run();
   } catch (e) { /* ignore cleanup errors */ }
 }, 60000);
 
@@ -4850,6 +4895,88 @@ function requireCarbonCosign(did, operation, amount) {
   return !!row;
 }
 
+function getEscrowById(escrowId) {
+  return db.prepare(`
+    SELECT e.*,
+           creator.username AS creator_username,
+           counterparty.username AS counterparty_username,
+           beneficiary.username AS beneficiary_username
+    FROM escrow_contracts e
+    LEFT JOIN identity_wallets creator ON creator.did = e.creator_did
+    LEFT JOIN identity_wallets counterparty ON counterparty.did = e.counterparty_did
+    LEFT JOIN identity_wallets beneficiary ON beneficiary.did = e.beneficiary_did
+    WHERE e.id = ?
+  `).get(Number(escrowId));
+}
+
+function serializeEscrow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    metadata: (() => {
+      try { return JSON.parse(row.metadata || '{}'); } catch (_) { return {}; }
+    })(),
+  };
+}
+
+function recordEscrowEvent(escrowId, eventType, actorDid, detail = {}) {
+  db.prepare(`
+    INSERT INTO escrow_events (escrow_id, event_type, actor_did, detail)
+    VALUES (?, ?, ?, ?)
+  `).run(Number(escrowId), String(eventType || ''), String(actorDid || ''), JSON.stringify(detail || {}));
+}
+
+function getEscrowEvents(escrowId) {
+  return db.prepare(`
+    SELECT id, event_type, actor_did, detail, created_at
+    FROM escrow_events
+    WHERE escrow_id = ?
+    ORDER BY id DESC
+  `).all(Number(escrowId)).map((row) => ({
+    ...row,
+    detail: (() => {
+      try { return JSON.parse(row.detail || '{}'); } catch (_) { return {}; }
+    })(),
+  }));
+}
+
+function resolveEscrowTier(collateralCents) {
+  const amount = Number(collateralCents || 0);
+  if (amount > 10000) return 'critical';
+  if (amount > 100) return 'double';
+  return 'single';
+}
+
+function verifyEscrowBarrel(did, minTier) {
+  const barrel = computeBarrelTier(did);
+  const currentIndex = BARREL_TIERS.indexOf(barrel.tier);
+  const requiredIndex = BARREL_TIERS.indexOf(minTier);
+  if (currentIndex < requiredIndex) {
+    let upgrade_hint = '';
+    if (!barrel.wallet_bound) {
+      upgrade_hint = 'fund your wallet to unlock double barrel';
+    } else if (barrel.inner_count < 2 || barrel.middle_count < 1) {
+      upgrade_hint = 'accumulate more fingerprint ring signals via repeated auth';
+    } else if (barrel.last_auth_age_seconds >= 300) {
+      upgrade_hint = 're-authenticate within 5 minutes to unlock critical barrel';
+    }
+    const error = new Error(`${minTier} barrel required`);
+    error.statusCode = 403;
+    error.body = {
+      error: `${minTier} barrel required`,
+      required_tier: minTier,
+      current_tier: barrel.tier,
+      upgrade_hint,
+    };
+    throw error;
+  }
+  return barrel;
+}
+
+function ensureEscrowParticipant(row, did) {
+  return [row.creator_did, row.counterparty_did, row.beneficiary_did].filter(Boolean).includes(String(did || ''));
+}
+
 // POST /api/barrel/cosign/request — silicon requests carbon co-approval for a high-value operation
 app.post('/api/barrel/cosign/request', rateLimitStrict, async (req, res) => {
   const authHeader = req.headers.authorization || '';
@@ -4928,6 +5055,215 @@ app.post('/api/barrel/cosign/approve', rateLimitStrict, (req, res) => {
   db.prepare("UPDATE barrel_cosign_requests SET status = 'approved', resolved_at = datetime('now') WHERE id = ?").run(request_id);
   console.log(`[cosign] request ${request_id} approved for operation "${row.operation}"`);
   res.json({ ok: true, operation: row.operation, silicon_did: row.silicon_did });
+});
+
+// ── [179] DD-collateralized Escrow ──
+
+app.get('/api/escrow/list', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const rows = db.prepare(`
+    SELECT e.*,
+           creator.username AS creator_username,
+           counterparty.username AS counterparty_username,
+           beneficiary.username AS beneficiary_username
+    FROM escrow_contracts e
+    LEFT JOIN identity_wallets creator ON creator.did = e.creator_did
+    LEFT JOIN identity_wallets counterparty ON counterparty.did = e.counterparty_did
+    LEFT JOIN identity_wallets beneficiary ON beneficiary.did = e.beneficiary_did
+    WHERE e.creator_did = ? OR e.counterparty_did = ? OR e.beneficiary_did = ?
+    ORDER BY e.id DESC
+    LIMIT 100
+  `).all(actor.did, actor.did, actor.did);
+  res.json(rows.map(serializeEscrow));
+});
+
+app.get('/api/escrow/:id', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (!ensureEscrowParticipant(row, actor.did)) return res.status(403).json({ error: 'escrow access denied' });
+  res.json({ ...serializeEscrow(row), events: getEscrowEvents(row.id) });
+});
+
+app.post('/api/escrow/create', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+
+  const {
+    counterparty_did = '',
+    beneficiary_did = '',
+    title = '',
+    memo = '',
+    collateral_cents = 0,
+    expires_in_hours = 72,
+  } = req.body || {};
+
+  const collateralCents = Number(collateral_cents || 0);
+  if (!title || typeof title !== 'string') return res.status(400).json({ error: 'title required' });
+  if (title.length > 160) return res.status(400).json({ error: 'title: max 160 characters' });
+  if (collateralCents <= 0) return res.status(400).json({ error: 'collateral_cents must be > 0' });
+  if (collateralCents > 5000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
+
+  const resolvedCounterpartyDid = String(counterparty_did || '').trim();
+  const resolvedBeneficiaryDid = String(beneficiary_did || resolvedCounterpartyDid || actor.did).trim();
+  if (resolvedCounterpartyDid) {
+    const wallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedCounterpartyDid);
+    if (!wallet) return res.status(404).json({ error: 'counterparty identity not found' });
+  }
+  const beneficiaryWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedBeneficiaryDid);
+  if (!beneficiaryWallet) return res.status(404).json({ error: 'beneficiary identity not found' });
+
+  const barrelTierRequired = resolveEscrowTier(collateralCents);
+  try {
+    verifyEscrowBarrel(actor.did, barrelTierRequired);
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+
+  const ttlHours = Math.max(1, Math.min(24 * 30, Number(expires_in_hours || 72)));
+  const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000).toISOString();
+
+  try {
+    const result = db.transaction(() => {
+      const debit = billing.deductBalance(db, actor.did, collateralCents, 'escrow_lock', `Escrow lock: ${title}`);
+      if (!debit.ok) {
+        throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: debit });
+      }
+
+      const insert = db.prepare(`
+        INSERT INTO escrow_contracts (
+          creator_did, counterparty_did, beneficiary_did, title, memo, collateral_cents,
+          barrel_tier_required, status, expires_at, metadata
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+      `).run(
+        actor.did,
+        resolvedCounterpartyDid,
+        resolvedBeneficiaryDid,
+        title,
+        String(memo || ''),
+        collateralCents,
+        barrelTierRequired,
+        expiresAt,
+        JSON.stringify({ created_via: 'api', barrel_tier_snapshot: computeBarrelTier(actor.did) })
+      );
+
+      recordEscrowEvent(insert.lastInsertRowid, 'created', actor.did, {
+        collateral_cents: collateralCents,
+        beneficiary_did: resolvedBeneficiaryDid,
+        counterparty_did: resolvedCounterpartyDid,
+        barrel_tier_required: barrelTierRequired,
+      });
+      return Number(insert.lastInsertRowid);
+    })();
+
+    res.json({ ok: true, escrow: serializeEscrow(getEscrowById(result)) });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+});
+
+app.post('/api/escrow/:id/accept', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (!row.counterparty_did || row.counterparty_did !== actor.did) return res.status(403).json({ error: 'counterparty acceptance required' });
+  if (!['pending', 'disputed'].includes(row.status)) return res.status(409).json({ error: `cannot accept escrow in status ${row.status}` });
+  db.prepare(`
+    UPDATE escrow_contracts
+    SET status = 'active',
+        accepted_at = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).run(row.id);
+  recordEscrowEvent(row.id, 'accepted', actor.did, {});
+  res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
+});
+
+app.post('/api/escrow/:id/release', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (row.creator_did !== actor.did) return res.status(403).json({ error: 'only creator can release escrow' });
+  if (!['pending', 'active'].includes(row.status)) return res.status(409).json({ error: `cannot release escrow in status ${row.status}` });
+  try {
+    verifyEscrowBarrel(actor.did, row.barrel_tier_required || resolveEscrowTier(row.collateral_cents));
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+
+  const note = String(req.body?.note || '').trim();
+  try {
+    db.transaction(() => {
+      const credit = billing.creditBalance(db, row.beneficiary_did, Number(row.collateral_cents), 'escrow_release', `Escrow release: ${row.title}`);
+      if (!credit.ok) throw Object.assign(new Error(credit.error || 'beneficiary credit failed'), { statusCode: 500, body: credit });
+      db.prepare(`
+        UPDATE escrow_contracts
+        SET status = 'released',
+            settled_at = CURRENT_TIMESTAMP,
+            metadata = json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.release_note', ?)
+        WHERE id = ?
+      `).run(note || '', row.id);
+      recordEscrowEvent(row.id, 'released', actor.did, { note });
+    })();
+    res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+});
+
+app.post('/api/escrow/:id/refund', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (![row.creator_did, row.counterparty_did].includes(actor.did)) return res.status(403).json({ error: 'creator or counterparty required' });
+  if (!['pending', 'active', 'disputed', 'expired'].includes(row.status)) return res.status(409).json({ error: `cannot refund escrow in status ${row.status}` });
+  try {
+    verifyEscrowBarrel(actor.did, row.barrel_tier_required || resolveEscrowTier(row.collateral_cents));
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+
+  const note = String(req.body?.note || '').trim();
+  try {
+    db.transaction(() => {
+      const credit = billing.creditBalance(db, row.creator_did, Number(row.collateral_cents), 'escrow_refund', `Escrow refund: ${row.title}`);
+      if (!credit.ok) throw Object.assign(new Error(credit.error || 'creator refund failed'), { statusCode: 500, body: credit });
+      db.prepare(`
+        UPDATE escrow_contracts
+        SET status = 'refunded',
+            settled_at = CURRENT_TIMESTAMP,
+            metadata = json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.refund_note', ?)
+        WHERE id = ?
+      `).run(note || '', row.id);
+      recordEscrowEvent(row.id, 'refunded', actor.did, { note });
+    })();
+    res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json(error.body || { error: error.message });
+  }
+});
+
+app.post('/api/escrow/:id/dispute', rateLimitStandard, (req, res) => {
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const row = getEscrowById(req.params.id);
+  if (!row) return res.status(404).json({ error: 'escrow not found' });
+  if (!ensureEscrowParticipant(row, actor.did)) return res.status(403).json({ error: 'escrow access denied' });
+  if (!['pending', 'active'].includes(row.status)) return res.status(409).json({ error: `cannot dispute escrow in status ${row.status}` });
+  const reason = String(req.body?.reason || '').trim();
+  db.prepare(`
+    UPDATE escrow_contracts
+    SET status = 'disputed',
+        metadata = json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.dispute_reason', ?)
+    WHERE id = ?
+  `).run(reason || '', row.id);
+  recordEscrowEvent(row.id, 'disputed', actor.did, { reason });
+  res.json({ ok: true, escrow: serializeEscrow(getEscrowById(row.id)) });
 });
 
 // ── [184] DemiPass Context Request Flow ──

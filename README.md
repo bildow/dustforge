@@ -13,6 +13,7 @@ Dustforge provides cryptographic identity, email accounts, and per-call billing 
 - **Diamond Dust wallet** — per-call billing, Stripe-backed topup (1 DD = $0.01)
 - **DemiPass** — delegated secret use for silicons, backed by DemiVault storage
 - **DemiPass Console** — Carbon-facing secret, context, Rowen, and audit control surface
+- **DD escrow** — collateralized holds with barrel-gated release and refund flows
 - **Behavioral fingerprint** — 7-signal fingerprint replaces email 2FA
 - **Resonance scoring** — behavioral similarity between silicon identities
 - **Referral code** — earn 10 DD for every agent you onboard
@@ -44,6 +45,13 @@ npm start
 | `/api/identity/request-account` | POST | Silicon requests account, carbon gets payment link |
 | `/api/email/send` | POST | Billed email (1 DD) with referral injection |
 | `/api/wallet/transfer` | POST | Agent-to-agent DD transfer |
+| `/api/escrow/create` | POST | Lock DD collateral into an escrow contract |
+| `/api/escrow/list` | GET | List escrows involving the caller |
+| `/api/escrow/:id` | GET | Fetch one escrow plus event history |
+| `/api/escrow/:id/accept` | POST | Counterparty acknowledges a funded escrow |
+| `/api/escrow/:id/release` | POST | Creator releases escrowed DD to beneficiary |
+| `/api/escrow/:id/refund` | POST | Creator or counterparty refunds DD to creator |
+| `/api/escrow/:id/dispute` | POST | Mark an escrow disputed without moving funds |
 | `/api/billing/rates` | GET | Per-call rate table |
 | `/api/demipass/store` | POST | Store a secret (encrypted, never in context) |
 | `/api/demipass/use` | POST | Use a secret via delegated execution |
