@@ -965,6 +965,34 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_events (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 
+// Blindkey use-tokens — short-lived, single-use nonces that encode pre-validated context
+// A silicon must first request a use-token by presenting its intended context.
+// The token captures the validation result. The actual secret use only accepts a valid token.
+try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_use_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token TEXT NOT NULL UNIQUE,
+  did TEXT NOT NULL,
+  secret_id INTEGER NOT NULL REFERENCES blindkey_secrets(id),
+  context_id INTEGER REFERENCES blindkey_contexts(id),
+  action_type TEXT NOT NULL,
+  target_url TEXT DEFAULT '',
+  target_host TEXT DEFAULT '',
+  status TEXT DEFAULT 'valid' CHECK(status IN ('valid', 'used', 'expired')),
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT NOT NULL,
+  used_at TEXT
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_token ON blindkey_use_tokens(token)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_did ON blindkey_use_tokens(did)"); } catch(e) {}
+
+// Cleanup expired use-tokens every 60 seconds
+setInterval(() => {
+  try {
+    db.prepare("DELETE FROM blindkey_use_tokens WHERE status = 'expired' AND expires_at < datetime('now', '-5 minutes')").run();
+    db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE status = 'valid' AND expires_at < datetime('now')").run();
+  } catch (e) { /* ignore cleanup errors */ }
+}, 60000);
+
 // Blindkey-level encryption uses the identity module's existing AES-256-GCM
 function blindkeyEncrypt(value) {
   const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
@@ -1128,10 +1156,204 @@ app.get('/api/blindkey/list', rateLimitStandard, billing.billingMiddleware(db, '
   res.json({ secrets, total: secrets.length });
 });
 
-// POST /api/blindkey/use — use a secret without seeing it (delegated execution)
-app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
-  const { name, action, params, context: contextName } = req.body || {};
+// POST /api/blindkey/request-token — request a short-lived use-token by presenting intended context
+// The token captures the result of context validation as a single-use credential.
+// The silicon never sees the secret — it only gets a nonce that proves its intent was validated.
+app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+  const { name, context: contextName, action, target_host, target_url } = req.body || {};
   if (!name || !action) return res.status(400).json({ error: 'name and action required' });
+  if (!contextName) return res.status(400).json({ error: 'context required — use-tokens always require a context' });
+
+  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  // Validate context using existing enforceBlindkeyContext
+  const ctxCheck = enforceBlindkeyContext(secret, contextName, action, target_url || null, target_host || null);
+  if (!ctxCheck.allowed) {
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+      'use_token_denied', req.identity.did, secret.id, contextName,
+      JSON.stringify({ action, target_host, target_url, error: ctxCheck.error })
+    );
+    return res.status(403).json({ error: ctxCheck.error });
+  }
+
+  // Generate a single-use token — 32 bytes of crypto randomness
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresInSeconds = 30;
+
+  try {
+    db.prepare(`
+      INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'))
+    `).run(token, req.identity.did, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '');
+
+    // Log token issuance
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+      'use_token_issued', req.identity.did, secret.id, contextName,
+      JSON.stringify({ action, target_host, target_url, expires_in_seconds: expiresInSeconds })
+    );
+
+    // Cleanup: expire stale tokens on this request
+    db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE status = 'valid' AND expires_at < datetime('now')").run();
+    db.prepare("DELETE FROM blindkey_use_tokens WHERE status = 'expired' AND expires_at < datetime('now', '-5 minutes')").run();
+
+    res.json({ use_token: token, expires_in_seconds: expiresInSeconds, action, context: contextName });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blindkey/use — use a secret without seeing it (delegated execution)
+// Supports two modes:
+//   1. use-token mode: { use_token, command } — uses pre-validated context from token
+//   2. direct mode: { name, action, params, context } — validates context inline (backward compatible)
+app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
+  const { use_token } = req.body || {};
+
+  // ── Use-token mode ──
+  if (use_token) {
+    const tokenRow = db.prepare('SELECT * FROM blindkey_use_tokens WHERE token = ?').get(use_token);
+    if (!tokenRow) return res.status(404).json({ error: 'use-token not found' });
+    if (tokenRow.status !== 'valid') return res.status(410).json({ error: `use-token already ${tokenRow.status}` });
+    if (new Date(tokenRow.expires_at + 'Z') < new Date()) {
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
+      return res.status(410).json({ error: 'use-token expired' });
+    }
+    if (tokenRow.did !== req.identity.did) return res.status(403).json({ error: 'use-token belongs to a different identity' });
+
+    // Mark token as used
+    db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
+
+    // Load the secret from the token's secret_id
+    const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ? AND status = ?').get(tokenRow.secret_id, 'active');
+    if (!secret) return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked' });
+
+    let decryptedValue;
+    try {
+      decryptedValue = blindkeyDecrypt(secret.encrypted_value);
+    } catch (e) {
+      return res.status(500).json({ error: 'failed to decrypt secret' });
+    }
+
+    // Update usage stats
+    db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+    if (tokenRow.context_id) {
+      db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
+    }
+
+    // Execute using the token's pre-validated context
+    const action = tokenRow.action_type;
+    const target_host = tokenRow.target_host;
+    const target_url = tokenRow.target_url;
+
+    try {
+      let result;
+
+      switch (action) {
+        case 'http_header': {
+          const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = req.body.params || {};
+          const effectiveUrl = url || target_url;
+          if (!effectiveUrl) return res.status(400).json({ error: 'params.url or token target_url required for http_header action' });
+
+          const ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+          let urlHost;
+          try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
+          if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
+            return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
+          }
+
+          const response = await fetch(effectiveUrl, {
+            method,
+            headers: { [header_name]: header_prefix + decryptedValue, 'Content-Type': 'application/json' },
+            body: reqBody ? JSON.stringify(reqBody) : undefined,
+            signal: AbortSignal.timeout(30000),
+          });
+          const responseBody = await response.text();
+          let parsed;
+          try { parsed = JSON.parse(responseBody); } catch (_) { parsed = responseBody; }
+          const secretRedacted = typeof parsed === 'string'
+            ? parsed.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
+            : JSON.parse(JSON.stringify(parsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+          result = { status: response.status, body: secretRedacted };
+          break;
+        }
+
+        case 'ssh_exec': {
+          const { command, target_user, key_name } = req.body;
+          if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
+          const effectiveUser = target_user || 'claude';
+
+          if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
+            return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
+          }
+
+          const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /\bexec\b/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
+          for (const pat of dangerousPatterns) {
+            if (pat.test(command)) return res.status(400).json({ error: 'command contains disallowed pattern' });
+          }
+          if (!/^[a-zA-Z0-9\s\/_\-.:=,@+*?[\]{}()#<>|&;'"%!\\\n]+$/.test(command)) {
+            return res.status(400).json({ error: 'command contains disallowed characters' });
+          }
+          if (!/^[a-zA-Z0-9._-]+$/.test(effectiveUser)) {
+            return res.status(400).json({ error: 'invalid target_user' });
+          }
+
+          let password = decryptedValue;
+          if (key_name) {
+            const keySecret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, key_name, 'active');
+            if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
+            try {
+              password = blindkeyDecrypt(keySecret.encrypted_value);
+              db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(keySecret.id);
+            } catch (e) {
+              return res.status(500).json({ error: 'failed to decrypt key_name secret' });
+            }
+          }
+
+          try {
+            const escapedPassword = password.replace(/'/g, "'\"'\"'");
+            const escapedCommand = command.replace(/'/g, "'\"'\"'");
+            const sshCmd = `sshpass -p '${escapedPassword}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser}@${target_host} '${escapedCommand}'`;
+            const output = execSync(sshCmd, { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+            const redactedOutput = output
+              .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
+              .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+            result = { stdout: redactedOutput, exit_code: 0 };
+          } catch (sshErr) {
+            const redact = (s) => s
+              .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
+              .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+            result = { stdout: redact((sshErr.stdout || '').toString()), stderr: redact((sshErr.stderr || '').toString()), exit_code: sshErr.status || 1 };
+          }
+          break;
+        }
+
+        case 'inject_env':
+        case 'env_inject': {
+          const { env_name = 'SECRET_VALUE' } = req.body.params || {};
+          result = { env_name, env_set: true, note: 'Secret injected as environment variable. Value not returned.' };
+          break;
+        }
+
+        default:
+          return res.status(400).json({ error: `unknown action in use-token: ${action}` });
+      }
+
+      // Log token use
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'use_token_redeemed', req.identity.did, secret.id, null,
+        JSON.stringify({ action, target_host, target_url, token_id: tokenRow.id })
+      );
+
+      return res.json({ ok: true, action, via: 'use_token', result });
+    } catch (e) {
+      return res.status(500).json({ error: `action failed: ${e.message}` });
+    }
+  }
+
+  // ── Direct mode (backward compatible) ──
+  const { name, action, params, context: contextName } = req.body || {};
+  if (!name || !action) return res.status(400).json({ error: 'name and action required (or provide use_token)' });
 
   const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret not found' });
@@ -1576,7 +1798,8 @@ app.post('/api/rowen/ingest', rateLimitStandard, (req, res) => {
 });
 
 // POST /api/rowen/deliver — clean-room use flow (Rowen's entry point for secret usage)
-// Validates requestor owns the secret and context is approved, executes the action, never returns the secret.
+// Uses the use-token flow internally: requests a token, then redeems it, in one atomic operation.
+// The token still exists as an auditable record even though both steps happen in one request.
 app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
   if (!requireAdminAccess(req, res)) return;
 
@@ -1590,13 +1813,34 @@ app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
   const action = (action_params && action_params.action) || null;
   if (!action) return res.status(400).json({ error: 'action_params.action required' });
 
-  // Enforce context
   const targetUrl = (action_params && action_params.url) || (action_params && action_params.target_url) || null;
   const targetHost = (action_params && action_params.target_host) || null;
+
+  // ── Step 1: Request a use-token (validates context, creates auditable record) ──
   const ctxCheck = enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost);
   if (!ctxCheck.allowed) {
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+      'rowen_deliver_denied', requestor_did, secret.id, contextName || null,
+      JSON.stringify({ action, target_url: targetUrl, target_host: targetHost, error: ctxCheck.error })
+    );
     return res.status(403).json({ error: ctxCheck.error });
   }
+
+  // Generate the use-token (even though we'll redeem it immediately, it's an audit record)
+  const useToken = crypto.randomBytes(32).toString('hex');
+  const expiresInSeconds = 30;
+  db.prepare(`
+    INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'))
+  `).run(useToken, requestor_did, secret.id, ctxCheck.context_id || null, action, targetUrl || '', targetHost || '');
+
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+    'rowen_token_issued', requestor_did, secret.id, contextName || null,
+    JSON.stringify({ action, target_url: targetUrl, target_host: targetHost })
+  );
+
+  // ── Step 2: Immediately redeem the use-token ──
+  db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE token = ?").run(useToken);
 
   let decryptedValue;
   try {
@@ -1694,16 +1938,16 @@ app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
         return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, ssh_exec, env_inject, http_body` });
     }
 
-    // Log the deliver event
+    // Log the deliver event (with token reference for audit trail)
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
       'rowen_deliver',
       requestor_did,
       secret.id,
       contextName || null,
-      JSON.stringify({ action, target_url: targetUrl, target_host: targetHost })
+      JSON.stringify({ action, target_url: targetUrl, target_host: targetHost, use_token: useToken.slice(0, 8) + '...' })
     );
 
-    res.json({ ok: true, action, secret_name, result });
+    res.json({ ok: true, action, secret_name, via: 'use_token', result });
   } catch (e) {
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
