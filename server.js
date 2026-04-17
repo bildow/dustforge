@@ -802,6 +802,19 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     } else if (meta.type === 'wallet_topup') {
       const idempotencyKey = `stripe_${event.id || session.id}`;
       billing.creditBalance(db, meta.did, Number(meta.amount_cents), 'stripe_topup', 'Stripe topup', idempotencyKey);
+    } else if (meta.type === 'fleet_topup') {
+      // DF-175: Fleet QR funding settlement — credit the fleet wallet
+      const idempotencyKey = `fleet_stripe_${event.id || session.id}`;
+      const fleetDid = meta.fleet_wallet_did || meta.did;
+      if (fleetDid) {
+        const result = billing.creditBalance(db, fleetDid, Number(meta.amount_cents), 'fleet_stripe_topup', `Fleet topup via Stripe (${meta.fleet_slug || 'unknown'})`, idempotencyKey);
+        console.log(`[stripe-webhook] fleet topup: ${meta.fleet_slug} wallet ${fleetDid} credited ${meta.amount_cents} DD — ${result.ok ? 'ok' : result.error}`);
+      } else {
+        console.error('[stripe-webhook] fleet_topup missing fleet_wallet_did in metadata');
+      }
+    } else if (meta.type === 'prepaid_keys') {
+      // Prepaid key fulfillment is handled by the success redirect, not webhook
+      console.log('[stripe-webhook] prepaid_keys session completed:', session.id);
     }
   }
   res.json({ received: true });
@@ -2490,12 +2503,16 @@ app.get('/api/ops/dashboard', (req, res) => {
 
 // ── Encrypted Channel Abstraction (Progressive Barrel Auth foundation) ──
 
-function deriveChannelKey(channelName) {
-  return crypto.hkdfSync('sha256', process.env.IDENTITY_MASTER_KEY, 'dustforge-channel-v1', channelName, 32);
+// DF-176: Channel keys are now per-identity. The DID is mixed into the HKDF
+// info parameter so each identity has its own encryption scope. A wrapped
+// payload from identity A cannot be unwrapped by identity B.
+function deriveChannelKey(channelName, did) {
+  const info = did ? `${channelName}:${did}` : channelName;
+  return crypto.hkdfSync('sha256', process.env.IDENTITY_MASTER_KEY, 'dustforge-channel-v1', info, 32);
 }
 
-function encryptChannelPayload(channelName, plaintext) {
-  const key = deriveChannelKey(channelName);
+function encryptChannelPayload(channelName, plaintext, did) {
+  const key = deriveChannelKey(channelName, did);
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', Buffer.from(key), iv);
   let encrypted = cipher.update(plaintext, 'utf8', 'hex');
@@ -2504,9 +2521,9 @@ function encryptChannelPayload(channelName, plaintext) {
   return iv.toString('hex') + ':' + tag + ':' + encrypted;
 }
 
-function decryptChannelPayload(channelName, ciphertext) {
+function decryptChannelPayload(channelName, ciphertext, did) {
   const [ivHex, tagHex, data] = ciphertext.split(':');
-  const key = deriveChannelKey(channelName);
+  const key = deriveChannelKey(channelName, did);
   const decipher = crypto.createDecipheriv('aes-256-gcm', Buffer.from(key), Buffer.from(ivHex, 'hex'));
   decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
   let decrypted = decipher.update(data, 'hex', 'utf8');
@@ -2524,8 +2541,9 @@ app.post('/api/channel/test', (req, res) => {
     return res.status(400).json({ error: 'payload string required' });
   }
   try {
-    const encrypted = encryptChannelPayload(channel, payload);
-    const decrypted = decryptChannelPayload(channel, encrypted);
+    const testDid = req.body.did || 'test-did';
+    const encrypted = encryptChannelPayload(channel, payload, testDid);
+    const decrypted = decryptChannelPayload(channel, encrypted, testDid);
     res.json({ encrypted, decrypted, channel, match: decrypted === payload });
   } catch (err) {
     res.status(500).json({ error: 'channel crypto failed', detail: err.message });
@@ -2547,7 +2565,7 @@ app.post('/api/channel/wrap', (req, res) => {
     return res.status(400).json({ error: 'data object required' });
   }
   try {
-    const wrapped = encryptChannelPayload(channel, JSON.stringify(data));
+    const wrapped = encryptChannelPayload(channel, JSON.stringify(data), v.decoded.sub);
     res.json({ wrapped, channel });
   } catch (err) {
     res.status(500).json({ error: 'channel wrap failed', detail: err.message });
@@ -2569,7 +2587,7 @@ app.post('/api/channel/unwrap', (req, res) => {
     return res.status(400).json({ error: 'wrapped ciphertext string required' });
   }
   try {
-    const plaintext = decryptChannelPayload(channel, wrapped);
+    const plaintext = decryptChannelPayload(channel, wrapped, v.decoded.sub);
     const data = JSON.parse(plaintext);
     res.json({ data, channel });
   } catch (err) {
@@ -2857,6 +2875,11 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
     return res.status(403).json({ error: 'owner or admin role required' });
   }
 
+  // DF-178: Check global platform capacity gate before fleet-specific limit
+  if (isSoftCapReached()) {
+    return res.status(409).json(capacityGateResponse('Fleet provisioning is paused — platform capacity limit reached.'));
+  }
+
   // Check max_agents limit
   const currentCount = db.prepare('SELECT COUNT(*) as count FROM fleet_members WHERE fleet_id = ?').get(fleet.id).count;
   if (currentCount >= fleet.max_agents) {
@@ -2923,6 +2946,11 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
   const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
   if (!membership || !['owner', 'admin'].includes(membership.role)) {
     return res.status(403).json({ error: 'owner or admin role required' });
+  }
+
+  // DF-178: Check global platform capacity gate before fleet-specific limit
+  if (isSoftCapReached()) {
+    return res.status(409).json(capacityGateResponse('Fleet bulk provisioning is paused — platform capacity limit reached.'));
   }
 
   // Check max_agents capacity
@@ -3197,7 +3225,7 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req,
 
   if (channel === 'auth') {
     try {
-      const wrappedToken = encryptChannelPayload('auth', token);
+      const wrappedToken = encryptChannelPayload('auth', token, wallet.did);
       return res.json({ ok: true, wrapped_token: wrappedToken, channel: 'auth', barrel_tier: barrelTier, fingerprint_hash: fingerprintHash });
     } catch (err) {
       return res.status(500).json({ error: 'auth channel encryption failed', detail: err.message });
@@ -3279,8 +3307,8 @@ app.post('/api/identity/auth-critical', rateLimitStandard, async (req, res) => {
 
 // ── Ledger Channel (D4) — encrypted wallet transfer ──
 
-function wrapLedgerResponse(data) {
-  return encryptChannelPayload('ledger', JSON.stringify(data));
+function wrapLedgerResponse(data, did) {
+  return encryptChannelPayload('ledger', JSON.stringify(data), did);
 }
 
 app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
@@ -3300,15 +3328,24 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
   if (!sender || !receiver) return res.status(404).json({ error: 'identity not found' });
   if (sender.status !== 'active') return res.status(403).json({ error: 'account suspended' });
-  const debit = billing.deductBalance(db, from_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''));
-  if (!debit.ok) return res.status(402).json(debit);
-  billing.creditBalance(db, to_did, amount_cents, 'transfer_in', 'Secure transfer from ' + sender.username + (description ? ': ' + description : ''));
+  // DF-177: Atomic transfer — debit and credit in a single transaction
+  let debit;
+  try {
+    const atomicTransfer = db.transaction(() => {
+      debit = billing.deductBalance(db, from_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''));
+      if (!debit.ok) throw new Error(debit.error || 'insufficient balance');
+      billing.creditBalance(db, to_did, amount_cents, 'transfer_in', 'Secure transfer from ' + sender.username + (description ? ': ' + description : ''));
+    });
+    atomicTransfer();
+  } catch (e) {
+    return res.status(402).json({ ok: false, error: e.message, balance_cents: sender.balance_cents });
+  }
 
   const responseData = { ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents };
 
   if (channel === 'ledger') {
     try {
-      const wrapped = wrapLedgerResponse(responseData);
+      const wrapped = wrapLedgerResponse(responseData, from_did);
       return res.json({ wrapped, channel: 'ledger' });
     } catch (err) {
       return res.status(500).json({ error: 'ledger channel encryption failed', detail: err.message });
