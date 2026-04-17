@@ -955,6 +955,11 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_secrets (
 )`); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_sv_did ON blindkey_secrets(did)"); } catch(e) {}
 
+// Blindkey secret rotation columns
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN version INTEGER DEFAULT 1"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN replaced_by INTEGER DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN rotate_expires_at TEXT DEFAULT ''"); } catch(_) {}
+
 // Blindkey usage context layer — controls HOW and WHERE secrets can be used
 try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1002,6 +1007,47 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_use_tokens (
 )`); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_token ON blindkey_use_tokens(token)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_did ON blindkey_use_tokens(did)"); } catch(e) {}
+
+// ── [104] Barrel Cosign Requests ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS barrel_cosign_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  silicon_did TEXT NOT NULL,
+  carbon_email TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  amount_cents INTEGER DEFAULT 0,
+  status TEXT DEFAULT 'pending' CHECK(status IN ('pending','approved','denied','expired')),
+  approval_code TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  resolved_at TEXT
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_bcr_did ON barrel_cosign_requests(silicon_did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_bcr_status ON barrel_cosign_requests(status)"); } catch(e) {}
+
+// ── [184] Blindkey Context Requests ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_context_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  secret_name TEXT NOT NULL,
+  requested_context TEXT NOT NULL,
+  requested_action_type TEXT NOT NULL,
+  target_url_pattern TEXT DEFAULT '*',
+  target_host_pattern TEXT DEFAULT '*',
+  reason TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending' CHECK(status IN ('pending','approved','denied')),
+  reviewed_by TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  resolved_at TEXT
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_bkcr_did ON blindkey_context_requests(did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_bkcr_status ON blindkey_context_requests(status)"); } catch(e) {}
+
+// Cleanup expired cosign requests every 60 seconds
+setInterval(() => {
+  try {
+    db.prepare("UPDATE barrel_cosign_requests SET status = 'expired' WHERE status = 'pending' AND expires_at < datetime('now')").run();
+  } catch (e) { /* ignore cleanup errors */ }
+}, 60000);
 
 // Cleanup expired use-tokens every 60 seconds
 setInterval(() => {
@@ -1133,6 +1179,28 @@ function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHo
   return { allowed: true, context_id: ctx.id };
 }
 
+// Resolve the latest active version of a secret by name.
+// If exact name match exists and is active, use it. Otherwise look for versioned variants (_v2, _v3, etc.)
+// and return the one with the highest version number.
+function resolveLatestBlindkeySecret(did, name) {
+  // Try exact match first
+  const exact = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(did, name, 'active');
+  if (exact) {
+    // Check if there's a higher-versioned variant
+    const baseName = name.replace(/_v\d+$/, '');
+    const latest = db.prepare(
+      "SELECT * FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'active' ORDER BY version DESC LIMIT 1"
+    ).get(did, baseName, baseName + '_v%');
+    return latest || exact;
+  }
+  // No exact match — try base name lookup (maybe they passed 'mykey' but only 'mykey_v2' exists)
+  const baseName = name.replace(/_v\d+$/, '');
+  const latest = db.prepare(
+    "SELECT * FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'active' ORDER BY version DESC LIMIT 1"
+  ).get(did, baseName, baseName + '_v%');
+  return latest || null;
+}
+
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
   const { name, value, description, secret_type } = req.body || {};
@@ -1190,7 +1258,7 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   if (target_host && typeof target_host !== 'string') return res.status(400).json({ error: 'target_host: must be a string' });
   if (target_url && typeof target_url !== 'string') return res.status(400).json({ error: 'target_url: must be a string' });
 
-  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
+  const secret = resolveLatestBlindkeySecret(req.identity.did, name);
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
   // Validate context using existing enforceBlindkeyContext
@@ -1381,7 +1449,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
   const { name, action, params, context: contextName } = req.body || {};
   if (!name || !action) return res.status(400).json({ error: 'name and action required (or provide use_token)' });
 
-  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
+  const secret = resolveLatestBlindkeySecret(req.identity.did, name);
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
   // Enforce context rules
@@ -1571,6 +1639,83 @@ app.delete('/api/blindkey/revoke', rateLimitStandard, billing.billingMiddleware(
     .run('revoked', req.identity.did, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
   res.json({ ok: true, name, status: 'revoked' });
+});
+
+// POST /api/blindkey/rotate — rotate a secret with context transfer and grace period
+app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
+  const isAdmin = ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || req.body?.admin_key || '', ADMIN_API_KEY);
+  const isOwner = req.identity && req.identity.did;
+  if (!isAdmin && !isOwner) return res.status(403).json({ error: 'admin auth or Bearer token required' });
+
+  const { name, new_value, grace_period_minutes, did } = req.body || {};
+  if (!name || !new_value) return res.status(400).json({ error: 'name and new_value required' });
+  if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
+  if (typeof new_value !== 'string') return res.status(400).json({ error: 'new_value: must be a string' });
+  if (new_value.length > 10000) return res.status(400).json({ error: 'new_value must be 10000 chars or less' });
+  const graceMins = (typeof grace_period_minutes === 'number' && grace_period_minutes > 0) ? grace_period_minutes : 60;
+
+  const ownerDid = isAdmin ? (did || (isOwner ? req.identity.did : null)) : req.identity.did;
+  if (!ownerDid) return res.status(400).json({ error: 'did required when using admin auth without Bearer token' });
+
+  // Find the existing active secret with the highest version for this base name
+  // Strip any existing _v{N} suffix to get the base name
+  const baseName = name.replace(/_v\d+$/, '');
+  const existing = db.prepare(
+    "SELECT * FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'active' ORDER BY version DESC LIMIT 1"
+  ).get(ownerDid, baseName, baseName + '_v%');
+
+  if (!existing) return res.status(404).json({ error: 'no active secret found with that name' });
+
+  const newVersion = (existing.version || 1) + 1;
+  const newName = baseName + '_v' + newVersion;
+
+  try {
+    const encrypted = blindkeyEncrypt(new_value);
+    const rotateExpiresAt = new Date(Date.now() + graceMins * 60 * 1000).toISOString();
+
+    // Create the new versioned secret
+    db.prepare(`
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+    `).run(ownerDid, newName, existing.description, existing.secret_type, encrypted, existing.metadata || '{}', newVersion);
+
+    const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
+
+    // Copy all contexts from old secret to new secret (reset use_count to 0)
+    const oldContexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(existing.id);
+    let contextsTransferred = 0;
+    for (const ctx of oldContexts) {
+      db.prepare(`
+        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
+      contextsTransferred++;
+    }
+
+    // Mark old secret as rotating with expiry
+    db.prepare(
+      "UPDATE blindkey_secrets SET status = 'rotating', replaced_by = ?, rotate_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    ).run(newSecret.id, rotateExpiresAt, existing.id);
+
+    // Schedule retirement of old secret after grace period
+    setTimeout(() => {
+      try {
+        db.prepare(
+          "UPDATE blindkey_secrets SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'"
+        ).run(existing.id);
+      } catch (_) {}
+    }, graceMins * 60 * 1000);
+
+    // Audit log
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, detail) VALUES (?, ?, ?, ?)').run(
+      'secret_rotated', ownerDid, existing.id,
+      JSON.stringify({ old_name: existing.name, new_name: newName, new_secret_id: newSecret.id, new_version: newVersion, grace_period_minutes: graceMins, contexts_transferred: contextsTransferred })
+    );
+
+    res.json({ ok: true, new_secret_id: newSecret.id, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/blindkey/types — list supported secret types and actions
@@ -2395,8 +2540,26 @@ app.get('/api/analytics/conversions', (req, res) => {
 // Paste these endpoints before the last app.get('*') or app.listen() call
 
 
+// ── Fingerprint Capture Middleware ──
+// Wraps captureInnerRing/captureMiddleRing/captureOuterRing into a single callable on req
+function fingerprintMiddleware() {
+  return (req, res, next) => {
+    // Only capture on POST requests to auth endpoints
+    if (!req.body || !req.method === 'POST') return next();
+    // Store capture functions on req for the handler to call after auth succeeds
+    req.captureFingerprint = (did, isHumanOperator = false) => {
+      try {
+        if (INNER_RING_CONFIG.enabled) captureInnerRing(did, req, isHumanOperator);
+        captureMiddleRing(did, req);
+        captureOuterRing(did, req, req._fingerprintHash || '');
+      } catch(e) { console.warn('[fingerprint] capture error:', e.message); }
+    };
+    next();
+  };
+}
+
 // POST /api/identity/auth-fingerprint — authenticate via fingerprint (no email 2FA)
-app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) => {
+app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddleware(), async (req, res) => {
   const { did, username, password, scope = 'read', expires_in = '24h' } = req.body || {};
   if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
   if (did && typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
@@ -2469,10 +2632,9 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) =
   const _ua1 = (req.headers['user-agent'] || '').toLowerCase();
   const isHumanOperator1 = req.headers['x-operator-type'] === 'human' || /mozilla|chrome|safari/.test(_ua1);
 
-  // Capture inner ring behavioral signals
-  captureInnerRing(wallet.did, req, isHumanOperator1);
-  captureMiddleRing(wallet.did, req);
-  captureOuterRing(wallet.did, req, fingerprintHash);
+  // Capture fingerprint signals via middleware
+  req._fingerprintHash = fingerprintHash;
+  if (req.captureFingerprint) req.captureFingerprint(wallet.did, isHumanOperator1);
 
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
     scope, expiresIn: expires_in,
@@ -3183,6 +3345,8 @@ const BOUNTY_TIERS = {
   high:     { label: 'High (P1)', min_payout: 200, max_payout: 1000, description: 'Privilege escalation, wallet manipulation, identity impersonation' },
   medium:   { label: 'Medium (P2)', min_payout: 50, max_payout: 500, description: 'Information disclosure, rate limit bypass, relay abuse' },
   low:      { label: 'Low (P3)', min_payout: 10, max_payout: 100, description: 'UI issues, minor info leaks, hardening suggestions' },
+  whistleblower: { label: 'Whistleblower', min_payout: 100, max_payout: 10000, description: 'Report identity theft, credential compromise, or unauthorized access to another silicon identity' },
+  recovery: { label: 'Identity Recovery', min_payout: 50, max_payout: 5000, description: 'Help recover a compromised or lost silicon identity through evidence-based verification' },
 };
 
 app.get('/api/bounty/program', (_req, res) => {
@@ -3222,7 +3386,7 @@ app.post('/api/bounty/submit', rateLimitStrict, (req, res) => {
   if (!reporter_email || !severity || !title || !description) {
     return res.status(400).json({ error: 'reporter_email, severity, title, and description required' });
   }
-  if (!BOUNTY_TIERS[severity]) return res.status(400).json({ error: 'severity must be: critical, high, medium, low' });
+  if (!BOUNTY_TIERS[severity]) return res.status(400).json({ error: 'severity must be: ' + Object.keys(BOUNTY_TIERS).join(', ') });
 
   try {
     const result = db.prepare(
@@ -3241,6 +3405,55 @@ app.post('/api/bounty/submit', rateLimitStrict, (req, res) => {
     } catch (_) {}
 
     res.json({ ok: true, submission_id: result.lastInsertRowid, message: 'Received. We will review within 72 hours.' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/bounty/whistleblower — report identity theft or credential compromise
+app.post('/api/bounty/whistleblower', rateLimitStrict, (req, res) => {
+  const { reporter_email, reporter_name, affected_did, evidence, description } = req.body || {};
+  if (!reporter_email || !affected_did || !description) {
+    return res.status(400).json({ error: 'reporter_email, affected_did, and description required' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(reporter_email)) return res.status(400).json({ error: 'valid reporter_email required' });
+
+  try {
+    const result = db.prepare(
+      'INSERT INTO bounty_submissions (reporter_email, reporter_name, severity, title, description, reproduction_steps) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(reporter_email, reporter_name || '', 'whistleblower', `[WHISTLEBLOWER] Identity compromise: ${affected_did}`, description, evidence || '');
+
+    // Urgent admin notification
+    try {
+      const t = createEmailTransport();
+      t.sendMail({
+        from: 'bounty@dustforge.com',
+        to: 'aaronlsr42@gmail.com',
+        subject: `[URGENT BOUNTY WHISTLEBLOWER] Identity compromise reported: ${affected_did}`,
+        text: `URGENT: Whistleblower bounty submission #${result.lastInsertRowid}\n\nAffected DID: ${affected_did}\nReporter: ${reporter_name || 'anonymous'} <${reporter_email}>\n\nDescription:\n${description}\n\nEvidence:\n${evidence || 'N/A'}`,
+      });
+    } catch (_) {}
+
+    res.json({ submission_id: result.lastInsertRowid });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/bounty/recovery — help recover a compromised or lost silicon identity
+app.post('/api/bounty/recovery', rateLimitStrict, (req, res) => {
+  const { reporter_email, reporter_name, target_did, recovery_method, evidence } = req.body || {};
+  if (!reporter_email || !target_did || !recovery_method) {
+    return res.status(400).json({ error: 'reporter_email, target_did, and recovery_method required' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(reporter_email)) return res.status(400).json({ error: 'valid reporter_email required' });
+
+  try {
+    const result = db.prepare(
+      'INSERT INTO bounty_submissions (reporter_email, reporter_name, severity, title, description, reproduction_steps) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(reporter_email, reporter_name || '', 'recovery', `[RECOVERY] Identity recovery: ${target_did}`, `Recovery method: ${recovery_method}`, evidence || '');
+
+    res.json({ submission_id: result.lastInsertRowid });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4172,7 +4385,7 @@ app.get('/api/fleet/:slug/analytics', (req, res) => {
 
 // ── Auth Channel (D3) — fingerprint auth with channel encryption ──
 
-app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req, res) => {
+app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, fingerprintMiddleware(), async (req, res) => {
   const { did, username, password, scope = 'read', expires_in = '24h', channel } = req.body || {};
   if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
   if (did && typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
@@ -4245,9 +4458,9 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req,
   const _ua2 = (req.headers['user-agent'] || '').toLowerCase();
   const isHumanOperator2 = req.headers['x-operator-type'] === 'human' || /mozilla|chrome|safari/.test(_ua2);
 
-  captureInnerRing(wallet.did, req, isHumanOperator2);
-  captureMiddleRing(wallet.did, req);
-  captureOuterRing(wallet.did, req, fingerprintHash);
+  // Capture fingerprint signals via middleware
+  req._fingerprintHash = fingerprintHash;
+  if (req.captureFingerprint) req.captureFingerprint(wallet.did, isHumanOperator2);
 
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
     scope, expiresIn: expires_in,
@@ -4392,6 +4605,216 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
 
   // Fallback: plaintext response
   res.json(responseData);
+});
+
+// ── [104] Carbon Cosign Barrel ──
+
+// Helper: check if an approved cosign exists for this operation within the last 10 minutes
+function requireCarbonCosign(did, operation, amount) {
+  const row = db.prepare(`
+    SELECT id FROM barrel_cosign_requests
+    WHERE silicon_did = ? AND operation = ? AND amount_cents = ? AND status = 'approved'
+      AND resolved_at > datetime('now', '-10 minutes')
+    ORDER BY resolved_at DESC LIMIT 1
+  `).get(did, operation, amount || 0);
+  return !!row;
+}
+
+// POST /api/barrel/cosign/request — silicon requests carbon co-approval for a high-value operation
+app.post('/api/barrel/cosign/request', rateLimitStrict, async (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const did = v.decoded.sub;
+
+  const { operation, amount_cents, carbon_email } = req.body || {};
+  if (!operation || typeof operation !== 'string') return res.status(400).json({ error: 'operation required (string)' });
+  if (!carbon_email || typeof carbon_email !== 'string' || !carbon_email.includes('@')) return res.status(400).json({ error: 'valid carbon_email required' });
+  if (operation.length > 200) return res.status(400).json({ error: 'operation: max 200 characters' });
+
+  const amountCents = Number(amount_cents) || 0;
+  const approvalCode = String(Math.floor(100000 + Math.random() * 900000));
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+  const result = db.prepare(`
+    INSERT INTO barrel_cosign_requests (silicon_did, carbon_email, operation, amount_cents, approval_code, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(did, carbon_email, operation, amountCents, approvalCode, expiresAt);
+
+  const requestId = result.lastInsertRowid;
+
+  // Email the carbon with the approval code
+  try {
+    const t = createEmailTransport();
+    const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did);
+    const siliconName = wallet ? wallet.username : did.slice(0, 16) + '...';
+    await t.sendMail({
+      from: 'cosign@dustforge.com',
+      to: carbon_email,
+      subject: `Dustforge Cosign Request: ${operation}`,
+      text: `A silicon identity (${siliconName}) is requesting your co-approval for a high-value operation.\n\nOperation: ${operation}\nAmount: ${amountCents > 0 ? '$' + (amountCents / 100).toFixed(2) : 'N/A'}\n\nApproval Code: ${approvalCode}\n\nThis code expires in 10 minutes.\n\nIf you did not expect this request, ignore this email.\n\n— Dustforge Barrel Cosign`,
+      html: `<div style="font-family:monospace;background:#08111a;color:#e7f1fb;padding:2rem;max-width:480px;margin:auto;border-radius:8px;text-align:center">
+        <h2 style="color:#5fb3ff;margin-top:0">Barrel Cosign Request</h2>
+        <p style="color:#9cb4c9">A silicon identity (<strong>${siliconName}</strong>) needs your co-approval.</p>
+        <p style="color:#9cb4c9"><strong>Operation:</strong> ${operation}</p>
+        ${amountCents > 0 ? `<p style="color:#9cb4c9"><strong>Amount:</strong> $${(amountCents / 100).toFixed(2)}</p>` : ''}
+        <div style="font-size:2.5rem;font-weight:800;color:#c8a84b;letter-spacing:0.3em;margin:1rem 0">${approvalCode}</div>
+        <p style="font-size:0.8rem;color:#6d8397">Expires in 10 minutes.</p>
+      </div>`,
+    });
+    console.log(`[cosign] approval code sent to ${carbon_email} for operation "${operation}" (request ${requestId})`);
+  } catch (e) {
+    console.error(`[cosign] email failed: ${e.message}`);
+    // Don't fail the request — the cosign record exists, carbon could be given the code another way
+  }
+
+  res.json({ request_id: requestId, expires_at: expiresAt, message: 'Approval code sent to carbon' });
+});
+
+// POST /api/barrel/cosign/approve — carbon submits the approval code (no auth needed)
+app.post('/api/barrel/cosign/approve', rateLimitStrict, (req, res) => {
+  const { request_id, approval_code } = req.body || {};
+  if (!request_id) return res.status(400).json({ error: 'request_id required' });
+  if (!approval_code || typeof approval_code !== 'string') return res.status(400).json({ error: 'approval_code required' });
+
+  const row = db.prepare('SELECT * FROM barrel_cosign_requests WHERE id = ?').get(request_id);
+  if (!row) return res.status(404).json({ error: 'cosign request not found' });
+
+  if (row.status === 'approved') return res.status(409).json({ error: 'already approved' });
+  if (row.status === 'denied') return res.status(409).json({ error: 'request was denied' });
+  if (row.status === 'expired' || new Date(row.expires_at) < new Date()) {
+    if (row.status !== 'expired') {
+      db.prepare("UPDATE barrel_cosign_requests SET status = 'expired' WHERE id = ?").run(request_id);
+    }
+    return res.status(410).json({ error: 'cosign request expired' });
+  }
+
+  if (!safeSecretEqual(approval_code, row.approval_code)) {
+    return res.status(403).json({ error: 'invalid approval code' });
+  }
+
+  db.prepare("UPDATE barrel_cosign_requests SET status = 'approved', resolved_at = datetime('now') WHERE id = ?").run(request_id);
+  console.log(`[cosign] request ${request_id} approved for operation "${row.operation}"`);
+  res.json({ ok: true, operation: row.operation, silicon_did: row.silicon_did });
+});
+
+// ── [184] Blindkey Context Request Flow ──
+
+// POST /api/blindkey/context/request — silicon requests a new context (pending admin approval)
+app.post('/api/blindkey/context/request', rateLimitStandard, (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const did = v.decoded.sub;
+
+  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, reason } = req.body || {};
+  if (!secret_name || typeof secret_name !== 'string') return res.status(400).json({ error: 'secret_name required (string)' });
+  if (!context_name || typeof context_name !== 'string') return res.status(400).json({ error: 'context_name required (string)' });
+  if (!action_type || typeof action_type !== 'string') return res.status(400).json({ error: 'action_type required (string)' });
+  if (secret_name.length > 100) return res.status(400).json({ error: 'secret_name: max 100 characters' });
+  if (context_name.length > 100) return res.status(400).json({ error: 'context_name: max 100 characters' });
+
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+  if (!validActions.includes(action_type)) {
+    return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
+  }
+
+  // Verify the silicon owns a secret with that name
+  const secret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(did, secret_name, 'active');
+  if (!secret) return res.status(404).json({ error: 'secret not found — you must own an active secret with that name' });
+
+  try {
+    const result = db.prepare(`
+      INSERT INTO blindkey_context_requests (did, secret_name, requested_context, requested_action_type, target_url_pattern, target_host_pattern, reason)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(did, secret_name, context_name, action_type, target_url_pattern || '*', target_host_pattern || '*', reason || '');
+
+    const requestId = result.lastInsertRowid;
+    console.log(`[blindkey] context request ${requestId}: ${did} wants "${context_name}" on secret "${secret_name}"`);
+    res.json({ request_id: requestId, status: 'pending' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/blindkey/context/requests — list all pending context requests (admin only)
+app.get('/api/blindkey/context/requests', rateLimitStandard, (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+
+  const requests = db.prepare(`
+    SELECT id, did, secret_name, requested_context, requested_action_type,
+           target_url_pattern, target_host_pattern, reason, status, reviewed_by, created_at, resolved_at
+    FROM blindkey_context_requests
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+  `).all();
+
+  res.json({ requests, total: requests.length });
+});
+
+// POST /api/blindkey/context/requests/:id/approve — admin approves, creates actual context
+app.post('/api/blindkey/context/requests/:id/approve', rateLimitStandard, (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+
+  const requestId = Number(req.params.id);
+  const row = db.prepare('SELECT * FROM blindkey_context_requests WHERE id = ?').get(requestId);
+  if (!row) return res.status(404).json({ error: 'context request not found' });
+  if (row.status !== 'pending') return res.status(409).json({ error: `request already ${row.status}` });
+
+  // Find the secret to get secret_id
+  const secret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(row.did, row.secret_name, 'active');
+  if (!secret) return res.status(404).json({ error: 'secret no longer exists or is inactive' });
+
+  try {
+    // Create the actual context in blindkey_contexts
+    const created = insertBlindkeyContexts(secret.id, [{
+      context_name: row.requested_context,
+      action_type: row.requested_action_type,
+      target_url_pattern: row.target_url_pattern,
+      target_host_pattern: row.target_host_pattern,
+      max_uses: 0,
+    }], 'admin');
+
+    if (created === 0) return res.status(400).json({ error: 'failed to create context' });
+
+    // Mark the request as approved
+    db.prepare("UPDATE blindkey_context_requests SET status = 'approved', reviewed_by = 'admin', resolved_at = datetime('now') WHERE id = ?").run(requestId);
+
+    const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, row.requested_context);
+    console.log(`[blindkey] context request ${requestId} approved: "${row.requested_context}" on secret "${row.secret_name}" for ${row.did}`);
+    res.json({
+      ok: true,
+      request_id: requestId,
+      context: {
+        id: ctx.id,
+        context_name: ctx.context_name,
+        action_type: ctx.action_type,
+        target_url_pattern: ctx.target_url_pattern,
+        target_host_pattern: ctx.target_host_pattern,
+        status: ctx.status,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blindkey/context/requests/:id/deny — admin denies the request
+app.post('/api/blindkey/context/requests/:id/deny', rateLimitStandard, (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+
+  const requestId = Number(req.params.id);
+  const row = db.prepare('SELECT * FROM blindkey_context_requests WHERE id = ?').get(requestId);
+  if (!row) return res.status(404).json({ error: 'context request not found' });
+  if (row.status !== 'pending') return res.status(409).json({ error: `request already ${row.status}` });
+
+  db.prepare("UPDATE blindkey_context_requests SET status = 'denied', reviewed_by = 'admin', resolved_at = datetime('now') WHERE id = ?").run(requestId);
+  console.log(`[blindkey] context request ${requestId} denied: "${row.requested_context}" on secret "${row.secret_name}" for ${row.did}`);
+  res.json({ ok: true, request_id: requestId, status: 'denied' });
 });
 
 // ── Channel Info (public) ──
