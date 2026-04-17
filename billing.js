@@ -80,9 +80,10 @@ function deductBalance(db, did, amount_cents, type, description = '') {
     }
 
     const newBalance = currentBalance - amount_cents;
+    const provenance = /fleet|bulk|provision/i.test(type) ? 'fleet_provisioned' : 'organic';
     db.prepare(
-      'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, ?, ?, ?, ?)'
-    ).run(did, -amount_cents, type, description, newBalance);
+      'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(did, -amount_cents, type, description, newBalance, provenance);
 
     // Update cache
     db.prepare('UPDATE identity_wallets SET balance_cents = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
@@ -120,10 +121,11 @@ function creditBalance(db, did, amount_cents, type, description = '', idempotenc
 
     const currentBalance = getDerivedBalance(db, did);
     const newBalance = currentBalance + amount_cents;
+    const provenance = /fleet|bulk|provision/i.test(type) ? 'fleet_provisioned' : 'organic';
 
     db.prepare(
-      'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, idempotency_key) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(did, amount_cents, type, description, newBalance, idempotency_key || null);
+      'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, idempotency_key, provenance) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(did, amount_cents, type, description, newBalance, idempotency_key || null, provenance);
 
     // Update cache
     db.prepare('UPDATE identity_wallets SET balance_cents = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')

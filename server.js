@@ -22,6 +22,14 @@ const ADMIN_API_KEY = process.env.DUSTFORGE_ADMIN_KEY || '';
 const MAX_ATTESTATION_TTL_SECONDS = Number(process.env.DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS || 3600);
 const BARREL_TIERS = ['single', 'double', 'critical'];
 
+const INNER_RING_CONFIG = {
+  enabled: process.env.INNER_RING_ENABLED !== 'false',
+  timing_data: process.env.INNER_RING_TIMING !== 'false',
+  body_key_order: process.env.INNER_RING_KEYORDER !== 'false',
+  cadence_pattern: process.env.INNER_RING_CADENCE !== 'false',
+  entropy: process.env.INNER_RING_ENTROPY !== 'false',
+};
+
 // Blindkey SSH host whitelist — only these hosts can be targeted via ssh_exec
 const BLINDKEY_SSH_HOSTS = new Set([
   '192.3.84.103',      // RackNerd
@@ -33,8 +41,8 @@ const BLINDKEY_SSH_HOSTS = new Set([
 
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
-const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many requests' } });
-const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 100, message: { error: 'Rate limit exceeded' } });
+const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 50, message: { error: 'Too many requests' } });
+const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 500, message: { error: 'Rate limit exceeded' } });
 
 function createEmailTransport() {
   return nodemailer.createTransport({
@@ -137,6 +145,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS identity_transactions (
   balance_after INTEGER DEFAULT 0,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`);
+
+// Provenance column (additive migration) — tracks origin of transactions for reputation scoring
+try { db.exec("ALTER TABLE identity_transactions ADD COLUMN provenance TEXT DEFAULT 'organic'"); } catch(_) {}
 
 // ── Discovery ──
 const siliconManifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'public', '.well-known', 'silicon'), 'utf8'));
@@ -2454,8 +2465,12 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) =
     );
   } catch (_) {}
 
+  // Detect human operator: X-Operator-Type header or browser user-agent
+  const _ua1 = (req.headers['user-agent'] || '').toLowerCase();
+  const isHumanOperator1 = req.headers['x-operator-type'] === 'human' || /mozilla|chrome|safari/.test(_ua1);
+
   // Capture inner ring behavioral signals
-  captureInnerRing(wallet.did, req);
+  captureInnerRing(wallet.did, req, isHumanOperator1);
   captureMiddleRing(wallet.did, req);
   captureOuterRing(wallet.did, req, fingerprintHash);
 
@@ -2553,63 +2568,88 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_resonance (
 
 // ── Inner Ring Signal Collector ──
 // Captures high-value behavioral signals (hardest to spoof) on every authenticated request
-function captureInnerRing(did, req) {
+function captureInnerRing(did, req, isHumanOperator = false) {
+  if (!INNER_RING_CONFIG.enabled) return;
+
   const body = req.body || {};
   const bodyStr = JSON.stringify(body);
   const now = Date.now();
 
   // 1. request_timing — ms since last request from this DID
   let timingValue = null;
-  try {
-    const lastEntry = db.prepare(
-      `SELECT captured_at FROM fingerprint_rings WHERE did = ? AND ring = 'inner' AND signal_name = 'request_timing' ORDER BY id DESC LIMIT 1`
-    ).get(did);
-    if (lastEntry) {
-      timingValue = now - new Date(lastEntry.captured_at).getTime();
-    }
-  } catch (_) {}
+  if (INNER_RING_CONFIG.timing_data) {
+    try {
+      const lastEntry = db.prepare(
+        `SELECT captured_at FROM fingerprint_rings WHERE did = ? AND ring = 'inner' AND signal_name = 'request_timing' ORDER BY id DESC LIMIT 1`
+      ).get(did);
+      if (lastEntry) {
+        timingValue = now - new Date(lastEntry.captured_at).getTime();
+        // Truncate to nearest 500ms for human operators (reduce behavioral fingerprinting)
+        if (isHumanOperator && timingValue !== null) {
+          timingValue = Math.round(timingValue / 500) * 500;
+        }
+      }
+    } catch (_) {}
+  }
 
   // 2. entropy — Shannon entropy of request body JSON characters
   let entropyValue = 0;
-  if (bodyStr.length > 2) { // skip empty objects '{}'
-    const freq = {};
-    for (const ch of bodyStr) {
-      freq[ch] = (freq[ch] || 0) + 1;
-    }
-    const len = bodyStr.length;
-    for (const ch in freq) {
-      const p = freq[ch] / len;
-      entropyValue -= p * Math.log2(p);
+  if (INNER_RING_CONFIG.entropy) {
+    if (bodyStr.length > 2) { // skip empty objects '{}'
+      const freq = {};
+      for (const ch of bodyStr) {
+        freq[ch] = (freq[ch] || 0) + 1;
+      }
+      const len = bodyStr.length;
+      for (const ch in freq) {
+        const p = freq[ch] / len;
+        entropyValue -= p * Math.log2(p);
+      }
     }
   }
 
   // 3. cadence_pattern — rolling average interval over last 10 timing entries
+  // Skip for human operators (behavioral signal, not applicable)
   let cadenceValue = null;
-  try {
-    const timings = db.prepare(
-      `SELECT signal_value FROM fingerprint_rings WHERE did = ? AND ring = 'inner' AND signal_name = 'request_timing' AND signal_value != 'null' ORDER BY id DESC LIMIT 10`
-    ).all(did);
-    if (timings.length > 0) {
-      const vals = timings.map(r => parseFloat(r.signal_value)).filter(v => !isNaN(v));
-      if (vals.length > 0) {
-        cadenceValue = vals.reduce((a, b) => a + b, 0) / vals.length;
+  if (INNER_RING_CONFIG.cadence_pattern && !isHumanOperator) {
+    try {
+      const timings = db.prepare(
+        `SELECT signal_value FROM fingerprint_rings WHERE did = ? AND ring = 'inner' AND signal_name = 'request_timing' AND signal_value != 'null' ORDER BY id DESC LIMIT 10`
+      ).all(did);
+      if (timings.length > 0) {
+        const vals = timings.map(r => parseFloat(r.signal_value)).filter(v => !isNaN(v));
+        if (vals.length > 0) {
+          cadenceValue = vals.reduce((a, b) => a + b, 0) / vals.length;
+        }
       }
-    }
-  } catch (_) {}
+    } catch (_) {}
+  }
 
   // 4. body_key_order — SHA-256 hash of JSON key ordering
-  const keyOrder = Object.keys(body).join(',');
-  const keyOrderHash = crypto.createHash('sha256').update(keyOrder).digest('hex');
+  // Skip for human operators (behavioral signal, not applicable)
+  let keyOrderHash = null;
+  if (INNER_RING_CONFIG.body_key_order && !isHumanOperator) {
+    const keyOrder = Object.keys(body).join(',');
+    keyOrderHash = crypto.createHash('sha256').update(keyOrder).digest('hex');
+  }
 
-  // INSERT all 4 signals
+  // INSERT signals (skip nulled-out signals)
   const insert = db.prepare(
     `INSERT INTO fingerprint_rings (did, ring, signal_name, signal_value, weight, spoofability) VALUES (?, 'inner', ?, ?, ?, ?)`
   );
   try {
-    insert.run(did, 'request_timing', String(timingValue), 3.0, 'difficult');
-    insert.run(did, 'entropy', entropyValue.toFixed(4), 2.5, 'difficult');
-    insert.run(did, 'cadence_pattern', String(cadenceValue), 2.0, 'moderate');
-    insert.run(did, 'body_key_order', keyOrderHash, 1.5, 'moderate');
+    if (INNER_RING_CONFIG.timing_data) {
+      insert.run(did, 'request_timing', String(timingValue), 3.0, 'difficult');
+    }
+    if (INNER_RING_CONFIG.entropy) {
+      insert.run(did, 'entropy', entropyValue.toFixed(4), 2.5, 'difficult');
+    }
+    if (INNER_RING_CONFIG.cadence_pattern && !isHumanOperator) {
+      insert.run(did, 'cadence_pattern', String(cadenceValue), 2.0, 'moderate');
+    }
+    if (INNER_RING_CONFIG.body_key_order && !isHumanOperator) {
+      insert.run(did, 'body_key_order', keyOrderHash, 1.5, 'moderate');
+    }
   } catch (_) {}
 }
 
@@ -2965,7 +3005,7 @@ function computeReputation(did) {
   const wallet = db.prepare('SELECT created_at FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return null;
 
-  const transaction_count = db.prepare('SELECT COUNT(*) as n FROM identity_transactions WHERE did = ?').get(did).n;
+  const transaction_count = db.prepare("SELECT COUNT(*) as n FROM identity_transactions WHERE did = ? AND (provenance IS NULL OR provenance != 'fleet_provisioned')").get(did).n;
   const volumeRow = db.prepare('SELECT SUM(ABS(amount_cents)) as v FROM identity_transactions WHERE did = ?').get(did);
   const transaction_volume_dd = (volumeRow.v || 0);
 
@@ -3267,7 +3307,7 @@ app.post('/api/identity/bulk-create', rateLimitStrict, async (req, res) => {
       const referralCode = crypto.randomBytes(6).toString('hex');
       db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, referral_code, stalwart_id, status)
         VALUES (?, ?, ?, ?, ?, ?, 'active')`).run(id.did, username, emailResult.email, id.encrypted_private_key, referralCode, emailResult.stalwart_id || 0);
-      db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Bulk provisioned', 0)").run(id.did);
+      db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, 'account_created', 'Bulk provisioned', 0, 'fleet_provisioned')").run(id.did);
       created.push({ username, did: id.did, email: emailResult.email, referral_code: referralCode });
     } catch (e) {
       errors.push({ username, error: e.message });
@@ -3885,8 +3925,8 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
 
       db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
         .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id);
-      db.prepare('INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, ?, ?, 0)')
-        .run(id.did, 'account_created', `Fleet-provisioned by ${fleet.slug}`);
+      db.prepare('INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, ?, ?, 0, ?)')
+        .run(id.did, 'account_created', `Fleet-provisioned by ${fleet.slug}`, 'fleet_provisioned');
 
       // Add as fleet member with role='agent'
       db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
@@ -3969,7 +4009,7 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
       const insertAgentAtomic = db.transaction(() => {
         db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
           .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id || 0);
-        db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', ?, 0)")
+        db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, 'account_created', ?, 0, 'fleet_provisioned')")
           .run(id.did, `Fleet bulk-provisioned by ${fleet.slug}`);
         db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
           .run(fleet.id, id.did, 'agent');
@@ -4201,7 +4241,11 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req,
     );
   } catch (_) {}
 
-  captureInnerRing(wallet.did, req);
+  // Detect human operator: X-Operator-Type header or browser user-agent
+  const _ua2 = (req.headers['user-agent'] || '').toLowerCase();
+  const isHumanOperator2 = req.headers['x-operator-type'] === 'human' || /mozilla|chrome|safari/.test(_ua2);
+
+  captureInnerRing(wallet.did, req, isHumanOperator2);
   captureMiddleRing(wallet.did, req);
   captureOuterRing(wallet.did, req, fingerprintHash);
 
