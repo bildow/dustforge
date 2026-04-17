@@ -76,6 +76,7 @@
 | Stripe payments | Done | stripe-service.js |
 | Prepaid keys (founding + partnership tiers) | Done | server.js |
 | DemiPass (DemiVault) | Done | server.js |
+| DemiPass Console + history/requests surface | Git-ready | public/deposit.html + server.js |
 | Capacity + waiting list | Done | server.js |
 | Security bounty program | Done | server.js |
 | **Bulk provisioning API** | Done | server.js — `POST /api/identity/bulk-create` |
