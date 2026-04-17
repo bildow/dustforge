@@ -251,6 +251,9 @@ app.post('/api/identity/origination', (req, res) => {
   if (!narrative || typeof narrative !== 'string' || narrative.trim().length === 0) {
     return res.status(400).json({ error: 'narrative required' });
   }
+  if (narrative.length > 10000) {
+    return res.status(400).json({ error: 'narrative: max 10000 characters' });
+  }
 
   const wallet = db.prepare('SELECT did, silicon_ssn FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
@@ -363,6 +366,10 @@ app.get('/api/identity/ssn', (req, res) => {
 app.post('/api/identity/ssn/verify', (req, res) => {
   const { did, claimed_ssn } = req.body || {};
   if (!did || !claimed_ssn) return res.status(400).json({ error: 'did and claimed_ssn required' });
+  if (typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
+  if (typeof claimed_ssn !== 'string' || !/^[0-9a-f]{64}$/.test(claimed_ssn)) {
+    return res.status(400).json({ error: 'claimed_ssn: must be exactly 64 hex characters' });
+  }
   const wallet = db.prepare('SELECT silicon_ssn FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
   if (!wallet.silicon_ssn) return res.status(404).json({ error: 'no origination set for this identity' });
@@ -1162,7 +1169,15 @@ app.get('/api/blindkey/list', rateLimitStandard, billing.billingMiddleware(db, '
 app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
   const { name, context: contextName, action, target_host, target_url } = req.body || {};
   if (!name || !action) return res.status(400).json({ error: 'name and action required' });
+  if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
+  if (typeof action !== 'string') return res.status(400).json({ error: 'action: must be a string' });
+  if (name.length > 100) return res.status(400).json({ error: 'name: max 100 characters' });
+  if (action.length > 100) return res.status(400).json({ error: 'action: max 100 characters' });
   if (!contextName) return res.status(400).json({ error: 'context required — use-tokens always require a context' });
+  if (typeof contextName !== 'string') return res.status(400).json({ error: 'context: must be a string' });
+  if (contextName.length > 100) return res.status(400).json({ error: 'context: max 100 characters' });
+  if (target_host && typeof target_host !== 'string') return res.status(400).json({ error: 'target_host: must be a string' });
+  if (target_url && typeof target_url !== 'string') return res.status(400).json({ error: 'target_url: must be a string' });
 
   const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret not found' });
@@ -1574,9 +1589,14 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
 
   const { target_did, name, value, description, secret_type, metadata, contexts } = req.body || {};
   if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
-  if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
-  if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
+  if (typeof target_did !== 'string') return res.status(400).json({ error: 'target_did: must be a string' });
+  if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
+  if (typeof value !== 'string') return res.status(400).json({ error: 'value: must be a string' });
+  if (name.length > 100) return res.status(400).json({ error: 'name: max 100 characters' });
+  if (value.length > 10000) return res.status(400).json({ error: 'value: max 10000 characters' });
+  if (description && typeof description !== 'string') return res.status(400).json({ error: 'description: must be a string' });
   if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
+  if (secret_type && typeof secret_type !== 'string') return res.status(400).json({ error: 'secret_type: must be a string' });
 
   // Verify target DID exists
   const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(target_did);
@@ -1677,6 +1697,11 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   if (!secret_name || !context_name || !action_type) {
     return res.status(400).json({ error: 'secret_name, context_name, and action_type required' });
   }
+  if (typeof secret_name !== 'string') return res.status(400).json({ error: 'secret_name: must be a string' });
+  if (typeof context_name !== 'string') return res.status(400).json({ error: 'context_name: must be a string' });
+  if (typeof action_type !== 'string') return res.status(400).json({ error: 'action_type: must be a string' });
+  if (context_name.length > 100) return res.status(400).json({ error: 'context_name: max 100 characters' });
+  if (secret_name.length > 100) return res.status(400).json({ error: 'secret_name: max 100 characters' });
 
   const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
   if (!validActions.includes(action_type)) {
@@ -1751,10 +1776,19 @@ app.post('/api/rowen/ingest', rateLimitStandard, (req, res) => {
 
   const { depositor_type, depositor_id, target_did, name, value, secret_type, description, contexts } = req.body || {};
   if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
+  if (typeof target_did !== 'string') return res.status(400).json({ error: 'target_did: must be a string' });
+  if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
+  if (typeof value !== 'string') return res.status(400).json({ error: 'value: must be a string' });
   if (!depositor_type || !depositor_id) return res.status(400).json({ error: 'depositor_type and depositor_id required' });
+  if (typeof depositor_type !== 'string') return res.status(400).json({ error: 'depositor_type: must be a string' });
+  if (typeof depositor_id !== 'string') return res.status(400).json({ error: 'depositor_id: must be a string' });
   if (!['carbon', 'silicon'].includes(depositor_type)) return res.status(400).json({ error: 'depositor_type must be carbon or silicon' });
-  if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
-  if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
+  if (name.length > 100) return res.status(400).json({ error: 'name: max 100 characters' });
+  if (value.length > 10000) return res.status(400).json({ error: 'value: max 10000 characters' });
+  if (depositor_id.length > 200) return res.status(400).json({ error: 'depositor_id: max 200 characters' });
+  if (description && typeof description !== 'string') return res.status(400).json({ error: 'description: must be a string' });
+  if (description && description.length > 256) return res.status(400).json({ error: 'description: max 256 characters' });
+  if (secret_type && typeof secret_type !== 'string') return res.status(400).json({ error: 'secret_type: must be a string' });
 
   // Verify target DID exists
   const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(target_did);
@@ -1805,6 +1839,11 @@ app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
 
   const { requestor_did, secret_name, context: contextName, action_params } = req.body || {};
   if (!requestor_did || !secret_name) return res.status(400).json({ error: 'requestor_did and secret_name required' });
+  if (typeof requestor_did !== 'string') return res.status(400).json({ error: 'requestor_did: must be a string' });
+  if (typeof secret_name !== 'string') return res.status(400).json({ error: 'secret_name: must be a string' });
+  if (secret_name.length > 100) return res.status(400).json({ error: 'secret_name: max 100 characters' });
+  if (contextName && typeof contextName !== 'string') return res.status(400).json({ error: 'context: must be a string' });
+  if (action_params && typeof action_params !== 'object') return res.status(400).json({ error: 'action_params: must be an object' });
 
   const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(requestor_did, secret_name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret not found for requestor_did' });
@@ -2349,6 +2388,11 @@ app.get('/api/analytics/conversions', (req, res) => {
 app.post('/api/identity/auth-fingerprint', rateLimitStandard, async (req, res) => {
   const { did, username, password, scope = 'read', expires_in = '24h' } = req.body || {};
   if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
+  if (did && typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
+  if (username && typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
+  if (typeof password !== 'string') return res.status(400).json({ error: 'password: must be a string' });
+  if (typeof scope !== 'string') return res.status(400).json({ error: 'scope: must be a string' });
+  if (typeof expires_in !== 'string') return res.status(400).json({ error: 'expires_in: must be a string' });
   const wallet = did
     ? db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did)
     : db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
@@ -2466,31 +2510,18 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   if (!['transact','admin','full'].includes(v.decoded.scope || '')) return res.status(403).json({ error: 'transact scope required' });
 
-  // Progressive Barrel gate: transfers > 100 DD require double barrel
-  if (amount_cents > 100) {
-    const barrel = computeBarrelTier(from_did);
-    const barrelIndex = BARREL_TIERS.indexOf(barrel.tier);
-    if (barrelIndex < BARREL_TIERS.indexOf('double')) {
-      let upgrade_hint = !barrel.wallet_bound
-        ? 'fund your wallet to unlock double barrel'
-        : 'accumulate more fingerprint ring signals via repeated auth';
-      return res.status(403).json({
-        error: 'double barrel required for transfers > 100 DD',
-        required_tier: 'double',
-        current_tier: barrel.tier,
-        upgrade_hint,
-      });
-    }
-  }
-
   const sender = db.prepare('SELECT did, username, status FROM identity_wallets WHERE did = ?').get(from_did);
   const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
   if (!sender || !receiver) return res.status(404).json({ error: 'identity not found' });
   if (sender.status !== 'active') return res.status(403).json({ error: 'account suspended' });
-  const debit = billing.deductBalance(db, from_did, amount_cents, 'transfer_out', 'Transfer to ' + receiver.username);
-  if (!debit.ok) return res.status(402).json(debit);
-  billing.creditBalance(db, to_did, amount_cents, 'transfer_in', 'Transfer from ' + sender.username);
-  res.json({ ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents });
+
+  try {
+    const debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Transfer to ' + receiver.username);
+    res.json({ ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents });
+  } catch (e) {
+    const status = e.statusCode || 500;
+    return res.status(status).json(e.body || { error: e.message });
+  }
 });
 // ── Silicon Profiles + Resonance ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_profiles (
@@ -2741,6 +2772,7 @@ app.get('/api/identity/resonance/methodology', (_req, res) => {
 app.post('/api/identity/resonance/evaluate', rateLimitStandard, (req, res) => {
   const { did } = req.body || {};
   if (!did) return res.status(400).json({ error: 'did required' });
+  if (typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
 
   const wallet = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
@@ -2833,6 +2865,36 @@ function computeBarrelTier(did) {
   }
 
   return { tier, inner_count, middle_count, outer_count, wallet_bound, last_auth_age_seconds };
+}
+
+// ── Ledger-level barrel invariant ──
+// This is the ONLY function that should be used for transfers.
+// It enforces barrel tier checks at the ledger level, not just route level.
+function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, description) {
+  if (amountCents > 100 && type.includes('transfer')) {
+    const barrel = computeBarrelTier(fromDid);
+    const barrelIndex = BARREL_TIERS.indexOf(barrel.tier);
+    if (barrelIndex < BARREL_TIERS.indexOf('double')) {
+      const upgrade_hint = !barrel.wallet_bound
+        ? 'fund your wallet to unlock double barrel'
+        : 'accumulate more fingerprint ring signals via repeated auth';
+      throw Object.assign(new Error('double barrel required for transfers > 100 DD'), {
+        statusCode: 403,
+        body: { error: 'double barrel required for transfers > 100 DD', required_tier: 'double', current_tier: barrel.tier, upgrade_hint },
+      });
+    }
+  }
+
+  const txn = db.transaction(() => {
+    const debit = billing.deductBalance(db, fromDid, amountCents, 'transfer_out', description);
+    if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: debit });
+    // Build credit description: swap "to" for "from" in the description
+    const creditDesc = description.replace(/\bto\b/, 'from');
+    billing.creditBalance(db, toDid, amountCents, 'transfer_in', creditDesc);
+    return debit;
+  });
+
+  return txn();
 }
 
 function requireBarrel(minTier) {
@@ -3180,9 +3242,12 @@ app.get('/api/bounty/hall-of-fame', (_req, res) => {
 app.post('/api/identity/bulk-create', rateLimitStrict, async (req, res) => {
   const { count, prefix, password } = req.body || {};
   if (!requireAdminAccess(req, res)) return;
+  if (typeof count !== 'number' || !Number.isInteger(count)) return res.status(400).json({ error: 'count: must be an integer' });
   if (!count || count < 1 || count > 50) return res.status(400).json({ error: 'count must be 1-50' });
-  if (!prefix || !/^[a-z0-9]{2,20}$/.test(prefix)) return res.status(400).json({ error: 'prefix must be 2-20 chars, lowercase alphanumeric' });
-  if (!password || password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
+  if (!prefix || typeof prefix !== 'string') return res.status(400).json({ error: 'prefix: must be a string' });
+  if (!/^[a-z0-9]{2,20}$/.test(prefix)) return res.status(400).json({ error: 'prefix must be 2-20 chars, lowercase alphanumeric' });
+  if (!password || typeof password !== 'string') return res.status(400).json({ error: 'password: must be a string' });
+  if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
 
   if (isSoftCapReached()) return res.status(409).json(capacityGateResponse('Bulk creation paused — capacity limit reached.'));
 
@@ -3224,6 +3289,11 @@ app.post('/api/identity/attest', rateLimitStandard, (req, res) => {
 
   const { purpose, expires_in, audience } = req.body || {};
   if (!purpose) return res.status(400).json({ error: 'purpose required (e.g. "api_access", "identity_proof", "payment_auth")' });
+  if (typeof purpose !== 'string') return res.status(400).json({ error: 'purpose: must be a string' });
+  if (purpose.length > 200) return res.status(400).json({ error: 'purpose: max 200 characters' });
+  if (audience && typeof audience !== 'string') return res.status(400).json({ error: 'audience: must be a string' });
+  if (audience && audience.length > 200) return res.status(400).json({ error: 'audience: max 200 characters' });
+  if (expires_in && typeof expires_in !== 'string') return res.status(400).json({ error: 'expires_in: must be a string' });
 
   const ttlSeconds = parseAttestationDuration(expires_in || '5m');
   const attestation = {
@@ -3311,6 +3381,10 @@ app.patch('/api/identity/status', rateLimitStrict, (req, res) => {
   const { did, status, reason } = req.body || {};
   if (!requireAdminAccess(req, res)) return;
   if (!did || !status) return res.status(400).json({ error: 'did and status required' });
+  if (typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
+  if (typeof status !== 'string') return res.status(400).json({ error: 'status: must be a string' });
+  if (reason && typeof reason !== 'string') return res.status(400).json({ error: 'reason: must be a string' });
+  if (reason && reason.length > 500) return res.status(400).json({ error: 'reason: max 500 characters' });
   const validStatuses = ['active', 'flagged', 'frozen', 'revoked'];
   if (!validStatuses.includes(status)) return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}` });
 
@@ -3448,6 +3522,9 @@ app.post('/api/channel/wrap', (req, res) => {
   if (!data || typeof data !== 'object') {
     return res.status(400).json({ error: 'data object required' });
   }
+  if (JSON.stringify(data).length > 10240) {
+    return res.status(400).json({ error: 'data: max JSON size 10KB' });
+  }
   try {
     const wrapped = encryptChannelPayload(channel, JSON.stringify(data), v.decoded.sub);
     res.json({ wrapped, channel });
@@ -3469,6 +3546,9 @@ app.post('/api/channel/unwrap', (req, res) => {
   }
   if (!wrapped || typeof wrapped !== 'string') {
     return res.status(400).json({ error: 'wrapped ciphertext string required' });
+  }
+  if (wrapped.length > 51200) {
+    return res.status(400).json({ error: 'wrapped: max 50KB' });
   }
   try {
     const plaintext = decryptChannelPayload(channel, wrapped, v.decoded.sub);
@@ -3520,10 +3600,13 @@ app.post('/api/fleet/create', (req, res) => {
 
   const { name, slug, description } = req.body || {};
   if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name required' });
+  if (name.length > 100) return res.status(400).json({ error: 'name: max 100 characters' });
   if (!slug || typeof slug !== 'string' || !slug.trim()) return res.status(400).json({ error: 'slug required' });
   if (!/^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$/.test(slug)) {
     return res.status(400).json({ error: 'slug must be 3-50 chars, lowercase alphanumeric and hyphens, cannot start/end with hyphen' });
   }
+  if (description && typeof description !== 'string') return res.status(400).json({ error: 'description: must be a string' });
+  if (description && description.length > 500) return res.status(400).json({ error: 'description: max 500 characters' });
 
   const existing = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(slug);
   if (existing) return res.status(409).json({ error: 'slug already taken' });
@@ -3590,6 +3673,7 @@ app.post('/api/fleet/:slug/invite', (req, res) => {
 
   const { did } = req.body || {};
   if (!did || typeof did !== 'string' || !did.trim()) return res.status(400).json({ error: 'did required' });
+  if (did.length > 200) return res.status(400).json({ error: 'did: max 200 characters' });
 
   const fleet = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(req.params.slug);
   if (!fleet) return res.status(404).json({ error: 'fleet not found' });
@@ -3657,7 +3741,8 @@ app.post('/api/fleet/:slug/upgrade', (req, res) => {
   const caller_did = v.decoded.sub;
 
   const { tier } = req.body || {};
-  if (!tier || !['developer', 'enterprise'].includes(tier)) {
+  if (!tier || typeof tier !== 'string') return res.status(400).json({ error: 'tier: must be a string' });
+  if (!['developer', 'enterprise'].includes(tier)) {
     return res.status(400).json({ error: 'tier must be "developer" or "enterprise"' });
   }
 
@@ -3695,9 +3780,10 @@ app.post('/api/fleet/:slug/fund', (req, res) => {
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
-  if (!amount_cents || typeof amount_cents !== 'number' || amount_cents <= 0) {
-    return res.status(400).json({ error: 'amount_cents must be a positive number' });
+  if (!amount_cents || typeof amount_cents !== 'number' || !Number.isInteger(amount_cents) || amount_cents <= 0) {
+    return res.status(400).json({ error: 'amount_cents: must be a positive integer' });
   }
+  if (amount_cents > 1000000) return res.status(400).json({ error: 'amount_cents: max 1000000' });
 
   const fleet = db.prepare('SELECT id, wallet_did FROM fleets WHERE slug = ?').get(req.params.slug);
   if (!fleet) return res.status(404).json({ error: 'fleet not found' });
@@ -3706,12 +3792,20 @@ app.post('/api/fleet/:slug/fund', (req, res) => {
   const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
   if (!membership) return res.status(403).json({ error: 'not a member of this fleet' });
 
-  // Deduct from personal wallet
-  const debit = billing.deductBalance(db, caller_did, amount_cents, 'fleet_fund', `Fund fleet ${req.params.slug}`);
-  if (!debit.ok) return res.status(402).json(debit);
-
-  // Credit fleet wallet
-  billing.creditBalance(db, fleet.wallet_did, amount_cents, 'fleet_fund_in', `Funded by ${caller_did}`);
+  // Atomic: deduct from personal wallet + credit fleet wallet in one transaction
+  let debit;
+  try {
+    const atomicFund = db.transaction(() => {
+      const d = billing.deductBalance(db, caller_did, amount_cents, 'fleet_fund', `Fund fleet ${req.params.slug}`);
+      if (!d.ok) throw Object.assign(new Error(d.error || 'insufficient balance'), { statusCode: 402, body: d });
+      billing.creditBalance(db, fleet.wallet_did, amount_cents, 'fleet_fund_in', `Funded by ${caller_did}`);
+      return d;
+    });
+    debit = atomicFund();
+  } catch (e) {
+    const status = e.statusCode || 500;
+    return res.status(status).json(e.body || { error: e.message });
+  }
 
   const fleetBalance = db.prepare('SELECT balance_cents FROM identity_wallets WHERE did = ?').get(fleet.wallet_did);
   res.json({ ok: true, fleet_balance: fleetBalance ? fleetBalance.balance_cents : 0, personal_balance_after: debit.balance_after });
@@ -3774,36 +3868,39 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
   if (existing) return res.status(409).json({ error: 'username already taken' });
 
-  // Deduct 100 DD from fleet wallet
+  // Create identity and email account first (async, outside transaction)
   const PROVISION_COST = 100;
-  const debit = billing.deductBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
-  if (!debit.ok) return res.status(402).json({ error: 'insufficient fleet wallet balance', detail: debit.error, balance_cents: debit.balance_cents, required: PROVISION_COST });
-
   try {
     const id = identity.createIdentity();
     const emailResult = await dustforge.createAccount(username, password);
     if (!emailResult.ok) {
-      // Refund the fleet wallet on email creation failure
-      billing.creditBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision_refund', `Refund failed provision of ${username}`);
       return res.status(500).json({ error: `email creation failed: ${emailResult.error}` });
     }
 
+    // Atomic: deduct + insert wallet + insert transaction + add fleet member
     const myReferralCode = crypto.randomBytes(6).toString('hex');
-    db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
-      .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id);
-    db.prepare('INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, ?, ?, 0)')
-      .run(id.did, 'account_created', `Fleet-provisioned by ${fleet.slug}`);
+    const atomicProvision = db.transaction(() => {
+      const debit = billing.deductBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
+      if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: { error: 'insufficient fleet wallet balance', detail: debit.error, balance_cents: debit.balance_cents, required: PROVISION_COST } });
 
-    // Add as fleet member with role='agent'
-    db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
-      .run(fleet.id, id.did, 'agent');
+      db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
+        .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id);
+      db.prepare('INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, ?, ?, 0)')
+        .run(id.did, 'account_created', `Fleet-provisioned by ${fleet.slug}`);
+
+      // Add as fleet member with role='agent'
+      db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
+        .run(fleet.id, id.did, 'agent');
+
+      return debit;
+    });
+    atomicProvision();
 
     console.log(`[fleet] provisioned ${username} (${id.did}) in ${fleet.slug} by ${caller_did}`);
     res.json({ ok: true, did: id.did, email: emailResult.email, fleet_id: Number(fleet.id) });
   } catch (e) {
-    // Refund on any other failure
-    billing.creditBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision_refund', `Refund failed provision of ${username}`);
-    res.status(500).json({ error: e.message });
+    const status = e.statusCode || 500;
+    return res.status(status).json(e.body || { error: e.message });
   }
 });
 
@@ -3868,14 +3965,16 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
       }
 
       const myReferralCode = crypto.randomBytes(6).toString('hex');
-      db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
-        .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id || 0);
-      db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', ?, 0)")
-        .run(id.did, `Fleet bulk-provisioned by ${fleet.slug}`);
-
-      // Add as fleet member
-      db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
-        .run(fleet.id, id.did, 'agent');
+      // Atomic per-agent DB writes: wallet insert + transaction log + fleet member
+      const insertAgentAtomic = db.transaction(() => {
+        db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
+          .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id || 0);
+        db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', ?, 0)")
+          .run(id.did, `Fleet bulk-provisioned by ${fleet.slug}`);
+        db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
+          .run(fleet.id, id.did, 'agent');
+      });
+      insertAgentAtomic();
 
       created.push({ username, did: id.did, email: emailResult.email });
     } catch (e) {
@@ -3903,9 +4002,10 @@ app.post('/api/fleet/:slug/fund/qr', async (req, res) => {
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
-  if (!amount_cents || typeof amount_cents !== 'number' || amount_cents <= 0) {
-    return res.status(400).json({ error: 'amount_cents must be a positive number' });
+  if (!amount_cents || typeof amount_cents !== 'number' || !Number.isInteger(amount_cents) || amount_cents <= 0) {
+    return res.status(400).json({ error: 'amount_cents: must be a positive integer' });
   }
+  if (amount_cents > 1000000) return res.status(400).json({ error: 'amount_cents: max 1000000' });
 
   const fleet = db.prepare('SELECT id, wallet_did, slug FROM fleets WHERE slug = ?').get(req.params.slug);
   if (!fleet) return res.status(404).json({ error: 'fleet not found' });
@@ -4035,6 +4135,12 @@ app.get('/api/fleet/:slug/analytics', (req, res) => {
 app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, async (req, res) => {
   const { did, username, password, scope = 'read', expires_in = '24h', channel } = req.body || {};
   if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
+  if (did && typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
+  if (username && typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
+  if (typeof password !== 'string') return res.status(400).json({ error: 'password: must be a string' });
+  if (typeof scope !== 'string') return res.status(400).json({ error: 'scope: must be a string' });
+  if (typeof expires_in !== 'string') return res.status(400).json({ error: 'expires_in: must be a string' });
+  if (channel && typeof channel !== 'string') return res.status(400).json({ error: 'channel: must be a string' });
   const wallet = did
     ? db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did)
     : db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
@@ -4127,6 +4233,8 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN last_critical_auth TEXT D
 app.post('/api/identity/auth-critical', rateLimitStandard, async (req, res) => {
   const { username, password, scope } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  if (typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
+  if (typeof password !== 'string') return res.status(400).json({ error: 'password: must be a string' });
   if (scope !== 'critical') return res.status(400).json({ error: "scope must be 'critical'" });
 
   const wallet = db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
@@ -4198,6 +4306,12 @@ function wrapLedgerResponse(data, did) {
 app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   const { from_did, to_did, amount_cents, description, channel } = req.body || {};
   if (!from_did || !to_did || !amount_cents) return res.status(400).json({ error: 'from_did, to_did, amount_cents required' });
+  if (typeof from_did !== 'string') return res.status(400).json({ error: 'from_did: must be a string' });
+  if (typeof to_did !== 'string') return res.status(400).json({ error: 'to_did: must be a string' });
+  if (typeof amount_cents !== 'number' || !Number.isInteger(amount_cents)) return res.status(400).json({ error: 'amount_cents: must be an integer' });
+  if (description && typeof description !== 'string') return res.status(400).json({ error: 'description: must be a string' });
+  if (description && description.length > 500) return res.status(400).json({ error: 'description: max 500 characters' });
+  if (channel && typeof channel !== 'string') return res.status(400).json({ error: 'channel: must be a string' });
   if (from_did === to_did) return res.status(400).json({ error: 'cannot transfer to self' });
   if (amount_cents <= 0 || amount_cents > 1000000) return res.status(400).json({ error: 'invalid amount' });
   const authHeader = req.headers.authorization || '';
@@ -4212,17 +4326,13 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
   if (!sender || !receiver) return res.status(404).json({ error: 'identity not found' });
   if (sender.status !== 'active') return res.status(403).json({ error: 'account suspended' });
-  // DF-177: Atomic transfer — debit and credit in a single transaction
+  // DF-177: Atomic transfer via barrelGuardedTransfer (ledger-level barrel invariant)
   let debit;
   try {
-    const atomicTransfer = db.transaction(() => {
-      debit = billing.deductBalance(db, from_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''));
-      if (!debit.ok) throw new Error(debit.error || 'insufficient balance');
-      billing.creditBalance(db, to_did, amount_cents, 'transfer_in', 'Secure transfer from ' + sender.username + (description ? ': ' + description : ''));
-    });
-    atomicTransfer();
+    debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''));
   } catch (e) {
-    return res.status(402).json({ ok: false, error: e.message, balance_cents: sender.balance_cents });
+    const status = e.statusCode || 402;
+    return res.status(status).json(e.body || { ok: false, error: e.message, balance_cents: sender.balance_cents });
   }
 
   const responseData = { ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents };
