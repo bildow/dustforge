@@ -30,7 +30,7 @@ const INNER_RING_CONFIG = {
   entropy: process.env.INNER_RING_ENTROPY !== 'false',
 };
 
-// Blindkey SSH host whitelist — only these hosts can be targeted via ssh_exec
+// DemiPass SSH host whitelist — only these hosts can be targeted via ssh_exec
 const BLINDKEY_SSH_HOSTS = new Set([
   '192.3.84.103',      // RackNerd
   '100.83.112.88',     // phasewhip
@@ -82,6 +82,12 @@ db.pragma('journal_mode = WAL');
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, 'public')));
+
+// DemiPass public surface — keep legacy /api/blindkey/* routes working during the rename.
+app.use('/api/demipass', (req, _res, next) => {
+  req.url = '/api/blindkey' + req.url;
+  next();
+});
 
 // ── CORS ──
 app.use((req, res, next) => {
@@ -918,6 +924,7 @@ app.get('/api/stripe/prices', (req, res) => {
       email_send: '1 DD',
       relay_forward: '1 DD per forward',
       blindkey_use: '1 DD per action',
+      demipass_use: '1 DD per action',
       wallet_transfer: 'free',
       identity_lookup: 'free',
     },
@@ -929,7 +936,7 @@ app.get('/api/stripe/prices', (req, res) => {
 // ============================================================
 
 // ============================================================
-// Blindkey — secrets that never enter the LLM context
+// DemiPass — secrets that never enter the LLM context
 // ============================================================
 // The silicon calls the API to USE a secret without ever seeing it.
 // Dustforge injects the secret server-side, makes the call, returns the result.
@@ -937,6 +944,8 @@ app.get('/api/stripe/prices', (req, res) => {
 //
 // This is the only safe pattern for AI agents because you can't trust
 // the agent's runtime — prompt injection can exfiltrate anything in context.
+// DemiVault is the backend storage layer. The blindkey_* SQLite schema remains
+// in place for compatibility with live deployments and already-issued automation.
 
 try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_secrets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3341,7 +3350,7 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS bounty_submissions (
 )`); } catch(e) {}
 
 const BOUNTY_TIERS = {
-  critical: { label: 'Critical (P0)', min_payout: 500, max_payout: 5000, description: 'Auth bypass, RCE, data exfiltration, Blindkey secret leakage' },
+  critical: { label: 'Critical (P0)', min_payout: 500, max_payout: 5000, description: 'Auth bypass, RCE, data exfiltration, DemiPass secret leakage' },
   high:     { label: 'High (P1)', min_payout: 200, max_payout: 1000, description: 'Privilege escalation, wallet manipulation, identity impersonation' },
   medium:   { label: 'Medium (P2)', min_payout: 50, max_payout: 500, description: 'Information disclosure, rate limit bypass, relay abuse' },
   low:      { label: 'Low (P3)', min_payout: 10, max_payout: 100, description: 'UI issues, minor info leaks, hardening suggestions' },
@@ -3356,7 +3365,7 @@ app.get('/api/bounty/program', (_req, res) => {
     scope: [
       'api.dustforge.com — all endpoints',
       'dustforge.com — static site',
-      'Authentication (fingerprint, token, Blindkey)',
+      'Authentication (fingerprint, token, DemiPass)',
       'Billing/wallet (Diamond Dust ledger)',
       'Email system (send, relay, forward)',
       'Prepaid key system',
@@ -3703,6 +3712,7 @@ app.get('/api/ops/dashboard', (req, res) => {
     },
     prepaid: { total: prepaidKeysTotal, active: prepaidKeysActive, redeemed: prepaidKeysRedeemed },
     blindkey: { secrets_stored: blindkeySecrets, total_uses: blindkeyUses },
+    demipass: { secrets_stored: blindkeySecrets, total_uses: blindkeyUses, storage_backend: 'DemiVault (legacy blindkey_* schema)' },
     relays: relays,
     fingerprint_profiles: profiles,
     waiting_list: waitingList,
@@ -4373,7 +4383,7 @@ app.get('/api/fleet/:slug/analytics', (req, res) => {
     fleet: { name: fleet.name, slug: fleet.slug, tier: fleet.tier, member_count: memberCount, max_agents: fleet.max_agents },
     wallet: { balance_dd: walletBalance, total_funded_dd: fundedRow.total, total_spent_dd: spentRow.total },
     members: memberDetails,
-    activity: { transactions_24h, transactions_7d, emails_sent_24h, blindkey_uses_24h },
+    activity: { transactions_24h, transactions_7d, emails_sent_24h, blindkey_uses_24h, demipass_uses_24h: blindkey_uses_24h },
     top_agents,
     fingerprint_health: {
       agents_with_inner_ring,
@@ -4700,7 +4710,7 @@ app.post('/api/barrel/cosign/approve', rateLimitStrict, (req, res) => {
   res.json({ ok: true, operation: row.operation, silicon_did: row.silicon_did });
 });
 
-// ── [184] Blindkey Context Request Flow ──
+// ── [184] DemiPass Context Request Flow ──
 
 // POST /api/blindkey/context/request — silicon requests a new context (pending admin approval)
 app.post('/api/blindkey/context/request', rateLimitStandard, (req, res) => {

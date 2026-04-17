@@ -9,7 +9,7 @@ Goal:
 
 Questions:
 - did fingerprinting work in practice during Brain onboarding
-- could Brain actually store and use a Blindkey/secret safely
+- could Brain actually store and use a DemiPass/secret safely
 - is the resonance score meaningful enough to be shown or relied on
 
 Deliverables:

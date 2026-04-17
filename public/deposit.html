@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Blindkey Deposit — Dustforge</title>
+<title>DemiPass Deposit — Dustforge</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#d96b6b; --warm:#c8a84b; }
@@ -51,8 +51,8 @@
   <!-- Step 1: Authenticate as Carbon -->
   <div id="step1">
     <div class="step-indicator"><span class="step-dot active"></span><span class="step-dot"></span><span class="step-dot"></span><span class="step-dot"></span></div>
-    <h1>Blindkey <span>Deposit</span></h1>
-    <p class="subtitle">Deposit secrets into a Silicon's Blindkey vault. Secrets never enter the LLM context.</p>
+    <h1>DemiPass <span>Deposit</span></h1>
+    <p class="subtitle">Deposit secrets into a Silicon's DemiVault. Secrets never enter the LLM context.</p>
 
     <div class="form-group">
       <label>Admin Key</label>
@@ -78,7 +78,7 @@
     <div class="info-card" id="silicon-info" style="display:none">
       <div class="info-row"><span class="info-label">Username</span><span class="info-value" id="info-username"></span></div>
       <div class="info-row"><span class="info-label">DID</span><span class="info-value mono" id="info-did"></span></div>
-      <div class="info-row"><span class="info-label">Blindkey Secrets</span><span class="info-value" id="info-secret-count"></span></div>
+      <div class="info-row"><span class="info-label">DemiPass Secrets</span><span class="info-value" id="info-secret-count"></span></div>
     </div>
 
     <button class="btn-primary" id="btn-continue-deposit" style="display:none;margin-top:1rem" onclick="showDepositForm()">Continue to Deposit</button>
@@ -238,7 +238,7 @@ async function lookupSilicon() {
 
     document.getElementById('info-username').textContent = data.username;
     document.getElementById('info-did').textContent = data.did;
-    document.getElementById('info-secret-count').textContent = (data.blindkey_count !== undefined ? data.blindkey_count : data.secret_count !== undefined ? data.secret_count : '—');
+    document.getElementById('info-secret-count').textContent = (data.demipass_count !== undefined ? data.demipass_count : data.blindkey_count !== undefined ? data.blindkey_count : data.secret_count !== undefined ? data.secret_count : '—');
     document.getElementById('silicon-info').style.display = 'block';
     document.getElementById('btn-continue-deposit').style.display = 'block';
     clearStatus('step2-status');
@@ -295,7 +295,7 @@ async function depositSecret() {
   showStatus('step3-status', 'info', 'Depositing...');
 
   try {
-    const res = await fetch(API + '/api/blindkey/deposit', {
+    const res = await fetch(API + '/api/demipass/deposit', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -311,7 +311,7 @@ async function depositSecret() {
     // Move to verification step
     document.getElementById('step3').style.display = 'none';
     document.getElementById('step4').style.display = 'block';
-    document.getElementById('step4-summary').textContent = 'Secret "' + name + '" deposited into ' + targetUsername + "'s Blindkey vault.";
+    document.getElementById('step4-summary').textContent = 'Secret "' + name + '" deposited into ' + targetUsername + "'s DemiVault.";
     document.getElementById('verify-target').textContent = targetUsername;
 
     // Fetch updated secret list
@@ -327,7 +327,7 @@ async function loadSecretList() {
 
   try {
     const param = targetUsername ? 'username=' + encodeURIComponent(targetUsername) : 'did=' + encodeURIComponent(targetDid);
-    const res = await fetch(API + '/api/blindkey/list?' + param, {
+    const res = await fetch(API + '/api/demipass/list?' + param, {
       headers: { 'x-admin-key': adminKey },
     });
     const data = await res.json();

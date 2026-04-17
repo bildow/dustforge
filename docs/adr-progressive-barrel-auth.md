@@ -38,8 +38,8 @@ Three assurance tiers, each building on the previous:
 
 | Tier | Requirements | Authorized Operations |
 |------|-------------|----------------------|
-| **Single barrel** | Fingerprint auth only | Reads, lookups, email send, Blindkey use, wallet balance checks |
-| **Double barrel** | Fingerprint + wallet binding verified | Transfers > 100 DD, identity status changes, Blindkey store/delete, resonance attestations |
+| **Single barrel** | Fingerprint auth only | Reads, lookups, email send, DemiPass use, wallet balance checks |
+| **Double barrel** | Fingerprint + wallet binding verified | Transfers > 100 DD, identity status changes, DemiPass store/delete, resonance attestations |
 | **Critical barrel** | Double barrel + fresh re-auth within 5 minutes | Key export, account deletion, SSN derivation, recovery key generation |
 
 **Single barrel** is the default. A silicon authenticates via fingerprint, receives a single-barrel JWT, and can perform all standard operations.

@@ -75,7 +75,7 @@
 | Referral system (10 DD) | Done | referral.js |
 | Stripe payments | Done | stripe-service.js |
 | Prepaid keys (founding + partnership tiers) | Done | server.js |
-| Blindkey (secrets vault) | Done | server.js |
+| DemiPass (DemiVault) | Done | server.js |
 | Capacity + waiting list | Done | server.js |
 | Security bounty program | Done | server.js |
 | **Bulk provisioning API** | Done | server.js — `POST /api/identity/bulk-create` |
@@ -169,7 +169,7 @@
 
 ## Database Tables (SQLite, WAL mode)
 
-`identity_wallets`, `identity_transactions`, `identity_pending_checkouts`, `identity_2fa_codes`, `prepaid_keys`, `prepaid_entitlements`, `email_verifications`, `forward_relays`, `blindkey_secrets`, `silicon_profiles`, `silicon_resonance`, `silicon_vault`, `platform_tokens`, `conversion_events`, `waiting_list`, `bounty_submissions`
+`identity_wallets`, `identity_transactions`, `identity_pending_checkouts`, `identity_2fa_codes`, `prepaid_keys`, `prepaid_entitlements`, `email_verifications`, `forward_relays`, `blindkey_secrets` (legacy DemiVault schema), `silicon_profiles`, `silicon_resonance`, `silicon_vault`, `platform_tokens`, `conversion_events`, `waiting_list`, `bounty_submissions`
 
 ## Runtime Notes
 

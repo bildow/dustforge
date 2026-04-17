@@ -20,7 +20,7 @@ This plan is based on:
 - Files:
   - `server.js`
 
-2. Blindkey `http_header` exfiltrates the secret
+2. DemiPass `http_header` exfiltrates the secret
 - Live result: secret was reflected back through `postman-echo.com` in the API response body.
 - Root cause: caller controls outbound URL and Dustforge returns upstream response content verbatim.
 - Files:
@@ -46,7 +46,7 @@ This plan is based on:
 
 ### P1 — Fix in the same patch set if possible
 
-6. Blindkey `verify_match` is an equality oracle
+6. DemiPass `verify_match` is an equality oracle
 - Live result: exact candidate returned `matches: true`.
 - Root cause: direct string comparison API over stored secret.
 - Files:
@@ -87,7 +87,7 @@ This plan is based on:
 - Remove or hard-gate `/api/billing/topup`.
 - If needed for ops, require an admin-only shared secret or internal-only route.
 
-3. Restrict Blindkey actions
+3. Restrict DemiPass actions
 - Remove `http_header` entirely, or hard-allowlist destinations and redact upstream response bodies.
 - Remove `verify_match`, or replace it with a bounded internal-use-only mechanism unavailable to silicons.
 
@@ -122,7 +122,7 @@ This plan is based on:
 ### `server.js`
 - `POST /api/identity/auth-fingerprint`
 - `POST /api/billing/topup`
-- `POST /api/blindkey/use`
+- `POST /api/demipass/use`
 - `POST /api/prepaid/purchase`
 - `GET /api/prepaid/success`
 - `POST /api/relay/create`
@@ -138,8 +138,8 @@ This plan is based on:
 
 1. Wrong password on `auth-fingerprint` returns `401`.
 2. Stalwart outage on `auth-fingerprint` returns `503`, never `200`.
-3. Blindkey secret cannot be exfiltrated through caller-controlled outbound requests.
-4. Blindkey cannot be used as a direct equality oracle by a silicon.
+3. DemiPass secret cannot be exfiltrated through caller-controlled outbound requests.
+4. DemiPass cannot be used as a direct equality oracle by a silicon.
 5. `/api/billing/topup` rejects unauthenticated callers.
 6. `/api/prepaid/purchase` rejects missing or invalid verification tokens.
 7. Stripe metadata no longer contains raw passwords.
@@ -153,7 +153,7 @@ This plan is based on:
 - create a disposable account
 - verify wrong password fails
 - verify temporary auth dependency failure fails closed
-- store a Blindkey test secret and confirm no action returns it
+- store a DemiPass test secret and confirm no action returns it
 - confirm prepaid purchase without verification token fails
 - confirm external wallet credit requires auth or internal credentials
 

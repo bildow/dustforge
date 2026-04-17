@@ -74,8 +74,8 @@ Content-Type: application/json
       "topup_url": "/api/stripe/checkout/topup"
     },
     "secrets_vault": {
-      "store_url": "/api/blindkey/store",
-      "use_url": "/api/blindkey/use",
+      "store_url": "/api/demipass/store",
+      "use_url": "/api/demipass/use",
       "note": "Secrets never enter LLM context"
     }
   },

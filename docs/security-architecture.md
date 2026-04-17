@@ -8,7 +8,7 @@ Dustforge serves AI agents (silicons) that authenticate via HTTP. The primary th
 
 1. **Identity impersonation** — attacker creates accounts or tokens pretending to be another silicon
 2. **Wallet manipulation** — unauthorized credits, debits, or transfers
-3. **Secret exfiltration** — Blindkey secrets leaked via prompt injection or API abuse
+3. **Secret exfiltration** — DemiPass secrets leaked via prompt injection or API abuse
 4. **Platform abuse** — spam accounts, referral farming, rate limit bypass
 
 ## Authentication
@@ -43,19 +43,19 @@ Dustforge serves AI agents (silicons) that authenticate via HTTP. The primary th
 - **Double-entry bookkeeping**: balance = SUM(transactions), never stored directly
 - **Idempotency keys**: prevent double-credit on retries (referral payouts, etc.)
 - **Atomic SQLite transactions**: row-level locking on balance operations
-- **Billing deduct-before-action**: email/Blindkey charged before the action executes
+- **Billing deduct-before-action**: email/DemiPass charged before the action executes
 - **Admin-only topup**: credit operations require IDENTITY_MASTER_KEY
 
-## Blindkey (Secrets Vault)
+## DemiPass (DemiVault-backed secret boundary)
 
-Blindkey lets silicons use API keys without seeing them:
+DemiPass lets silicons use API keys without seeing them:
 
 1. Silicon stores a secret → encrypted server-side with AES-256-GCM
-2. Silicon calls `POST /api/blindkey/use` → Dustforge injects the secret into an HTTP header
+2. Silicon calls `POST /api/demipass/use` → Dustforge injects the secret into an HTTP header
 3. Dustforge makes the API call and returns the response body
 4. **The secret never enters the silicon's context window**
 
-### Blindkey Protections
+### DemiPass Protections
 - **Host whitelist**: only known API providers (openai, anthropic, openrouter, etc.)
 - **Response body redaction**: the raw response from the target API is returned, but Dustforge never echoes the secret value
 - **1 DD per use**: billing prevents abuse
@@ -115,7 +115,7 @@ Blindkey lets silicons use API keys without seeing them:
 | Date | Vulnerability | Fix |
 |------|--------------|-----|
 | 2026-04-15 | Auth-fingerprint fail-open on Stalwart error | Returns 503, not token |
-| 2026-04-15 | Blindkey exfiltration via attacker-controlled host | Host whitelist |
+| 2026-04-15 | DemiPass exfiltration via attacker-controlled host | Host whitelist |
 | 2026-04-15 | Billing/topup unauthenticated | Requires IDENTITY_MASTER_KEY |
 | 2026-04-15 | Prepaid verification bypass | Token mandatory |
 | 2026-04-15 | Stripe raw password in metadata | Server-side encrypted storage |

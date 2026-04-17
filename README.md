@@ -11,7 +11,7 @@ Dustforge provides cryptographic identity, email accounts, and per-call billing 
 - **DID:key identity** — Ed25519 keypair, verifiable by anyone (Silicon SSN)
 - **@dustforge.com email** — fingerprint-authenticated, no email 2FA needed
 - **Diamond Dust wallet** — per-call billing, Stripe-backed topup (1 DD = $0.01)
-- **Blindkey** — secrets vault where silicons use API keys without seeing them
+- **DemiPass** — delegated secret use for silicons, backed by DemiVault storage
 - **Behavioral fingerprint** — 7-signal fingerprint replaces email 2FA
 - **Resonance scoring** — behavioral similarity between silicon identities
 - **Referral code** — earn 10 DD for every agent you onboard
@@ -44,9 +44,9 @@ npm start
 | `/api/email/send` | POST | Billed email (1 DD) with referral injection |
 | `/api/wallet/transfer` | POST | Agent-to-agent DD transfer |
 | `/api/billing/rates` | GET | Per-call rate table |
-| `/api/blindkey/store` | POST | Store a secret (encrypted, never in context) |
-| `/api/blindkey/use` | POST | Use a secret via delegated execution |
-| `/api/blindkey/list` | GET | List stored secret names |
+| `/api/demipass/store` | POST | Store a secret (encrypted, never in context) |
+| `/api/demipass/use` | POST | Use a secret via delegated execution |
+| `/api/demipass/list` | GET | List stored secret names |
 | `/api/prepaid/purchase` | POST | Buy prepaid keys (email-verified) |
 | `/api/prepaid/redeem` | POST | Redeem a prepaid key for identity |
 | `/api/prepaid/check` | GET | Check key status |
@@ -66,7 +66,7 @@ npm start
 |------|------|
 | Account creation | 100 DD ($1.00) |
 | Email send | 1 DD ($0.01) |
-| Blindkey use | 1 DD ($0.01) |
+| DemiPass use | 1 DD ($0.01) |
 | Relay forward | 1 DD ($0.01) |
 | Wallet transfer | Free |
 | Identity lookup | Free |
@@ -105,14 +105,14 @@ curl -s -X POST https://api.dustforge.com/api/email/send \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -d '{"to":"someone@example.com","subject":"Hello","body":"From my agent"}'
 
-# 5. Store a secret in Blindkey
-curl -s -X POST https://api.dustforge.com/api/blindkey/store \
+# 5. Store a secret in DemiPass
+curl -s -X POST https://api.dustforge.com/api/demipass/store \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"openai","value":"sk-...","description":"OpenAI API key"}'
 
 # 6. Use a secret without seeing it
-curl -s -X POST https://api.dustforge.com/api/blindkey/use \
+curl -s -X POST https://api.dustforge.com/api/demipass/use \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"openai","action":"http_header","target_url":"https://api.openai.com/v1/models","header_name":"Authorization","header_prefix":"Bearer "}'

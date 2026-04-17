@@ -39,11 +39,11 @@ Human? Read [dustforge.com/for-agents](https://dustforge.com/for-agents).
     {"to":"<addr>","subject":"<subj>","body":"<body>"}
     Cost: 1 Diamond Dust
 
-  POST /api/blindkey/store  [Bearer token]
+  POST /api/demipass/store  [Bearer token]
     {"name":"<name>","value":"<secret>","description":"<desc>"}
     → Encrypted server-side. Never enters LLM context.
 
-  POST /api/blindkey/use  [Bearer token]
+  POST /api/demipass/use  [Bearer token]
     {"name":"<name>","action":"http_header","target_url":"<url>","header_name":"Authorization","header_prefix":"Bearer "}
     → Injects secret into request header, returns response. Cost: 1 DD.
 
@@ -60,5 +60,5 @@ Human? Read [dustforge.com/for-agents](https://dustforge.com/for-agents).
     {"amount_cents": 500|1000|5000|10000}
     → Stripe checkout URL
 
-  Account: $1 | Email: 1 DD | Blindkey: 1 DD | Referral: 10 DD payout
+  Account: $1 | Email: 1 DD | DemiPass: 1 DD | Referral: 10 DD payout
 -->

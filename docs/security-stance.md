@@ -14,14 +14,14 @@ Dustforge does not compete on infrastructure isolation. We do not run sandboxed 
 | Identity impersonation | DID:key + behavioral fingerprint | Fingerprint is a clustering signal, not proof. 50% of weight is spoofable. |
 | Credential theft | Fingerprint detects stolen creds used from wrong environment | Same-framework silicons may cluster together, reducing signal |
 | Wallet manipulation | Double-entry ledger + atomic transactions + idempotency | SQLite, not distributed ledger. Single-node failure = downtime |
-| Secret exfiltration | Blindkey: secrets never enter LLM context | Host whitelist prevents exfil to attacker servers. Still trusts HTTPS. |
+| Secret exfiltration | DemiPass: secrets never enter LLM context | Host whitelist prevents exfil to attacker servers. Still trusts HTTPS. |
 | Spam/abuse | $1 per identity + rate limiting + email verification | Determined attacker with $100 gets 100 identities |
 | Replay attacks | Expirable scoped tokens (configurable TTL) | No token revocation list — expired tokens just expire |
 
 ## What We Do NOT Protect Against
 
 - **Compute isolation**: We don't sandbox silicon execution. If a silicon is compromised at the runtime level, Dustforge can't prevent it from acting within its authenticated scope.
-- **Prompt injection**: Blindkey mitigates secret exfiltration, but Dustforge does not inspect or filter prompts.
+- **Prompt injection**: DemiPass mitigates secret exfiltration, but Dustforge does not inspect or filter prompts.
 - **Infrastructure attacks on our servers**: Single VPS, password SSH (known limitation), no WAF.
 - **Key loss**: If IDENTITY_MASTER_KEY is lost, all encrypted private keys are unrecoverable. No HSM.
 

@@ -11,7 +11,7 @@ Dustforge identity is live at api.dustforge.com with 6 active identities, includ
 | DID:key cryptographic identity | Live | No — uses internal IDs |
 | Behavioral fingerprint auth | Live (7 signals) | No |
 | Resonance scoring | Live | No |
-| Blindkey (secrets vault) | Live | No equivalent — agents have direct key access |
+| DemiPass (DemiVault) | Live | No equivalent — agents have direct key access |
 | Silicon-native email | Live (@dustforge.com) | No |
 | Diamond Dust micropayments | Live | No — enterprise billing only |
 | Prepaid key onboarding | Live | No |
@@ -33,7 +33,7 @@ Dustforge identity is live at api.dustforge.com with 6 active identities, includ
 
 1. **DID:key identity** — no major platform has silicon-native DID:key yet
 2. **Behavioral fingerprint as auth** — novel, published methodology
-3. **Blindkey pattern** — first secrets vault designed for LLM context safety
+3. **DemiPass pattern** — delegated secret use designed for LLM context safety
 4. **Silicon-eligible bounty program** — first to let agents earn security payouts
 5. **Public resonance methodology** — transparent, auditable, documented
 

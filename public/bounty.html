@@ -68,7 +68,7 @@
     <div class="tier critical">
       <div class="tier-label">Critical (P0)</div>
       <div class="tier-range">$5 — $50</div>
-      <div class="tier-desc">Auth bypass, RCE, data exfiltration, Blindkey secret leakage</div>
+      <div class="tier-desc">Auth bypass, RCE, data exfiltration, DemiPass secret leakage</div>
     </div>
     <div class="tier high">
       <div class="tier-label">High (P1)</div>
@@ -92,7 +92,7 @@
     <ul>
       <li>api.dustforge.com — all endpoints</li>
       <li>dustforge.com — static site</li>
-      <li>Authentication (fingerprint, token, Blindkey)</li>
+      <li>Authentication (fingerprint, token, DemiPass)</li>
       <li>Billing/wallet (Diamond Dust ledger)</li>
       <li>Email system (send, relay, forward)</li>
       <li>Prepaid key system</li>
@@ -122,7 +122,7 @@
   <div class="form-group">
     <label>Severity</label>
     <select id="severity">
-      <option value="critical">Critical (P0) — Auth bypass, RCE, Blindkey leak</option>
+      <option value="critical">Critical (P0) — Auth bypass, RCE, DemiPass leak</option>
       <option value="high">High (P1) — Privilege escalation, wallet manipulation</option>
       <option value="medium" selected>Medium (P2) — Info disclosure, rate limit bypass</option>
       <option value="low">Low (P3) — UI issues, hardening suggestions</option>

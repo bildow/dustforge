@@ -4,7 +4,7 @@
  * Runs on phasewhip (100.83.112.88:7743). Only accessible over Tailscale.
  * The Dustforge API on RackNerd calls this for operations that must never
  * leave the trusted network: private key decryption, ledger writes,
- * and blind key usage.
+ * and DemiPass usage.
  *
  * Auth: HMAC-SHA256 on every request (except /vault/health).
  * Anomaly detection: lockdown after 10 decrypts in 60 seconds.
@@ -66,6 +66,12 @@ try {
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json());
+
+// DemiPass public surface — keep legacy /vault/blindkey-use working during the rename.
+app.use('/vault/demipass-use', (req, _res, next) => {
+  req.url = '/vault/blindkey-use';
+  next();
+});
 
 // Rate limit: 100 requests per minute per IP
 const globalLimiter = rateLimit({
@@ -183,7 +189,7 @@ function lockdownCheck(req, res, next) {
   next();
 }
 
-// ── Encryption helpers (match identity.js / blindkey pattern) ──
+// ── Encryption helpers (match identity.js / DemiPass pattern) ──
 
 function decryptPrivateKey(encryptedBase64) {
   const key = Buffer.from(IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
@@ -349,7 +355,7 @@ app.post('/vault/ledger-write', hmacAuth, lockdownCheck, (req, res) => {
   }
 });
 
-// ── POST /vault/blindkey-use ──
+// ── POST /vault/blindkey-use (legacy) / /vault/demipass-use (public) ──
 app.post('/vault/blindkey-use', hmacAuth, lockdownCheck, async (req, res) => {
   const { did, secret_name, context, action, action_params } = req.body || {};
 
@@ -534,5 +540,5 @@ app.post('/vault/blindkey-use', hmacAuth, lockdownCheck, async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[vault] listening on 0.0.0.0:${PORT}`);
   console.log(`[vault] DB: ${DB_PATH}`);
-  console.log(`[vault] Endpoints: /vault/health, /vault/decrypt, /vault/ledger-write, /vault/blindkey-use`);
+  console.log(`[vault] Endpoints: /vault/health, /vault/decrypt, /vault/ledger-write, /vault/blindkey-use, /vault/demipass-use`);
 });

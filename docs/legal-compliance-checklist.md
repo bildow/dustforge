@@ -122,7 +122,7 @@ Last updated: 2026-04-16
 | Rate limiting | [x] | Three-tier express-rate-limit (strict/standard/relaxed) — shipped 2026-04-12 |
 | Wallet double-entry validation | [x] | Double-entry bookkeeping, balance=SUM(transactions), idempotency keys — shipped 2026-04-12 |
 | Database backups | [x] | Daily at 2 AM on RackNerd, 14-day retention — shipped 2026-04-08 |
-| Blindkey host whitelist | [x] | Only known API providers allowed — shipped 2026-04-15 |
+| DemiPass host whitelist | [x] | Only known API providers allowed — shipped 2026-04-15 |
 | Auth fail-closed | [x] | Stalwart lookup failure returns 503, not token — shipped 2026-04-15 |
 | Fingerprint capture | [x] | auth-fingerprint now INSERTs silicon_profiles — shipped 2026-04-16 |
 | Bounty program | [x] | /bounty.html + /api/bounty/* — DD-only payouts until Stripe Connect KYC — shipped 2026-04-16 |
