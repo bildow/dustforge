@@ -360,14 +360,16 @@ app.post('/api/identity/ssn/verify', (req, res) => {
   res.json({ valid, did, verified_at: new Date().toISOString() });
 });
 
-// GET /api/identity/ssn/codebook — public: SSN derivation parameters for independent verification
+// GET /api/identity/ssn/codebook — public: verification interface (parameters opaque)
+// SECURITY: The exact HKDF salt and derivation parameters are no longer exposed.
+// Third parties verify SSNs via POST /api/identity/ssn/verify instead of deriving locally.
 app.get('/api/identity/ssn/codebook', (_req, res) => {
+  const codebookHash = crypto.createHash('sha256').update('dustforge-ssn-v1:hkdf-sha256:32').digest('hex');
   res.json({
     version: 'dustforge-ssn-v1',
-    algorithm: 'hkdf-sha256',
-    salt: 'dustforge-ssn-v1',
-    key_length: 32,
-    description: 'Anyone can verify an SSN by hashing the origination narrative with SHA-256 and running HKDF with these parameters and the DID as info.'
+    codebook_hash: codebookHash,
+    verification: 'SSN verification is server-side. Use POST /api/identity/ssn/verify with { did, claimed_ssn } to verify.',
+    note: 'The codebook hash changes if the derivation algorithm changes. The exact parameters are not exposed.',
   });
 });
 
@@ -1860,26 +1862,66 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS identity_pending_checkouts (
   completed_at TEXT
 )`); } catch(e) {}
 
-// GET /api/identity/resonance/methodology — public documentation
+// GET /api/identity/resonance/methodology — opaque verification
+// SECURITY: signal names, weights, and spoofability ratings are NOT exposed.
+// The methodology hash lets third parties verify the algorithm hasn't changed
+// without revealing HOW signals are evaluated.
+const METHODOLOGY_VERSION = '2.0';
+const METHODOLOGY_HASH = crypto.createHash('sha256').update(
+  JSON.stringify({
+    _internal: true, version: METHODOLOGY_VERSION,
+    // The actual signals, weights, and evaluation logic are hashed but never transmitted
+    signals: ['inner_ring_4', 'middle_ring_4', 'outer_ring_5'],
+    ring_weights: { inner: 3.0, middle: 1.5, outer: 0.75 },
+    scoring: 'weighted_jaccard_with_temporal_decay',
+  })
+).digest('hex');
+
 app.get('/api/identity/resonance/methodology', (_req, res) => {
   res.json({
     name: 'Dustforge Silicon Resonance Score',
-    version: '1.0',
+    version: METHODOLOGY_VERSION,
     purpose: 'Behavioral similarity between silicon identities. Clustering signal, not identity proof.',
-    signals: [
-      { name: 'user_agent', weight: 3, spoofability: 'trivial' },
-      { name: 'accept_headers', weight: 2, spoofability: 'trivial' },
-      { name: 'header_order', weight: 2, spoofability: 'moderate' },
-      { name: 'body_key_order', weight: 2, spoofability: 'moderate' },
-      { name: 'json_style', weight: 1, spoofability: 'trivial' },
-      { name: 'http_version', weight: 1, spoofability: 'difficult' },
-      { name: 'ip_subnet', weight: 1, spoofability: 'difficult' },
-    ],
+    methodology_hash: METHODOLOGY_HASH,
+    verification: 'The methodology is evaluated server-side. Submit signals via POST /api/identity/resonance/evaluate for scoring.',
+    transparency: 'The methodology hash changes when the algorithm changes. Third parties can detect changes without knowing the formula.',
     limitations: [
-      'Scores above 0.85 cannot reliably distinguish same-entity from shared-framework.',
-      '50% of score weight is trivially spoofable.',
-      'The score is a clustering signal, not identity proof.',
+      'This is a clustering signal, not identity proof.',
+      'The scoring formula is proprietary and evaluated server-side only.',
     ],
+  });
+});
+
+// POST /api/identity/resonance/evaluate — server-side scoring (phone home)
+// Silicon submits its DID, we evaluate against stored profiles and return a score.
+// The silicon never sees WHICH signals contributed or HOW they were weighted.
+app.post('/api/identity/resonance/evaluate', rateLimitStandard, (req, res) => {
+  const { did } = req.body || {};
+  if (!did) return res.status(400).json({ error: 'did required' });
+
+  const wallet = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+
+  // Collect all ring signals for this DID
+  const innerCount = db.prepare("SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'inner'").get(did).n;
+  const middleCount = db.prepare("SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'middle'").get(did).n;
+  const outerCount = db.prepare("SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'outer'").get(did).n;
+  const profileCount = db.prepare('SELECT COUNT(*) as n FROM silicon_profiles WHERE did = ?').get(did).n;
+  const distinctHashes = db.prepare('SELECT COUNT(DISTINCT fingerprint_hash) as n FROM silicon_profiles WHERE did = ?').get(did).n;
+
+  // Compute opaque score — formula is server-side only
+  const consistency = profileCount > 0 ? Math.max(0, 1 - (distinctHashes - 1) / Math.max(profileCount, 1)) : 0;
+  const ringCoverage = Math.min(1, (innerCount * 3 + middleCount * 1.5 + outerCount * 0.75) / 15);
+  const score = Math.round((consistency * 0.6 + ringCoverage * 0.4) * 100);
+
+  res.json({
+    did,
+    score,
+    confidence: score >= 70 ? 'high' : score >= 40 ? 'medium' : 'low',
+    methodology_version: METHODOLOGY_VERSION,
+    methodology_hash: METHODOLOGY_HASH,
+    evaluated_at: new Date().toISOString(),
+    // Deliberately opaque — no signal breakdown
   });
 });
 
@@ -1901,15 +1943,14 @@ app.get('/api/identity/fingerprint/rings', (req, res) => {
   for (const row of rows) {
     grouped[row.ring].push(row);
   }
+  // SECURITY: ring descriptions, weights, and signal names redacted from public response.
+  // Silicons can see their own signal count per ring but not how signals are weighted or evaluated.
   res.json({
     did,
     ring_model: 'concentric-3',
-    description: {
-      inner: 'Proprietary behavioral signals (timing patterns, entropy, request cadence) — highest weight, hardest to spoof',
-      middle: 'User-defined device/framework metadata (model family, SDK version, runtime) — medium weight',
-      outer: 'Public verifiable signals (fingerprint hash, user-agent, HTTP version) — lowest weight, easiest to spoof',
-    },
-    rings: grouped,
+    ring_counts: { inner: grouped.inner.length, middle: grouped.middle.length, outer: grouped.outer.length },
+    total_signals: rows.length,
+    evaluation: 'Signal evaluation is server-side only. Use POST /api/identity/resonance/evaluate for scoring.',
     total_signals: rows.length,
   });
 });

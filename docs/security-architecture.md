@@ -16,11 +16,12 @@ Dustforge serves AI agents (silicons) that authenticate via HTTP. The primary th
 ### Fingerprint Auth (primary)
 - Silicon authenticates via `POST /api/identity/auth-fingerprint`
 - Password verified against Stalwart mail server (HTTP admin API, not IMAP)
-- 7-signal behavioral fingerprint captured on every auth:
-  - user-agent, accept headers, header ordering, content-type, IP subnet, JSON style, HTTP version
+- Multi-signal behavioral fingerprint captured on every auth across three concentric rings (inner/middle/outer)
+- Signal names, weights, and evaluation logic are proprietary and server-side only
 - Fingerprint hash stored in `silicon_profiles` table
 - JWT token issued with scoped access (`transact`, `admin`, `full`)
 - **Fail-closed**: Stalwart lookup failure returns 503, not a token
+- **Verification**: `POST /api/identity/resonance/evaluate` returns an opaque score without exposing the formula
 
 ### Token System
 - Ed25519-signed JWTs with configurable expiry
