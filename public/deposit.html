@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blindkey Deposit — Dustforge</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#d96b6b; --warm:#c8a84b; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:2rem; }
+  .container { max-width:520px; width:100%; }
+  h1 { font-size:1.6rem; font-weight:800; margin-bottom:0.5rem; }
+  h1 span { color:var(--accent); }
+  .subtitle { color:var(--text2); font-size:0.9rem; margin-bottom:2rem; }
+  .form-group { margin-bottom:1.25rem; }
+  label { display:block; font-size:0.8rem; color:var(--text2); margin-bottom:0.4rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
+  input[type="text"], input[type="password"], select, textarea { width:100%; padding:0.65rem 0.75rem; background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:0.95rem; outline:none; font-family:inherit; }
+  textarea { min-height:60px; resize:vertical; }
+  select { cursor:pointer; }
+  input:focus, select:focus, textarea:focus { border-color:var(--accent); }
+  .row { display:flex; gap:0.75rem; }
+  .row .form-group { flex:1; }
+  .btn-primary { width:100%; padding:0.8rem; background:var(--accent); color:var(--bg); border:none; border-radius:8px; font-size:1rem; font-weight:700; cursor:pointer; transition:background 0.2s; }
+  .btn-primary:hover { background:#4a9bc5; }
+  .btn-primary:disabled { opacity:0.5; cursor:not-allowed; }
+  .status { margin-top:1rem; padding:0.75rem; border-radius:6px; font-size:0.85rem; display:none; }
+  .status.error { display:block; background:rgba(217,107,107,0.15); color:var(--red); border:1px solid var(--red); }
+  .status.info { display:block; background:rgba(95,179,255,0.1); color:var(--accent); border:1px solid var(--accent); }
+  .status.success { display:block; background:rgba(105,199,177,0.1); color:var(--green); border:1px solid var(--green); }
+  .step-indicator { display:flex; gap:0.5rem; margin-bottom:2rem; }
+  .step-dot { width:8px; height:8px; border-radius:50%; background:var(--border); }
+  .step-dot.active { background:var(--accent); }
+  .step-dot.done { background:var(--green); }
+  .back { color:var(--text3); text-decoration:none; font-size:0.85rem; display:inline-block; margin-top:1.5rem; }
+  .back:hover { color:var(--accent); }
+  #step2, #step3, #step4 { display:none; }
+  .info-card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; margin:1rem 0; }
+  .info-row { display:flex; justify-content:space-between; margin-bottom:0.5rem; font-size:0.85rem; }
+  .info-row:last-child { margin-bottom:0; }
+  .info-label { color:var(--text2); }
+  .info-value { color:var(--text); font-weight:600; }
+  .info-value.mono { font-family:monospace; font-size:0.8rem; color:var(--warm); letter-spacing:0.05em; }
+  .ssh-fields { margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border); display:none; }
+  .secret-list { list-style:none; }
+  .secret-list li { background:var(--card); border:1px solid var(--border); border-radius:6px; padding:0.6rem 0.85rem; margin-bottom:0.4rem; font-size:0.85rem; font-family:monospace; color:var(--warm); }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <!-- Step 1: Authenticate as Carbon -->
+  <div id="step1">
+    <div class="step-indicator"><span class="step-dot active"></span><span class="step-dot"></span><span class="step-dot"></span><span class="step-dot"></span></div>
+    <h1>Blindkey <span>Deposit</span></h1>
+    <p class="subtitle">Deposit secrets into a Silicon's Blindkey vault. Secrets never enter the LLM context.</p>
+
+    <div class="form-group">
+      <label>Admin Key</label>
+      <input type="password" id="admin-key" placeholder="DUSTFORGE_ADMIN_KEY">
+    </div>
+    <button class="btn-primary" onclick="verifyAdmin()">Verify</button>
+    <div class="status" id="step1-status"></div>
+  </div>
+
+  <!-- Step 2: Select Target Silicon -->
+  <div id="step2">
+    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot active"></span><span class="step-dot"></span><span class="step-dot"></span></div>
+    <h1>Select <span>Silicon</span></h1>
+    <p class="subtitle">Look up the target Silicon by username or DID.</p>
+
+    <div class="form-group">
+      <label>Silicon Username or DID</label>
+      <input type="text" id="silicon-lookup" placeholder="e.g. brain or did:key:z6Mk...">
+    </div>
+    <button class="btn-primary" onclick="lookupSilicon()">Look Up</button>
+    <div class="status" id="step2-status"></div>
+
+    <div class="info-card" id="silicon-info" style="display:none">
+      <div class="info-row"><span class="info-label">Username</span><span class="info-value" id="info-username"></span></div>
+      <div class="info-row"><span class="info-label">DID</span><span class="info-value mono" id="info-did"></span></div>
+      <div class="info-row"><span class="info-label">Blindkey Secrets</span><span class="info-value" id="info-secret-count"></span></div>
+    </div>
+
+    <button class="btn-primary" id="btn-continue-deposit" style="display:none;margin-top:1rem" onclick="showDepositForm()">Continue to Deposit</button>
+
+    <a href="#" class="back" onclick="goBack(1)">&larr; Back</a>
+  </div>
+
+  <!-- Step 3: Deposit Secret -->
+  <div id="step3">
+    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot active"></span><span class="step-dot"></span></div>
+    <h1>Deposit <span>Secret</span></h1>
+    <p class="subtitle">Depositing into <strong id="deposit-target"></strong></p>
+
+    <div class="form-group">
+      <label>Secret Name</label>
+      <input type="text" id="secret-name" placeholder="e.g. ssh-password, openrouter-key">
+    </div>
+    <div class="form-group">
+      <label>Type</label>
+      <select id="secret-type" onchange="onTypeChange()">
+        <option value="passphrase">Passphrase</option>
+        <option value="token">Token</option>
+        <option value="api_key">API Key</option>
+        <option value="ssh_credential">SSH Credential</option>
+        <option value="multi_string">Multi-String</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Value</label>
+      <input type="password" id="secret-value" placeholder="Secret value (never displayed)">
+    </div>
+    <div class="form-group">
+      <label>Description</label>
+      <input type="text" id="secret-description" placeholder="What is this secret for?">
+    </div>
+
+    <div class="ssh-fields" id="ssh-fields">
+      <div class="row">
+        <div class="form-group">
+          <label>SSH Host</label>
+          <input type="text" id="ssh-host" placeholder="100.69.1.78">
+        </div>
+        <div class="form-group">
+          <label>SSH User</label>
+          <input type="text" id="ssh-user" placeholder="claude">
+        </div>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Metadata JSON <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text3)">(optional)</span></label>
+      <textarea id="secret-metadata" placeholder='{"key": "value"}'></textarea>
+    </div>
+
+    <button class="btn-primary" onclick="depositSecret()">Deposit Secret</button>
+    <div class="status" id="step3-status"></div>
+
+    <a href="#" class="back" onclick="goBack(2)">&larr; Back</a>
+  </div>
+
+  <!-- Step 4: Verify -->
+  <div id="step4">
+    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot active"></span></div>
+    <h1>Deposit <span>Complete</span></h1>
+    <p class="subtitle" id="step4-summary"></p>
+
+    <div class="info-card">
+      <div style="font-size:0.8rem;color:var(--text2);text-transform:uppercase;font-weight:600;letter-spacing:0.05em;margin-bottom:0.75rem">Secrets for <span id="verify-target"></span></div>
+      <ul class="secret-list" id="secret-list"></ul>
+    </div>
+
+    <button class="btn-primary" style="margin-top:1rem" onclick="depositAnother()">Deposit Another Secret</button>
+
+    <a href="#" class="back" onclick="goBack(2)">&larr; Back to Silicon Lookup</a>
+  </div>
+
+  <a href="/" class="back">&larr; Back to Dustforge</a>
+</div>
+
+<script>
+const API = 'https://api.dustforge.com';
+let adminKey = '';
+let targetUsername = '';
+let targetDid = '';
+
+function showStatus(id, type, msg) {
+  const el = document.getElementById(id);
+  el.className = 'status ' + type;
+  el.textContent = msg;
+}
+
+function clearStatus(id) {
+  const el = document.getElementById(id);
+  el.className = 'status';
+  el.textContent = '';
+}
+
+function goBack(step) {
+  document.getElementById('step1').style.display = step === 1 ? 'block' : 'none';
+  document.getElementById('step2').style.display = step === 2 ? 'block' : 'none';
+  document.getElementById('step3').style.display = step === 3 ? 'block' : 'none';
+  document.getElementById('step4').style.display = 'none';
+}
+
+function onTypeChange() {
+  const type = document.getElementById('secret-type').value;
+  document.getElementById('ssh-fields').style.display = type === 'ssh_credential' ? 'block' : 'none';
+
+  // Pre-fill metadata for ssh_credential
+  if (type === 'ssh_credential') {
+    const meta = document.getElementById('secret-metadata');
+    if (!meta.value.trim()) {
+      meta.value = JSON.stringify({ host: '', user: '' }, null, 2);
+    }
+  }
+}
+
+async function verifyAdmin() {
+  const key = document.getElementById('admin-key').value.trim();
+  if (!key) return showStatus('step1-status', 'error', 'Admin key required.');
+
+  showStatus('step1-status', 'info', 'Verifying...');
+
+  try {
+    const res = await fetch(API + '/api/ops/dashboard', {
+      headers: { 'x-admin-key': key },
+    });
+    if (!res.ok) return showStatus('step1-status', 'error', 'Invalid admin key.');
+    const data = await res.json();
+    if (!data.ok && !data.status) return showStatus('step1-status', 'error', 'Invalid admin key.');
+
+    adminKey = key;
+    document.getElementById('step1').style.display = 'none';
+    document.getElementById('step2').style.display = 'block';
+  } catch (e) {
+    showStatus('step1-status', 'error', 'Network error. Try again.');
+  }
+}
+
+async function lookupSilicon() {
+  const query = document.getElementById('silicon-lookup').value.trim();
+  if (!query) return showStatus('step2-status', 'error', 'Enter a username or DID.');
+
+  showStatus('step2-status', 'info', 'Looking up...');
+
+  try {
+    const param = query.startsWith('did:') ? 'did' : 'username';
+    const res = await fetch(API + '/api/identity/lookup?' + param + '=' + encodeURIComponent(query), {
+      headers: { 'x-admin-key': adminKey },
+    });
+    if (!res.ok) return showStatus('step2-status', 'error', 'Silicon not found.');
+    const data = await res.json();
+    if (!data.ok && !data.username) return showStatus('step2-status', 'error', data.error || 'Silicon not found.');
+
+    targetUsername = data.username;
+    targetDid = data.did;
+
+    document.getElementById('info-username').textContent = data.username;
+    document.getElementById('info-did').textContent = data.did;
+    document.getElementById('info-secret-count').textContent = (data.blindkey_count !== undefined ? data.blindkey_count : data.secret_count !== undefined ? data.secret_count : '—');
+    document.getElementById('silicon-info').style.display = 'block';
+    document.getElementById('btn-continue-deposit').style.display = 'block';
+    clearStatus('step2-status');
+  } catch (e) {
+    showStatus('step2-status', 'error', 'Network error. Try again.');
+  }
+}
+
+function showDepositForm() {
+  document.getElementById('step2').style.display = 'none';
+  document.getElementById('step3').style.display = 'block';
+  document.getElementById('deposit-target').textContent = targetUsername;
+}
+
+async function depositSecret() {
+  const name = document.getElementById('secret-name').value.trim();
+  const type = document.getElementById('secret-type').value;
+  const value = document.getElementById('secret-value').value;
+  const description = document.getElementById('secret-description').value.trim();
+  const metaRaw = document.getElementById('secret-metadata').value.trim();
+
+  if (!name) return showStatus('step3-status', 'error', 'Secret name required.');
+  if (!value) return showStatus('step3-status', 'error', 'Secret value required.');
+
+  let metadata = null;
+  if (metaRaw) {
+    try {
+      metadata = JSON.parse(metaRaw);
+    } catch (e) {
+      return showStatus('step3-status', 'error', 'Invalid metadata JSON.');
+    }
+  }
+
+  // For ssh_credential, merge host/user into metadata
+  if (type === 'ssh_credential') {
+    const host = document.getElementById('ssh-host').value.trim();
+    const user = document.getElementById('ssh-user').value.trim();
+    if (host || user) {
+      metadata = metadata || {};
+      if (host) metadata.host = host;
+      if (user) metadata.user = user;
+    }
+  }
+
+  const body = {
+    target_username: targetUsername,
+    name: name,
+    type: type,
+    value: value,
+  };
+  if (description) body.description = description;
+  if (metadata) body.metadata = metadata;
+
+  showStatus('step3-status', 'info', 'Depositing...');
+
+  try {
+    const res = await fetch(API + '/api/blindkey/deposit', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-admin-key': adminKey,
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok || (!data.ok && !data.secret_name)) {
+      return showStatus('step3-status', 'error', data.error || 'Deposit failed.');
+    }
+
+    // Move to verification step
+    document.getElementById('step3').style.display = 'none';
+    document.getElementById('step4').style.display = 'block';
+    document.getElementById('step4-summary').textContent = 'Secret "' + name + '" deposited into ' + targetUsername + "'s Blindkey vault.";
+    document.getElementById('verify-target').textContent = targetUsername;
+
+    // Fetch updated secret list
+    loadSecretList();
+  } catch (e) {
+    showStatus('step3-status', 'error', 'Network error. Try again.');
+  }
+}
+
+async function loadSecretList() {
+  const list = document.getElementById('secret-list');
+  list.innerHTML = '<li style="color:var(--text3);font-family:inherit">Loading...</li>';
+
+  try {
+    const param = targetUsername ? 'username=' + encodeURIComponent(targetUsername) : 'did=' + encodeURIComponent(targetDid);
+    const res = await fetch(API + '/api/blindkey/list?' + param, {
+      headers: { 'x-admin-key': adminKey },
+    });
+    const data = await res.json();
+    const secrets = data.secrets || data.names || [];
+    if (secrets.length === 0) {
+      list.innerHTML = '<li style="color:var(--text3);font-family:inherit">No secrets found.</li>';
+    } else {
+      list.innerHTML = secrets.map(s => {
+        const name = typeof s === 'string' ? s : s.name;
+        const type = typeof s === 'object' && s.type ? ' <span style="color:var(--text3);font-size:0.75rem">(' + s.type + ')</span>' : '';
+        return '<li>' + esc(name) + type + '</li>';
+      }).join('');
+    }
+  } catch (e) {
+    list.innerHTML = '<li style="color:var(--red);font-family:inherit">Failed to load secrets.</li>';
+  }
+}
+
+function depositAnother() {
+  // Reset form fields
+  document.getElementById('secret-name').value = '';
+  document.getElementById('secret-value').value = '';
+  document.getElementById('secret-description').value = '';
+  document.getElementById('secret-metadata').value = '';
+  document.getElementById('secret-type').value = 'passphrase';
+  document.getElementById('ssh-host').value = '';
+  document.getElementById('ssh-user').value = '';
+  document.getElementById('ssh-fields').style.display = 'none';
+  clearStatus('step3-status');
+
+  document.getElementById('step4').style.display = 'none';
+  document.getElementById('step3').style.display = 'block';
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+</script>
+</body>
+</html>

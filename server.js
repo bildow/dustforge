@@ -5,6 +5,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
+const { execSync } = require('child_process');
 const identity = require('./identity');
 const dustforge = require('./dustforge');
 const billing = require('./billing');
@@ -20,6 +21,15 @@ const DB_PATH = process.env.DB_PATH || './data/dustforge.db';
 const ADMIN_API_KEY = process.env.DUSTFORGE_ADMIN_KEY || '';
 const MAX_ATTESTATION_TTL_SECONDS = Number(process.env.DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS || 3600);
 const BARREL_TIERS = ['single', 'double', 'critical'];
+
+// Blindkey SSH host whitelist — only these hosts can be targeted via ssh_exec
+const BLINDKEY_SSH_HOSTS = new Set([
+  '192.3.84.103',      // RackNerd
+  '100.83.112.88',     // phasewhip
+  '100.94.192.51',     // ky7
+  '100.69.1.78',       // k1
+  '100.103.90.79',     // flimflam
+]);
 
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
@@ -1071,8 +1081,90 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         break;
       }
 
+      case 'ssh_exec': {
+        // SSH into a whitelisted host using stored credentials and run a command
+        // The credentials NEVER appear in the response
+        const { target_host, target_user, command, key_name } = req.body;
+        if (!target_host || !target_user || !command) {
+          return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
+        }
+
+        // Host whitelist check
+        if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
+          return res.status(403).json({
+            error: `host ${target_host} not in SSH whitelist. Allowed: ${[...BLINDKEY_SSH_HOSTS].join(', ')}`,
+          });
+        }
+
+        // Command sanitization — reject exfiltration vectors
+        const dangerousPatterns = [
+          /`/,                          // backticks
+          /\$\(/,                       // command substitution
+          /\|\s*(curl|wget|nc|ncat)/i,  // pipe to network tools
+          />\s*\/dev\/tcp/,             // bash /dev/tcp exfil
+          /\beval\b/,                   // eval
+          /\bexec\b/,                   // exec
+          /\bsource\b/,                // source
+          /\b(curl|wget)\b.*\|/i,      // curl/wget piped
+        ];
+        for (const pat of dangerousPatterns) {
+          if (pat.test(command)) {
+            return res.status(400).json({ error: 'command contains disallowed pattern. Backticks, $(), eval, exec, and piping to curl/wget/nc are not permitted.' });
+          }
+        }
+
+        // Only allow safe shell characters
+        if (!/^[a-zA-Z0-9\s\/_\-.:=,@+*?[\]{}()#<>|&;'"%!\\\n]+$/.test(command)) {
+          return res.status(400).json({ error: 'command contains disallowed characters' });
+        }
+
+        // Optionally load a second secret (e.g. an SSH key) by key_name
+        let password = decryptedValue;
+        if (key_name) {
+          const keySecret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, key_name, 'active');
+          if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
+          try {
+            // Use key_name secret as the password, original secret as supplemental
+            password = blindkeyDecrypt(keySecret.encrypted_value);
+            db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(keySecret.id);
+          } catch (e) {
+            return res.status(500).json({ error: 'failed to decrypt key_name secret' });
+          }
+        }
+
+        // Sanitize user and host to prevent injection in the ssh command itself
+        if (!/^[a-zA-Z0-9._-]+$/.test(target_user)) {
+          return res.status(400).json({ error: 'invalid target_user' });
+        }
+
+        try {
+          // Escape single quotes in password for shell safety
+          const escapedPassword = password.replace(/'/g, "'\"'\"'");
+          // Escape single quotes in command for remote shell
+          const escapedCommand = command.replace(/'/g, "'\"'\"'");
+          const sshCmd = `sshpass -p '${escapedPassword}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const output = execSync(sshCmd, { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+
+          // Redact any echo of credentials in the output
+          const redactedOutput = output
+            .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
+            .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+
+          result = { stdout: redactedOutput, exit_code: 0 };
+        } catch (sshErr) {
+          const stderr = (sshErr.stderr || '').toString();
+          const stdout = (sshErr.stdout || '').toString();
+          // Redact credentials from error output
+          const redact = (s) => s
+            .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
+            .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+          result = { stdout: redact(stdout), stderr: redact(stderr), exit_code: sshErr.status || 1 };
+        }
+        break;
+      }
+
       default:
-        return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, sign, verify_match, inject_env` });
+        return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, sign, verify_match, inject_env, ssh_exec` });
     }
 
     res.json({ ok: true, action, secret_name: name, result });
@@ -1094,12 +1186,13 @@ app.delete('/api/blindkey/revoke', rateLimitStandard, billing.billingMiddleware(
 // GET /api/blindkey/types — list supported secret types and actions
 app.get('/api/blindkey/types', (_req, res) => {
   res.json({
-    secret_types: ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'],
+    secret_types: ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'passphrase', 'token', 'ssh_credential', 'multi_string', 'other'],
     actions: {
       http_header: { description: 'Make an HTTP request with the secret injected as a header', params: ['url', 'method', 'header_name', 'header_prefix', 'body'] },
       sign: { description: 'Sign data using the secret as an HMAC key', params: ['data', 'algorithm'] },
-      verify_match: { description: 'Check if a candidate value matches the secret', params: ['candidate'] },
+      verify_match: { description: 'Check if a candidate value matches the secret (DISABLED)', params: ['candidate'] },
       inject_env: { description: 'Confirm secret is set as an environment variable (value not returned)', params: ['env_name'] },
+      ssh_exec: { description: 'SSH into a whitelisted host using stored credentials and run a command', params: ['target_host', 'target_user', 'command', 'key_name'] },
     },
     security: {
       encryption: 'AES-256-GCM at rest',
@@ -1108,6 +1201,102 @@ app.get('/api/blindkey/types', (_req, res) => {
       billing: 'Store/revoke: free. List: free. Use: 1¢ per action (api_call_compute)',
     },
   });
+});
+
+// POST /api/blindkey/deposit — carbon deposits a secret into a silicon's vault (admin only)
+// The secret never touches any silicon's context — only the carbon (human) and the server see it.
+app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+
+  const { target_did, name, value, description, secret_type, metadata } = req.body || {};
+  if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
+  if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
+  if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
+  if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
+
+  // Verify target DID exists
+  const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(target_did);
+  if (!targetWallet) return res.status(404).json({ error: 'target_did not found' });
+
+  const validTypes = ['passphrase', 'token', 'api_key', 'ssh_credential', 'multi_string', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
+  const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
+
+  try {
+    const encrypted = blindkeyEncrypt(value);
+    const metaJson = metadata ? JSON.stringify(metadata) : '{}';
+    db.prepare(`
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(did, name) DO UPDATE SET
+        encrypted_value = excluded.encrypted_value,
+        description = excluded.description,
+        secret_type = excluded.secret_type,
+        metadata = excluded.metadata,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(target_did, name, description || '', resolvedType, encrypted, metaJson);
+
+    const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(target_did, name);
+    res.json({ ok: true, secret_id: inserted.id, name, secret_type: resolvedType, target_did });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blindkey/deposit/batch — deposit multiple secrets at once (admin only)
+app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+
+  const { secrets } = req.body || {};
+  if (!Array.isArray(secrets) || secrets.length === 0) return res.status(400).json({ error: 'secrets array required' });
+  if (secrets.length > 50) return res.status(400).json({ error: 'max 50 secrets per batch' });
+
+  const validTypes = ['passphrase', 'token', 'api_key', 'ssh_credential', 'multi_string', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
+  const results = [];
+  const errors = [];
+
+  const insertStmt = db.prepare(`
+    INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(did, name) DO UPDATE SET
+      encrypted_value = excluded.encrypted_value,
+      description = excluded.description,
+      secret_type = excluded.secret_type,
+      metadata = excluded.metadata,
+      updated_at = CURRENT_TIMESTAMP
+  `);
+
+  const txn = db.transaction(() => {
+    for (let i = 0; i < secrets.length; i++) {
+      const s = secrets[i];
+      if (!s.target_did || !s.name || !s.value) {
+        errors.push({ index: i, error: 'target_did, name, and value required' });
+        continue;
+      }
+      if (s.name.length > 64) { errors.push({ index: i, error: 'name must be 64 chars or less' }); continue; }
+      if (s.value.length > 10000) { errors.push({ index: i, error: 'value must be 10000 chars or less' }); continue; }
+
+      const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(s.target_did);
+      if (!targetWallet) { errors.push({ index: i, error: 'target_did not found' }); continue; }
+
+      const resolvedType = validTypes.includes(s.secret_type) ? s.secret_type : 'api_key';
+      try {
+        const encrypted = blindkeyEncrypt(s.value);
+        const metaJson = s.metadata ? JSON.stringify(s.metadata) : '{}';
+        insertStmt.run(s.target_did, s.name, s.description || '', resolvedType, encrypted, metaJson);
+        const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
+        results.push({ ok: true, secret_id: inserted.id, name: s.name, secret_type: resolvedType, target_did: s.target_did });
+      } catch (e) {
+        errors.push({ index: i, error: e.message });
+      }
+    }
+  });
+
+  try {
+    txn();
+    res.json({ ok: true, deposited: results.length, results, errors });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Email verification for prepaid purchases ──
