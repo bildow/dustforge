@@ -85,6 +85,7 @@
 | Prepaid keys (founding + partnership tiers) | Done | server.js |
 | DemiPass (DemiVault) | Done | server.js |
 | DemiPass Console + history/requests surface | Done | `public/deposit.html`, `server.js` — merged via `c302211`, hardened in `076a35f` |
+| Rowen/Conductor mediation contract | Sandbox | `server.js` — `codex-sandbox-rowen-conductor-2026-04-17` |
 | Capacity + waiting list | Done | server.js |
 | Security bounty program | Done | server.js |
 | **Bulk provisioning API** | Done | server.js — `POST /api/identity/bulk-create` |
@@ -183,6 +184,9 @@
 ## Runtime Notes
 
 - Admin-only endpoints now require `DUSTFORGE_ADMIN_KEY` and should be called with the `x-admin-key` header or `admin_key` in the POST body. Query-string admin auth is no longer accepted.
+- Sandbox branch `codex-sandbox-rowen-conductor-2026-04-17` adds dedicated service auth for secret mediation:
+  - `DUSTFORGE_ROWEN_KEY`
+  - `DUSTFORGE_CONDUCTOR_KEY`
 - Portable attestations are capped by `DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS` (default `3600`).
 - `/api/stripe/success` is status-only in the sandbox hardening branch. Account fulfillment must come from `POST /api/stripe/webhook`.
 - DemiPass merged surface now on `main` adds:
@@ -192,6 +196,10 @@
   - Rowen ingest and deliver controls in the operator surface
   - target lookup by username for secret deposit
   - CORS allowance for `x-admin-key` so the console can reach `api.dustforge.com`
+- Sandbox branch `codex-sandbox-rowen-conductor-2026-04-17` adds:
+  - `/api/rowen/authorize` preflight policy check
+  - service-authenticated Rowen ingest/deliver
+  - explicit `/api/conductor/rowen/*` aliases so Conductor can request Rowen mediation without the admin key
 
 ## Deploy Process
 

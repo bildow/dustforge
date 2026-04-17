@@ -19,6 +19,8 @@ app.set("trust proxy", 1);
 const PORT = process.env.PORT || 3000;
 const DB_PATH = process.env.DB_PATH || './data/dustforge.db';
 const ADMIN_API_KEY = process.env.DUSTFORGE_ADMIN_KEY || '';
+const ROWEN_SERVICE_KEY = process.env.DUSTFORGE_ROWEN_KEY || '';
+const CONDUCTOR_SERVICE_KEY = process.env.DUSTFORGE_CONDUCTOR_KEY || '';
 const MAX_ATTESTATION_TTL_SECONDS = Number(process.env.DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS || 3600);
 const BARREL_TIERS = ['single', 'double', 'critical'];
 
@@ -72,6 +74,36 @@ function requireAdminAccess(req, res) {
     return false;
   }
   return true;
+}
+
+function getSecretServiceActor(req, res) {
+  const serviceName = String(req.headers['x-service-name'] || req.body?.service_name || '').trim().toLowerCase();
+  const provided = String(req.headers['x-service-key'] || req.body?.service_key || '').trim();
+  if (!serviceName || !provided) {
+    if (res) res.status(403).json({ error: 'service auth required' });
+    return { ok: false };
+  }
+  const expected = serviceName === 'rowen'
+    ? ROWEN_SERVICE_KEY
+    : serviceName === 'conductor'
+      ? CONDUCTOR_SERVICE_KEY
+      : '';
+  if (!expected) {
+    if (res) res.status(503).json({ error: `${serviceName || 'service'} auth not configured` });
+    return { ok: false };
+  }
+  if (!safeSecretEqual(provided, expected)) {
+    if (res) res.status(403).json({ error: 'invalid service auth' });
+    return { ok: false };
+  }
+  return { ok: true, actor: serviceName };
+}
+
+function getSecretMediationActor(req, res) {
+  const service = getSecretServiceActor(req);
+  if (service.ok) return { ok: true, mode: 'service', actor: service.actor };
+  if (requireAdminAccess(req, res)) return { ok: true, mode: 'admin', actor: 'admin' };
+  return { ok: false };
 }
 
 function getBearerIdentity(req) {
@@ -1226,7 +1258,20 @@ function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHo
     return { allowed: false, error: `context '${contextName}' has reached its max usage limit (${ctx.max_uses})` };
   }
 
-  return { allowed: true, context_id: ctx.id };
+  return {
+    allowed: true,
+    context_id: ctx.id,
+    context: {
+      id: ctx.id,
+      context_name: ctx.context_name,
+      action_type: ctx.action_type,
+      target_url_pattern: ctx.target_url_pattern,
+      target_host_pattern: ctx.target_host_pattern,
+      max_uses: ctx.max_uses,
+      use_count: ctx.use_count,
+      allowed_by: ctx.allowed_by,
+    },
+  };
 }
 
 // Resolve the latest active version of a secret by name.
@@ -1249,6 +1294,40 @@ function resolveLatestBlindkeySecret(did, name) {
     "SELECT * FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'active' ORDER BY version DESC LIMIT 1"
   ).get(did, baseName, baseName + '_v%');
   return latest || null;
+}
+
+function authorizeSecretMediation({ requestorDid, secretName, contextName, actionParams = {} }) {
+  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(requestorDid, secretName, 'active');
+  if (!secret) {
+    return { ok: false, status: 404, error: 'secret not found for requestor_did' };
+  }
+
+  const action = actionParams.action || null;
+  if (!action) return { ok: false, status: 400, error: 'action_params.action required' };
+
+  const targetUrl = actionParams.url || actionParams.target_url || null;
+  const targetHost = actionParams.target_host || null;
+  const ctxCheck = enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost);
+  if (!ctxCheck.allowed) {
+    return {
+      ok: false,
+      status: 403,
+      error: ctxCheck.error,
+      secret,
+      action,
+      targetUrl,
+      targetHost,
+    };
+  }
+
+  return {
+    ok: true,
+    secret,
+    action,
+    targetUrl,
+    targetHost,
+    contextCheck: ctxCheck,
+  };
 }
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
@@ -2154,10 +2233,9 @@ app.get('/api/blindkey/contexts', rateLimitStandard, (req, res) => {
   res.json({ secret_name, contexts, total: contexts.length });
 });
 
-// POST /api/rowen/ingest — clean-room deposit flow (Rowen's entry point for secret ingestion)
-// In the future, Rowen's ephemeral container calls this. For now, standard endpoint with separation.
-app.post('/api/rowen/ingest', rateLimitStandard, (req, res) => {
-  if (!requireAdminAccess(req, res)) return;
+function handleRowenIngest(req, res) {
+  const mediator = getSecretMediationActor(req, res);
+  if (!mediator.ok) return;
 
   const { depositor_type, depositor_id, target_did, name, value, secret_type, description, contexts } = req.body || {};
   if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
@@ -2205,24 +2283,22 @@ app.post('/api/rowen/ingest', rateLimitStandard, (req, res) => {
     // Log the ingest event
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, detail) VALUES (?, ?, ?, ?)').run(
       'rowen_ingest',
-      `${depositor_type}:${depositor_id}`,
+      `${mediator.actor}:${depositor_type}:${depositor_id}`,
       inserted.id,
-      JSON.stringify({ target_did, name, secret_type: resolvedType, contexts_created })
+      JSON.stringify({ target_did, name, secret_type: resolvedType, contexts_created, mediator: mediator.actor })
     );
 
-    res.json({ ok: true, secret_id: inserted.id, contexts_created });
+    res.json({ ok: true, mediator: mediator.actor, secret_id: inserted.id, contexts_created });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+}
 
-// POST /api/rowen/deliver — clean-room use flow (Rowen's entry point for secret usage)
-// Uses the use-token flow internally: requests a token, then redeems it, in one atomic operation.
-// The token still exists as an auditable record even though both steps happen in one request.
-app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
-  if (!requireAdminAccess(req, res)) return;
+function handleRowenAuthorize(req, res) {
+  const mediator = getSecretMediationActor(req, res);
+  if (!mediator.ok) return;
 
-  const { requestor_did, secret_name, context: contextName, action_params } = req.body || {};
+  const { requestor_did, secret_name, context: contextName, action_params, request_reason = '', runtime_context = {} } = req.body || {};
   if (!requestor_did || !secret_name) return res.status(400).json({ error: 'requestor_did and secret_name required' });
   if (typeof requestor_did !== 'string') return res.status(400).json({ error: 'requestor_did: must be a string' });
   if (typeof secret_name !== 'string') return res.status(400).json({ error: 'secret_name: must be a string' });
@@ -2230,25 +2306,81 @@ app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
   if (contextName && typeof contextName !== 'string') return res.status(400).json({ error: 'context: must be a string' });
   if (action_params && typeof action_params !== 'object') return res.status(400).json({ error: 'action_params: must be an object' });
 
-  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(requestor_did, secret_name, 'active');
-  if (!secret) return res.status(404).json({ error: 'secret not found for requestor_did' });
-
-  // Determine action from context or action_params
-  const action = (action_params && action_params.action) || null;
-  if (!action) return res.status(400).json({ error: 'action_params.action required' });
-
-  const targetUrl = (action_params && action_params.url) || (action_params && action_params.target_url) || null;
-  const targetHost = (action_params && action_params.target_host) || null;
-
-  // ── Step 1: Request a use-token (validates context, creates auditable record) ──
-  const ctxCheck = enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost);
-  if (!ctxCheck.allowed) {
-    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
-      'rowen_deliver_denied', requestor_did, secret.id, contextName || null,
-      JSON.stringify({ action, target_url: targetUrl, target_host: targetHost, error: ctxCheck.error })
+  const authorization = authorizeSecretMediation({
+    requestorDid: requestor_did,
+    secretName: secret_name,
+    contextName,
+    actionParams: action_params || {},
+  });
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+    .run(
+      authorization.ok ? 'rowen_authorize_allowed' : 'rowen_authorize_denied',
+      `${mediator.actor}:${requestor_did}`,
+      authorization.secret?.id || null,
+      contextName || null,
+      JSON.stringify({
+        action: action_params?.action || '',
+        target_url: action_params?.url || action_params?.target_url || '',
+        target_host: action_params?.target_host || '',
+        request_reason: String(request_reason || '').slice(0, 500),
+        runtime_context,
+        mediator: mediator.actor,
+        error: authorization.ok ? null : authorization.error,
+      })
     );
-    return res.status(403).json({ error: ctxCheck.error });
+
+  if (!authorization.ok) return res.status(authorization.status || 500).json({ error: authorization.error });
+  res.json({
+    ok: true,
+    mediator: mediator.actor,
+    requestor_did,
+    secret_name,
+    context: contextName || null,
+    action: authorization.action,
+    authorized: true,
+    context_details: authorization.contextCheck.context,
+  });
+}
+
+// POST /api/rowen/deliver — clean-room use flow (Rowen's entry point for secret usage)
+// Uses the use-token flow internally: requests a token, then redeems it, in one atomic operation.
+// The token still exists as an auditable record even though both steps happen in one request.
+async function handleRowenDeliver(req, res) {
+  const mediator = getSecretMediationActor(req, res);
+  if (!mediator.ok) return;
+
+  const { requestor_did, secret_name, context: contextName, action_params, request_reason = '', runtime_context = {} } = req.body || {};
+  if (!requestor_did || !secret_name) return res.status(400).json({ error: 'requestor_did and secret_name required' });
+  if (typeof requestor_did !== 'string') return res.status(400).json({ error: 'requestor_did: must be a string' });
+  if (typeof secret_name !== 'string') return res.status(400).json({ error: 'secret_name: must be a string' });
+  if (secret_name.length > 100) return res.status(400).json({ error: 'secret_name: max 100 characters' });
+  if (contextName && typeof contextName !== 'string') return res.status(400).json({ error: 'context: must be a string' });
+  if (action_params && typeof action_params !== 'object') return res.status(400).json({ error: 'action_params: must be an object' });
+  const authorization = authorizeSecretMediation({
+    requestorDid: requestor_did,
+    secretName: secret_name,
+    contextName,
+    actionParams: action_params || {},
+  });
+  if (!authorization.ok) {
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+      'rowen_deliver_denied',
+      `${mediator.actor}:${requestor_did}`,
+      authorization.secret?.id || null,
+      contextName || null,
+      JSON.stringify({
+        action: action_params?.action || '',
+        target_url: action_params?.url || action_params?.target_url || '',
+        target_host: action_params?.target_host || '',
+        error: authorization.error,
+        request_reason: String(request_reason || '').slice(0, 500),
+        runtime_context,
+        mediator: mediator.actor,
+      })
+    );
+    return res.status(authorization.status || 500).json({ error: authorization.error });
   }
+  const { secret, action, targetUrl, targetHost, contextCheck: ctxCheck } = authorization;
 
   // Generate the use-token (even though we'll redeem it immediately, it's an audit record)
   const useToken = crypto.randomBytes(32).toString('hex');
@@ -2259,8 +2391,15 @@ app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
   `).run(useToken, requestor_did, secret.id, ctxCheck.context_id || null, action, targetUrl || '', targetHost || '');
 
   db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
-    'rowen_token_issued', requestor_did, secret.id, contextName || null,
-    JSON.stringify({ action, target_url: targetUrl, target_host: targetHost })
+    'rowen_token_issued', `${mediator.actor}:${requestor_did}`, secret.id, contextName || null,
+    JSON.stringify({
+      action,
+      target_url: targetUrl,
+      target_host: targetHost,
+      request_reason: String(request_reason || '').slice(0, 500),
+      runtime_context,
+      mediator: mediator.actor,
+    })
   );
 
   // ── Step 2: Immediately redeem the use-token ──
@@ -2365,16 +2504,54 @@ app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
     // Log the deliver event (with token reference for audit trail)
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
       'rowen_deliver',
-      requestor_did,
+      `${mediator.actor}:${requestor_did}`,
       secret.id,
       contextName || null,
-      JSON.stringify({ action, target_url: targetUrl, target_host: targetHost, use_token: useToken.slice(0, 8) + '...' })
+      JSON.stringify({
+        action,
+        target_url: targetUrl,
+        target_host: targetHost,
+        use_token: useToken.slice(0, 8) + '...',
+        request_reason: String(request_reason || '').slice(0, 500),
+        runtime_context,
+        mediator: mediator.actor,
+      })
     );
 
-    res.json({ ok: true, action, secret_name, via: 'use_token', result });
+    res.json({
+      ok: true,
+      mediator: mediator.actor,
+      action,
+      secret_name,
+      context: contextName || null,
+      context_details: ctxCheck.context || null,
+      via: 'use_token',
+      result,
+    });
   } catch (e) {
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
+}
+
+// POST /api/rowen/ingest — clean-room deposit flow (Rowen's entry point for secret ingestion)
+app.post('/api/rowen/ingest', rateLimitStandard, handleRowenIngest);
+// POST /api/rowen/authorize — preflight context authorization without execution
+app.post('/api/rowen/authorize', rateLimitStandard, handleRowenAuthorize);
+// POST /api/rowen/deliver — clean-room use flow
+app.post('/api/rowen/deliver', rateLimitStandard, handleRowenDeliver);
+
+// Conductor aliases — explicit service surface for mediator wiring
+app.post('/api/conductor/rowen/ingest', rateLimitStandard, (req, res) => {
+  req.body = { ...(req.body || {}), service_name: req.body?.service_name || 'conductor' };
+  return handleRowenIngest(req, res);
+});
+app.post('/api/conductor/rowen/authorize', rateLimitStandard, (req, res) => {
+  req.body = { ...(req.body || {}), service_name: req.body?.service_name || 'conductor' };
+  return handleRowenAuthorize(req, res);
+});
+app.post('/api/conductor/rowen/deliver', rateLimitStandard, (req, res) => {
+  req.body = { ...(req.body || {}), service_name: req.body?.service_name || 'conductor' };
+  return handleRowenDeliver(req, res);
 });
 
 // ── Email verification for prepaid purchases ──
