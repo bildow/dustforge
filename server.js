@@ -100,7 +100,7 @@ function getDemiPassActor(req, res, options = {}) {
     };
   }
   if (allowAdmin && ADMIN_API_KEY) {
-    const provided = req.headers['x-admin-key'] || req.body?.admin_key || req.query?.admin_key || '';
+    const provided = req.headers['x-admin-key'] || req.body?.admin_key || '';
     if (safeSecretEqual(provided, ADMIN_API_KEY)) {
       return { ok: true, mode: 'admin', actor: 'admin' };
     }
@@ -133,7 +133,7 @@ app.use('/api/demipass', (req, _res, next) => {
 // ── CORS ──
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-key');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
@@ -1785,9 +1785,8 @@ app.delete('/api/blindkey/revoke', rateLimitStandard, (req, res) => {
 
 // POST /api/blindkey/rotate — rotate a secret with context transfer and grace period
 app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
-  const isAdmin = ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || req.body?.admin_key || '', ADMIN_API_KEY);
-  const isOwner = req.identity && req.identity.did;
-  if (!isAdmin && !isOwner) return res.status(403).json({ error: 'admin auth or Bearer token required' });
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
 
   const { name, new_value, grace_period_minutes, did } = req.body || {};
   if (!name || !new_value) return res.status(400).json({ error: 'name and new_value required' });
@@ -1796,8 +1795,11 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
   if (new_value.length > 10000) return res.status(400).json({ error: 'new_value must be 10000 chars or less' });
   const graceMins = (typeof grace_period_minutes === 'number' && grace_period_minutes > 0) ? grace_period_minutes : 60;
 
-  const ownerDid = isAdmin ? (did || (isOwner ? req.identity.did : null)) : req.identity.did;
-  if (!ownerDid) return res.status(400).json({ error: 'did required when using admin auth without Bearer token' });
+  let ownerDid = actor.did || null;
+  if (actor.mode === 'admin') {
+    ownerDid = did || ownerDid;
+    if (!ownerDid) return res.status(400).json({ error: 'did required when using admin auth without Bearer token' });
+  }
 
   // Find the existing active secret with the highest version for this base name
   // Strip any existing _v{N} suffix to get the base name
