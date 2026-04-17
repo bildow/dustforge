@@ -1,0 +1,16 @@
+{
+  "name": "dustforge-vault",
+  "version": "1.0.0",
+  "description": "Hardened vault API for Dustforge — runs on phasewhip, called over Tailscale",
+  "main": "vault-server.js",
+  "scripts": {
+    "start": "node vault-server.js"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.4.1",
+    "express": "^5.2.1",
+    "express-rate-limit": "^7.5.0"
+  }
+}
