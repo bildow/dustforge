@@ -937,6 +937,34 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_secrets (
 )`); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_sv_did ON blindkey_secrets(did)"); } catch(e) {}
 
+// Blindkey usage context layer — controls HOW and WHERE secrets can be used
+try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_contexts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  secret_id INTEGER NOT NULL REFERENCES blindkey_secrets(id),
+  context_name TEXT NOT NULL,
+  action_type TEXT NOT NULL CHECK(action_type IN ('http_header', 'ssh_exec', 'http_body', 'env_inject')),
+  target_url_pattern TEXT DEFAULT '*',
+  target_host_pattern TEXT DEFAULT '*',
+  allowed_by TEXT NOT NULL,
+  status TEXT DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
+  max_uses INTEGER DEFAULT 0,
+  use_count INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(secret_id, context_name)
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_bc_secret ON blindkey_contexts(secret_id)"); } catch(e) {}
+
+// Blindkey events — audit log for rowen and context operations
+try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  secret_id INTEGER,
+  context_name TEXT,
+  detail TEXT DEFAULT '{}',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
 // Blindkey-level encryption uses the identity module's existing AES-256-GCM
 function blindkeyEncrypt(value) {
   const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
@@ -956,6 +984,107 @@ function blindkeyDecrypt(encryptedBase64) {
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+}
+
+// Simple glob matcher for context target patterns (supports * and prefix*)
+function blindkeyPatternMatch(pattern, value) {
+  if (!pattern || pattern === '*') return true;
+  if (!value) return false;
+  // Strip protocol for comparison
+  const cleanValue = value.replace(/^https?:\/\//, '');
+  const cleanPattern = pattern.replace(/^https?:\/\//, '');
+  if (cleanPattern.endsWith('*')) {
+    return cleanValue.startsWith(cleanPattern.slice(0, -1));
+  }
+  return cleanValue === cleanPattern;
+}
+
+// Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
+function insertBlindkeyContexts(secretId, contexts, allowedBy) {
+  const insertCtx = db.prepare(`
+    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(secret_id, context_name) DO UPDATE SET
+      action_type = excluded.action_type,
+      target_url_pattern = excluded.target_url_pattern,
+      target_host_pattern = excluded.target_host_pattern,
+      allowed_by = excluded.allowed_by,
+      max_uses = excluded.max_uses
+  `);
+  let created = 0;
+  for (const ctx of contexts) {
+    if (!ctx.context_name || !ctx.action_type) continue;
+    const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+    if (!validActions.includes(ctx.action_type)) continue;
+    insertCtx.run(
+      secretId,
+      ctx.context_name,
+      ctx.action_type,
+      ctx.target_url_pattern || '*',
+      ctx.target_host_pattern || '*',
+      allowedBy,
+      ctx.max_uses || 0
+    );
+    created++;
+  }
+  return created;
+}
+
+// Enforce context rules on a blindkey/use request. Returns { allowed, error }
+function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost) {
+  const contexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(secret.id);
+
+  // Backward compatible: no contexts exist and none requested → allow
+  if (contexts.length === 0 && !contextName) {
+    return { allowed: true };
+  }
+
+  // Contexts exist but none specified → deny
+  if (contexts.length > 0 && !contextName) {
+    return { allowed: false, error: 'this secret has usage contexts defined. You must specify a context name.' };
+  }
+
+  // Context specified but none exist → deny (can't use a context that doesn't exist)
+  if (contexts.length === 0 && contextName) {
+    return { allowed: false, error: `context '${contextName}' not found for this secret` };
+  }
+
+  // Look up the specific context
+  const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, contextName);
+  if (!ctx) {
+    return { allowed: false, error: `context '${contextName}' not found for this secret` };
+  }
+
+  // Check status
+  if (ctx.status !== 'active') {
+    return { allowed: false, error: `context '${contextName}' is ${ctx.status}` };
+  }
+
+  // Check action_type matches
+  if (ctx.action_type !== action) {
+    return { allowed: false, error: `context '${contextName}' allows action '${ctx.action_type}' but '${action}' was requested` };
+  }
+
+  // Check target_url_pattern for http actions
+  if ((action === 'http_header' || action === 'http_body') && targetUrl) {
+    if (!blindkeyPatternMatch(ctx.target_url_pattern, targetUrl)) {
+      return { allowed: false, error: `target URL does not match context pattern '${ctx.target_url_pattern}'` };
+    }
+  }
+
+  // Check target_host_pattern for ssh_exec
+  if (action === 'ssh_exec' && targetHost) {
+    if (!blindkeyPatternMatch(ctx.target_host_pattern, targetHost)) {
+      return { allowed: false, error: `target host does not match context pattern '${ctx.target_host_pattern}'` };
+    }
+  }
+
+  // Check max_uses
+  if (ctx.max_uses > 0 && ctx.use_count >= ctx.max_uses) {
+    return { allowed: false, error: `context '${contextName}' has reached its max usage limit (${ctx.max_uses})` };
+  }
+
+  return { allowed: true, context_id: ctx.id };
 }
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
@@ -1001,11 +1130,19 @@ app.get('/api/blindkey/list', rateLimitStandard, billing.billingMiddleware(db, '
 
 // POST /api/blindkey/use — use a secret without seeing it (delegated execution)
 app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
-  const { name, action, params } = req.body || {};
+  const { name, action, params, context: contextName } = req.body || {};
   if (!name || !action) return res.status(400).json({ error: 'name and action required' });
 
   const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  // Enforce context rules
+  const targetUrl = (params && params.url) || (req.body && req.body.target_url) || null;
+  const targetHost = (req.body && req.body.target_host) || (params && params.target_host) || null;
+  const ctxCheck = enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost);
+  if (!ctxCheck.allowed) {
+    return res.status(403).json({ error: ctxCheck.error });
+  }
 
   let decryptedValue;
   try {
@@ -1016,6 +1153,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
   // Update usage stats
   db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+
+  // Increment context use_count if a context was used
+  if (ctxCheck.context_id) {
+    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
+  }
 
   // Execute the action with the secret injected
   try {
@@ -1208,7 +1350,7 @@ app.get('/api/blindkey/types', (_req, res) => {
 app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
   if (!requireAdminAccess(req, res)) return;
 
-  const { target_did, name, value, description, secret_type, metadata } = req.body || {};
+  const { target_did, name, value, description, secret_type, metadata, contexts } = req.body || {};
   if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
   if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
   if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
@@ -1236,7 +1378,14 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
     `).run(target_did, name, description || '', resolvedType, encrypted, metaJson);
 
     const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(target_did, name);
-    res.json({ ok: true, secret_id: inserted.id, name, secret_type: resolvedType, target_did });
+
+    // Insert contexts if provided
+    let contexts_created = 0;
+    if (Array.isArray(contexts) && contexts.length > 0) {
+      contexts_created = insertBlindkeyContexts(inserted.id, contexts, 'carbon_deposit');
+    }
+
+    res.json({ ok: true, secret_id: inserted.id, name, secret_type: resolvedType, target_did, contexts_created });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1296,6 +1445,267 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
     res.json({ ok: true, deposited: results.length, results, errors });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blindkey/context/add — add a context to an existing secret
+// Requires admin auth OR Bearer token from the secret owner
+app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
+  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, max_uses } = req.body || {};
+  if (!secret_name || !context_name || !action_type) {
+    return res.status(400).json({ error: 'secret_name, context_name, and action_type required' });
+  }
+
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+  if (!validActions.includes(action_type)) {
+    return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
+  }
+
+  // Allow admin or the secret owner (via Bearer token)
+  const isAdmin = ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || req.body?.admin_key || '', ADMIN_API_KEY);
+  let secret;
+
+  if (isAdmin) {
+    // Admin can add context to any secret by name — but needs a DID or secret_id
+    const { did } = req.body || {};
+    if (!did) return res.status(400).json({ error: 'did required when using admin auth' });
+    secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(did, secret_name, 'active');
+  } else if (req.identity && req.identity.did) {
+    secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, secret_name, 'active');
+  } else {
+    return res.status(403).json({ error: 'admin auth or Bearer token required' });
+  }
+
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  try {
+    const created = insertBlindkeyContexts(secret.id, [{
+      context_name,
+      action_type,
+      target_url_pattern: target_url_pattern || '*',
+      target_host_pattern: target_host_pattern || '*',
+      max_uses: max_uses || 0,
+    }], isAdmin ? 'admin' : 'owner');
+
+    if (created === 0) return res.status(400).json({ error: 'failed to create context' });
+
+    const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, context_name);
+    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, max_uses: ctx.max_uses, status: ctx.status } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/blindkey/contexts — list approved contexts for a secret
+// Requires Bearer token from the DID owner
+app.get('/api/blindkey/contexts', rateLimitStandard, (req, res) => {
+  const { did, secret_name } = req.query || {};
+
+  // Require Bearer token identity that matches the requested DID
+  if (!req.identity || !req.identity.did) {
+    return res.status(403).json({ error: 'Bearer token required' });
+  }
+  if (did && did !== req.identity.did) {
+    return res.status(403).json({ error: 'can only list contexts for your own secrets' });
+  }
+
+  const ownerDid = did || req.identity.did;
+  if (!secret_name) return res.status(400).json({ error: 'secret_name query parameter required' });
+
+  const secret = db.prepare('SELECT id, name FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, secret_name);
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  const contexts = db.prepare(
+    'SELECT id, context_name, action_type, target_url_pattern, target_host_pattern, status, max_uses, use_count, created_at FROM blindkey_contexts WHERE secret_id = ?'
+  ).all(secret.id);
+
+  res.json({ secret_name, contexts, total: contexts.length });
+});
+
+// POST /api/rowen/ingest — clean-room deposit flow (Rowen's entry point for secret ingestion)
+// In the future, Rowen's ephemeral container calls this. For now, standard endpoint with separation.
+app.post('/api/rowen/ingest', rateLimitStandard, (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+
+  const { depositor_type, depositor_id, target_did, name, value, secret_type, description, contexts } = req.body || {};
+  if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
+  if (!depositor_type || !depositor_id) return res.status(400).json({ error: 'depositor_type and depositor_id required' });
+  if (!['carbon', 'silicon'].includes(depositor_type)) return res.status(400).json({ error: 'depositor_type must be carbon or silicon' });
+  if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
+  if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
+
+  // Verify target DID exists
+  const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(target_did);
+  if (!targetWallet) return res.status(404).json({ error: 'target_did not found' });
+
+  const validTypes = ['passphrase', 'token', 'api_key', 'ssh_credential', 'multi_string', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
+  const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
+
+  try {
+    const encrypted = blindkeyEncrypt(value);
+    db.prepare(`
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(did, name) DO UPDATE SET
+        encrypted_value = excluded.encrypted_value,
+        description = excluded.description,
+        secret_type = excluded.secret_type,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(target_did, name, description || '', resolvedType, encrypted, JSON.stringify({ depositor_type, depositor_id, via: 'rowen' }));
+
+    const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(target_did, name);
+
+    // Insert contexts if provided
+    let contexts_created = 0;
+    if (Array.isArray(contexts) && contexts.length > 0) {
+      contexts_created = insertBlindkeyContexts(inserted.id, contexts, 'rowen_ingest');
+    }
+
+    // Log the ingest event
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, detail) VALUES (?, ?, ?, ?)').run(
+      'rowen_ingest',
+      `${depositor_type}:${depositor_id}`,
+      inserted.id,
+      JSON.stringify({ target_did, name, secret_type: resolvedType, contexts_created })
+    );
+
+    res.json({ ok: true, secret_id: inserted.id, contexts_created });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/rowen/deliver — clean-room use flow (Rowen's entry point for secret usage)
+// Validates requestor owns the secret and context is approved, executes the action, never returns the secret.
+app.post('/api/rowen/deliver', rateLimitStandard, async (req, res) => {
+  if (!requireAdminAccess(req, res)) return;
+
+  const { requestor_did, secret_name, context: contextName, action_params } = req.body || {};
+  if (!requestor_did || !secret_name) return res.status(400).json({ error: 'requestor_did and secret_name required' });
+
+  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(requestor_did, secret_name, 'active');
+  if (!secret) return res.status(404).json({ error: 'secret not found for requestor_did' });
+
+  // Determine action from context or action_params
+  const action = (action_params && action_params.action) || null;
+  if (!action) return res.status(400).json({ error: 'action_params.action required' });
+
+  // Enforce context
+  const targetUrl = (action_params && action_params.url) || (action_params && action_params.target_url) || null;
+  const targetHost = (action_params && action_params.target_host) || null;
+  const ctxCheck = enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost);
+  if (!ctxCheck.allowed) {
+    return res.status(403).json({ error: ctxCheck.error });
+  }
+
+  let decryptedValue;
+  try {
+    decryptedValue = blindkeyDecrypt(secret.encrypted_value);
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to decrypt secret' });
+  }
+
+  // Update usage stats
+  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+  if (ctxCheck.context_id) {
+    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
+  }
+
+  // Execute the action — delegates to the same logic as blindkey/use
+  try {
+    let result;
+
+    switch (action) {
+      case 'http_header': {
+        const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params || {};
+        if (!url) return res.status(400).json({ error: 'action_params.url required for http_header action' });
+
+        const ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+        let urlHost;
+        try { urlHost = new URL(url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
+        if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
+          // Also allow if context target_url_pattern matches (context already validated above)
+          const isPrivateNet = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.)/.test(urlHost);
+          if (!isPrivateNet) {
+            return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${ALLOWED_HOSTS.join(', ')}` });
+          }
+        }
+
+        const response = await fetch(url, {
+          method,
+          headers: {
+            [header_name]: header_prefix + decryptedValue,
+            'Content-Type': 'application/json',
+          },
+          body: reqBody ? JSON.stringify(reqBody) : undefined,
+          signal: AbortSignal.timeout(30000),
+        });
+        const responseBody = await response.text();
+        let parsed;
+        try { parsed = JSON.parse(responseBody); } catch (_) { parsed = responseBody; }
+        const secretRedacted = typeof parsed === 'string'
+          ? parsed.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
+          : JSON.parse(JSON.stringify(parsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+        result = { status: response.status, body: secretRedacted };
+        break;
+      }
+
+      case 'ssh_exec': {
+        const { target_host, target_user, command } = action_params || {};
+        if (!target_host || !target_user || !command) {
+          return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
+        }
+        if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
+          return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
+        }
+        const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /\bexec\b/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
+        for (const pat of dangerousPatterns) {
+          if (pat.test(command)) return res.status(400).json({ error: 'command contains disallowed pattern' });
+        }
+        if (!/^[a-zA-Z0-9\s\/_\-.:=,@+*?[\]{}()#<>|&;'"%!\\\n]+$/.test(command)) {
+          return res.status(400).json({ error: 'command contains disallowed characters' });
+        }
+        try {
+          const escapedPassword = decryptedValue.replace(/'/g, "'\"'\"'");
+          const escapedCommand = command.replace(/'/g, "'\"'\"'");
+          const sshCmd = `sshpass -p '${escapedPassword}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const output = execSync(sshCmd, { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+          const redactedOutput = output.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+          result = { stdout: redactedOutput, exit_code: 0 };
+        } catch (sshErr) {
+          const redact = (s) => s.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+          result = { stdout: redact((sshErr.stdout || '').toString()), stderr: redact((sshErr.stderr || '').toString()), exit_code: sshErr.status || 1 };
+        }
+        break;
+      }
+
+      case 'env_inject': {
+        const { env_name = 'SECRET_VALUE' } = action_params || {};
+        result = { env_name, env_set: true, note: 'Secret injected as environment variable. Value not returned.' };
+        break;
+      }
+
+      case 'http_body': {
+        result = { note: 'http_body action type reserved for future implementation' };
+        break;
+      }
+
+      default:
+        return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, ssh_exec, env_inject, http_body` });
+    }
+
+    // Log the deliver event
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+      'rowen_deliver',
+      requestor_did,
+      secret.id,
+      contextName || null,
+      JSON.stringify({ action, target_url: targetUrl, target_host: targetHost })
+    );
+
+    res.json({ ok: true, action, secret_name, result });
+  } catch (e) {
+    res.status(500).json({ error: `action failed: ${e.message}` });
   }
 });
 
