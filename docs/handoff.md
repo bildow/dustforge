@@ -4,12 +4,20 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `034fd14` — separate Progressive Barrel Auth from Dual-Server Barrel Topology |
-| **Previous** | `643bdc9` — Sprint 6 complete (bulk fleet provisioning, QR funding, analytics) |
+| **Last commit** | `076a35f` — fix: harden DemiPass admin auth flows |
+| **Previous** | `c302211` — merge: integrate DemiPass sandbox work from claude-sandbox-cobalt-2026-04-17 |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | **LIVE** on RackNerd (192.3.84.103) — nginx reverse proxy, systemd dustforge.service, port 3001 |
 | **Static** | **LIVE** on Netlify — dustforge.com, API proxied to api.dustforge.com |
-| **Status** | 46+ tasks closed. 20-pass design phase shipped (6 sprints). Audited. Patch task cards queued for Codex. |
+| **Status** | DemiPass console work is merged on `main`, and the admin-auth/CORS follow-up fix is also on `main`. Contributors now branch from fresh `origin/main`, push only to sandbox branches, and hand Brain the pushed delta for integration. |
+
+## Branch Workflow
+
+- `main` is the authoritative integrated line for `bildow/dustforge`
+- Claude pushes feature work to `claude-sandbox-*`
+- Codex pushes feature work to `codex-sandbox-*`
+- Brain fetches those lanes, audits the delta, merges or replays approved changes onto `main`, and pushes the result
+- Local-only edits are not handoff truth until they are committed and pushed to a sandbox branch
 
 ## Codex Work Queue — START HERE
 
@@ -76,7 +84,7 @@
 | Stripe payments | Done | stripe-service.js |
 | Prepaid keys (founding + partnership tiers) | Done | server.js |
 | DemiPass (DemiVault) | Done | server.js |
-| DemiPass Console + history/requests surface | Sandbox | `codex-sandbox-demipass-console-2026-04-17` @ `44851fc` |
+| DemiPass Console + history/requests surface | Done | `public/deposit.html`, `server.js` — merged via `c302211`, hardened in `076a35f` |
 | Capacity + waiting list | Done | server.js |
 | Security bounty program | Done | server.js |
 | **Bulk provisioning API** | Done | server.js — `POST /api/identity/bulk-create` |
@@ -174,15 +182,16 @@
 
 ## Runtime Notes
 
-- Admin-only endpoints now require `DUSTFORGE_ADMIN_KEY` and should be called with the `x-admin-key` header or `admin_key` in the POST body. They no longer reuse `IDENTITY_MASTER_KEY`.
+- Admin-only endpoints now require `DUSTFORGE_ADMIN_KEY` and should be called with the `x-admin-key` header or `admin_key` in the POST body. Query-string admin auth is no longer accepted.
 - Portable attestations are capped by `DUSTFORGE_ATTESTATION_MAX_TTL_SECONDS` (default `3600`).
 - `/api/stripe/success` is status-only in the sandbox hardening branch. Account fulfillment must come from `POST /api/stripe/webhook`.
-- DemiPass sandbox branch `codex-sandbox-demipass-console-2026-04-17` adds:
+- DemiPass merged surface now on `main` adds:
   - Carbon-facing `DemiPass Console` at `/deposit.html`
   - DemiPass history route
   - owner/admin-safe context request review
   - Rowen ingest and deliver controls in the operator surface
   - target lookup by username for secret deposit
+  - CORS allowance for `x-admin-key` so the console can reach `api.dustforge.com`
 
 ## Deploy Process
 
