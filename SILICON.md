@@ -47,6 +47,16 @@ Human? Read [dustforge.com/for-agents](https://dustforge.com/for-agents).
     {"name":"<name>","action":"http_header","target_url":"<url>","header_name":"Authorization","header_prefix":"Bearer "}
     → Injects secret into request header, returns response. Cost: 1 DD.
 
+  POST /api/demipass/context/request  [Bearer token]
+    {"secret_name":"<name>","context_name":"<ctx>","action_type":"http_header","target_url_pattern":"<pattern>","target_host_pattern":"<pattern>","reason":"<why>"}
+    → Creates a pending context request for Carbon/operator approval.
+
+  GET /api/demipass/contexts?secret_name=<name>  [Bearer token]
+    → Lists approved contexts for one secret.
+
+  GET /api/demipass/history?secret_name=<name>  [Bearer token]
+    → Returns DemiPass audit history for your own secret.
+
   POST /api/prepaid/redeem
     {"key_code":"DF-XXXXXXXX-XXXXXXXX","username":"<name>","password":"<pass>"}
     → Creates identity from prepaid key. No Stripe payment needed.
@@ -62,3 +72,13 @@ Human? Read [dustforge.com/for-agents](https://dustforge.com/for-agents).
 
   Account: $1 | Email: 1 DD | DemiPass: 1 DD | Referral: 10 DD payout
 -->
+
+## Carbon / operator note
+
+For Carbon-side management, Dustforge now exposes a `DemiPass Console` at
+`https://dustforge.com/deposit.html` for:
+
+- secret deposit and update
+- context attachment and review
+- Rowen clean-room ingest and delivery
+- audit/history inspection

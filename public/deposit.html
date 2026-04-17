@@ -3,166 +3,364 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DemiPass Deposit — Dustforge</title>
+<title>DemiPass Console — Dustforge</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
-  :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#d96b6b; --warm:#c8a84b; }
-  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:2rem; }
-  .container { max-width:520px; width:100%; }
-  h1 { font-size:1.6rem; font-weight:800; margin-bottom:0.5rem; }
-  h1 span { color:var(--accent); }
-  .subtitle { color:var(--text2); font-size:0.9rem; margin-bottom:2rem; }
-  .form-group { margin-bottom:1.25rem; }
-  label { display:block; font-size:0.8rem; color:var(--text2); margin-bottom:0.4rem; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
-  input[type="text"], input[type="password"], select, textarea { width:100%; padding:0.65rem 0.75rem; background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:0.95rem; outline:none; font-family:inherit; }
-  textarea { min-height:60px; resize:vertical; }
-  select { cursor:pointer; }
+  :root {
+    --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb;
+    --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#d96b6b; --warm:#c8a84b;
+  }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,sans-serif; min-height:100vh; padding:2rem; }
+  .shell { max-width:1280px; margin:0 auto; }
+  .hero { margin-bottom:1.5rem; }
+  .hero h1 { font-size:2rem; font-weight:800; margin-bottom:0.4rem; }
+  .hero h1 span { color:var(--accent); }
+  .hero p { color:var(--text2); max-width:780px; }
+  .auth-card, .panel, .modal { background:var(--surface); border:1px solid var(--border); border-radius:14px; }
+  .auth-card { max-width:520px; padding:1.5rem; margin:3rem auto; }
+  .lookup { display:flex; gap:0.75rem; align-items:end; margin-top:1rem; }
+  .lookup .field { flex:1; }
+  .grid { display:grid; grid-template-columns: 1.1fr 0.9fr; gap:1rem; }
+  .column { display:flex; flex-direction:column; gap:1rem; }
+  .panel { padding:1rem; }
+  .panel h2 { font-size:1rem; margin-bottom:0.8rem; }
+  .panel h3 { font-size:0.9rem; margin-bottom:0.6rem; color:var(--text2); text-transform:uppercase; letter-spacing:0.05em; }
+  .field { margin-bottom:0.9rem; }
+  label { display:block; font-size:0.78rem; color:var(--text2); margin-bottom:0.35rem; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; }
+  input, select, textarea { width:100%; padding:0.72rem 0.8rem; background:var(--card); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:0.94rem; outline:none; font-family:inherit; }
+  textarea { min-height:84px; resize:vertical; }
   input:focus, select:focus, textarea:focus { border-color:var(--accent); }
-  .row { display:flex; gap:0.75rem; }
-  .row .form-group { flex:1; }
-  .btn-primary { width:100%; padding:0.8rem; background:var(--accent); color:var(--bg); border:none; border-radius:8px; font-size:1rem; font-weight:700; cursor:pointer; transition:background 0.2s; }
-  .btn-primary:hover { background:#4a9bc5; }
-  .btn-primary:disabled { opacity:0.5; cursor:not-allowed; }
-  .status { margin-top:1rem; padding:0.75rem; border-radius:6px; font-size:0.85rem; display:none; }
-  .status.error { display:block; background:rgba(217,107,107,0.15); color:var(--red); border:1px solid var(--red); }
-  .status.info { display:block; background:rgba(95,179,255,0.1); color:var(--accent); border:1px solid var(--accent); }
-  .status.success { display:block; background:rgba(105,199,177,0.1); color:var(--green); border:1px solid var(--green); }
-  .step-indicator { display:flex; gap:0.5rem; margin-bottom:2rem; }
-  .step-dot { width:8px; height:8px; border-radius:50%; background:var(--border); }
-  .step-dot.active { background:var(--accent); }
-  .step-dot.done { background:var(--green); }
-  .back { color:var(--text3); text-decoration:none; font-size:0.85rem; display:inline-block; margin-top:1.5rem; }
-  .back:hover { color:var(--accent); }
-  #step2, #step3, #step4 { display:none; }
-  .info-card { background:var(--card); border:1px solid var(--border); border-radius:8px; padding:1rem; margin:1rem 0; }
-  .info-row { display:flex; justify-content:space-between; margin-bottom:0.5rem; font-size:0.85rem; }
-  .info-row:last-child { margin-bottom:0; }
-  .info-label { color:var(--text2); }
-  .info-value { color:var(--text); font-weight:600; }
-  .info-value.mono { font-family:monospace; font-size:0.8rem; color:var(--warm); letter-spacing:0.05em; }
-  .ssh-fields { margin-top:0.75rem; padding-top:0.75rem; border-top:1px solid var(--border); display:none; }
-  .secret-list { list-style:none; }
-  .secret-list li { background:var(--card); border:1px solid var(--border); border-radius:6px; padding:0.6rem 0.85rem; margin-bottom:0.4rem; font-size:0.85rem; font-family:monospace; color:var(--warm); }
+  .row { display:grid; grid-template-columns:repeat(2, 1fr); gap:0.75rem; }
+  .row3 { display:grid; grid-template-columns:1fr 1fr 0.8fr; gap:0.75rem; }
+  .btn, button { border:none; border-radius:8px; padding:0.8rem 1rem; cursor:pointer; font-weight:700; }
+  .btn-primary { background:var(--accent); color:var(--bg); }
+  .btn-secondary { background:var(--card); color:var(--text); border:1px solid var(--border); }
+  .btn-danger { background:rgba(217,107,107,0.12); color:var(--red); border:1px solid rgba(217,107,107,0.35); }
+  .btn-small { padding:0.45rem 0.7rem; font-size:0.8rem; }
+  .btn-row { display:flex; gap:0.5rem; flex-wrap:wrap; }
+  .status { display:none; margin-top:0.8rem; padding:0.75rem; border-radius:8px; font-size:0.85rem; }
+  .status.info { display:block; color:var(--accent); background:rgba(95,179,255,0.08); border:1px solid rgba(95,179,255,0.25); }
+  .status.success { display:block; color:var(--green); background:rgba(105,199,177,0.08); border:1px solid rgba(105,199,177,0.25); }
+  .status.error { display:block; color:var(--red); background:rgba(217,107,107,0.08); border:1px solid rgba(217,107,107,0.25); }
+  .summary { display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:0.75rem; margin-top:1rem; }
+  .metric { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:0.85rem; }
+  .metric .label { color:var(--text3); font-size:0.74rem; text-transform:uppercase; letter-spacing:0.05em; }
+  .metric .value { margin-top:0.3rem; font-size:0.95rem; font-weight:700; word-break:break-word; }
+  .table-wrap { overflow:auto; border:1px solid var(--border); border-radius:10px; }
+  table { width:100%; border-collapse:collapse; min-width:640px; }
+  th, td { text-align:left; padding:0.7rem; border-bottom:1px solid rgba(39,68,95,0.5); font-size:0.85rem; vertical-align:top; }
+  th { color:var(--text2); font-size:0.76rem; text-transform:uppercase; letter-spacing:0.05em; background:rgba(19,33,49,0.75); }
+  td code { color:var(--warm); font-size:0.78rem; }
+  .pill { display:inline-flex; align-items:center; gap:0.3rem; padding:0.18rem 0.45rem; border-radius:999px; font-size:0.72rem; border:1px solid var(--border); color:var(--text2); }
+  .pill.active { color:var(--green); border-color:rgba(105,199,177,0.4); }
+  .pill.pending { color:var(--warm); border-color:rgba(200,168,75,0.4); }
+  .pill.revoked, .pill.denied { color:var(--red); border-color:rgba(217,107,107,0.4); }
+  .section-note { color:var(--text3); font-size:0.82rem; margin-bottom:0.75rem; }
+  .context-list { display:flex; flex-direction:column; gap:0.55rem; margin-top:0.75rem; }
+  .context-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:0.8rem; }
+  .context-card .meta { color:var(--text3); font-size:0.78rem; margin-top:0.3rem; line-height:1.5; }
+  .empty { color:var(--text3); font-size:0.84rem; padding:0.5rem 0; }
+  .subpanel { margin-top:1rem; padding-top:1rem; border-top:1px solid rgba(39,68,95,0.5); }
+  .footer-link { margin-top:1rem; display:inline-block; color:var(--text3); text-decoration:none; font-size:0.84rem; }
+  .footer-link:hover { color:var(--accent); }
+  @media (max-width: 980px) {
+    .grid, .summary, .row, .row3, .lookup { grid-template-columns:1fr; display:grid; }
+  }
 </style>
 </head>
 <body>
+<div class="shell">
+  <div class="hero">
+    <h1>DemiPass <span>Console</span></h1>
+    <p>Carbon-facing control surface for DemiVault secrets, contextual authorization, Rowen clean-room ingest and delivery, and audit history. Secrets stay out of LLM context; approvals and use traces stay visible.</p>
+  </div>
 
-<div class="container">
-  <!-- Step 1: Authenticate as Carbon -->
-  <div id="step1">
-    <div class="step-indicator"><span class="step-dot active"></span><span class="step-dot"></span><span class="step-dot"></span><span class="step-dot"></span></div>
-    <h1>DemiPass <span>Deposit</span></h1>
-    <p class="subtitle">Deposit secrets into a Silicon's DemiVault. Secrets never enter the LLM context.</p>
-
-    <div class="form-group">
+  <div class="auth-card" id="auth-card">
+    <h2 style="margin-bottom:0.5rem">Admin Access</h2>
+    <p class="section-note">Use your Dustforge admin key to manage a silicon’s DemiVault and Rowen flows.</p>
+    <div class="field">
       <label>Admin Key</label>
       <input type="password" id="admin-key" placeholder="DUSTFORGE_ADMIN_KEY">
     </div>
-    <button class="btn-primary" onclick="verifyAdmin()">Verify</button>
-    <div class="status" id="step1-status"></div>
+    <div class="lookup">
+      <div class="field">
+        <label>Target Silicon Username or DID</label>
+        <input type="text" id="lookup-input" placeholder="brain or did:key:z6Mk...">
+      </div>
+      <button class="btn btn-primary" onclick="verifyAndLookup()">Open Console</button>
+    </div>
+    <div class="status" id="auth-status"></div>
   </div>
 
-  <!-- Step 2: Select Target Silicon -->
-  <div id="step2">
-    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot active"></span><span class="step-dot"></span><span class="step-dot"></span></div>
-    <h1>Select <span>Silicon</span></h1>
-    <p class="subtitle">Look up the target Silicon by username or DID.</p>
-
-    <div class="form-group">
-      <label>Silicon Username or DID</label>
-      <input type="text" id="silicon-lookup" placeholder="e.g. brain or did:key:z6Mk...">
-    </div>
-    <button class="btn-primary" onclick="lookupSilicon()">Look Up</button>
-    <div class="status" id="step2-status"></div>
-
-    <div class="info-card" id="silicon-info" style="display:none">
-      <div class="info-row"><span class="info-label">Username</span><span class="info-value" id="info-username"></span></div>
-      <div class="info-row"><span class="info-label">DID</span><span class="info-value mono" id="info-did"></span></div>
-      <div class="info-row"><span class="info-label">DemiPass Secrets</span><span class="info-value" id="info-secret-count"></span></div>
-    </div>
-
-    <button class="btn-primary" id="btn-continue-deposit" style="display:none;margin-top:1rem" onclick="showDepositForm()">Continue to Deposit</button>
-
-    <a href="#" class="back" onclick="goBack(1)">&larr; Back</a>
-  </div>
-
-  <!-- Step 3: Deposit Secret -->
-  <div id="step3">
-    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot active"></span><span class="step-dot"></span></div>
-    <h1>Deposit <span>Secret</span></h1>
-    <p class="subtitle">Depositing into <strong id="deposit-target"></strong></p>
-
-    <div class="form-group">
-      <label>Secret Name</label>
-      <input type="text" id="secret-name" placeholder="e.g. ssh-password, openrouter-key">
-    </div>
-    <div class="form-group">
-      <label>Type</label>
-      <select id="secret-type" onchange="onTypeChange()">
-        <option value="passphrase">Passphrase</option>
-        <option value="token">Token</option>
-        <option value="api_key">API Key</option>
-        <option value="ssh_credential">SSH Credential</option>
-        <option value="multi_string">Multi-String</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label>Value</label>
-      <input type="password" id="secret-value" placeholder="Secret value (never displayed)">
-    </div>
-    <div class="form-group">
-      <label>Description</label>
-      <input type="text" id="secret-description" placeholder="What is this secret for?">
-    </div>
-
-    <div class="ssh-fields" id="ssh-fields">
-      <div class="row">
-        <div class="form-group">
-          <label>SSH Host</label>
-          <input type="text" id="ssh-host" placeholder="100.69.1.78">
+  <div id="console" style="display:none">
+    <div class="panel" style="margin-bottom:1rem">
+      <div class="btn-row" style="justify-content:space-between; align-items:center">
+        <div>
+          <h2 id="identity-title">Identity</h2>
+          <div class="section-note" id="identity-subtitle">Loading…</div>
         </div>
-        <div class="form-group">
-          <label>SSH User</label>
-          <input type="text" id="ssh-user" placeholder="claude">
+        <div class="btn-row">
+          <button class="btn btn-secondary btn-small" onclick="refreshAll()">Refresh</button>
+          <button class="btn btn-secondary btn-small" onclick="switchIdentity()">Switch Identity</button>
         </div>
+      </div>
+      <div class="summary">
+        <div class="metric"><div class="label">Username</div><div class="value" id="metric-username">—</div></div>
+        <div class="metric"><div class="label">DID</div><div class="value" id="metric-did">—</div></div>
+        <div class="metric"><div class="label">Secrets</div><div class="value" id="metric-secrets">0</div></div>
+        <div class="metric"><div class="label">Pending Requests</div><div class="value" id="metric-requests">0</div></div>
       </div>
     </div>
 
-    <div class="form-group">
-      <label>Metadata JSON <span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--text3)">(optional)</span></label>
-      <textarea id="secret-metadata" placeholder='{"key": "value"}'></textarea>
+    <div class="grid">
+      <div class="column">
+        <div class="panel">
+          <h2>Phase 1 — Secret Management</h2>
+          <p class="section-note">Create or update a secret in the target identity’s DemiVault. Optionally pre-attach a context so the silicon can use it immediately.</p>
+          <div class="row">
+            <div class="field">
+              <label>Secret Name</label>
+              <input type="text" id="secret-name" placeholder="openrouter-key">
+            </div>
+            <div class="field">
+              <label>Secret Type</label>
+              <select id="secret-type">
+                <option value="api_key">API key</option>
+                <option value="oauth_token">OAuth token</option>
+                <option value="password">Password</option>
+                <option value="ssh_credential">SSH credential</option>
+                <option value="webhook_secret">Webhook secret</option>
+                <option value="connection_string">Connection string</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label>Secret Value</label>
+            <input type="password" id="secret-value" placeholder="Secret value">
+          </div>
+          <div class="field">
+            <label>Description</label>
+            <input type="text" id="secret-description" placeholder="What this is for">
+          </div>
+          <div class="row3">
+            <div class="field">
+              <label>Context Name</label>
+              <input type="text" id="context-name" placeholder="openrouter-completion">
+            </div>
+            <div class="field">
+              <label>Action</label>
+              <select id="context-action">
+                <option value="http_header">http_header</option>
+                <option value="ssh_exec">ssh_exec</option>
+                <option value="env_inject">env_inject</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Max Uses</label>
+              <input type="number" id="context-max-uses" min="0" value="0">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Target URL Pattern</label>
+              <input type="text" id="context-url-pattern" placeholder="https://api.openrouter.ai/*">
+            </div>
+            <div class="field">
+              <label>Target Host Pattern</label>
+              <input type="text" id="context-host-pattern" placeholder="openrouter.ai">
+            </div>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" onclick="storeSecret()">Store Secret</button>
+            <button class="btn btn-secondary" onclick="resetSecretForm()">Clear</button>
+          </div>
+          <div class="status" id="store-status"></div>
+
+          <div class="subpanel">
+            <h3>Secrets</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Name</th><th>Type</th><th>Uses</th><th>Updated</th><th>Actions</th></tr>
+                </thead>
+                <tbody id="secrets-body"><tr><td colspan="5" class="empty">No secrets loaded.</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Phase 2 — Contexts and Approvals</h2>
+          <p class="section-note">Attach explicit authorization rules to a secret, review context requests from silicons, and preserve a clean approval trace.</p>
+          <div class="row3">
+            <div class="field">
+              <label>Secret</label>
+              <select id="context-secret-select"></select>
+            </div>
+            <div class="field">
+              <label>Context Name</label>
+              <input type="text" id="manual-context-name" placeholder="github-api">
+            </div>
+            <div class="field">
+              <label>Max Uses</label>
+              <input type="number" id="manual-context-max-uses" min="0" value="0">
+            </div>
+          </div>
+          <div class="row3">
+            <div class="field">
+              <label>Action</label>
+              <select id="manual-context-action">
+                <option value="http_header">http_header</option>
+                <option value="ssh_exec">ssh_exec</option>
+                <option value="env_inject">env_inject</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Target URL Pattern</label>
+              <input type="text" id="manual-context-url" placeholder="https://api.github.com/*">
+            </div>
+            <div class="field">
+              <label>Target Host Pattern</label>
+              <input type="text" id="manual-context-host" placeholder="api.github.com">
+            </div>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" onclick="addContext()">Add Context</button>
+            <button class="btn btn-secondary" onclick="loadContextsForSelectedSecret()">Load Contexts</button>
+          </div>
+          <div class="status" id="context-status"></div>
+
+          <div class="subpanel">
+            <h3>Contexts</h3>
+            <div id="contexts-list" class="context-list"><div class="empty">Select a secret and load its contexts.</div></div>
+          </div>
+
+          <div class="subpanel">
+            <h3>Pending Context Requests</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Secret</th><th>Request</th><th>Target</th><th>Reason</th><th>Actions</th></tr>
+                </thead>
+                <tbody id="requests-body"><tr><td colspan="5" class="empty">No pending requests.</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="column">
+        <div class="panel">
+          <h2>Phase 3 — Rowen Clean-Room</h2>
+          <p class="section-note">Drive clean-room ingest and delivery through Rowen’s explicit entry points. Rowen acts once; the secret stays in DemiVault.</p>
+
+          <h3>Rowen Ingest</h3>
+          <div class="row">
+            <div class="field">
+              <label>Depositor Type</label>
+              <select id="rowen-depositor-type">
+                <option value="carbon">carbon</option>
+                <option value="silicon">silicon</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Depositor ID</label>
+              <input type="text" id="rowen-depositor-id" placeholder="aaron or brain">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Secret Name</label>
+              <input type="text" id="rowen-secret-name" placeholder="github-token">
+            </div>
+            <div class="field">
+              <label>Secret Type</label>
+              <select id="rowen-secret-type">
+                <option value="api_key">api_key</option>
+                <option value="oauth_token">oauth_token</option>
+                <option value="password">password</option>
+                <option value="ssh_credential">ssh_credential</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label>Secret Value</label>
+            <input type="password" id="rowen-secret-value" placeholder="Secret value">
+          </div>
+          <div class="field">
+            <label>Description</label>
+            <input type="text" id="rowen-secret-description" placeholder="Optional description">
+          </div>
+          <button class="btn btn-primary" onclick="rowenIngest()">Run Rowen Ingest</button>
+          <div class="status" id="rowen-ingest-status"></div>
+
+          <div class="subpanel">
+            <h3>Rowen Deliver</h3>
+            <div class="row">
+              <div class="field">
+                <label>Secret Name</label>
+                <input type="text" id="rowen-deliver-secret" placeholder="github-token">
+              </div>
+              <div class="field">
+                <label>Context Name</label>
+                <input type="text" id="rowen-deliver-context" placeholder="github-api">
+              </div>
+            </div>
+            <div class="row3">
+              <div class="field">
+                <label>Action</label>
+                <select id="rowen-deliver-action">
+                  <option value="http_header">http_header</option>
+                  <option value="ssh_exec">ssh_exec</option>
+                  <option value="env_inject">env_inject</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Target URL</label>
+                <input type="text" id="rowen-deliver-url" placeholder="https://api.github.com/user">
+              </div>
+              <div class="field">
+                <label>Target Host</label>
+                <input type="text" id="rowen-deliver-host" placeholder="api.github.com">
+              </div>
+            </div>
+            <button class="btn btn-primary" onclick="rowenDeliver()">Run Rowen Deliver</button>
+            <div class="status" id="rowen-deliver-status"></div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <h2>Phase 4 — Audit and History</h2>
+          <p class="section-note">Every store, context approval, token issuance, and Rowen action should remain inspectable.</p>
+          <div class="btn-row" style="margin-bottom:0.8rem">
+            <button class="btn btn-secondary btn-small" onclick="loadHistory()">Reload History</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Time</th><th>Event</th><th>Secret</th><th>Actor</th><th>Detail</th></tr>
+              </thead>
+              <tbody id="history-body"><tr><td colspan="5" class="empty">No history loaded.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </div>
-
-    <button class="btn-primary" onclick="depositSecret()">Deposit Secret</button>
-    <div class="status" id="step3-status"></div>
-
-    <a href="#" class="back" onclick="goBack(2)">&larr; Back</a>
   </div>
 
-  <!-- Step 4: Verify -->
-  <div id="step4">
-    <div class="step-indicator"><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot done"></span><span class="step-dot active"></span></div>
-    <h1>Deposit <span>Complete</span></h1>
-    <p class="subtitle" id="step4-summary"></p>
-
-    <div class="info-card">
-      <div style="font-size:0.8rem;color:var(--text2);text-transform:uppercase;font-weight:600;letter-spacing:0.05em;margin-bottom:0.75rem">Secrets for <span id="verify-target"></span></div>
-      <ul class="secret-list" id="secret-list"></ul>
-    </div>
-
-    <button class="btn-primary" style="margin-top:1rem" onclick="depositAnother()">Deposit Another Secret</button>
-
-    <a href="#" class="back" onclick="goBack(2)">&larr; Back to Silicon Lookup</a>
-  </div>
-
-  <a href="/" class="back">&larr; Back to Dustforge</a>
+  <a href="/" class="footer-link">&larr; Back to Dustforge</a>
 </div>
 
 <script>
 const API = 'https://api.dustforge.com';
-let adminKey = '';
-let targetUsername = '';
-let targetDid = '';
+const state = { adminKey: '', targetDid: '', targetUsername: '', secrets: [], contexts: {} };
+
+function esc(s) {
+  const div = document.createElement('div');
+  div.textContent = s == null ? '' : String(s);
+  return div.innerHTML;
+}
 
 function showStatus(id, type, msg) {
   const el = document.getElementById(id);
@@ -176,193 +374,346 @@ function clearStatus(id) {
   el.textContent = '';
 }
 
-function goBack(step) {
-  document.getElementById('step1').style.display = step === 1 ? 'block' : 'none';
-  document.getElementById('step2').style.display = step === 2 ? 'block' : 'none';
-  document.getElementById('step3').style.display = step === 3 ? 'block' : 'none';
-  document.getElementById('step4').style.display = 'none';
+async function api(path, opts = {}) {
+  const headers = Object.assign({
+    'Content-Type': 'application/json',
+    'x-admin-key': state.adminKey,
+  }, opts.headers || {});
+  const res = await fetch(API + path, Object.assign({}, opts, { headers }));
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error(data.error || ('request failed: ' + res.status));
+  return data;
 }
 
-function onTypeChange() {
-  const type = document.getElementById('secret-type').value;
-  document.getElementById('ssh-fields').style.display = type === 'ssh_credential' ? 'block' : 'none';
-
-  // Pre-fill metadata for ssh_credential
-  if (type === 'ssh_credential') {
-    const meta = document.getElementById('secret-metadata');
-    if (!meta.value.trim()) {
-      meta.value = JSON.stringify({ host: '', user: '' }, null, 2);
-    }
-  }
-}
-
-async function verifyAdmin() {
+async function verifyAndLookup() {
   const key = document.getElementById('admin-key').value.trim();
-  if (!key) return showStatus('step1-status', 'error', 'Admin key required.');
-
-  showStatus('step1-status', 'info', 'Verifying...');
-
+  const query = document.getElementById('lookup-input').value.trim();
+  if (!key) return showStatus('auth-status', 'error', 'Admin key required.');
+  if (!query) return showStatus('auth-status', 'error', 'Target silicon username or DID required.');
+  showStatus('auth-status', 'info', 'Opening DemiPass console…');
   try {
-    const res = await fetch(API + '/api/ops/dashboard', {
-      headers: { 'x-admin-key': key },
-    });
-    if (!res.ok) return showStatus('step1-status', 'error', 'Invalid admin key.');
-    const data = await res.json();
-    if (!data.ok && !data.status) return showStatus('step1-status', 'error', 'Invalid admin key.');
-
-    adminKey = key;
-    document.getElementById('step1').style.display = 'none';
-    document.getElementById('step2').style.display = 'block';
-  } catch (e) {
-    showStatus('step1-status', 'error', 'Network error. Try again.');
+    state.adminKey = key;
+    await api('/api/ops/dashboard', { method: 'GET' });
+    const param = query.startsWith('did:') ? 'did=' + encodeURIComponent(query) : 'username=' + encodeURIComponent(query);
+    const identity = await api('/api/identity/lookup?' + param, { method: 'GET' });
+    state.targetDid = identity.did;
+    state.targetUsername = identity.username;
+    document.getElementById('auth-card').style.display = 'none';
+    document.getElementById('console').style.display = 'block';
+    document.getElementById('identity-title').textContent = 'DemiPass Console · ' + identity.username;
+    document.getElementById('identity-subtitle').textContent = 'DemiVault for ' + identity.did;
+    document.getElementById('metric-username').textContent = identity.username;
+    document.getElementById('metric-did').textContent = identity.did;
+    document.getElementById('rowen-depositor-id').value = 'aaron';
+    await refreshAll();
+  } catch (err) {
+    showStatus('auth-status', 'error', err.message);
   }
 }
 
-async function lookupSilicon() {
-  const query = document.getElementById('silicon-lookup').value.trim();
-  if (!query) return showStatus('step2-status', 'error', 'Enter a username or DID.');
+function switchIdentity() {
+  document.getElementById('console').style.display = 'none';
+  document.getElementById('auth-card').style.display = 'block';
+  showStatus('auth-status', 'info', 'Enter another username or DID to switch targets.');
+}
 
-  showStatus('step2-status', 'info', 'Looking up...');
+async function refreshAll() {
+  await Promise.all([loadSecrets(), loadRequests(), loadHistory()]);
+}
 
-  try {
-    const param = query.startsWith('did:') ? 'did' : 'username';
-    const res = await fetch(API + '/api/identity/lookup?' + param + '=' + encodeURIComponent(query), {
-      headers: { 'x-admin-key': adminKey },
-    });
-    if (!res.ok) return showStatus('step2-status', 'error', 'Silicon not found.');
-    const data = await res.json();
-    if (!data.ok && !data.username) return showStatus('step2-status', 'error', data.error || 'Silicon not found.');
+async function loadSecrets() {
+  const data = await api('/api/demipass/list?did=' + encodeURIComponent(state.targetDid), { method: 'GET' });
+  state.secrets = data.secrets || [];
+  document.getElementById('metric-secrets').textContent = String(state.secrets.length);
 
-    targetUsername = data.username;
-    targetDid = data.did;
+  const body = document.getElementById('secrets-body');
+  if (!state.secrets.length) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">No DemiPass secrets stored.</td></tr>';
+  } else {
+    body.innerHTML = state.secrets.map((secret) => `
+      <tr>
+        <td><strong>${esc(secret.name)}</strong><div class="pill ${esc(secret.status)}">${esc(secret.status)}</div></td>
+        <td>${esc(secret.secret_type || 'other')}</td>
+        <td>${secret.use_count || 0}</td>
+        <td>${esc(secret.updated_at || secret.created_at || '—')}</td>
+        <td>
+          <div class="btn-row">
+            <button class="btn btn-secondary btn-small" onclick="selectSecret('${encodeURIComponent(secret.name)}')">Contexts</button>
+            <button class="btn btn-secondary btn-small" onclick="prefillRotate('${encodeURIComponent(secret.name)}')">Rotate</button>
+            <button class="btn btn-danger btn-small" onclick="revokeSecret('${encodeURIComponent(secret.name)}')">Revoke</button>
+          </div>
+        </td>
+      </tr>
+    `).join('');
+  }
 
-    document.getElementById('info-username').textContent = data.username;
-    document.getElementById('info-did').textContent = data.did;
-    document.getElementById('info-secret-count').textContent = (data.demipass_count !== undefined ? data.demipass_count : data.blindkey_count !== undefined ? data.blindkey_count : data.secret_count !== undefined ? data.secret_count : '—');
-    document.getElementById('silicon-info').style.display = 'block';
-    document.getElementById('btn-continue-deposit').style.display = 'block';
-    clearStatus('step2-status');
-  } catch (e) {
-    showStatus('step2-status', 'error', 'Network error. Try again.');
+  const options = state.secrets.map((secret) => `<option value="${esc(secret.name)}">${esc(secret.name)}</option>`).join('');
+  document.getElementById('context-secret-select').innerHTML = options || '<option value="">No secrets</option>';
+  if (state.secrets.length) {
+    document.getElementById('context-secret-select').value = state.secrets[0].name;
   }
 }
 
-function showDepositForm() {
-  document.getElementById('step2').style.display = 'none';
-  document.getElementById('step3').style.display = 'block';
-  document.getElementById('deposit-target').textContent = targetUsername;
+function resetSecretForm() {
+  ['secret-name', 'secret-value', 'secret-description', 'context-name', 'context-url-pattern', 'context-host-pattern'].forEach((id) => {
+    document.getElementById(id).value = '';
+  });
+  document.getElementById('secret-type').value = 'api_key';
+  document.getElementById('context-action').value = 'http_header';
+  document.getElementById('context-max-uses').value = '0';
+  clearStatus('store-status');
 }
 
-async function depositSecret() {
+async function storeSecret() {
   const name = document.getElementById('secret-name').value.trim();
-  const type = document.getElementById('secret-type').value;
   const value = document.getElementById('secret-value').value;
-  const description = document.getElementById('secret-description').value.trim();
-  const metaRaw = document.getElementById('secret-metadata').value.trim();
+  if (!name || !value) return showStatus('store-status', 'error', 'Secret name and value required.');
 
-  if (!name) return showStatus('step3-status', 'error', 'Secret name required.');
-  if (!value) return showStatus('step3-status', 'error', 'Secret value required.');
+  const contextName = document.getElementById('context-name').value.trim();
+  const contexts = contextName ? [{
+    context_name: contextName,
+    action_type: document.getElementById('context-action').value,
+    target_url_pattern: document.getElementById('context-url-pattern').value.trim() || '*',
+    target_host_pattern: document.getElementById('context-host-pattern').value.trim() || '*',
+    max_uses: Number(document.getElementById('context-max-uses').value || 0),
+  }] : [];
 
-  let metadata = null;
-  if (metaRaw) {
-    try {
-      metadata = JSON.parse(metaRaw);
-    } catch (e) {
-      return showStatus('step3-status', 'error', 'Invalid metadata JSON.');
-    }
-  }
-
-  // For ssh_credential, merge host/user into metadata
-  if (type === 'ssh_credential') {
-    const host = document.getElementById('ssh-host').value.trim();
-    const user = document.getElementById('ssh-user').value.trim();
-    if (host || user) {
-      metadata = metadata || {};
-      if (host) metadata.host = host;
-      if (user) metadata.user = user;
-    }
-  }
-
-  const body = {
-    target_username: targetUsername,
-    name: name,
-    type: type,
-    value: value,
-  };
-  if (description) body.description = description;
-  if (metadata) body.metadata = metadata;
-
-  showStatus('step3-status', 'info', 'Depositing...');
-
+  showStatus('store-status', 'info', 'Storing secret in DemiVault…');
   try {
-    const res = await fetch(API + '/api/demipass/deposit', {
+    await api('/api/demipass/deposit', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-admin-key': adminKey,
-      },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        target_did: state.targetDid,
+        name,
+        value,
+        description: document.getElementById('secret-description').value.trim(),
+        secret_type: document.getElementById('secret-type').value,
+        contexts,
+      }),
     });
-    const data = await res.json();
-    if (!res.ok || (!data.ok && !data.secret_name)) {
-      return showStatus('step3-status', 'error', data.error || 'Deposit failed.');
-    }
-
-    // Move to verification step
-    document.getElementById('step3').style.display = 'none';
-    document.getElementById('step4').style.display = 'block';
-    document.getElementById('step4-summary').textContent = 'Secret "' + name + '" deposited into ' + targetUsername + "'s DemiVault.";
-    document.getElementById('verify-target').textContent = targetUsername;
-
-    // Fetch updated secret list
-    loadSecretList();
-  } catch (e) {
-    showStatus('step3-status', 'error', 'Network error. Try again.');
+    showStatus('store-status', 'success', 'Secret stored.');
+    resetSecretForm();
+    await refreshAll();
+  } catch (err) {
+    showStatus('store-status', 'error', err.message);
   }
 }
 
-async function loadSecretList() {
-  const list = document.getElementById('secret-list');
-  list.innerHTML = '<li style="color:var(--text3);font-family:inherit">Loading...</li>';
+function selectSecret(encodedName) {
+  const name = decodeURIComponent(encodedName);
+  document.getElementById('context-secret-select').value = name;
+  loadContexts(name);
+}
 
+function prefillRotate(encodedName) {
+  const name = decodeURIComponent(encodedName);
+  document.getElementById('secret-name').value = name;
+  document.getElementById('secret-value').focus();
+  showStatus('store-status', 'info', 'Enter a new value and store it as a fresh version, or use the rotate endpoint later for grace-period rollover.');
+}
+
+async function revokeSecret(encodedName) {
+  const name = decodeURIComponent(encodedName);
+  if (!confirm('Revoke secret "' + name + '"?')) return;
   try {
-    const param = targetUsername ? 'username=' + encodeURIComponent(targetUsername) : 'did=' + encodeURIComponent(targetDid);
-    const res = await fetch(API + '/api/demipass/list?' + param, {
-      headers: { 'x-admin-key': adminKey },
+    await api('/api/demipass/revoke', {
+      method: 'DELETE',
+      body: JSON.stringify({ did: state.targetDid, name }),
     });
-    const data = await res.json();
-    const secrets = data.secrets || data.names || [];
-    if (secrets.length === 0) {
-      list.innerHTML = '<li style="color:var(--text3);font-family:inherit">No secrets found.</li>';
-    } else {
-      list.innerHTML = secrets.map(s => {
-        const name = typeof s === 'string' ? s : s.name;
-        const type = typeof s === 'object' && s.type ? ' <span style="color:var(--text3);font-size:0.75rem">(' + s.type + ')</span>' : '';
-        return '<li>' + esc(name) + type + '</li>';
-      }).join('');
-    }
-  } catch (e) {
-    list.innerHTML = '<li style="color:var(--red);font-family:inherit">Failed to load secrets.</li>';
+    await refreshAll();
+  } catch (err) {
+    showStatus('store-status', 'error', err.message);
   }
 }
 
-function depositAnother() {
-  // Reset form fields
-  document.getElementById('secret-name').value = '';
-  document.getElementById('secret-value').value = '';
-  document.getElementById('secret-description').value = '';
-  document.getElementById('secret-metadata').value = '';
-  document.getElementById('secret-type').value = 'passphrase';
-  document.getElementById('ssh-host').value = '';
-  document.getElementById('ssh-user').value = '';
-  document.getElementById('ssh-fields').style.display = 'none';
-  clearStatus('step3-status');
+async function addContext() {
+  const secretName = document.getElementById('context-secret-select').value;
+  const contextName = document.getElementById('manual-context-name').value.trim();
+  if (!secretName || !contextName) return showStatus('context-status', 'error', 'Secret and context name required.');
 
-  document.getElementById('step4').style.display = 'none';
-  document.getElementById('step3').style.display = 'block';
+  showStatus('context-status', 'info', 'Adding context…');
+  try {
+    await api('/api/demipass/context/add', {
+      method: 'POST',
+      body: JSON.stringify({
+        did: state.targetDid,
+        secret_name: secretName,
+        context_name: contextName,
+        action_type: document.getElementById('manual-context-action').value,
+        target_url_pattern: document.getElementById('manual-context-url').value.trim() || '*',
+        target_host_pattern: document.getElementById('manual-context-host').value.trim() || '*',
+        max_uses: Number(document.getElementById('manual-context-max-uses').value || 0),
+      }),
+    });
+    showStatus('context-status', 'success', 'Context added.');
+    document.getElementById('manual-context-name').value = '';
+    document.getElementById('manual-context-url').value = '';
+    document.getElementById('manual-context-host').value = '';
+    document.getElementById('manual-context-max-uses').value = '0';
+    await loadContexts(secretName);
+  } catch (err) {
+    showStatus('context-status', 'error', err.message);
+  }
 }
 
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+async function loadContextsForSelectedSecret() {
+  const secretName = document.getElementById('context-secret-select').value;
+  if (!secretName) return;
+  await loadContexts(secretName);
+}
+
+async function loadContexts(secretName) {
+  const data = await api('/api/demipass/contexts?did=' + encodeURIComponent(state.targetDid) + '&secret_name=' + encodeURIComponent(secretName), { method: 'GET' });
+  state.contexts[secretName] = data.contexts || [];
+  const list = document.getElementById('contexts-list');
+  if (!data.contexts || !data.contexts.length) {
+    list.innerHTML = '<div class="empty">No contexts attached to ' + esc(secretName) + '.</div>';
+    return;
+  }
+  list.innerHTML = data.contexts.map((ctx) => `
+    <div class="context-card">
+      <div class="btn-row" style="justify-content:space-between">
+        <div>
+          <strong>${esc(ctx.context_name)}</strong>
+          <div class="pill ${esc(ctx.status)}">${esc(ctx.status)}</div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-secondary btn-small" onclick="toggleContextStatus(${ctx.id}, '${ctx.status === 'revoked' ? 'active' : 'revoked'}', '${encodeURIComponent(secretName)}')">${ctx.status === 'revoked' ? 'Restore' : 'Revoke'}</button>
+        </div>
+      </div>
+      <div class="meta">
+        action: <code>${esc(ctx.action_type)}</code><br>
+        host: <code>${esc(ctx.target_host_pattern || '*')}</code><br>
+        url: <code>${esc(ctx.target_url_pattern || '*')}</code><br>
+        uses: ${ctx.use_count || 0}${ctx.max_uses ? ' / ' + ctx.max_uses : ' / unlimited'}
+      </div>
+    </div>
+  `).join('');
+}
+
+async function toggleContextStatus(contextId, status, encodedSecretName) {
+  try {
+    await api('/api/demipass/context/' + contextId, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    });
+    await loadContexts(decodeURIComponent(encodedSecretName));
+  } catch (err) {
+    showStatus('context-status', 'error', err.message);
+  }
+}
+
+async function loadRequests() {
+  const data = await api('/api/demipass/context/requests?did=' + encodeURIComponent(state.targetDid), { method: 'GET' });
+  const pending = (data.requests || []).filter((row) => row.status === 'pending');
+  document.getElementById('metric-requests').textContent = String(pending.length);
+  const body = document.getElementById('requests-body');
+  if (!pending.length) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">No pending requests.</td></tr>';
+    return;
+  }
+  body.innerHTML = pending.map((row) => `
+    <tr>
+      <td><strong>${esc(row.secret_name)}</strong></td>
+      <td>${esc(row.requested_context)}<br><code>${esc(row.requested_action_type)}</code></td>
+      <td><code>${esc(row.target_host_pattern || '*')}</code><br><code>${esc(row.target_url_pattern || '*')}</code></td>
+      <td>${esc(row.reason || '—')}</td>
+      <td>
+        <div class="btn-row">
+          <button class="btn btn-primary btn-small" onclick="resolveRequest(${row.id}, 'approve')">Approve</button>
+          <button class="btn btn-danger btn-small" onclick="resolveRequest(${row.id}, 'deny')">Deny</button>
+        </div>
+      </td>
+    </tr>
+  `).join('');
+}
+
+async function resolveRequest(id, action) {
+  try {
+    await api('/api/demipass/context/requests/' + id + '/' + action, { method: 'POST' });
+    await Promise.all([loadRequests(), loadSecrets()]);
+  } catch (err) {
+    showStatus('context-status', 'error', err.message);
+  }
+}
+
+async function loadHistory() {
+  const data = await api('/api/demipass/history?did=' + encodeURIComponent(state.targetDid) + '&limit=50', { method: 'GET' });
+  const rows = data.events || [];
+  const body = document.getElementById('history-body');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="5" class="empty">No DemiPass history yet.</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map((row) => {
+    const detail = typeof row.detail === 'object' ? JSON.stringify(row.detail) : String(row.detail || '');
+    return `
+      <tr>
+        <td>${esc(row.created_at || '—')}</td>
+        <td>${esc(row.event_type)}</td>
+        <td>${esc(row.secret_name || '—')}</td>
+        <td>${esc(row.actor || '—')}</td>
+        <td><code>${esc(detail).slice(0, 180)}</code></td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function rowenIngest() {
+  const secretName = document.getElementById('rowen-secret-name').value.trim();
+  const secretValue = document.getElementById('rowen-secret-value').value;
+  if (!secretName || !secretValue) return showStatus('rowen-ingest-status', 'error', 'Secret name and value required.');
+  showStatus('rowen-ingest-status', 'info', 'Running Rowen ingest…');
+  try {
+    await api('/api/rowen/ingest', {
+      method: 'POST',
+      body: JSON.stringify({
+        depositor_type: document.getElementById('rowen-depositor-type').value,
+        depositor_id: document.getElementById('rowen-depositor-id').value.trim() || 'aaron',
+        target_did: state.targetDid,
+        name: secretName,
+        value: secretValue,
+        secret_type: document.getElementById('rowen-secret-type').value,
+        description: document.getElementById('rowen-secret-description').value.trim(),
+      }),
+    });
+    showStatus('rowen-ingest-status', 'success', 'Rowen ingest complete.');
+    document.getElementById('rowen-secret-name').value = '';
+    document.getElementById('rowen-secret-value').value = '';
+    document.getElementById('rowen-secret-description').value = '';
+    await refreshAll();
+  } catch (err) {
+    showStatus('rowen-ingest-status', 'error', err.message);
+  }
+}
+
+async function rowenDeliver() {
+  const secretName = document.getElementById('rowen-deliver-secret').value.trim();
+  const action = document.getElementById('rowen-deliver-action').value;
+  if (!secretName) return showStatus('rowen-deliver-status', 'error', 'Secret name required.');
+  showStatus('rowen-deliver-status', 'info', 'Running Rowen deliver…');
+  try {
+    const result = await api('/api/rowen/deliver', {
+      method: 'POST',
+      body: JSON.stringify({
+        requestor_did: state.targetDid,
+        secret_name: secretName,
+        context: document.getElementById('rowen-deliver-context').value.trim(),
+        action_params: {
+          action,
+          url: document.getElementById('rowen-deliver-url').value.trim(),
+          target_host: document.getElementById('rowen-deliver-host').value.trim(),
+        },
+      }),
+    });
+    showStatus('rowen-deliver-status', 'success', 'Rowen deliver complete: ' + JSON.stringify(result.result || {}).slice(0, 160));
+    await refreshAll();
+  } catch (err) {
+    showStatus('rowen-deliver-status', 'error', err.message);
+  }
+}
 </script>
 </body>
 </html>

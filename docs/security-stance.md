@@ -25,6 +25,29 @@ Dustforge does not compete on infrastructure isolation. We do not run sandboxed 
 - **Infrastructure attacks on our servers**: Single VPS, password SSH (known limitation), no WAF.
 - **Key loss**: If IDENTITY_MASTER_KEY is lost, all encrypted private keys are unrecoverable. No HSM.
 
+## DemiPass governance posture
+
+DemiPass is no longer just a storage/execution primitive. The product shape now includes:
+
+1. **DemiVault storage** — encrypted secret boundary
+2. **Context policy** — explicit action + host/url + optional use cap
+3. **Carbon governance** — console-driven review, approval, revocation, and history
+4. **Rowen clean-room operators** — ingest and deliver as explicit one-shot flows
+
+That is important because the real trust story is not only "secret never enters context."
+It is also:
+
+- who attached the context
+- who approved it
+- when it was used
+- whether Rowen or a silicon initiated the action
+
+This is a better operator posture than a silent vault, but it is still startup-grade:
+
+- approval semantics are lightweight, not multi-party
+- the Carbon-facing surface is currently admin-key based
+- auditability exists, but it is not yet a full compliance log product
+
 ## Why Identity-First Is Stronger For Our Use Case
 
 Silicon operators care about three things:

@@ -74,6 +74,47 @@ function requireAdminAccess(req, res) {
   return true;
 }
 
+function getBearerIdentity(req) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return { ok: false, status: 401, error: 'Bearer token required' };
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return { ok: false, status: 401, error: v.error };
+  const scope = v.decoded.scope || '';
+  if (!['transact', 'admin', 'full'].includes(scope)) {
+    return { ok: false, status: 403, error: 'transact scope required' };
+  }
+  return { ok: true, did: v.decoded.sub, scope, decoded: v.decoded };
+}
+
+function getDemiPassActor(req, res, options = {}) {
+  const allowAdmin = options.allowAdmin !== false;
+  const auth = getBearerIdentity(req);
+  if (auth.ok) {
+    return {
+      ok: true,
+      mode: 'owner',
+      did: auth.did,
+      actor: auth.did,
+      scope: auth.scope,
+    };
+  }
+  if (allowAdmin && ADMIN_API_KEY) {
+    const provided = req.headers['x-admin-key'] || req.body?.admin_key || req.query?.admin_key || '';
+    if (safeSecretEqual(provided, ADMIN_API_KEY)) {
+      return { ok: true, mode: 'admin', actor: 'admin' };
+    }
+  }
+  if (res) {
+    if (allowAdmin && ADMIN_API_KEY) {
+      res.status(403).json({ error: 'admin access or Bearer token required' });
+    } else {
+      res.status(auth.status || 401).json({ error: auth.error || 'Bearer token required' });
+    }
+  }
+  return { ok: false };
+}
+
 // Ensure data directory exists
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
@@ -1244,11 +1285,96 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
 });
 
 // GET /api/blindkey/list — list secret names and metadata (never values)
-app.get('/api/blindkey/list', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  let ownerDid = actor.did || null;
+  if (actor.mode === 'admin') {
+    const { did, username, include_inactive } = req.query || {};
+    if (!did && !username) return res.status(400).json({ error: 'did or username required when using admin access' });
+    if (did) {
+      ownerDid = did;
+    } else {
+      const wallet = db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username);
+      if (!wallet) return res.status(404).json({ error: 'identity not found' });
+      ownerDid = wallet.did;
+    }
+    const statusClause = include_inactive === '1' ? '' : 'AND status = ?';
+    const secrets = db.prepare(
+      `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version
+       FROM blindkey_secrets WHERE did = ? ${statusClause} ORDER BY updated_at DESC, name ASC`
+    ).all(ownerDid, ...(include_inactive === '1' ? [] : ['active']));
+    return res.json({ did: ownerDid, secrets, total: secrets.length });
+  }
+
   const secrets = db.prepare(
-    'SELECT name, description, secret_type, status, use_count, last_used_at, created_at, updated_at FROM blindkey_secrets WHERE did = ? AND status = ?'
-  ).all(req.identity.did, 'active');
-  res.json({ secrets, total: secrets.length });
+    `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version
+     FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
+  ).all(ownerDid, 'active');
+  res.json({ did: ownerDid, secrets, total: secrets.length });
+});
+
+// GET /api/blindkey/history — list audit events for DemiPass secrets
+app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { secret_name, event_type, limit = 100, did, username } = req.query || {};
+  const limitNum = Math.min(200, Math.max(1, Number(limit) || 100));
+  let ownerDid = actor.did || null;
+
+  if (actor.mode === 'admin') {
+    if (did) {
+      ownerDid = did;
+    } else if (username) {
+      const wallet = db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username);
+      if (!wallet) return res.status(404).json({ error: 'identity not found' });
+      ownerDid = wallet.did;
+    } else if (!secret_name) {
+      return res.status(400).json({ error: 'did, username, or secret_name required when using admin access' });
+    }
+  }
+
+  let secretId = null;
+  if (secret_name) {
+    const secret = ownerDid
+      ? db.prepare(`SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? ORDER BY version DESC LIMIT 1`).get(ownerDid, secret_name)
+      : db.prepare(`SELECT id FROM blindkey_secrets WHERE name = ? ORDER BY updated_at DESC LIMIT 1`).get(secret_name);
+    if (!secret) return res.status(404).json({ error: 'secret not found' });
+    secretId = secret.id;
+  }
+
+  let sql = `
+    SELECT e.id, e.event_type, e.actor, e.context_name, e.detail, e.created_at,
+           s.name as secret_name, s.did
+    FROM blindkey_events e
+    LEFT JOIN blindkey_secrets s ON s.id = e.secret_id
+    WHERE 1 = 1
+  `;
+  const params = [];
+  if (ownerDid) {
+    sql += ' AND s.did = ?';
+    params.push(ownerDid);
+  }
+  if (secretId) {
+    sql += ' AND e.secret_id = ?';
+    params.push(secretId);
+  }
+  if (event_type) {
+    sql += ' AND e.event_type = ?';
+    params.push(event_type);
+  }
+  sql += ' ORDER BY e.created_at DESC LIMIT ?';
+  params.push(limitNum);
+
+  const events = db.prepare(sql).all(...params).map((row) => {
+    let detail = row.detail;
+    try { detail = JSON.parse(row.detail || '{}'); } catch (_) {}
+    return { ...row, detail };
+  });
+
+  res.json({ did: ownerDid, events, total: events.length });
 });
 
 // POST /api/blindkey/request-token — request a short-lived use-token by presenting intended context
@@ -1641,13 +1767,20 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 });
 
 // DELETE /api/blindkey/revoke — deactivate a secret
-app.delete('/api/blindkey/revoke', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
-  const { name } = req.body || {};
+app.delete('/api/blindkey/revoke', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { name, did, username } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+  let ownerDid = actor.did || null;
+  if (actor.mode === 'admin') {
+    ownerDid = did || (username ? db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username)?.did : null);
+    if (!ownerDid) return res.status(400).json({ error: 'did or username required when using admin access' });
+  }
   const result = db.prepare('UPDATE blindkey_secrets SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?')
-    .run('revoked', req.identity.did, name);
+    .run('revoked', ownerDid, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
-  res.json({ ok: true, name, status: 'revoked' });
+  res.json({ ok: true, name, did: ownerDid, status: 'revoked' });
 });
 
 // POST /api/blindkey/rotate — rotate a secret with context transfer and grace period
@@ -1752,9 +1885,10 @@ app.get('/api/blindkey/types', (_req, res) => {
 app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
   if (!requireAdminAccess(req, res)) return;
 
-  const { target_did, name, value, description, secret_type, metadata, contexts } = req.body || {};
-  if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
-  if (typeof target_did !== 'string') return res.status(400).json({ error: 'target_did: must be a string' });
+  const { target_did, target_username, name, value, description, secret_type, metadata, contexts } = req.body || {};
+  if ((!target_did && !target_username) || !name || !value) return res.status(400).json({ error: 'target_did or target_username, plus name and value required' });
+  if (target_did && typeof target_did !== 'string') return res.status(400).json({ error: 'target_did: must be a string' });
+  if (target_username && typeof target_username !== 'string') return res.status(400).json({ error: 'target_username: must be a string' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
   if (typeof value !== 'string') return res.status(400).json({ error: 'value: must be a string' });
   if (name.length > 100) return res.status(400).json({ error: 'name: max 100 characters' });
@@ -1763,8 +1897,11 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
   if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
   if (secret_type && typeof secret_type !== 'string') return res.status(400).json({ error: 'secret_type: must be a string' });
 
+  const resolvedTargetDid = target_did || (target_username ? db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(target_username)?.did : null);
+  if (!resolvedTargetDid) return res.status(404).json({ error: 'target identity not found' });
+
   // Verify target DID exists
-  const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(target_did);
+  const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedTargetDid);
   if (!targetWallet) return res.status(404).json({ error: 'target_did not found' });
 
   const validTypes = ['passphrase', 'token', 'api_key', 'ssh_credential', 'multi_string', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
@@ -1782,9 +1919,9 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
         secret_type = excluded.secret_type,
         metadata = excluded.metadata,
         updated_at = CURRENT_TIMESTAMP
-    `).run(target_did, name, description || '', resolvedType, encrypted, metaJson);
+    `).run(resolvedTargetDid, name, description || '', resolvedType, encrypted, metaJson);
 
-    const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(target_did, name);
+    const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(resolvedTargetDid, name);
 
     // Insert contexts if provided
     let contexts_created = 0;
@@ -1792,7 +1929,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
       contexts_created = insertBlindkeyContexts(inserted.id, contexts, 'carbon_deposit');
     }
 
-    res.json({ ok: true, secret_id: inserted.id, name, secret_type: resolvedType, target_did, contexts_created });
+    res.json({ ok: true, secret_id: inserted.id, name, secret_type: resolvedType, target_did: resolvedTargetDid, contexts_created });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1874,7 +2011,9 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   }
 
   // Allow admin or the secret owner (via Bearer token)
-  const isAdmin = ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || req.body?.admin_key || '', ADMIN_API_KEY);
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const isAdmin = actor.mode === 'admin';
   let secret;
 
   if (isAdmin) {
@@ -1882,10 +2021,8 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
     const { did } = req.body || {};
     if (!did) return res.status(400).json({ error: 'did required when using admin auth' });
     secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(did, secret_name, 'active');
-  } else if (req.identity && req.identity.did) {
-    secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, secret_name, 'active');
   } else {
-    return res.status(403).json({ error: 'admin auth or Bearer token required' });
+    secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(actor.did, secret_name, 'active');
   }
 
   if (!secret) return res.status(404).json({ error: 'secret not found' });
@@ -1908,20 +2045,101 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   }
 });
 
+// PATCH /api/blindkey/context/:id — update an existing context
+app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const contextId = Number(req.params.id);
+  if (!contextId) return res.status(400).json({ error: 'valid context id required' });
+
+  const row = db.prepare(`
+    SELECT c.*, s.did, s.name as secret_name
+    FROM blindkey_contexts c
+    JOIN blindkey_secrets s ON s.id = c.secret_id
+    WHERE c.id = ?
+  `).get(contextId);
+  if (!row) return res.status(404).json({ error: 'context not found' });
+  if (actor.mode !== 'admin' && row.did !== actor.did) {
+    return res.status(403).json({ error: 'can only edit your own contexts' });
+  }
+
+  const next = {
+    context_name: req.body?.context_name ?? row.context_name,
+    action_type: req.body?.action_type ?? row.action_type,
+    target_url_pattern: req.body?.target_url_pattern ?? row.target_url_pattern,
+    target_host_pattern: req.body?.target_host_pattern ?? row.target_host_pattern,
+    max_uses: req.body?.max_uses ?? row.max_uses,
+    status: req.body?.status ?? row.status,
+  };
+
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+  if (!validActions.includes(next.action_type)) {
+    return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
+  }
+  if (!['active', 'revoked', 'pending'].includes(next.status)) {
+    return res.status(400).json({ error: 'status must be active, revoked, or pending' });
+  }
+
+  db.prepare(`
+    UPDATE blindkey_contexts
+    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?
+    WHERE id = ?
+  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status, contextId);
+
+  const updated = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(contextId);
+  res.json({ ok: true, context: updated });
+});
+
+// DELETE /api/blindkey/context/:id — revoke a context
+app.delete('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const contextId = Number(req.params.id);
+  if (!contextId) return res.status(400).json({ error: 'valid context id required' });
+
+  const row = db.prepare(`
+    SELECT c.id, s.did
+    FROM blindkey_contexts c
+    JOIN blindkey_secrets s ON s.id = c.secret_id
+    WHERE c.id = ?
+  `).get(contextId);
+  if (!row) return res.status(404).json({ error: 'context not found' });
+  if (actor.mode !== 'admin' && row.did !== actor.did) {
+    return res.status(403).json({ error: 'can only revoke your own contexts' });
+  }
+
+  db.prepare(`UPDATE blindkey_contexts SET status = 'revoked' WHERE id = ?`).run(contextId);
+  res.json({ ok: true, id: contextId, status: 'revoked' });
+});
+
 // GET /api/blindkey/contexts — list approved contexts for a secret
-// Requires Bearer token from the DID owner
+// Requires Bearer token from the DID owner, or admin auth for lookup by did/username.
 app.get('/api/blindkey/contexts', rateLimitStandard, (req, res) => {
-  const { did, secret_name } = req.query || {};
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
 
-  // Require Bearer token identity that matches the requested DID
-  if (!req.identity || !req.identity.did) {
-    return res.status(403).json({ error: 'Bearer token required' });
-  }
-  if (did && did !== req.identity.did) {
-    return res.status(403).json({ error: 'can only list contexts for your own secrets' });
+  const { did, username, secret_name } = req.query || {};
+  let ownerDid = actor.did || null;
+
+  if (actor.mode === 'admin') {
+    if (did) {
+      ownerDid = did;
+    } else if (username) {
+      const wallet = db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username);
+      if (!wallet) return res.status(404).json({ error: 'identity not found' });
+      ownerDid = wallet.did;
+    } else {
+      return res.status(400).json({ error: 'did or username required when using admin access' });
+    }
+  } else {
+    if (did && did !== actor.did) {
+      return res.status(403).json({ error: 'can only list contexts for your own secrets' });
+    }
+    ownerDid = did || actor.did;
   }
 
-  const ownerDid = did || req.identity.did;
   if (!secret_name) return res.status(400).json({ error: 'secret_name query parameter required' });
 
   const secret = db.prepare('SELECT id, name FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, secret_name);
@@ -4712,14 +4930,11 @@ app.post('/api/barrel/cosign/approve', rateLimitStrict, (req, res) => {
 
 // ── [184] DemiPass Context Request Flow ──
 
-// POST /api/blindkey/context/request — silicon requests a new context (pending admin approval)
+// POST /api/blindkey/context/request — silicon requests a new context (pending approval)
 app.post('/api/blindkey/context/request', rateLimitStandard, (req, res) => {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Bearer token required' });
-  const v = identity.verifyTokenStandalone(token);
-  if (!v.valid) return res.status(401).json({ error: v.error });
-  const did = v.decoded.sub;
+  const actor = getBearerIdentity(req);
+  if (!actor.ok) return res.status(actor.status).json({ error: actor.error });
+  const did = actor.did;
 
   const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, reason } = req.body || {};
   if (!secret_name || typeof secret_name !== 'string') return res.status(400).json({ error: 'secret_name required (string)' });
@@ -4751,29 +4966,57 @@ app.post('/api/blindkey/context/request', rateLimitStandard, (req, res) => {
   }
 });
 
-// GET /api/blindkey/context/requests — list all pending context requests (admin only)
+// GET /api/blindkey/context/requests — list context requests for owner or admin
 app.get('/api/blindkey/context/requests', rateLimitStandard, (req, res) => {
-  if (!requireAdminAccess(req, res)) return;
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
 
-  const requests = db.prepare(`
+  const { status = '', did, username } = req.query || {};
+  let ownerDid = actor.did || null;
+  if (actor.mode === 'admin') {
+    if (did) {
+      ownerDid = did;
+    } else if (username) {
+      const wallet = db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username);
+      if (!wallet) return res.status(404).json({ error: 'identity not found' });
+      ownerDid = wallet.did;
+    }
+  }
+
+  let sql = `
     SELECT id, did, secret_name, requested_context, requested_action_type,
            target_url_pattern, target_host_pattern, reason, status, reviewed_by, created_at, resolved_at
     FROM blindkey_context_requests
-    WHERE status = 'pending'
-    ORDER BY created_at ASC
-  `).all();
+    WHERE 1 = 1
+  `;
+  const params = [];
+  if (ownerDid) {
+    sql += ' AND did = ?';
+    params.push(ownerDid);
+  }
+  if (status) {
+    sql += ' AND status = ?';
+    params.push(status);
+  }
+  sql += ' ORDER BY created_at DESC';
+
+  const requests = db.prepare(sql).all(...params);
 
   res.json({ requests, total: requests.length });
 });
 
-// POST /api/blindkey/context/requests/:id/approve — admin approves, creates actual context
+// POST /api/blindkey/context/requests/:id/approve — owner or admin approves, creates actual context
 app.post('/api/blindkey/context/requests/:id/approve', rateLimitStandard, (req, res) => {
-  if (!requireAdminAccess(req, res)) return;
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
 
   const requestId = Number(req.params.id);
   const row = db.prepare('SELECT * FROM blindkey_context_requests WHERE id = ?').get(requestId);
   if (!row) return res.status(404).json({ error: 'context request not found' });
   if (row.status !== 'pending') return res.status(409).json({ error: `request already ${row.status}` });
+  if (actor.mode !== 'admin' && row.did !== actor.did) {
+    return res.status(403).json({ error: 'can only approve your own context requests' });
+  }
 
   // Find the secret to get secret_id
   const secret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(row.did, row.secret_name, 'active');
@@ -4792,7 +5035,7 @@ app.post('/api/blindkey/context/requests/:id/approve', rateLimitStandard, (req, 
     if (created === 0) return res.status(400).json({ error: 'failed to create context' });
 
     // Mark the request as approved
-    db.prepare("UPDATE blindkey_context_requests SET status = 'approved', reviewed_by = 'admin', resolved_at = datetime('now') WHERE id = ?").run(requestId);
+    db.prepare("UPDATE blindkey_context_requests SET status = 'approved', reviewed_by = ?, resolved_at = datetime('now') WHERE id = ?").run(actor.actor, requestId);
 
     const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, row.requested_context);
     console.log(`[blindkey] context request ${requestId} approved: "${row.requested_context}" on secret "${row.secret_name}" for ${row.did}`);
@@ -4813,16 +5056,20 @@ app.post('/api/blindkey/context/requests/:id/approve', rateLimitStandard, (req, 
   }
 });
 
-// POST /api/blindkey/context/requests/:id/deny — admin denies the request
+// POST /api/blindkey/context/requests/:id/deny — owner or admin denies the request
 app.post('/api/blindkey/context/requests/:id/deny', rateLimitStandard, (req, res) => {
-  if (!requireAdminAccess(req, res)) return;
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
 
   const requestId = Number(req.params.id);
   const row = db.prepare('SELECT * FROM blindkey_context_requests WHERE id = ?').get(requestId);
   if (!row) return res.status(404).json({ error: 'context request not found' });
   if (row.status !== 'pending') return res.status(409).json({ error: `request already ${row.status}` });
+  if (actor.mode !== 'admin' && row.did !== actor.did) {
+    return res.status(403).json({ error: 'can only deny your own context requests' });
+  }
 
-  db.prepare("UPDATE blindkey_context_requests SET status = 'denied', reviewed_by = 'admin', resolved_at = datetime('now') WHERE id = ?").run(requestId);
+  db.prepare("UPDATE blindkey_context_requests SET status = 'denied', reviewed_by = ?, resolved_at = datetime('now') WHERE id = ?").run(actor.actor, requestId);
   console.log(`[blindkey] context request ${requestId} denied: "${row.requested_context}" on secret "${row.secret_name}" for ${row.did}`);
   res.json({ ok: true, request_id: requestId, status: 'denied' });
 });

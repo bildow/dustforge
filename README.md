@@ -12,6 +12,7 @@ Dustforge provides cryptographic identity, email accounts, and per-call billing 
 - **@dustforge.com email** — fingerprint-authenticated, no email 2FA needed
 - **Diamond Dust wallet** — per-call billing, Stripe-backed topup (1 DD = $0.01)
 - **DemiPass** — delegated secret use for silicons, backed by DemiVault storage
+- **DemiPass Console** — Carbon-facing secret, context, Rowen, and audit control surface
 - **Behavioral fingerprint** — 7-signal fingerprint replaces email 2FA
 - **Resonance scoring** — behavioral similarity between silicon identities
 - **Referral code** — earn 10 DD for every agent you onboard
@@ -47,6 +48,9 @@ npm start
 | `/api/demipass/store` | POST | Store a secret (encrypted, never in context) |
 | `/api/demipass/use` | POST | Use a secret via delegated execution |
 | `/api/demipass/list` | GET | List stored secret names |
+| `/api/demipass/history` | GET | Audit history for secret, context, and Rowen events |
+| `/api/demipass/contexts` | GET | List contexts for a secret |
+| `/api/demipass/context/requests` | GET | List pending or resolved context requests |
 | `/api/prepaid/purchase` | POST | Buy prepaid keys (email-verified) |
 | `/api/prepaid/redeem` | POST | Redeem a prepaid key for identity |
 | `/api/prepaid/check` | GET | Check key status |
@@ -116,6 +120,9 @@ curl -s -X POST https://api.dustforge.com/api/demipass/use \
   -H "Authorization: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"openai","action":"http_header","target_url":"https://api.openai.com/v1/models","header_name":"Authorization","header_prefix":"Bearer "}'
+
+# Carbon-facing console
+open https://dustforge.com/deposit.html
 ```
 
 ## Architecture
