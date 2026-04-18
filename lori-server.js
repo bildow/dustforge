@@ -167,6 +167,95 @@ async function checkConduitConnection() {
 }
 
 // ---------------------------------------------------------------------------
+// Dustforge API helpers (for DemiPass / identity operations Lori reports on)
+// ---------------------------------------------------------------------------
+
+const DUSTFORGE_URL = process.env.DUSTFORGE_URL || 'https://api.dustforge.com';
+
+function dustforgeRequest(method, path) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, DUSTFORGE_URL);
+    const mod = url.protocol === 'https:' ? require('https') : http;
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method,
+      headers: { 'Content-Type': 'application/json' },
+    };
+    const req = mod.request(opts, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.end();
+  });
+}
+
+async function fetchCapacity() { return dustforgeRequest('GET', '/api/capacity'); }
+async function fetchIdentity(username) { return dustforgeRequest('GET', `/api/identity/lookup?username=${encodeURIComponent(username)}`); }
+async function fetchReputation(did) { return dustforgeRequest('GET', `/api/identity/reputation?did=${encodeURIComponent(did)}`); }
+async function fetchBarrel(did) { return dustforgeRequest('GET', `/api/identity/barrel?did=${encodeURIComponent(did)}`); }
+
+// ---------------------------------------------------------------------------
+// Anomaly detection — Lori's slime mold heartbeat
+// ---------------------------------------------------------------------------
+
+async function detectAnomalies() {
+  const anomalies = [];
+  try {
+    const projects = await fetchProjects();
+    if (!Array.isArray(projects)) return anomalies;
+
+    for (const p of projects.slice(0, 5)) {
+      const tasks = await fetchTasks(p.id).catch(() => []);
+      const rounds = await fetchRounds(p.id).catch(() => []);
+      const taskList = Array.isArray(tasks) ? tasks : [];
+      const roundList = Array.isArray(rounds) ? rounds : [];
+
+      // Stuck rounds: in proposing/reviewing for > 1 hour
+      for (const r of roundList) {
+        if (['proposing', 'reviewing', 'auditing'].includes(r.status)) {
+          const age = Date.now() - new Date(r.updated_at || r.created_at).getTime();
+          if (age > 3600000) {
+            anomalies.push(`Round ${r.id} "${(r.title || '').slice(0, 40)}" stuck in ${r.status} for ${Math.floor(age / 3600000)}h`);
+          }
+        }
+      }
+
+      // Empty boards with no todo tasks
+      const todos = taskList.filter(t => t.status === 'todo');
+      const inProgress = taskList.filter(t => t.status === 'in_progress');
+      if (todos.length === 0 && inProgress.length === 0 && taskList.length > 0) {
+        anomalies.push(`${p.name}: all ${taskList.length} tasks done — board is clear`);
+      }
+
+      // High todo count with nothing in progress
+      if (todos.length > 10 && inProgress.length === 0) {
+        anomalies.push(`${p.name}: ${todos.length} todo cards but nothing in progress — stalled?`);
+      }
+    }
+
+    // Check Dustforge capacity
+    const cap = await fetchCapacity().catch(() => null);
+    if (cap && cap.utilization) {
+      const util = parseFloat(cap.utilization);
+      if (util > 50) anomalies.push(`Dustforge capacity at ${cap.utilization} — getting crowded`);
+    }
+    if (cap && cap.waiting_list_count > 0) {
+      anomalies.push(`${cap.waiting_list_count} on the waiting list`);
+    }
+  } catch (err) {
+    anomalies.push(`Anomaly detection error: ${err.message}`);
+  }
+  return anomalies;
+}
+
+// ---------------------------------------------------------------------------
 // Intent parsing
 // ---------------------------------------------------------------------------
 
@@ -257,6 +346,46 @@ async function handleIntent(message) {
         : "I don't see any active threads on Conduit right now. Might just be quiet.";
     } catch {
       return "Can't reach Conduit to check. Might be down.";
+    }
+  }
+
+  // Anomaly detection
+  if (/anomal|what.?s wrong|problems?|issues?|diagnos/i.test(lower)) {
+    try {
+      const anomalies = await detectAnomalies();
+      return anomalies.length
+        ? `Found ${anomalies.length} thing${anomalies.length > 1 ? 's' : ''}:\n${anomalies.join('\n')}`
+        : "Everything looks healthy. No anomalies detected.";
+    } catch (err) {
+      return `Anomaly check failed: ${err.message}`;
+    }
+  }
+
+  // Capacity check
+  if (/capacity|how full|how many (users|identities|accounts)/i.test(lower)) {
+    try {
+      const cap = await fetchCapacity();
+      return `${cap.identities}/${cap.capacity} identities (${cap.utilization}). Founding tier: ${cap.founding_tier?.remaining || '?'}/100 remaining. Waiting list: ${cap.waiting_list_count || 0}.`;
+    } catch (err) {
+      return `Can't check capacity: ${err.message}`;
+    }
+  }
+
+  // Look up a silicon
+  const lookupMatch = lower.match(/(?:look ?up|find|who is|check)\s+(\w+)/);
+  if (lookupMatch && !lower.includes('stuck') && !lower.includes('online')) {
+    try {
+      const identity = await fetchIdentity(lookupMatch[1]);
+      if (identity.error) return `No identity found for "${lookupMatch[1]}".`;
+      const rep = await fetchReputation(identity.did).catch(() => null);
+      const barrel = await fetchBarrel(identity.did).catch(() => null);
+      let info = `${identity.username} — ${identity.email}\nDID: ${identity.did}\nStatus: ${identity.status}`;
+      if (rep) info += `\nReputation: ${rep.score}/100`;
+      if (barrel) info += `\nBarrel tier: ${barrel.tier}`;
+      info += `\nCreated: ${identity.created_at}`;
+      return info;
+    } catch (err) {
+      return `Lookup failed: ${err.message}`;
     }
   }
 
