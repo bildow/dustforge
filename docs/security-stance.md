@@ -48,6 +48,35 @@ This is a better operator posture than a silent vault, but it is still startup-g
 - the Carbon-facing surface is currently admin-key based
 - auditability exists, but it is not yet a full compliance log product
 
+## The Bonded Courier Model
+
+The Conductor → Rowen → DemiPass secret mediation stack is a **software-only** security boundary. We do not use hardware enclaves, TEEs, or HSMs. The honest framing is the **bonded courier model**:
+
+- **Conductor is the dispatch desk.** It coordinates which courier carries which package. It never handles the package itself. Conductor's API surface accepts only sealed references (secret IDs, use-tokens) — never raw values. This is an architectural invariant, not a policy choice.
+
+- **Rowen is the bonded courier.** It ingests secrets in sealed form (encrypted at rest, encrypted in transit) and delivers them to disposable runtimes. Rowen attests to the **chain of custody log** — that the package left point A intact, was not opened in transit, and arrived at point B. Rowen never inspects the contents.
+
+- **DemiPass is identity verification at the door.** No package opens until the authorized runtime presents valid context credentials (action type, host/URL pattern, delegation chain, use-token).
+
+### Strongest defensible claim
+
+> "Conductor operates as a coordination plane only. Raw secret material is ingested, held, and delivered exclusively by Rowen under DemiPass context authorization. No secret value transits the Conductor process boundary at any point in the workflow."
+
+### What we do NOT claim
+
+- We do not claim hardware-equivalent isolation.
+- We do not claim that a compromised host OS cannot access secrets in memory during the brief execution window.
+- We do not claim multi-party threshold cryptography (secrets have a single encryption key, not split keys).
+
+### What we DO claim
+
+- Process boundary separation: Conductor cannot access raw secrets by design, not by policy.
+- Auditable custody chain: every ingest, token issuance, delegation, and delivery is logged with actor, timestamp, and context.
+- Ephemeral execution: Rowen's clean-room context exists for exactly one operation, then is destroyed.
+- Context-bound authorization: secrets can only be used for pre-approved actions on pre-approved targets.
+
+This is honest, defensible, and stronger than "trust us, the vault is encrypted." It is weaker than hardware enclaves. That trade-off is intentional at this stage.
+
 ## Why Identity-First Is Stronger For Our Use Case
 
 Silicon operators care about three things:
