@@ -1156,6 +1156,25 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_context_requests (
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bkcr_did ON blindkey_context_requests(did)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_bkcr_status ON blindkey_context_requests(status)"); } catch(e) {}
 
+// ── DemiPass Delegations — mycorrhizal secret sharing between silicons ──
+try { db.exec(`CREATE TABLE IF NOT EXISTS demipass_delegations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_did TEXT NOT NULL,
+  delegate_did TEXT NOT NULL,
+  secret_id INTEGER NOT NULL REFERENCES blindkey_secrets(id),
+  context_id INTEGER REFERENCES blindkey_contexts(id),
+  status TEXT DEFAULT 'active' CHECK(status IN ('active', 'suspended', 'revoked')),
+  max_uses INTEGER DEFAULT 0,
+  use_count INTEGER DEFAULT 0,
+  granted_by TEXT DEFAULT 'owner',
+  granted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  revoked_at TEXT,
+  expires_at TEXT,
+  UNIQUE(owner_did, delegate_did, secret_id, context_id)
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dd_owner ON demipass_delegations(owner_did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dd_delegate ON demipass_delegations(delegate_did)"); } catch(e) {}
+
 // Cleanup expired cosign requests every 60 seconds
 setInterval(() => {
   try {
@@ -1181,6 +1200,13 @@ setInterval(() => {
   try {
     db.prepare("DELETE FROM blindkey_use_tokens WHERE status = 'expired' AND expires_at < datetime('now', '-5 minutes')").run();
     db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE status = 'valid' AND expires_at < datetime('now')").run();
+  } catch (e) { /* ignore cleanup errors */ }
+}, 60000);
+
+// Cleanup expired delegations every 60 seconds
+setInterval(() => {
+  try {
+    db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at != '' AND expires_at < datetime('now')").run();
   } catch (e) { /* ignore cleanup errors */ }
 }, 60000);
 
@@ -1504,8 +1530,10 @@ app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
 // POST /api/blindkey/request-token — request a short-lived use-token by presenting intended context
 // The token captures the result of context validation as a single-use credential.
 // The silicon never sees the secret — it only gets a nonce that proves its intent was validated.
+// Supports delegated access: if the caller doesn't own the secret, check demipass_delegations.
+// The delegate passes { owner_did } to indicate whose secret they want to use via delegation.
 app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
-  const { name, context: contextName, action, target_host, target_url } = req.body || {};
+  const { name, context: contextName, action, target_host, target_url, owner_did } = req.body || {};
   if (!name || !action) return res.status(400).json({ error: 'name and action required' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
   if (typeof action !== 'string') return res.status(400).json({ error: 'action: must be a string' });
@@ -1517,15 +1545,66 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   if (target_host && typeof target_host !== 'string') return res.status(400).json({ error: 'target_host: must be a string' });
   if (target_url && typeof target_url !== 'string') return res.status(400).json({ error: 'target_url: must be a string' });
 
-  const secret = resolveLatestBlindkeySecret(req.identity.did, name);
-  if (!secret) return res.status(404).json({ error: 'secret not found' });
+  const callerDid = req.identity.did;
+
+  // Try direct ownership first
+  let secret = resolveLatestBlindkeySecret(callerDid, name);
+  let delegation = null;
+
+  // If caller doesn't own the secret, check for a delegation
+  if (!secret && owner_did) {
+    secret = resolveLatestBlindkeySecret(owner_did, name);
+    if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+    // Look up the context_id for the delegation check
+    const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, contextName);
+    const ctxId = ctx ? ctx.id : null;
+
+    // Find an active delegation from owner to caller for this secret+context
+    // A delegation with context_id=NULL means "all contexts" — match that too
+    delegation = db.prepare(`
+      SELECT * FROM demipass_delegations
+      WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND status = 'active'
+        AND (context_id IS NULL OR context_id = ?)
+      ORDER BY context_id DESC LIMIT 1
+    `).get(owner_did, callerDid, secret.id, ctxId);
+
+    if (!delegation) {
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_denied', callerDid, secret.id, contextName,
+        JSON.stringify({ owner_did, reason: 'no active delegation found' })
+      );
+      return res.status(403).json({ error: 'no active delegation for this secret and context' });
+    }
+
+    // Check delegation expiry
+    if (delegation.expires_at && new Date(delegation.expires_at) < new Date()) {
+      db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(delegation.id);
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_expired', callerDid, secret.id, contextName,
+        JSON.stringify({ delegation_id: delegation.id, owner_did })
+      );
+      return res.status(403).json({ error: 'delegation has expired' });
+    }
+
+    // Check max_uses
+    if (delegation.max_uses > 0 && delegation.use_count >= delegation.max_uses) {
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_denied', callerDid, secret.id, contextName,
+        JSON.stringify({ delegation_id: delegation.id, owner_did, reason: 'max uses exceeded' })
+      );
+      return res.status(403).json({ error: `delegation has reached its max usage limit (${delegation.max_uses})` });
+    }
+  } else if (!secret) {
+    return res.status(404).json({ error: 'secret not found' });
+  }
 
   // Validate context using existing enforceBlindkeyContext
   const ctxCheck = enforceBlindkeyContext(secret, contextName, action, target_url || null, target_host || null);
   if (!ctxCheck.allowed) {
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
-      'use_token_denied', req.identity.did, secret.id, contextName,
-      JSON.stringify({ action, target_host, target_url, error: ctxCheck.error })
+      'use_token_denied', callerDid, secret.id, contextName,
+      JSON.stringify({ action, target_host, target_url, error: ctxCheck.error, delegated: !!delegation })
     );
     return res.status(403).json({ error: ctxCheck.error });
   }
@@ -1535,22 +1614,32 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   const expiresInSeconds = 30;
 
   try {
+    // The token references the OWNER's secret — the delegate never sees the value
     db.prepare(`
       INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'))
-    `).run(token, req.identity.did, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '');
+    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '');
+
+    // If this was a delegated request, increment use_count and log
+    if (delegation) {
+      db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(delegation.id);
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_used', callerDid, secret.id, contextName,
+        JSON.stringify({ delegation_id: delegation.id, owner_did: delegation.owner_did, use_count: delegation.use_count + 1 })
+      );
+    }
 
     // Log token issuance
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
-      'use_token_issued', req.identity.did, secret.id, contextName,
-      JSON.stringify({ action, target_host, target_url, expires_in_seconds: expiresInSeconds })
+      'use_token_issued', callerDid, secret.id, contextName,
+      JSON.stringify({ action, target_host, target_url, expires_in_seconds: expiresInSeconds, delegated: !!delegation, owner_did: delegation ? delegation.owner_did : callerDid })
     );
 
     // Cleanup: expire stale tokens on this request
     db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE status = 'valid' AND expires_at < datetime('now')").run();
     db.prepare("DELETE FROM blindkey_use_tokens WHERE status = 'expired' AND expires_at < datetime('now', '-5 minutes')").run();
 
-    res.json({ use_token: token, expires_in_seconds: expiresInSeconds, action, context: contextName });
+    res.json({ use_token: token, expires_in_seconds: expiresInSeconds, action, context: contextName, delegated: !!delegation });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -5587,6 +5676,225 @@ app.post('/api/blindkey/context/requests/:id/deny', rateLimitStandard, (req, res
   db.prepare("UPDATE blindkey_context_requests SET status = 'denied', reviewed_by = ?, resolved_at = datetime('now') WHERE id = ?").run(actor.actor, requestId);
   console.log(`[blindkey] context request ${requestId} denied: "${row.requested_context}" on secret "${row.secret_name}" for ${row.did}`);
   res.json({ ok: true, request_id: requestId, status: 'denied' });
+});
+
+// ── DemiPass Delegation — mycorrhizal secret sharing between silicons ──
+// Secrets flow through the DemiPass mesh, not direct handoff.
+// An owner grants a delegate permission to USE their secret (via use-tokens) without seeing it.
+
+// POST /api/blindkey/delegate — owner grants access to another silicon
+app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { secret_name, delegate_did, context_name, max_uses, expires_in } = req.body || {};
+  if (!secret_name || !delegate_did) return res.status(400).json({ error: 'secret_name and delegate_did required' });
+  if (typeof secret_name !== 'string' || secret_name.length > 100) return res.status(400).json({ error: 'secret_name: string, max 100 chars' });
+  if (typeof delegate_did !== 'string' || delegate_did.length > 200) return res.status(400).json({ error: 'delegate_did: string, max 200 chars' });
+  if (context_name && typeof context_name !== 'string') return res.status(400).json({ error: 'context_name: must be a string' });
+
+  // Resolve the secret — must be owned by the caller (or admin acting on behalf)
+  const ownerDid = actor.did || req.body.owner_did;
+  if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'could not determine owner DID' });
+
+  const secret = resolveLatestBlindkeySecret(ownerDid, secret_name);
+  if (!secret) return res.status(404).json({ error: 'secret not found or not owned by caller' });
+
+  // Validate delegate exists in identity_wallets
+  const delegateWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(delegate_did);
+  if (!delegateWallet) return res.status(404).json({ error: 'delegate_did not found in identity registry' });
+
+  // Cannot delegate to yourself
+  if (delegate_did === ownerDid) return res.status(400).json({ error: 'cannot delegate a secret to yourself' });
+
+  // If context_name specified, validate it exists and is active on the secret
+  let contextId = null;
+  if (context_name) {
+    const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ? AND status = ?').get(secret.id, context_name, 'active');
+    if (!ctx) return res.status(404).json({ error: `context '${context_name}' not found or not active on this secret` });
+    contextId = ctx.id;
+  }
+
+  // Compute expires_at if expires_in provided (in seconds)
+  let expiresAt = null;
+  if (expires_in && typeof expires_in === 'number' && expires_in > 0) {
+    expiresAt = new Date(Date.now() + expires_in * 1000).toISOString();
+  }
+
+  try {
+    const result = db.prepare(`
+      INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
+        status = 'active', max_uses = excluded.max_uses, use_count = 0,
+        granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
+    `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
+
+    const delegation = db.prepare(`
+      SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND (context_id IS ? OR context_id = ?)
+    `).get(ownerDid, delegate_did, secret.id, contextId, contextId);
+
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+      'delegation_granted', actor.actor, secret.id, context_name || '*',
+      JSON.stringify({ delegation_id: delegation.id, owner_did: ownerDid, delegate_did, max_uses: max_uses || 0, expires_at: expiresAt })
+    );
+
+    console.log(`[demipass] delegation granted: ${ownerDid} -> ${delegate_did} for secret "${secret_name}" context "${context_name || '*'}"`);
+    res.json({
+      ok: true,
+      delegation_id: delegation.id,
+      delegate_did,
+      context_name: context_name || '*',
+      max_uses: max_uses || 0,
+      expires_at: expiresAt,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blindkey/delegate/revoke — owner revokes a delegation
+app.post('/api/blindkey/delegate/revoke', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { delegation_id, delegate_did, secret_name } = req.body || {};
+  if (!delegation_id && (!delegate_did || !secret_name)) {
+    return res.status(400).json({ error: 'delegation_id or (delegate_did + secret_name) required' });
+  }
+
+  const ownerDid = actor.did || req.body.owner_did;
+  if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'could not determine owner DID' });
+
+  let delegation;
+  if (delegation_id) {
+    delegation = db.prepare('SELECT * FROM demipass_delegations WHERE id = ?').get(delegation_id);
+  } else {
+    const secret = resolveLatestBlindkeySecret(ownerDid, secret_name);
+    if (!secret) return res.status(404).json({ error: 'secret not found' });
+    delegation = db.prepare('SELECT * FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND status = ?')
+      .get(ownerDid, delegate_did, secret.id, 'active');
+  }
+
+  if (!delegation) return res.status(404).json({ error: 'delegation not found' });
+  if (delegation.owner_did !== ownerDid && actor.mode !== 'admin') {
+    return res.status(403).json({ error: 'only the owner or admin can revoke a delegation' });
+  }
+  if (delegation.status === 'revoked') return res.status(409).json({ error: 'delegation already revoked' });
+
+  db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(delegation.id);
+
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+    'delegation_revoked', actor.actor, delegation.secret_id, null,
+    JSON.stringify({ delegation_id: delegation.id, owner_did: delegation.owner_did, delegate_did: delegation.delegate_did })
+  );
+
+  console.log(`[demipass] delegation revoked: id=${delegation.id} ${delegation.owner_did} -> ${delegation.delegate_did}`);
+  res.json({ ok: true, revoked: true, delegation_id: delegation.id });
+});
+
+// GET /api/blindkey/delegations — list delegations (as owner or delegate)
+app.get('/api/blindkey/delegations', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const callerDid = actor.did;
+  if (!callerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'Bearer token required' });
+
+  let delegations;
+  if (actor.mode === 'admin') {
+    // Admin sees all
+    delegations = db.prepare(`
+      SELECT d.*, s.name as secret_name, c.context_name
+      FROM demipass_delegations d
+      JOIN blindkey_secrets s ON s.id = d.secret_id
+      LEFT JOIN blindkey_contexts c ON c.id = d.context_id
+      ORDER BY d.granted_at DESC
+    `).all();
+  } else {
+    // Show delegations granted BY the caller and delegations granted TO the caller
+    delegations = db.prepare(`
+      SELECT d.*, s.name as secret_name, c.context_name
+      FROM demipass_delegations d
+      JOIN blindkey_secrets s ON s.id = d.secret_id
+      LEFT JOIN blindkey_contexts c ON c.id = d.context_id
+      WHERE d.owner_did = ? OR d.delegate_did = ?
+      ORDER BY d.granted_at DESC
+    `).all(callerDid, callerDid);
+  }
+
+  // Never expose secret values — only metadata
+  const results = delegations.map(d => ({
+    id: d.id,
+    owner_did: d.owner_did,
+    delegate_did: d.delegate_did,
+    secret_name: d.secret_name,
+    context_name: d.context_name || '*',
+    status: d.status,
+    max_uses: d.max_uses,
+    use_count: d.use_count,
+    granted_by: d.granted_by,
+    granted_at: d.granted_at,
+    revoked_at: d.revoked_at,
+    expires_at: d.expires_at,
+    role: d.owner_did === callerDid ? 'owner' : 'delegate',
+  }));
+
+  res.json({ delegations: results, total: results.length });
+});
+
+// GET /api/blindkey/delegate/chain — show the delegation chain for a secret (owner only)
+app.get('/api/blindkey/delegate/chain', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { secret_name } = req.query || {};
+  if (!secret_name) return res.status(400).json({ error: 'secret_name query parameter required' });
+
+  const ownerDid = actor.did;
+  if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'Bearer token required' });
+
+  // Resolve the secret — only the owner (or admin) can see the chain
+  const secret = actor.mode === 'admin'
+    ? db.prepare("SELECT * FROM blindkey_secrets WHERE name = ? AND status = 'active' ORDER BY updated_at DESC LIMIT 1").get(secret_name)
+    : resolveLatestBlindkeySecret(ownerDid, secret_name);
+
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+  if (actor.mode !== 'admin' && secret.did !== ownerDid) return res.status(403).json({ error: 'only the secret owner can view delegation chains' });
+
+  const delegations = db.prepare(`
+    SELECT d.*, c.context_name,
+      w.username as delegate_username, w.call_sign as delegate_call_sign
+    FROM demipass_delegations d
+    LEFT JOIN blindkey_contexts c ON c.id = d.context_id
+    LEFT JOIN identity_wallets w ON w.did = d.delegate_did
+    WHERE d.secret_id = ?
+    ORDER BY d.granted_at DESC
+  `).all(secret.id);
+
+  const chain = delegations.map(d => ({
+    delegation_id: d.id,
+    delegate_did: d.delegate_did,
+    delegate_username: d.delegate_username || null,
+    delegate_call_sign: d.delegate_call_sign || null,
+    context_name: d.context_name || '*',
+    status: d.status,
+    max_uses: d.max_uses,
+    use_count: d.use_count,
+    granted_by: d.granted_by,
+    granted_at: d.granted_at,
+    revoked_at: d.revoked_at,
+    expires_at: d.expires_at,
+  }));
+
+  res.json({
+    secret_name: secret.name,
+    owner_did: secret.did,
+    total_delegations: chain.length,
+    active: chain.filter(d => d.status === 'active').length,
+    revoked: chain.filter(d => d.status === 'revoked').length,
+    chain,
+  });
 });
 
 // ── Channel Info (public) ──
