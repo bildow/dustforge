@@ -4,12 +4,12 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `f7281cc` — merge: reconcile current Claude and Codex sandbox lanes onto `main` |
-| **Previous** | `c913cc7` — docs: refresh workflow handoff state |
+| **Last commit** | `34ac892` — Self-discoverable onboarding SDK + silicon discovery headers |
+| **Previous** | `489a65f` — Lori L3+L4: write ops, task management, self-onboarding |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | **LIVE** on RackNerd (192.3.84.103) — nginx reverse proxy, systemd dustforge.service, port 3001 |
 | **Static** | **LIVE** on Netlify — dustforge.com, API proxied to api.dustforge.com |
-| **Status** | DemiPass console work is merged on `main`, and the admin-auth/CORS follow-up fix is also on `main`. Contributors now branch from fresh `origin/main`, push only to sandbox branches, and hand Brain the pushed delta for integration. |
+| **Status** | Lori complete (4 passes). SDK + discovery headers live. Brain's 6 defects fixed. Codex DemiPass audit fixes deployed. Rowen designed (10 cards) but not deployed. Next: Rowen deployment + DemiPass delivery test + AdWords. |
 
 ## Branch Workflow
 

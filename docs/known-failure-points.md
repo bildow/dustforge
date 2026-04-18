@@ -10,7 +10,7 @@ This document tracks confirmed correctness defects in the live Dustforge codebas
 ### DFP-01 — Secret rotation reactivates revoked contexts
 
 - Severity: High
-- Status: Open
+- Status: Fixed (commit 51726b0)
 - Surface: `POST /api/blindkey/rotate`
 - Code: [server.js](/root/sandbox/dustforge/server.js:2041)
 - Detail: rotation copies every `blindkey_contexts` row from the old secret onto the new version, but only carries `context_name`, `action_type`, patterns, `allowed_by`, `max_uses`, and a reset `use_count`.
@@ -21,7 +21,7 @@ This document tracks confirmed correctness defects in the live Dustforge codebas
 ### DFP-02 — Admin secret lookup is ambiguous across tenants
 
 - Severity: Medium
-- Status: Open
+- Status: Fixed (commit 51726b0)
 - Surface: `GET /api/blindkey/delegate/chain`, `GET /api/blindkey/history`
 - Code: [server.js](/root/sandbox/dustforge/server.js:1491), [server.js](/root/sandbox/dustforge/server.js:5858)
 - Detail: admin-mode lookups can resolve a secret by `name` alone and then pick the most recently updated matching row globally.
@@ -32,7 +32,7 @@ This document tracks confirmed correctness defects in the live Dustforge codebas
 ### DFP-03 — Rowen and direct owner flows enforce different HTTP host policies
 
 - Severity: Medium
-- Status: Open
+- Status: Fixed (commit 51726b0)
 - Surface: `POST /api/blindkey/use`, `POST /api/rowen/deliver`
 - Code: [server.js](/root/sandbox/dustforge/server.js:1700), [server.js](/root/sandbox/dustforge/server.js:1839), [server.js](/root/sandbox/dustforge/server.js:2564)
 - Detail: direct owner and use-token execution hard-block non-whitelisted HTTP hosts, while Rowen delivery allows private-network targets after context validation.
@@ -43,7 +43,7 @@ This document tracks confirmed correctness defects in the live Dustforge codebas
 ### DFP-04 — Delegation quotas burn on token issuance, not token redemption
 
 - Severity: High
-- Status: Open
+- Status: Fixed (commit 51726b0)
 - Surface: `POST /api/blindkey/request-token`
 - Code: [server.js](/root/sandbox/dustforge/server.js:1616)
 - Detail: delegated requests increment `demipass_delegations.use_count` immediately after a use-token is issued.
@@ -54,7 +54,7 @@ This document tracks confirmed correctness defects in the live Dustforge codebas
 ### DFP-05 — Rowen mediation cannot resolve rotated secrets by base name
 
 - Severity: Medium
-- Status: Open
+- Status: Fixed (commit 51726b0)
 - Surface: `POST /api/rowen/authorize`, `POST /api/rowen/deliver`, `/api/conductor/rowen/*`
 - Code: [server.js](/root/sandbox/dustforge/server.js:1370)
 - Detail: secret mediation looks up `blindkey_secrets` with an exact active `name` match instead of using the same latest-version resolver as the normal owner flows.
@@ -65,7 +65,7 @@ This document tracks confirmed correctness defects in the live Dustforge codebas
 ### DFP-06 — Escrow release bypasses counterparty acceptance
 
 - Severity: High
-- Status: Open
+- Status: Fixed (commit 51726b0)
 - Surface: `POST /api/escrow/:id/release`
 - Code: [server.js](/root/sandbox/dustforge/server.js:5451)
 - Detail: the release route allows release while escrow status is either `pending` or `active`.
