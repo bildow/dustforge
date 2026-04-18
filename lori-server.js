@@ -10,7 +10,18 @@ const AGENT_NAME = 'lori';
 const CONDUIT_URL = process.env.CONDUIT_URL || 'http://100.69.1.78:8080';
 const CONDUIT_TOKEN = process.env.CONDUIT_TOKEN || '';
 const PLATFORM_URL = process.env.PLATFORM_URL || 'http://100.83.112.88:3000';
+const LORI_AUTH_KEY = process.env.LORI_AUTH_KEY || '';
 const startTime = Date.now();
+
+// Auth middleware — all mutation routes require either Conduit token or LORI_AUTH_KEY
+function requireLoriAuth(req, res, next) {
+  if (!LORI_AUTH_KEY) return next(); // no key configured = dev mode (log warning)
+  const provided = req.headers['x-lori-key'] || req.headers['authorization']?.replace('Bearer ', '') || '';
+  // Allow Conduit relay (internal traffic from the dashboard proxy or Conduit itself)
+  if (provided === CONDUIT_TOKEN && CONDUIT_TOKEN) return next();
+  if (provided === LORI_AUTH_KEY) return next();
+  return res.status(403).json({ error: 'auth required' });
+}
 
 const LORI_SYSTEM_PROMPT = `You're Lori. You work the platform — Civitasvox, Dustforge, the whole stack. You know where every task card is, which rounds are stuck, and who's assigned to what. You're not an AI assistant, you're the person who actually runs the board.
 
@@ -573,7 +584,7 @@ app.get('/health', async (_req, res) => {
 });
 
 // Conduit inbound
-app.post('/api/conduit/inbound', async (req, res) => {
+app.post('/api/conduit/inbound', requireLoriAuth, async (req, res) => {
   const { body: msgBody, sender: rawSender } = req.body || {};
   if (!msgBody) return res.status(400).json({ error: 'no message body' });
 
@@ -598,7 +609,7 @@ app.post('/api/conduit/inbound', async (req, res) => {
 });
 
 // HTTP chat for humans
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', requireLoriAuth, async (req, res) => {
   const { message } = req.body || {};
   if (!message) return res.status(400).json({ error: 'no message' });
 

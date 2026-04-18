@@ -178,7 +178,7 @@ app.use((req, res, next) => {
   if (!isBrowser) {
     res.setHeader('X-Silicon-Manifest', '/.well-known/silicon');
     res.setHeader('X-Silicon-Onboard', '/api/onboard');
-    res.setHeader('X-Silicon-SDK', 'https://github.com/bildow/dustforge/blob/main/dustforge-onboard.js');
+    res.setHeader('X-Silicon-SDK', 'https://raw.githubusercontent.com/bildow/dustforge/main/dustforge-onboard.js');
     res.setHeader('X-Silicon-Identity', 'https://api.dustforge.com');
   }
   next();
@@ -2017,11 +2017,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         if (!url) return res.status(400).json({ error: 'params.url required for http_header action' });
 
         // Whitelist: only known API providers — prevents exfiltration to attacker-controlled servers
-        const ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+        // Use the same consolidated whitelist as direct DemiPass use
         let urlHost;
         try { urlHost = new URL(url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
-        if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
-          return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${ALLOWED_HOSTS.join(', ')}. Contact support to add hosts.` });
+        if (!BLINDKEY_HTTP_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
+          return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${BLINDKEY_HTTP_HOSTS.join(', ')}. Contact support to add hosts.` });
         }
 
         const response = await fetch(url, {
@@ -6036,10 +6036,20 @@ app.get('/api/blindkey/delegate/chain', rateLimitStandard, (req, res) => {
   const ownerDid = actor.did;
   if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'Bearer token required' });
 
-  // Resolve the secret — only the owner (or admin) can see the chain
-  const secret = actor.mode === 'admin'
-    ? db.prepare("SELECT * FROM blindkey_secrets WHERE name = ? AND status = 'active' ORDER BY updated_at DESC LIMIT 1").get(secret_name)
-    : resolveLatestBlindkeySecret(ownerDid, secret_name);
+  // Resolve the secret — admin must specify did or username, no cross-tenant resolution
+  let resolvedOwner = ownerDid;
+  if (actor.mode === 'admin' && !resolvedOwner) {
+    const { did, username } = req.query || {};
+    if (did) resolvedOwner = did;
+    else if (username) {
+      const w = db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username);
+      if (w) resolvedOwner = w.did;
+      else return res.status(404).json({ error: 'username not found' });
+    } else {
+      return res.status(400).json({ error: 'did or username required for admin delegation-chain lookup' });
+    }
+  }
+  const secret = resolveLatestBlindkeySecret(resolvedOwner, secret_name);
 
   if (!secret) return res.status(404).json({ error: 'secret not found' });
   if (actor.mode !== 'admin' && secret.did !== ownerDid) return res.status(403).json({ error: 'only the secret owner can view delegation chains' });
