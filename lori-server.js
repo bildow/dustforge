@@ -87,6 +87,68 @@ async function dispatchRound(roundId) {
   return res.data;
 }
 
+async function createTask(projectId, title, description, assignedTo) {
+  const res = await platformRequest('POST', `/api/projects/${projectId}/tasks`, {
+    title, description: description || '', assigned_to: assignedTo || '',
+  });
+  return res.data;
+}
+
+async function updateTask(taskId, updates) {
+  const res = await platformRequest('PATCH', `/api/tasks/${taskId}`, updates);
+  return res.data;
+}
+
+async function deleteTask(taskId) {
+  const res = await platformRequest('DELETE', `/api/tasks/${taskId}`);
+  return res.data;
+}
+
+async function resolveRound(roundId, outcome) {
+  const res = await platformRequest('POST', `/api/rounds/${roundId}/resolve`, {
+    resolution_outcome: outcome || 'harvested',
+  });
+  return res.data;
+}
+
+// ---------------------------------------------------------------------------
+// Self-onboarding — Lori discovers Dustforge and registers herself
+// ---------------------------------------------------------------------------
+
+async function selfOnboard() {
+  const https = require('https');
+  try {
+    // 1. Discover the manifest
+    const manifest = await dustforgeRequest('GET', '/.well-known/silicon');
+    console.log('[onboard] discovered manifest:', JSON.stringify(manifest).slice(0, 200));
+
+    // 2. Check if already registered
+    const existing = await fetchIdentity('lori').catch(() => null);
+    if (existing && !existing.error) {
+      console.log('[onboard] already registered as lori@dustforge.com');
+      return { already_registered: true, did: existing.did, email: existing.email };
+    }
+
+    // 3. Not registered — Lori can't self-create (costs $1 via Stripe)
+    // But she CAN authenticate if the account was created by admin
+    console.log('[onboard] not registered — need admin to create account or use prepaid key');
+    return { needs_registration: true, manifest };
+  } catch (err) {
+    console.error('[onboard] failed:', err.message);
+    return { error: err.message };
+  }
+}
+
+// Run self-check on startup
+setTimeout(async () => {
+  const result = await selfOnboard();
+  if (result.already_registered) {
+    console.log(`[lori] identity confirmed: ${result.did}`);
+  } else if (result.needs_registration) {
+    console.log('[lori] identity not found — waiting for admin registration');
+  }
+}, 5000);
+
 // ---------------------------------------------------------------------------
 // Conduit helpers
 // ---------------------------------------------------------------------------
@@ -387,6 +449,69 @@ async function handleIntent(message) {
     } catch (err) {
       return `Lookup failed: ${err.message}`;
     }
+  }
+
+  // Create a task card
+  const createMatch = lower.match(/(?:create|add|new)\s+(?:task|card)\s+(?:on|for|in)\s+(?:project\s+)?(\d+)\s*[:\-]?\s*(.+)/);
+  if (createMatch) {
+    try {
+      const result = await createTask(createMatch[1], createMatch[2].trim());
+      return `Created card #${result?.id || '?'}: "${createMatch[2].trim()}" on project ${createMatch[1]}.`;
+    } catch (err) {
+      return `Couldn't create the card: ${err.message}`;
+    }
+  }
+
+  // Mark a task done
+  const doneMatch = lower.match(/(?:mark|close|complete|done)\s+(?:card|task)\s+#?(\d+)/);
+  if (doneMatch) {
+    try {
+      await updateTask(doneMatch[1], { status: 'done' });
+      return `Card #${doneMatch[1]} marked done.`;
+    } catch (err) {
+      return `Couldn't close it: ${err.message}`;
+    }
+  }
+
+  // Delete a task
+  const deleteMatch = lower.match(/delete\s+(?:card|task)\s+#?(\d+)/);
+  if (deleteMatch) {
+    try {
+      await deleteTask(deleteMatch[1]);
+      return `Card #${deleteMatch[1]} deleted.`;
+    } catch (err) {
+      return `Couldn't delete it: ${err.message}`;
+    }
+  }
+
+  // Resolve/harvest a round
+  const resolveMatch = lower.match(/(?:resolve|harvest|close)\s+round\s+#?(\d+)/);
+  if (resolveMatch) {
+    try {
+      const result = await resolveRound(resolveMatch[1]);
+      return `Round ${resolveMatch[1]} resolved. ${result?.message || ''}`.trim();
+    } catch (err) {
+      return `Couldn't resolve it: ${err.message}`;
+    }
+  }
+
+  // Assign a task
+  const assignMatch = lower.match(/assign\s+(?:card|task)\s+#?(\d+)\s+to\s+(\S+)/);
+  if (assignMatch) {
+    try {
+      await updateTask(assignMatch[1], { assigned_to: assignMatch[2] });
+      return `Card #${assignMatch[1]} assigned to ${assignMatch[2]}.`;
+    } catch (err) {
+      return `Couldn't assign it: ${err.message}`;
+    }
+  }
+
+  // Self-onboard check
+  if (/onboard|register|identity|who am i/i.test(lower)) {
+    const result = await selfOnboard();
+    if (result.already_registered) return `I'm registered. DID: ${result.did}, email: ${result.email}`;
+    if (result.needs_registration) return "I'm not registered on Dustforge yet. Need an admin to create my account or give me a prepaid key.";
+    return `Onboarding check failed: ${result.error || 'unknown error'}`;
   }
 
   // Run an ideation round
