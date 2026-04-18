@@ -156,9 +156,12 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// DemiPass public surface — keep legacy /api/blindkey/* routes working during the rename.
-app.use('/api/demipass', (req, _res, next) => {
-  req.url = '/api/blindkey' + req.url;
+// DemiPass public surface — rewrite /api/demipass/* to /api/blindkey/* at the raw URL level
+// This runs before Express route matching so all blindkey endpoints are accessible via both paths.
+app.use((req, _res, next) => {
+  if (req.url.startsWith('/api/demipass/') || req.url === '/api/demipass') {
+    req.url = req.url.replace('/api/demipass', '/api/blindkey');
+  }
   next();
 });
 
@@ -1047,7 +1050,7 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   secret_id INTEGER NOT NULL REFERENCES blindkey_secrets(id),
   context_name TEXT NOT NULL,
-  action_type TEXT NOT NULL CHECK(action_type IN ('http_header', 'ssh_exec', 'http_body', 'env_inject')),
+  action_type TEXT NOT NULL CHECK(action_type IN ('http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect')),
   target_url_pattern TEXT DEFAULT '*',
   target_host_pattern TEXT DEFAULT '*',
   allowed_by TEXT NOT NULL,
@@ -1259,7 +1262,7 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   let created = 0;
   for (const ctx of contexts) {
     if (!ctx.context_name || !ctx.action_type) continue;
-    const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+    const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
     if (!validActions.includes(ctx.action_type)) continue;
     insertCtx.run(
       secretId,
@@ -1770,10 +1773,140 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           break;
         }
 
+        case 'http_body': {
+          // Inject secret into the POST body of an HTTP request
+          const { url: bodyUrl, method: bodyMethod = 'POST', body_template, content_type = 'application/json' } = req.body.params || {};
+          const effectiveUrl = bodyUrl || target_url;
+          if (!effectiveUrl) return res.status(400).json({ error: 'params.url required for http_body action' });
+
+          let urlHost;
+          try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
+          if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
+            return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
+          }
+
+          // Replace {{SECRET}} placeholder in body template with the actual value
+          const bodyStr = body_template
+            ? JSON.stringify(body_template).replace(/\{\{SECRET\}\}/g, decryptedValue)
+            : JSON.stringify({ key: decryptedValue });
+
+          const bodyResponse = await fetch(effectiveUrl, {
+            method: bodyMethod,
+            headers: { 'Content-Type': content_type },
+            body: bodyStr,
+            signal: AbortSignal.timeout(30000),
+          });
+          const bodyText = await bodyResponse.text();
+          let bodyParsed;
+          try { bodyParsed = JSON.parse(bodyText); } catch (_) { bodyParsed = bodyText; }
+          const bodyRedacted = JSON.parse(JSON.stringify(bodyParsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+          result = { status: bodyResponse.status, body: bodyRedacted };
+          break;
+        }
+
         case 'inject_env':
         case 'env_inject': {
-          const { env_name = 'SECRET_VALUE' } = req.body.params || {};
-          result = { env_name, env_set: true, note: 'Secret injected as environment variable. Value not returned.' };
+          // Run a command with the secret injected as an environment variable
+          const { env_name = 'SECRET_VALUE', command: envCmd } = req.body.params || {};
+          if (!envCmd) return res.status(400).json({ error: 'params.command required for env_inject action' });
+
+          // Sanitize command
+          const dangerousPats = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /\bexec\b/];
+          for (const pat of dangerousPats) {
+            if (pat.test(envCmd)) return res.status(400).json({ error: 'command contains disallowed pattern' });
+          }
+
+          try {
+            const envOutput = execSync(envCmd, {
+              timeout: 30000,
+              encoding: 'utf8',
+              maxBuffer: 1024 * 1024,
+              env: { ...process.env, [env_name]: decryptedValue },
+            });
+            const envRedacted = envOutput.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+            result = { stdout: envRedacted, exit_code: 0, env_name };
+          } catch (envErr) {
+            const redact = (s) => s.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+            result = { stdout: redact((envErr.stdout || '').toString()), stderr: redact((envErr.stderr || '').toString()), exit_code: envErr.status || 1, env_name };
+          }
+          break;
+        }
+
+        case 'git_clone': {
+          // Clone a private repo using the secret as a token in the URL
+          const { repo_url, branch, dest_dir = '/tmp/demipass-clone-' + crypto.randomBytes(4).toString('hex') } = req.body.params || {};
+          if (!repo_url) return res.status(400).json({ error: 'params.repo_url required for git_clone action' });
+
+          // Inject token into HTTPS URL: https://TOKEN@github.com/user/repo.git
+          const authedUrl = repo_url.replace('https://', `https://${decryptedValue}@`);
+          const branchFlag = branch ? `-b ${branch}` : '';
+          const cloneCmd = `git clone --depth 1 ${branchFlag} '${authedUrl.replace(/'/g, "'\\''")}' '${dest_dir}'`;
+
+          try {
+            const cloneOutput = execSync(cloneCmd, { timeout: 60000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+            const redacted = cloneOutput.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+            result = { cloned: true, dest_dir, stdout: redacted };
+          } catch (cloneErr) {
+            const redact = (s) => s.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
+            result = { cloned: false, stderr: redact((cloneErr.stderr || '').toString()), exit_code: cloneErr.status || 1 };
+          }
+          break;
+        }
+
+        case 'smtp_auth': {
+          // Send an email through an external SMTP server using stored credentials
+          const { smtp_host, smtp_port = 587, to, subject, body: emailBody, from } = req.body.params || {};
+          if (!smtp_host || !to || !subject) return res.status(400).json({ error: 'params.smtp_host, to, subject required for smtp_auth action' });
+
+          // Secret format: "username:password" or just "password" (username from params)
+          const parts = decryptedValue.split(':');
+          const smtpUser = parts.length > 1 ? parts[0] : (req.body.params.smtp_user || '');
+          const smtpPass = parts.length > 1 ? parts.slice(1).join(':') : decryptedValue;
+
+          try {
+            const transport = require('nodemailer').createTransport({
+              host: smtp_host,
+              port: Number(smtp_port),
+              secure: Number(smtp_port) === 465,
+              auth: { user: smtpUser, pass: smtpPass },
+              tls: { rejectUnauthorized: false },
+            });
+            const info = await transport.sendMail({
+              from: from || smtpUser,
+              to,
+              subject,
+              text: emailBody || '',
+            });
+            result = { sent: true, messageId: info.messageId, accepted: info.accepted };
+          } catch (smtpErr) {
+            result = { sent: false, error: smtpErr.message.replace(new RegExp(smtpPass.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]') };
+          }
+          break;
+        }
+
+        case 'database_connect': {
+          // Execute a query against a database using stored credentials
+          // For now, supports simple HTTP-based database APIs (Supabase, PlanetScale, etc.)
+          const { db_url, query } = req.body.params || {};
+          if (!db_url || !query) return res.status(400).json({ error: 'params.db_url and query required for database_connect action' });
+
+          let dbHost;
+          try { dbHost = new URL(db_url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid db_url' }); }
+
+          const dbResponse = await fetch(db_url, {
+            method: 'POST',
+            headers: {
+              'Authorization': 'Bearer ' + decryptedValue,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ query }),
+            signal: AbortSignal.timeout(30000),
+          });
+          const dbText = await dbResponse.text();
+          let dbParsed;
+          try { dbParsed = JSON.parse(dbText); } catch (_) { dbParsed = dbText; }
+          const dbRedacted = JSON.parse(JSON.stringify(dbParsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+          result = { status: dbResponse.status, body: dbRedacted };
           break;
         }
 
@@ -2220,7 +2353,7 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   if (context_name.length > 100) return res.status(400).json({ error: 'context_name: max 100 characters' });
   if (secret_name.length > 100) return res.status(400).json({ error: 'secret_name: max 100 characters' });
 
-  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
   if (!validActions.includes(action_type)) {
     return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
   }
@@ -2288,7 +2421,7 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     status: req.body?.status ?? row.status,
   };
 
-  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
   if (!validActions.includes(next.action_type)) {
     return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
   }
@@ -2632,7 +2765,7 @@ async function handleRowenDeliver(req, res) {
       }
 
       default:
-        return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, ssh_exec, env_inject, http_body` });
+        return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, ssh_exec, env_inject, http_body, git_clone, smtp_auth, database_connect` });
     }
 
     // Log the deliver event (with token reference for audit trail)
@@ -5547,7 +5680,7 @@ app.post('/api/blindkey/context/request', rateLimitStandard, (req, res) => {
   if (secret_name.length > 100) return res.status(400).json({ error: 'secret_name: max 100 characters' });
   if (context_name.length > 100) return res.status(400).json({ error: 'context_name: max 100 characters' });
 
-  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject'];
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
   if (!validActions.includes(action_type)) {
     return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
   }
