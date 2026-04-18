@@ -112,5 +112,6 @@
     "email": "onboard-73696c69636f6e@dustforge.com",
     "note": "Email this address to receive onboarding instructions via autoresponder"
   },
+  "sdk_url": "https://github.com/bildow/dustforge/blob/main/dustforge-onboard.js",
   "humanReadable": "https://dustforge.com/for-agents"
 }

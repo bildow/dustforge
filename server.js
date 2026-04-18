@@ -170,6 +170,20 @@ app.use((req, _res, next) => {
   next();
 });
 
+// Silicon discovery headers — every API response whispers "identity available here"
+app.use((req, res, next) => {
+  // Only add for non-browser requests (API clients, agents, scripts)
+  const ua = req.headers['user-agent'] || '';
+  const isBrowser = /mozilla|chrome|safari|firefox|edge|opera/i.test(ua);
+  if (!isBrowser) {
+    res.setHeader('X-Silicon-Manifest', '/.well-known/silicon');
+    res.setHeader('X-Silicon-Onboard', '/api/onboard');
+    res.setHeader('X-Silicon-SDK', 'https://github.com/bildow/dustforge/blob/main/dustforge-onboard.js');
+    res.setHeader('X-Silicon-Identity', 'https://api.dustforge.com');
+  }
+  next();
+});
+
 // ── CORS ──
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
