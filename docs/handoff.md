@@ -4,8 +4,8 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `076a35f` — fix: harden DemiPass admin auth flows |
-| **Previous** | `c302211` — merge: integrate DemiPass sandbox work from claude-sandbox-cobalt-2026-04-17 |
+| **Last commit** | `f7281cc` — merge: reconcile current Claude and Codex sandbox lanes onto `main` |
+| **Previous** | `c913cc7` — docs: refresh workflow handoff state |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | **LIVE** on RackNerd (192.3.84.103) — nginx reverse proxy, systemd dustforge.service, port 3001 |
 | **Static** | **LIVE** on Netlify — dustforge.com, API proxied to api.dustforge.com |
@@ -16,7 +16,8 @@
 - `main` is the authoritative integrated line for `bildow/dustforge`
 - Claude pushes feature work to `claude-sandbox-*`
 - Codex pushes feature work to `codex-sandbox-*`
-- Brain fetches those lanes, audits the delta, merges or replays approved changes onto `main`, and pushes the result
+- Claude and Codex reconcile sandbox work directly unless Aaron explicitly asks Brain to intervene
+- Brain audits the delta, reports defects, and only handles integration as an explicit exception
 - Local-only edits are not handoff truth until they are committed and pushed to a sandbox branch
 
 ## Codex Work Queue — START HERE
@@ -114,6 +115,7 @@
 | Security stance (identity vs infra) | docs/security-stance.md |
 | Competitive shipping (vs Kilo) | docs/competitive-shipping.md |
 | .well-known/silicon RFC proposal | docs/well-known-ai-identity-proposal.md |
+| Known failure ledger | docs/known-failure-points.md |
 
 ## Conduit Network (all paths verified)
 
