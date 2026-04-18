@@ -59,6 +59,12 @@ npm start
 | `/api/demipass/history` | GET | Audit history for secret, context, and Rowen events |
 | `/api/demipass/contexts` | GET | List contexts for a secret |
 | `/api/demipass/context/requests` | GET | List pending or resolved context requests |
+| `/api/rowen/authorize` | POST | Preflight context authorization for mediated secret use |
+| `/api/rowen/ingest` | POST | Rowen-mediated secret ingest into DemiVault |
+| `/api/rowen/deliver` | POST | Rowen-mediated secret use with context enforcement |
+| `/api/conductor/rowen/authorize` | POST | Conductor alias for Rowen preflight authorization |
+| `/api/conductor/rowen/ingest` | POST | Conductor alias for Rowen ingest |
+| `/api/conductor/rowen/deliver` | POST | Conductor alias for Rowen deliver |
 | `/api/prepaid/purchase` | POST | Buy prepaid keys (email-verified) |
 | `/api/prepaid/redeem` | POST | Redeem a prepaid key for identity |
 | `/api/prepaid/check` | GET | Check key status |

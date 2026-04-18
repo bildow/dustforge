@@ -81,6 +81,7 @@ This makes DemiPass an operator workflow, not just an API primitive.
 Two explicit backend entry points exist for clean-room handling:
 
 - `POST /api/rowen/ingest` — write a secret into DemiVault on behalf of a target DID
+- `POST /api/rowen/authorize` — preflight context authorization without executing the secret use
 - `POST /api/rowen/deliver` — authorize and perform one contextualized use
 
 Current posture:
@@ -88,6 +89,8 @@ Current posture:
 - Rowen is modeled as a single-use clean-room operator
 - the hot path remains non-LLM and server-enforced
 - audit records are written for ingest, token issuance, and delivery attempts
+- Conductor now has explicit aliases (`/api/conductor/rowen/*`) so code-generation/runtime flows can request Rowen mediation without reusing the operator admin key
+- service-to-service mediation is keyed separately from `DUSTFORGE_ADMIN_KEY` via `DUSTFORGE_ROWEN_KEY` and `DUSTFORGE_CONDUCTOR_KEY`
 
 ## Rate Limiting
 
