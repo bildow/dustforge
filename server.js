@@ -33,6 +33,11 @@ const INNER_RING_CONFIG = {
 };
 
 // DemiPass SSH host whitelist — only these hosts can be targeted via ssh_exec
+// Consolidated host whitelists — single source of truth for all DemiPass action types
+const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+const BLINDKEY_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
+const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
+const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
 const BLINDKEY_SSH_HOSTS = new Set([
   '192.3.84.103',      // RackNerd
   '100.83.112.88',     // phasewhip
@@ -1092,6 +1097,7 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_use_tokens (
 )`); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_token ON blindkey_use_tokens(token)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_did ON blindkey_use_tokens(did)"); } catch(e) {}
+try { db.exec("ALTER TABLE blindkey_use_tokens ADD COLUMN delegation_id INTEGER DEFAULT NULL"); } catch(e) {}
 
 // ── [104] Barrel Cosign Requests ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS barrel_cosign_requests (
@@ -1371,7 +1377,8 @@ function resolveLatestBlindkeySecret(did, name) {
 }
 
 function authorizeSecretMediation({ requestorDid, secretName, contextName, actionParams = {} }) {
-  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(requestorDid, secretName, 'active');
+  // Defect fix #5: use resolveLatestBlindkeySecret to handle rotated secrets (secret_v2 etc.)
+  const secret = resolveLatestBlindkeySecret(requestorDid, secretName);
   if (!secret) {
     return { ok: false, status: 404, error: 'secret not found for requestor_did' };
   }
@@ -1491,10 +1498,10 @@ app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
 
   let secretId = null;
   if (secret_name) {
-    const secret = ownerDid
-      ? db.prepare(`SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? ORDER BY version DESC LIMIT 1`).get(ownerDid, secret_name)
-      : db.prepare(`SELECT id FROM blindkey_secrets WHERE name = ? ORDER BY updated_at DESC LIMIT 1`).get(secret_name);
-    if (!secret) return res.status(404).json({ error: 'secret not found' });
+    // Defect fix: admin MUST specify did or username — never resolve by name alone across tenants
+    if (!ownerDid) return res.status(400).json({ error: 'did or username required when looking up by secret_name — cannot resolve across tenants' });
+    const secret = db.prepare(`SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? ORDER BY version DESC LIMIT 1`).get(ownerDid, secret_name);
+    if (!secret) return res.status(404).json({ error: 'secret not found for this identity' });
     secretId = secret.id;
   }
 
@@ -1619,13 +1626,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   try {
     // The token references the OWNER's secret — the delegate never sees the value
     db.prepare(`
-      INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'))
-    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '');
+      INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at, delegation_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'), ?)
+    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '', delegation ? delegation.id : null);
 
     // If this was a delegated request, increment use_count and log
     if (delegation) {
-      db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(delegation.id);
+      // Defect fix: DON'T burn quota here at issuance. Burn at redemption (in the use-token handler).
+      // Store delegation_id on the use-token so we can increment on redemption.
       db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
         'delegation_used', callerDid, secret.id, contextName,
         JSON.stringify({ delegation_id: delegation.id, owner_did: delegation.owner_did, use_count: delegation.use_count + 1 })
@@ -1669,6 +1677,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     // Mark token as used
     db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
 
+    // Defect fix #4: burn delegation quota on REDEMPTION, not issuance
+    if (tokenRow.delegation_id) {
+      db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
+    }
+
     // Load the secret from the token's secret_id
     const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ? AND status = ?').get(tokenRow.secret_id, 'active');
     if (!secret) return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked' });
@@ -1701,7 +1714,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'params.url or token target_url required for http_header action' });
 
-          const ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+          const ALLOWED_HOSTS = BLINDKEY_HTTP_HOSTS;
           let urlHost;
           try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
           if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
@@ -1784,7 +1797,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           let urlHost;
           try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
           // FIX #5: define ALLOWED_HOSTS in this scope
-          const HTTP_BODY_ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+          const HTTP_BODY_ALLOWED_HOSTS = BLINDKEY_HTTP_HOSTS;
           if (!HTTP_BODY_ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
             return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
           }
@@ -1825,7 +1838,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           if (!repo_url) return res.status(400).json({ error: 'params.repo_url required for git_clone action' });
 
           // FIX #1: whitelist git hosts
-          const GIT_ALLOWED_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
+          const GIT_ALLOWED_HOSTS = BLINDKEY_GIT_HOSTS;
           let gitHost;
           try { gitHost = new URL(repo_url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid repo_url' }); }
           if (!GIT_ALLOWED_HOSTS.some(h => gitHost === h || gitHost.endsWith('.' + h))) {
@@ -1864,7 +1877,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           if (!smtp_host || !to || !subject) return res.status(400).json({ error: 'params.smtp_host, to, subject required for smtp_auth action' });
 
           // FIX #1: smtp host must match token's target_host or be whitelisted
-          const SMTP_ALLOWED_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
+          const SMTP_ALLOWED_HOSTS = BLINDKEY_SMTP_HOSTS;
           if (target_host && smtp_host !== target_host) {
             return res.status(403).json({ error: `smtp_host ${smtp_host} does not match token target_host ${target_host}` });
           }
@@ -1909,7 +1922,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           try { dbHost = new URL(db_url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid db_url' }); }
 
           // FIX #1: whitelist database API hosts
-          const DB_ALLOWED_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
+          const DB_ALLOWED_HOSTS = BLINDKEY_DB_HOSTS;
           if (!DB_ALLOWED_HOSTS.some(h => dbHost === h || dbHost.endsWith('.' + h))) {
             return res.status(403).json({ error: `database host ${dbHost} not in whitelist` });
           }
@@ -2192,8 +2205,8 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
-    // Copy all contexts from old secret to new secret (reset use_count to 0)
-    const oldContexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(existing.id);
+    // Copy only ACTIVE contexts from old secret to new (skip revoked/suspended)
+    const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(existing.id);
     let contextsTransferred = 0;
     for (const ctx of oldContexts) {
       db.prepare(`
@@ -5608,7 +5621,8 @@ app.post('/api/escrow/:id/release', rateLimitStandard, (req, res) => {
   const row = getEscrowById(req.params.id);
   if (!row) return res.status(404).json({ error: 'escrow not found' });
   if (row.creator_did !== actor.did) return res.status(403).json({ error: 'only creator can release escrow' });
-  if (!['pending', 'active'].includes(row.status)) return res.status(409).json({ error: `cannot release escrow in status ${row.status}` });
+  // Defect fix #6: only allow release from 'active' (counterparty accepted), not 'pending'
+  if (row.status !== 'active') return res.status(409).json({ error: `cannot release escrow in status ${row.status} — counterparty must accept first` });
   try {
     verifyEscrowBarrel(actor.did, row.barrel_tier_required || resolveEscrowTier(row.collateral_cents));
   } catch (error) {
