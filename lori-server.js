@@ -337,8 +337,8 @@ async function handleIntent(message) {
     return "That's Rowen's department, not mine. Route anything secret-related through her.";
   }
 
-  // Status / what's stuck
-  if (/what.?s stuck|status|overview/i.test(lower)) {
+  // Status / what's stuck — broad matching
+  if (/what.?s stuck|status|overview|how.?s it going|what.?s going on|current state|board|update me|sitrep/i.test(lower)) {
     try {
       const projects = await fetchProjects();
       if (!projects || !Array.isArray(projects) || projects.length === 0) {
@@ -365,8 +365,11 @@ async function handleIntent(message) {
     }
   }
 
-  // Show tasks for a project
-  const taskMatch = lower.match(/(?:show|list|get)\s+tasks?\s+(?:for\s+)?(?:project\s+)?(\d+)/);
+  // Show tasks for a project — flexible matching
+  const taskMatch = lower.match(/(?:show|list|get|what are|current|give me)\s+(?:the\s+)?(?:task|card|todo|ticket)s?\s+(?:for\s+|on\s+|in\s+)?(?:project\s+)?(\d+)/)
+    || lower.match(/project\s+(\d+)\s+(?:task|card|todo)s?/)
+    || lower.match(/(?:civitasvox|dustforge|mvp)\s+(?:task|card)s?/i) && { 1: '17' }
+    || lower.match(/(?:platform|carbon silicon)\s+(?:task|card)s?/i) && { 1: '3' };
   if (taskMatch) {
     try {
       const tasks = await fetchTasks(taskMatch[1]);
@@ -551,7 +554,7 @@ function fallbackResponse(message) {
       'Try "status", "show tasks for project 1", "move card 5 to project 2", "who\'s online", or "run an ideation round on [topic]".'
     );
   }
-  return "I'm not sure what you're asking for. Try \"status\" or \"help\" if you're lost.";
+  return "I'm not sure what you're asking for. Try: \"status\", \"show tasks 17\", \"dustforge tasks\", \"anomalies\", \"capacity\", \"look up brain\", \"move card 5 to project 3\", or \"help\".";
 }
 
 // ---------------------------------------------------------------------------
