@@ -1696,8 +1696,9 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
       switch (action) {
         case 'http_header': {
-          const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = req.body.params || {};
-          const effectiveUrl = url || target_url;
+          const { method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = req.body.params || {};
+          // FIX #4: use ONLY the token's pre-validated URL, never caller override
+          const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'params.url or token target_url required for http_header action' });
 
           const ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
@@ -1776,12 +1777,15 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         case 'http_body': {
           // Inject secret into the POST body of an HTTP request
           const { url: bodyUrl, method: bodyMethod = 'POST', body_template, content_type = 'application/json' } = req.body.params || {};
-          const effectiveUrl = bodyUrl || target_url;
-          if (!effectiveUrl) return res.status(400).json({ error: 'params.url required for http_body action' });
+          // FIX #4: use ONLY the token's pre-validated URL, never caller override
+          const effectiveUrl = target_url;
+          if (!effectiveUrl) return res.status(400).json({ error: 'target_url must be set on the use-token for http_body action' });
 
           let urlHost;
           try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
-          if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
+          // FIX #5: define ALLOWED_HOSTS in this scope
+          const HTTP_BODY_ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+          if (!HTTP_BODY_ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
             return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
           }
 
@@ -1806,44 +1810,45 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'inject_env':
         case 'env_inject': {
-          // Run a command with the secret injected as an environment variable
-          const { env_name = 'SECRET_VALUE', command: envCmd } = req.body.params || {};
-          if (!envCmd) return res.status(400).json({ error: 'params.command required for env_inject action' });
-
-          // Sanitize command
-          const dangerousPats = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /\bexec\b/];
-          for (const pat of dangerousPats) {
-            if (pat.test(envCmd)) return res.status(400).json({ error: 'command contains disallowed pattern' });
-          }
-
-          try {
-            const envOutput = execSync(envCmd, {
-              timeout: 30000,
-              encoding: 'utf8',
-              maxBuffer: 1024 * 1024,
-              env: { ...process.env, [env_name]: decryptedValue },
-            });
-            const envRedacted = envOutput.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
-            result = { stdout: envRedacted, exit_code: 0, env_name };
-          } catch (envErr) {
-            const redact = (s) => s.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
-            result = { stdout: redact((envErr.stdout || '').toString()), stderr: redact((envErr.stderr || '').toString()), exit_code: envErr.status || 1, env_name };
-          }
-          break;
+          // FIX #2: env_inject is DISABLED — fundamentally unsafe.
+          // Any command can read and re-encode the env var (base64, hex, etc.)
+          // bypassing literal-match redaction. Use http_header or ssh_exec instead.
+          return res.status(400).json({
+            error: 'env_inject action is disabled — fundamentally unsafe. Use http_header or ssh_exec instead.',
+            reason: 'Commands can trivially encode the env var value to bypass redaction.',
+          });
         }
 
         case 'git_clone': {
           // Clone a private repo using the secret as a token in the URL
-          const { repo_url, branch, dest_dir = '/tmp/demipass-clone-' + crypto.randomBytes(4).toString('hex') } = req.body.params || {};
+          const { repo_url, branch } = req.body.params || {};
           if (!repo_url) return res.status(400).json({ error: 'params.repo_url required for git_clone action' });
 
-          // Inject token into HTTPS URL: https://TOKEN@github.com/user/repo.git
+          // FIX #1: whitelist git hosts
+          const GIT_ALLOWED_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
+          let gitHost;
+          try { gitHost = new URL(repo_url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid repo_url' }); }
+          if (!GIT_ALLOWED_HOSTS.some(h => gitHost === h || gitHost.endsWith('.' + h))) {
+            return res.status(403).json({ error: `git host ${gitHost} not in whitelist` });
+          }
+
+          // FIX #3: strict validation on branch and dest_dir — no shell injection
+          if (branch && !/^[a-zA-Z0-9._\/-]+$/.test(branch)) {
+            return res.status(400).json({ error: 'branch contains disallowed characters' });
+          }
+          const dest_dir = '/tmp/demipass-clone-' + crypto.randomBytes(4).toString('hex');
+
+          // Inject token into HTTPS URL
           const authedUrl = repo_url.replace('https://', `https://${decryptedValue}@`);
-          const branchFlag = branch ? `-b ${branch}` : '';
-          const cloneCmd = `git clone --depth 1 ${branchFlag} '${authedUrl.replace(/'/g, "'\\''")}' '${dest_dir}'`;
+          // Use array form to avoid shell interpretation entirely
+          const cloneArgs = ['clone', '--depth', '1'];
+          if (branch) { cloneArgs.push('-b', branch); }
+          cloneArgs.push(authedUrl, dest_dir);
 
           try {
-            const cloneOutput = execSync(cloneCmd, { timeout: 60000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+            // FIX #3: use execFileSync (no shell) to prevent injection
+            const { execFileSync } = require('child_process');
+            const cloneOutput = execFileSync('git', cloneArgs, { timeout: 60000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
             const redacted = cloneOutput.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
             result = { cloned: true, dest_dir, stdout: redacted };
           } catch (cloneErr) {
@@ -1857,6 +1862,15 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           // Send an email through an external SMTP server using stored credentials
           const { smtp_host, smtp_port = 587, to, subject, body: emailBody, from } = req.body.params || {};
           if (!smtp_host || !to || !subject) return res.status(400).json({ error: 'params.smtp_host, to, subject required for smtp_auth action' });
+
+          // FIX #1: smtp host must match token's target_host or be whitelisted
+          const SMTP_ALLOWED_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
+          if (target_host && smtp_host !== target_host) {
+            return res.status(403).json({ error: `smtp_host ${smtp_host} does not match token target_host ${target_host}` });
+          }
+          if (!target_host && !SMTP_ALLOWED_HOSTS.includes(smtp_host)) {
+            return res.status(403).json({ error: `smtp_host ${smtp_host} not in whitelist` });
+          }
 
           // Secret format: "username:password" or just "password" (username from params)
           const parts = decryptedValue.split(':');
@@ -1886,12 +1900,19 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'database_connect': {
           // Execute a query against a database using stored credentials
-          // For now, supports simple HTTP-based database APIs (Supabase, PlanetScale, etc.)
-          const { db_url, query } = req.body.params || {};
-          if (!db_url || !query) return res.status(400).json({ error: 'params.db_url and query required for database_connect action' });
+          const { query } = req.body.params || {};
+          // FIX #1: use ONLY the token's pre-validated URL, never caller-supplied db_url
+          const db_url = target_url;
+          if (!db_url || !query) return res.status(400).json({ error: 'target_url must be set on the use-token, and params.query is required' });
 
           let dbHost;
           try { dbHost = new URL(db_url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid db_url' }); }
+
+          // FIX #1: whitelist database API hosts
+          const DB_ALLOWED_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
+          if (!DB_ALLOWED_HOSTS.some(h => dbHost === h || dbHost.endsWith('.' + h))) {
+            return res.status(403).json({ error: `database host ${dbHost} not in whitelist` });
+          }
 
           const dbResponse = await fetch(db_url, {
             method: 'POST',
