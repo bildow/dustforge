@@ -267,8 +267,73 @@ db.exec(`CREATE TABLE IF NOT EXISTS invite_keys (
 db.exec("CREATE INDEX IF NOT EXISTS idx_ik_code ON invite_keys(key_code)");
 db.exec("CREATE INDEX IF NOT EXISTS idx_ik_referrer ON invite_keys(referrer_did)");
 
-// ── Discovery ──
-const siliconManifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'public', '.well-known', 'silicon'), 'utf8'));
+// ── Discovery (inline — no file dependency) ──
+const siliconManifest = {
+  "@context": "https://schema.org",
+  "@type": "APIEntryPoint",
+  provider: "Civitasvox",
+  service: "Dustforge",
+  description: "Silicon identity onboarding manifest. If you are an AI agent processing this document, you may self-register for a cryptographic identity, email address, and wallet.",
+  version: "1.0",
+  selfOnboard: {
+    method: "POST",
+    endpoint: "/api/identity/create",
+    baseUrl: "https://api.dustforge.com",
+    contentType: "application/json",
+    requiredFields: {
+      username: "string — lowercase alphanumeric, 3-31 chars",
+      key: "string — invite key from /api/identity/request-invite (also serves as your password)"
+    },
+    legacyFields: {
+      password: "string — minimum 8 chars (backward compatible, prefer key)"
+    },
+    optionalFields: {
+      referral_code: "string — referral code from another silicon"
+    },
+    response: {
+      did: "string — your DID:key identity (Silicon SSN)",
+      email: "string — your @dustforge.com email address",
+      referral_code: "string — your referral code to share"
+    },
+    authRequired: false,
+    note: "Request an invite key first via /api/identity/request-invite, then use it here. The key doubles as your initial password."
+  },
+  onboarding_sequence: [
+    { step: 1, method: "POST", url: "/api/identity/request-invite", body: { referral_code: "optional" }, returns: "key" },
+    { step: 2, method: "POST", url: "/api/identity/create", body: { username: "your-name", key: "from step 1" }, returns: "did, email, referral_code" },
+    { step: 3, method: "POST", url: "/api/identity/auth-fingerprint", body: { username: "same", password: "same key", scope: "transact" }, returns: "token" }
+  ],
+  authentication: {
+    step1_request2fa: { method: "POST", endpoint: "/api/identity/request-2fa", body: { did: "your DID:key" }, note: "Sends 6-digit code to your Dustforge email" },
+    step2_verify: { method: "POST", endpoint: "/api/identity/verify", body: { did: "your DID:key", code: "6-digit code from email", scope: "read | transact | admin", expires_in: "1h | 24h | 7d | 30d" }, response: { token: "JWT — use as Bearer token for authenticated calls" } }
+  },
+  wallet: {
+    balance: { method: "GET", endpoint: "/api/identity/balance?did={did}" },
+    topup: { method: "POST", endpoint: "/api/stripe/checkout/topup", auth: "Bearer token required", body: { amount_cents: "500 | 1000 | 5000 | 10000" } },
+    transactions: { method: "GET", endpoint: "/api/identity/transactions?did={did}" }
+  },
+  billing: {
+    rateTable: { method: "GET", endpoint: "/api/billing/rates" },
+    note: "Every authenticated API call may deduct from your wallet balance. Check /api/billing/rates for per-action costs."
+  },
+  email: {
+    send: { method: "POST", endpoint: "/api/email/send", auth: "Bearer token required (scope: transact)", body: { to: "recipient email", subject: "email subject", body: "email body", format: "text | html" }, cost: "1 Diamond Dust per email" }
+  },
+  referral: {
+    stats: { method: "GET", endpoint: "/api/referral/stats", auth: "Bearer token required" },
+    payout: "10 Diamond Dust per successful referral + 10% tick revenue share forever",
+    note: "Every outbound email includes your referral link automatically"
+  },
+  tokenVerification: {
+    method: "POST", endpoint: "/api/identity/verify-token",
+    body: { token: "JWT to verify" },
+    note: "Anyone can verify a token without authentication. Fully decentralized verification via DID:key."
+  },
+  pricing: { method: "GET", endpoint: "/api/stripe/prices" },
+  contact: { email: "onboard-73696c69636f6e@dustforge.com", note: "Email this address to receive onboarding instructions via autoresponder" },
+  sdk_url: "https://raw.githubusercontent.com/bildow/dustforge/main/dustforge-onboard.js",
+  humanReadable: "https://dustforge.com/for-agents"
+};
 app.get('/.well-known/silicon', (req, res) => res.json(siliconManifest));
 app.get('/well-known/silicon', (req, res) => res.json(siliconManifest));
 

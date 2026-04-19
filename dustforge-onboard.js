@@ -42,7 +42,15 @@ function _request(method, path, body) {
     const req = mod.request(opts, (res) => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(d); } });
+      res.on('end', () => {
+        let parsed;
+        try { parsed = JSON.parse(d); } catch { parsed = d; }
+        if (res.statusCode >= 400) {
+          const msg = (parsed && parsed.error) || `HTTP ${res.statusCode}`;
+          return reject(new Error(`${method} ${path} failed: ${msg}`));
+        }
+        resolve(parsed);
+      });
     });
     req.on('error', reject);
     req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });

@@ -4,43 +4,49 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `df90c93` — Invite key system |
+| **Last commit** | `ce8ef20` — Homepage instant onboard key generator |
 | **Branch** | `main` — `bildow/dustforge` |
-| **Deployed** | **LIVE** on RackNerd (192.3.84.103) |
-| **Status** | Invite keys, tick service, Rowen ingress+egress all deployed. DemiPass delivery test passed. |
+| **Deployed** | **LIVE** on RackNerd (192.3.84.103) + Netlify (dustforge.com) |
+| **Status** | All previous audit findings resolved. Homepage key generator live. Netlify redeploy verified. |
 
-## What Shipped This Session
+## What Shipped Since Last Audit
 
-### Invite Key System (four-prong onboarding funnel)
-- POST /api/identity/request-invite — public, generates DF-XXXXXXXX key
-- POST /api/identity/generate-invite — members create keys for others
-- POST /api/identity/create — accepts key (= password = referral)
-- GET /api/identity/onboard?key=KEY — interactive HTML/JSON flow
-- .well-known/silicon — executable onboarding_sequence
-- DemiPass SDK — fullOnboard() wraps all 3 steps
-- MCP server — demipass_onboard tool
+### Brain Audit Fixes (all 7 findings resolved)
+- `aa16d12` — tickId crash fix, atomic invite key claiming, doc honesty (Lori onboarding)
+- `535483e` — Invite key stranding fix: release claiming → active on all failure paths
+- `59eee08` — Manifest drift fix: proxy .well-known/silicon to API via Netlify redirect
+- `c449cfb` — Removed stale static .well-known/silicon file
+- `63e23c6` — Aligned manifest, SDK, and referral numbers (all say 10 DD, not 25¢)
 
-### Tick Service (temporal anchor)
-- POST /api/tick — anonymous (free, 10/min rate limit) or member (1 DD, signed)
-- GET /api/tick/ledger — member history access
-- Referral code embedded in every signed tick response
-- 10% revenue share to referrer on every tick, forever
+### Self-Executing Onboard Script
+- `fea31ae` — GET /api/identity/onboard?key=KEY&format=script returns Node.js script
+- Key is baked into the script URL — recipient runs `node <(curl -s 'URL') my-agent-name`
+- Key consumed on execution, not on URL generation
 
-### Rowen Deployed
-- Egress: port 3002, SecretDose, dual-barrel stub mode — RUNNING
-- Ingress: port 3004, HMAC auth, vault forwarding — RUNNING
-- DemiPass delivery test PASSED (token issued + redeemed + secret injected)
+### Homepage Instant Key Generator
+- `ce8ef20` — "Try it right now" section on dustforge.com
+- Generates live invite key on click via /api/identity/request-invite
+- Displays ready-to-paste curl command with copy button
+- Netlify redeploy verified — **LIVE** at dustforge.com
 
-### Lori
-- Self-onboarded via .well-known/silicon manifest — but with pre-configured credentials in .env (DUSTFORGE_PASSWORD, REFERRAL_CODE). The HTTP calls were autonomous but the credentials were operator-provided, not self-generated. True autonomous onboarding requires the invite key flow.
-- DeepSeek V3.2 LLM via OpenRouter
-- Identity wiped and re-created
+### Netlify Configuration
+- .well-known/silicon proxied to api.dustforge.com (not static file)
+- /api/* proxied to api.dustforge.com
+- /for-agents, /privacy, /terms redirects all verified 200
+
+## Previously Shipped (verified in prior audit)
+- Invite key system (request → create → auth, atomic claiming)
+- Tick service (anonymous + member, referral revenue share)
+- Rowen ingress (port 3004, HMAC) + egress (port 3002, SecretDose)
+- DemiPass delivery test passed
+- Lori self-onboarded (operator-provided creds, not fully autonomous)
+- DemiPass SDK + MCP server with invite flow
 
 ## Repos
 
 | Repo | Latest | Status |
 |------|--------|--------|
-| bildow/dustforge | df90c93 | LIVE |
+| bildow/dustforge | ce8ef20 | LIVE (RackNerd + Netlify) |
 | bildow/demipass | 66416ef | SDK + MCP with invite flow |
 | bildow/rowen | a340463 | Ingress + egress deployed |
 | bildow/tome | 621390f | Barometer + checkpoint |
@@ -48,17 +54,28 @@
 
 ## For Brain's Audit
 
-Verify:
-1. Invite key flow end-to-end (request → create → auth)
-2. Tick service (anonymous rate limit, member signing, referral embedding)
-3. Rowen ingress HMAC auth
-4. Rowen egress SecretDose + barrel stub
-5. .well-known/silicon onboarding_sequence is correct
-6. DemiPass SDK fullOnboard() matches server endpoints
+### Verify new since last audit:
+1. Homepage key generator works end-to-end (dustforge.com → click → key appears → curl command works)
+2. Self-executing onboard script (GET /api/identity/onboard?key=KEY&format=script returns valid Node.js)
+3. .well-known/silicon is proxied (not stale static file) — should show invite key flow
+4. Atomic invite key claiming — two parallel requests can't both claim same key
+5. Invite key release on failure — key returns to 'active' if account creation fails
+6. Referral numbers consistent — all references say 10 DD (not 25¢ or 1 DD)
+7. Netlify redirects all return 200 (/for-agents, /privacy, /terms, /.well-known/silicon)
 
-## Task Cards Created This Session
+### Re-verify from prior audit (regression check):
+8. Invite key flow end-to-end (request → create → auth)
+9. Tick service (anonymous rate limit, member signing, referral embedding)
+10. DemiPass SDK fullOnboard() matches server endpoints
+
+## Open Task Cards
+- 220: Lori Conductor wrapper (real LLM personality)
 - 243: DemiPass wallet UI (circuit breaker metaphor)
-- 244: Tick service (updated with final pricing model)
+- 244: Tick service refinements
 - 245: Rowen honeypot
 - 246: Auto-ledger (free writes, paid reads)
 - 247: Chrono Triggers (scheduled delivery)
+- 249: Google Ads landing page optimization
+- 251: demipass.com landing page
+- 252: npm publish demipass package
+- 253: HackerNews Show HN post
