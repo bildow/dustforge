@@ -6103,3 +6103,108 @@ app.get('/api/channel/info', (req, res) => {
 module.exports = { app, db };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
+
+// ============================================================
+// Tick Service — temporal anchor for LLM sessions
+// ============================================================
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS ticks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT DEFAULT '',
+  note TEXT DEFAULT '',
+  ip TEXT DEFAULT '',
+  tz TEXT DEFAULT 'UTC',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_did ON ticks(did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_ip ON ticks(ip)"); } catch(e) {}
+
+const tickRateAnon = rateLimit({ windowMs: 60*1000, max: 10, keyGenerator: (req) => req.ip, message: { error: 'anonymous tick rate limit: 10/min. Onboard for higher limits.' } });
+const tickRateMember = rateLimit({ windowMs: 60*1000, max: 60, keyGenerator: (req) => req.identity?.did || req.ip });
+
+app.post('/api/tick', (req, res) => {
+  const { note = '', tz = 'UTC' } = req.body || {};
+  const noteClean = String(note).slice(0, 300);
+
+  // Check for member auth (optional)
+  const auth = getBearerIdentity(req);
+  const isMember = auth.ok;
+  const did = isMember ? auth.did : '';
+
+  // Rate limit
+  if (!isMember) {
+    // Check anonymous rate
+    const recentAnon = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE ip = ? AND created_at > datetime('now', '-1 minute') AND did = ''").get(req.ip || '').n;
+    if (recentAnon >= 10) return res.status(429).json({ error: 'anonymous tick rate limit: 10/min. Onboard at /.well-known/silicon for higher limits and signed timestamps.' });
+    const dailyAnon = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE ip = ? AND created_at > datetime('now', '-1 day') AND did = ''").get(req.ip || '').n;
+    if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day. Onboard for unlimited.' });
+  }
+
+  // Bill member
+  if (isMember) {
+    const cost = 1; // 0.01 DD = 1 cent... actually 1 unit in our system
+    // For now, don't bill — tick is free for members during beta
+  }
+
+  // Record the tick
+  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz) VALUES (?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz);
+  const tickId = result.lastInsertRowid;
+
+  // Get previous tick for this identity/ip
+  let previous = null;
+  if (isMember && did) {
+    previous = db.prepare('SELECT id, note, created_at FROM ticks WHERE did = ? AND id < ? ORDER BY id DESC LIMIT 1').get(did, tickId);
+  } else {
+    previous = db.prepare("SELECT id, note, created_at FROM ticks WHERE ip = ? AND did = '' AND id < ? ORDER BY id DESC LIMIT 1").get(req.ip || '', tickId);
+  }
+
+  const now = new Date();
+  let ago = null;
+  if (previous) {
+    const prevTime = new Date(previous.created_at + 'Z');
+    const diffMs = now.getTime() - prevTime.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    const diffHr = Math.floor(diffMin / 60);
+    const diffDay = Math.floor(diffHr / 24);
+    ago = diffDay > 0 ? `${diffDay}d ${diffHr % 24}h` : diffHr > 0 ? `${diffHr}h ${diffMin % 60}m` : `${diffMin}m`;
+  }
+
+  // Build response
+  const response = {
+    tick_id: tickId,
+    time: now.toISOString(),
+    tz,
+    note: noteClean,
+    previous: previous ? { tick_id: previous.id, note: previous.note, at: previous.created_at, ago } : null,
+    member: isMember,
+  };
+
+  // Signature (member only)
+  if (isMember) {
+    const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(did);
+    const sigPayload = `${tickId}:${response.time}:${did}:${noteClean}`;
+    const sig = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY || '').update(sigPayload).digest('hex');
+    response.signature = sig;
+    response.referral_code = wallet?.referral_code || '';
+    response.did = did;
+  } else {
+    response.signature = null;
+    response.referral_code = null;
+    response.onboard_hint = '/.well-known/silicon';
+  }
+
+  res.json(response);
+});
+
+// GET /api/tick/ledger — member only, read your tick history
+app.get('/api/tick/ledger', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required. Ledger access is a member benefit.' });
+
+  const limit = Math.min(100, Number(req.query.limit) || 50);
+  const offset = Number(req.query.offset) || 0;
+  const ticks = db.prepare('SELECT id, note, tz, created_at FROM ticks WHERE did = ? ORDER BY id DESC LIMIT ? OFFSET ?').all(auth.did, limit, offset);
+  const total = db.prepare('SELECT COUNT(*) as n FROM ticks WHERE did = ?').get(auth.did).n;
+
+  res.json({ ticks, total, limit, offset });
+});
