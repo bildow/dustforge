@@ -311,18 +311,28 @@ app.post('/api/identity/create', async (req, res) => {
     keyReferrerDid = inviteKey.referrer_did || '';
   }
 
-  if (!effectivePassword || effectivePassword.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
+  if (!effectivePassword || effectivePassword.length < 8) {
+    if (inviteKey) db.prepare("UPDATE invite_keys SET status = 'active', used_at = NULL WHERE id = ? AND status = 'claiming'").run(inviteKey.id);
+    return res.status(400).json({ error: 'password must be at least 8 characters' });
+  }
 
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
-  if (existing) return res.status(409).json({ error: 'username already taken' });
+  if (existing) {
+    if (inviteKey) db.prepare("UPDATE invite_keys SET status = 'active', used_at = NULL WHERE id = ? AND status = 'claiming'").run(inviteKey.id);
+    return res.status(409).json({ error: 'username already taken' });
+  }
   if (isSoftCapReached()) {
+    if (inviteKey) db.prepare("UPDATE invite_keys SET status = 'active', used_at = NULL WHERE id = ? AND status = 'claiming'").run(inviteKey.id);
     return res.status(409).json(capacityGateResponse('Identity creation is paused while the waiting list is active. Use /api/waiting-list or sponsored onboarding once capacity opens.'));
   }
 
   try {
     const id = identity.createIdentity();
     const emailResult = await dustforge.createAccount(username, effectivePassword);
-    if (!emailResult.ok) return res.status(500).json({ error: `email creation failed: ${emailResult.error}` });
+    if (!emailResult.ok) {
+      if (inviteKey) db.prepare("UPDATE invite_keys SET status = 'active', used_at = NULL WHERE id = ? AND status = 'claiming'").run(inviteKey.id);
+      return res.status(500).json({ error: `email creation failed: ${emailResult.error}` });
+    }
 
     const myReferralCode = crypto.randomBytes(6).toString('hex');
     let referredBy = keyReferrerDid;
@@ -350,6 +360,8 @@ app.post('/api/identity/create', async (req, res) => {
     console.log(`[identity] created: ${username} → ${id.did} [${callerClass.classification}/${callerClass.source_channel}]${inviteKey ? ' (invite key)' : ''}`);
     res.json({ ok: true, did: id.did, email: emailResult.email, referral_code: myReferralCode });
   } catch (e) {
+    // Release the invite key back to active if account creation failed
+    if (inviteKey) db.prepare("UPDATE invite_keys SET status = 'active', used_at = NULL WHERE id = ? AND status = 'claiming'").run(inviteKey.id);
     res.status(500).json({ error: e.message });
   }
 });
