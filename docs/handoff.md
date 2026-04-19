@@ -4,48 +4,84 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `7f592cc` — Fix 5 Brain audit findings |
+| **Last commit** | `83c2de3` — Handoff checkpoint |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | **LIVE** on RackNerd (192.3.84.103) |
-| **Status** | Brain's 5 audit findings fixed and deployed. Lori complete (4 passes). Rowen egress built but not deployed. |
+| **Status** | Brain audit fixes deployed. DemiPass + Rowen split into standalone repos. |
 
-## Just Fixed (this session)
+## Repo Split (2026-04-18)
 
-1. Lori auth gate — `requireLoriAuth` on `/api/conduit/inbound` and `/api/chat`
+| Repo | Purpose | Status |
+|------|---------|--------|
+| `bildow/dustforge` | Identity platform + API (DID:key, wallet, fleet, fingerprint) | Live at api.dustforge.com |
+| `bildow/demipass` | Standalone secrets SDK + MCP server for Claude Code | Initial commit `adeb830` |
+| `bildow/rowen` | Bonded courier — ingress/egress split, namespace-deployable | Initial commit `a340463` |
+| `bildow/civitasvox` | Platform observatory (task boards, rounds, traces) | Live at 100.83.112.88:3000 |
+| `bildow/civitasvox-site` | Under construction page for civitasvox.com | Deployed to Netlify |
+
+## DemiPass Standalone (demipass.com purchased)
+
+- `index.js` — 233-line SDK, zero deps, 14 exported functions (store, use-tokens, delegation, rotation, audit)
+- `mcp-server.js` — 199-line MCP server for Claude Code (5 tools via JSON-RPC stdin/stdout)
+- `.env.example` — DEMIPASS_URL, DEMIPASS_TOKEN, DEMIPASS_ADMIN_KEY
+- Currently points at Dustforge API — standalone DemiPass server TBD
+
+## Rowen Split
+
+- `ingress/server.js` — receives secrets, encrypts into DemiVault, wipes memory. Port 3002.
+- `egress/server.js` — dual-barrel closing table, SecretDose (30s hard kill), heartbeat supervision. Port 3003.
+- `shared/crypto.js` — HMAC-SHA256 auth between services
+- `shared/config.js` — namespace-aware env loading (NAMESPACE_ID per customer)
+- `shared/audit.js` — fire-and-forget logging to DemiPass API
+- Each customer namespace gets own ingress + egress with unique HMAC keys
+
+## Brain Audit Fixes (commit 7f592cc, deployed)
+
+1. Lori auth gate — requireLoriAuth on mutation routes
 2. Admin delegation-chain — requires did/username, no cross-tenant
-3. Rowen host policy — unified to `BLINDKEY_HTTP_HOSTS`
+3. Rowen host policy — unified to BLINDKEY_HTTP_HOSTS
 4. SDK URL — raw.githubusercontent.com (JS, not HTML)
 5. Handoff — this document
+
+## Containers on Phasewhip (7 running)
+
+| Container | IP | Port | Service |
+|-----------|-----|------|---------|
+| brain | 10.225.75.22 | 8002 | Conductor gateway |
+| chad | 10.225.75.165 | — | Fitness agent |
+| civitasvox | 10.225.75.198 | 3000 | Platform |
+| conductor | 10.225.75.95 | 8001 | MiMo V2 Pro |
+| lori | 10.225.75.121 | 3003 | Platform assistant (needs Conductor wrapper) |
+| mail | 10.225.75.76 | 8090 | Stalwart |
+| rowen | 10.225.75.34 | 3002 | Auth keeper (stub — real code in bildow/rowen) |
 
 ## Critical Path
 
 1. ~~Fix Brain's 5 audit findings~~ DONE
-2. Deploy Rowen egress to container (card 219)
-3. DemiPass delivery test — Brain uses OpenRouter key via use-token
-4. Lori Conductor wrapper (card 220) — LLM personality, not regex
-5. AdWords unpause
+2. ~~Split DemiPass to standalone repo~~ DONE
+3. ~~Split Rowen to standalone repo~~ DONE
+4. Deploy Rowen ingress/egress to container
+5. DemiPass delivery test (Brain uses OpenRouter key via use-token)
+6. Lori Conductor wrapper (card 220) — real LLM personality
+7. npm publish demipass
+8. demipass.com landing page
+9. AdWords unpause
 
-## New Cards This Session
+## Task Cards Created This Session
 
-- 232: Carbon onboarding via silicon — inverted SaaS + Anthropic pitch
-- 233: Sandbox demo mode for carbon evaluation
-- 234: Degraded state — silicon recruits its own carbon
-- 235: DemiPass MCP Server for Claude Code (Anthropic enterprise pitch)
-- 239: Session health barometer — context degradation early warning
-- 240 (pending): Session flight recorder — situational awareness as live telemetry
+- 232: Carbon onboarding via silicon — inverted SaaS
+- 233: Sandbox demo mode
+- 234: Degraded state — silicon recruits its carbon
+- 235: DemiPass MCP Server for Claude Code
+- 239: Session health barometer
+- 240: Session flight recorder database
+- 241: DemiPass standalone product at demipass.com
+- 242: DemiPass MCP Server (duplicate of 235 — consolidate)
 
-## Infrastructure
+## Known Issues
 
-- Phasewhip incus socket keeps crashing — recurring issue, restart fixes
-- civitasvox.com DNS configured at Bluehost → 75.2.60.5 (Netlify)
-- civitasvox-site repo created at bildow/civitasvox-site, under construction page deployed
-- Shell can lock up under heavy context load — restart session fixes
-
-## Key Files Modified
-
-- `server.js` — delegation-chain fix, host policy unification, SDK header fix
-- `lori-server.js` — auth middleware added
-- `public/.well-known/silicon` — sdk_url fixed to raw URL
-- `rowen-server.js` — built, not deployed
-- `dustforge-onboard.js` — SDK, working
-- `lori-server.js` — 616 lines, platform assistant
+- Incus socket exhaustion on phasewhip (recurring)
+- Brain Matrix messages fail to render in Element (HTML formatting)
+- Lori dashboard chat panel too small (needs CSS fix)
+- Lori uses regex intent parsing, not LLM (card 220)
+- gh auth expired — use GitHub API with git credential token
