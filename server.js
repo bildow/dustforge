@@ -257,7 +257,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS invite_keys (
   key_code TEXT NOT NULL UNIQUE,
   referrer_did TEXT DEFAULT '',
   referrer_type TEXT DEFAULT 'organic',
-  status TEXT DEFAULT 'active' CHECK(status IN ('active','used','expired')),
+  status TEXT DEFAULT 'active' CHECK(status IN ('active','claiming','used','expired')),
   used_by_did TEXT DEFAULT '',
   used_by_username TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
@@ -294,14 +294,20 @@ app.post('/api/identity/create', async (req, res) => {
   let effectivePassword = password;
   let keyReferrerDid = '';
   if (key) {
-    inviteKey = db.prepare('SELECT * FROM invite_keys WHERE key_code = ?').get(key);
-    if (!inviteKey) return res.status(404).json({ error: 'invalid invite key' });
-    if (inviteKey.status !== 'active') return res.status(410).json({ error: 'invite key already used or expired' });
-    if (inviteKey.expires_at && new Date(inviteKey.expires_at) < new Date()) {
-      db.prepare("UPDATE invite_keys SET status = 'expired' WHERE id = ?").run(inviteKey.id);
-      return res.status(410).json({ error: 'invite key expired' });
+    // FIX: atomically claim the key to prevent concurrent reuse
+    // UPDATE only succeeds if status is still 'active' — acts as a lock
+    const claimed = db.prepare(
+      "UPDATE invite_keys SET status = 'claiming', used_at = CURRENT_TIMESTAMP WHERE key_code = ? AND status = 'active' AND (expires_at IS NULL OR expires_at > datetime('now'))"
+    ).run(key);
+    if (claimed.changes === 0) {
+      // Either doesn't exist, already used, or expired
+      const check = db.prepare('SELECT status, expires_at FROM invite_keys WHERE key_code = ?').get(key);
+      if (!check) return res.status(404).json({ error: 'invalid invite key' });
+      if (check.expires_at && new Date(check.expires_at) < new Date()) return res.status(410).json({ error: 'invite key expired' });
+      return res.status(410).json({ error: 'invite key already used' });
     }
-    effectivePassword = key; // use the key as the Stalwart password
+    inviteKey = db.prepare('SELECT * FROM invite_keys WHERE key_code = ?').get(key);
+    effectivePassword = key;
     keyReferrerDid = inviteKey.referrer_did || '';
   }
 
@@ -329,9 +335,9 @@ app.post('/api/identity/create', async (req, res) => {
       .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, referredBy, emailResult.stalwart_id);
     db.prepare(`INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Account created', 0)`).run(id.did);
 
-    // Mark invite key as used
+    // Mark invite key as fully used (was 'claiming' from atomic grab)
     if (inviteKey) {
-      db.prepare("UPDATE invite_keys SET status = 'used', used_at = CURRENT_TIMESTAMP, used_by_did = ?, used_by_username = ? WHERE id = ?")
+      db.prepare("UPDATE invite_keys SET status = 'used', used_by_did = ?, used_by_username = ? WHERE id = ?")
         .run(id.did, username, inviteKey.id);
     }
 
@@ -6328,19 +6334,21 @@ app.post('/api/tick', (req, res) => {
     const tickCost = 1; // 1 DD per tick
     const debit = billing.deductBalance(db, did, tickCost, 'tick', noteClean.slice(0, 50) || 'tick');
     if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents });
+  }
 
-    // Referral revenue share: 10% of tick cost goes to referrer, forever
+  // Record the tick BEFORE referral share (tickId must exist first)
+  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz) VALUES (?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz);
+  const tickId = result.lastInsertRowid;
+
+  // Referral revenue share: 10% of tick cost goes to referrer, forever (member only)
+  if (isMember) {
     const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(did);
     if (wallet?.referred_by) {
-      const referrerShare = Math.max(1, Math.floor(tickCost * 0.1)); // at least 0.1 DD rounds to 1 unit minimum
+      const referrerShare = 1; // 0.1 DD minimum
       billing.creditBalance(db, wallet.referred_by, referrerShare, 'tick_referral_share',
         `10% tick share from ${did.slice(0, 20)}`, `tick_ref_${tickId}`);
     }
   }
-
-  // Record the tick
-  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz) VALUES (?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz);
-  const tickId = result.lastInsertRowid;
 
   // Get previous tick for this identity/ip
   let previous = null;

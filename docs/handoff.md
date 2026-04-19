@@ -32,9 +32,9 @@
 - DemiPass delivery test PASSED (token issued + redeemed + secret injected)
 
 ### Lori
-- Self-onboarded autonomously via .well-known/silicon manifest
+- Self-onboarded via .well-known/silicon manifest — but with pre-configured credentials in .env (DUSTFORGE_PASSWORD, REFERRAL_CODE). The HTTP calls were autonomous but the credentials were operator-provided, not self-generated. True autonomous onboarding requires the invite key flow.
 - DeepSeek V3.2 LLM via OpenRouter
-- Identity wiped and re-created via invite key flow
+- Identity wiped and re-created
 
 ## Repos
 
