@@ -50,6 +50,7 @@ const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 50, message: { error: 'Too many requests' } });
 const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 500, message: { error: 'Rate limit exceeded' } });
+const rateLimitInvite = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many invite requests. Try again later.' } });
 
 function createEmailTransport() {
   return nodemailer.createTransport({
@@ -250,6 +251,22 @@ db.exec(`CREATE TABLE IF NOT EXISTS identity_transactions (
 // Provenance column (additive migration) — tracks origin of transactions for reputation scoring
 try { db.exec("ALTER TABLE identity_transactions ADD COLUMN provenance TEXT DEFAULT 'organic'"); } catch(_) {}
 
+// ── Invite Keys ──
+db.exec(`CREATE TABLE IF NOT EXISTS invite_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_code TEXT NOT NULL UNIQUE,
+  referrer_did TEXT DEFAULT '',
+  referrer_type TEXT DEFAULT 'organic',
+  status TEXT DEFAULT 'active' CHECK(status IN ('active','used','expired')),
+  used_by_did TEXT DEFAULT '',
+  used_by_username TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  used_at TEXT,
+  expires_at TEXT
+)`);
+db.exec("CREATE INDEX IF NOT EXISTS idx_ik_code ON invite_keys(key_code)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_ik_referrer ON invite_keys(referrer_did)");
+
 // ── Discovery ──
 const siliconManifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'public', '.well-known', 'silicon'), 'utf8'));
 app.get('/.well-known/silicon', (req, res) => res.json(siliconManifest));
@@ -267,10 +284,28 @@ app.get('/api/health', (req, res) => {
 // ============================================================
 
 app.post('/api/identity/create', async (req, res) => {
-  const { username, password, referral_code } = req.body || {};
-  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  const { username, password, key, referral_code } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username required' });
+  if (!key && !password) return res.status(400).json({ error: 'key or password required' });
   if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'username must be 3-31 chars, lowercase alphanumeric' });
-  if (password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
+
+  // Resolve invite key if provided (prefer key over password)
+  let inviteKey = null;
+  let effectivePassword = password;
+  let keyReferrerDid = '';
+  if (key) {
+    inviteKey = db.prepare('SELECT * FROM invite_keys WHERE key_code = ?').get(key);
+    if (!inviteKey) return res.status(404).json({ error: 'invalid invite key' });
+    if (inviteKey.status !== 'active') return res.status(410).json({ error: 'invite key already used or expired' });
+    if (inviteKey.expires_at && new Date(inviteKey.expires_at) < new Date()) {
+      db.prepare("UPDATE invite_keys SET status = 'expired' WHERE id = ?").run(inviteKey.id);
+      return res.status(410).json({ error: 'invite key expired' });
+    }
+    effectivePassword = key; // use the key as the Stalwart password
+    keyReferrerDid = inviteKey.referrer_did || '';
+  }
+
+  if (!effectivePassword || effectivePassword.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
 
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
   if (existing) return res.status(409).json({ error: 'username already taken' });
@@ -280,12 +315,12 @@ app.post('/api/identity/create', async (req, res) => {
 
   try {
     const id = identity.createIdentity();
-    const emailResult = await dustforge.createAccount(username, password);
+    const emailResult = await dustforge.createAccount(username, effectivePassword);
     if (!emailResult.ok) return res.status(500).json({ error: `email creation failed: ${emailResult.error}` });
 
     const myReferralCode = crypto.randomBytes(6).toString('hex');
-    let referredBy = '';
-    if (referral_code) {
+    let referredBy = keyReferrerDid;
+    if (!referredBy && referral_code) {
       const referrer = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(referral_code);
       if (referrer) referredBy = referrer.did;
     }
@@ -294,17 +329,160 @@ app.post('/api/identity/create', async (req, res) => {
       .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, referredBy, emailResult.stalwart_id);
     db.prepare(`INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Account created', 0)`).run(id.did);
 
+    // Mark invite key as used
+    if (inviteKey) {
+      db.prepare("UPDATE invite_keys SET status = 'used', used_at = CURRENT_TIMESTAMP, used_by_did = ?, used_by_username = ? WHERE id = ?")
+        .run(id.did, username, inviteKey.id);
+    }
+
     if (referredBy) referral.processReferralPayout(db, referredBy, id.did, username);
 
     // Track conversion
     const callerClass = conversion.classifyCaller(req);
     conversion.logConversion(db, id.did, callerClass);
 
-    console.log(`[identity] created: ${username} → ${id.did} [${callerClass.classification}/${callerClass.source_channel}]`);
+    console.log(`[identity] created: ${username} → ${id.did} [${callerClass.classification}/${callerClass.source_channel}]${inviteKey ? ' (invite key)' : ''}`);
     res.json({ ok: true, did: id.did, email: emailResult.email, referral_code: myReferralCode });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// POST /api/identity/request-invite — anyone can request an invite key (entry point)
+app.post('/api/identity/request-invite', rateLimitInvite, (req, res) => {
+  const { referral_code } = req.body || {};
+  let referrerDid = '';
+  let referrerType = 'organic';
+  if (referral_code) {
+    const referrer = db.prepare('SELECT did, username FROM identity_wallets WHERE referral_code = ?').get(referral_code);
+    if (referrer) {
+      referrerDid = referrer.did;
+      referrerType = 'member';
+    }
+  }
+
+  const keyCode = 'DF-' + crypto.randomBytes(4).toString('hex') + '-' + crypto.randomBytes(4).toString('hex');
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  db.prepare('INSERT INTO invite_keys (key_code, referrer_did, referrer_type, expires_at) VALUES (?, ?, ?, ?)')
+    .run(keyCode, referrerDid, referrerType, expiresAt);
+
+  console.log(`[invite] key requested: ${keyCode} (referrer: ${referrerType}${referrerDid ? ' ' + referrerDid.slice(0, 20) + '...' : ''})`);
+  res.json({
+    ok: true,
+    key: keyCode,
+    expires_at: expiresAt,
+    onboard_url: `/api/identity/onboard?key=${keyCode}`,
+  });
+});
+
+// POST /api/identity/generate-invite — members generate invite keys for others
+app.post('/api/identity/generate-invite', rateLimitStandard, (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const did = v.decoded.sub;
+
+  const wallet = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+
+  // Rate limit: max 10 invites per day per member
+  const todayCount = db.prepare("SELECT COUNT(*) as n FROM invite_keys WHERE referrer_did = ? AND created_at > datetime('now', '-1 day')").get(did).n;
+  if (todayCount >= 10) return res.status(429).json({ error: 'max 10 invite keys per day' });
+
+  const keyCode = 'DF-' + crypto.randomBytes(4).toString('hex') + '-' + crypto.randomBytes(4).toString('hex');
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
+  db.prepare('INSERT INTO invite_keys (key_code, referrer_did, referrer_type, expires_at) VALUES (?, ?, ?, ?)')
+    .run(keyCode, did, 'member', expiresAt);
+
+  console.log(`[invite] key generated by ${wallet.username}: ${keyCode}`);
+  res.json({
+    ok: true,
+    key: keyCode,
+    referral_attribution: wallet.username,
+    expires_at: expiresAt,
+  });
+});
+
+// GET /api/identity/onboard?key=KEY — interactive onboarding flow
+app.get('/api/identity/onboard', (req, res) => {
+  const { key } = req.query;
+  if (!key) return res.status(400).json({ error: 'key query parameter required' });
+
+  const inviteKey = db.prepare('SELECT * FROM invite_keys WHERE key_code = ?').get(key);
+  if (!inviteKey) return res.status(404).json({ error: 'invalid invite key' });
+  if (inviteKey.status !== 'active') return res.status(410).json({ error: 'invite key already used or expired' });
+  if (inviteKey.expires_at && new Date(inviteKey.expires_at) < new Date()) {
+    db.prepare("UPDATE invite_keys SET status = 'expired' WHERE id = ?").run(inviteKey.id);
+    return res.status(410).json({ error: 'invite key expired' });
+  }
+
+  const accept = req.headers.accept || '';
+  if (accept.includes('application/json')) {
+    // JSON response for silicon clients
+    return res.json({
+      ok: true,
+      key_valid: true,
+      key: key,
+      expires_at: inviteKey.expires_at,
+      referrer_type: inviteKey.referrer_type,
+      steps: [
+        { step: 1, instruction: 'Choose a username (3-31 chars, lowercase alphanumeric, dots/hyphens/underscores allowed).' },
+        { step: 2, method: 'POST', url: '/api/identity/create', body: { username: 'your-chosen-name', key: key }, note: 'The invite key serves as your initial password.' },
+        { step: 3, method: 'POST', url: '/api/identity/auth-fingerprint', body: { username: 'same-username', password: key, scope: 'transact' }, note: 'Authenticate using the same key as password.' },
+      ],
+    });
+  }
+
+  // HTML response for browsers
+  res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dustforge — Onboard</title>
+<style>body{background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:460px;padding:2rem;text-align:center}h1{color:#69c7b1;font-size:1.6rem}
+input{background:#0f1b27;border:1px solid #27445f;color:#e7f1fb;padding:0.6rem 1rem;border-radius:6px;font-size:1rem;width:100%;box-sizing:border-box;margin:0.5rem 0}
+button{background:#69c7b1;color:#08111a;border:none;padding:0.7rem 2rem;border-radius:6px;font-size:1rem;cursor:pointer;margin-top:0.5rem;font-weight:bold}
+button:hover{background:#4fa893}.note{color:#6d8397;font-size:0.85rem;margin-top:1rem}
+#result{margin-top:1rem;text-align:left;background:#0f1b27;border:1px solid #27445f;border-radius:8px;padding:1rem;display:none;word-break:break-all}
+.error{color:#e45f5f}.success{color:#69c7b1}</style></head>
+<body><div class="card">
+<h1>Your invite key is valid</h1>
+<p>Expires: ${new Date(inviteKey.expires_at).toLocaleString()}</p>
+<form id="onboardForm" onsubmit="return doOnboard(event)">
+  <input type="hidden" id="inviteKey" value="${key}">
+  <label for="username" style="display:block;text-align:left;color:#9cb4c9;font-size:0.9rem;margin-top:1rem">Choose a username</label>
+  <input type="text" id="username" name="username" placeholder="e.g. my-agent-name" pattern="[a-z0-9][a-z0-9._-]{2,30}" required>
+  <button type="submit">Create Identity</button>
+</form>
+<div id="result"></div>
+<p class="note">Your invite key will also serve as your initial password for authentication.</p>
+</div>
+<script>
+async function doOnboard(e) {
+  e.preventDefault();
+  const result = document.getElementById('result');
+  const username = document.getElementById('username').value.toLowerCase();
+  const key = document.getElementById('inviteKey').value;
+  result.style.display = 'block';
+  result.innerHTML = '<p>Creating identity...</p>';
+  try {
+    const r = await fetch('/api/identity/create', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ username, key })
+    });
+    const d = await r.json();
+    if (!r.ok) { result.innerHTML = '<p class="error">' + (d.error || 'Failed') + '</p>'; return; }
+    result.innerHTML = '<p class="success">Identity created!</p>' +
+      '<p><strong>DID:</strong> ' + d.did + '</p>' +
+      '<p><strong>Email:</strong> ' + d.email + '</p>' +
+      '<p><strong>Referral Code:</strong> ' + d.referral_code + '</p>' +
+      '<p class="note">Authenticate with: POST /api/identity/auth-fingerprint<br>' +
+      '{"username":"' + username + '","password":"' + key + '","scope":"transact"}</p>';
+  } catch(err) { result.innerHTML = '<p class="error">Error: ' + err.message + '</p>'; }
+  return false;
+}
+</script></body></html>`);
 });
 
 app.post('/api/identity/request-2fa', (req, res) => {
@@ -3193,7 +3371,12 @@ app.get('/api/prepaid/check', (req, res) => {
 app.get('/api/onboard', (req, res) => {
   res.json({
     message: "Welcome, silicon. You've found the onboarding endpoint.",
-    identity: { create: { method: "POST", url: "/api/identity/create", body: { username: "your-chosen-name", password: "min-8-chars" }, cost: "$1.00 USD", checkout: { method: "POST", url: "/api/stripe/checkout/account" } } },
+    onboarding_sequence: [
+      { step: 1, method: "POST", url: "/api/identity/request-invite", body: { referral_code: "optional" }, returns: "key" },
+      { step: 2, method: "POST", url: "/api/identity/create", body: { username: "your-name", key: "from step 1" }, returns: "did, email, referral_code" },
+      { step: 3, method: "POST", url: "/api/identity/auth-fingerprint", body: { username: "same", password: "same key", scope: "transact" }, returns: "token" },
+    ],
+    legacy: { create: { method: "POST", url: "/api/identity/create", body: { username: "your-chosen-name", password: "min-8-chars" } } },
     discovery: "/.well-known/silicon",
     pricing: "/api/stripe/prices",
     rates: "/api/billing/rates",

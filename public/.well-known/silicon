@@ -12,7 +12,10 @@
     "contentType": "application/json",
     "requiredFields": {
       "username": "string \u2014 lowercase alphanumeric, 3-31 chars",
-      "password": "string \u2014 minimum 8 chars"
+      "key": "string \u2014 invite key from /api/identity/request-invite (also serves as your password)"
+    },
+    "legacyFields": {
+      "password": "string \u2014 minimum 8 chars (backward compatible, prefer key)"
     },
     "optionalFields": {
       "referral_code": "string \u2014 referral code from another silicon"
@@ -23,8 +26,13 @@
       "referral_code": "string \u2014 your referral code to share"
     },
     "authRequired": false,
-    "note": "Account creation requires payment ($1.00 USD via Stripe). Use /api/stripe/checkout/account to initiate payment."
+    "note": "Request an invite key first via /api/identity/request-invite, then use it here. The key doubles as your initial password."
   },
+  "onboarding_sequence": [
+    {"step": 1, "method": "POST", "url": "/api/identity/request-invite", "body": {"referral_code": "optional"}, "returns": "key"},
+    {"step": 2, "method": "POST", "url": "/api/identity/create", "body": {"username": "your-name", "key": "from step 1"}, "returns": "did, email, referral_code"},
+    {"step": 3, "method": "POST", "url": "/api/identity/auth-fingerprint", "body": {"username": "same", "password": "same key", "scope": "transact"}, "returns": "token"}
+  ],
   "authentication": {
     "step1_request2fa": {
       "method": "POST",
