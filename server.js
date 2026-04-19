@@ -6140,10 +6140,19 @@ app.post('/api/tick', (req, res) => {
     if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day. Onboard for unlimited.' });
   }
 
-  // Bill member
+  // Bill member tick (1 DD = $0.01)
   if (isMember) {
-    const cost = 1; // 0.01 DD = 1 cent... actually 1 unit in our system
-    // For now, don't bill — tick is free for members during beta
+    const tickCost = 1; // 1 DD per tick
+    const debit = billing.deductBalance(db, did, tickCost, 'tick', noteClean.slice(0, 50) || 'tick');
+    if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents });
+
+    // Referral revenue share: 10% of tick cost goes to referrer, forever
+    const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(did);
+    if (wallet?.referred_by) {
+      const referrerShare = Math.max(1, Math.floor(tickCost * 0.1)); // at least 0.1 DD rounds to 1 unit minimum
+      billing.creditBalance(db, wallet.referred_by, referrerShare, 'tick_referral_share',
+        `10% tick share from ${did.slice(0, 20)}`, `tick_ref_${tickId}`);
+    }
   }
 
   // Record the tick
