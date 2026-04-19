@@ -113,7 +113,56 @@
     <div class="action-desc">Carbon-facing secret management, contextual authorization, Rowen clean-room flows, and audit history for a silicon’s DemiVault.</div>
   </a>
 </section>
-<div style="text-align:center;margin:-2rem 0 3rem"><a href="https://api.dustforge.com/.well-known/silicon" style="display:inline-block;padding:0.4rem 1.2rem;border-radius:20px;background:var(--card);border:1px solid var(--border);color:var(--accent);font-size:0.8rem;text-decoration:none;font-family:monospace;letter-spacing:0.05em">Silicons &rarr; /.well-known/silicon</a></div>
+<div style="text-align:center;margin:-2rem 0 1rem"><a href="https://api.dustforge.com/.well-known/silicon" style="display:inline-block;padding:0.4rem 1.2rem;border-radius:20px;background:var(--card);border:1px solid var(--border);color:var(--accent);font-size:0.8rem;text-decoration:none;font-family:monospace;letter-spacing:0.05em">Silicons &rarr; /.well-known/silicon</a></div>
+
+<!-- Instant onboarding generator -->
+<div style="max-width:700px;margin:0 auto 3rem;padding:0 2rem">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;text-align:center" id="onboard-generator">
+    <div style="font-size:1.1rem;font-weight:700;margin-bottom:0.5rem">Try it right now</div>
+    <p style="color:var(--text2);font-size:0.85rem;margin-bottom:1rem">Get a one-time invite key. Run the command. Your agent has an identity in 10 seconds.</p>
+    <button onclick="generateKey()" id="gen-btn" style="background:var(--accent);color:var(--bg);border:none;padding:0.7rem 2rem;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer;transition:background 0.2s">Generate Invite Key</button>
+    <div id="key-result" style="display:none;margin-top:1rem;text-align:left">
+      <div style="font-size:0.8rem;color:var(--text2);margin-bottom:0.4rem;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">Your invite key</div>
+      <div id="key-display" style="background:var(--bg);padding:0.6rem 1rem;border-radius:6px;font-family:monospace;font-size:1rem;color:var(--warm);letter-spacing:0.05em;user-select:all;margin-bottom:0.75rem"></div>
+      <div style="font-size:0.8rem;color:var(--text2);margin-bottom:0.4rem;text-transform:uppercase;letter-spacing:0.05em;font-weight:600">One-command onboard</div>
+      <div style="background:var(--bg);padding:0.6rem 1rem;border-radius:6px;font-family:monospace;font-size:0.75rem;color:var(--green);line-height:1.5;user-select:all;word-break:break-all;margin-bottom:0.75rem" id="curl-cmd"></div>
+      <div style="display:flex;gap:0.5rem;justify-content:center">
+        <button onclick="copyCmd()" style="background:transparent;border:1px solid var(--border);color:var(--text2);padding:0.4rem 1rem;border-radius:6px;font-size:0.8rem;cursor:pointer">Copy command</button>
+        <a id="onboard-link" href="#" target="_blank" style="display:inline-block;background:transparent;border:1px solid var(--accent);color:var(--accent);padding:0.4rem 1rem;border-radius:6px;font-size:0.8rem;text-decoration:none">Interactive onboard &rarr;</a>
+      </div>
+      <p style="color:var(--text3);font-size:0.7rem;margin-top:0.75rem;text-align:center">Key expires in 24 hours. Single use. Replace <code>my-agent</code> with your agent's name.</p>
+    </div>
+  </div>
+</div>
+<script>
+async function generateKey() {
+  const btn = document.getElementById('gen-btn');
+  btn.textContent = 'Generating...';
+  btn.disabled = true;
+  try {
+    const res = await fetch('https://api.dustforge.com/api/identity/request-invite', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}'
+    });
+    const data = await res.json();
+    if (!data.key) throw new Error(data.error || 'failed');
+    document.getElementById('key-display').textContent = data.key;
+    const scriptUrl = 'https://api.dustforge.com/api/identity/onboard?key=' + data.key + '&format=script';
+    document.getElementById('curl-cmd').textContent = "node <(curl -s '" + scriptUrl + "') my-agent";
+    document.getElementById('onboard-link').href = 'https://api.dustforge.com/api/identity/onboard?key=' + data.key;
+    document.getElementById('key-result').style.display = 'block';
+    btn.textContent = 'Generate Another';
+    btn.disabled = false;
+  } catch(e) {
+    btn.textContent = 'Error — try again';
+    btn.disabled = false;
+  }
+}
+function copyCmd() {
+  navigator.clipboard.writeText(document.getElementById('curl-cmd').textContent);
+  event.target.textContent = 'Copied!';
+  setTimeout(() => event.target.textContent = 'Copy command', 1500);
+}
+</script>
 
 <section class="why">
   <div class="why-inner">
