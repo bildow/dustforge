@@ -11,6 +11,8 @@ const CONDUIT_URL = process.env.CONDUIT_URL || 'http://100.69.1.78:8080';
 const CONDUIT_TOKEN = process.env.CONDUIT_TOKEN || '';
 const PLATFORM_URL = process.env.PLATFORM_URL || 'http://100.83.112.88:3000';
 const LORI_AUTH_KEY = process.env.LORI_AUTH_KEY || '';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const LLM_MODEL = process.env.LLM_MODEL || 'deepseek/deepseek-v3.2';
 const startTime = Date.now();
 
 // Auth middleware — all mutation routes require either Conduit token or LORI_AUTH_KEY
@@ -551,7 +553,47 @@ async function handleIntent(message) {
   return null;
 }
 
+// LLM fallback — when regex can't parse, ask DeepSeek with Lori's personality
+async function llmResponse(message) {
+  if (!OPENROUTER_API_KEY) return null;
+  try {
+    const https = require('https');
+    const body = JSON.stringify({
+      model: LLM_MODEL,
+      messages: [
+        { role: 'system', content: LORI_SYSTEM_PROMPT },
+        { role: 'user', content: message },
+      ],
+      max_tokens: 500,
+      temperature: 0.7,
+    });
+    const result = await new Promise((resolve, reject) => {
+      const req = https.request('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://dustforge.com',
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+      });
+      req.on('error', reject);
+      req.setTimeout(30000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.write(body);
+      req.end();
+    });
+    return result?.choices?.[0]?.message?.content || null;
+  } catch (e) {
+    console.error('[llm] fallback error:', e.message);
+    return null;
+  }
+}
+
 function fallbackResponse(message) {
+  // This is now only used when LLM is unavailable
   const lower = message.toLowerCase().trim();
   if (/^(hey|hi|hello|yo|sup)\b/.test(lower)) {
     return "Hey. What do you need?";
@@ -600,6 +642,7 @@ app.post('/api/conduit/inbound', requireLoriAuth, async (req, res) => {
   console.log(`[conduit] from=${sender}: ${content.slice(0, 120)}`);
 
   let reply = await handleIntent(content);
+  if (!reply) reply = await llmResponse(content);
   if (!reply) reply = fallbackResponse(content);
 
   // Send back on Conduit
@@ -614,6 +657,7 @@ app.post('/api/chat', requireLoriAuth, async (req, res) => {
   if (!message) return res.status(400).json({ error: 'no message' });
 
   let response = await handleIntent(message);
+  if (!response) response = await llmResponse(message);
   if (!response) response = fallbackResponse(message);
 
   res.json({ response });
