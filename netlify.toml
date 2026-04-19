@@ -26,8 +26,9 @@
 
 [[redirects]]
   from = "/.well-known/silicon"
-  to = "/well-known/silicon"
+  to = "https://api.dustforge.com/.well-known/silicon"
   status = 200
+  force = true
 
 # Headers
 [[headers]]
