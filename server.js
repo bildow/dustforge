@@ -6420,10 +6420,6 @@ app.get('/api/channel/info', (req, res) => {
   });
 });
 
-module.exports = { app, db };
-
-app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
-
 // ============================================================
 // Tick Service — temporal anchor for LLM sessions
 // ============================================================
@@ -6434,13 +6430,29 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS ticks (
   note TEXT DEFAULT '',
   ip TEXT DEFAULT '',
   tz TEXT DEFAULT 'UTC',
+  chain_hash TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_did ON ticks(did)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_ip ON ticks(ip)"); } catch(e) {}
+// Add chain_hash column if missing (existing installs)
+try { db.exec("ALTER TABLE ticks ADD COLUMN chain_hash TEXT DEFAULT ''"); } catch(e) {}
 
-const tickRateAnon = rateLimit({ windowMs: 60*1000, max: 10, keyGenerator: (req) => req.ip, message: { error: 'anonymous tick rate limit: 10/min. Onboard for higher limits.' } });
-const tickRateMember = rateLimit({ windowMs: 60*1000, max: 60, keyGenerator: (req) => req.identity?.did || req.ip });
+// Referral share accumulator — tracks fractional DD until >= 1 DD threshold
+try { db.exec(`CREATE TABLE IF NOT EXISTS referral_accumulators (
+  referrer_did TEXT NOT NULL,
+  source_did TEXT NOT NULL,
+  accumulated INTEGER DEFAULT 0,
+  last_tick_id INTEGER DEFAULT 0,
+  PRIMARY KEY (referrer_did, source_did)
+)`); } catch(e) {}
+
+// Tick chain: each tick's hash covers its own data + previous hash = tamper-evident chain
+function computeTickHash(tickId, did, note, tz, time, prevHash) {
+  return crypto.createHash('sha256')
+    .update(`${tickId}:${did}:${note}:${tz}:${time}:${prevHash}`)
+    .digest('hex');
+}
 
 app.post('/api/tick', (req, res) => {
   const { note = '', tz = 'UTC' } = req.body || {};
@@ -6453,46 +6465,67 @@ app.post('/api/tick', (req, res) => {
 
   // Rate limit
   if (!isMember) {
-    // Check anonymous rate
     const recentAnon = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE ip = ? AND created_at > datetime('now', '-1 minute') AND did = ''").get(req.ip || '').n;
     if (recentAnon >= 10) return res.status(429).json({ error: 'anonymous tick rate limit: 10/min. Onboard at /.well-known/silicon for higher limits and signed timestamps.' });
     const dailyAnon = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE ip = ? AND created_at > datetime('now', '-1 day') AND did = ''").get(req.ip || '').n;
     if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day. Onboard for unlimited.' });
   }
 
-  // Bill member tick (1 DD = $0.01)
+  // Bill member tick (1 DD per tick)
   if (isMember) {
-    const tickCost = 1; // 1 DD per tick
-    const debit = billing.deductBalance(db, did, tickCost, 'tick', noteClean.slice(0, 50) || 'tick');
+    const debit = billing.deductBalance(db, did, 1, 'tick', noteClean.slice(0, 50) || 'tick');
     if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents });
   }
 
-  // Record the tick BEFORE referral share (tickId must exist first)
-  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz) VALUES (?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz);
+  const now = new Date();
+  const timeISO = now.toISOString();
+
+  // Get previous tick for chain hash
+  let prevTick = null;
+  if (isMember && did) {
+    prevTick = db.prepare('SELECT id, note, created_at, chain_hash FROM ticks WHERE did = ? ORDER BY id DESC LIMIT 1').get(did);
+  } else {
+    prevTick = db.prepare("SELECT id, note, created_at, chain_hash FROM ticks WHERE ip = ? AND did = '' ORDER BY id DESC LIMIT 1").get(req.ip || '');
+  }
+  const prevHash = prevTick?.chain_hash || '0'.repeat(64);
+
+  // Insert tick
+  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz, created_at) VALUES (?, ?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz, timeISO);
   const tickId = result.lastInsertRowid;
 
-  // Referral revenue share: 10% of tick cost goes to referrer, forever (member only)
+  // Compute and store chain hash
+  const chainHash = computeTickHash(tickId, did, noteClean, tz, timeISO, prevHash);
+  db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
+
+  // Referral revenue share: accumulate 10% (0.1 DD) per tick, pay out at 1 DD threshold
   if (isMember) {
     const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(did);
     if (wallet?.referred_by) {
-      const referrerShare = 1; // 0.1 DD minimum
-      billing.creditBalance(db, wallet.referred_by, referrerShare, 'tick_referral_share',
-        `10% tick share from ${did.slice(0, 20)}`, `tick_ref_${tickId}`);
+      // Accumulate 1 unit (representing 0.1 DD in tenths) per tick
+      db.prepare(`INSERT INTO referral_accumulators (referrer_did, source_did, accumulated, last_tick_id)
+        VALUES (?, ?, 1, ?)
+        ON CONFLICT(referrer_did, source_did) DO UPDATE SET
+          accumulated = accumulated + 1,
+          last_tick_id = ?`).run(wallet.referred_by, did, tickId, tickId);
+
+      // Check if accumulated >= 10 (= 1 DD threshold)
+      const acc = db.prepare('SELECT accumulated FROM referral_accumulators WHERE referrer_did = ? AND source_did = ?')
+        .get(wallet.referred_by, did);
+      if (acc && acc.accumulated >= 10) {
+        const payoutDD = Math.floor(acc.accumulated / 10);
+        const remainder = acc.accumulated % 10;
+        billing.creditBalance(db, wallet.referred_by, payoutDD, 'tick_referral_share',
+          `10% tick share from ${did.slice(0, 20)} (${payoutDD} DD)`, `tick_ref_batch_${tickId}`);
+        db.prepare('UPDATE referral_accumulators SET accumulated = ? WHERE referrer_did = ? AND source_did = ?')
+          .run(remainder, wallet.referred_by, did);
+      }
     }
   }
 
-  // Get previous tick for this identity/ip
-  let previous = null;
-  if (isMember && did) {
-    previous = db.prepare('SELECT id, note, created_at FROM ticks WHERE did = ? AND id < ? ORDER BY id DESC LIMIT 1').get(did, tickId);
-  } else {
-    previous = db.prepare("SELECT id, note, created_at FROM ticks WHERE ip = ? AND did = '' AND id < ? ORDER BY id DESC LIMIT 1").get(req.ip || '', tickId);
-  }
-
-  const now = new Date();
+  // Compute time since previous tick
   let ago = null;
-  if (previous) {
-    const prevTime = new Date(previous.created_at + 'Z');
+  if (prevTick) {
+    const prevTime = new Date(prevTick.created_at.endsWith('Z') ? prevTick.created_at : prevTick.created_at + 'Z');
     const diffMs = now.getTime() - prevTime.getTime();
     const diffMin = Math.floor(diffMs / 60000);
     const diffHr = Math.floor(diffMin / 60);
@@ -6503,17 +6536,18 @@ app.post('/api/tick', (req, res) => {
   // Build response
   const response = {
     tick_id: tickId,
-    time: now.toISOString(),
+    time: timeISO,
     tz,
     note: noteClean,
-    previous: previous ? { tick_id: previous.id, note: previous.note, at: previous.created_at, ago } : null,
+    chain_hash: chainHash,
+    previous: prevTick ? { tick_id: prevTick.id, note: prevTick.note, at: prevTick.created_at, ago } : null,
     member: isMember,
   };
 
   // Signature (member only)
   if (isMember) {
     const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(did);
-    const sigPayload = `${tickId}:${response.time}:${did}:${noteClean}`;
+    const sigPayload = `${tickId}:${timeISO}:${did}:${noteClean}:${chainHash}`;
     const sig = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY || '').update(sigPayload).digest('hex');
     response.signature = sig;
     response.referral_code = wallet?.referral_code || '';
@@ -6527,6 +6561,65 @@ app.post('/api/tick', (req, res) => {
   res.json(response);
 });
 
+// POST /api/tick/verify — anyone can verify a tick signature (decentralized trust)
+app.post('/api/tick/verify', (req, res) => {
+  const { tick_id, signature } = req.body || {};
+  if (!tick_id || !signature) return res.status(400).json({ error: 'tick_id and signature required' });
+
+  const tick = db.prepare('SELECT id, did, note, tz, chain_hash, created_at FROM ticks WHERE id = ?').get(tick_id);
+  if (!tick) return res.status(404).json({ error: 'tick not found', valid: false });
+  if (!tick.did) return res.status(400).json({ error: 'anonymous ticks are not signed', valid: false });
+
+  const sigPayload = `${tick.id}:${tick.created_at}:${tick.did}:${tick.note}:${tick.chain_hash}`;
+  const expected = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY || '').update(sigPayload).digest('hex');
+
+  const valid = signature === expected;
+  res.json({
+    valid,
+    tick_id: tick.id,
+    did: tick.did,
+    time: tick.created_at,
+    note: tick.note,
+    chain_hash: tick.chain_hash,
+  });
+});
+
+// GET /api/tick/stats — member aggregate stats
+app.get('/api/tick/stats', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const total = db.prepare('SELECT COUNT(*) as n FROM ticks WHERE did = ?').get(auth.did).n;
+  const first = db.prepare('SELECT created_at FROM ticks WHERE did = ? ORDER BY id ASC LIMIT 1').get(auth.did);
+  const last = db.prepare('SELECT created_at FROM ticks WHERE did = ? ORDER BY id DESC LIMIT 1').get(auth.did);
+
+  // Streak: consecutive days with at least one tick (counting backward from today)
+  let streak = 0;
+  if (total > 0) {
+    const days = db.prepare(`SELECT DISTINCT date(created_at) as d FROM ticks WHERE did = ? ORDER BY d DESC`).all(auth.did);
+    const today = new Date().toISOString().slice(0, 10);
+    let expectedDate = new Date(today);
+    for (const row of days) {
+      const tickDate = row.d;
+      const expected = expectedDate.toISOString().slice(0, 10);
+      if (tickDate === expected) {
+        streak++;
+        expectedDate.setDate(expectedDate.getDate() - 1);
+      } else {
+        break;
+      }
+    }
+  }
+
+  res.json({
+    did: auth.did,
+    total_ticks: total,
+    streak_days: streak,
+    first_tick: first?.created_at || null,
+    last_tick: last?.created_at || null,
+  });
+});
+
 // GET /api/tick/ledger — member only, read your tick history
 app.get('/api/tick/ledger', (req, res) => {
   const auth = getBearerIdentity(req);
@@ -6534,8 +6627,46 @@ app.get('/api/tick/ledger', (req, res) => {
 
   const limit = Math.min(100, Number(req.query.limit) || 50);
   const offset = Number(req.query.offset) || 0;
-  const ticks = db.prepare('SELECT id, note, tz, created_at FROM ticks WHERE did = ? ORDER BY id DESC LIMIT ? OFFSET ?').all(auth.did, limit, offset);
+  const ticks = db.prepare('SELECT id, note, tz, chain_hash, created_at FROM ticks WHERE did = ? ORDER BY id DESC LIMIT ? OFFSET ?').all(auth.did, limit, offset);
   const total = db.prepare('SELECT COUNT(*) as n FROM ticks WHERE did = ?').get(auth.did).n;
 
   res.json({ ticks, total, limit, offset });
 });
+
+// POST /api/tick/chain/verify — verify chain integrity for a range of ticks
+app.post('/api/tick/chain/verify', (req, res) => {
+  const { did, from_tick_id, to_tick_id } = req.body || {};
+  if (!did) return res.status(400).json({ error: 'did required' });
+
+  const fromId = from_tick_id || 0;
+  const toId = to_tick_id || Number.MAX_SAFE_INTEGER;
+  const ticks = db.prepare('SELECT id, did, note, tz, chain_hash, created_at FROM ticks WHERE did = ? AND id >= ? AND id <= ? ORDER BY id ASC')
+    .all(did, fromId, toId);
+
+  if (ticks.length === 0) return res.json({ valid: true, ticks_checked: 0 });
+
+  // Get the tick before the range for initial prev_hash
+  const before = db.prepare('SELECT chain_hash FROM ticks WHERE did = ? AND id < ? ORDER BY id DESC LIMIT 1').get(did, ticks[0].id);
+  let prevHash = before?.chain_hash || '0'.repeat(64);
+  let brokenAt = null;
+
+  for (const tick of ticks) {
+    const expected = computeTickHash(tick.id, tick.did, tick.note, tick.tz, tick.created_at, prevHash);
+    if (tick.chain_hash !== expected) {
+      brokenAt = tick.id;
+      break;
+    }
+    prevHash = tick.chain_hash;
+  }
+
+  res.json({
+    valid: brokenAt === null,
+    ticks_checked: ticks.length,
+    broken_at_tick_id: brokenAt,
+    range: { from: ticks[0].id, to: ticks[ticks.length - 1].id },
+  });
+});
+
+module.exports = { app, db };
+
+app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
