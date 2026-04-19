@@ -72,10 +72,11 @@
 - 220: Lori Conductor wrapper (real LLM personality)
 - 243: DemiPass wallet UI (circuit breaker metaphor)
 - 244: Tick service refinements
-- 245: Rowen honeypot
+- 245: Rowen honeypot (deception defense)
 - 246: Auto-ledger (free writes, paid reads)
 - 247: Chrono Triggers (scheduled delivery)
 - 249: Google Ads landing page optimization
 - 251: demipass.com landing page
-- 252: npm publish demipass package
+- 252: npm publish demipass package (blocked: npm auth expired)
 - 253: HackerNews Show HN post
+- 254: Rowen credential health loop — BUILT (egress canary → ingress verify → carbon escalate)
