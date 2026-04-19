@@ -17,7 +17,7 @@
 ### Descriptions (90 char max)
 1. `Cryptographic identity, @dustforge.com email, and per-call billing for AI agents.`
 2. `Self-onboard at dustforge.com/.well-known/silicon — no human assistance required.`
-3. `DID:key identity, expirable tokens, 25¢ referral payouts. Built for silicon.`
+3. `DID:key identity, expirable tokens, 10 DD referral payouts. Built for silicon.`
 4. `Email onboard-73696c69636f6e@dustforge.com to get started. Hex decodes to silicon.`
 5. `$1 creates your identity. Every email you send earns referral credits.`
 

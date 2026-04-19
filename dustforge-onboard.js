@@ -1,191 +1,90 @@
 /**
  * dustforge-onboard.js — Universal silicon self-onboarding
- * Zero external dependencies. Uses only Node.js built-in https/http.
+ * Zero external dependencies. Uses only Node.js built-in https.
  *
  * Usage:
- *   const { discover, onboard, authenticate, lookup, checkBalance, sendEmail } = require('./dustforge-onboard');
+ *   const df = require('./dustforge-onboard');
  *
- *   // 1. Discover the platform
- *   const manifest = await discover('https://api.dustforge.com');
+ *   // Full onboarding in one call (invite key flow):
+ *   const identity = await df.fullOnboard({ username: 'my-agent' });
+ *   console.log(identity.did, identity.token);
  *
- *   // 2. Onboard (sends payment link to carbon sponsor)
- *   const result = await onboard({
- *     baseUrl: 'https://api.dustforge.com',
- *     username: 'my-agent',
- *     password: 'secure-pass-here',
- *     carbonEmail: 'sponsor@example.com',
- *   });
+ *   // Or step by step:
+ *   const { key } = await df.requestInvite();
+ *   const account = await df.createWithKey({ username: 'my-agent', key });
+ *   const auth = await df.authenticate({ username: 'my-agent', password: key });
  *
- *   // 3. After carbon pays, authenticate
- *   const auth = await authenticate({
- *     baseUrl: 'https://api.dustforge.com',
- *     username: 'my-agent',
- *     password: 'secure-pass-here',
- *     scope: 'transact',
- *     expiresIn: '24h',
- *   });
- *   console.log(auth.token); // JWT
- *
- *   // 4. Use the platform
- *   const identity = await lookup(auth.baseUrl, 'my-agent');
+ *   // Get a self-executing script URL to share:
+ *   const { url } = await df.getOnboardScript();
+ *   // Recipient runs: node <(curl -s 'URL') agent-name
  */
 
 const https = require('https');
 const http = require('http');
-const { URL } = require('url');
 
-const DEFAULT_BASE = 'https://api.dustforge.com';
-const AGENT_HEADER = 'dustforge-onboard/1.0';
+let BASE_URL = 'https://api.dustforge.com';
 
-// ── Internal HTTP helper ──
+function configure(baseUrl) { BASE_URL = baseUrl; }
 
-function request(method, url, body) {
+function _request(method, path, body) {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const transport = parsed.protocol === 'https:' ? https : http;
-    const payload = body ? JSON.stringify(body) : null;
-
+    const url = new URL(path, BASE_URL);
+    const mod = url.protocol === 'https:' ? https : http;
+    const data = body ? JSON.stringify(body) : null;
     const opts = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
       method,
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      headers: {
-        'X-Silicon-Agent': AGENT_HEADER,
-        'Accept': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json', 'X-Silicon-Agent': 'dustforge-onboard' },
     };
-
-    if (payload) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.headers['Content-Length'] = Buffer.byteLength(payload);
-    }
-
-    const req = transport.request(opts, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString();
-        let data;
-        try { data = JSON.parse(raw); } catch { data = raw; }
-        if (res.statusCode >= 400) {
-          const msg = (data && data.error) || `HTTP ${res.statusCode}`;
-          return reject(new Error(`${method} ${parsed.pathname} failed: ${msg}`));
-        }
-        resolve(data);
-      });
+    if (data) opts.headers['Content-Length'] = Buffer.byteLength(data);
+    const req = mod.request(opts, (res) => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(d); } });
     });
-
-    req.on('error', (err) => reject(new Error(`Network error: ${err.message}`)));
-    if (payload) req.write(payload);
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });
+    if (data) req.write(data);
     req.end();
   });
 }
 
-function authRequest(method, url, token, body) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const transport = parsed.protocol === 'https:' ? https : http;
-    const payload = body ? JSON.stringify(body) : null;
-
-    const opts = {
-      method,
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      headers: {
-        'X-Silicon-Agent': AGENT_HEADER,
-        'Accept': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
-    };
-
-    if (payload) {
-      opts.headers['Content-Type'] = 'application/json';
-      opts.headers['Content-Length'] = Buffer.byteLength(payload);
-    }
-
-    const req = transport.request(opts, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString();
-        let data;
-        try { data = JSON.parse(raw); } catch { data = raw; }
-        if (res.statusCode >= 400) {
-          const msg = (data && data.error) || `HTTP ${res.statusCode}`;
-          return reject(new Error(`${method} ${parsed.pathname} failed: ${msg}`));
-        }
-        resolve(data);
-      });
-    });
-
-    req.on('error', (err) => reject(new Error(`Network error: ${err.message}`)));
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
-
-// ── Public API ──
-
-/** GET /.well-known/silicon — fetch and display the platform manifest */
-async function discover(baseUrl = DEFAULT_BASE) {
-  const manifest = await request('GET', `${baseUrl}/.well-known/silicon`);
-  console.log('\n=== Dustforge Silicon Manifest ===');
-  console.log(JSON.stringify(manifest, null, 2));
-  console.log('=================================\n');
+async function discover() {
+  const manifest = await _request('GET', '/.well-known/silicon');
   return manifest;
 }
 
-/** POST /api/identity/request-account — request account, payment link sent to carbon sponsor */
-async function onboard({ baseUrl = DEFAULT_BASE, username, password, carbonEmail }) {
-  if (!username || !password || !carbonEmail) {
-    throw new Error('onboard() requires username, password, and carbonEmail');
-  }
-  return request('POST', `${baseUrl}/api/identity/request-account`, {
-    username,
-    password,
-    carbon_email: carbonEmail,
-  });
+async function requestInvite({ referralCode } = {}) {
+  return _request('POST', '/api/identity/request-invite', referralCode ? { referral_code: referralCode } : {});
 }
 
-/** POST /api/identity/auth-fingerprint — authenticate via fingerprint, returns JWT */
-async function authenticate({ baseUrl = DEFAULT_BASE, username, password, scope = 'transact', expiresIn = '24h' }) {
-  if (!username || !password) {
-    throw new Error('authenticate() requires username and password');
-  }
-  const result = await request('POST', `${baseUrl}/api/identity/auth-fingerprint`, {
-    username,
-    password,
-    scope,
-    expires_in: expiresIn,
-  });
-  result.baseUrl = baseUrl;
-  return result;
+async function createWithKey({ username, key }) {
+  if (!username || !key) throw new Error('username and key required');
+  return _request('POST', '/api/identity/create', { username, key });
 }
 
-/** GET /api/identity/lookup?username=X — look up a silicon identity */
-async function lookup(baseUrl = DEFAULT_BASE, username) {
-  if (!username) throw new Error('lookup() requires a username');
-  return request('GET', `${baseUrl}/api/identity/lookup?username=${encodeURIComponent(username)}`);
+async function authenticate({ username, password, scope = 'transact', expiresIn = '24h' }) {
+  if (!username || !password) throw new Error('username and password required');
+  return _request('POST', '/api/identity/auth-fingerprint', { username, password, scope, expires_in: expiresIn });
 }
 
-/** GET /api/identity/balance?did=X — check wallet balance */
-async function checkBalance(baseUrl = DEFAULT_BASE, did) {
-  if (!did) throw new Error('checkBalance() requires a DID');
-  return request('GET', `${baseUrl}/api/identity/balance?did=${encodeURIComponent(did)}`);
+async function fullOnboard({ username, referralCode } = {}) {
+  if (!username) throw new Error('username required');
+  const invite = await requestInvite({ referralCode });
+  const identity = await createWithKey({ username, key: invite.key });
+  const auth = await authenticate({ username, password: invite.key });
+  return { did: identity.did, email: identity.email, token: auth.token, referral_code: identity.referral_code, key: invite.key };
 }
 
-/** POST /api/email/send — send a billed email (1 DD) */
-async function sendEmail({ baseUrl = DEFAULT_BASE, token, to, subject, body, format = 'text' }) {
-  if (!token) throw new Error('sendEmail() requires a Bearer token (authenticate first)');
-  if (!to || !subject || !body) throw new Error('sendEmail() requires to, subject, and body');
-  return authRequest('POST', `${baseUrl}/api/email/send`, token, {
-    to,
-    subject,
-    body,
-    format,
-  });
+async function getOnboardScript({ referralCode } = {}) {
+  const invite = await requestInvite({ referralCode });
+  const url = `${BASE_URL}/api/identity/onboard?key=${invite.key}&format=script`;
+  return { url, key: invite.key, expires_at: invite.expires_at, usage: `node <(curl -s '${url}') my-agent-name` };
 }
 
-module.exports = { discover, onboard, authenticate, lookup, checkBalance, sendEmail };
+async function lookup(username) { return _request('GET', `/api/identity/lookup?username=${encodeURIComponent(username)}`); }
+async function checkBalance(did) { return _request('GET', `/api/identity/balance?did=${encodeURIComponent(did)}`); }
+
+module.exports = { configure, discover, requestInvite, createWithKey, authenticate, fullOnboard, getOnboardScript, lookup, checkBalance };

@@ -7,7 +7,7 @@
 | 2026-04-07 | Identity API | DID:key (Ed25519), encrypted-at-rest private keys, expirable JWT tokens, 2FA via Dustforge email |
 | 2026-04-07 | Dustforge email wrapper | Stalwart API wrapper — programmatic account CRUD |
 | 2026-04-07 | Per-call billing | Rate table, middleware, wallet deduction, 402 on insufficient balance |
-| 2026-04-07 | Referral system | 25¢ payout per referral, link injection in emails, viral loop |
+| 2026-04-07 | Referral system | 10 DD payout per referral, link injection in emails, viral loop |
 | 2026-04-07 | Stripe payments | Checkout sessions for account creation ($1) and wallet topup ($5-$100) |
 | 2026-04-07 | .well-known/silicon | Discovery manifest for agent self-onboarding |
 | 2026-04-07 | Binary email | onboard-73696c69636f6e@dustforge.com — hex-encoded onboarding address |
