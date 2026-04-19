@@ -438,6 +438,60 @@ app.get('/api/identity/onboard', (req, res) => {
     return res.status(410).json({ error: 'invite key expired' });
   }
 
+  const format = req.query.format || '';
+
+  // Self-executing script — the key IS the script IS the onboarding
+  if (format === 'script' || format === 'js') {
+    res.type('application/javascript').send(`#!/usr/bin/env node
+// Dustforge Self-Onboarding Script
+// Run: node <(curl -s '${req.protocol}://${req.get('host')}/api/identity/onboard?key=${key}&format=script')
+// Or:  curl -s '...&format=script' | node -
+//
+// This key expires: ${inviteKey.expires_at}
+// This key can only be used once.
+
+const https = require('https');
+const KEY = '${key}';
+const BASE = 'https://api.dustforge.com';
+
+function post(path, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const url = new URL(path, BASE);
+    const req = https.request({ hostname: url.hostname, port: 443, path: url.pathname, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data), 'X-Silicon-Agent': 'onboard-script' }
+    }, res => { let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(d); } }); });
+    req.on('error', reject); req.write(data); req.end();
+  });
+}
+
+(async () => {
+  const username = process.argv[2] || 'silicon-' + Date.now().toString(36);
+  console.log('[dustforge] onboarding as:', username);
+  console.log('[dustforge] using invite key:', KEY.slice(0, 10) + '...');
+
+  // Step 1: Create identity with invite key
+  const created = await post('/api/identity/create', { username, key: KEY });
+  if (created.error) { console.error('[dustforge] FAILED:', created.error); process.exit(1); }
+  console.log('[dustforge] identity created!');
+  console.log('  DID:', created.did);
+  console.log('  Email:', created.email);
+  console.log('  Referral:', created.referral_code);
+
+  // Step 2: Authenticate (key is the password)
+  const auth = await post('/api/identity/auth-fingerprint', { username, password: KEY, scope: 'transact', expires_in: '24h' });
+  if (auth.error) { console.error('[dustforge] auth failed:', auth.error); process.exit(1); }
+  console.log('[dustforge] authenticated!');
+  console.log('  Token:', auth.token?.slice(0, 30) + '...');
+  console.log('  Fingerprint:', auth.fingerprint_hash);
+
+  // Output for piping
+  console.log(JSON.stringify({ did: created.did, email: created.email, token: auth.token, referral_code: created.referral_code, username }));
+})();
+`);
+    return;
+  }
+
   const accept = req.headers.accept || '';
   if (accept.includes('application/json')) {
     // JSON response for silicon clients
