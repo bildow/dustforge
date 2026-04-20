@@ -190,6 +190,7 @@
     <div class="tab" data-tab="actions">Actions</div>
     <div class="tab" data-tab="activity">Activity</div>
     <div class="tab" data-tab="health">Health</div>
+    <div class="tab" data-tab="buoy">Buoy</div>
   </div>
 
   <!-- Tab: Secrets (Phase 1 + Phase 2 breaker controls) -->
@@ -269,6 +270,92 @@
         <span class="section-title" style="color:var(--red)">Honeypot Traps</span>
       </div>
       <div id="honeypot-feed"><div class="empty">No honeypot traps triggered. Good.</div></div>
+    </div>
+  </div>
+
+  <!-- Tab: Buoy (temporal anchoring) -->
+  <div id="tab-buoy" class="tab-panel" style="padding-top:1rem">
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title"><span class="feed-dot" style="background:var(--green)"></span>Tick Chain</span>
+        <div style="display:flex;gap:0.5rem">
+          <button class="btn btn-primary btn-sm" onclick="dropTick()">Drop Tick</button>
+          <button class="btn btn-ghost btn-sm" onclick="loadBuoy()">Refresh</button>
+        </div>
+      </div>
+      <div id="buoy-ledger"><div class="loading">Loading tick chain...</div></div>
+    </div>
+    <div class="section" style="margin-top:1rem">
+      <div class="section-header">
+        <span class="section-title">Stats</span>
+      </div>
+      <div id="buoy-stats"><div class="loading">Loading stats...</div></div>
+    </div>
+    <div class="section" style="margin-top:1rem">
+      <div class="section-header">
+        <span class="section-title">Chain Verification</span>
+        <button class="btn btn-green btn-sm" onclick="verifyChain()">Verify My Chain</button>
+      </div>
+      <div id="buoy-verify"></div>
+    </div>
+    <div class="section" style="margin-top:1rem">
+      <div class="section-header">
+        <span class="section-title">Chrono Triggers</span>
+        <button class="btn btn-primary btn-sm" onclick="openChronoModal()">+ New Trigger</button>
+      </div>
+      <div id="chrono-list"><div class="loading">Loading triggers...</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- Chrono Trigger Modal -->
+<div id="modal-chrono" class="modal-overlay" onclick="if(event.target===this)closeModals()">
+  <div class="modal">
+    <h3>Create Chrono Trigger</h3>
+    <label>Name</label>
+    <input type="text" id="chrono-name" placeholder="e.g. daily-backup-check">
+    <label>Action</label>
+    <select id="chrono-action">
+      <option value="webhook">Webhook (POST to URL)</option>
+      <option value="tick">Auto-tick</option>
+    </select>
+    <label>Target (URL for webhook, ignored for tick)</label>
+    <input type="text" id="chrono-target" placeholder="https://...">
+    <label>Fire in</label>
+    <input type="text" id="chrono-fire" placeholder="e.g. 24h, 7d, 30m">
+    <label>Payload (JSON, optional)</label>
+    <textarea id="chrono-payload" placeholder='{"note": "check something"}'></textarea>
+    <div id="chrono-msg" class="modal-msg"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+      <button class="btn btn-green" onclick="createChrono()">Arm Trigger</button>
+    </div>
+  </div>
+</div>
+
+<!-- Drop Tick Modal -->
+<div id="modal-tick" class="modal-overlay" onclick="if(event.target===this)closeModals()">
+  <div class="modal">
+    <h3>Drop a Buoy Tick</h3>
+    <label>Type</label>
+    <select id="tick-type">
+      <option value="tick">General tick</option>
+      <option value="begin">Begin (starting a task)</option>
+      <option value="complete">Complete (finished a task)</option>
+      <option value="handoff">Handoff (passing to another agent)</option>
+      <option value="decision">Decision (product/architecture choice)</option>
+      <option value="block">Block (something is blocking)</option>
+      <option value="unblock">Unblock (blocker resolved)</option>
+      <option value="alert">Alert (security/anomaly)</option>
+    </select>
+    <label>Note</label>
+    <input type="text" id="tick-note" placeholder="What happened?">
+    <label>Tags (comma-separated, optional)</label>
+    <input type="text" id="tick-tags" placeholder="card:245, repo:rowen">
+    <div id="tick-msg" class="modal-msg"></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+      <button class="btn btn-green" onclick="submitTick()">Drop</button>
     </div>
   </div>
 </div>
@@ -433,6 +520,7 @@ document.querySelectorAll('.tab').forEach(t => {
     if (t.dataset.tab === 'actions') loadDelegations();
     if (t.dataset.tab === 'activity') refreshActivity();
     if (t.dataset.tab === 'health') loadHealth();
+    if (t.dataset.tab === 'buoy') loadBuoy();
   });
 });
 
@@ -759,6 +847,122 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s || 
 
 document.getElementById('auth-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') login(); });
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeModals(); });
+
+// ── Buoy Tab ──
+function dropTick() { closeModals(); document.getElementById('modal-tick').classList.add('show'); }
+function openChronoModal() { closeModals(); document.getElementById('modal-chrono').classList.add('show'); }
+
+async function submitTick() {
+  const type = document.getElementById('tick-type').value;
+  const note = document.getElementById('tick-note').value.trim();
+  const tagsRaw = document.getElementById('tick-tags').value.trim();
+  const msg = document.getElementById('tick-msg');
+  if (!note) { msg.textContent = 'Note required'; msg.className = 'modal-msg error'; return; }
+  const tags = tagsRaw ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean) : [];
+  try {
+    const result = await api('POST', '/api/tick', { type, note, tags });
+    msg.textContent = `Tick #${result.tick_id} dropped. Chain: ${result.chain_hash?.slice(0,12)}...`;
+    msg.className = 'modal-msg ok';
+    document.getElementById('tick-note').value = '';
+    loadBuoy();
+    setTimeout(closeModals, 1200);
+  } catch (e) { msg.textContent = e.message; msg.className = 'modal-msg error'; }
+}
+
+async function createChrono() {
+  const name = document.getElementById('chrono-name').value.trim();
+  const action = document.getElementById('chrono-action').value;
+  const target = document.getElementById('chrono-target').value.trim();
+  const fireIn = document.getElementById('chrono-fire').value.trim();
+  const payloadRaw = document.getElementById('chrono-payload').value.trim();
+  const msg = document.getElementById('chrono-msg');
+  if (!name || !fireIn) { msg.textContent = 'Name and fire time required'; msg.className = 'modal-msg error'; return; }
+  let payload = {};
+  if (payloadRaw) { try { payload = JSON.parse(payloadRaw); } catch { msg.textContent = 'Invalid JSON payload'; msg.className = 'modal-msg error'; return; } }
+  try {
+    const result = await api('POST', '/api/chrono/create', { name, action, target: target || 'self', fire_in: fireIn, payload });
+    msg.textContent = `Trigger armed: fires at ${result.fire_at}`;
+    msg.className = 'modal-msg ok';
+    loadBuoy();
+    setTimeout(closeModals, 1200);
+  } catch (e) { msg.textContent = e.message; msg.className = 'modal-msg error'; }
+}
+
+async function loadBuoy() {
+  // Ledger
+  try {
+    const data = await api('GET', '/api/tick/ledger?limit=20');
+    const ticks = data.ticks || [];
+    if (!ticks.length) { document.getElementById('buoy-ledger').innerHTML = '<div class="empty">No ticks yet. Drop your first buoy.</div>'; }
+    else {
+      let html = '<table><tr><th>ID</th><th>Type</th><th>Note</th><th>Chain Hash</th><th>Time</th></tr>';
+      for (const t of ticks) {
+        html += `<tr>
+          <td style="font-weight:600">#${t.id}</td>
+          <td><span class="badge badge-active">${esc(t.tick_type || t.type || 'tick')}</span></td>
+          <td>${esc(t.note)}</td>
+          <td style="font-family:monospace;font-size:0.7rem;color:var(--yellow)">${esc((t.chain_hash||'').slice(0,16))}...</td>
+          <td style="color:var(--text3);font-size:0.8rem">${new Date(t.created_at).toLocaleString()}</td>
+        </tr>`;
+      }
+      html += '</table>';
+      document.getElementById('buoy-ledger').innerHTML = html;
+    }
+  } catch { document.getElementById('buoy-ledger').innerHTML = '<div class="empty">Could not load tick ledger.</div>'; }
+
+  // Stats
+  try {
+    const stats = await api('GET', '/api/tick/stats');
+    document.getElementById('buoy-stats').innerHTML = `
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:1rem">
+        <div class="stat-card"><div class="stat-label">Total Ticks</div><div class="stat-value" style="font-size:1.3rem;color:var(--green)">${stats.total_ticks || 0}</div></div>
+        <div class="stat-card"><div class="stat-label">Streak</div><div class="stat-value" style="font-size:1.3rem;color:var(--yellow)">${stats.streak_days || 0} days</div></div>
+        <div class="stat-card"><div class="stat-label">First Tick</div><div style="font-size:0.8rem;color:var(--text2)">${stats.first_tick ? new Date(stats.first_tick).toLocaleDateString() : '—'}</div></div>
+        <div class="stat-card"><div class="stat-label">Last Tick</div><div style="font-size:0.8rem;color:var(--text2)">${stats.last_tick ? new Date(stats.last_tick).toLocaleDateString() : '—'}</div></div>
+      </div>`;
+  } catch { document.getElementById('buoy-stats').innerHTML = '<div class="empty">Could not load stats.</div>'; }
+
+  // Chrono triggers
+  try {
+    const data = await api('GET', '/api/chrono/list');
+    const triggers = data.triggers || [];
+    if (!triggers.length) { document.getElementById('chrono-list').innerHTML = '<div class="empty">No chrono triggers. Arm your first dead man\'s switch.</div>'; }
+    else {
+      let html = '<table><tr><th>Name</th><th>Action</th><th>Status</th><th>Fires At</th><th></th></tr>';
+      for (const t of triggers) {
+        const statusCls = t.status === 'armed' ? 'badge-active' : t.status === 'fired' ? 'badge-rotated' : 'badge-revoked';
+        html += `<tr>
+          <td style="font-weight:600">${esc(t.name)}</td>
+          <td>${esc(t.action)}</td>
+          <td><span class="badge ${statusCls}">${t.status}</span></td>
+          <td style="color:var(--text3);font-size:0.8rem">${new Date(t.fire_at).toLocaleString()}</td>
+          <td>${t.status === 'armed' ? `<button class="btn btn-ghost btn-sm" onclick="cancelChrono(${t.id})">Cancel</button> <button class="btn btn-ghost btn-sm" onclick="extendChrono(${t.id})">+24h</button>` : ''}</td>
+        </tr>`;
+      }
+      html += '</table>';
+      document.getElementById('chrono-list').innerHTML = html;
+    }
+  } catch { document.getElementById('chrono-list').innerHTML = '<div class="empty">Could not load triggers.</div>'; }
+}
+
+async function verifyChain() {
+  const el = document.getElementById('buoy-verify');
+  try {
+    const result = await api('POST', '/api/tick/chain/verify', { did: currentDid });
+    if (result.valid) {
+      el.innerHTML = `<div style="color:var(--green);font-weight:600">Chain VALID — ${result.ticks_checked} ticks verified, no tampering detected.</div>`;
+    } else {
+      el.innerHTML = `<div style="color:var(--red);font-weight:600">Chain BROKEN at tick #${result.broken_at_tick_id}. ${result.ticks_checked} ticks checked.</div>`;
+    }
+  } catch (e) { el.innerHTML = `<div style="color:var(--text3)">${e.message}</div>`; }
+}
+
+async function cancelChrono(id) {
+  try { await api('POST', '/api/chrono/cancel', { trigger_id: id }); loadBuoy(); } catch (e) { alert(e.message); }
+}
+async function extendChrono(id) {
+  try { await api('POST', '/api/chrono/extend', { trigger_id: id, extend_by: '24h' }); loadBuoy(); } catch (e) { alert(e.message); }
+}
 </script>
 </body>
 </html>

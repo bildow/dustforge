@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buoy — Temporal anchors for the agentic era</title>
+<meta name="description" content="Tamper-evident tick chains, scheduled delivery, and dead man's switches for AI agent workflows. Drop a buoy. Prove the sequence.">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg: #08111a; --surface: #0e1824; --card: #132131; --border: #27445f;
+    --text: #e7f1fb; --text2: #9cb4c9; --text3: #6d8397;
+    --accent: #5fb3ff; --green: #69c7b1; --yellow: #c8a84b; --red: #e06c75;
+  }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; line-height:1.7; }
+  .header { padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }
+  .logo { font-size:1.5rem; font-weight:800; text-decoration:none; color:var(--text); }
+  .logo span { color:var(--green); }
+  .nav { display:flex; gap:1.5rem; font-size:0.9rem; }
+  .nav a { color:var(--text2); text-decoration:none; }
+  .nav a:hover { color:var(--green); }
+
+  .hero { text-align:center; padding:5rem 2rem 3rem; max-width:800px; margin:0 auto; }
+  .hero h1 { font-size:2.8rem; font-weight:800; line-height:1.1; margin-bottom:1.5rem; }
+  .hero h1 span { color:var(--green); }
+  .hero .tagline { font-size:1.2rem; color:var(--text2); max-width:600px; margin:0 auto 2rem; }
+  .hero .sub { font-size:0.95rem; color:var(--text3); max-width:550px; margin:0 auto 2.5rem; }
+
+  .demo { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.5rem; max-width:600px; margin:0 auto 3rem; text-align:left; font-family:monospace; font-size:0.85rem; }
+  .demo .req { color:var(--green); }
+  .demo .res { color:var(--text2); margin-top:0.5rem; }
+  .demo .hash { color:var(--yellow); }
+  .demo .label { color:var(--text3); font-family:sans-serif; font-size:0.75rem; margin-bottom:0.5rem; text-transform:uppercase; letter-spacing:0.05em; }
+
+  .features { background:var(--surface); padding:4rem 2rem; }
+  .features-inner { max-width:900px; margin:0 auto; }
+  .features h2 { text-align:center; font-size:2rem; margin-bottom:2.5rem; }
+  .feature-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); gap:1.5rem; }
+  .feature { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.5rem; }
+  .feature h3 { font-size:0.95rem; margin-bottom:0.5rem; color:var(--green); }
+  .feature p { font-size:0.85rem; color:var(--text2); }
+
+  .types { padding:4rem 2rem; max-width:700px; margin:0 auto; }
+  .types h2 { text-align:center; font-size:1.8rem; margin-bottom:2rem; }
+  .type-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+  .type-table th { text-align:left; color:var(--text3); font-size:0.7rem; text-transform:uppercase; padding:0.5rem 0.75rem; border-bottom:1px solid var(--border); }
+  .type-table td { padding:0.6rem 0.75rem; border-bottom:1px solid rgba(39,68,95,0.3); }
+  .type-badge { display:inline-block; padding:0.15rem 0.5rem; border-radius:4px; font-size:0.7rem; font-weight:600; background:rgba(105,199,177,0.15); color:var(--green); }
+
+  .use-cases { background:var(--surface); padding:4rem 2rem; }
+  .use-cases-inner { max-width:900px; margin:0 auto; }
+  .use-cases h2 { text-align:center; font-size:1.8rem; margin-bottom:2rem; }
+  .case-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(250px, 1fr)); gap:1.5rem; }
+  .case { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.5rem; }
+  .case h4 { font-size:0.9rem; color:var(--yellow); margin-bottom:0.4rem; }
+  .case p { font-size:0.8rem; color:var(--text2); }
+
+  .cta { text-align:center; padding:4rem 2rem; }
+  .cta h2 { font-size:1.8rem; margin-bottom:1rem; }
+  .cta code { display:inline-block; background:var(--card); padding:0.5rem 1.5rem; border-radius:6px; font-size:1rem; color:var(--green); margin-bottom:1.5rem; border:1px solid var(--border); }
+  .cta p { color:var(--text3); font-size:0.85rem; }
+
+  footer { text-align:center; padding:2rem; color:var(--text3); font-size:0.8rem; border-top:1px solid var(--border); }
+  footer a { color:var(--text3); }
+  @media (max-width:600px) { .hero h1 { font-size:2rem; } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <a href="/" class="logo"><span>Buoy</span></a>
+  <div class="nav">
+    <a href="https://dustforge.com/vault.html">Vault</a>
+    <a href="https://www.npmjs.com/package/demipass">npm</a>
+    <a href="https://dustforge.com">Dustforge</a>
+  </div>
+</div>
+
+<div class="hero">
+  <h1>Drop a <span>buoy</span></h1>
+  <p class="tagline">Tamper-evident temporal anchors for AI agent workflows.</p>
+  <p class="sub">Every tick is hash-chained to the previous one. Every signature is verifiable. Every handoff between agents is provable. If the chain breaks, you know.</p>
+</div>
+
+<div class="demo">
+  <div class="label">Drop a tick</div>
+  <div class="req">POST /api/tick</div>
+  <div class="req">{"type": "handoff", "note": "passing to Brain for audit", "tags": ["card:245"]}</div>
+  <div class="res" style="margin-top:1rem">
+    tick_id: 48<br>
+    type: "handoff"<br>
+    <span class="hash">chain_hash: "759ed285...8fb57776"</span><br>
+    previous: { tick_id: 47, ago: "23m" }<br>
+    signature: "a3f1c9e2..."
+  </div>
+</div>
+
+<div class="features">
+  <div class="features-inner">
+    <h2>What Buoy does</h2>
+    <div class="feature-grid">
+      <div class="feature">
+        <h3>Chain Hashing</h3>
+        <p>Every tick's SHA-256 hash covers its own data plus the previous tick's hash. One tampered entry breaks the entire chain downstream. Append-only, verifiable by anyone.</p>
+      </div>
+      <div class="feature">
+        <h3>Chrono Triggers</h3>
+        <p>Schedule a payload for future delivery. If you don't cancel or extend before the timer fires, it delivers. Dead man's switch, scheduled rotation, timed messages.</p>
+      </div>
+      <div class="feature">
+        <h3>Cross-Agent Provenance</h3>
+        <p>Claude ticks at task start. Brain ticks at audit complete. The ref_tick field links them. The chain proves the sequence of custody across any number of agents.</p>
+      </div>
+      <div class="feature">
+        <h3>Decentralized Verification</h3>
+        <p>Anyone can verify a tick signature without authentication. POST /api/tick/verify with the tick_id and signature. No trust required — the math proves it.</p>
+      </div>
+      <div class="feature">
+        <h3>Streak Tracking</h3>
+        <p>Consecutive days with at least one tick. Session health barometer. If the streak breaks, something changed — investigate.</p>
+      </div>
+      <div class="feature">
+        <h3>Referral Revenue Share</h3>
+        <p>10% of every tick fee from your referrals, forever. Accumulated fractionally, paid out at 1 DD threshold. The chain tracks it all.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="types">
+  <h2>Tick Types</h2>
+  <table class="type-table">
+    <tr><th>Type</th><th>When to use</th></tr>
+    <tr><td><span class="type-badge">begin</span></td><td>Agent starts a task or session</td></tr>
+    <tr><td><span class="type-badge">complete</span></td><td>Agent finishes a task</td></tr>
+    <tr><td><span class="type-badge">handoff</span></td><td>Work passes between agents</td></tr>
+    <tr><td><span class="type-badge">audit</span></td><td>Agent verifies another's work</td></tr>
+    <tr><td><span class="type-badge">decision</span></td><td>Product or architecture choice made</td></tr>
+    <tr><td><span class="type-badge">block</span></td><td>Agent is blocked on something</td></tr>
+    <tr><td><span class="type-badge">unblock</span></td><td>Blocker resolved</td></tr>
+    <tr><td><span class="type-badge">alert</span></td><td>Security or anomaly event</td></tr>
+  </table>
+</div>
+
+<div class="use-cases">
+  <div class="use-cases-inner">
+    <h2>Use cases</h2>
+    <div class="case-grid">
+      <div class="case">
+        <h4>Multi-agent audit trail</h4>
+        <p>Agent A builds, Agent B audits, Agent A fixes. The tick chain proves the sequence — no one can claim work was verified when it wasn't.</p>
+      </div>
+      <div class="case">
+        <h4>Dead man's switch</h4>
+        <p>Schedule a chrono trigger that fires in 24h. Reset it daily. If you stop resetting, it fires — sends a webhook, records a tick, alerts your team.</p>
+      </div>
+      <div class="case">
+        <h4>Session health</h4>
+        <p>Tick at session start and end. Track streaks. If an agent's streak breaks, investigate — context corruption, credential expiry, or infrastructure failure.</p>
+      </div>
+      <div class="case">
+        <h4>Decision archaeology</h4>
+        <p>Six months from now: "when did we decide to name it Buoy?" Query the chain by tag or type=decision. The tick has the context, the timestamp, and the hash proof.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="cta">
+  <h2>One line to start</h2>
+  <code>POST /api/tick {"note": "hello world"}</code>
+  <p>Free for anonymous ticks (10/min). 1 DD per signed member tick with chain verification.</p>
+</div>
+
+<footer>
+  <p>Buoy &mdash; a Dustforge product &middot; AKStrapped LLC &middot; <a href="https://dustforge.com/terms.html">Terms</a> &middot; <a href="https://dustforge.com/privacy.html">Privacy</a></p>
+</footer>
+
+</body>
+</html>
