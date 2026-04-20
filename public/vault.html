@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DemiPass — Vault Dashboard</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg: #08111a;
+    --surface: #0e1824;
+    --card: #132131;
+    --card-hover: #1b3148;
+    --border: #27445f;
+    --text: #e7f1fb;
+    --text2: #9cb4c9;
+    --text3: #6d8397;
+    --accent: #5fb3ff;
+    --green: #69c7b1;
+    --red: #e06c75;
+    --yellow: #c8a84b;
+  }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; line-height:1.6; }
+
+  .header { padding:1rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }
+  .logo { font-size:1.3rem; font-weight:800; color:var(--text); text-decoration:none; letter-spacing:-0.02em; }
+  .logo span { color:var(--accent); }
+  .header-right { display:flex; align-items:center; gap:1.5rem; font-size:0.85rem; color:var(--text2); }
+  .header-right .did { font-family:monospace; font-size:0.75rem; color:var(--text3); }
+  .logout { color:var(--red); cursor:pointer; text-decoration:none; font-size:0.8rem; }
+
+  .auth-screen { max-width:400px; margin:8rem auto; padding:2rem; text-align:center; }
+  .auth-screen h2 { margin-bottom:1rem; font-size:1.5rem; }
+  .auth-screen p { color:var(--text2); margin-bottom:1.5rem; font-size:0.9rem; }
+  .auth-screen input { width:100%; padding:0.7rem 1rem; background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:0.9rem; margin-bottom:0.75rem; }
+  .auth-screen input:focus { outline:none; border-color:var(--accent); }
+  .auth-screen button { width:100%; padding:0.7rem; background:var(--accent); border:none; border-radius:6px; color:var(--bg); font-weight:700; font-size:0.9rem; cursor:pointer; }
+  .auth-screen button:hover { opacity:0.9; }
+  .auth-error { color:var(--red); font-size:0.8rem; margin-top:0.5rem; }
+
+  .dashboard { display:none; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:1rem; padding:1.5rem 2rem; }
+  .stat-card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.25rem; }
+  .stat-label { font-size:0.75rem; color:var(--text3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:0.25rem; }
+  .stat-value { font-size:1.8rem; font-weight:800; }
+  .stat-value.balance { color:var(--green); }
+  .stat-value.secrets { color:var(--accent); }
+  .stat-value.tokens { color:var(--yellow); }
+  .stat-sub { font-size:0.7rem; color:var(--text3); margin-top:0.25rem; }
+
+  .section { padding:0 2rem 1.5rem; }
+  .section-title { font-size:1rem; font-weight:700; margin-bottom:0.75rem; padding-bottom:0.5rem; border-bottom:1px solid var(--border); }
+
+  table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+  th { text-align:left; color:var(--text3); font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em; padding:0.5rem 0.75rem; border-bottom:1px solid var(--border); }
+  td { padding:0.6rem 0.75rem; border-bottom:1px solid rgba(39,68,95,0.3); }
+  tr:hover td { background:rgba(95,179,255,0.03); }
+
+  .badge { display:inline-block; padding:0.15rem 0.5rem; border-radius:4px; font-size:0.7rem; font-weight:600; }
+  .badge-active { background:rgba(105,199,177,0.15); color:var(--green); }
+  .badge-revoked { background:rgba(224,108,117,0.15); color:var(--red); }
+  .badge-rotated { background:rgba(200,168,75,0.15); color:var(--yellow); }
+
+  .breaker { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:0.4rem; vertical-align:middle; }
+  .breaker-closed { background:var(--green); box-shadow:0 0 4px var(--green); }
+  .breaker-open { background:var(--red); box-shadow:0 0 4px var(--red); }
+
+  .audit-entry { display:flex; gap:0.75rem; padding:0.5rem 0; border-bottom:1px solid rgba(39,68,95,0.2); font-size:0.8rem; }
+  .audit-time { color:var(--text3); font-family:monospace; font-size:0.7rem; min-width:140px; }
+  .audit-type { color:var(--accent); font-weight:600; min-width:120px; }
+  .audit-detail { color:var(--text2); flex:1; }
+
+  .empty { color:var(--text3); font-style:italic; padding:1rem 0; font-size:0.85rem; }
+  .loading { color:var(--text3); padding:1rem 0; font-size:0.85rem; }
+
+  @media (max-width:600px) {
+    .grid { grid-template-columns:1fr 1fr; padding:1rem; }
+    .section { padding:0 1rem 1rem; }
+    .header { padding:1rem; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Auth Screen -->
+<div id="auth" class="auth-screen">
+  <h2>Demi<span style="color:var(--accent)">Pass</span> Vault</h2>
+  <p>Sign in with your Dustforge credentials.</p>
+  <input type="text" id="auth-user" placeholder="Username" autocomplete="username">
+  <input type="password" id="auth-pass" placeholder="Password or invite key" autocomplete="current-password">
+  <button onclick="login()">Authenticate</button>
+  <div id="auth-err" class="auth-error"></div>
+</div>
+
+<!-- Dashboard -->
+<div id="dash" class="dashboard">
+  <div class="header">
+    <a href="/" class="logo">Demi<span>Pass</span> Vault</a>
+    <div class="header-right">
+      <span id="dash-user"></span>
+      <span id="dash-did" class="did"></span>
+      <a class="logout" onclick="logout()">sign out</a>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="grid">
+    <div class="stat-card">
+      <div class="stat-label">Diamond Dust</div>
+      <div class="stat-value balance" id="stat-balance">--</div>
+      <div class="stat-sub" id="stat-balance-sub"></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Secrets Stored</div>
+      <div class="stat-value secrets" id="stat-secrets">--</div>
+      <div class="stat-sub" id="stat-secrets-sub"></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Use-Tokens (24h)</div>
+      <div class="stat-value tokens" id="stat-tokens">--</div>
+      <div class="stat-sub" id="stat-tokens-sub"></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Tick Streak</div>
+      <div class="stat-value" id="stat-streak" style="color:var(--accent)">--</div>
+      <div class="stat-sub" id="stat-streak-sub"></div>
+    </div>
+  </div>
+
+  <!-- Secrets Table -->
+  <div class="section">
+    <div class="section-title">Secrets</div>
+    <div id="secrets-table"><div class="loading">Loading secrets...</div></div>
+  </div>
+
+  <!-- Recent Audit -->
+  <div class="section">
+    <div class="section-title">Recent Activity</div>
+    <div id="audit-log"><div class="loading">Loading activity...</div></div>
+  </div>
+</div>
+
+<script>
+const API = 'https://api.dustforge.com';
+let token = localStorage.getItem('dp_token') || '';
+let currentDid = localStorage.getItem('dp_did') || '';
+let currentUser = localStorage.getItem('dp_user') || '';
+
+if (token) showDashboard();
+
+async function api(method, path, body) {
+  const opts = {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+  };
+  if (token) opts.headers['Authorization'] = 'Bearer ' + token;
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(API + path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (res.status >= 400) throw new Error(data.error || 'request failed');
+  return data;
+}
+
+async function login() {
+  const user = document.getElementById('auth-user').value.trim();
+  const pass = document.getElementById('auth-pass').value;
+  const err = document.getElementById('auth-err');
+  err.textContent = '';
+  if (!user || !pass) { err.textContent = 'Username and password required'; return; }
+  try {
+    const auth = await api('POST', '/api/identity/auth-fingerprint', {
+      username: user, password: pass, scope: 'transact', expires_in: '24h'
+    });
+    token = auth.token;
+    currentDid = auth.did || '';
+    currentUser = user;
+    localStorage.setItem('dp_token', token);
+    localStorage.setItem('dp_did', currentDid);
+    localStorage.setItem('dp_user', currentUser);
+    showDashboard();
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
+function logout() {
+  token = ''; currentDid = ''; currentUser = '';
+  localStorage.removeItem('dp_token');
+  localStorage.removeItem('dp_did');
+  localStorage.removeItem('dp_user');
+  document.getElementById('auth').style.display = '';
+  document.getElementById('dash').style.display = 'none';
+}
+
+async function showDashboard() {
+  document.getElementById('auth').style.display = 'none';
+  document.getElementById('dash').style.display = 'block';
+  document.getElementById('dash-user').textContent = currentUser;
+  document.getElementById('dash-did').textContent = currentDid ? currentDid.slice(0, 20) + '...' : '';
+
+  // Load all data in parallel
+  const [balance, secrets, history, tickStats] = await Promise.allSettled([
+    api('GET', '/api/identity/balance?did=' + encodeURIComponent(currentDid)),
+    api('GET', '/api/demipass/list'),
+    api('GET', '/api/demipass/history?limit=15'),
+    api('GET', '/api/tick/stats'),
+  ]);
+
+  // Balance
+  if (balance.status === 'fulfilled') {
+    document.getElementById('stat-balance').textContent = balance.value.balance_cents || 0;
+    document.getElementById('stat-balance-sub').textContent = 'DD available';
+  }
+
+  // Secrets
+  if (secrets.status === 'fulfilled') {
+    const list = secrets.value.secrets || [];
+    document.getElementById('stat-secrets').textContent = list.length;
+    const active = list.filter(s => s.status === 'active').length;
+    document.getElementById('stat-secrets-sub').textContent = active + ' active';
+    renderSecrets(list);
+  } else {
+    document.getElementById('secrets-table').innerHTML = '<div class="empty">No secrets stored yet.</div>';
+    document.getElementById('stat-secrets').textContent = '0';
+  }
+
+  // History / audit
+  if (history.status === 'fulfilled') {
+    const events = history.value.events || history.value.history || [];
+    // Count tokens in last 24h
+    const dayAgo = Date.now() - 86400000;
+    const tokenEvents = events.filter(e =>
+      e.event_type === 'token_issued' && new Date(e.created_at).getTime() > dayAgo
+    );
+    document.getElementById('stat-tokens').textContent = tokenEvents.length;
+    document.getElementById('stat-tokens-sub').textContent = 'issued today';
+    renderAudit(events);
+  } else {
+    document.getElementById('audit-log').innerHTML = '<div class="empty">No activity yet.</div>';
+    document.getElementById('stat-tokens').textContent = '0';
+  }
+
+  // Tick streak
+  if (tickStats.status === 'fulfilled') {
+    document.getElementById('stat-streak').textContent = tickStats.value.streak_days || 0;
+    document.getElementById('stat-streak-sub').textContent = tickStats.value.total_ticks + ' total ticks';
+  } else {
+    document.getElementById('stat-streak').textContent = '0';
+    document.getElementById('stat-streak-sub').textContent = '';
+  }
+}
+
+function renderSecrets(secrets) {
+  if (!secrets.length) {
+    document.getElementById('secrets-table').innerHTML = '<div class="empty">No secrets stored yet. Use the SDK or MCP server to store your first secret.</div>';
+    return;
+  }
+  let html = '<table><tr><th>Status</th><th>Name</th><th>Type</th><th>Contexts</th><th>Created</th></tr>';
+  for (const s of secrets) {
+    const badge = s.status === 'active' ? 'badge-active'
+      : s.status === 'revoked' ? 'badge-revoked'
+      : 'badge-rotated';
+    const breaker = s.status === 'active' ? 'breaker-closed' : 'breaker-open';
+    const created = new Date(s.created_at).toLocaleDateString();
+    html += `<tr>
+      <td><span class="breaker ${breaker}"></span><span class="badge ${badge}">${s.status}</span></td>
+      <td style="font-weight:600">${esc(s.name)}</td>
+      <td style="color:var(--text2)">${esc(s.secret_type || s.type || '-')}</td>
+      <td style="color:var(--text3)">${s.context_count || 0}</td>
+      <td style="color:var(--text3)">${created}</td>
+    </tr>`;
+  }
+  html += '</table>';
+  document.getElementById('secrets-table').innerHTML = html;
+}
+
+function renderAudit(events) {
+  if (!events.length) {
+    document.getElementById('audit-log').innerHTML = '<div class="empty">No activity recorded yet.</div>';
+    return;
+  }
+  let html = '';
+  for (const e of events.slice(0, 15)) {
+    const time = new Date(e.created_at || e.timestamp).toLocaleString();
+    const type = e.event_type || e.type || 'event';
+    const detail = e.detail || e.description || '';
+    let parsed = detail;
+    try { parsed = typeof detail === 'string' ? JSON.parse(detail) : detail; } catch {}
+    const summary = typeof parsed === 'object' ? (parsed.name || parsed.secret_name || parsed.message || JSON.stringify(parsed).slice(0, 80)) : String(parsed).slice(0, 80);
+    html += `<div class="audit-entry">
+      <span class="audit-time">${time}</span>
+      <span class="audit-type">${esc(type)}</span>
+      <span class="audit-detail">${esc(summary)}</span>
+    </div>`;
+  }
+  document.getElementById('audit-log').innerHTML = html;
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s || '';
+  return d.innerHTML;
+}
+
+// Enter key on password field
+document.getElementById('auth-pass').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') login();
+});
+</script>
+</body>
+</html>
