@@ -6667,6 +6667,283 @@ app.post('/api/tick/chain/verify', (req, res) => {
   });
 });
 
+// ============================================================
+// Auto-Ledger — free writes on every API call, paid reads
+// ============================================================
+// Every authenticated API response automatically records a ledger entry.
+// Writing is free (anti-churn: the more you use it, the more you need it).
+// Reading costs 1 DD per page (the monetization is in the read, not the write).
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS auto_ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  method TEXT NOT NULL,
+  path TEXT NOT NULL,
+  status_code INTEGER DEFAULT 0,
+  summary TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_al_did ON auto_ledger(did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_al_created ON auto_ledger(created_at)"); } catch(e) {}
+
+// Middleware: intercept response to log ledger entries for authenticated requests
+app.use((req, res, next) => {
+  const originalEnd = res.end;
+  res.end = function(chunk, encoding) {
+    // Only log for authenticated API calls (not health, not static)
+    if (req.path.startsWith('/api/') && req.path !== '/api/health') {
+      const auth = getBearerIdentity(req);
+      if (auth.ok) {
+        const summary = summarizePath(req.method, req.path, res.statusCode);
+        try {
+          db.prepare('INSERT INTO auto_ledger (did, method, path, status_code, summary) VALUES (?, ?, ?, ?, ?)')
+            .run(auth.did, req.method, req.path, res.statusCode, summary);
+        } catch(e) {
+          // Ledger writes must never break the response
+        }
+      }
+    }
+    originalEnd.call(this, chunk, encoding);
+  };
+  next();
+});
+
+function summarizePath(method, path, status) {
+  // Human-readable summary of what happened
+  if (path.includes('/tick') && method === 'POST') return 'tick recorded';
+  if (path.includes('/tick/ledger')) return 'tick ledger read';
+  if (path.includes('/tick/stats')) return 'tick stats read';
+  if (path.includes('/tick/verify')) return 'tick signature verified';
+  if (path.includes('/demipass/store')) return 'secret stored';
+  if (path.includes('/demipass/request-token')) return 'use-token requested';
+  if (path.includes('/demipass/use')) return 'use-token redeemed';
+  if (path.includes('/demipass/rotate')) return 'secret rotated';
+  if (path.includes('/demipass/delegate')) return 'delegation modified';
+  if (path.includes('/email/send')) return 'email sent';
+  if (path.includes('/identity/balance')) return 'balance checked';
+  if (path.includes('/identity/auth')) return 'authenticated';
+  if (path.includes('/transfer')) return 'transfer executed';
+  if (status >= 400) return `${method} ${path} failed (${status})`;
+  return `${method} ${path}`;
+}
+
+// GET /api/ledger — read your auto-ledger (1 DD per page)
+app.get('/api/ledger', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required. Your ledger is a member benefit.' });
+
+  const limit = Math.min(100, Number(req.query.limit) || 50);
+  const offset = Number(req.query.offset) || 0;
+
+  // Charge 1 DD per read
+  const debit = billing.deductBalance(db, auth.did, 1, 'ledger_read', 'auto-ledger page read');
+  if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for ledger read (1 DD)', balance: debit.balance_cents });
+
+  const entries = db.prepare('SELECT id, method, path, status_code, summary, created_at FROM auto_ledger WHERE did = ? ORDER BY id DESC LIMIT ? OFFSET ?')
+    .all(auth.did, limit, offset);
+  const total = db.prepare('SELECT COUNT(*) as n FROM auto_ledger WHERE did = ?').get(auth.did).n;
+
+  res.json({
+    entries,
+    total,
+    limit,
+    offset,
+    cost: '1 DD',
+    note: 'Writes are free. Every API call you make is automatically recorded here.',
+  });
+});
+
+// GET /api/ledger/summary — free summary (total entries, date range, no detail)
+app.get('/api/ledger/summary', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const total = db.prepare('SELECT COUNT(*) as n FROM auto_ledger WHERE did = ?').get(auth.did).n;
+  const first = db.prepare('SELECT created_at FROM auto_ledger WHERE did = ? ORDER BY id ASC LIMIT 1').get(auth.did);
+  const last = db.prepare('SELECT created_at FROM auto_ledger WHERE did = ? ORDER BY id DESC LIMIT 1').get(auth.did);
+  const byMethod = db.prepare('SELECT method, COUNT(*) as n FROM auto_ledger WHERE did = ? GROUP BY method').all(auth.did);
+
+  res.json({
+    total_entries: total,
+    first_entry: first?.created_at || null,
+    last_entry: last?.created_at || null,
+    by_method: Object.fromEntries(byMethod.map(r => [r.method, r.n])),
+    read_cost: '1 DD per page',
+  });
+});
+
+// ============================================================
+// Chrono Triggers — scheduled delivery / dead man's switch
+// ============================================================
+// Schedule a payload to be delivered at a future time. If the owner
+// doesn't cancel or extend before the trigger fires, it delivers.
+// Use cases: dead man's switch, scheduled secret rotation, timed messages.
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS chrono_triggers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  name TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  action TEXT NOT NULL DEFAULT 'webhook',
+  target TEXT NOT NULL DEFAULT '',
+  fire_at TEXT NOT NULL,
+  status TEXT DEFAULT 'armed' CHECK(status IN ('armed','fired','cancelled','extended')),
+  fires_count INTEGER DEFAULT 0,
+  last_extended_at TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_ct_did ON chrono_triggers(did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_ct_fire ON chrono_triggers(fire_at)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_ct_status ON chrono_triggers(status)"); } catch(e) {}
+
+// POST /api/chrono/create — schedule a trigger
+app.post('/api/chrono/create', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { name, payload = {}, action = 'webhook', target, fire_in, fire_at } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  if (!target) return res.status(400).json({ error: 'target required (URL for webhook, DID for message)' });
+  if (!fire_in && !fire_at) return res.status(400).json({ error: 'fire_in (e.g. "24h", "7d") or fire_at (ISO timestamp) required' });
+
+  // Parse fire time
+  let fireTime;
+  if (fire_at) {
+    fireTime = new Date(fire_at);
+    if (isNaN(fireTime.getTime())) return res.status(400).json({ error: 'invalid fire_at timestamp' });
+  } else {
+    const match = fire_in.match(/^(\d+)(m|h|d)$/);
+    if (!match) return res.status(400).json({ error: 'fire_in must be like "30m", "24h", or "7d"' });
+    const [, amount, unit] = match;
+    const ms = { m: 60000, h: 3600000, d: 86400000 }[unit] * Number(amount);
+    if (ms > 30 * 86400000) return res.status(400).json({ error: 'max trigger window is 30 days' });
+    fireTime = new Date(Date.now() + ms);
+  }
+
+  if (fireTime <= new Date()) return res.status(400).json({ error: 'fire time must be in the future' });
+
+  // Cost: 1 DD to arm a trigger
+  const debit = billing.deductBalance(db, auth.did, 1, 'chrono_create', `arm trigger: ${name}`);
+  if (!debit.ok) return res.status(402).json({ error: 'insufficient balance (1 DD to arm)', balance: debit.balance_cents });
+
+  const result = db.prepare('INSERT INTO chrono_triggers (did, name, payload, action, target, fire_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(auth.did, name, JSON.stringify(payload), action, target, fireTime.toISOString());
+
+  res.json({
+    ok: true,
+    trigger_id: result.lastInsertRowid,
+    name,
+    fire_at: fireTime.toISOString(),
+    status: 'armed',
+    cost: '1 DD',
+  });
+});
+
+// POST /api/chrono/extend — push back the fire time (dead man's switch reset)
+app.post('/api/chrono/extend', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { trigger_id, extend_by } = req.body || {};
+  if (!trigger_id) return res.status(400).json({ error: 'trigger_id required' });
+  if (!extend_by) return res.status(400).json({ error: 'extend_by required (e.g. "24h", "7d")' });
+
+  const trigger = db.prepare('SELECT * FROM chrono_triggers WHERE id = ? AND did = ?').get(trigger_id, auth.did);
+  if (!trigger) return res.status(404).json({ error: 'trigger not found or not owned by you' });
+  if (trigger.status !== 'armed') return res.status(400).json({ error: `trigger is ${trigger.status}, cannot extend` });
+
+  const match = extend_by.match(/^(\d+)(m|h|d)$/);
+  if (!match) return res.status(400).json({ error: 'extend_by must be like "30m", "24h", or "7d"' });
+  const [, amount, unit] = match;
+  const ms = { m: 60000, h: 3600000, d: 86400000 }[unit] * Number(amount);
+
+  const currentFire = new Date(trigger.fire_at);
+  const newFire = new Date(Math.max(currentFire.getTime(), Date.now()) + ms);
+  if (newFire - Date.now() > 30 * 86400000) return res.status(400).json({ error: 'max trigger window is 30 days from now' });
+
+  db.prepare('UPDATE chrono_triggers SET fire_at = ?, last_extended_at = ?, status = ? WHERE id = ?')
+    .run(newFire.toISOString(), new Date().toISOString(), 'armed', trigger_id);
+
+  res.json({ ok: true, trigger_id, new_fire_at: newFire.toISOString(), status: 'armed' });
+});
+
+// POST /api/chrono/cancel — disarm a trigger
+app.post('/api/chrono/cancel', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { trigger_id } = req.body || {};
+  if (!trigger_id) return res.status(400).json({ error: 'trigger_id required' });
+
+  const trigger = db.prepare('SELECT * FROM chrono_triggers WHERE id = ? AND did = ?').get(trigger_id, auth.did);
+  if (!trigger) return res.status(404).json({ error: 'trigger not found or not owned by you' });
+  if (trigger.status !== 'armed') return res.status(400).json({ error: `trigger is ${trigger.status}, cannot cancel` });
+
+  db.prepare('UPDATE chrono_triggers SET status = ? WHERE id = ?').run('cancelled', trigger_id);
+  res.json({ ok: true, trigger_id, status: 'cancelled' });
+});
+
+// GET /api/chrono/list — list your triggers
+app.get('/api/chrono/list', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const status = req.query.status || null;
+  let triggers;
+  if (status) {
+    triggers = db.prepare('SELECT id, name, action, target, fire_at, status, fires_count, last_extended_at, created_at FROM chrono_triggers WHERE did = ? AND status = ? ORDER BY fire_at ASC')
+      .all(auth.did, status);
+  } else {
+    triggers = db.prepare('SELECT id, name, action, target, fire_at, status, fires_count, last_extended_at, created_at FROM chrono_triggers WHERE did = ? ORDER BY fire_at ASC')
+      .all(auth.did);
+  }
+
+  res.json({ triggers, total: triggers.length });
+});
+
+// Chrono Trigger executor — runs every 30 seconds, fires due triggers
+setInterval(() => {
+  const now = new Date().toISOString();
+  const due = db.prepare("SELECT * FROM chrono_triggers WHERE status = 'armed' AND fire_at <= ?").all(now);
+
+  for (const trigger of due) {
+    console.log(`[CHRONO] Firing trigger ${trigger.id} (${trigger.name}) for ${trigger.did}`);
+
+    // Mark as fired immediately to prevent double-fire
+    db.prepare('UPDATE chrono_triggers SET status = ?, fires_count = fires_count + 1 WHERE id = ?')
+      .run('fired', trigger.id);
+
+    // Execute the action
+    if (trigger.action === 'webhook') {
+      fetch(trigger.target, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Chrono-Trigger': String(trigger.id) },
+        body: JSON.stringify({
+          trigger_id: trigger.id,
+          name: trigger.name,
+          payload: JSON.parse(trigger.payload || '{}'),
+          fired_at: now,
+          owner_did: trigger.did,
+        }),
+        signal: AbortSignal.timeout(10000),
+      }).catch(err => {
+        console.error(`[CHRONO] Webhook delivery failed for trigger ${trigger.id}: ${err.message}`);
+      });
+    } else if (trigger.action === 'tick') {
+      // Auto-tick: records a tick with the trigger's payload as the note
+      const payload = JSON.parse(trigger.payload || '{}');
+      db.prepare('INSERT INTO ticks (did, note, ip, tz) VALUES (?, ?, ?, ?)')
+        .run(trigger.did, `[chrono:${trigger.name}] ${payload.note || ''}`.slice(0, 300), '', 'UTC');
+    }
+
+    // Audit log
+    try {
+      db.prepare('INSERT INTO auto_ledger (did, method, path, status_code, summary) VALUES (?, ?, ?, ?, ?)')
+        .run(trigger.did, 'CHRONO', `/chrono/fire/${trigger.id}`, 200, `trigger fired: ${trigger.name}`);
+    } catch(e) {}
+  }
+}, 30000);
+
 module.exports = { app, db };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
