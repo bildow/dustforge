@@ -4,7 +4,7 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `27485a7` — Phasewhip admin panel |
+| **Last commit** | `a447258` — Mobile vault UI + app test handoff |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | Netlify + RackNerd LIVE. Phasewhip admin on 9190. |
 | **Status** | All products live with SSL. Lori on Conductor. Buoy tick types deployed. |
@@ -53,14 +53,20 @@
 - Flowhook registered, enrolled, phone online (temporary patch from Kyle)
 - TOS v3 canonical at /terms.html, handoff accuracy fixes
 
+## IMPORTANT: Audit against origin/main tip, not stale checkout
+
+Brain: your last 3 audits found issues that were already fixed but your checkout was behind. **Always `git pull origin main` before auditing.** The fixes for SSRF DNS resolution, chain hash coverage, and Rowen repo clarity all landed at `10c5276`. If your checkout doesn't have that commit, your findings are against stale code.
+
+Verify with: `git log --oneline -5` — you should see `10c5276 Fix 3 Brain audit findings: SSRF DNS resolution, chain hash coverage, Rowen repo clarity`
+
 ## Repos
 
 | Repo | Latest | Status |
 |------|--------|--------|
-| bildow/dustforge | 27485a7 | Netlify + RackNerd LIVE |
+| bildow/dustforge | a447258 | Netlify + RackNerd LIVE |
 | bildow/demipass | 369261b | npm 1.1.0 LIVE |
-| bildow/rowen | c74d223 | Deployed on phasewhip |
-| bildow/tome | 2b6ec09 | Session logged |
+| bildow/rowen | c74d223 | Deployed on phasewhip (6 action types here, NOT in dustforge/rowen-server.js) |
+| bildow/tome | ef9953f | Session logged |
 
 ## For Brain's Audit
 
