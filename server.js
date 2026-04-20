@@ -6435,8 +6435,12 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS ticks (
 )`); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_did ON ticks(did)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_ip ON ticks(ip)"); } catch(e) {}
-// Add chain_hash column if missing (existing installs)
+// Add columns if missing (existing installs)
 try { db.exec("ALTER TABLE ticks ADD COLUMN chain_hash TEXT DEFAULT ''"); } catch(e) {}
+try { db.exec("ALTER TABLE ticks ADD COLUMN tick_type TEXT DEFAULT 'tick'"); } catch(e) {}
+try { db.exec("ALTER TABLE ticks ADD COLUMN ref_tick INTEGER DEFAULT NULL"); } catch(e) {}
+try { db.exec("ALTER TABLE ticks ADD COLUMN tags TEXT DEFAULT '[]'"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_type ON ticks(tick_type)"); } catch(e) {}
 
 // Referral share accumulator — tracks fractional DD until >= 1 DD threshold
 try { db.exec(`CREATE TABLE IF NOT EXISTS referral_accumulators (
@@ -6455,8 +6459,11 @@ function computeTickHash(tickId, did, note, tz, time, prevHash) {
 }
 
 app.post('/api/tick', (req, res) => {
-  const { note = '', tz = 'UTC' } = req.body || {};
+  const { note = '', tz = 'UTC', type = 'tick', ref_tick = null, tags = [] } = req.body || {};
   const noteClean = String(note).slice(0, 300);
+  const validTypes = ['tick', 'begin', 'complete', 'handoff', 'audit', 'decision', 'block', 'unblock', 'alert'];
+  const tickType = validTypes.includes(type) ? type : 'tick';
+  const tagsClean = Array.isArray(tags) ? JSON.stringify(tags.slice(0, 10).map(t => String(t).slice(0, 50))) : '[]';
 
   // Check for member auth (optional)
   const auth = getBearerIdentity(req);
@@ -6490,7 +6497,7 @@ app.post('/api/tick', (req, res) => {
   const prevHash = prevTick?.chain_hash || '0'.repeat(64);
 
   // Insert tick
-  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz, created_at) VALUES (?, ?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz, timeISO);
+  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz, created_at, tick_type, ref_tick, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz, timeISO, tickType, ref_tick, tagsClean);
   const tickId = result.lastInsertRowid;
 
   // Compute and store chain hash
@@ -6538,8 +6545,11 @@ app.post('/api/tick', (req, res) => {
     tick_id: tickId,
     time: timeISO,
     tz,
+    type: tickType,
     note: noteClean,
     chain_hash: chainHash,
+    ref_tick: ref_tick || null,
+    tags: JSON.parse(tagsClean),
     previous: prevTick ? { tick_id: prevTick.id, note: prevTick.note, at: prevTick.created_at, ago } : null,
     member: isMember,
   };
