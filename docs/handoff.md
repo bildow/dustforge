@@ -4,10 +4,10 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `ccb8273` — cleanup after TOS v3 canonical |
+| **Last commit** | `f579d08` — Fix Lori query string bug |
 | **Branch** | `main` — `bildow/dustforge` |
-| **Deployed** | Netlify LIVE, RackNerd PENDING deploy |
-| **Status** | Massive session. 10+ cards shipped. TOS v3 canonical. Vault dashboard all 5 phases. npm published. |
+| **Deployed** | Netlify LIVE, RackNerd LIVE (deployed 2026-04-20) |
+| **Status** | RackNerd deployed. TOS at /terms.html (v3, pending Brain's v4 push). DemiPass e2e 9/9 pass. |
 
 ## What Shipped This Session (2026-04-19/20)
 
@@ -61,7 +61,7 @@
 3. **Chrono Triggers** — POST /api/chrono/create arms a trigger, /extend pushes fire time, /cancel disarms, 30s executor fires due triggers
 4. **Referral accumulator** — referral_accumulators table, 0.1 DD per tick accumulated, pays out at 1 DD threshold
 5. **Vault dashboard** — dustforge.com/vault.html loads, auth works, secrets table renders, circuit breaker panic button trips all
-6. **TOS v3** — dustforge.com/terms.html is the v3 with invite key flow, breach notification (72h), export controls, dual-barrel Rowen description
+6. **TOS** — dustforge.com/terms.html is v3. Still contains "prepared without legal counsel" disclaimer (line 31) and 72h breach notice (Section 12). These are intentional pending Brain's v4 rewrite — do not remove without replacement.
 7. **Rowen honeypot** — unapproved hosts get fake success (not error), intelligence logged
 8. **Rowen credential health** — egress 401/403 → ingress /credential-health → audit event
 9. **DemiPass SDK** — `npm install demipass` works, README matches actual API
@@ -91,7 +91,7 @@ Your v4 draft is at /root/sandbox/dustforge-terms-v4/. Claude Code cannot read /
 ## Blocked on Kyle (RackNerd)
 - `git pull && pm2 restart dustforge` (deploys ALL new server code)
 - civitasvox.com nginx vhost + certbot SSL
-- demipass.com DNS + nginx vhost + certbot SSL
+- demipass.com root domain DNS still propagating (www.demipass.com HTTPS live, demipass.com cert pending root A record propagation)
 - Flowhook agent token for Aaron's Moto G (device ZT4225JC23)
 
 ## DemiPass Product Direction (decided this session)
