@@ -205,7 +205,7 @@ function dustforgeRequest(method, path, body) {
     const opts = {
       hostname: url.hostname,
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: url.pathname,
+      path: url.pathname + url.search,
       method,
       headers: { 'Content-Type': 'application/json', 'X-Silicon-Agent': AGENT_NAME },
     };
