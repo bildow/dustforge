@@ -13,6 +13,8 @@ const PLATFORM_URL = process.env.PLATFORM_URL || 'http://100.83.112.88:3000';
 const LORI_AUTH_KEY = process.env.LORI_AUTH_KEY || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const LLM_MODEL = process.env.LLM_MODEL || 'deepseek/deepseek-v3.2';
+const CONDUCTOR_URL = process.env.CONDUCTOR_URL || 'http://10.225.75.95:8001';
+const CONDUCTOR_TOKEN = process.env.CONDUCTOR_TOKEN || 'a8c2f5d3e7b1940682fe5c3a7d2e8b6f4c9a1d3e7f2b5c8';
 const startTime = Date.now();
 
 // Auth middleware — all mutation routes require either Conduit token or LORI_AUTH_KEY
@@ -600,8 +602,63 @@ async function handleIntent(message) {
   return null;
 }
 
-// LLM fallback — when regex can't parse, ask DeepSeek with Lori's personality
-async function llmResponse(message) {
+// LLM via Conductor (primary) → OpenRouter (fallback)
+// Conductor uses MiMo V2 Pro for structured work. OpenRouter DeepSeek as backup.
+async function llmResponse(message, context = null) {
+  // Try Conductor first
+  const conductorResult = await callConductor(message, context);
+  if (conductorResult) return conductorResult;
+
+  // Fallback to OpenRouter direct
+  return callOpenRouter(message);
+}
+
+async function callConductor(message, context) {
+  try {
+    const body = JSON.stringify({
+      model: 'openrouter/xiaomi/mimo-v2-pro',
+      messages: [
+        { role: 'system', content: LORI_SYSTEM_PROMPT + (context ? `\n\nCurrent context:\n${context}` : '') },
+        { role: 'user', content: message },
+      ],
+      max_tokens: 500,
+      temperature: 0.7,
+    });
+    const result = await new Promise((resolve, reject) => {
+      const url = new URL('/v1/chat/completions', CONDUCTOR_URL);
+      const req = http.request({
+        hostname: url.hostname,
+        port: url.port,
+        path: url.pathname,
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${CONDUCTOR_TOKEN}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+      });
+      req.on('error', reject);
+      req.setTimeout(15000, () => { req.destroy(); reject(new Error('conductor timeout')); });
+      req.write(body);
+      req.end();
+    });
+    const content = result?.choices?.[0]?.message?.content;
+    if (content) {
+      console.log('[llm] via conductor (MiMo V2 Pro)');
+      return content;
+    }
+    return null;
+  } catch (e) {
+    console.warn('[llm] conductor unavailable:', e.message, '— falling back to OpenRouter');
+    return null;
+  }
+}
+
+async function callOpenRouter(message) {
   if (!OPENROUTER_API_KEY) return null;
   try {
     const https = require('https');
@@ -632,9 +689,11 @@ async function llmResponse(message) {
       req.write(body);
       req.end();
     });
-    return result?.choices?.[0]?.message?.content || null;
+    const content = result?.choices?.[0]?.message?.content;
+    if (content) console.log('[llm] via openrouter (DeepSeek V3.2 fallback)');
+    return content || null;
   } catch (e) {
-    console.error('[llm] fallback error:', e.message);
+    console.error('[llm] openrouter error:', e.message);
     return null;
   }
 }
@@ -664,11 +723,30 @@ function fallbackResponse(message) {
 // Health check
 app.get('/health', async (_req, res) => {
   const connected = await checkConduitConnection();
+  // Check Conductor availability
+  let conductorStatus = 'unknown';
+  try {
+    const cRes = await new Promise((resolve, reject) => {
+      const req = http.request({ hostname: new URL(CONDUCTOR_URL).hostname, port: new URL(CONDUCTOR_URL).port, path: '/health', method: 'GET' }, (res) => {
+        let d = ''; res.on('data', c => d += c); res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve(null); } });
+      });
+      req.on('error', reject);
+      req.setTimeout(3000, () => { req.destroy(); reject(new Error('timeout')); });
+      req.end();
+    });
+    conductorStatus = cRes?.status || 'live';
+  } catch { conductorStatus = 'unreachable'; }
+
   res.json({
     agent: AGENT_NAME,
     role: 'platform-assistant',
     uptime: Math.floor((Date.now() - startTime) / 1000),
     conduit_connected: connected,
+    llm: {
+      primary: 'conductor (MiMo V2 Pro)',
+      primary_status: conductorStatus,
+      fallback: OPENROUTER_API_KEY ? 'openrouter (DeepSeek V3.2)' : 'none',
+    },
   });
 });
 
@@ -689,7 +767,18 @@ app.post('/api/conduit/inbound', requireLoriAuth, async (req, res) => {
   console.log(`[conduit] from=${sender}: ${content.slice(0, 120)}`);
 
   let reply = await handleIntent(content);
-  if (!reply) reply = await llmResponse(content);
+  if (!reply) {
+    // Gather context for the LLM so it can give informed answers
+    let context = '';
+    try {
+      const projects = await fetchProjects().catch(() => []);
+      if (Array.isArray(projects) && projects.length) {
+        context += `Active projects: ${projects.map(p => p.name || p.title || `#${p.id}`).join(', ')}\n`;
+      }
+    } catch {}
+    context += `Sender: ${sender}\nTimestamp: ${new Date().toISOString()}`;
+    reply = await llmResponse(content, context);
+  }
   if (!reply) reply = fallbackResponse(content);
 
   // Send back on Conduit
