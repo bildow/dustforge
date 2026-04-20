@@ -68,15 +68,22 @@
 9. Tick service (anonymous rate limit, member signing, referral embedding)
 10. DemiPass SDK fullOnboard() matches server endpoints
 
+## Completed Cards (this session)
+- 244: Tick service refinements — DONE (e5e8dbb)
+- 245: Rowen honeypot — DONE (b820dc3)
+- 246: Auto-ledger — DONE (c08d59e)
+- 247: Chrono Triggers — DONE (c08d59e)
+- 252: npm publish demipass@1.0.0 — DONE
+- 254: Rowen credential health loop — DONE (690876c)
+- 243 P1: Vault dashboard read-only — DONE (cabd732)
+
 ## Open Task Cards
 - 220: Lori Conductor wrapper (real LLM personality)
-- 243: DemiPass wallet UI (circuit breaker metaphor)
-- 244: Tick service refinements
-- 245: Rowen honeypot (deception defense)
-- 246: Auto-ledger (free writes, paid reads)
-- 247: Chrono Triggers (scheduled delivery)
-- 249: Google Ads landing page optimization
+- 243 P2-P5: Vault UI circuit breaker controls, carbon actions, telemetry, multi-tenant
+- 249: Google Ads landing page optimization (blocked: desktop)
 - 251: demipass.com landing page
-- 252: npm publish demipass package (blocked: npm auth expired)
 - 253: HackerNews Show HN post
-- 254: Rowen credential health loop — BUILT (egress canary → ingress verify → carbon escalate)
+
+## Blocked on Kyle (RackNerd)
+- git pull + pm2 restart dustforge (deploys tick/ledger/chrono/manifest fix)
+- Add civitasvox.com nginx vhost + certbot SSL
