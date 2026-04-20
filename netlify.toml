@@ -17,6 +17,11 @@
   to = "/terms.html"
   status = 200
 
+[[redirects]]
+  from = "/terms-v4"
+  to = "/terms-v4.html"
+  status = 200
+
 # API calls proxy to RackNerd
 [[redirects]]
   from = "/api/*"
