@@ -42,9 +42,10 @@
 - `369261b` — demipass@1.1.0 published (includes Buoy MCP server)
 - e2e test: 9/9 pass (store→context→token→rotate→revoke)
 
-### Rowen Egress Expansion
-- `c74d223` — 4 new action types: document, http_body, env_inject, smtp_auth
-- Total: 6 action types (document, http_header, http_body, ssh_exec, env_inject, smtp_auth)
+### Rowen Egress Expansion (bildow/rowen repo, NOT dustforge/rowen-server.js)
+- `c74d223` in **bildow/rowen** `egress/server.js` — 4 new action types: document, http_body, env_inject, smtp_auth
+- Total: 6 action types in the standalone rowen repo
+- NOTE: dustforge/rowen-server.js is the older monolithic version and only has http_header + ssh_exec. The standalone bildow/rowen repo is the source of truth for egress.
 
 ### Other
 - 36 authoritative @dustforge.com emails reserved on production (legal, support, admin, etc.)
@@ -68,7 +69,7 @@
 2. **Chrono tick chain fix** — auto-ticks use computeTickHash, billing, referral accumulator (not raw INSERT)
 3. **Lori Conductor wrapper** — health endpoint shows `llm.primary: "conductor (MiMo V2 Pro)"`, `primary_status: "live"`. Send a natural language message via POST /api/conduit/inbound and verify Conductor processes it.
 4. **Buoy tick types** — POST /api/tick with `type`, `ref_tick`, `tags` fields. Verify chain_hash includes the type in computation. Verify ref_tick links work.
-5. **Egress action types** — document, http_body, env_inject, smtp_auth in rowen egress/server.js. Verify honeypot traps fire on unapproved hosts for http_body. Verify document returns plaintext to caller.
+5. **Egress action types** — document, http_body, env_inject, smtp_auth in **bildow/rowen** repo at `egress/server.js` (commit `c74d223`), NOT in dustforge/rowen-server.js (which is the older monolithic version). Verify honeypot traps fire on unapproved hosts for http_body. Verify document returns plaintext to caller.
 6. **demipass.com HTTPS** — valid cert, serves landing page
 7. **buoy.dustforge.com HTTPS** — valid cert, serves landing page
 8. **36 reserved emails** — `GET /api/identity/lookup?username=legal` returns status=reserved

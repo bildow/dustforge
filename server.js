@@ -6451,10 +6451,10 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS referral_accumulators (
   PRIMARY KEY (referrer_did, source_did)
 )`); } catch(e) {}
 
-// Tick chain: each tick's hash covers its own data + previous hash = tamper-evident chain
-function computeTickHash(tickId, did, note, tz, time, prevHash) {
+// Tick chain: each tick's hash covers ALL fields + previous hash = tamper-evident chain
+function computeTickHash(tickId, did, note, tz, time, prevHash, tickType, refTick, tags) {
   return crypto.createHash('sha256')
-    .update(`${tickId}:${did}:${note}:${tz}:${time}:${prevHash}`)
+    .update(`${tickId}:${did}:${note}:${tz}:${time}:${tickType || 'tick'}:${refTick || ''}:${tags || '[]'}:${prevHash}`)
     .digest('hex');
 }
 
@@ -6500,8 +6500,8 @@ app.post('/api/tick', (req, res) => {
   const result = db.prepare('INSERT INTO ticks (did, note, ip, tz, created_at, tick_type, ref_tick, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz, timeISO, tickType, ref_tick, tagsClean);
   const tickId = result.lastInsertRowid;
 
-  // Compute and store chain hash
-  const chainHash = computeTickHash(tickId, did, noteClean, tz, timeISO, prevHash);
+  // Compute and store chain hash (covers ALL fields for tamper evidence)
+  const chainHash = computeTickHash(tickId, did, noteClean, tz, timeISO, prevHash, tickType, ref_tick, tagsClean);
   db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
 
   // Referral revenue share: accumulate 10% (0.1 DD) per tick, pay out at 1 DD threshold
@@ -6650,7 +6650,7 @@ app.post('/api/tick/chain/verify', (req, res) => {
 
   const fromId = from_tick_id || 0;
   const toId = to_tick_id || Number.MAX_SAFE_INTEGER;
-  const ticks = db.prepare('SELECT id, did, note, tz, chain_hash, created_at FROM ticks WHERE did = ? AND id >= ? AND id <= ? ORDER BY id ASC')
+  const ticks = db.prepare('SELECT id, did, note, tz, chain_hash, created_at, tick_type, ref_tick, tags FROM ticks WHERE did = ? AND id >= ? AND id <= ? ORDER BY id ASC')
     .all(did, fromId, toId);
 
   if (ticks.length === 0) return res.json({ valid: true, ticks_checked: 0 });
@@ -6661,7 +6661,7 @@ app.post('/api/tick/chain/verify', (req, res) => {
   let brokenAt = null;
 
   for (const tick of ticks) {
-    const expected = computeTickHash(tick.id, tick.did, tick.note, tick.tz, tick.created_at, prevHash);
+    const expected = computeTickHash(tick.id, tick.did, tick.note, tick.tz, tick.created_at, prevHash, tick.tick_type, tick.ref_tick, tick.tags);
     if (tick.chain_hash !== expected) {
       brokenAt = tick.id;
       break;
@@ -6807,7 +6807,7 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_ct_fire ON chrono_triggers(fire_at
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ct_status ON chrono_triggers(status)"); } catch(e) {}
 
 // POST /api/chrono/create — schedule a trigger
-app.post('/api/chrono/create', (req, res) => {
+app.post('/api/chrono/create', async (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
 
@@ -6827,6 +6827,19 @@ app.post('/api/chrono/create', (req, res) => {
     }
     if (host === '169.254.169.254' || host === 'metadata.google.internal') {
       return res.status(400).json({ error: 'webhook target blocked: cloud metadata endpoint' });
+    }
+    // DNS resolution check — verify resolved IP is not private
+    try {
+      const dns = require('dns');
+      const { promisify } = require('util');
+      const ips = await promisify(dns.resolve4)(host);
+      for (const ip of ips) {
+        if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)/.test(ip)) {
+          return res.status(400).json({ error: `webhook target resolves to private IP ${ip}` });
+        }
+      }
+    } catch (dnsErr) {
+      return res.status(400).json({ error: `webhook target DNS resolution failed: ${dnsErr.message}` });
     }
   }
 
@@ -6926,7 +6939,7 @@ app.get('/api/chrono/list', (req, res) => {
 });
 
 // Chrono Trigger executor — runs every 30 seconds, fires due triggers
-setInterval(() => {
+setInterval(async () => {
   const now = new Date().toISOString();
   const due = db.prepare("SELECT * FROM chrono_triggers WHERE status = 'armed' AND fire_at <= ?").all(now);
 
@@ -6939,13 +6952,37 @@ setInterval(() => {
 
     // Execute the action
     if (trigger.action === 'webhook') {
-      // Defense in depth: re-validate target at fire time (may have been stored before SSRF checks)
+      // SSRF prevention: resolve hostname to IP, check resolved IP, disable redirects
       let skipWebhook = false;
+      let resolvedTarget = trigger.target;
       try {
         const u = new URL(trigger.target);
-        if (u.protocol !== 'https:') skipWebhook = true;
-        if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.|0\.|169\.254\.|::1|fc|fd)/.test(u.hostname)) skipWebhook = true;
-        if (u.hostname === '169.254.169.254' || u.hostname === 'metadata.google.internal') skipWebhook = true;
+        if (u.protocol !== 'https:') { skipWebhook = true; }
+        else {
+          // Hostname-level check
+          if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.|0\.|169\.254\.|::1|fc|fd)/.test(u.hostname)) skipWebhook = true;
+          if (u.hostname === '169.254.169.254' || u.hostname === 'metadata.google.internal') skipWebhook = true;
+
+          // DNS resolution check — resolve hostname and verify the IP is not private
+          if (!skipWebhook) {
+            const dns = require('dns');
+            const { promisify } = require('util');
+            const resolve4 = promisify(dns.resolve4);
+            try {
+              const ips = await resolve4(u.hostname);
+              for (const ip of ips) {
+                if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)/.test(ip)) {
+                  console.error(`[CHRONO] BLOCKED: ${u.hostname} resolves to private IP ${ip}`);
+                  skipWebhook = true;
+                  break;
+                }
+              }
+            } catch (dnsErr) {
+              console.error(`[CHRONO] BLOCKED: DNS resolution failed for ${u.hostname}: ${dnsErr.message}`);
+              skipWebhook = true;
+            }
+          }
+        }
       } catch { skipWebhook = true; }
 
       if (skipWebhook) {
@@ -6953,6 +6990,7 @@ setInterval(() => {
       } else {
         fetch(trigger.target, {
           method: 'POST',
+          redirect: 'error', // SSRF: reject all redirects — attacker can't bounce to internal targets
           headers: { 'Content-Type': 'application/json', 'X-Chrono-Trigger': String(trigger.id) },
           body: JSON.stringify({
             trigger_id: trigger.id,
@@ -6984,8 +7022,8 @@ setInterval(() => {
         .run(trigger.did, noteClean, '', 'UTC', timeISO);
       const tickId = result.lastInsertRowid;
 
-      // Chain hash
-      const chainHash = computeTickHash(tickId, trigger.did, noteClean, 'UTC', timeISO, prevHash);
+      // Chain hash (includes tick_type for tamper evidence)
+      const chainHash = computeTickHash(tickId, trigger.did, noteClean, 'UTC', timeISO, prevHash, 'tick', null, '[]');
       db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
 
       // Referral accumulator
