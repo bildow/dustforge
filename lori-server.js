@@ -157,22 +157,30 @@ async function selfOnboard() {
       return { already_registered: true, did: existing.did, email: existing.email, token: null };
     }
 
-    // 3. Not registered — create account autonomously
-    console.log('[onboard] Step 2: not registered. Attempting self-registration...');
-    const password = process.env.DUSTFORGE_PASSWORD || crypto.randomBytes(16).toString('hex');
+    // 3. Not registered — use canonical invite key flow
+    console.log('[onboard] Step 2: not registered. Requesting invite key...');
+
+    // 3a. Request invite key
+    const inviteResult = await dustforgeRequest('POST', '/api/identity/request-invite', JSON.stringify({}));
+    if (!inviteResult.key) {
+      console.log('[onboard] Step 3a: invite key request failed —', inviteResult.error || JSON.stringify(inviteResult));
+      return { needs_registration: true, error: inviteResult.error || 'invite key request failed', manifest };
+    }
+    console.log(`[onboard] Step 3a: invite key obtained (${inviteResult.key.slice(0, 8)}...)`);
+
+    // 3b. Create account with invite key (key = password = referral attribution)
     const createBody = JSON.stringify({
       username: AGENT_NAME,
-      password,
-      referral_code: process.env.REFERRAL_CODE || '',
+      key: inviteResult.key,
     });
     const createResult = await dustforgeRequest('POST', '/api/identity/create', createBody);
 
     if (createResult.ok || createResult.did) {
-      console.log(`[onboard] Step 3: registered! DID: ${createResult.did}, email: ${createResult.email}`);
+      console.log(`[onboard] Step 3b: registered! DID: ${createResult.did}, email: ${createResult.email}`);
       console.log(`[onboard]   referral code: ${createResult.referral_code}`);
 
-      // 4. Authenticate immediately
-      const authBody = JSON.stringify({ username: AGENT_NAME, password, scope: 'transact', expires_in: '24h' });
+      // 4. Authenticate with the invite key as password
+      const authBody = JSON.stringify({ username: AGENT_NAME, password: inviteResult.key, scope: 'transact', expires_in: '24h' });
       const authResult = await dustforgeRequest('POST', '/api/identity/auth-fingerprint', authBody);
       if (authResult.token) {
         console.log(`[onboard] Step 4: authenticated — fingerprint ${authResult.fingerprint_hash}`);
@@ -181,7 +189,7 @@ async function selfOnboard() {
       return { registered: true, did: createResult.did, email: createResult.email, token: null };
     }
 
-    console.log('[onboard] Step 3: registration failed —', createResult.error || JSON.stringify(createResult));
+    console.log('[onboard] Step 3b: registration failed —', createResult.error || JSON.stringify(createResult));
     return { needs_registration: true, error: createResult.error, manifest };
   } catch (err) {
     console.error('[onboard] failed:', err.message);

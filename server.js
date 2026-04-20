@@ -6806,6 +6806,20 @@ app.post('/api/chrono/create', (req, res) => {
   if (!target) return res.status(400).json({ error: 'target required (URL for webhook, DID for message)' });
   if (!fire_in && !fire_at) return res.status(400).json({ error: 'fire_in (e.g. "24h", "7d") or fire_at (ISO timestamp) required' });
 
+  // SSRF prevention: validate webhook targets at create time
+  if (action === 'webhook') {
+    let targetUrl;
+    try { targetUrl = new URL(target); } catch { return res.status(400).json({ error: 'target must be a valid URL' }); }
+    if (targetUrl.protocol !== 'https:') return res.status(400).json({ error: 'webhook target must use HTTPS' });
+    const host = targetUrl.hostname;
+    if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.|0\.|169\.254\.|::1|fc|fd)/.test(host)) {
+      return res.status(400).json({ error: 'webhook target cannot be a private/internal address' });
+    }
+    if (host === '169.254.169.254' || host === 'metadata.google.internal') {
+      return res.status(400).json({ error: 'webhook target blocked: cloud metadata endpoint' });
+    }
+  }
+
   // Parse fire time
   let fireTime;
   if (fire_at) {
@@ -6915,25 +6929,72 @@ setInterval(() => {
 
     // Execute the action
     if (trigger.action === 'webhook') {
-      fetch(trigger.target, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Chrono-Trigger': String(trigger.id) },
-        body: JSON.stringify({
-          trigger_id: trigger.id,
-          name: trigger.name,
-          payload: JSON.parse(trigger.payload || '{}'),
-          fired_at: now,
-          owner_did: trigger.did,
-        }),
-        signal: AbortSignal.timeout(10000),
-      }).catch(err => {
-        console.error(`[CHRONO] Webhook delivery failed for trigger ${trigger.id}: ${err.message}`);
-      });
+      // Defense in depth: re-validate target at fire time (may have been stored before SSRF checks)
+      let skipWebhook = false;
+      try {
+        const u = new URL(trigger.target);
+        if (u.protocol !== 'https:') skipWebhook = true;
+        if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.|0\.|169\.254\.|::1|fc|fd)/.test(u.hostname)) skipWebhook = true;
+        if (u.hostname === '169.254.169.254' || u.hostname === 'metadata.google.internal') skipWebhook = true;
+      } catch { skipWebhook = true; }
+
+      if (skipWebhook) {
+        console.error(`[CHRONO] BLOCKED: trigger ${trigger.id} targets unsafe URL ${trigger.target}`);
+      } else {
+        fetch(trigger.target, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Chrono-Trigger': String(trigger.id) },
+          body: JSON.stringify({
+            trigger_id: trigger.id,
+            name: trigger.name,
+            payload: JSON.parse(trigger.payload || '{}'),
+            fired_at: now,
+            owner_did: trigger.did,
+          }),
+          signal: AbortSignal.timeout(10000),
+        }).catch(err => {
+          console.error(`[CHRONO] Webhook delivery failed for trigger ${trigger.id}: ${err.message}`);
+        });
+      }
     } else if (trigger.action === 'tick') {
-      // Auto-tick: records a tick with the trigger's payload as the note
+      // Auto-tick: use the full tick pipeline (chain hash, billing, referral)
       const payload = JSON.parse(trigger.payload || '{}');
-      db.prepare('INSERT INTO ticks (did, note, ip, tz) VALUES (?, ?, ?, ?)')
-        .run(trigger.did, `[chrono:${trigger.name}] ${payload.note || ''}`.slice(0, 300), '', 'UTC');
+      const noteClean = `[chrono:${trigger.name}] ${payload.note || ''}`.slice(0, 300);
+      const timeISO = new Date().toISOString();
+
+      // Bill 1 DD
+      billing.deductBalance(db, trigger.did, 1, 'tick', `chrono:${trigger.name}`);
+
+      // Get previous tick for chain
+      const prevTick = db.prepare('SELECT chain_hash FROM ticks WHERE did = ? ORDER BY id DESC LIMIT 1').get(trigger.did);
+      const prevHash = prevTick?.chain_hash || '0'.repeat(64);
+
+      // Insert
+      const result = db.prepare('INSERT INTO ticks (did, note, ip, tz, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(trigger.did, noteClean, '', 'UTC', timeISO);
+      const tickId = result.lastInsertRowid;
+
+      // Chain hash
+      const chainHash = computeTickHash(tickId, trigger.did, noteClean, 'UTC', timeISO, prevHash);
+      db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
+
+      // Referral accumulator
+      const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(trigger.did);
+      if (wallet?.referred_by) {
+        db.prepare(`INSERT INTO referral_accumulators (referrer_did, source_did, accumulated, last_tick_id)
+          VALUES (?, ?, 1, ?) ON CONFLICT(referrer_did, source_did) DO UPDATE SET accumulated = accumulated + 1, last_tick_id = ?`)
+          .run(wallet.referred_by, trigger.did, tickId, tickId);
+        const acc = db.prepare('SELECT accumulated FROM referral_accumulators WHERE referrer_did = ? AND source_did = ?')
+          .get(wallet.referred_by, trigger.did);
+        if (acc && acc.accumulated >= 10) {
+          const payoutDD = Math.floor(acc.accumulated / 10);
+          const remainder = acc.accumulated % 10;
+          billing.creditBalance(db, wallet.referred_by, payoutDD, 'tick_referral_share',
+            `10% tick share from ${trigger.did.slice(0, 20)} (chrono)`, `tick_ref_chrono_${tickId}`);
+          db.prepare('UPDATE referral_accumulators SET accumulated = ? WHERE referrer_did = ? AND source_did = ?')
+            .run(remainder, wallet.referred_by, trigger.did);
+        }
+      }
     }
 
     // Audit log
