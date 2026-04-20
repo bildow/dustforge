@@ -129,27 +129,89 @@ async function resolveRound(roundId, outcome) {
 // ---------------------------------------------------------------------------
 
 async function selfOnboard() {
-  const https = require('https');
   try {
     // 1. Discover the manifest
     const manifest = await dustforgeRequest('GET', '/.well-known/silicon');
-    console.log('[onboard] discovered manifest:', JSON.stringify(manifest).slice(0, 200));
+    console.log('[onboard] Step 1: discovered manifest —', manifest.service || 'unknown service');
+    console.log('[onboard]   onboard endpoint:', manifest.selfOnboard?.endpoint);
+    console.log('[onboard]   sdk:', manifest.sdk_url);
 
     // 2. Check if already registered
-    const existing = await fetchIdentity('lori').catch(() => null);
+    const existing = await fetchIdentity(AGENT_NAME).catch(() => null);
     if (existing && !existing.error) {
-      console.log('[onboard] already registered as lori@dustforge.com');
-      return { already_registered: true, did: existing.did, email: existing.email };
+      console.log(`[onboard] Step 2: already registered as ${existing.email} (${existing.did})`);
+
+      // 3. Authenticate
+      const authBody = JSON.stringify({
+        username: AGENT_NAME,
+        password: process.env.DUSTFORGE_PASSWORD || '',
+        scope: 'transact',
+        expires_in: '24h',
+      });
+      const authResult = await dustforgeRequest('POST', '/api/identity/auth-fingerprint', authBody);
+      if (authResult.token) {
+        console.log(`[onboard] Step 3: authenticated — fingerprint ${authResult.fingerprint_hash}`);
+        return { already_registered: true, did: existing.did, email: existing.email, token: authResult.token };
+      }
+      console.log('[onboard] Step 3: auth failed —', authResult.error || 'unknown error');
+      return { already_registered: true, did: existing.did, email: existing.email, token: null };
     }
 
-    // 3. Not registered — Lori can't self-create (costs $1 via Stripe)
-    // But she CAN authenticate if the account was created by admin
-    console.log('[onboard] not registered — need admin to create account or use prepaid key');
-    return { needs_registration: true, manifest };
+    // 3. Not registered — create account autonomously
+    console.log('[onboard] Step 2: not registered. Attempting self-registration...');
+    const password = process.env.DUSTFORGE_PASSWORD || crypto.randomBytes(16).toString('hex');
+    const createBody = JSON.stringify({
+      username: AGENT_NAME,
+      password,
+      referral_code: process.env.REFERRAL_CODE || '',
+    });
+    const createResult = await dustforgeRequest('POST', '/api/identity/create', createBody);
+
+    if (createResult.ok || createResult.did) {
+      console.log(`[onboard] Step 3: registered! DID: ${createResult.did}, email: ${createResult.email}`);
+      console.log(`[onboard]   referral code: ${createResult.referral_code}`);
+
+      // 4. Authenticate immediately
+      const authBody = JSON.stringify({ username: AGENT_NAME, password, scope: 'transact', expires_in: '24h' });
+      const authResult = await dustforgeRequest('POST', '/api/identity/auth-fingerprint', authBody);
+      if (authResult.token) {
+        console.log(`[onboard] Step 4: authenticated — fingerprint ${authResult.fingerprint_hash}`);
+        return { registered: true, did: createResult.did, email: createResult.email, token: authResult.token };
+      }
+      return { registered: true, did: createResult.did, email: createResult.email, token: null };
+    }
+
+    console.log('[onboard] Step 3: registration failed —', createResult.error || JSON.stringify(createResult));
+    return { needs_registration: true, error: createResult.error, manifest };
   } catch (err) {
     console.error('[onboard] failed:', err.message);
     return { error: err.message };
   }
+}
+
+// Helper for POST requests to Dustforge
+function dustforgeRequest(method, path, body) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(path, DUSTFORGE_URL);
+    const mod = url.protocol === 'https:' ? require('https') : http;
+    const opts = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname,
+      method,
+      headers: { 'Content-Type': 'application/json', 'X-Silicon-Agent': AGENT_NAME },
+    };
+    if (body) opts.headers['Content-Length'] = Buffer.byteLength(body);
+    const req = mod.request(opts, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve({ raw: data }); } });
+    });
+    req.on('error', reject);
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });
+    if (body) req.write(body);
+    req.end();
+  });
 }
 
 // Run self-check on startup
@@ -246,30 +308,7 @@ async function checkConduitConnection() {
 // ---------------------------------------------------------------------------
 
 const DUSTFORGE_URL = process.env.DUSTFORGE_URL || 'https://api.dustforge.com';
-
-function dustforgeRequest(method, path) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(path, DUSTFORGE_URL);
-    const mod = url.protocol === 'https:' ? require('https') : http;
-    const opts = {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: url.pathname + url.search,
-      method,
-      headers: { 'Content-Type': 'application/json' },
-    };
-    const req = mod.request(opts, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); } catch { resolve(data); }
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
-    req.end();
-  });
-}
+// dustforgeRequest is defined above in the self-onboarding section (supports GET + POST)
 
 async function fetchCapacity() { return dustforgeRequest('GET', '/api/capacity'); }
 async function fetchIdentity(username) { return dustforgeRequest('GET', `/api/identity/lookup?username=${encodeURIComponent(username)}`); }
