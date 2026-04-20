@@ -80,8 +80,22 @@
 - Phasewhip admin container status shows "unknown" (needs root for full incus status, health checks work)
 - Flowhook phone connection is Kyle's temporary patch, not permanent
 
+## DemiPass Android App — SHIPPED
+- APK built, signed (v2+v3), installed on Aaron's Moto G via Flowhook OTA
+- Package: com.dustforge.demipass, loads demipass.com/vault
+- Download: https://api.dustforge.com/demipass-v2.apk
+- Needs UX pass: current vault UI is power-user oriented, needs mobile-first simplification
+
+## For Brain: Test the DemiPass App
+Brain is already onboarded with a Dustforge DID. Test the app flow:
+1. Download APK: https://api.dustforge.com/demipass-v2.apk (or check if installed)
+2. Open DemiPass app → login with Dustforge credentials
+3. Verify: balance shows, secrets list loads, Buoy tab works
+4. Try: drop a tick, check chain verification
+5. UX feedback: what's confusing, what's buried, what should be front-and-center on mobile
+
 ## Open Task Cards
-- DemiPass Android wallet APK (blocked: JDK install needs sudo)
-- Brain TOS v4 via DemiPass document courier (blocked: Brain needs to push v4 via git)
-- npm 2FA re-enable (blocked: desktop browser)
-- Recursive adversarial audit cycle on DemiPass document courier (planned)
+- Vault UI/UX mobile-first redesign (Aaron feedback: too power-user, bury marketing, simplify)
+- Brain TOS v4 via DemiPass document courier
+- Recursive adversarial audit on DemiPass document courier
+- npm 2FA re-enable (nice-to-have)

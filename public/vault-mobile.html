@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>DemiPass</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#08111a">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg:#08111a; --surface:#0e1824; --card:#132131; --card2:#1b3148;
+    --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397;
+    --accent:#5fb3ff; --green:#69c7b1; --red:#e06c75; --yellow:#c8a84b; --orange:#d19a66;
+  }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; line-height:1.5; min-height:100vh; overflow-x:hidden; }
+
+  /* Auth */
+  .auth { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; padding:2rem; }
+  .auth h1 { font-size:2rem; font-weight:800; margin-bottom:0.5rem; }
+  .auth h1 span { color:var(--accent); }
+  .auth p { color:var(--text3); font-size:0.85rem; margin-bottom:2rem; }
+  .auth input { width:100%; max-width:320px; padding:0.8rem 1rem; background:var(--card); border:1px solid var(--border); border-radius:10px; color:var(--text); font-size:1rem; margin-bottom:0.75rem; -webkit-appearance:none; }
+  .auth input:focus { outline:none; border-color:var(--accent); }
+  .auth button { width:100%; max-width:320px; padding:0.85rem; background:var(--accent); border:none; border-radius:10px; color:var(--bg); font-weight:700; font-size:1rem; cursor:pointer; }
+  .auth-err { color:var(--red); font-size:0.8rem; margin-top:0.5rem; max-width:320px; text-align:center; }
+
+  /* App shell */
+  .app { display:none; }
+  .topbar { padding:0.75rem 1rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--bg); z-index:10; }
+  .topbar-left { font-weight:700; font-size:1rem; }
+  .topbar-left span { color:var(--accent); }
+  .topbar-right { display:flex; align-items:center; gap:1rem; }
+  .topbar-user { font-size:0.8rem; color:var(--text2); }
+  .topbar-out { font-size:0.75rem; color:var(--red); cursor:pointer; }
+
+  /* Balance hero */
+  .balance-hero { text-align:center; padding:2rem 1rem 1.5rem; }
+  .balance-amount { font-size:3rem; font-weight:800; color:var(--green); }
+  .balance-label { font-size:0.75rem; color:var(--text3); text-transform:uppercase; letter-spacing:0.1em; margin-top:0.25rem; }
+
+  /* Quick stats */
+  .quick-stats { display:flex; justify-content:center; gap:1.5rem; padding:0 1rem 1.5rem; }
+  .qs { text-align:center; }
+  .qs-val { font-size:1.2rem; font-weight:700; }
+  .qs-label { font-size:0.65rem; color:var(--text3); text-transform:uppercase; }
+
+  /* Panic button */
+  .panic-strip { display:none; padding:0.6rem 1rem; background:rgba(224,108,117,0.1); border-bottom:1px solid rgba(224,108,117,0.3); text-align:center; }
+  .panic-strip span { color:var(--red); font-weight:600; font-size:0.8rem; }
+
+  /* Sections */
+  .section { padding:0 1rem 1rem; }
+  .section-head { display:flex; justify-content:space-between; align-items:center; padding:0.75rem 0; }
+  .section-title { font-size:0.85rem; font-weight:700; color:var(--text2); text-transform:uppercase; letter-spacing:0.05em; }
+
+  /* Secret cards */
+  .secret-card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1rem; margin-bottom:0.75rem; display:flex; align-items:center; gap:0.75rem; }
+  .secret-dot { width:14px; height:14px; border-radius:50%; flex-shrink:0; cursor:pointer; }
+  .secret-dot.on { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .secret-dot.off { background:var(--red); box-shadow:0 0 8px var(--red); }
+  .secret-info { flex:1; min-width:0; }
+  .secret-name { font-weight:700; font-size:0.95rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .secret-meta { font-size:0.75rem; color:var(--text3); }
+  .secret-actions { display:flex; gap:0.4rem; }
+  .sa-btn { padding:0.3rem 0.5rem; border:1px solid var(--border); border-radius:6px; background:transparent; color:var(--text3); font-size:0.65rem; cursor:pointer; }
+  .sa-btn:active { background:var(--card2); }
+
+  /* Bottom nav */
+  .bottomnav { position:fixed; bottom:0; left:0; right:0; background:var(--surface); border-top:1px solid var(--border); display:flex; justify-content:space-around; padding:0.5rem 0 calc(0.5rem + env(safe-area-inset-bottom)); z-index:10; }
+  .bn-item { text-align:center; padding:0.4rem 0; cursor:pointer; color:var(--text3); font-size:0.65rem; min-width:60px; }
+  .bn-item.active { color:var(--accent); }
+  .bn-icon { font-size:1.2rem; display:block; margin-bottom:0.15rem; }
+
+  /* Pages */
+  .page { display:none; padding-bottom:70px; }
+  .page.active { display:block; }
+
+  /* Buttons */
+  .btn-primary { padding:0.6rem 1.2rem; background:var(--accent); border:none; border-radius:8px; color:var(--bg); font-weight:700; font-size:0.8rem; cursor:pointer; }
+  .btn-danger { padding:0.6rem 1.2rem; background:var(--red); border:none; border-radius:8px; color:#fff; font-weight:700; font-size:0.8rem; cursor:pointer; }
+  .btn-ghost { padding:0.5rem 0.8rem; background:transparent; border:1px solid var(--border); border-radius:8px; color:var(--text2); font-size:0.8rem; cursor:pointer; }
+
+  /* Modal */
+  .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:100; justify-content:center; align-items:flex-end; }
+  .modal-bg.show { display:flex; }
+  .modal-sheet { background:var(--card); border-radius:16px 16px 0 0; width:100%; max-width:500px; max-height:85vh; overflow-y:auto; padding:1.5rem; }
+  .modal-sheet h3 { margin-bottom:1rem; }
+  .modal-sheet label { display:block; font-size:0.8rem; color:var(--text3); margin:0.75rem 0 0.25rem; }
+  .modal-sheet input, .modal-sheet select { width:100%; padding:0.6rem; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:0.9rem; }
+  .modal-sheet input:focus, .modal-sheet select:focus { outline:none; border-color:var(--accent); }
+  .modal-actions { display:flex; gap:0.5rem; margin-top:1.25rem; justify-content:flex-end; }
+  .modal-msg { font-size:0.8rem; margin-top:0.5rem; }
+  .modal-msg.ok { color:var(--green); }
+  .modal-msg.err { color:var(--red); }
+
+  /* Activity list */
+  .activity-item { padding:0.6rem 0; border-bottom:1px solid rgba(39,68,95,0.2); }
+  .activity-top { display:flex; justify-content:space-between; font-size:0.8rem; }
+  .activity-type { color:var(--accent); font-weight:600; }
+  .activity-time { color:var(--text3); font-size:0.7rem; }
+  .activity-detail { font-size:0.75rem; color:var(--text2); margin-top:0.15rem; }
+
+  .empty { color:var(--text3); font-style:italic; padding:1.5rem 0; text-align:center; font-size:0.85rem; }
+</style>
+</head>
+<body>
+
+<!-- Auth -->
+<div id="auth" class="auth">
+  <h1>Demi<span>Pass</span></h1>
+  <p>Sign in to your vault</p>
+  <input type="text" id="auth-user" placeholder="Username" autocomplete="username">
+  <input type="password" id="auth-pass" placeholder="Password" autocomplete="current-password">
+  <button onclick="login()">Sign in</button>
+  <div id="auth-err" class="auth-err"></div>
+</div>
+
+<!-- App -->
+<div id="app" class="app">
+  <div class="topbar">
+    <div class="topbar-left">Demi<span>Pass</span></div>
+    <div class="topbar-right">
+      <span class="topbar-user" id="app-user"></span>
+      <span class="topbar-out" onclick="logout()">out</span>
+    </div>
+  </div>
+
+  <div id="panic" class="panic-strip">
+    <span>ALL BREAKERS TRIPPED</span>
+    <button class="btn-ghost" style="margin-left:0.5rem;font-size:0.7rem" onclick="resetPanic()">Reset</button>
+  </div>
+
+  <!-- Page: Vault (home) -->
+  <div id="page-vault" class="page active">
+    <div class="balance-hero">
+      <div class="balance-amount" id="bal">--</div>
+      <div class="balance-label">Diamond Dust</div>
+    </div>
+    <div class="quick-stats">
+      <div class="qs"><div class="qs-val" style="color:var(--accent)" id="qs-secrets">--</div><div class="qs-label">Secrets</div></div>
+      <div class="qs"><div class="qs-val" style="color:var(--yellow)" id="qs-tokens">--</div><div class="qs-label">Tokens 24h</div></div>
+      <div class="qs"><div class="qs-val" style="color:var(--green)" id="qs-streak">--</div><div class="qs-label">Streak</div></div>
+    </div>
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">Secrets</span>
+        <button class="btn-primary" onclick="openModal('store')">+ New</button>
+      </div>
+      <div id="secret-list"><div class="empty">No secrets yet</div></div>
+    </div>
+    <div style="padding:1rem;text-align:center">
+      <button class="btn-danger" onclick="confirmPanic()" style="width:100%;padding:0.8rem;border-radius:10px">Trip All Breakers</button>
+    </div>
+  </div>
+
+  <!-- Page: Activity -->
+  <div id="page-activity" class="page">
+    <div class="section" style="padding-top:1rem">
+      <div class="section-head">
+        <span class="section-title">Recent Activity</span>
+        <button class="btn-ghost" onclick="loadActivity()">Refresh</button>
+      </div>
+      <div id="activity-list"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Page: Buoy -->
+  <div id="page-buoy" class="page">
+    <div class="section" style="padding-top:1rem">
+      <div class="section-head">
+        <span class="section-title">Tick Chain</span>
+        <button class="btn-primary" onclick="openModal('tick')">Drop Tick</button>
+      </div>
+      <div id="tick-list"><div class="empty">Loading...</div></div>
+    </div>
+    <div class="section">
+      <div class="section-head">
+        <span class="section-title">Triggers</span>
+        <button class="btn-ghost" onclick="openModal('chrono')">+ Trigger</button>
+      </div>
+      <div id="trigger-list"><div class="empty">Loading...</div></div>
+    </div>
+  </div>
+
+  <!-- Page: Settings -->
+  <div id="page-settings" class="page">
+    <div class="section" style="padding-top:1rem">
+      <div class="section-title" style="padding:0.75rem 0">Account</div>
+      <div style="background:var(--card);border-radius:12px;padding:1rem">
+        <div style="font-size:0.8rem;color:var(--text3)">DID</div>
+        <div id="set-did" style="font-family:monospace;font-size:0.7rem;word-break:break-all;margin-bottom:0.75rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3)">Email</div>
+        <div id="set-email" style="font-size:0.85rem;margin-bottom:0.75rem"></div>
+      </div>
+      <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
+      <div style="display:flex;flex-direction:column;gap:0.5rem">
+        <button class="btn-ghost" onclick="verifyChain()" style="width:100%;text-align:left;padding:0.8rem">Verify chain integrity</button>
+        <button class="btn-ghost" onclick="loadLedgerSummary()" style="width:100%;text-align:left;padding:0.8rem">Ledger summary</button>
+      </div>
+      <div id="settings-output" style="margin-top:1rem;font-size:0.8rem"></div>
+    </div>
+  </div>
+
+  <!-- Bottom nav -->
+  <div class="bottomnav">
+    <div class="bn-item active" data-page="vault"><span class="bn-icon">&#x1f512;</span>Vault</div>
+    <div class="bn-item" data-page="activity"><span class="bn-icon">&#x26a1;</span>Activity</div>
+    <div class="bn-item" data-page="buoy"><span class="bn-icon">&#x2693;</span>Buoy</div>
+    <div class="bn-item" data-page="settings"><span class="bn-icon">&#x2699;</span>Settings</div>
+  </div>
+</div>
+
+<!-- Store Modal -->
+<div id="modal-store" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Store a Secret</h3>
+    <label>Name</label><input type="text" id="s-name" placeholder="e.g. OPENROUTER_KEY">
+    <label>Value</label><input type="password" id="s-value" placeholder="The secret value">
+    <label>Type</label>
+    <select id="s-type"><option value="api_key">API Key</option><option value="password">Password</option><option value="token">Token</option><option value="other">Other</option></select>
+    <div id="s-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="storeSecret()">Store</button></div>
+  </div>
+</div>
+
+<!-- Tick Modal -->
+<div id="modal-tick" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Drop a Tick</h3>
+    <label>Type</label>
+    <select id="t-type"><option value="tick">General</option><option value="begin">Begin</option><option value="complete">Complete</option><option value="handoff">Handoff</option><option value="decision">Decision</option><option value="block">Block</option><option value="unblock">Unblock</option></select>
+    <label>Note</label><input type="text" id="t-note" placeholder="What happened?">
+    <div id="t-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="dropTick()">Drop</button></div>
+  </div>
+</div>
+
+<!-- Chrono Modal -->
+<div id="modal-chrono" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Arm Trigger</h3>
+    <label>Name</label><input type="text" id="c-name" placeholder="e.g. daily-check">
+    <label>Fire in</label><input type="text" id="c-fire" placeholder="e.g. 24h, 7d">
+    <label>Action</label>
+    <select id="c-action"><option value="tick">Auto-tick</option><option value="webhook">Webhook</option></select>
+    <label>Target (webhook URL)</label><input type="text" id="c-target" placeholder="https://...">
+    <div id="c-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="armTrigger()">Arm</button></div>
+  </div>
+</div>
+
+<script>
+const API='https://api.dustforge.com';
+let tk=localStorage.getItem('dp_token')||'',did=localStorage.getItem('dp_did')||'',user=localStorage.getItem('dp_user')||'';
+let secrets=[],panic=false;
+
+if(tk)showApp();
+
+async function api(m,p,b){const o={method:m,headers:{'Content-Type':'application/json'}};if(tk)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const r=await fetch(API+p,o);const d=await r.json().catch(()=>({}));if(r.status>=400)throw new Error(d.error||'failed');return d}
+
+async function login(){
+  const u=document.getElementById('auth-user').value.trim(),p=document.getElementById('auth-pass').value,e=document.getElementById('auth-err');
+  e.textContent='';if(!u||!p){e.textContent='Username and password required';return}
+  try{const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
+  tk=a.token;did=a.did||'';user=u;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);showApp()}catch(x){e.textContent=x.message}}
+
+function logout(){tk='';did='';user='';localStorage.removeItem('dp_token');localStorage.removeItem('dp_did');localStorage.removeItem('dp_user');document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
+
+// Nav
+document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>{
+  document.querySelectorAll('.bn-item').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
+  n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
+  if(n.dataset.page==='activity')loadActivity();
+  if(n.dataset.page==='buoy')loadBuoy();
+}));
+
+async function showApp(){
+  document.getElementById('auth').style.display='none';document.getElementById('app').style.display='block';
+  document.getElementById('app-user').textContent=user;
+  document.getElementById('set-did').textContent=did;
+  document.getElementById('set-email').textContent=user+'@dustforge.com';
+  await loadVault()}
+
+async function loadVault(){
+  const[b,s,h,t]=await Promise.allSettled([api('GET','/api/identity/balance?did='+encodeURIComponent(did)),api('GET','/api/demipass/list'),api('GET','/api/demipass/history?limit=15'),api('GET','/api/tick/stats')]);
+  if(b.status==='fulfilled'){document.getElementById('bal').textContent=b.value.balance_cents||0}
+  if(s.status==='fulfilled'){secrets=s.value.secrets||[];document.getElementById('qs-secrets').textContent=secrets.length;renderSecrets()}else{document.getElementById('qs-secrets').textContent='0'}
+  if(h.status==='fulfilled'){const ev=h.value.events||h.value.history||[];const d=Date.now()-864e5;document.getElementById('qs-tokens').textContent=ev.filter(e=>e.event_type==='token_issued'&&new Date(e.created_at).getTime()>d).length}
+  if(t.status==='fulfilled'){document.getElementById('qs-streak').textContent=t.value.streak_days||0}}
+
+function renderSecrets(){
+  if(!secrets.length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}
+  let h='';for(const s of secrets){
+    const on=s.status==='active'&&!panic;
+    h+=`<div class="secret-card"><div class="secret-dot ${on?'on':'off'}"></div><div class="secret-info"><div class="secret-name">${esc(s.name)}</div><div class="secret-meta">${esc(s.secret_type||'-')} &middot; ${s.context_count||0} contexts</div></div><div class="secret-actions">${s.status==='active'?`<button class="sa-btn" onclick="revokeSecret('${esc(s.name)}')">revoke</button>`:''}</div></div>`}
+  document.getElementById('secret-list').innerHTML=h}
+
+async function loadActivity(){
+  try{const h=await api('GET','/api/demipass/history?limit=20');const ev=h.events||h.history||[];
+  if(!ev.length){document.getElementById('activity-list').innerHTML='<div class="empty">No activity yet</div>';return}
+  let html='';for(const e of ev){let det=e.detail||'';try{det=typeof det==='string'?JSON.parse(det):det}catch{}
+  const sum=typeof det==='object'?(det.name||det.secret_name||det.message||JSON.stringify(det).slice(0,60)):String(det).slice(0,60);
+  html+=`<div class="activity-item"><div class="activity-top"><span class="activity-type">${esc(e.event_type||'event')}</span><span class="activity-time">${new Date(e.created_at).toLocaleTimeString()}</span></div><div class="activity-detail">${esc(sum)}</div></div>`}
+  document.getElementById('activity-list').innerHTML=html}catch{document.getElementById('activity-list').innerHTML='<div class="empty">Could not load</div>'}}
+
+async function loadBuoy(){
+  try{const d=await api('GET','/api/tick/ledger?limit=15');const ticks=d.ticks||[];
+  if(!ticks.length){document.getElementById('tick-list').innerHTML='<div class="empty">No ticks yet</div>'}
+  else{let h='';for(const t of ticks){h+=`<div class="activity-item"><div class="activity-top"><span class="activity-type">${esc(t.tick_type||'tick')}</span><span class="activity-time">${new Date(t.created_at).toLocaleTimeString()}</span></div><div class="activity-detail">${esc(t.note)}</div></div>`}
+  document.getElementById('tick-list').innerHTML=h}}catch{document.getElementById('tick-list').innerHTML='<div class="empty">Could not load</div>'}
+  try{const d=await api('GET','/api/chrono/list');const tr=d.triggers||[];
+  if(!tr.length){document.getElementById('trigger-list').innerHTML='<div class="empty">No triggers armed</div>'}
+  else{let h='';for(const t of tr){h+=`<div class="activity-item"><div class="activity-top"><span class="activity-type" style="color:${t.status==='armed'?'var(--green)':'var(--text3)'}">${esc(t.name)}</span><span class="activity-time">${t.status}</span></div><div class="activity-detail">fires: ${new Date(t.fire_at).toLocaleString()}</div></div>`}
+  document.getElementById('trigger-list').innerHTML=h}}catch{}}
+
+// Actions
+async function storeSecret(){const n=document.getElementById('s-name').value.trim(),v=document.getElementById('s-value').value,t=document.getElementById('s-type').value,m=document.getElementById('s-msg');
+  if(!n||!v){m.textContent='Name and value required';m.className='modal-msg err';return}
+  try{await api('POST','/api/demipass/store',{name:n,value:v,secret_type:t});m.textContent='Stored';m.className='modal-msg ok';document.getElementById('s-value').value='';loadVault();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+
+async function revokeSecret(name){if(!confirm('Revoke '+name+'?'))return;try{await api('DELETE','/api/demipass/revoke',{name});loadVault()}catch(e){alert(e.message)}}
+
+function confirmPanic(){if(!confirm('TRIP ALL BREAKERS? This revokes every active secret.'))return;(async()=>{for(const s of secrets.filter(x=>x.status==='active')){try{await api('DELETE','/api/demipass/revoke',{name:s.name})}catch{}}panic=true;document.getElementById('panic').style.display='block';loadVault()})()}
+function resetPanic(){panic=false;document.getElementById('panic').style.display='none';loadVault()}
+
+async function dropTick(){const t=document.getElementById('t-type').value,n=document.getElementById('t-note').value.trim(),m=document.getElementById('t-msg');
+  if(!n){m.textContent='Note required';m.className='modal-msg err';return}
+  try{const r=await api('POST','/api/tick',{type:t,note:n});m.textContent='Tick #'+r.tick_id;m.className='modal-msg ok';loadBuoy();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+
+async function armTrigger(){const n=document.getElementById('c-name').value.trim(),f=document.getElementById('c-fire').value.trim(),a=document.getElementById('c-action').value,t=document.getElementById('c-target').value.trim(),m=document.getElementById('c-msg');
+  if(!n||!f){m.textContent='Name and fire time required';m.className='modal-msg err';return}
+  try{const r=await api('POST','/api/chrono/create',{name:n,fire_in:f,action:a,target:t||'self'});m.textContent='Armed';m.className='modal-msg ok';loadBuoy();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+
+async function verifyChain(){const o=document.getElementById('settings-output');try{const r=await api('POST','/api/tick/chain/verify',{did});o.innerHTML=r.valid?'<span style="color:var(--green)">Chain valid — '+r.ticks_checked+' ticks verified</span>':'<span style="color:var(--red)">Chain broken at tick #'+r.broken_at_tick_id+'</span>'}catch(e){o.textContent=e.message}}
+
+async function loadLedgerSummary(){const o=document.getElementById('settings-output');try{const r=await api('GET','/api/ledger/summary');o.innerHTML='Entries: '+r.total_entries+'<br>First: '+(r.first_entry||'—')+'<br>Last: '+(r.last_entry||'—')}catch(e){o.textContent=e.message}}
+
+function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
+function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
+function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+
+document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModal()});
+setInterval(loadVault,30000);
+</script>
+</body>
+</html>
