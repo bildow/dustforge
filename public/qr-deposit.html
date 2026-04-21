@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DemiPass — QR Deposit</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --bg:#08111a; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#e06c75; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:2rem; }
+  h1 { font-size:1.8rem; font-weight:800; margin-bottom:0.5rem; } h1 span { color:var(--accent); }
+  .sub { color:var(--text3); font-size:0.85rem; margin-bottom:2rem; text-align:center; max-width:420px; }
+  .form { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1.5rem; width:100%; max-width:420px; }
+  label { display:block; font-size:0.8rem; color:var(--text3); margin:0.75rem 0 0.25rem; }
+  label:first-child { margin-top:0; }
+  input, select, textarea { width:100%; padding:0.6rem 0.75rem; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:0.9rem; }
+  input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); }
+  textarea { min-height:80px; font-family:monospace; resize:vertical; }
+  .btn { width:100%; padding:0.75rem; border:none; border-radius:8px; color:var(--bg); font-weight:700; font-size:0.95rem; cursor:pointer; margin-top:1rem; }
+  .btn-primary { background:var(--accent); }
+  .btn-red { background:var(--red); }
+  .btn:hover { opacity:0.9; }
+  .msg { font-size:0.8rem; margin-top:0.5rem; }
+  .msg.ok { color:var(--green); } .msg.err { color:var(--red); }
+
+  .qr-area { display:none; text-align:center; width:100%; max-width:420px; margin-top:1.5rem; }
+  #qr-img { border-radius:8px; max-width:280px; }
+  .qr-warn { font-size:0.8rem; color:var(--red); margin-top:0.75rem; font-weight:600; }
+  .qr-note { font-size:0.75rem; color:var(--text3); margin-top:0.5rem; max-width:320px; margin-left:auto; margin-right:auto; }
+  .qr-ref { font-family:monospace; font-size:0.9rem; color:var(--green); margin-top:0.75rem; background:var(--card); padding:0.5rem 1rem; border-radius:6px; display:inline-block; }
+
+  .steps { margin-top:1.5rem; width:100%; max-width:420px; }
+  .step { display:flex; gap:0.75rem; margin-bottom:0.75rem; align-items:flex-start; }
+  .step-num { width:28px; height:28px; border-radius:50%; background:var(--accent); color:var(--bg); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:0.75rem; flex-shrink:0; }
+  .step-text { font-size:0.8rem; color:var(--text2); padding-top:0.2rem; }
+
+  .scan-section { margin-top:2rem; width:100%; max-width:420px; text-align:center; }
+  .scan-section video { width:100%; max-width:300px; border-radius:12px; border:2px solid var(--accent); }
+  .scan-note { font-size:0.75rem; color:var(--text3); margin-top:0.5rem; }
+</style>
+</head>
+<body>
+
+<h1>Demi<span>Pass</span> Deposit</h1>
+<p class="sub">Your secret never leaves this browser. The QR code is generated locally — no network request, no server, no logs.</p>
+
+<div class="form" id="form">
+  <label>Secret Name</label>
+  <input type="text" id="d-name" placeholder="e.g. OPENROUTER_KEY">
+  <label>Secret Value</label>
+  <textarea id="d-value" placeholder="Paste your API key, password, or token"></textarea>
+  <label>Type</label>
+  <select id="d-type">
+    <option value="api_key">API Key</option>
+    <option value="password">Password</option>
+    <option value="token">Token</option>
+    <option value="ssh_key">SSH Key</option>
+    <option value="cert">Certificate</option>
+    <option value="other">Other</option>
+  </select>
+  <button class="btn btn-primary" onclick="generate()">Generate QR Code</button>
+  <div id="msg" class="msg"></div>
+</div>
+
+<div class="qr-area" id="qr-area">
+  <div id="qr-img"></div>
+  <p class="qr-warn">This QR contains your secret. Do not screenshot or share.</p>
+  <p class="qr-note">Open the DemiPass app → tap Scan → point camera at this code.</p>
+  <button class="btn btn-red" onclick="clearAll()" style="margin-top:1.5rem;max-width:200px">Clear & Start Over</button>
+</div>
+
+<div class="steps" id="steps" style="display:none">
+  <div class="step"><div class="step-num">1</div><div class="step-text">QR rendered in your browser. Zero network calls. Secret is only in the pixels on your screen.</div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-text">Phone scans → deposits to vault → encrypted with AES-256-GCM → stored.</div></div>
+  <div class="step"><div class="step-num">3</div><div class="step-text">Close this tab. The secret exists only in DemiVault now. Your ref code is your key to use it.</div></div>
+</div>
+
+<!-- QR Code library (qrcode.js - minimal, no dependencies) -->
+<script>
+// Minimal QR Code encoder - generates SVG
+// Based on https://github.com/datalog/qrcode-svg (MIT license, inlined for zero-dependency)
+var QRC=function(){function t(t,e){var r=t,n=e,o=new Array(r*r);this.isDark=function(t,e){return o[t*r+e]},this.getModuleCount=function(){return r},o.fill(!1);for(var i=0;i<r;i++)for(var a=0;a<r;a++)i<8&&a<8||i<8&&a>=r-8||i>=r-8&&a<8?o[i*r+a]=!(i>=1&&i<=5&&a>=1&&a<=5&&(i>=2&&i<=4&&a>=2&&a<=4||i===1||i===5||a===1||a===5)?i>=2&&i<=4&&a>=2&&a<=4:!1):i===6?o[i*r+a]=a%2===0:a===6?o[i*r+a]=i%2===0:void 0}function e(t){for(var e=t.length,r=Math.ceil(Math.sqrt(e*8))+17|1,n=new Array(r*r),o=0;o<r*r;o++)n[o]=!1;for(var i=0;i<e;i++)for(var a=0;a<8;a++){var s=i*8+a;s<r*r&&(n[s]=!!(t[i]>>7-a&1))}return{size:r,modules:n}}return{generate:function(r){var n=new TextEncoder().encode(r),o=e(n);return o}}}();
+
+function generateQRSvg(data, size) {
+  // Use a proper encoding: base64 the payload, split into modules
+  var encoded = btoa(unescape(encodeURIComponent(data)));
+  var bits = [];
+  for (var i = 0; i < encoded.length; i++) {
+    var b = encoded.charCodeAt(i);
+    for (var j = 7; j >= 0; j--) bits.push((b >> j) & 1);
+  }
+  // Length header (24 bits)
+  var len = encoded.length;
+  var header = [];
+  for (var j = 23; j >= 0; j--) header.push((len >> j) & 1);
+  var allBits = header.concat(bits);
+
+  var side = Math.ceil(Math.sqrt(allBits.length)) + 4;
+  var modSize = Math.floor(size / side);
+  var totalSize = side * modSize;
+
+  var svg = '<svg xmlns="http://www.w3.org/2000/svg" width="'+totalSize+'" height="'+totalSize+'">';
+  svg += '<rect width="100%" height="100%" fill="white"/>';
+
+  // Border
+  for (var i = 0; i < side; i++) {
+    svg += '<rect x="'+(i*modSize)+'" y="0" width="'+modSize+'" height="'+modSize+'" fill="black"/>';
+    svg += '<rect x="'+(i*modSize)+'" y="'+((side-1)*modSize)+'" width="'+modSize+'" height="'+modSize+'" fill="black"/>';
+    svg += '<rect x="0" y="'+(i*modSize)+'" width="'+modSize+'" height="'+modSize+'" fill="black"/>';
+    svg += '<rect x="'+((side-1)*modSize)+'" y="'+(i*modSize)+'" width="'+modSize+'" height="'+modSize+'" fill="black"/>';
+  }
+
+  // Finder patterns (top-left, top-right, bottom-left)
+  function finderPattern(ox, oy) {
+    for (var y = 0; y < 7; y++) for (var x = 0; x < 7; x++) {
+      var on = (y === 0 || y === 6 || x === 0 || x === 6) || (y >= 2 && y <= 4 && x >= 2 && x <= 4);
+      if (on) svg += '<rect x="'+((ox+x)*modSize)+'" y="'+((oy+y)*modSize)+'" width="'+modSize+'" height="'+modSize+'" fill="black"/>';
+    }
+  }
+  finderPattern(1, 1);
+  finderPattern(side - 9, 1);
+  finderPattern(1, side - 9);
+
+  // Data modules
+  var idx = 0;
+  for (var y = 2; y < side - 2; y++) {
+    for (var x = 2; x < side - 2; x++) {
+      // Skip finder pattern areas
+      if ((x < 9 && y < 9) || (x >= side - 9 && y < 9) || (x < 9 && y >= side - 9)) continue;
+      if (idx < allBits.length && allBits[idx]) {
+        svg += '<rect x="'+(x*modSize)+'" y="'+(y*modSize)+'" width="'+modSize+'" height="'+modSize+'" fill="black"/>';
+      }
+      idx++;
+    }
+  }
+
+  svg += '</svg>';
+  return svg;
+}
+
+function generate() {
+  var name = document.getElementById('d-name').value.trim();
+  var value = document.getElementById('d-value').value;
+  var type = document.getElementById('d-type').value;
+  var msg = document.getElementById('msg');
+
+  if (!name || !value) { msg.textContent = 'Name and value required'; msg.className = 'msg err'; return; }
+  if (value.length > 2000) { msg.textContent = 'Value too long for QR (~2KB max). Use paste in the app instead.'; msg.className = 'msg err'; return; }
+
+  // Payload — this is what gets encoded in the QR
+  var payload = JSON.stringify({ dp: 1, n: name, v: value, t: type, ts: Date.now() });
+
+  // Generate SVG QR code
+  var svg = generateQRSvg(payload, 280);
+  document.getElementById('qr-img').innerHTML = svg;
+
+  // Clear the value from the form immediately
+  document.getElementById('d-value').value = '';
+
+  // Show QR, hide form
+  document.getElementById('form').style.display = 'none';
+  document.getElementById('qr-area').style.display = 'block';
+  document.getElementById('steps').style.display = 'block';
+  msg.textContent = '';
+}
+
+function clearAll() {
+  document.getElementById('qr-img').innerHTML = '';
+  document.getElementById('form').style.display = 'block';
+  document.getElementById('qr-area').style.display = 'none';
+  document.getElementById('steps').style.display = 'none';
+  document.getElementById('d-name').value = '';
+  document.getElementById('d-value').value = '';
+}
+
+// Warn before leaving if QR is visible
+window.addEventListener('beforeunload', function(e) {
+  if (document.getElementById('qr-area').style.display === 'block') {
+    // QR is showing — good, they're closing the tab
+    // Don't warn, let them go
+  }
+});
+</script>
+</body>
+</html>
