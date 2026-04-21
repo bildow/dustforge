@@ -8369,6 +8369,39 @@ app.get('/api/identity/genesis/status', (req, res) => {
   res.json({ did, genesis_recorded: !!exists, recorded_at: exists?.created_at || null });
 });
 
+// ============================================================
+// Genesis Hash Backup — air-gap protocol support
+// ============================================================
+// The genesis fingerprint DB is the crown jewel. This endpoint
+// exports origin hashes for air-gapped backup to physical media.
+
+app.get('/api/admin/genesis-backup', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  const fingerprints = db.prepare('SELECT did, origin_hash, structural_hash, word_count, seed_version, created_at FROM genesis_fingerprints ORDER BY created_at ASC').all();
+  const backupHash = crypto.createHash('sha256')
+    .update(fingerprints.map(f => f.origin_hash).join(':'))
+    .digest('hex');
+
+  res.json({
+    backup_type: 'genesis_fingerprints',
+    created_at: new Date().toISOString(),
+    total_fingerprints: fingerprints.length,
+    integrity_hash: backupHash,
+    fingerprints,
+    protocol: {
+      step_1: 'Save this JSON to a USB drive or offline storage',
+      step_2: 'Store the drive in a physically secure location',
+      step_3: 'Rotate backup media every 24 hours',
+      step_4: 'Old backups should be retained for 30 days minimum',
+      step_5: 'The integrity_hash can verify the backup is complete and unmodified',
+      warning: 'These hashes are the root of all identity. If compromised, all derived identities are compromised. Treat with the same care as a root CA private key.',
+    },
+  });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
