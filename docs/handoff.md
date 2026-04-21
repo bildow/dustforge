@@ -157,24 +157,13 @@ Brain is already onboarded with a Dustforge DID. Test the app flow:
 One active use-token per secret per DID. Returns 429 if outstanding token exists.
 **Verify:** request a token, don't redeem, request another for same secret → should get 429.
 
-### Card #18: Trust gradient fingerprint — SHIPPED (4c61635) per Brain's design review
-Three-ring fingerprint as trust gradient, not binary gate. Buoy tick chain IS the behavioral
-profile. Anomaly detection computes deviation from historic pattern:
-- Normal (<20% deviation): proceed
-- Unusual (20-50%): proceed + flag in audit
-- Suspicious (50-80%): suspend transaction 1 hour
-- Anomalous (80-95%): suspend all access 12 hours
-- Critical (>95% or impossible pattern): lock until carbon re-auth
-
-Rings: Inner (request source — IP, agent, TLS), Middle (temporal — time-of-day, frequency,
-tick type distribution), Outer (behavioral — action sequences, session shape).
-
-**Questions for Brain:**
-1. How do we compute "deviation" without a statistics library? Simple thresholds vs actual distribution?
-2. What's the minimum tick history before the profile is meaningful? 10 ticks? 50? 100?
-3. How do we handle legitimate pattern changes (new IP, new time zone, new workflow)?
-4. Should the gradient apply to ALL token requests or only high-value actions (ssh_exec, document)?
-5. False positive cost: a 1-hour suspension during a production deploy is catastrophic. How do we tune?
+### Card #18: Trust gradient — SHIPPED (4c61635) as ADVISORY ONLY per Brain's design review
+**NOTE: This is NOT the three-ring deviation/suspension system from the original design.**
+Brain's review explicitly recommended: "ship only as explanatory reputation, not authority primitive."
+What shipped is a simple additive score over 6 factors, mapped to 6 coarse bands.
+Does NOT compute deviation from historic behavior. Does NOT suspend or lock access.
+Advisory only — influences review queues and UI prominence, not authorization.
+The deviation/suspension model remains a future design question (not claimed as shipped).
 
 ### Card #19: Wallet attestation on Buoy ticks — SHIPPED (ea0e1d2)
 Signed ticks now include attestation block: wallet_active, secrets_count, custody_since,

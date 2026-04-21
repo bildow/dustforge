@@ -2054,7 +2054,20 @@ const DID_TOKEN_LIMIT = 10;        // max tokens per DID per minute
 const DID_TOKEN_WINDOW = 60000;
 const VELOCITY_THRESHOLD = 5;      // distinct secrets in this window
 const VELOCITY_WINDOW = 1800000;   // 30 minutes
-const suspendedDids = new Set();    // DIDs auto-suspended by velocity throttle
+// Suspended DIDs — persisted to DB so suspensions survive restarts
+try { db.exec(`CREATE TABLE IF NOT EXISTS suspended_dids (
+  did TEXT PRIMARY KEY,
+  reason TEXT DEFAULT '',
+  suspended_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// Load existing suspensions from DB on startup
+const suspendedDids = new Set();
+try {
+  const rows = db.prepare('SELECT did FROM suspended_dids').all();
+  for (const r of rows) suspendedDids.add(r.did);
+  if (rows.length) console.log(`[VELOCITY] loaded ${rows.length} suspended DIDs from DB`);
+} catch(e) {}
 
 function checkDidRateLimit(did) {
   const now = Date.now();
@@ -2082,7 +2095,9 @@ function checkVelocityThrottle(did, secretId) {
 
   if (access.size >= VELOCITY_THRESHOLD) {
     suspendedDids.add(did);
-    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${access.size} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED`);
+    // Persist to DB so suspension survives restart
+    try { db.prepare('INSERT OR REPLACE INTO suspended_dids (did, reason) VALUES (?, ?)').run(did, `velocity: ${access.size} secrets in ${VELOCITY_WINDOW/60000}min`); } catch(_) {}
+    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${access.size} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED (persisted)`);
     // Buoy alert tick
     try {
       db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
@@ -7574,7 +7589,8 @@ app.post('/api/blindkey/unsuspend', rateLimitStandard, (req, res) => {
     suspendedDids.delete(did);
     didSecretAccess.delete(did);
     didTokenCounters.delete(did);
-    console.log(`[VELOCITY] DID ${did.slice(0, 30)} unsuspended by admin`);
+    try { db.prepare('DELETE FROM suspended_dids WHERE did = ?').run(did); } catch(_) {}
+    console.log(`[VELOCITY] DID ${did.slice(0, 30)} unsuspended by admin (removed from DB)`);
     return res.json({ ok: true, did, status: 'unsuspended' });
   }
   res.json({ ok: true, did, status: 'was not suspended' });
@@ -7768,13 +7784,46 @@ app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
   });
 });
 
+// GET /api/buoy/notarized/:id — inspect a notarization before signing
+app.get('/api/buoy/notarized/:id', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const record = db.prepare('SELECT * FROM notarized_ticks WHERE id = ?').get(req.params.id);
+  if (!record) return res.status(404).json({ error: 'not found' });
+  if (record.initiator_did !== auth.did && record.counterparty_did !== auth.did) {
+    return res.status(403).json({ error: 'you are not a party to this notarization' });
+  }
+
+  // Parse the canonical payload so the counterparty can read it
+  let parsed = {};
+  try { parsed = JSON.parse(record.canonical_payload); } catch {}
+
+  res.json({
+    id: record.id,
+    status: record.status,
+    initiator_did: record.initiator_did,
+    counterparty_did: record.counterparty_did,
+    claim: parsed.claim || '',
+    canonical_payload: parsed,
+    payload_hash: record.payload_hash,
+    asset_ref: record.asset_ref,
+    amount: record.amount,
+    unit: record.unit,
+    expires_at: record.expires_at,
+    created_at: record.created_at,
+    cosigned_at: record.cosigned_at,
+    note: record.status === 'pending' ? 'Review the claim above. If you agree, POST /api/buoy/cosign with this notarized_id and payload_hash.' : null,
+  });
+});
+
 // POST /api/buoy/cosign — counterparty co-signs a notarized intent
 app.post('/api/buoy/cosign', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
 
   const { notarized_id, payload_hash } = req.body || {};
-  if (!notarized_id) return res.status(400).json({ error: 'notarized_id required' });
+  if (!notarized_id || !payload_hash) return res.status(400).json({ error: 'notarized_id and payload_hash required. Inspect the payload first via GET /api/buoy/notarized/:id' });
 
   const record = db.prepare('SELECT * FROM notarized_ticks WHERE id = ?').get(notarized_id);
   if (!record) return res.status(404).json({ error: 'notarized tick not found' });
@@ -7785,9 +7834,9 @@ app.post('/api/buoy/cosign', rateLimitStandard, (req, res) => {
     return res.status(410).json({ error: 'notarization expired' });
   }
 
-  // Verify payload hash matches
-  if (payload_hash && payload_hash !== record.payload_hash) {
-    return res.status(400).json({ error: 'payload_hash mismatch — you may be signing a different version' });
+  // Verify payload hash matches — counterparty MUST prove they saw the exact payload
+  if (payload_hash !== record.payload_hash) {
+    return res.status(400).json({ error: 'payload_hash mismatch — you may be signing a different version. Inspect via GET /api/buoy/notarized/' + notarized_id });
   }
 
   // Generate counterparty signature
@@ -7843,10 +7892,10 @@ app.get('/api/buoy/notarized', rateLimitStandard, (req, res) => {
   const { status } = req.query;
   let records;
   if (status) {
-    records = db.prepare('SELECT id, tick_id, initiator_did, counterparty_did, payload_hash, asset_ref, amount, unit, expires_at, status, created_at, cosigned_at FROM notarized_ticks WHERE (initiator_did = ? OR counterparty_did = ?) AND status = ? ORDER BY id DESC LIMIT 50')
+    records = db.prepare('SELECT id, tick_id, initiator_did, counterparty_did, canonical_payload, payload_hash, asset_ref, amount, unit, expires_at, status, created_at, cosigned_at FROM notarized_ticks WHERE (initiator_did = ? OR counterparty_did = ?) AND status = ? ORDER BY id DESC LIMIT 50')
       .all(auth.did, auth.did, status);
   } else {
-    records = db.prepare('SELECT id, tick_id, initiator_did, counterparty_did, payload_hash, asset_ref, amount, unit, expires_at, status, created_at, cosigned_at FROM notarized_ticks WHERE initiator_did = ? OR counterparty_did = ? ORDER BY id DESC LIMIT 50')
+    records = db.prepare('SELECT id, tick_id, initiator_did, counterparty_did, canonical_payload, payload_hash, asset_ref, amount, unit, expires_at, status, created_at, cosigned_at FROM notarized_ticks WHERE initiator_did = ? OR counterparty_did = ? ORDER BY id DESC LIMIT 50')
       .all(auth.did, auth.did);
   }
 
