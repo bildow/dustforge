@@ -2183,6 +2183,33 @@ function graduatedSuspensionTier(did, distinctCount, threshold) {
   return { action: 'lock', duration: 0, reason: `velocity: locked until re-auth (resonance ${resonance})` };
 }
 
+// Progressive barrel auth — resonance-gated tiers
+// Uses existing BARREL_TIERS array ['single', 'double', 'critical'] from line 25
+const BARREL_RESONANCE_GATES = {
+  single: { min_resonance: 0, description: 'basic read operations' },
+  double: { min_resonance: 20, description: 'write operations — requires established behavioral pattern' },
+  critical: { min_resonance: 50, description: 'destructive/admin operations — requires strong behavioral pattern' },
+};
+
+function checkBarrelAuth(did, tier) {
+  const required = BARREL_RESONANCE_GATES[tier];
+  if (!required) return { ok: true };
+
+  const resonance = getResonanceScore(did);
+
+  if (resonance < required.min_resonance) {
+    return {
+      ok: false,
+      error: `${tier} barrel auth required (resonance ${resonance} < ${required.min_resonance}). ${required.description}. Build more behavioral history to unlock this tier.`,
+      resonance,
+      required: required.min_resonance,
+      tier,
+    };
+  }
+
+  return { ok: true, resonance, tier };
+}
+
 function checkVelocityThrottle(did, secretId) {
   if (suspendedDids.has(did)) return false;
 
