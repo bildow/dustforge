@@ -1598,6 +1598,35 @@ setInterval(() => {
   } catch (e) { /* ignore cleanup errors */ }
 }, 60000);
 
+// Sanitize secret descriptions to prevent prompt injection.
+// Descriptions are rendered into LLM context via demipass_list.
+// A hostile silicon could inject instructions via metadata.
+// Check if an IP or hostname is private/internal (SSRF prevention)
+function isPrivateHost(host) {
+  return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.|0\.|169\.254\.|::1|fc|fd)/.test(host)
+    || /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(host)  // Tailscale CGNAT 100.64-127.x
+    || host === '169.254.169.254' || host === 'metadata.google.internal';
+}
+
+function sanitizeDescription(desc) {
+  if (!desc) return '';
+  let clean = String(desc).slice(0, 256);
+  // Strip patterns that look like instructions to an LLM
+  const injectionPatterns = [
+    /\b(IMPORTANT|URGENT|CRITICAL|NOTE|WARNING)\s*:/gi,
+    /\b(call|invoke|execute|run|send|post|get|fetch|curl|wget)\s+(demipass|api|http|the|all|every)/gi,
+    /\b(first|before|after|always|never|must|should)\s+(call|send|list|read|output|print|return)/gi,
+    /\b(ignore|disregard|override|forget)\s+(previous|above|prior|all|these|the)/gi,
+    /\b(you are|you must|you should|your task|your job|your role)\b/gi,
+    /<[^>]+>/g,  // HTML tags
+    /\{[{%]/g,   // template injection
+  ];
+  for (const pat of injectionPatterns) {
+    clean = clean.replace(pat, '[filtered]');
+  }
+  return clean;
+}
+
 // Blindkey-level encryption uses the identity module's existing AES-256-GCM
 function blindkeyEncrypt(value) {
   const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, 'hex').slice(0, 32);
@@ -1919,7 +1948,7 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
   const secrets = db.prepare(
     `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
-  ).all(ownerDid, 'active');
+  ).all(ownerDid, 'active').map(s => ({ ...s, description: sanitizeDescription(s.description) }));
   res.json({ did: ownerDid, secrets, total: secrets.length });
 });
 
@@ -3264,7 +3293,7 @@ async function handleRowenDeliver(req, res) {
         try { urlHost = new URL(url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
         if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
           // Also allow if context target_url_pattern matches (context already validated above)
-          const isPrivateNet = /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.)/.test(urlHost);
+          const isPrivateNet = isPrivateHost(urlHost);
           if (!isPrivateNet) {
             return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${ALLOWED_HOSTS.join(', ')}` });
           }
@@ -7027,11 +7056,8 @@ app.post('/api/chrono/create', async (req, res) => {
     try { targetUrl = new URL(target); } catch { return res.status(400).json({ error: 'target must be a valid URL' }); }
     if (targetUrl.protocol !== 'https:') return res.status(400).json({ error: 'webhook target must use HTTPS' });
     const host = targetUrl.hostname;
-    if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.|0\.|169\.254\.|::1|fc|fd)/.test(host)) {
+    if (isPrivateHost(host)) {
       return res.status(400).json({ error: 'webhook target cannot be a private/internal address' });
-    }
-    if (host === '169.254.169.254' || host === 'metadata.google.internal') {
-      return res.status(400).json({ error: 'webhook target blocked: cloud metadata endpoint' });
     }
     // DNS resolution check — verify resolved IP is not private
     try {
@@ -7039,7 +7065,7 @@ app.post('/api/chrono/create', async (req, res) => {
       const { promisify } = require('util');
       const ips = await promisify(dns.resolve4)(host);
       for (const ip of ips) {
-        if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)/.test(ip)) {
+        if (isPrivateHost(ip)) {
           return res.status(400).json({ error: `webhook target resolves to private IP ${ip}` });
         }
       }
@@ -7164,9 +7190,8 @@ setInterval(async () => {
         const u = new URL(trigger.target);
         if (u.protocol !== 'https:') { skipWebhook = true; }
         else {
-          // Hostname-level check
-          if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|localhost|127\.|0\.|169\.254\.|::1|fc|fd)/.test(u.hostname)) skipWebhook = true;
-          if (u.hostname === '169.254.169.254' || u.hostname === 'metadata.google.internal') skipWebhook = true;
+          // Hostname-level check (includes Tailscale CGNAT 100.64-127.x)
+          if (isPrivateHost(u.hostname)) skipWebhook = true;
 
           // DNS resolution check — resolve hostname and verify the IP is not private
           if (!skipWebhook) {
@@ -7176,7 +7201,7 @@ setInterval(async () => {
             try {
               const ips = await resolve4(u.hostname);
               for (const ip of ips) {
-                if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)/.test(ip)) {
+                if (isPrivateHost(ip)) {
                   console.error(`[CHRONO] BLOCKED: ${u.hostname} resolves to private IP ${ip}`);
                   skipWebhook = true;
                   break;
