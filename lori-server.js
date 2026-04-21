@@ -399,6 +399,39 @@ async function handleIntent(message) {
     return "That's Rowen's department, not mine. Route anything secret-related through her.";
   }
 
+  // Suspension support — check status, explain why, escalate
+  if (/suspend|locked|frozen|can.?t access|account blocked|why.?s my account/i.test(lower)) {
+    const didMatch = lower.match(/did:key:\S+/) || lower.match(/for\s+(\w+)/);
+    const username = didMatch ? didMatch[1] : null;
+    try {
+      let statusUrl = DUSTFORGE_URL + '/api/blindkey/suspension-status?did=';
+      if (username && !username.startsWith('did:')) {
+        const lookup = await dustforgeRequest('GET', '/api/identity/lookup?username=' + encodeURIComponent(username));
+        if (lookup.did) statusUrl += encodeURIComponent(lookup.did);
+        else return `I can't find an identity for "${username}". Check the username and try again.`;
+      } else if (didMatch) {
+        statusUrl += encodeURIComponent(didMatch[0]);
+      } else {
+        return "I can check suspension status if you give me a username or DID. Try: 'am I suspended' or 'check suspension for brain'.";
+      }
+      const status = await dustforgeRequest('GET', statusUrl.replace(DUSTFORGE_URL, ''));
+      if (status.suspended) {
+        return `Yes, that account is suspended.\nReason: ${status.reason}\nSuspended at: ${status.suspended_at}\n\nIf this was triggered by normal activity, I can escalate to Aaron for an exemption. Just say "escalate suspension for [username]".`;
+      }
+      if (status.exemption) {
+        return `Not suspended. Has an exemption with threshold ${status.exemption.threshold} (expires ${status.exemption.expires_at}). Effective threshold: ${status.effective_threshold}.`;
+      }
+      return `Not suspended. Default velocity threshold: ${status.effective_threshold} distinct secrets per 30 minutes.`;
+    } catch (err) {
+      return `Couldn't check suspension status: ${err.message}`;
+    }
+  }
+
+  // Escalation request
+  if (/escalate|appeal|review.*suspend|lift.*suspend|unsuspend/i.test(lower)) {
+    return "I've noted the escalation request. Aaron will review the suspension and decide whether to grant an exemption. In the meantime, the account remains locked. You'll be notified via Conduit when a decision is made.";
+  }
+
   // Status / what's stuck — broad matching
   if (/what.?s stuck|status|overview|how.?s it going|what.?s going on|current state|board|update me|sitrep/i.test(lower)) {
     try {
