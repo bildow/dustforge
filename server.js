@@ -194,6 +194,39 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Suspension lockdown middleware ──
+// Suspended DIDs can only access: health, trust (to see why), unsuspend, and the suspension message.
+// Everything else returns a suspension notice.
+const SUSPENSION_EXEMPT_PATHS = new Set([
+  '/api/health', '/.well-known/silicon', '/api/identity/trust',
+  '/api/blindkey/unsuspend', '/api/buoy/probes',
+]);
+app.use((req, res, next) => {
+  if (!req.path.startsWith('/api/')) return next(); // static files pass through
+  if (SUSPENSION_EXEMPT_PATHS.has(req.path)) return next();
+
+  // Check auth without blocking — we just want to know if the caller is suspended
+  const authHeader = req.headers.authorization || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (bearerToken) {
+    try {
+      const identity = require('./identity');
+      const v = identity.verifyTokenStandalone(bearerToken);
+      if (v.valid && v.decoded?.sub && suspendedDids.has(v.decoded.sub)) {
+        return res.status(403).json({
+          error: 'account suspended',
+          suspended: true,
+          reason: db.prepare('SELECT reason FROM suspended_dids WHERE did = ?').get(v.decoded.sub)?.reason || 'velocity threshold exceeded',
+          message: 'Your account has been suspended. All functionality is locked until the suspension is lifted.',
+          contact: 'support@dustforge.com',
+          check_status: 'GET /api/identity/trust?did=' + v.decoded.sub,
+        });
+      }
+    } catch(_) {} // identity module may not be loaded yet during startup
+  }
+  next();
+});
+
 // ── Schema ──
 db.exec(`CREATE TABLE IF NOT EXISTS identity_wallets (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2061,6 +2094,26 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS suspended_dids (
   suspended_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 
+// Velocity exemptions — DIDs verified as high-volume legitimate
+try { db.exec(`CREATE TABLE IF NOT EXISTS velocity_exemptions (
+  did TEXT PRIMARY KEY,
+  threshold INTEGER DEFAULT 8,
+  reason TEXT DEFAULT '',
+  granted_by TEXT DEFAULT '',
+  granted_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT NOT NULL
+)`); } catch(e) {}
+
+function getEffectiveThreshold(did) {
+  const exemption = db.prepare("SELECT threshold, expires_at FROM velocity_exemptions WHERE did = ?").get(did);
+  if (exemption && new Date(exemption.expires_at) > new Date()) {
+    return exemption.threshold;
+  }
+  // Check if this DID has been suspended before — if so, the threshold was already loosened
+  // (future: track trigger count and auto-loosen)
+  return VELOCITY_THRESHOLD;
+}
+
 // Velocity access log — persisted so 30-min window survives restarts
 try { db.exec(`CREATE TABLE IF NOT EXISTS velocity_access_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2103,10 +2156,11 @@ function checkVelocityThrottle(did, secretId) {
     "SELECT COUNT(DISTINCT secret_id) as n FROM velocity_access_log WHERE did = ? AND accessed_at >= ?"
   ).get(did, cutoff)?.n || 0;
 
-  if (distinctCount >= VELOCITY_THRESHOLD) {
+  const effectiveThreshold = getEffectiveThreshold(did);
+  if (distinctCount >= effectiveThreshold) {
     suspendedDids.add(did);
-    try { db.prepare('INSERT OR REPLACE INTO suspended_dids (did, reason) VALUES (?, ?)').run(did, `velocity: ${distinctCount} secrets in ${VELOCITY_WINDOW/60000}min`); } catch(_) {}
-    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${distinctCount} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED (persisted)`);
+    try { db.prepare('INSERT OR REPLACE INTO suspended_dids (did, reason) VALUES (?, ?)').run(did, `velocity: ${distinctCount}/${effectiveThreshold} secrets in ${VELOCITY_WINDOW/60000}min`); } catch(_) {}
+    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${distinctCount}/${effectiveThreshold} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED (persisted)`);
     // Buoy alert tick
     try {
       db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
@@ -7618,6 +7672,21 @@ function computeTrustGradient(did) {
   const factors = {};
   let score = 0;
 
+  // Check suspension first — overrides everything
+  const isSuspended = suspendedDids.has(did);
+  const suspensionRecord = isSuspended ? db.prepare('SELECT reason, suspended_at FROM suspended_dids WHERE did = ?').get(did) : null;
+  if (isSuspended) {
+    return {
+      band: 'suspended',
+      factors: {
+        suspended: true,
+        reason: suspensionRecord?.reason || 'velocity threshold exceeded',
+        suspended_at: suspensionRecord?.suspended_at || null,
+        contact: 'support@dustforge.com',
+      },
+    };
+  }
+
   // 1. Identity continuity — how long has this DID existed
   const wallet = db.prepare('SELECT created_at, status FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return { band: 'unknown', factors: { identity: 'not found' } };
@@ -7729,6 +7798,7 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_nt_initiator ON notarized_ticks(in
 app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (suspendedDids.has(auth.did)) return res.status(403).json({ error: 'account suspended — cannot create notarizations. Contact support@dustforge.com' });
 
   const { counterparty_did, claim, asset_ref, amount, unit, expires_in, prior_tick_ref } = req.body || {};
   if (!counterparty_did || !claim) return res.status(400).json({ error: 'counterparty_did and claim required' });
@@ -7737,6 +7807,7 @@ app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
   const counterparty = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(counterparty_did);
   if (!counterparty) return res.status(404).json({ error: 'counterparty DID not found' });
   if (counterparty_did === auth.did) return res.status(400).json({ error: 'cannot notarize with yourself' });
+  if (suspendedDids.has(counterparty_did)) return res.status(403).json({ error: 'counterparty account is suspended' });
 
   // Build canonical payload (deterministic serialization)
   const nonce = crypto.randomBytes(16).toString('hex');
@@ -7916,6 +7987,60 @@ setInterval(() => {
   const expired = db.prepare("UPDATE notarized_ticks SET status = 'expired' WHERE status = 'pending' AND expires_at <= datetime('now')").run();
   if (expired.changes > 0) console.log(`[NOTARIZE] expired ${expired.changes} pending notarizations`);
 }, 60000);
+
+// POST /api/demipass/exempt — admin grants velocity exemption (loosen threshold)
+app.post('/api/blindkey/exempt', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  const { did, threshold = 8, reason = '', expires_in = '90d' } = req.body || {};
+  if (!did) return res.status(400).json({ error: 'did required' });
+
+  const match = String(expires_in).match(/^(\d+)(d)$/);
+  const days = match ? Number(match[1]) : 90;
+  const expiresAt = new Date(Date.now() + days * 86400000).toISOString();
+
+  db.prepare('INSERT OR REPLACE INTO velocity_exemptions (did, threshold, reason, granted_by, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .run(did, Math.max(VELOCITY_THRESHOLD, Number(threshold)), reason, 'admin', expiresAt);
+
+  // If currently suspended, unsuspend too
+  if (suspendedDids.has(did)) {
+    suspendedDids.delete(did);
+    didTokenCounters.delete(did);
+    try {
+      db.prepare('DELETE FROM suspended_dids WHERE did = ?').run(did);
+      db.prepare('DELETE FROM velocity_access_log WHERE did = ?').run(did);
+    } catch(_) {}
+  }
+
+  res.json({ ok: true, did, threshold, expires_at: expiresAt, note: 'Exemption granted. DID unsuspended if applicable.' });
+});
+
+// GET /api/demipass/suspension-status — check suspension status for a DID
+app.get('/api/blindkey/suspension-status', rateLimitStandard, (req, res) => {
+  const { did } = req.query;
+  if (!did) return res.status(400).json({ error: 'did required' });
+
+  const suspended = suspendedDids.has(did);
+  const record = suspended ? db.prepare('SELECT * FROM suspended_dids WHERE did = ?').get(did) : null;
+  const exemption = db.prepare('SELECT * FROM velocity_exemptions WHERE did = ?').get(did);
+  const effectiveThreshold = getEffectiveThreshold(did);
+
+  res.json({
+    did,
+    suspended,
+    reason: record?.reason || null,
+    suspended_at: record?.suspended_at || null,
+    exemption: exemption ? {
+      threshold: exemption.threshold,
+      expires_at: exemption.expires_at,
+      expired: new Date(exemption.expires_at) < new Date(),
+    } : null,
+    effective_threshold: effectiveThreshold,
+    contact: suspended ? 'support@dustforge.com' : null,
+  });
+});
 
 module.exports = { app, db, buoyNotifyConduit };
 
