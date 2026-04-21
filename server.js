@@ -7580,6 +7580,285 @@ app.post('/api/blindkey/unsuspend', rateLimitStandard, (req, res) => {
   res.json({ ok: true, did, status: 'was not suspended' });
 });
 
+// ============================================================
+// Trust Gradient — advisory reputation layer (card #18)
+// ============================================================
+// Per Brain's design review: descriptive, explainable, advisory ONLY.
+// Does NOT gate access. Influences review queues, rate limits, UI.
+// Coarse bands, not numeric scores. Every factor attributable and replay-safe.
+
+const TRUST_BANDS = ['unknown', 'new', 'establishing', 'established', 'proven', 'veteran'];
+
+function computeTrustGradient(did) {
+  const factors = {};
+  let score = 0;
+
+  // 1. Identity continuity — how long has this DID existed
+  const wallet = db.prepare('SELECT created_at, status FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return { band: 'unknown', factors: { identity: 'not found' } };
+  const ageDays = Math.floor((Date.now() - new Date(wallet.created_at + 'Z').getTime()) / 86400000);
+  factors.identity_age_days = ageDays;
+  if (ageDays > 90) score += 3;
+  else if (ageDays > 30) score += 2;
+  else if (ageDays > 7) score += 1;
+
+  // 2. Wallet attestation — custody commitment
+  const secretCount = db.prepare("SELECT COUNT(*) as n FROM blindkey_secrets WHERE did = ? AND status = 'active'").get(did)?.n || 0;
+  factors.active_secrets = secretCount;
+  if (secretCount > 5) score += 2;
+  else if (secretCount > 0) score += 1;
+
+  // 3. Buoy tick history — behavioral consistency
+  const tickCount = db.prepare('SELECT COUNT(*) as n FROM ticks WHERE did = ?').get(did)?.n || 0;
+  const tickDays = db.prepare("SELECT COUNT(DISTINCT date(created_at)) as n FROM ticks WHERE did = ?").get(did)?.n || 0;
+  factors.total_ticks = tickCount;
+  factors.active_days = tickDays;
+  if (tickDays > 30) score += 3;
+  else if (tickDays > 7) score += 2;
+  else if (tickDays > 1) score += 1;
+
+  // 4. Successful egress history — verified use of secrets
+  const useCount = db.prepare("SELECT SUM(use_count) as n FROM blindkey_secrets WHERE did = ?").get(did)?.n || 0;
+  factors.total_secret_uses = useCount;
+  if (useCount > 50) score += 2;
+  else if (useCount > 5) score += 1;
+
+  // 5. Abuse history — negative signals (sticky)
+  const velocitySuspended = suspendedDids.has(did);
+  factors.velocity_suspended = velocitySuspended;
+  if (velocitySuspended) score -= 3;
+
+  // Abuse events from ticks
+  const abuseCount = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE tick_type = 'alert' AND tags LIKE ? AND did = 'system'")
+    .get(`%${did.slice(0, 30)}%`)?.n || 0;
+  factors.abuse_alerts = abuseCount;
+  if (abuseCount > 0) score -= abuseCount;
+
+  // 6. Delegation activity — trusted by others
+  const delegationsReceived = db.prepare("SELECT COUNT(*) as n FROM demipass_delegations WHERE delegate_did = ? AND status = 'active'").get(did)?.n || 0;
+  factors.delegations_received = delegationsReceived;
+  if (delegationsReceived > 3) score += 2;
+  else if (delegationsReceived > 0) score += 1;
+
+  // Compute band (clamp score to band index)
+  const bandIdx = Math.max(0, Math.min(TRUST_BANDS.length - 1, Math.floor(score / 2)));
+  const band = TRUST_BANDS[bandIdx];
+
+  return { band, factors, score_debug: score };
+}
+
+// GET /api/identity/trust — view trust gradient for a DID (advisory only)
+app.get('/api/identity/trust', rateLimitStandard, (req, res) => {
+  const { did, username } = req.query;
+  let targetDid = did;
+  if (!targetDid && username) {
+    const w = db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username);
+    targetDid = w?.did;
+  }
+  if (!targetDid) return res.status(400).json({ error: 'did or username required' });
+
+  const gradient = computeTrustGradient(targetDid);
+
+  // Public: band only. Authenticated caller on their own DID: full factors.
+  const auth = getBearerIdentity(req);
+  const isOwner = auth.ok && auth.did === targetDid;
+  const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
+
+  if (isOwner || isAdmin) {
+    res.json({ did: targetDid, ...gradient, note: 'Advisory only. Does not gate access.' });
+  } else {
+    res.json({ did: targetDid, band: gradient.band, note: 'Advisory only. Authenticate for detailed factors.' });
+  }
+});
+
+// ============================================================
+// Notarized Ticks — Phase 1: bilateral intent records (card #21)
+// ============================================================
+// Per Brain: ship notarization first, escrow settlement later.
+// A notarized tick = two parties co-sign the exact same canonical payload.
+// State: draft → signed_by_a → cosigned → (immutable)
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS notarized_ticks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tick_id INTEGER NOT NULL,
+  initiator_did TEXT NOT NULL,
+  counterparty_did TEXT NOT NULL,
+  canonical_payload TEXT NOT NULL,
+  payload_hash TEXT NOT NULL,
+  initiator_sig TEXT NOT NULL,
+  counterparty_sig TEXT DEFAULT NULL,
+  asset_ref TEXT DEFAULT '',
+  amount TEXT DEFAULT '',
+  unit TEXT DEFAULT '',
+  expires_at TEXT NOT NULL,
+  nonce TEXT NOT NULL,
+  prior_tick_ref INTEGER DEFAULT NULL,
+  status TEXT DEFAULT 'pending' CHECK(status IN ('pending','cosigned','expired','rejected')),
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  cosigned_at TEXT DEFAULT NULL
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_nt_counterparty ON notarized_ticks(counterparty_did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_nt_initiator ON notarized_ticks(initiator_did)"); } catch(e) {}
+
+// POST /api/buoy/notarize — create a notarized intent
+app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { counterparty_did, claim, asset_ref, amount, unit, expires_in, prior_tick_ref } = req.body || {};
+  if (!counterparty_did || !claim) return res.status(400).json({ error: 'counterparty_did and claim required' });
+
+  // Verify counterparty exists
+  const counterparty = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(counterparty_did);
+  if (!counterparty) return res.status(404).json({ error: 'counterparty DID not found' });
+  if (counterparty_did === auth.did) return res.status(400).json({ error: 'cannot notarize with yourself' });
+
+  // Build canonical payload (deterministic serialization)
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const expiresMatch = (expires_in || '24h').match(/^(\d+)(m|h|d)$/);
+  const expiresMs = expiresMatch ? { m: 60000, h: 3600000, d: 86400000 }[expiresMatch[2]] * Number(expiresMatch[1]) : 86400000;
+  const expiresAt = new Date(Date.now() + expiresMs).toISOString();
+
+  const canonical = JSON.stringify({
+    initiator: auth.did,
+    counterparty: counterparty_did,
+    claim,
+    asset_ref: asset_ref || '',
+    amount: amount || '',
+    unit: unit || '',
+    nonce,
+    expires_at: expiresAt,
+    prior_tick_ref: prior_tick_ref || null,
+  });
+  const payloadHash = crypto.createHash('sha256').update(canonical).digest('hex');
+  const initiatorSig = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY || '')
+    .update(payloadHash + ':' + auth.did).digest('hex');
+
+  // Create a Buoy tick for the notarization
+  const tickResult = db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(auth.did, `notarize: ${claim.slice(0, 100)}`, req.ip || '', 'UTC', 'decision',
+      JSON.stringify(['buoy:notarize', `counterparty:${counterparty_did.slice(0, 30)}`]));
+  const tickId = tickResult.lastInsertRowid;
+
+  // Insert notarized tick record
+  db.prepare(`INSERT INTO notarized_ticks
+    (tick_id, initiator_did, counterparty_did, canonical_payload, payload_hash, initiator_sig, asset_ref, amount, unit, expires_at, nonce, prior_tick_ref)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(tickId, auth.did, counterparty_did, canonical, payloadHash, initiatorSig,
+    asset_ref || '', amount || '', unit || '', expiresAt, nonce, prior_tick_ref || null);
+
+  const notarizedId = db.prepare('SELECT last_insert_rowid() as id').get().id;
+
+  // Notify counterparty via Conduit (if available)
+  buoyNotifyConduit({
+    tick_id: tickId, type: 'decision',
+    note: `Notarization request from ${auth.did.slice(0, 25)}: "${claim.slice(0, 80)}"`,
+    tags: ['buoy:notarize-request'],
+    time: new Date().toISOString(),
+  });
+
+  res.json({
+    ok: true,
+    notarized_id: notarizedId,
+    tick_id: tickId,
+    payload_hash: payloadHash,
+    status: 'pending',
+    expires_at: expiresAt,
+    note: 'Counterparty must co-sign via POST /api/buoy/cosign to complete notarization.',
+  });
+});
+
+// POST /api/buoy/cosign — counterparty co-signs a notarized intent
+app.post('/api/buoy/cosign', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { notarized_id, payload_hash } = req.body || {};
+  if (!notarized_id) return res.status(400).json({ error: 'notarized_id required' });
+
+  const record = db.prepare('SELECT * FROM notarized_ticks WHERE id = ?').get(notarized_id);
+  if (!record) return res.status(404).json({ error: 'notarized tick not found' });
+  if (record.counterparty_did !== auth.did) return res.status(403).json({ error: 'you are not the counterparty' });
+  if (record.status !== 'pending') return res.status(400).json({ error: `cannot cosign: status is ${record.status}` });
+  if (new Date(record.expires_at) < new Date()) {
+    db.prepare("UPDATE notarized_ticks SET status = 'expired' WHERE id = ?").run(notarized_id);
+    return res.status(410).json({ error: 'notarization expired' });
+  }
+
+  // Verify payload hash matches
+  if (payload_hash && payload_hash !== record.payload_hash) {
+    return res.status(400).json({ error: 'payload_hash mismatch — you may be signing a different version' });
+  }
+
+  // Generate counterparty signature
+  const counterpartySig = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY || '')
+    .update(record.payload_hash + ':' + auth.did).digest('hex');
+
+  db.prepare("UPDATE notarized_ticks SET counterparty_sig = ?, status = 'cosigned', cosigned_at = ? WHERE id = ?")
+    .run(counterpartySig, new Date().toISOString(), notarized_id);
+
+  // Buoy tick for the co-signature
+  db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(auth.did, `cosigned notarization #${notarized_id}`, req.ip || '', 'UTC', 'decision',
+      JSON.stringify(['buoy:cosign', `notarized:${notarized_id}`]));
+
+  res.json({
+    ok: true,
+    notarized_id: notarized_id,
+    status: 'cosigned',
+    payload_hash: record.payload_hash,
+    initiator_did: record.initiator_did,
+    counterparty_did: auth.did,
+    note: 'Both parties have signed. This notarized intent is now immutable.',
+  });
+});
+
+// POST /api/buoy/reject — counterparty rejects a notarization
+app.post('/api/buoy/reject', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { notarized_id, reason } = req.body || {};
+  if (!notarized_id) return res.status(400).json({ error: 'notarized_id required' });
+
+  const record = db.prepare('SELECT * FROM notarized_ticks WHERE id = ?').get(notarized_id);
+  if (!record) return res.status(404).json({ error: 'not found' });
+  if (record.counterparty_did !== auth.did) return res.status(403).json({ error: 'you are not the counterparty' });
+  if (record.status !== 'pending') return res.status(400).json({ error: `cannot reject: status is ${record.status}` });
+
+  db.prepare("UPDATE notarized_ticks SET status = 'rejected' WHERE id = ?").run(notarized_id);
+
+  db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(auth.did, `rejected notarization #${notarized_id}: ${(reason || '').slice(0, 100)}`, req.ip || '', 'UTC', 'decision',
+      JSON.stringify(['buoy:reject', `notarized:${notarized_id}`]));
+
+  res.json({ ok: true, notarized_id, status: 'rejected' });
+});
+
+// GET /api/buoy/notarized — list notarized ticks involving this DID
+app.get('/api/buoy/notarized', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { status } = req.query;
+  let records;
+  if (status) {
+    records = db.prepare('SELECT id, tick_id, initiator_did, counterparty_did, payload_hash, asset_ref, amount, unit, expires_at, status, created_at, cosigned_at FROM notarized_ticks WHERE (initiator_did = ? OR counterparty_did = ?) AND status = ? ORDER BY id DESC LIMIT 50')
+      .all(auth.did, auth.did, status);
+  } else {
+    records = db.prepare('SELECT id, tick_id, initiator_did, counterparty_did, payload_hash, asset_ref, amount, unit, expires_at, status, created_at, cosigned_at FROM notarized_ticks WHERE initiator_did = ? OR counterparty_did = ? ORDER BY id DESC LIMIT 50')
+      .all(auth.did, auth.did);
+  }
+
+  res.json({ records, total: records.length });
+});
+
+// Expire stale notarizations every minute
+setInterval(() => {
+  const expired = db.prepare("UPDATE notarized_ticks SET status = 'expired' WHERE status = 'pending' AND expires_at <= datetime('now')").run();
+  if (expired.changes > 0) console.log(`[NOTARIZE] expired ${expired.changes} pending notarizations`);
+}, 60000);
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
