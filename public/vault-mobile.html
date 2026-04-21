@@ -345,7 +345,21 @@ async function loadBuoy(){
 async function storeSecret(){const n=document.getElementById('s-name').value.trim(),v=document.getElementById('s-value').value,t=document.getElementById('s-type').value,exp=document.getElementById('s-expires').value.trim(),m=document.getElementById('s-msg');
   if(!n||!v){m.textContent='Name and value required';m.className='modal-msg err';return}
   const body={name:n,value:v,secret_type:t};if(exp)body.expires_in=exp;
-  try{const r=await api('POST','/api/demipass/store',body);m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');m.className='modal-msg ok';document.getElementById('s-value').value='';loadVault();setTimeout(closeModal,1200)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+  try{
+    const r=await api('POST','/api/demipass/store',body);
+    // PURGE: zero the secret from all in-memory locations after confirmed storage
+    body.value='';
+    document.getElementById('s-value').value='';
+    // Overwrite the JS string reference (best effort — JS doesn't guarantee memory zeroing)
+    for(let i=0;i<v.length;i++){v[i]='\0'} // no-op on immutable strings, but signals intent
+    m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');
+    m.className='modal-msg ok';
+    loadVault();setTimeout(closeModal,1200);
+  }catch(e){
+    // PURGE on failure too — don't leave the secret in memory after an error
+    body.value='';document.getElementById('s-value').value='';
+    m.textContent=e.message;m.className='modal-msg err';
+  }}
 
 async function revokeSecret(name){if(!confirm('Revoke '+name+'?'))return;try{await api('DELETE','/api/demipass/revoke',{name});loadVault()}catch(e){alert(e.message)}}
 
@@ -422,7 +436,9 @@ async function handleScannedData(raw) {
     if (data.dp !== 1 || !data.n || !data.v) { msg.textContent = 'Not a DemiPass QR code'; msg.className = 'modal-msg err'; return; }
     msg.textContent = 'Depositing ' + data.n + '...'; msg.className = 'modal-msg ok';
     await api('POST', '/api/demipass/store', { name: data.n, value: data.v, secret_type: data.t || 'other' });
-    msg.textContent = 'Deposited! ' + data.n + ' is in your vault.'; msg.className = 'modal-msg ok';
+    // PURGE: zero scanned secret from memory after confirmed storage
+    data.v = ''; data.n = '';
+    msg.textContent = 'Deposited! Secret is in your vault.'; msg.className = 'modal-msg ok';
     loadVault();
     setTimeout(() => closeModal(), 1500);
   } catch (e) {

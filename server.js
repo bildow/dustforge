@@ -218,7 +218,9 @@ app.use((req, res, next) => {
           error: 'account suspended',
           suspended: true,
           reason: db.prepare('SELECT reason FROM suspended_dids WHERE did = ?').get(v.decoded.sub)?.reason || 'velocity threshold exceeded',
-          message: 'Your account has been suspended. All functionality is locked until the suspension is lifted.',
+          message: 'Your account has been suspended. All functionality is locked — both Dustforge identity and DemiPass vault — until the suspension is lifted.',
+          scope: 'cross-platform',
+          affected: ['dustforge:identity', 'dustforge:email', 'dustforge:wallet', 'demipass:vault', 'demipass:egress', 'buoy:signed-ticks'],
           contact: 'support@dustforge.com',
           check_status: 'GET /api/identity/trust?did=' + v.decoded.sub,
         });
