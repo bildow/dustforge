@@ -3104,7 +3104,7 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
 // POST /api/blindkey/context/add — add a context to an existing secret
 // Requires admin auth OR Bearer token from the secret owner
 app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
-  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, max_uses } = req.body || {};
+  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, target_host, target_url, max_uses } = req.body || {};
   if (!secret_name || !context_name || !action_type) {
     return res.status(400).json({ error: 'secret_name, context_name, and action_type required' });
   }
@@ -3140,8 +3140,8 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
     const created = insertBlindkeyContexts(secret.id, [{
       context_name,
       action_type,
-      target_url_pattern: target_url_pattern || '*',
-      target_host_pattern: target_host_pattern || '*',
+      target_url_pattern: target_url_pattern || target_url || '*',
+      target_host_pattern: target_host_pattern || target_host || '*',
       max_uses: max_uses || 0,
     }], isAdmin ? 'admin' : 'owner');
 
