@@ -2115,12 +2115,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   let { name, ref, context: contextName, action, target_host, target_url, owner_did } = req.body || {};
 
   // Per-DID rate limit + suspension check
+  // Ref-based requests are exempt from rate counting — the ref IS the authorization
   const callerDidEarly = req.identity?.did;
+  const isRefBased = ref && typeof ref === 'string' && ref.startsWith('DP-');
   if (callerDidEarly) {
     if (suspendedDids.has(callerDidEarly)) {
       return res.status(403).json({ error: 'account suspended — velocity threshold exceeded. Contact support to unlock.' });
     }
-    if (!checkDidRateLimit(callerDidEarly)) {
+    if (!isRefBased && !checkDidRateLimit(callerDidEarly)) {
       return res.status(429).json({ error: `rate limit: max ${DID_TOKEN_LIMIT} token requests per minute per identity` });
     }
   }
