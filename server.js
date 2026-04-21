@@ -7258,6 +7258,114 @@ setInterval(async () => {
   }
 }, 30000);
 
+// ============================================================
+// Buoy Probe Telemetry — DDOS spike detection
+// ============================================================
+// Tracks outbound probe frequency per target host. When probe rate
+// exceeds a threshold, logs a Buoy alert tick and throttles further
+// probes. Prevents the platform from tripping router DDOS filters
+// when multiple agents hammer the same host simultaneously.
+
+const probeCounters = new Map(); // host → { count, windowStart, throttled }
+const PROBE_WINDOW_MS = 60000;   // 1-minute sliding window
+const PROBE_THRESHOLD = 30;      // max probes per host per window
+const PROBE_THROTTLE_MS = 30000; // throttle duration after spike
+
+// Record a probe to a host. Returns { allowed, count, throttled }
+function recordProbe(host) {
+  const now = Date.now();
+  let entry = probeCounters.get(host);
+
+  if (!entry || now - entry.windowStart > PROBE_WINDOW_MS) {
+    entry = { count: 0, windowStart: now, throttled: false, throttleUntil: 0 };
+    probeCounters.set(host, entry);
+  }
+
+  // Check throttle
+  if (entry.throttled && now < entry.throttleUntil) {
+    return { allowed: false, count: entry.count, throttled: true };
+  }
+  if (entry.throttled && now >= entry.throttleUntil) {
+    entry.throttled = false;
+  }
+
+  entry.count++;
+
+  // Spike detection
+  if (entry.count >= PROBE_THRESHOLD) {
+    entry.throttled = true;
+    entry.throttleUntil = now + PROBE_THROTTLE_MS;
+
+    console.error(`[BUOY-PROBE] SPIKE DETECTED: ${host} hit ${entry.count} probes in ${PROBE_WINDOW_MS/1000}s — throttling for ${PROBE_THROTTLE_MS/1000}s`);
+
+    // Log a Buoy alert tick
+    try {
+      db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('system', `probe spike: ${host} (${entry.count} in ${PROBE_WINDOW_MS/1000}s)`, '', 'UTC', 'alert',
+          JSON.stringify(['buoy:probe-spike', `host:${host}`, `count:${entry.count}`]));
+    } catch(_) {}
+
+    return { allowed: false, count: entry.count, throttled: true };
+  }
+
+  return { allowed: true, count: entry.count, throttled: false };
+}
+
+// Clean up stale entries every 5 minutes
+setInterval(() => {
+  const cutoff = Date.now() - PROBE_WINDOW_MS * 2;
+  for (const [host, entry] of probeCounters) {
+    if (entry.windowStart < cutoff) probeCounters.delete(host);
+  }
+}, 300000);
+
+// GET /api/buoy/probes — view probe telemetry
+app.get('/api/buoy/probes', (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const probes = [];
+  for (const [host, entry] of probeCounters) {
+    probes.push({
+      host,
+      count: entry.count,
+      window_start: new Date(entry.windowStart).toISOString(),
+      throttled: entry.throttled,
+      throttle_until: entry.throttled ? new Date(entry.throttleUntil).toISOString() : null,
+    });
+  }
+  probes.sort((a, b) => b.count - a.count);
+
+  // Recent spike ticks
+  const spikeTicks = db.prepare("SELECT id, note, created_at FROM ticks WHERE tick_type = 'alert' AND tags LIKE '%probe-spike%' ORDER BY id DESC LIMIT 10").all();
+
+  res.json({
+    active_hosts: probes.length,
+    threshold: PROBE_THRESHOLD,
+    window_seconds: PROBE_WINDOW_MS / 1000,
+    probes,
+    recent_spikes: spikeTicks,
+  });
+});
+
+// POST /api/buoy/probe — record an outbound probe (agents call this before probing)
+app.post('/api/buoy/probe', (req, res) => {
+  const { host } = req.body || {};
+  if (!host) return res.status(400).json({ error: 'host required' });
+
+  const result = recordProbe(host);
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: `probe throttled: ${host} exceeded ${PROBE_THRESHOLD} probes in ${PROBE_WINDOW_MS/1000}s`,
+      throttled: true,
+      count: result.count,
+      retry_after_seconds: PROBE_THROTTLE_MS / 1000,
+    });
+  }
+
+  res.json({ ok: true, host, count: result.count, threshold: PROBE_THRESHOLD });
+});
+
 module.exports = { app, db };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
