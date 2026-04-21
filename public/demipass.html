@@ -86,10 +86,10 @@
 <div class="header">
   <a href="/" class="logo">Demi<span>Pass</span></a>
   <div class="nav">
-    <a href="https://dustforge.com/vault.html">Vault</a>
+    <a href="/vault-mobile.html">Vault</a>
+    <a href="/qr-deposit.html">QR Deposit</a>
     <a href="https://www.npmjs.com/package/demipass">npm</a>
     <a href="https://github.com/bildow/demipass">GitHub</a>
-    <a href="https://dustforge.com">Dustforge</a>
   </div>
 </div>
 
@@ -103,6 +103,63 @@
     <code>npm install demipass</code>
     <div class="or">or add to Claude Code as MCP server</div>
     <code style="font-size:0.8rem;color:var(--text2)">node node_modules/demipass/mcp-server.js</code>
+  </div>
+</div>
+
+<!-- Onboarding Journey -->
+<div style="background:var(--surface);padding:4rem 2rem">
+  <div style="max-width:700px;margin:0 auto">
+    <h2 style="text-align:center;font-size:2rem;margin-bottom:0.5rem">Get started</h2>
+    <p style="text-align:center;color:var(--text2);margin-bottom:2.5rem">Three paths to your first deposit. Pick the one that fits.</p>
+
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1.5rem">
+      <!-- Path 1: Phone app -->
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+        <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x1f4f1;</div>
+        <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--green)">Phone App</h3>
+        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6">
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">1.</strong> Download the APK</p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">2.</strong> Sign in or create an account</p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> Tap <em>+ New</em> or <em>Scan QR</em></p>
+          <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Secret is in your vault</p>
+          <a href="https://api.dustforge.com/demipass-v3.apk" style="display:inline-block;padding:0.5rem 1rem;background:var(--green);color:var(--bg);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">Download APK</a>
+        </div>
+      </div>
+
+      <!-- Path 2: QR from computer -->
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+        <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x1f4bb;</div>
+        <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--accent)">QR Deposit</h3>
+        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6">
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">1.</strong> Open the QR deposit page</p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">2.</strong> Paste your secret &mdash; QR renders locally</p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> Scan with the DemiPass app</p>
+          <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Close the tab. Done.</p>
+          <a href="/qr-deposit.html" style="display:inline-block;padding:0.5rem 1rem;background:var(--accent);color:var(--bg);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">Open QR Deposit</a>
+        </div>
+      </div>
+
+      <!-- Path 3: SDK / CLI -->
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+        <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x2328;</div>
+        <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--yellow)">SDK / CLI</h3>
+        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6">
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">1.</strong> <code style="background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">npm install demipass</code></p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">2.</strong> Configure with your token</p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> <code style="background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">demipass.store({name, value})</code></p>
+          <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Use ref code to access anywhere</p>
+          <a href="https://www.npmjs.com/package/demipass" style="display:inline-block;padding:0.5rem 1rem;border:1px solid var(--border);color:var(--text2);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">View on npm</a>
+        </div>
+      </div>
+    </div>
+
+    <!-- Routed reference explainer -->
+    <div style="margin-top:2.5rem;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+      <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--green)">Your ref code is your key</h3>
+      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:0.75rem">When you store a secret, DemiPass returns a routed reference code:</p>
+      <code style="display:block;background:var(--bg);padding:0.75rem 1rem;border-radius:6px;font-size:1rem;color:var(--green);text-align:center;letter-spacing:0.05em">DP-API-openrout-7f3a9c1e</code>
+      <p style="font-size:0.8rem;color:var(--text3);margin-top:0.75rem;text-align:center">Share this with any agent. It's not the secret &mdash; it's a routing address. The agent uses it to request a use-token. The secret is injected server-side. Nobody sees it.</p>
+    </div>
   </div>
 </div>
 
@@ -197,8 +254,12 @@
 
 <div class="cta">
   <h2>Start in 30 seconds</h2>
-  <p>npm install, configure, store your first secret. Your agent never sees it again.</p>
-  <a href="https://dustforge.com/vault.html">Open the Vault</a>
+  <p>Download the app, scan a QR, or npm install. Your agent never sees the secret again.</p>
+  <div style="display:flex;gap:1rem;justify-content:center;flex-wrap:wrap">
+    <a href="https://api.dustforge.com/demipass-v3.apk" style="display:inline-block;padding:0.75rem 2rem;background:var(--green);color:var(--bg);font-weight:700;border-radius:8px;text-decoration:none;font-size:1rem">Get the App</a>
+    <a href="/qr-deposit.html" style="display:inline-block;padding:0.75rem 2rem;background:var(--accent);color:var(--bg);font-weight:700;border-radius:8px;text-decoration:none;font-size:1rem">QR Deposit</a>
+    <a href="/vault-mobile.html" style="display:inline-block;padding:0.75rem 2rem;background:transparent;border:1px solid var(--border);color:var(--text2);font-weight:700;border-radius:8px;text-decoration:none;font-size:1rem">Open Vault</a>
+  </div>
 </div>
 
 <footer>
