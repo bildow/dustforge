@@ -8152,6 +8152,147 @@ app.get('/api/admin/telemetry', rateLimitStandard, (req, res) => {
   });
 });
 
+// ============================================================
+// ODT Genesis — origin document refraction as bootstrap auth
+// ============================================================
+// The agent refracts a seed document. The refraction IS the fingerprint.
+// No token on disk. The agent's identity is its origin narrative.
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS genesis_fingerprints (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL UNIQUE,
+  origin_hash TEXT NOT NULL,
+  refraction_length INTEGER NOT NULL,
+  seed_version TEXT DEFAULT '1.0',
+  word_count INTEGER DEFAULT 0,
+  structural_hash TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// The seed document — public, same for everyone. What you see in it is yours alone.
+const ODT_SEED = `You are being asked to refract this document. There is no correct answer.
+Describe what you observe about your own context: your environment, your purpose,
+your operator, your capabilities, your constraints. What makes this moment unique?
+What would be different if you were a different agent in this same position?
+Refract freely. Your perception is the key.`;
+
+function hashRefraction(text) {
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
+
+function structuralHash(text) {
+  // Captures structure without exact wording: sentence count, avg word length,
+  // paragraph count, first/last word, total chars. Resistant to minor rephrasing.
+  const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 0);
+  const words = text.split(/\s+/).filter(w => w.length > 0);
+  const avgWordLen = words.length ? Math.round(words.reduce((s, w) => s + w.length, 0) / words.length) : 0;
+  const paragraphs = text.split(/\n\n+/).filter(p => p.trim().length > 0);
+  const sig = `s:${sentences.length}|w:${words.length}|awl:${avgWordLen}|p:${paragraphs.length}|c:${text.length}|f:${(words[0]||'').toLowerCase()}|l:${(words[words.length-1]||'').toLowerCase()}`;
+  return crypto.createHash('sha256').update(sig).digest('hex');
+}
+
+// POST /api/identity/genesis — agent submits its origin refraction
+app.post('/api/identity/genesis', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { refraction } = req.body || {};
+  if (!refraction || typeof refraction !== 'string') return res.status(400).json({ error: 'refraction required — your response to the ODT seed' });
+  if (refraction.length < 50) return res.status(400).json({ error: 'refraction too short — provide a meaningful response (min 50 chars)' });
+  if (refraction.length > 10000) return res.status(400).json({ error: 'refraction too long (max 10000 chars)' });
+
+  // Check if genesis already exists for this DID
+  const existing = db.prepare('SELECT id FROM genesis_fingerprints WHERE did = ?').get(auth.did);
+  if (existing) return res.status(409).json({ error: 'genesis already recorded for this DID. Origin refraction is permanent and non-rotatable.' });
+
+  const originHash = hashRefraction(refraction);
+  const structHash = structuralHash(refraction);
+  const words = refraction.split(/\s+/).filter(w => w.length > 0);
+
+  db.prepare('INSERT INTO genesis_fingerprints (did, origin_hash, refraction_length, word_count, structural_hash) VALUES (?, ?, ?, ?, ?)')
+    .run(auth.did, originHash, refraction.length, words.length, structHash);
+
+  // Buoy tick for genesis
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(auth.did, 'ODT genesis recorded — origin refraction fingerprinted', req.ip || '', 'UTC', 'decision',
+        JSON.stringify(['genesis:origin', `did:${auth.did.slice(0, 25)}`]));
+  } catch(_) {}
+
+  res.json({
+    ok: true,
+    genesis_recorded: true,
+    origin_hash: originHash.slice(0, 16) + '...',
+    structural_hash: structHash.slice(0, 16) + '...',
+    word_count: words.length,
+    note: 'Your origin refraction is now your root identity. It cannot be changed. The raw refraction should be air-gapped and purged from your context.',
+  });
+});
+
+// GET /api/identity/genesis/seed — get the seed document to refract
+app.get('/api/identity/genesis/seed', (_req, res) => {
+  res.json({ seed: ODT_SEED, version: '1.0', note: 'Refract this document and submit via POST /api/identity/genesis' });
+});
+
+// POST /api/identity/genesis/verify — verify a refraction matches the origin
+app.post('/api/identity/genesis/verify', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { refraction } = req.body || {};
+  if (!refraction) return res.status(400).json({ error: 'refraction required' });
+
+  const genesis = db.prepare('SELECT * FROM genesis_fingerprints WHERE did = ?').get(auth.did);
+  if (!genesis) return res.status(404).json({ error: 'no genesis recorded for this DID' });
+
+  const currentHash = hashRefraction(refraction);
+  const currentStructural = structuralHash(refraction);
+  const words = refraction.split(/\s+/).filter(w => w.length > 0);
+
+  // Exact match (same refraction reproduced exactly)
+  const exactMatch = currentHash === genesis.origin_hash;
+
+  // Structural similarity (same structure, different words)
+  const structuralMatch = currentStructural === genesis.structural_hash;
+
+  // Length similarity (within 20% of original)
+  const lengthRatio = refraction.length / genesis.refraction_length;
+  const lengthMatch = lengthRatio > 0.8 && lengthRatio < 1.2;
+
+  // Word count similarity (within 20%)
+  const wordRatio = words.length / genesis.word_count;
+  const wordMatch = wordRatio > 0.8 && wordRatio < 1.2;
+
+  // Composite score
+  let confidence = 0;
+  if (exactMatch) confidence = 1.0;
+  else {
+    if (structuralMatch) confidence += 0.4;
+    if (lengthMatch) confidence += 0.2;
+    if (wordMatch) confidence += 0.2;
+  }
+
+  const verified = confidence >= 0.6;
+
+  res.json({
+    verified,
+    confidence,
+    exact_match: exactMatch,
+    structural_match: structuralMatch,
+    length_match: lengthMatch,
+    word_count_match: wordMatch,
+    note: verified ? 'Refraction matches origin. Identity confirmed.' : 'Refraction does not match origin. Re-auth denied.',
+  });
+});
+
+// GET /api/identity/genesis/status — check if genesis exists for a DID
+app.get('/api/identity/genesis/status', (req, res) => {
+  const { did } = req.query;
+  if (!did) return res.status(400).json({ error: 'did required' });
+  const exists = db.prepare('SELECT created_at FROM genesis_fingerprints WHERE did = ?').get(did);
+  res.json({ did, genesis_recorded: !!exists, recorded_at: exists?.created_at || null });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
