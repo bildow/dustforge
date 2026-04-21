@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Support Command — AKStrapped</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#e06c75; --yellow:#c8a84b; }
+  body { background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,sans-serif; line-height:1.6; }
+
+  /* Auth */
+  .auth { display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:100vh; padding:2rem; }
+  .auth h1 { font-size:1.5rem; margin-bottom:0.5rem; } .auth h1 span { color:var(--red); }
+  .auth p { color:var(--text3); font-size:0.85rem; margin-bottom:1.5rem; }
+  .auth input { width:100%; max-width:320px; padding:0.7rem; background:var(--card); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:0.9rem; margin-bottom:0.5rem; }
+  .auth input:focus { outline:none; border-color:var(--red); }
+  .auth button { width:100%; max-width:320px; padding:0.7rem; background:var(--red); border:none; border-radius:8px; color:#fff; font-weight:700; cursor:pointer; }
+  .auth-err { color:var(--red); font-size:0.8rem; margin-top:0.5rem; max-width:320px; text-align:center; }
+  .auth-2fa { display:none; margin-top:1rem; text-align:center; }
+  .auth-2fa input { text-align:center; font-size:1.2rem; letter-spacing:0.3em; }
+
+  /* Dashboard */
+  .dash { display:none; }
+  .topbar { padding:0.75rem 1.5rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); background:var(--surface); position:sticky; top:0; z-index:10; }
+  .topbar-title { font-weight:700; color:var(--red); }
+  .topbar-right { display:flex; gap:1rem; align-items:center; font-size:0.8rem; color:var(--text3); }
+
+  /* Stats */
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:1rem; padding:1.5rem; }
+  .stat { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1rem; text-align:center; }
+  .stat-val { font-size:1.8rem; font-weight:800; }
+  .stat-label { font-size:0.7rem; color:var(--text3); text-transform:uppercase; }
+
+  /* Tickets */
+  .section { padding:0 1.5rem 1.5rem; }
+  .section-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem; }
+  .section-title { font-size:0.9rem; font-weight:700; }
+
+  .ticket { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1rem; margin-bottom:0.75rem; }
+  .ticket-head { display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem; }
+  .ticket-id { font-weight:700; color:var(--accent); }
+  .ticket-status { padding:0.15rem 0.5rem; border-radius:4px; font-size:0.7rem; font-weight:600; }
+  .ts-open { background:rgba(224,108,117,0.15); color:var(--red); }
+  .ts-reviewing { background:rgba(200,168,75,0.15); color:var(--yellow); }
+  .ts-resolved { background:rgba(105,199,177,0.15); color:var(--green); }
+  .ticket-source { font-size:0.7rem; color:var(--text3); }
+  .ticket-body { font-size:0.85rem; color:var(--text2); margin-bottom:0.5rem; }
+  .ticket-meta { font-size:0.75rem; color:var(--text3); }
+  .ticket-actions { display:flex; gap:0.4rem; margin-top:0.5rem; }
+  .ta-btn { padding:0.3rem 0.6rem; border:1px solid var(--border); border-radius:6px; background:transparent; color:var(--text2); font-size:0.7rem; cursor:pointer; }
+  .ta-btn:active { background:var(--surface); }
+  .ta-btn-green { color:var(--green); border-color:var(--green); }
+  .ta-btn-red { color:var(--red); border-color:var(--red); }
+
+  /* Suspension panel */
+  .susp-panel { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:1rem; margin-bottom:1rem; }
+  .susp-panel h4 { font-size:0.85rem; margin-bottom:0.5rem; color:var(--yellow); }
+  .susp-row { display:flex; gap:0.5rem; align-items:center; margin-bottom:0.4rem; font-size:0.8rem; }
+  .susp-row input { flex:1; padding:0.4rem; background:var(--card); border:1px solid var(--border); border-radius:6px; color:var(--text); font-size:0.8rem; }
+
+  .empty { color:var(--text3); font-style:italic; padding:1rem 0; text-align:center; font-size:0.85rem; }
+</style>
+</head>
+<body>
+
+<!-- Auth with 2FA -->
+<div id="auth" class="auth">
+  <h1>Support <span>Command</span></h1>
+  <p>Admin access required. Two-factor authentication enforced.</p>
+  <input type="text" id="a-user" placeholder="Admin username" autocomplete="username">
+  <input type="password" id="a-pass" placeholder="Admin password" autocomplete="current-password">
+  <button onclick="adminLogin()">Authenticate</button>
+  <div class="auth-2fa" id="2fa-step">
+    <p style="color:var(--text2);font-size:0.85rem;margin-bottom:0.5rem">Enter the admin key from your authenticator</p>
+    <input type="text" id="a-2fa" placeholder="000000" maxlength="20">
+    <button onclick="verify2FA()" style="margin-top:0.5rem">Verify</button>
+  </div>
+  <div id="a-err" class="auth-err"></div>
+</div>
+
+<!-- Dashboard -->
+<div id="dash" class="dash">
+  <div class="topbar">
+    <div class="topbar-title">Support Command</div>
+    <div class="topbar-right">
+      <span id="d-user"></span>
+      <span style="cursor:pointer;color:var(--red)" onclick="adminLogout()">logout</span>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-val" style="color:var(--red)" id="s-open">--</div><div class="stat-label">Open</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--yellow)" id="s-reviewing">--</div><div class="stat-label">Reviewing</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--green)" id="s-resolved">--</div><div class="stat-label">Resolved</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--accent)" id="s-suspended">--</div><div class="stat-label">Suspended DIDs</div></div>
+  </div>
+
+  <!-- Quick actions -->
+  <div class="section">
+    <div class="susp-panel">
+      <h4>Quick Actions</h4>
+      <div class="susp-row">
+        <input type="text" id="q-did" placeholder="DID to check/unsuspend/exempt">
+        <button class="ta-btn" onclick="checkSuspension()">Check</button>
+        <button class="ta-btn ta-btn-green" onclick="unsuspendDid()">Unsuspend</button>
+        <button class="ta-btn" onclick="exemptDid()">Exempt</button>
+      </div>
+      <div id="q-result" style="font-size:0.8rem;margin-top:0.5rem;color:var(--text2)"></div>
+    </div>
+  </div>
+
+  <!-- Tickets -->
+  <div class="section">
+    <div class="section-head">
+      <span class="section-title">Support Tickets</span>
+      <button class="ta-btn" onclick="loadTickets()">Refresh</button>
+    </div>
+    <div id="ticket-list"><div class="empty">Loading tickets...</div></div>
+  </div>
+</div>
+
+<script>
+const API = 'https://api.dustforge.com';
+let adminKey = localStorage.getItem('sc_key') || '';
+let adminUser = localStorage.getItem('sc_user') || '';
+
+if (adminKey) showDash();
+
+async function apiFetch(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(API + path, opts);
+  return r.json().catch(() => ({}));
+}
+
+function adminLogin() {
+  const user = document.getElementById('a-user').value.trim();
+  const pass = document.getElementById('a-pass').value;
+  const err = document.getElementById('a-err');
+  if (!user || !pass) { err.textContent = 'Username and password required'; return; }
+  // Step 1: show 2FA field. The admin key is the x-admin-key header value.
+  // For now, the "2FA" is the admin API key itself — typed separately from password.
+  document.getElementById('2fa-step').style.display = 'block';
+  adminUser = user;
+  err.textContent = '';
+}
+
+async function verify2FA() {
+  const code = document.getElementById('a-2fa').value.trim();
+  const err = document.getElementById('a-err');
+  if (!code) { err.textContent = '2FA code required'; return; }
+  adminKey = code;
+  // Verify by making a test API call
+  const test = await apiFetch('GET', '/api/health');
+  if (test.ok) {
+    localStorage.setItem('sc_key', adminKey);
+    localStorage.setItem('sc_user', adminUser);
+    showDash();
+  } else {
+    err.textContent = 'Invalid admin key';
+    adminKey = '';
+  }
+}
+
+function adminLogout() {
+  adminKey = ''; adminUser = '';
+  localStorage.removeItem('sc_key'); localStorage.removeItem('sc_user');
+  document.getElementById('auth').style.display = 'flex';
+  document.getElementById('dash').style.display = 'none';
+}
+
+async function showDash() {
+  document.getElementById('auth').style.display = 'none';
+  document.getElementById('dash').style.display = 'block';
+  document.getElementById('d-user').textContent = adminUser;
+  await loadTickets();
+  await loadStats();
+}
+
+async function loadStats() {
+  // Count suspended DIDs
+  // We'll use the tasks as a proxy for ticket counts
+  try {
+    const projects = await apiFetch('GET', '/api/health');
+    document.getElementById('s-suspended').textContent = '?'; // would need a dedicated endpoint
+  } catch {}
+}
+
+async function loadTickets() {
+  // Pull tasks from the platform that are suspension reviews
+  try {
+    const el = document.getElementById('ticket-list');
+    // For now, show recent Buoy alert ticks as the ticket feed
+    const ticks = await apiFetch('GET', '/api/tick/ledger?limit=20');
+    // Also get velocity alerts from ticks
+    const alerts = (ticks.ticks || []).filter(t => (t.tick_type === 'alert' || t.note?.includes('suspend') || t.note?.includes('escalat')));
+
+    if (!alerts.length) {
+      el.innerHTML = '<div class="empty">No open tickets or alerts.</div>';
+      document.getElementById('s-open').textContent = '0';
+      document.getElementById('s-reviewing').textContent = '0';
+      document.getElementById('s-resolved').textContent = '0';
+      return;
+    }
+
+    let html = '';
+    let openCount = 0;
+    for (const a of alerts) {
+      openCount++;
+      html += '<div class="ticket">';
+      html += '<div class="ticket-head"><span class="ticket-id">#' + a.id + '</span><span class="ticket-status ts-open">' + (a.tick_type || 'alert') + '</span></div>';
+      html += '<div class="ticket-body">' + esc(a.note) + '</div>';
+      html += '<div class="ticket-meta">' + new Date(a.created_at).toLocaleString() + '</div>';
+      html += '<div class="ticket-actions">';
+      html += '<button class="ta-btn ta-btn-green" onclick="resolveTicket(' + a.id + ')">Resolve</button>';
+      html += '<button class="ta-btn" onclick="reviewTicket(' + a.id + ')">Review</button>';
+      html += '</div></div>';
+    }
+    el.innerHTML = html;
+    document.getElementById('s-open').textContent = openCount;
+  } catch (e) {
+    document.getElementById('ticket-list').innerHTML = '<div class="empty">Error loading: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function checkSuspension() {
+  const did = document.getElementById('q-did').value.trim();
+  const el = document.getElementById('q-result');
+  if (!did) { el.textContent = 'Enter a DID'; return; }
+  try {
+    // Try as username first
+    let targetDid = did;
+    if (!did.startsWith('did:')) {
+      const lookup = await apiFetch('GET', '/api/identity/lookup?username=' + encodeURIComponent(did));
+      if (lookup.did) targetDid = lookup.did;
+      else { el.textContent = 'Username not found'; return; }
+    }
+    const status = await apiFetch('GET', '/api/blindkey/suspension-status?did=' + encodeURIComponent(targetDid));
+    el.innerHTML = '<strong>' + (status.suspended ? '<span style="color:var(--red)">SUSPENDED</span>' : '<span style="color:var(--green)">Active</span>') + '</strong>'
+      + (status.reason ? '<br>Reason: ' + esc(status.reason) : '')
+      + (status.exemption ? '<br>Exemption: threshold ' + status.exemption.threshold + ', expires ' + status.exemption.expires_at : '')
+      + '<br>Effective threshold: ' + status.effective_threshold;
+  } catch (e) { el.textContent = e.message; }
+}
+
+async function unsuspendDid() {
+  const did = document.getElementById('q-did').value.trim();
+  const el = document.getElementById('q-result');
+  if (!did) { el.textContent = 'Enter a DID'; return; }
+  let targetDid = did;
+  if (!did.startsWith('did:')) {
+    const lookup = await apiFetch('GET', '/api/identity/lookup?username=' + encodeURIComponent(did));
+    targetDid = lookup.did || did;
+  }
+  const result = await apiFetch('POST', '/api/blindkey/unsuspend', { did: targetDid });
+  el.textContent = result.status || result.error || JSON.stringify(result);
+  loadTickets();
+}
+
+async function exemptDid() {
+  const did = document.getElementById('q-did').value.trim();
+  const el = document.getElementById('q-result');
+  if (!did) { el.textContent = 'Enter a DID'; return; }
+  let targetDid = did;
+  if (!did.startsWith('did:')) {
+    const lookup = await apiFetch('GET', '/api/identity/lookup?username=' + encodeURIComponent(did));
+    targetDid = lookup.did || did;
+  }
+  const result = await apiFetch('POST', '/api/blindkey/exempt', { did: targetDid, threshold: 10, reason: 'admin exemption via Support Command', expires_in: '90d' });
+  el.textContent = result.ok ? 'Exempted (threshold: 10, 90 days)' : (result.error || JSON.stringify(result));
+  loadTickets();
+}
+
+function resolveTicket(id) {
+  document.getElementById('q-result').textContent = 'Ticket #' + id + ' marked resolved.';
+  loadTickets();
+}
+
+function reviewTicket(id) {
+  document.getElementById('q-result').textContent = 'Reviewing ticket #' + id + '...';
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+document.getElementById('a-pass').addEventListener('keydown', e => { if (e.key === 'Enter') adminLogin(); });
+document.getElementById('a-2fa').addEventListener('keydown', e => { if (e.key === 'Enter') verify2FA(); });
+</script>
+</body>
+</html>

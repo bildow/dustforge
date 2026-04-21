@@ -200,7 +200,7 @@ app.use((req, res, next) => {
 const SUSPENSION_EXEMPT_PATHS = new Set([
   '/api/health', '/.well-known/silicon', '/api/identity/trust',
   '/api/blindkey/unsuspend', '/api/blindkey/suspension-status',
-  '/api/buoy/probes',
+  '/api/buoy/probes', '/api/support/ticket',
 ]);
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next(); // static files pass through
@@ -8041,6 +8041,81 @@ app.get('/api/blindkey/suspension-status', rateLimitStandard, (req, res) => {
     effective_threshold: effectiveThreshold,
     contact: suspended ? 'support@dustforge.com' : null,
   });
+});
+
+// ============================================================
+// Support Tickets — common channel for Dustforge + DemiPass
+// ============================================================
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS support_tickets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL DEFAULT 'unknown',
+  did TEXT DEFAULT '',
+  username TEXT DEFAULT '',
+  email TEXT DEFAULT '',
+  category TEXT DEFAULT 'general',
+  subject TEXT NOT NULL,
+  body TEXT DEFAULT '',
+  status TEXT DEFAULT 'open' CHECK(status IN ('open','reviewing','resolved','closed')),
+  resolution TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_st_status ON support_tickets(status)"); } catch(e) {}
+
+// POST /api/support/ticket — submit a support ticket (no auth required for suspended users)
+app.post('/api/support/ticket', rateLimit({ windowMs: 60*60*1000, max: 5, message: { error: 'max 5 tickets per hour' } }), (req, res) => {
+  const { subject, body: ticketBody, category, username, email, source } = req.body || {};
+  if (!subject) return res.status(400).json({ error: 'subject required' });
+
+  // Try to get DID from auth if available
+  let did = '';
+  try {
+    const auth = getBearerIdentity(req);
+    if (auth.ok) did = auth.did;
+  } catch {}
+
+  const result = db.prepare(
+    'INSERT INTO support_tickets (source, did, username, email, category, subject, body) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(source || 'api', did, username || '', email || '', category || 'general', subject.slice(0, 200), (ticketBody || '').slice(0, 2000));
+
+  res.json({ ok: true, ticket_id: result.lastInsertRowid, status: 'open', note: 'Your ticket has been filed. We review within 24 hours.' });
+});
+
+// GET /api/support/tickets — admin list all tickets
+app.get('/api/support/tickets', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  const status = req.query.status || null;
+  const tickets = status
+    ? db.prepare('SELECT * FROM support_tickets WHERE status = ? ORDER BY created_at DESC LIMIT 100').all(status)
+    : db.prepare('SELECT * FROM support_tickets ORDER BY created_at DESC LIMIT 100').all();
+
+  const counts = {
+    open: db.prepare("SELECT COUNT(*) as n FROM support_tickets WHERE status = 'open'").get().n,
+    reviewing: db.prepare("SELECT COUNT(*) as n FROM support_tickets WHERE status = 'reviewing'").get().n,
+    resolved: db.prepare("SELECT COUNT(*) as n FROM support_tickets WHERE status = 'resolved'").get().n,
+  };
+
+  res.json({ tickets, counts, total: tickets.length });
+});
+
+// PATCH /api/support/tickets/:id — admin update ticket status
+app.patch('/api/support/tickets/:id', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  const { status, resolution } = req.body || {};
+  const ticket = db.prepare('SELECT * FROM support_tickets WHERE id = ?').get(req.params.id);
+  if (!ticket) return res.status(404).json({ error: 'ticket not found' });
+
+  if (status) db.prepare("UPDATE support_tickets SET status = ?, updated_at = datetime('now') WHERE id = ?").run(status, req.params.id);
+  if (resolution) db.prepare("UPDATE support_tickets SET resolution = ?, updated_at = datetime('now') WHERE id = ?").run(resolution, req.params.id);
+
+  res.json({ ok: true, ticket_id: Number(req.params.id), status: status || ticket.status });
 });
 
 module.exports = { app, db, buoyNotifyConduit };
