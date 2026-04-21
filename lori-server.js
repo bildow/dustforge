@@ -297,7 +297,8 @@ async function conduitReply(sender, text) {
       body: text,
       sender: AGENT_NAME,
     });
-    return msgRes.data;
+    if (msgRes.status >= 400) return { error: `conduit HTTP ${msgRes.status}`, status: msgRes.status };
+    return { ok: true, data: msgRes.data, status: msgRes.status };
   } catch (err) {
     console.error('[conduit] reply failed:', err.message);
     return null;
@@ -440,7 +441,7 @@ async function handleIntent(message) {
 
       // Send Conduit message to notify
       const conduitResult = await conduitReply('civitasvox-brain', `[ESCALATION] Suspension review requested for ${subject}. Task created on project 1. Aaron needs to review and decide on exemption.`);
-      const conduitOk = conduitResult && !conduitResult.error;
+      const conduitOk = conduitResult && conduitResult.ok === true;
 
       // Report what actually succeeded
       const outcomes = [];
