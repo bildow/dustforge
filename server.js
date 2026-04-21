@@ -199,7 +199,8 @@ app.use((req, res, next) => {
 // Everything else returns a suspension notice.
 const SUSPENSION_EXEMPT_PATHS = new Set([
   '/api/health', '/.well-known/silicon', '/api/identity/trust',
-  '/api/blindkey/unsuspend', '/api/buoy/probes',
+  '/api/blindkey/unsuspend', '/api/blindkey/suspension-status',
+  '/api/buoy/probes',
 ]);
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api/')) return next(); // static files pass through
@@ -2164,9 +2165,9 @@ function checkVelocityThrottle(did, secretId) {
     // Buoy alert tick
     try {
       db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
-        .run('system', `velocity suspend: ${did.slice(0, 30)} (${access.size} secrets in ${VELOCITY_WINDOW/60000}min)`,
+        .run('system', `velocity suspend: ${did.slice(0, 30)} (${distinctCount}/${effectiveThreshold} secrets in ${VELOCITY_WINDOW/60000}min)`,
           '', 'UTC', 'alert', JSON.stringify(['security:velocity-suspend', `did:${did.slice(0, 30)}`]));
-    } catch(_) {}
+    } catch(e) { console.error('[VELOCITY] failed to write alert tick:', e.message); }
     return false;
   }
   return true;

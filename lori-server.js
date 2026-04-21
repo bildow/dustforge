@@ -427,9 +427,23 @@ async function handleIntent(message) {
     }
   }
 
-  // Escalation request
+  // Escalation request — actually create a task and notify
   if (/escalate|appeal|review.*suspend|lift.*suspend|unsuspend/i.test(lower)) {
-    return "I've noted the escalation request. Aaron will review the suspension and decide whether to grant an exemption. In the meantime, the account remains locked. You'll be notified via Conduit when a decision is made.";
+    try {
+      // Extract DID or username from the message
+      const didMatch = lower.match(/did:key:\S+/) || lower.match(/(?:for|about)\s+(\w+)/);
+      const subject = didMatch ? didMatch[1] || didMatch[0] : 'unknown';
+
+      // Create a task on the platform for Aaron to review
+      await createTask(1, `Suspension review: ${subject}`, `Escalated by ${msg.slice(0, 200)}. Check /api/blindkey/suspension-status for details.`, 'aaron');
+
+      // Send Conduit message to notify
+      await conduitReply('civitasvox-brain', `[ESCALATION] Suspension review requested for ${subject}. Task created on project 1. Aaron needs to review and decide on exemption.`);
+
+      return `Escalation filed. I created a task for Aaron and notified Brain via Conduit. The account stays locked until Aaron reviews. He'll check the velocity log and either grant an exemption or confirm the suspension.`;
+    } catch (err) {
+      return `I tried to escalate but hit an error: ${err.message}. Email support@dustforge.com directly as a backup.`;
+    }
   }
 
   // Status / what's stuck — broad matching
