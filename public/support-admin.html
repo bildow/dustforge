@@ -93,7 +93,25 @@
     <div class="stat"><div class="stat-val" style="color:var(--red)" id="s-open">--</div><div class="stat-label">Open</div></div>
     <div class="stat"><div class="stat-val" style="color:var(--yellow)" id="s-reviewing">--</div><div class="stat-label">Reviewing</div></div>
     <div class="stat"><div class="stat-val" style="color:var(--green)" id="s-resolved">--</div><div class="stat-label">Resolved</div></div>
-    <div class="stat"><div class="stat-val" style="color:var(--accent)" id="s-suspended">--</div><div class="stat-label">Suspended DIDs</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--accent)" id="s-suspended">--</div><div class="stat-label">Suspended</div></div>
+  </div>
+
+  <!-- User telemetry -->
+  <div class="stats">
+    <div class="stat"><div class="stat-val" style="color:var(--text)" id="t-total">--</div><div class="stat-label">Total Users</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--green)" id="t-active7">--</div><div class="stat-label">Active 7d</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--accent)" id="t-signups-week">--</div><div class="stat-label">Signups (week)</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--yellow)" id="t-secrets">--</div><div class="stat-label">Secrets</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--green)" id="t-ticks">--</div><div class="stat-label">Buoy Ticks</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--text3)" id="t-waitlist">--</div><div class="stat-label">Waitlist</div></div>
+  </div>
+
+  <!-- Recent signups -->
+  <div class="section">
+    <div class="section-head">
+      <span class="section-title">Recent Signups</span>
+    </div>
+    <div id="recent-signups"><div class="empty">Loading...</div></div>
   </div>
 
   <!-- Quick actions -->
@@ -186,7 +204,28 @@ async function loadStats() {
       document.getElementById('s-reviewing').textContent = data.counts.reviewing || 0;
       document.getElementById('s-resolved').textContent = data.counts.resolved || 0;
     }
-    document.getElementById('s-suspended').textContent = '—';
+  } catch {}
+  // User telemetry
+  try {
+    const t = await apiFetch('GET', '/api/admin/telemetry');
+    document.getElementById('t-total').textContent = t.users?.total || 0;
+    document.getElementById('t-active7').textContent = t.users?.active_7d || 0;
+    document.getElementById('t-signups-week').textContent = t.signups?.week || 0;
+    document.getElementById('t-secrets').textContent = t.platform?.secrets || 0;
+    document.getElementById('t-ticks').textContent = t.platform?.ticks || 0;
+    document.getElementById('t-waitlist').textContent = t.waitlist || 0;
+    document.getElementById('s-suspended').textContent = t.suspended || 0;
+    // Recent signups
+    const signups = t.recent_signups || [];
+    if (signups.length) {
+      let html = '';
+      for (const s of signups) {
+        html += '<div style="display:flex;justify-content:space-between;padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem"><span style="font-weight:600">' + esc(s.username) + '</span><span style="color:var(--text3)">' + new Date(s.created_at).toLocaleDateString() + '</span></div>';
+      }
+      document.getElementById('recent-signups').innerHTML = html;
+    } else {
+      document.getElementById('recent-signups').innerHTML = '<div class="empty">No signups yet.</div>';
+    }
   } catch {}
 }
 

@@ -8120,6 +8120,38 @@ app.patch('/api/support/tickets/:id', rateLimitStandard, (req, res) => {
   res.json({ ok: true, ticket_id: Number(req.params.id), status: status || ticket.status });
 });
 
+// GET /api/admin/telemetry — user signup counts, active users, trends
+app.get('/api/admin/telemetry', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  const total = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status != 'reserved'").get().n;
+  const reserved = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'reserved'").get().n;
+  const active7d = db.prepare("SELECT COUNT(DISTINCT did) as n FROM ticks WHERE created_at > datetime('now', '-7 days') AND did != '' AND did != 'system'").get().n;
+  const active30d = db.prepare("SELECT COUNT(DISTINCT did) as n FROM ticks WHERE created_at > datetime('now', '-30 days') AND did != '' AND did != 'system'").get().n;
+  const signupsToday = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE created_at > datetime('now', '-1 day') AND status != 'reserved'").get().n;
+  const signupsWeek = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE created_at > datetime('now', '-7 days') AND status != 'reserved'").get().n;
+  const signupsMonth = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE created_at > datetime('now', '-30 days') AND status != 'reserved'").get().n;
+  const secretsTotal = db.prepare("SELECT COUNT(*) as n FROM blindkey_secrets WHERE status = 'active'").get().n;
+  const ticksTotal = db.prepare("SELECT COUNT(*) as n FROM ticks").get().n;
+  const ticksToday = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE created_at > datetime('now', '-1 day')").get().n;
+  const waitlistCount = db.prepare("SELECT COUNT(*) as n FROM waiting_list").get().n;
+  const suspendedCount = db.prepare("SELECT COUNT(*) as n FROM suspended_dids").get().n;
+
+  // Recent signups
+  const recentSignups = db.prepare("SELECT username, email, status, created_at FROM identity_wallets WHERE status != 'reserved' ORDER BY created_at DESC LIMIT 10").all();
+
+  res.json({
+    users: { total, reserved, active_7d: active7d, active_30d: active30d },
+    signups: { today: signupsToday, week: signupsWeek, month: signupsMonth },
+    platform: { secrets: secretsTotal, ticks: ticksTotal, ticks_today: ticksToday },
+    waitlist: waitlistCount,
+    suspended: suspendedCount,
+    recent_signups: recentSignups,
+  });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
