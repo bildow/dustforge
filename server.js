@@ -2147,6 +2147,42 @@ function checkDidRateLimit(did) {
   return entry.count <= DID_TOKEN_LIMIT;
 }
 
+// Graduated suspension tiers based on resonance + velocity
+// The rings modulate the response — high-resonance agents get warnings, low-resonance get locked
+function getResonanceScore(did) {
+  try {
+    const profileCount = db.prepare('SELECT COUNT(*) as n FROM silicon_profiles WHERE did = ?').get(did)?.n || 0;
+    const distinctHashes = db.prepare('SELECT COUNT(DISTINCT fingerprint_hash) as n FROM silicon_profiles WHERE did = ?').get(did)?.n || 0;
+    const innerCount = db.prepare("SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'inner'").get(did)?.n || 0;
+    const middleCount = db.prepare("SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'middle'").get(did)?.n || 0;
+    const outerCount = db.prepare("SELECT COUNT(DISTINCT signal_name) as n FROM fingerprint_rings WHERE did = ? AND ring = 'outer'").get(did)?.n || 0;
+    const consistency = profileCount > 0 ? Math.max(0, 1 - (distinctHashes - 1) / Math.max(profileCount, 1)) : 0;
+    const ringCoverage = Math.min(1, (innerCount * 3 + middleCount * 1.5 + outerCount * 0.75) / 15);
+    return Math.round((consistency * 0.6 + ringCoverage * 0.4) * 100);
+  } catch { return 0; }
+}
+
+function graduatedSuspensionTier(did, distinctCount, threshold) {
+  const resonance = getResonanceScore(did);
+  const overageRatio = distinctCount / threshold;
+
+  // High resonance (>70) = established agent, give benefit of doubt
+  if (resonance > 70) {
+    if (overageRatio < 1.5) return { action: 'warn', duration: 0, reason: 'velocity warning (high resonance)' };
+    if (overageRatio < 2.0) return { action: 'suspend', duration: 3600000, reason: `velocity: 1h suspend (resonance ${resonance})` };
+    return { action: 'suspend', duration: 43200000, reason: `velocity: 12h suspend (resonance ${resonance}, overage ${overageRatio.toFixed(1)}x)` };
+  }
+
+  // Medium resonance (40-70) = establishing agent
+  if (resonance > 40) {
+    if (overageRatio < 1.2) return { action: 'suspend', duration: 3600000, reason: `velocity: 1h suspend (resonance ${resonance})` };
+    return { action: 'suspend', duration: 43200000, reason: `velocity: 12h suspend (resonance ${resonance})` };
+  }
+
+  // Low resonance (<40) = new or suspicious agent — lock until carbon re-auth
+  return { action: 'lock', duration: 0, reason: `velocity: locked until re-auth (resonance ${resonance})` };
+}
+
 function checkVelocityThrottle(did, secretId) {
   if (suspendedDids.has(did)) return false;
 
@@ -2161,9 +2197,22 @@ function checkVelocityThrottle(did, secretId) {
 
   const effectiveThreshold = getEffectiveThreshold(did);
   if (distinctCount >= effectiveThreshold) {
+    const tier = graduatedSuspensionTier(did, distinctCount, effectiveThreshold);
+
+    if (tier.action === 'warn') {
+      // High-resonance agent just over threshold — warn but don't suspend
+      console.warn(`[VELOCITY] WARNING: DID ${did.slice(0, 30)} at ${distinctCount}/${effectiveThreshold} — resonance high, warning only`);
+      try {
+        db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('system', `velocity warning: ${did.slice(0, 30)} (${tier.reason})`, '', 'UTC', 'alert',
+            JSON.stringify(['security:velocity-warning', `did:${did.slice(0, 30)}`]));
+      } catch(_) {}
+      return true; // allow this request but flag it
+    }
+
     suspendedDids.add(did);
-    try { db.prepare('INSERT OR REPLACE INTO suspended_dids (did, reason) VALUES (?, ?)').run(did, `velocity: ${distinctCount}/${effectiveThreshold} secrets in ${VELOCITY_WINDOW/60000}min`); } catch(_) {}
-    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${distinctCount}/${effectiveThreshold} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED (persisted)`);
+    try { db.prepare('INSERT OR REPLACE INTO suspended_dids (did, reason) VALUES (?, ?)').run(did, tier.reason); } catch(_) {}
+    console.error(`[VELOCITY] DID ${did.slice(0, 30)} — ${tier.reason} (${tier.action})`);
     // Buoy alert tick
     try {
       db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
