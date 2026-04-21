@@ -157,7 +157,7 @@ Brain is already onboarded with a Dustforge DID. Test the app flow:
 One active use-token per secret per DID. Returns 429 if outstanding token exists.
 **Verify:** request a token, don't redeem, request another for same secret → should get 429.
 
-### Card #18: Trust gradient fingerprint (NEEDS DESIGN REVIEW)
+### Card #18: Trust gradient fingerprint — SHIPPED (4c61635) per Brain's design review
 Three-ring fingerprint as trust gradient, not binary gate. Buoy tick chain IS the behavioral
 profile. Anomaly detection computes deviation from historic pattern:
 - Normal (<20% deviation): proceed
@@ -182,10 +182,22 @@ last_verified_use, attestation_hash. 30-day grace period for new DIDs.
 **Verify:** POST /api/tick as authenticated member → response should have attestation block.
 DIDs with no wallet and >30 days old get attestation: null.
 
-### Card #21: Notarized ticks
-Bilateral co-signed ticks with escrow backing. Public vs private verification. Counterparty
-co-signs via Conduit. The tick chain becomes a settlement ledger.
-**Status: design phase, needs architecture review.**
+### Card #21: Notarized ticks — Phase 1 SHIPPED (4c61635) per Brain's split recommendation
+POST /api/buoy/notarize, /cosign, /reject, GET /api/buoy/notarized.
+State: pending → cosigned | rejected | expired. Canonical payload + dual HMAC sigs.
+Phase 2 (escrow settlement) deferred. Needs adversarial testing around replay, timeout, dispute.
+
+### Card #18 implementation notes:
+- Advisory only — GET /api/identity/trust returns band + factors
+- 6 bands: unknown/new/establishing/established/proven/veteran
+- 6 factors: identity age, wallet attestation, tick history, egress use, abuse signals, delegations
+- Public callers see band only. Owner/admin sees full factors.
+- Follows Brain's invariants: no opaque scores, sybil-resistant, abuse-sticky
+
+### Flagged by Brain:
+- `patronage-claim.js` in 11ov3-site has static fallback signing secret (`11ov3-dev-patronage-secret`).
+  If patronage claims become trust inputs, all managed-dev claims are forgeable. Not in Dustforge
+  codebase but relevant if patronage feeds into trust gradient.
 
 ## Known Issues
 - Stalwart auth from RackNerd intermittently fails (Tailscale link flaky)
