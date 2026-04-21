@@ -2045,6 +2045,67 @@ app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
   res.json({ did: ownerDid, events, total: events.length });
 });
 
+// ── Per-DID rate limiting + velocity throttle ──
+// Prevents credential harvesting via parallel identities and detects
+// abnormal access patterns that indicate compromise or hostile probing.
+const didTokenCounters = new Map(); // did → { count, windowStart }
+const didSecretAccess = new Map();  // did → Map(secretId → timestamp)
+const DID_TOKEN_LIMIT = 10;        // max tokens per DID per minute
+const DID_TOKEN_WINDOW = 60000;
+const VELOCITY_THRESHOLD = 5;      // distinct secrets in this window
+const VELOCITY_WINDOW = 1800000;   // 30 minutes
+const suspendedDids = new Set();    // DIDs auto-suspended by velocity throttle
+
+function checkDidRateLimit(did) {
+  const now = Date.now();
+  let entry = didTokenCounters.get(did);
+  if (!entry || now - entry.windowStart > DID_TOKEN_WINDOW) {
+    entry = { count: 0, windowStart: now };
+    didTokenCounters.set(did, entry);
+  }
+  entry.count++;
+  return entry.count <= DID_TOKEN_LIMIT;
+}
+
+function checkVelocityThrottle(did, secretId) {
+  if (suspendedDids.has(did)) return false;
+  const now = Date.now();
+  let access = didSecretAccess.get(did);
+  if (!access) { access = new Map(); didSecretAccess.set(did, access); }
+
+  // Clean old entries
+  for (const [sid, ts] of access) {
+    if (now - ts > VELOCITY_WINDOW) access.delete(sid);
+  }
+
+  access.set(secretId, now);
+
+  if (access.size >= VELOCITY_THRESHOLD) {
+    suspendedDids.add(did);
+    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${access.size} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED`);
+    // Buoy alert tick
+    try {
+      db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('system', `velocity suspend: ${did.slice(0, 30)} (${access.size} secrets in ${VELOCITY_WINDOW/60000}min)`,
+          '', 'UTC', 'alert', JSON.stringify(['security:velocity-suspend', `did:${did.slice(0, 30)}`]));
+    } catch(_) {}
+    return false;
+  }
+  return true;
+}
+
+// Clean up stale counters every 5 minutes
+setInterval(() => {
+  const cutoff = Date.now() - DID_TOKEN_WINDOW * 2;
+  for (const [did, entry] of didTokenCounters) {
+    if (entry.windowStart < cutoff) didTokenCounters.delete(did);
+  }
+  const vCutoff = Date.now() - VELOCITY_WINDOW * 2;
+  for (const [did, access] of didSecretAccess) {
+    if (access.size === 0) didSecretAccess.delete(did);
+  }
+}, 300000);
+
 // POST /api/blindkey/request-token — request a short-lived use-token by presenting intended context
 // The token captures the result of context validation as a single-use credential.
 // The silicon never sees the secret — it only gets a nonce that proves its intent was validated.
@@ -2052,6 +2113,17 @@ app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
 // The delegate passes { owner_did } to indicate whose secret they want to use via delegation.
 app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
   let { name, ref, context: contextName, action, target_host, target_url, owner_did } = req.body || {};
+
+  // Per-DID rate limit + suspension check
+  const callerDidEarly = req.identity?.did;
+  if (callerDidEarly) {
+    if (suspendedDids.has(callerDidEarly)) {
+      return res.status(403).json({ error: 'account suspended — velocity threshold exceeded. Contact support to unlock.' });
+    }
+    if (!checkDidRateLimit(callerDidEarly)) {
+      return res.status(429).json({ error: `rate limit: max ${DID_TOKEN_LIMIT} token requests per minute per identity` });
+    }
+  }
 
   // Routed reference mode — parse DP-TYPE-slug-nonce and resolve everything
   if (ref && typeof ref === 'string' && ref.startsWith('DP-')) {
@@ -2171,6 +2243,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   // Generate a single-use token — 32 bytes of crypto randomness
   const token = crypto.randomBytes(32).toString('hex');
   const expiresInSeconds = 30;
+
+  // Velocity throttle — track distinct secrets accessed per DID
+  if (!checkVelocityThrottle(callerDid, secret.id)) {
+    return res.status(403).json({
+      error: 'account suspended — too many distinct secrets accessed in a short period. This may indicate credential compromise. Contact support to unlock.',
+      suspended: true,
+    });
+  }
 
   try {
     // The token references the OWNER's secret — the delegate never sees the value
@@ -7443,6 +7523,25 @@ app.post('/api/buoy/notify', (req, res) => {
   res.json({ ok: true, relayed_to: 'conduit', type });
 });
 
+
+// POST /api/demipass/unsuspend — admin unlocks a velocity-suspended DID
+app.post('/api/blindkey/unsuspend', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required to unsuspend' });
+
+  const { did } = req.body || {};
+  if (!did) return res.status(400).json({ error: 'did required' });
+
+  if (suspendedDids.has(did)) {
+    suspendedDids.delete(did);
+    didSecretAccess.delete(did);
+    didTokenCounters.delete(did);
+    console.log(`[VELOCITY] DID ${did.slice(0, 30)} unsuspended by admin`);
+    return res.json({ ok: true, did, status: 'unsuspended' });
+  }
+  res.json({ ok: true, did, status: 'was not suspended' });
+});
 
 module.exports = { app, db, buoyNotifyConduit };
 
