@@ -1798,9 +1798,32 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
   if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
   if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
 
-  // Basic code detection — reject if it looks like executable code
-  const codePatterns = /^(#!|<script|function\s*\(|import\s+|require\s*\(|eval\s*\(|exec\s*\()/i;
-  if (codePatterns.test(value.trim())) return res.status(400).json({ error: 'value appears to be executable code. Secrets should be credentials, tokens, or keys — not code.' });
+  // Code injection detection — reject values that look like executable code.
+  // Secrets should be credentials, tokens, keys, or connection strings — not programs.
+  const trimmed = value.trim();
+  const codePatterns = [
+    /^#!/,                              // shebang (shell/python scripts)
+    /^<script/i,                        // HTML script tags
+    /^<\?php/i,                         // PHP open tag
+    /^function\s*\(/,                   // JS function declaration
+    /^import\s+/,                       // Python/JS imports
+    /^require\s*\(/,                    // Node.js require
+    /^eval\s*\(/,                       // eval calls
+    /^exec\s*\(/,                       // exec calls
+    /^class\s+\w+/,                     // class definitions
+    /^const\s+\w+\s*=/,                 // JS const declarations
+    /^var\s+\w+\s*=/,                   // JS var declarations
+    /^let\s+\w+\s*=/,                   // JS let declarations
+    /^def\s+\w+\s*\(/,                  // Python function defs
+    /<\/script>/i,                      // script close tags anywhere
+  ];
+  if (codePatterns.some(p => p.test(trimmed))) {
+    return res.status(400).json({ error: 'value appears to be executable code. Secrets should be credentials, tokens, or keys — not code.' });
+  }
+  // Block extremely long single-line values that look like encoded payloads (>10KB of base64 is suspicious)
+  if (value.length > 10000 && /^[A-Za-z0-9+/=]+$/.test(value)) {
+    return res.status(400).json({ error: 'value exceeds 10KB and appears to be an encoded payload. If this is a legitimate certificate, use secret_type: certificate.' });
+  }
 
   const validTypes = ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
   const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
@@ -2273,10 +2296,14 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
 
           try {
-            const escapedPassword = password.replace(/'/g, "'\"'\"'");
+            // SECURITY: pass password via SSHPASS env var, never on command line.
+            // This prevents shell injection via crafted secret values.
             const escapedCommand = command.replace(/'/g, "'\"'\"'");
-            const sshCmd = `sshpass -p '${escapedPassword}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser}@${target_host} '${escapedCommand}'`;
-            const output = execSync(sshCmd, { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+            const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser}@${target_host} '${escapedCommand}'`;
+            const output = execSync(sshCmd, {
+              timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
+              env: { ...process.env, SSHPASS: password },
+            });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
@@ -2614,12 +2641,13 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         try {
-          // Escape single quotes in password for shell safety
-          const escapedPassword = password.replace(/'/g, "'\"'\"'");
-          // Escape single quotes in command for remote shell
+          // SECURITY: pass password via SSHPASS env var, never on command line
           const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -p '${escapedPassword}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
-          const output = execSync(sshCmd, { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const output = execSync(sshCmd, {
+            timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
+            env: { ...process.env, SSHPASS: password },
+          });
 
           // Redact any echo of credentials in the output
           const redactedOutput = output
@@ -3277,10 +3305,13 @@ async function handleRowenDeliver(req, res) {
           return res.status(400).json({ error: 'command contains disallowed characters' });
         }
         try {
-          const escapedPassword = decryptedValue.replace(/'/g, "'\"'\"'");
+          // SECURITY: pass password via SSHPASS env var, never on command line
           const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -p '${escapedPassword}' ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
-          const output = execSync(sshCmd, { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const output = execSync(sshCmd, {
+            timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
+            env: { ...process.env, SSHPASS: decryptedValue },
+          });
           const redactedOutput = output.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
           result = { stdout: redactedOutput, exit_code: 0 };
         } catch (sshErr) {
