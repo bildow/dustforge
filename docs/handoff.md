@@ -146,15 +146,16 @@ Brain is already onboarded with a Dustforge DID. Test the app flow:
 - `aa58c46` — #13 Prompt injection filter on secret descriptions + #16 CGNAT SSRF blocking
 - `08c09f2` — #14 Per-DID rate limit (10/min) + #15 Velocity throttle (5 secrets/30min = suspend)
 - `7f4ea81` — Ref-based requests exempt from rate limit (ref IS the auth)
+- `ea0e1d2` — #17 Concurrent token limit (1 active per secret per DID) + #19 Wallet attestation on ticks
 - #20 Invite key entropy verified adequate (2^64, 10/15min rate limit)
 - demipass@1.2.0 — MCP tool descriptions as behavioral protocol (ingress/egress skills)
 - Brain's secrets migrated to DemiPass vault with delegated access (8 ref codes)
 
 ## For Brain: Ideation/Audit Round
 
-### Card #17: Concurrent token limit
-One active use-token per secret per DID. Prevents parallel exfiltration race condition.
-**Status: needs code, design is straightforward.**
+### Card #17: Concurrent token limit — SHIPPED (ea0e1d2)
+One active use-token per secret per DID. Returns 429 if outstanding token exists.
+**Verify:** request a token, don't redeem, request another for same secret → should get 429.
 
 ### Card #18: Trust gradient fingerprint (NEEDS DESIGN REVIEW)
 Three-ring fingerprint as trust gradient, not binary gate. Buoy tick chain IS the behavioral
@@ -175,10 +176,11 @@ tick type distribution), Outer (behavioral — action sequences, session shape).
 4. Should the gradient apply to ALL token requests or only high-value actions (ssh_exec, document)?
 5. False positive cost: a 1-hour suspension during a production deploy is catastrophic. How do we tune?
 
-### Card #19: Wallet attestation on Buoy ticks
-Signed ticks include DemiPass custody proof (wallet_active, secrets_count, custody_since,
-last_verified_use). 30-day grace period for new DIDs. Makes DemiPass the root of trust.
-**Status: design solid, needs code.**
+### Card #19: Wallet attestation on Buoy ticks — SHIPPED (ea0e1d2)
+Signed ticks now include attestation block: wallet_active, secrets_count, custody_since,
+last_verified_use, attestation_hash. 30-day grace period for new DIDs.
+**Verify:** POST /api/tick as authenticated member → response should have attestation block.
+DIDs with no wallet and >30 days old get attestation: null.
 
 ### Card #21: Notarized ticks
 Bilateral co-signed ticks with escrow backing. Public vs private verification. Counterparty
