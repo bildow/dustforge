@@ -222,6 +222,8 @@
     <label>Value</label><input type="password" id="s-value" placeholder="The secret value">
     <label>Type</label>
     <select id="s-type"><option value="api_key">API Key</option><option value="password">Password</option><option value="token">Token</option><option value="other">Other</option></select>
+    <label>Expires in (optional)</label>
+    <input type="text" id="s-expires" placeholder="e.g. 30d, 90d, or leave blank">
     <div id="s-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="storeSecret()">Store</button></div>
   </div>
@@ -310,7 +312,15 @@ function renderSecrets(){
   if(!secrets.length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}
   let h='';for(const s of secrets){
     const on=s.status==='active'&&!panic;
-    h+=`<div class="secret-card"><div class="secret-dot ${on?'on':'off'}"></div><div class="secret-info"><div class="secret-name">${esc(s.name)}</div><div class="secret-meta">${esc(s.secret_type||'-')} &middot; ${s.context_count||0} contexts</div></div><div class="secret-actions">${s.status==='active'?`<button class="sa-btn" onclick="revokeSecret('${esc(s.name)}')">revoke</button>`:''}</div></div>`}
+    let expiryHint = '';
+    if (s.expires_at) {
+      const daysLeft = Math.ceil((new Date(s.expires_at) - Date.now()) / 86400000);
+      if (daysLeft < 0) expiryHint = ' <span style="color:var(--red)">EXPIRED</span>';
+      else if (daysLeft <= 7) expiryHint = ` <span style="color:var(--red)">${daysLeft}d left</span>`;
+      else if (daysLeft <= 30) expiryHint = ` <span style="color:var(--yellow)">${daysLeft}d left</span>`;
+    }
+    const providerTag = s.provider ? ` &middot; ${esc(s.provider)}` : '';
+    h+=`<div class="secret-card"><div class="secret-dot ${on?'on':'off'}"></div><div class="secret-info"><div class="secret-name">${esc(s.name)}</div><div class="secret-meta">${esc(s.secret_type||'-')}${providerTag} &middot; used ${s.use_count||0}x${expiryHint}</div></div><div class="secret-actions">${s.status==='active'?`<button class="sa-btn" onclick="revokeSecret('${esc(s.name)}')">revoke</button>`:''}</div></div>`}
   document.getElementById('secret-list').innerHTML=h}
 
 async function loadActivity(){
@@ -332,9 +342,10 @@ async function loadBuoy(){
   document.getElementById('trigger-list').innerHTML=h}}catch{}}
 
 // Actions
-async function storeSecret(){const n=document.getElementById('s-name').value.trim(),v=document.getElementById('s-value').value,t=document.getElementById('s-type').value,m=document.getElementById('s-msg');
+async function storeSecret(){const n=document.getElementById('s-name').value.trim(),v=document.getElementById('s-value').value,t=document.getElementById('s-type').value,exp=document.getElementById('s-expires').value.trim(),m=document.getElementById('s-msg');
   if(!n||!v){m.textContent='Name and value required';m.className='modal-msg err';return}
-  try{await api('POST','/api/demipass/store',{name:n,value:v,secret_type:t});m.textContent='Stored';m.className='modal-msg ok';document.getElementById('s-value').value='';loadVault();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+  const body={name:n,value:v,secret_type:t};if(exp)body.expires_in=exp;
+  try{const r=await api('POST','/api/demipass/store',body);m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');m.className='modal-msg ok';document.getElementById('s-value').value='';loadVault();setTimeout(closeModal,1200)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
 
 async function revokeSecret(name){if(!confirm('Revoke '+name+'?'))return;try{await api('DELETE','/api/demipass/revoke',{name});loadVault()}catch(e){alert(e.message)}}
 

@@ -1379,6 +1379,35 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN version INTEGER DEFAULT 1
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN replaced_by INTEGER DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN rotate_expires_at TEXT DEFAULT ''"); } catch(_) {}
 
+// Secret metadata: expiration + Buoy timestamps
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN expires_at TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN buoy_ingested_tick INTEGER DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN buoy_last_used_tick INTEGER DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN provider TEXT DEFAULT ''"); } catch(_) {}
+
+// Known provider patterns — auto-detect expiration hints
+const PROVIDER_PATTERNS = {
+  'sk-or-': { provider: 'openrouter', typical_expiry_days: null },
+  'sk-': { provider: 'openai', typical_expiry_days: null },
+  'ghp_': { provider: 'github', typical_expiry_days: 90 },
+  'ghs_': { provider: 'github', typical_expiry_days: 1 },
+  'glpat-': { provider: 'gitlab', typical_expiry_days: 365 },
+  'npm_': { provider: 'npm', typical_expiry_days: 30 },
+  'sk_live_': { provider: 'stripe', typical_expiry_days: null },
+  'sk_test_': { provider: 'stripe', typical_expiry_days: null },
+  'xoxb-': { provider: 'slack', typical_expiry_days: null },
+  'AIza': { provider: 'google', typical_expiry_days: null },
+  'AKIA': { provider: 'aws', typical_expiry_days: null },
+  'DF-': { provider: 'dustforge', typical_expiry_days: 1 },
+};
+
+function detectProvider(value) {
+  for (const [prefix, info] of Object.entries(PROVIDER_PATTERNS)) {
+    if (value.startsWith(prefix)) return info;
+  }
+  return { provider: '', typical_expiry_days: null };
+}
+
 // DemiPass routed references — credit-card-style prefix routing
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN ref_code TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_ref ON blindkey_secrets(ref_code) WHERE ref_code != ''"); } catch(_) {}
@@ -1776,17 +1805,40 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
   const validTypes = ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
   const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
 
+  // Accept optional expiration
+  const { expires_in, expires_at: expiresAtRaw } = req.body || {};
+
   try {
     const encrypted = blindkeyEncrypt(value);
+
+    // Auto-detect provider from value prefix
+    const providerInfo = detectProvider(value);
+
+    // Compute expiration
+    let expiresAt = null;
+    if (expiresAtRaw) {
+      expiresAt = new Date(expiresAtRaw).toISOString();
+    } else if (expires_in) {
+      const match = String(expires_in).match(/^(\d+)(m|h|d)$/);
+      if (match) {
+        const ms = { m: 60000, h: 3600000, d: 86400000 }[match[2]] * Number(match[1]);
+        expiresAt = new Date(Date.now() + ms).toISOString();
+      }
+    } else if (providerInfo.typical_expiry_days) {
+      expiresAt = new Date(Date.now() + providerInfo.typical_expiry_days * 86400000).toISOString();
+    }
+
     db.prepare(`
-      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(did, name) DO UPDATE SET
         encrypted_value = excluded.encrypted_value,
         description = excluded.description,
         secret_type = excluded.secret_type,
+        expires_at = excluded.expires_at,
+        provider = excluded.provider,
         updated_at = CURRENT_TIMESTAMP
-    `).run(req.identity.did, name, description || '', resolvedType, encrypted);
+    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider);
 
     // Generate and store ref_code if not already set
     const stored = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?").get(req.identity.did, name);
@@ -1796,7 +1848,22 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       db.prepare("UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?").run(refCode, stored.id);
     }
 
-    res.json({ ok: true, name, ref: refCode, secret_type: resolvedType, description: description || '', note: 'Secret stored. It will never be returned in any API response.' });
+    // Buoy ingestion tick — anchor this deposit in the tick chain
+    let buoyTickId = null;
+    try {
+      const tickResult = db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(req.identity.did, `secret stored: ${name}`, req.ip || '', 'UTC', 'tick', JSON.stringify(['demipass:store', `secret:${name}`]));
+      buoyTickId = tickResult.lastInsertRowid;
+      db.prepare("UPDATE blindkey_secrets SET buoy_ingested_tick = ? WHERE id = ?").run(buoyTickId, stored.id);
+    } catch(_) {}
+
+    res.json({
+      ok: true, name, ref: refCode, secret_type: resolvedType, description: description || '',
+      provider: providerInfo.provider || null,
+      expires_at: expiresAt,
+      buoy_tick: buoyTickId,
+      note: 'Secret stored. It will never be returned in any API response.',
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1827,10 +1894,41 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
   }
 
   const secrets = db.prepare(
-    `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code
+    `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
   ).all(ownerDid, 'active');
   res.json({ did: ownerDid, secrets, total: secrets.length });
+});
+
+// GET /api/blindkey/expiring — list secrets expiring within a window
+app.get('/api/blindkey/expiring', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const ownerDid = actor.did || null;
+  if (!ownerDid) return res.status(400).json({ error: 'identity required' });
+
+  const withinDays = Math.min(90, Math.max(1, Number(req.query.days) || 7));
+  const cutoff = new Date(Date.now() + withinDays * 86400000).toISOString();
+
+  const expiring = db.prepare(
+    `SELECT id, name, secret_type, ref_code, expires_at, provider, use_count, last_used_at, buoy_ingested_tick, buoy_last_used_tick
+     FROM blindkey_secrets WHERE did = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at ASC`
+  ).all(ownerDid, cutoff);
+
+  const expired = db.prepare(
+    `SELECT id, name, secret_type, ref_code, expires_at, provider
+     FROM blindkey_secrets WHERE did = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at ASC`
+  ).all(ownerDid, new Date().toISOString());
+
+  res.json({
+    did: ownerDid,
+    within_days: withinDays,
+    expiring,
+    already_expired: expired,
+    total_expiring: expiring.length,
+    total_expired: expired.length,
+  });
 });
 
 // GET /api/blindkey/history — list audit events for DemiPass secrets
@@ -2092,11 +2190,17 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       return res.status(500).json({ error: 'failed to decrypt secret' });
     }
 
-    // Update usage stats
+    // Update usage stats + Buoy last-used tick
     db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
     if (tokenRow.context_id) {
       db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
     }
+    // Buoy tick for secret use
+    try {
+      const useTick = db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(req.identity.did, `secret used: ${secret.name}`, req.ip || '', 'UTC', 'tick', JSON.stringify(['demipass:use', `secret:${secret.name}`]));
+      db.prepare("UPDATE blindkey_secrets SET buoy_last_used_tick = ? WHERE id = ?").run(useTick.lastInsertRowid, secret.id);
+    } catch(_) {}
 
     // Execute using the token's pre-validated context
     const action = tokenRow.action_type;
