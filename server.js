@@ -2049,7 +2049,7 @@ app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
 // Prevents credential harvesting via parallel identities and detects
 // abnormal access patterns that indicate compromise or hostile probing.
 const didTokenCounters = new Map(); // did → { count, windowStart }
-const didSecretAccess = new Map();  // did → Map(secretId → timestamp)
+// didSecretAccess removed — velocity tracking now uses velocity_access_log DB table
 const DID_TOKEN_LIMIT = 10;        // max tokens per DID per minute
 const DID_TOKEN_WINDOW = 60000;
 const VELOCITY_THRESHOLD = 5;      // distinct secrets in this window
@@ -2060,6 +2060,17 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS suspended_dids (
   reason TEXT DEFAULT '',
   suspended_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
+
+// Velocity access log — persisted so 30-min window survives restarts
+try { db.exec(`CREATE TABLE IF NOT EXISTS velocity_access_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  secret_id INTEGER NOT NULL,
+  accessed_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_val_did ON velocity_access_log(did)"); } catch(e) {}
+// Clean old entries on startup
+try { db.exec("DELETE FROM velocity_access_log WHERE accessed_at < datetime('now', '-60 minutes')"); } catch(e) {}
 
 // Load existing suspensions from DB on startup
 const suspendedDids = new Set();
@@ -2082,22 +2093,20 @@ function checkDidRateLimit(did) {
 
 function checkVelocityThrottle(did, secretId) {
   if (suspendedDids.has(did)) return false;
-  const now = Date.now();
-  let access = didSecretAccess.get(did);
-  if (!access) { access = new Map(); didSecretAccess.set(did, access); }
 
-  // Clean old entries
-  for (const [sid, ts] of access) {
-    if (now - ts > VELOCITY_WINDOW) access.delete(sid);
-  }
+  // Persist access to DB so velocity window survives restarts
+  try { db.prepare('INSERT INTO velocity_access_log (did, secret_id) VALUES (?, ?)').run(did, secretId); } catch(_) {}
 
-  access.set(secretId, now);
+  // Count distinct secrets accessed in the velocity window (from DB, not memory)
+  const cutoff = new Date(Date.now() - VELOCITY_WINDOW).toISOString();
+  const distinctCount = db.prepare(
+    "SELECT COUNT(DISTINCT secret_id) as n FROM velocity_access_log WHERE did = ? AND accessed_at >= ?"
+  ).get(did, cutoff)?.n || 0;
 
-  if (access.size >= VELOCITY_THRESHOLD) {
+  if (distinctCount >= VELOCITY_THRESHOLD) {
     suspendedDids.add(did);
-    // Persist to DB so suspension survives restart
-    try { db.prepare('INSERT OR REPLACE INTO suspended_dids (did, reason) VALUES (?, ?)').run(did, `velocity: ${access.size} secrets in ${VELOCITY_WINDOW/60000}min`); } catch(_) {}
-    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${access.size} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED (persisted)`);
+    try { db.prepare('INSERT OR REPLACE INTO suspended_dids (did, reason) VALUES (?, ?)').run(did, `velocity: ${distinctCount} secrets in ${VELOCITY_WINDOW/60000}min`); } catch(_) {}
+    console.error(`[VELOCITY] DID ${did.slice(0, 30)} accessed ${distinctCount} distinct secrets in ${VELOCITY_WINDOW/60000}min — AUTO-SUSPENDED (persisted)`);
     // Buoy alert tick
     try {
       db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
@@ -2115,10 +2124,8 @@ setInterval(() => {
   for (const [did, entry] of didTokenCounters) {
     if (entry.windowStart < cutoff) didTokenCounters.delete(did);
   }
-  const vCutoff = Date.now() - VELOCITY_WINDOW * 2;
-  for (const [did, access] of didSecretAccess) {
-    if (access.size === 0) didSecretAccess.delete(did);
-  }
+  // Clean old velocity access log entries from DB
+  try { db.prepare("DELETE FROM velocity_access_log WHERE accessed_at < datetime('now', '-60 minutes')").run(); } catch(_) {}
 }, 300000);
 
 // POST /api/blindkey/request-token — request a short-lived use-token by presenting intended context
@@ -7587,9 +7594,11 @@ app.post('/api/blindkey/unsuspend', rateLimitStandard, (req, res) => {
 
   if (suspendedDids.has(did)) {
     suspendedDids.delete(did);
-    didSecretAccess.delete(did);
     didTokenCounters.delete(did);
-    try { db.prepare('DELETE FROM suspended_dids WHERE did = ?').run(did); } catch(_) {}
+    try {
+      db.prepare('DELETE FROM suspended_dids WHERE did = ?').run(did);
+      db.prepare('DELETE FROM velocity_access_log WHERE did = ?').run(did);
+    } catch(_) {}
     console.log(`[VELOCITY] DID ${did.slice(0, 30)} unsuspended by admin (removed from DB)`);
     return res.json({ ok: true, did, status: 'unsuspended' });
   }
