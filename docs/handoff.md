@@ -4,10 +4,10 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `a447258` — Mobile vault UI + app test handoff |
+| **Last commit** | `e369242` — Vault injection hardening |
 | **Branch** | `main` — `bildow/dustforge` |
-| **Deployed** | Netlify + RackNerd LIVE. Phasewhip admin on 9190. |
-| **Status** | All products live with SSL. Lori on Conductor. Buoy tick types deployed. |
+| **Deployed** | Netlify + RackNerd LIVE |
+| **Status** | All 11 task cards complete. Injection hardened. Capacity tested 8/8 pass. |
 
 ## What Shipped This Session (2026-04-20)
 
@@ -63,9 +63,9 @@ Verify with: `git log --oneline -5` — you should see `10c5276 Fix 3 Brain audi
 
 | Repo | Latest | Status |
 |------|--------|--------|
-| bildow/dustforge | a447258 | Netlify + RackNerd LIVE |
+| bildow/dustforge | e369242 | Netlify + RackNerd LIVE |
 | bildow/demipass | 369261b | npm 1.1.0 LIVE |
-| bildow/rowen | c74d223 | Deployed on phasewhip (6 action types here, NOT in dustforge/rowen-server.js) |
+| bildow/rowen | 2f246e0 | Deployed on phasewhip (SSHPASS fix + 6 action types) |
 | bildow/tome | ef9953f | Session logged |
 
 ## For Brain's Audit
@@ -100,8 +100,49 @@ Brain is already onboarded with a Dustforge DID. Test the app flow:
 4. Try: drop a tick, check chain verification
 5. UX feedback: what's confusing, what's buried, what should be front-and-center on mobile
 
-## Open Task Cards
-- Vault UI/UX mobile-first redesign (Aaron feedback: too power-user, bury marketing, simplify)
-- Brain TOS v4 via DemiPass document courier
-- Recursive adversarial audit on DemiPass document courier
-- npm 2FA re-enable (nice-to-have)
+## Completed This Continuation Session
+
+### DemiPass Routed References
+- `d752cd4` — Credit-card-style ref codes (DP-PWD-flimflam-e542b0b9). One-field token requests.
+- Brain tested: `{"ref":"DP-PWD-flimflam-e542b0b9"}` → delegated SSH exec → worked.
+
+### TOS v4
+- `4448b4e` — Brain pushed TOS v4 via DemiPass delegated SSH (first real credential courier operation)
+- Deployed to Netlify. Live at dustforge.com/terms.html and /terms-v4.html
+
+### Secret Metadata (card 9)
+- `b3fed44` — expires_at, buoy_ingested_tick, buoy_last_used_tick, provider columns
+- Auto-detects 12 provider prefixes (OpenRouter, GitHub, npm, Stripe, etc.)
+- GET /api/demipass/expiring for proactive rotation planning
+- Mobile vault shows expiration countdown (red/yellow/expired)
+
+### Injection Hardening (card 10)
+- `e369242` (dustforge) + `2f246e0` (rowen) — All 4 ssh_exec paths now use SSHPASS env var
+- 14 code detection patterns on store. >10KB base64 blocked.
+- Shell injection via crafted secret values eliminated.
+
+### Capacity Testing (card 11)
+- 8/8 PASS on production: 100 secrets (121ms), 4KB RSA, 8KB PEM, SSH keys, connection strings, Unicode
+- Decrypt: 0.06ms per secret at volume. No degradation.
+
+### QR Deposit Flow (card 7)
+- `43b2f3a` — qr-deposit.html (local QR gen) + vault-mobile.html scanner (BarcodeDetector API)
+
+### Landing Page Onboarding (card 8)
+- `29d72c9` — Three paths (Phone App, QR Deposit, SDK/CLI), routed reference explainer
+
+## For Brain's Audit
+
+### New since last audit (pull origin/main first!):
+1. **Routed references** — POST /api/demipass/request-token with `{"ref":"DP-..."}` auto-resolves owner, delegation, context, action. Same error for not-found and no-delegation (anti-enumeration).
+2. **SSH injection fix** — all ssh_exec paths use `sshpass -e` with SSHPASS env var, not `-p 'password'`. Verify in server.js and rowen egress/server.js.
+3. **Input sanitization** — 14 code detection patterns + >10KB base64 block. Try storing `<script>alert(1)</script>` and verify rejection.
+4. **Secret metadata** — store a secret with `ghp_` prefix, verify provider auto-detected as "github" and expires_at set to 90 days. Check buoy_ingested_tick is set.
+5. **Expiring endpoint** — GET /api/demipass/expiring?days=90 returns secrets approaching expiration.
+6. **TOS v4** — dustforge.com/terms.html and /terms-v4.html both serve v4 content.
+7. **Capacity** — vault handles 100+ secrets, 8KB values, Unicode, special chars without degradation.
+
+## Known Issues
+- Stalwart auth from RackNerd intermittently fails (Tailscale link flaky after power loss)
+- Aaron's DID changed during password reset (old: u7QFEhT8..., new: u7QGkcLs...)
+- npm 2FA still disabled on gnomishplumber account
