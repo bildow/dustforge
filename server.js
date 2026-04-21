@@ -2255,6 +2255,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   }
 
   try {
+    // Concurrent token limit: only one active (non-expired, non-used) token per secret per DID
+    const outstanding = db.prepare(
+      "SELECT COUNT(*) as n FROM blindkey_use_tokens WHERE did = ? AND secret_id = ? AND status = 'valid' AND expires_at > datetime('now')"
+    ).get(callerDid, secret.id);
+    if (outstanding && outstanding.n > 0) {
+      return res.status(429).json({ error: 'concurrent token limit: you already have an active token for this secret. Wait for it to expire (30s) or redeem it first.' });
+    }
+
     // The token references the OWNER's secret — the delegate never sees the value
     db.prepare(`
       INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at, delegation_id)
@@ -6870,14 +6878,41 @@ app.post('/api/tick', (req, res) => {
     member: isMember,
   };
 
-  // Signature (member only)
+  // Signature + wallet attestation (member only)
   if (isMember) {
-    const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(did);
+    const wallet = db.prepare('SELECT referral_code, created_at FROM identity_wallets WHERE did = ?').get(did);
     const sigPayload = `${tickId}:${timeISO}:${did}:${noteClean}:${chainHash}`;
     const sig = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY || '').update(sigPayload).digest('hex');
     response.signature = sig;
     response.referral_code = wallet?.referral_code || '';
     response.did = did;
+
+    // DemiPass wallet attestation — proves custody without revealing secrets
+    const secretCount = db.prepare("SELECT COUNT(*) as n FROM blindkey_secrets WHERE did = ? AND status = 'active'").get(did);
+    const lastUse = db.prepare("SELECT last_used_at FROM blindkey_secrets WHERE did = ? AND status = 'active' AND last_used_at IS NOT NULL ORDER BY last_used_at DESC LIMIT 1").get(did);
+    const firstDeposit = db.prepare("SELECT created_at FROM blindkey_secrets WHERE did = ? ORDER BY created_at ASC LIMIT 1").get(did);
+    const hasWallet = (secretCount?.n || 0) > 0;
+
+    // Grace period: DIDs less than 30 days old get attested ticks without a wallet
+    const accountAge = wallet?.created_at ? (Date.now() - new Date(wallet.created_at + 'Z').getTime()) / 86400000 : 0;
+    const inGracePeriod = accountAge < 30;
+
+    if (hasWallet || inGracePeriod) {
+      const attestationData = {
+        wallet_active: hasWallet,
+        secrets_count: secretCount?.n || 0,
+        custody_since: firstDeposit?.created_at || null,
+        last_verified_use: lastUse?.last_used_at || null,
+        grace_period: inGracePeriod && !hasWallet,
+      };
+      const attestationHash = crypto.createHmac('sha256', process.env.IDENTITY_MASTER_KEY || '')
+        .update(JSON.stringify(attestationData) + ':' + tickId + ':' + did)
+        .digest('hex');
+      response.attestation = { ...attestationData, attestation_hash: attestationHash };
+    } else {
+      response.attestation = null;
+      response.attestation_note = 'No DemiPass wallet and grace period expired. Tick is signed but unattested.';
+    }
   } else {
     response.signature = null;
     response.referral_code = null;
