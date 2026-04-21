@@ -435,12 +435,24 @@ async function handleIntent(message) {
       const subject = didMatch ? didMatch[1] || didMatch[0] : 'unknown';
 
       // Create a task on the platform for Aaron to review
-      await createTask(1, `Suspension review: ${subject}`, `Escalated by ${msg.slice(0, 200)}. Check /api/blindkey/suspension-status for details.`, 'aaron');
+      const taskResult = await createTask(1, `Suspension review: ${subject}`, `Escalated by ${msg.slice(0, 200)}. Check /api/blindkey/suspension-status for details.`, 'aaron');
+      const taskOk = taskResult && (taskResult.id || taskResult.ok);
 
       // Send Conduit message to notify
-      await conduitReply('civitasvox-brain', `[ESCALATION] Suspension review requested for ${subject}. Task created on project 1. Aaron needs to review and decide on exemption.`);
+      const conduitResult = await conduitReply('civitasvox-brain', `[ESCALATION] Suspension review requested for ${subject}. Task created on project 1. Aaron needs to review and decide on exemption.`);
+      const conduitOk = conduitResult && !conduitResult.error;
 
-      return `Escalation filed. I created a task for Aaron and notified Brain via Conduit. The account stays locked until Aaron reviews. He'll check the velocity log and either grant an exemption or confirm the suspension.`;
+      // Report what actually succeeded
+      const outcomes = [];
+      if (taskOk) outcomes.push('task created on project board');
+      else outcomes.push('task creation failed — platform may be down');
+      if (conduitOk) outcomes.push('Brain notified via Conduit');
+      else outcomes.push('Conduit notification failed — Brain may not see this immediately');
+
+      if (taskOk || conduitOk) {
+        return `Escalation filed (${outcomes.join('; ')}). The account stays locked until Aaron reviews. If both channels failed, email support@dustforge.com directly.`;
+      }
+      return `Escalation attempted but both channels failed: ${outcomes.join('; ')}. Please email support@dustforge.com directly.`;
     } catch (err) {
       return `I tried to escalate but hit an error: ${err.message}. Email support@dustforge.com directly as a backup.`;
     }
