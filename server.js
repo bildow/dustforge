@@ -1379,6 +1379,27 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN version INTEGER DEFAULT 1
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN replaced_by INTEGER DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN rotate_expires_at TEXT DEFAULT ''"); } catch(_) {}
 
+// DemiPass routed references — credit-card-style prefix routing
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN ref_code TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_ref ON blindkey_secrets(ref_code) WHERE ref_code != ''"); } catch(_) {}
+
+function generateRefCode(secretType, name) {
+  const prefix = { api_key: 'API', password: 'PWD', token: 'TKN', ssh_key: 'SSH', cert: 'CRT', other: 'SEC' }[secretType] || 'SEC';
+  const slug = name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toLowerCase();
+  const nonce = crypto.randomBytes(4).toString('hex');
+  return `DP-${prefix}-${slug}-${nonce}`;
+}
+
+// Backfill ref_codes for existing secrets that don't have one
+try {
+  const missing = db.prepare("SELECT id, secret_type, name FROM blindkey_secrets WHERE ref_code = '' OR ref_code IS NULL").all();
+  for (const s of missing) {
+    const ref = generateRefCode(s.secret_type, s.name);
+    db.prepare("UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?").run(ref, s.id);
+  }
+  if (missing.length) console.log(`[demipass] backfilled ${missing.length} ref_codes`);
+} catch(_) {}
+
 // Blindkey usage context layer — controls HOW and WHERE secrets can be used
 try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1767,7 +1788,15 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
         updated_at = CURRENT_TIMESTAMP
     `).run(req.identity.did, name, description || '', resolvedType, encrypted);
 
-    res.json({ ok: true, name, secret_type: resolvedType, description: description || '', note: 'Secret stored. It will never be returned in any API response.' });
+    // Generate and store ref_code if not already set
+    const stored = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?").get(req.identity.did, name);
+    let refCode = stored?.ref_code;
+    if (!refCode) {
+      refCode = generateRefCode(resolvedType, name);
+      db.prepare("UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?").run(refCode, stored.id);
+    }
+
+    res.json({ ok: true, name, ref: refCode, secret_type: resolvedType, description: description || '', note: 'Secret stored. It will never be returned in any API response.' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1798,7 +1827,7 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
   }
 
   const secrets = db.prepare(
-    `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version
+    `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
   ).all(ownerDid, 'active');
   res.json({ did: ownerDid, secrets, total: secrets.length });
@@ -1872,8 +1901,49 @@ app.get('/api/blindkey/history', rateLimitStandard, (req, res) => {
 // Supports delegated access: if the caller doesn't own the secret, check demipass_delegations.
 // The delegate passes { owner_did } to indicate whose secret they want to use via delegation.
 app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
-  const { name, context: contextName, action, target_host, target_url, owner_did } = req.body || {};
-  if (!name || !action) return res.status(400).json({ error: 'name and action required' });
+  let { name, ref, context: contextName, action, target_host, target_url, owner_did } = req.body || {};
+
+  // Routed reference mode — parse DP-TYPE-slug-nonce and resolve everything
+  if (ref && typeof ref === 'string' && ref.startsWith('DP-')) {
+    const refSecret = db.prepare("SELECT * FROM blindkey_secrets WHERE ref_code = ? AND status = 'active'").get(ref);
+    if (!refSecret) return res.status(403).json({ error: 'access denied' }); // same error for not-found and no-delegation
+
+    // Check if caller owns it or has delegation
+    const callerDid = req.identity.did;
+    if (refSecret.did === callerDid) {
+      // Direct ownership — use it
+      name = refSecret.name;
+      owner_did = null;
+    } else {
+      // Check delegation
+      const del = db.prepare(`SELECT * FROM demipass_delegations WHERE secret_id = ? AND delegate_did = ? AND status = 'active'`).get(refSecret.id, callerDid);
+      if (!del) return res.status(403).json({ error: 'access denied' }); // same error — no enumeration
+      name = refSecret.name;
+      owner_did = refSecret.did;
+    }
+
+    // Auto-resolve action from secret_type if not provided
+    if (!action) {
+      const typeToAction = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
+      action = typeToAction[refSecret.secret_type] || 'http_header';
+    }
+
+    // Auto-resolve context — use the first active context if not provided
+    if (!contextName) {
+      const firstCtx = db.prepare("SELECT context_name FROM blindkey_contexts WHERE secret_id = ? AND status = 'active' LIMIT 1").get(refSecret.id);
+      contextName = firstCtx?.context_name || 'default';
+    }
+
+    // Auto-resolve target_host from context if not provided
+    if (!target_host) {
+      const ctx = db.prepare("SELECT target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND context_name = ? AND status = 'active'").get(refSecret.id, contextName);
+      if (ctx?.target_host_pattern && ctx.target_host_pattern !== '*') {
+        target_host = ctx.target_host_pattern;
+      }
+    }
+  }
+
+  if (!name || !action) return res.status(400).json({ error: 'name and action required (or use ref: "DP-...")' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
   if (typeof action !== 'string') return res.status(400).json({ error: 'action: must be a string' });
   if (name.length > 100) return res.status(400).json({ error: 'name: max 100 characters' });
