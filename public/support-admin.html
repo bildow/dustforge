@@ -151,14 +151,14 @@ async function verify2FA() {
   const err = document.getElementById('a-err');
   if (!code) { err.textContent = '2FA code required'; return; }
   adminKey = code;
-  // Verify by making a test API call
-  const test = await apiFetch('GET', '/api/health');
-  if (test.ok) {
+  // Verify by making an admin-only API call (not just /api/health)
+  const test = await apiFetch('GET', '/api/support/tickets');
+  if (test.tickets !== undefined) {
     localStorage.setItem('sc_key', adminKey);
     localStorage.setItem('sc_user', adminUser);
     showDash();
   } else {
-    err.textContent = 'Invalid admin key';
+    err.textContent = test.error || 'Invalid admin key';
     adminKey = '';
   }
 }
@@ -179,46 +179,48 @@ async function showDash() {
 }
 
 async function loadStats() {
-  // Count suspended DIDs
-  // We'll use the tasks as a proxy for ticket counts
   try {
-    const projects = await apiFetch('GET', '/api/health');
-    document.getElementById('s-suspended').textContent = '?'; // would need a dedicated endpoint
+    const data = await apiFetch('GET', '/api/support/tickets');
+    if (data.counts) {
+      document.getElementById('s-open').textContent = data.counts.open || 0;
+      document.getElementById('s-reviewing').textContent = data.counts.reviewing || 0;
+      document.getElementById('s-resolved').textContent = data.counts.resolved || 0;
+    }
+    document.getElementById('s-suspended').textContent = '—';
   } catch {}
 }
 
 async function loadTickets() {
-  // Pull tasks from the platform that are suspension reviews
   try {
     const el = document.getElementById('ticket-list');
-    // For now, show recent Buoy alert ticks as the ticket feed
-    const ticks = await apiFetch('GET', '/api/tick/ledger?limit=20');
-    // Also get velocity alerts from ticks
-    const alerts = (ticks.ticks || []).filter(t => (t.tick_type === 'alert' || t.note?.includes('suspend') || t.note?.includes('escalat')));
+    const data = await apiFetch('GET', '/api/support/tickets');
+    const tickets = data.tickets || [];
 
-    if (!alerts.length) {
-      el.innerHTML = '<div class="empty">No open tickets or alerts.</div>';
-      document.getElementById('s-open').textContent = '0';
-      document.getElementById('s-reviewing').textContent = '0';
-      document.getElementById('s-resolved').textContent = '0';
+    if (!tickets.length) {
+      el.innerHTML = '<div class="empty">No support tickets.</div>';
       return;
     }
 
     let html = '';
-    let openCount = 0;
-    for (const a of alerts) {
-      openCount++;
+    let html = '';
+    for (const t of tickets) {
+      const statusCls = t.status === 'open' ? 'ts-open' : t.status === 'reviewing' ? 'ts-reviewing' : 'ts-resolved';
       html += '<div class="ticket">';
-      html += '<div class="ticket-head"><span class="ticket-id">#' + a.id + '</span><span class="ticket-status ts-open">' + (a.tick_type || 'alert') + '</span></div>';
-      html += '<div class="ticket-body">' + esc(a.note) + '</div>';
-      html += '<div class="ticket-meta">' + new Date(a.created_at).toLocaleString() + '</div>';
+      html += '<div class="ticket-head"><span class="ticket-id">#' + t.id + '</span><span class="ticket-status ' + statusCls + '">' + t.status + '</span><span class="ticket-source">' + esc(t.source) + '</span></div>';
+      html += '<div class="ticket-body"><strong>' + esc(t.subject) + '</strong>' + (t.body ? '<br>' + esc(t.body).slice(0, 200) : '') + '</div>';
+      html += '<div class="ticket-meta">' + (t.username || t.did?.slice(0, 25) || 'anonymous') + ' &middot; ' + new Date(t.created_at).toLocaleString() + (t.resolution ? '<br>Resolution: ' + esc(t.resolution) : '') + '</div>';
       html += '<div class="ticket-actions">';
-      html += '<button class="ta-btn ta-btn-green" onclick="resolveTicket(' + a.id + ')">Resolve</button>';
-      html += '<button class="ta-btn" onclick="reviewTicket(' + a.id + ')">Review</button>';
+      if (t.status === 'open') {
+        html += '<button class="ta-btn" onclick="updateTicket(' + t.id + ',\'reviewing\')">Review</button>';
+        html += '<button class="ta-btn ta-btn-green" onclick="updateTicket(' + t.id + ',\'resolved\')">Resolve</button>';
+        html += '<button class="ta-btn ta-btn-red" onclick="updateTicket(' + t.id + ',\'closed\')">Close</button>';
+      } else if (t.status === 'reviewing') {
+        html += '<button class="ta-btn ta-btn-green" onclick="updateTicket(' + t.id + ',\'resolved\')">Resolve</button>';
+        html += '<button class="ta-btn ta-btn-red" onclick="updateTicket(' + t.id + ',\'closed\')">Close</button>';
+      }
       html += '</div></div>';
     }
     el.innerHTML = html;
-    document.getElementById('s-open').textContent = openCount;
   } catch (e) {
     document.getElementById('ticket-list').innerHTML = '<div class="empty">Error loading: ' + esc(e.message) + '</div>';
   }
@@ -272,13 +274,16 @@ async function exemptDid() {
   loadTickets();
 }
 
-function resolveTicket(id) {
-  document.getElementById('q-result').textContent = 'Ticket #' + id + ' marked resolved.';
-  loadTickets();
-}
-
-function reviewTicket(id) {
-  document.getElementById('q-result').textContent = 'Reviewing ticket #' + id + '...';
+async function updateTicket(id, status) {
+  const resolution = status === 'resolved' ? prompt('Resolution note (optional):') || '' : '';
+  try {
+    const result = await apiFetch('PATCH', '/api/support/tickets/' + id, { status, resolution });
+    document.getElementById('q-result').textContent = result.ok ? 'Ticket #' + id + ' → ' + status : (result.error || 'failed');
+    loadTickets();
+    loadStats();
+  } catch (e) {
+    document.getElementById('q-result').textContent = 'Error: ' + e.message;
+  }
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
