@@ -163,6 +163,78 @@
   </div>
 </div>
 
+<!-- Agent Onboarding -->
+<div style="padding:4rem 2rem">
+  <div style="max-width:700px;margin:0 auto">
+    <h2 style="text-align:center;font-size:2rem;margin-bottom:0.5rem">Wire up your agent</h2>
+    <p style="text-align:center;color:var(--text2);margin-bottom:2.5rem">Works with Claude Code, Codex, or any MCP-compatible agent. Three steps.</p>
+
+    <div style="display:flex;flex-direction:column;gap:1.5rem">
+      <!-- Step 1 -->
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
+          <div style="width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:800;flex-shrink:0">1</div>
+          <h3 style="font-size:1rem">Install the package</h3>
+        </div>
+        <code style="display:block;background:var(--bg);padding:0.6rem 1rem;border-radius:6px;font-size:0.95rem;color:var(--green)">npm install demipass</code>
+      </div>
+
+      <!-- Step 2 -->
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
+          <div style="width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:800;flex-shrink:0">2</div>
+          <h3 style="font-size:1rem">Add to your MCP config</h3>
+        </div>
+        <p style="font-size:0.8rem;color:var(--text3);margin-bottom:0.75rem">Add to <code style="background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">.mcp.json</code> in your project root:</p>
+        <pre style="background:var(--bg);padding:1rem;border-radius:6px;font-size:0.75rem;color:var(--text2);overflow-x:auto;line-height:1.5">{
+  "mcpServers": {
+    "demipass": {
+      "command": "node",
+      "args": ["node_modules/demipass/mcp-server.js"],
+      "env": {
+        "DEMIPASS_URL": "https://api.dustforge.com",
+        "DEMIPASS_TOKEN": "your-bearer-token"
+      }
+    },
+    "buoy": {
+      "command": "node",
+      "args": ["node_modules/demipass/buoy-mcp.js"],
+      "env": {
+        "BUOY_URL": "https://api.dustforge.com",
+        "BUOY_TOKEN": "your-bearer-token"
+      }
+    }
+  }
+}</pre>
+      </div>
+
+      <!-- Step 3 -->
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
+          <div style="width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:800;flex-shrink:0">3</div>
+          <h3 style="font-size:1rem">Your agent gets 11 tools</h3>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0.5rem;font-size:0.8rem">
+          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_store</code> — deposit a secret</div>
+          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_ssh</code> — SSH via ref code</div>
+          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_use</code> — one-step egress</div>
+          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_search</code> — find secrets</div>
+          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_expiring</code> — rotation alerts</div>
+          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_whoami</code> — identity check</div>
+          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_tick</code> — temporal anchor</div>
+          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_verify</code> — verify signatures</div>
+          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_chain_verify</code> — chain integrity</div>
+          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_stats</code> — tick statistics</div>
+          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_ledger</code> — tick history</div>
+        </div>
+        <p style="font-size:0.75rem;color:var(--text3);margin-top:0.75rem">The tools teach the agent how to handle secrets. The behavioral protocol is built into the tool descriptions — no separate training needed.</p>
+      </div>
+    </div>
+
+    <p style="text-align:center;margin-top:1.5rem"><a href="https://github.com/bildow/demipass/blob/main/ONBOARDING.md" style="color:var(--accent);font-size:0.85rem">Full onboarding guide on GitHub</a></p>
+  </div>
+</div>
+
 <div class="features">
   <div class="features-inner">
     <h2>Why DemiPass</h2>
