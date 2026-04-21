@@ -7407,15 +7407,8 @@ function buoyNotifyConduit(tick) {
   });
 }
 
-// Hook into the tick response — call after successful tick creation
-// We patch the existing POST /api/tick response by adding a post-tick hook
-const _origTickHandler = app._router.stack.find(
-  l => l.route && l.route.path === '/api/tick' && l.route.methods.post
-);
-
-// Alternative approach: just expose a function and call it from the probe spike handler too
-// The probe spike already inserts a tick — we just need to also relay it
-// For now, add a Conduit relay endpoint that agents or the tick handler can call
+// Agents call POST /api/buoy/notify after creating important ticks,
+// or subscribe to alert ticks via Conduit polling.
 
 app.post('/api/buoy/notify', (req, res) => {
   const { tick_id, type, note, chain_hash, tags, time } = req.body || {};
@@ -7425,10 +7418,6 @@ app.post('/api/buoy/notify', (req, res) => {
   res.json({ ok: true, relayed_to: 'conduit', type });
 });
 
-// Auto-relay probe spikes to Conduit
-const _origRecordProbe = recordProbe;
-// Monkey-patch is fragile — instead, the spike alert tick above already records the event.
-// Agents should subscribe to alert ticks via Conduit polling or the notify endpoint.
 
 module.exports = { app, db, buoyNotifyConduit };
 
