@@ -202,7 +202,6 @@ async function loadTickets() {
     }
 
     let html = '';
-    let html = '';
     for (const t of tickets) {
       const statusCls = t.status === 'open' ? 'ts-open' : t.status === 'reviewing' ? 'ts-reviewing' : 'ts-resolved';
       html += '<div class="ticket">';
