@@ -4,10 +4,11 @@
 
 | Field | Value |
 |-------|-------|
-| **Last commit** | `e369242` — Vault injection hardening |
+| **Last commit** | `22c2802` — see docs/handoff-latest.md for current state |
 | **Branch** | `main` — `bildow/dustforge` |
 | **Deployed** | Netlify + RackNerd LIVE |
-| **Status** | All 11 task cards complete. Injection hardened. Capacity tested 8/8 pass. |
+| **Status** | ODT genesis live. demipass@1.5.0. Graduated suspension. Founders page. See handoff-latest.md. |
+| **NOTE** | This file is maintained for backward compat. The authoritative handoff is `docs/handoff-latest.md`. |
 
 ## What Shipped This Session (2026-04-20)
 
@@ -50,7 +51,7 @@
 ### Other
 - 36 authoritative @dustforge.com emails reserved on production (legal, support, admin, etc.)
 - Phasewhip admin panel at http://100.83.112.88:9190 (container health + Lori chat)
-- Flowhook registered, enrolled, phone online (temporary patch from Kyle)
+- Flowhook registered and enrolled. Connection status: intermittent (Kyle temporary patch, not permanent).
 - TOS v3 canonical at /terms.html, handoff accuracy fixes
 
 ## IMPORTANT: Audit against origin/main tip, not stale checkout

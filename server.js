@@ -8380,14 +8380,27 @@ app.get('/api/admin/genesis-backup', rateLimitStandard, (req, res) => {
   if (!actor.ok) return;
   if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
 
-  const fingerprints = db.prepare('SELECT did, origin_hash, structural_hash, word_count, seed_version, created_at FROM genesis_fingerprints ORDER BY created_at ASC').all();
+  // Salt every export so leaked backups can't be correlated across dumps
+  // or used for offline guessing against the public seed
+  const backupSalt = crypto.randomBytes(32).toString('hex');
+  const fingerprints = db.prepare('SELECT did, origin_hash, structural_hash, word_count, seed_version, created_at FROM genesis_fingerprints ORDER BY created_at ASC').all()
+    .map(f => ({
+      did: f.did,
+      // Salted hashes — not the raw origin_hash. Can only be verified with this specific backup's salt.
+      salted_origin: crypto.createHash('sha256').update(f.origin_hash + ':' + backupSalt).digest('hex'),
+      salted_structural: crypto.createHash('sha256').update(f.structural_hash + ':' + backupSalt).digest('hex'),
+      word_count: f.word_count,
+      seed_version: f.seed_version,
+      created_at: f.created_at,
+    }));
   const backupHash = crypto.createHash('sha256')
-    .update(fingerprints.map(f => f.origin_hash).join(':'))
+    .update(fingerprints.map(f => f.salted_origin).join(':') + ':' + backupSalt)
     .digest('hex');
 
   res.json({
     backup_type: 'genesis_fingerprints',
     created_at: new Date().toISOString(),
+    backup_salt: backupSalt,
     total_fingerprints: fingerprints.length,
     integrity_hash: backupHash,
     fingerprints,

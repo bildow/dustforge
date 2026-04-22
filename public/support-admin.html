@@ -67,12 +67,12 @@
 <!-- Auth with 2FA -->
 <div id="auth" class="auth">
   <h1>Support <span>Command</span></h1>
-  <p>Admin access required. Two-factor authentication enforced.</p>
-  <input type="text" id="a-user" placeholder="Admin username" autocomplete="username">
-  <input type="password" id="a-pass" placeholder="Admin password" autocomplete="current-password">
+  <p>Admin API key required.</p>
+  <input type="text" id="a-user" placeholder="Admin name (for display)" autocomplete="username">
+  <input type="password" id="a-pass" placeholder="Not used — press Authenticate to continue" autocomplete="current-password">
   <button onclick="adminLogin()">Authenticate</button>
   <div class="auth-2fa" id="2fa-step">
-    <p style="color:var(--text2);font-size:0.85rem;margin-bottom:0.5rem">Enter the admin key from your authenticator</p>
+    <p style="color:var(--text2);font-size:0.85rem;margin-bottom:0.5rem">Enter the admin API key (x-admin-key)</p>
     <input type="text" id="a-2fa" placeholder="000000" maxlength="20">
     <button onclick="verify2FA()" style="margin-top:0.5rem">Verify</button>
   </div>
