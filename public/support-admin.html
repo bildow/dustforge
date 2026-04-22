@@ -82,13 +82,23 @@
 <!-- Dashboard -->
 <div id="dash" class="dash">
   <div class="topbar">
-    <div class="topbar-title">Support Command</div>
+    <div class="topbar-title">Mission Control</div>
     <div class="topbar-right">
       <span id="d-user"></span>
       <span style="cursor:pointer;color:var(--red)" onclick="adminLogout()">logout</span>
     </div>
   </div>
 
+  <!-- Tab navigation -->
+  <div style="display:flex;gap:0;border-bottom:1px solid rgba(39,68,95,0.3);margin-bottom:1rem">
+    <button class="tab-btn active" onclick="showTab('overview')" id="tab-overview" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid var(--accent);color:var(--accent);font-weight:600;font-size:0.8rem;cursor:pointer">Overview</button>
+    <button class="tab-btn" onclick="showTab('tickets')" id="tab-tickets" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-weight:600;font-size:0.8rem;cursor:pointer">Tickets</button>
+    <button class="tab-btn" onclick="showTab('infra')" id="tab-infra" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-weight:600;font-size:0.8rem;cursor:pointer">Infrastructure</button>
+    <button class="tab-btn" onclick="showTab('cruise')" id="tab-cruise" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-weight:600;font-size:0.8rem;cursor:pointer">Cruise</button>
+  </div>
+
+  <!-- Overview tab -->
+  <div id="panel-overview">
   <div class="stats">
     <div class="stat"><div class="stat-val" style="color:var(--red)" id="s-open">--</div><div class="stat-label">Open</div></div>
     <div class="stat"><div class="stat-val" style="color:var(--yellow)" id="s-reviewing">--</div><div class="stat-label">Reviewing</div></div>
@@ -135,6 +145,43 @@
       <button class="ta-btn" onclick="loadTickets()">Refresh</button>
     </div>
     <div id="ticket-list"><div class="empty">Loading tickets...</div></div>
+  </div>
+</div>
+</div><!-- end overview tab -->
+
+<!-- Tickets tab (detailed view) -->
+<div id="panel-tickets" style="display:none">
+  <div class="section">
+    <div class="section-head"><span class="section-title">All Tickets</span><button class="ta-btn" onclick="loadTickets()">Refresh</button></div>
+    <div id="ticket-list-full"><div class="empty">Loading...</div></div>
+  </div>
+</div>
+
+<!-- Infrastructure tab -->
+<div id="panel-infra" style="display:none">
+  <div class="section">
+    <div class="section-head"><span class="section-title">Phasewhip Containers</span><button class="ta-btn" onclick="loadInfra()">Refresh</button></div>
+    <div id="infra-phasewhip"><div class="empty">Loading phasewhip incus status...</div></div>
+  </div>
+  <div class="section">
+    <div class="section-head"><span class="section-title">K1 Containers</span></div>
+    <div id="infra-k1"><div class="empty">Loading k1 incus status...</div></div>
+  </div>
+  <div class="section">
+    <div class="section-head"><span class="section-title">RackNerd (Dustforge)</span></div>
+    <div id="infra-racknerd"><div class="empty">Loading...</div></div>
+  </div>
+</div>
+
+<!-- Cruise tab -->
+<div id="panel-cruise" style="display:none">
+  <div class="section">
+    <div class="section-head"><span class="section-title">Active Cruise Sessions</span><button class="ta-btn" onclick="loadCruise()">Refresh</button></div>
+    <div id="cruise-sessions"><div class="empty">Loading cruise sessions...</div></div>
+  </div>
+  <div class="section">
+    <div class="section-head"><span class="section-title">Claims Ledger</span></div>
+    <div id="claims-ledger"><div class="empty">Loading...</div></div>
   </div>
 </div>
 
@@ -325,6 +372,70 @@ async function updateTicket(id, status) {
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+
+// Tab switching
+function showTab(name) {
+  ['overview','tickets','infra','cruise'].forEach(t => {
+    document.getElementById('panel-' + t).style.display = t === name ? 'block' : 'none';
+    const btn = document.getElementById('tab-' + t);
+    btn.style.borderBottomColor = t === name ? 'var(--accent)' : 'transparent';
+    btn.style.color = t === name ? 'var(--accent)' : 'var(--text3)';
+  });
+  if (name === 'infra') loadInfra();
+  if (name === 'cruise') loadCruise();
+}
+
+// Infrastructure loading
+async function loadInfra() {
+  // RackNerd health
+  try {
+    const health = await apiFetch('GET', '/api/health');
+    document.getElementById('infra-racknerd').innerHTML =
+      '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
+      '<div>Status: <span style="color:var(--green)">online</span></div>' +
+      '<div>Uptime: ' + Math.floor(health.uptime / 3600) + 'h ' + Math.floor((health.uptime % 3600) / 60) + 'm</div>' +
+      '<div>Identities: ' + health.identities + '</div>' +
+      '</div>';
+  } catch { document.getElementById('infra-racknerd').innerHTML = '<div class="empty">Could not reach RackNerd</div>'; }
+
+  // Phasewhip + K1 — these need Tailscale access
+  document.getElementById('infra-phasewhip').innerHTML =
+    '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
+    '<div>Dashboard: <a href="https://phasewhip.taildb5a42.ts.net/incus/" target="_blank" style="color:var(--accent)">phasewhip incus</a></div>' +
+    '<div>Containers: brain, conductor, civitasvox, rowen, lori</div>' +
+    '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.25rem">Requires Tailscale access</div>' +
+    '</div>';
+  document.getElementById('infra-k1').innerHTML =
+    '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
+    '<div>Dashboard: <a href="https://k1.taildb5a42.ts.net/incus/" target="_blank" style="color:var(--accent)">k1 incus</a></div>' +
+    '<div>Services: Conduit (8080)</div>' +
+    '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.25rem">Requires Tailscale access</div>' +
+    '</div>';
+}
+
+// Cruise sessions
+async function loadCruise() {
+  try {
+    // Use admin telemetry to get cruise overview
+    const t = await apiFetch('GET', '/api/admin/telemetry');
+    document.getElementById('cruise-sessions').innerHTML =
+      '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
+      '<div>Total Buoy ticks: ' + (t.platform?.ticks || 0) + '</div>' +
+      '<div>Ticks today: ' + (t.platform?.ticks_today || 0) + '</div>' +
+      '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.5rem">Cruise sessions are per-agent. Use GET /api/insights/cruise/status with agent credentials.</div>' +
+      '</div>';
+  } catch { document.getElementById('cruise-sessions').innerHTML = '<div class="empty">Could not load cruise data</div>'; }
+
+  // Claims ledger overview
+  try {
+    const t = await apiFetch('GET', '/api/admin/telemetry');
+    document.getElementById('claims-ledger').innerHTML =
+      '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
+      '<div>Active secrets: ' + (t.platform?.secrets || 0) + '</div>' +
+      '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.5rem">Claims are scoped per-DID. Admin claims overview endpoint coming in pass 2.</div>' +
+      '</div>';
+  } catch { document.getElementById('claims-ledger').innerHTML = '<div class="empty">Could not load claims</div>'; }
+}
 
 document.getElementById('a-pass').addEventListener('keydown', e => { if (e.key === 'Enter') adminLogin(); });
 document.getElementById('a-2fa').addEventListener('keydown', e => { if (e.key === 'Enter') verify2FA(); });
