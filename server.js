@@ -8472,6 +8472,167 @@ app.get('/api/admin/genesis-backup', rateLimitStandard, (req, res) => {
   });
 });
 
+// ============================================================
+// Insight Claims Ledger (Fork 5 — Brain's design)
+// ============================================================
+// Append-only, typed claims with TTL. The judgment substrate.
+// Prose documents are rendered views on this ledger, not the source of truth.
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS insight_claims (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  claim_type TEXT NOT NULL CHECK(claim_type IN ('observation', 'constraint', 'heuristic')),
+  claim TEXT NOT NULL,
+  source TEXT DEFAULT '',
+  provenance TEXT DEFAULT '',
+  weight REAL DEFAULT 1.0,
+  ttl_hours INTEGER DEFAULT 24,
+  expires_at TEXT DEFAULT '',
+  status TEXT DEFAULT 'active' CHECK(status IN ('active', 'expired', 'superseded', 'rejected')),
+  created_by TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// Auto-expire stale claims on read
+function expireInsightClaims() {
+  try {
+    db.prepare("UPDATE insight_claims SET status = 'expired' WHERE status = 'active' AND expires_at != '' AND expires_at < datetime('now')").run();
+  } catch(_) {}
+}
+
+// POST /api/insights/claim — append a new claim to the ledger
+app.post('/api/insights/claim', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { claim_type, claim, source, provenance, weight, ttl_hours } = req.body || {};
+  if (!claim_type || !claim) return res.status(400).json({ error: 'claim_type and claim required' });
+  if (!['observation', 'constraint', 'heuristic'].includes(claim_type)) {
+    return res.status(400).json({ error: 'claim_type must be: observation, constraint, heuristic' });
+  }
+  if (typeof claim !== 'string' || claim.length < 5) return res.status(400).json({ error: 'claim must be at least 5 characters' });
+  if (claim.length > 1000) return res.status(400).json({ error: 'claim max 1000 characters' });
+
+  const ttl = Math.min(Math.max(Number(ttl_hours) || 24, 1), 720); // 1h to 30d
+  const expiresAt = new Date(Date.now() + ttl * 3600000).toISOString();
+
+  const result = db.prepare(
+    'INSERT INTO insight_claims (claim_type, claim, source, provenance, weight, ttl_hours, expires_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+  ).run(claim_type, claim, source || '', provenance || '', Math.min(Math.max(Number(weight) || 1.0, 0.1), 10.0), ttl, expiresAt, auth.did);
+
+  res.json({ ok: true, claim_id: result.lastInsertRowid, expires_at: expiresAt, ttl_hours: ttl });
+});
+
+// GET /api/insights/score — the scorer: returns why_now, why_not, what_changed
+app.get('/api/insights/score', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  expireInsightClaims();
+
+  // Pull active claims by type
+  const observations = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'observation' ORDER BY weight DESC, created_at DESC LIMIT 20").all();
+  const constraints = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'constraint' ORDER BY weight DESC, created_at DESC LIMIT 20").all();
+  const heuristics = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'heuristic' ORDER BY weight DESC, created_at DESC LIMIT 20").all();
+
+  // Recently expired (what_changed)
+  const recentlyExpired = db.prepare("SELECT * FROM insight_claims WHERE status = 'expired' AND expires_at > datetime('now', '-6 hours') ORDER BY expires_at DESC LIMIT 10").all();
+
+  // Score observations against constraints to produce ranked actions
+  const why_now = [];
+  const why_not = [];
+
+  for (const obs of observations) {
+    // Check if any constraint blocks this observation
+    const blocked = constraints.find(c =>
+      c.claim.toLowerCase().includes('budget') && obs.weight < 3.0 ||
+      c.claim.toLowerCase().includes('unavailable') && obs.weight < 5.0
+    );
+
+    if (blocked) {
+      why_not.push({
+        claim: obs.claim,
+        blocked_by: blocked.claim,
+        weight: obs.weight,
+        reason: `Observation weight (${obs.weight}) insufficient to override constraint`,
+      });
+    } else {
+      // Apply heuristic boost
+      const boost = heuristics.find(h => {
+        const hWords = h.claim.toLowerCase().split(/\s+/);
+        const oWords = obs.claim.toLowerCase().split(/\s+/);
+        return hWords.some(w => w.length > 4 && oWords.includes(w));
+      });
+
+      why_now.push({
+        claim: obs.claim,
+        weight: obs.weight + (boost ? boost.weight * 0.5 : 0),
+        source: obs.source,
+        heuristic_applied: boost ? boost.claim : null,
+      });
+    }
+  }
+
+  // Sort by weight descending
+  why_now.sort((a, b) => b.weight - a.weight);
+
+  const what_changed = recentlyExpired.map(c => ({
+    claim: c.claim,
+    type: c.claim_type,
+    expired_at: c.expires_at,
+    was_weight: c.weight,
+  }));
+
+  res.json({
+    why_now: why_now.slice(0, 10),
+    why_not,
+    what_changed,
+    active_claims: { observations: observations.length, constraints: constraints.length, heuristics: heuristics.length },
+    scored_at: new Date().toISOString(),
+  });
+});
+
+// GET /api/insights/claims — list active claims (the ledger)
+app.get('/api/insights/claims', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  expireInsightClaims();
+
+  const status = req.query.status || 'active';
+  const type = req.query.type;
+  let query = 'SELECT * FROM insight_claims WHERE status = ?';
+  const params = [status];
+  if (type) { query += ' AND claim_type = ?'; params.push(type); }
+  query += ' ORDER BY weight DESC, created_at DESC LIMIT 50';
+
+  res.json({ claims: db.prepare(query).all(...params) });
+});
+
+// PATCH /api/insights/claims/:id — supersede or reject a claim
+app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { status, reason } = req.body || {};
+  if (!['superseded', 'rejected'].includes(status)) {
+    return res.status(400).json({ error: 'status must be superseded or rejected' });
+  }
+
+  const claim = db.prepare('SELECT * FROM insight_claims WHERE id = ?').get(req.params.id);
+  if (!claim) return res.status(404).json({ error: 'claim not found' });
+
+  db.prepare("UPDATE insight_claims SET status = ? WHERE id = ?").run(status, req.params.id);
+
+  // Log the invalidation as a new observation
+  if (reason) {
+    db.prepare('INSERT INTO insight_claims (claim_type, claim, source, provenance, weight, ttl_hours, expires_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('observation', `Claim #${req.params.id} ${status}: ${reason}`, 'system', `invalidation of claim ${req.params.id}`, 1.0, 24,
+        new Date(Date.now() + 24 * 3600000).toISOString(), auth.did);
+  }
+
+  res.json({ ok: true, claim_id: Number(req.params.id), new_status: status });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
