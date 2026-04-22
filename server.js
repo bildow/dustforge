@@ -1211,6 +1211,63 @@ app.post('/api/stripe/checkout/topup-external', rateLimitStandard, async (req, r
   }
 });
 
+// POST /api/stripe/checkout/founders — founders package ($100/year, first 100)
+app.post('/api/stripe/checkout/founders', rateLimitStandard, async (req, res) => {
+  try {
+    // Check capacity — only 100 founders
+    const capacity = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'founder'").get()?.n || 0;
+    if (capacity >= 100) return res.status(409).json({ error: 'Founders package sold out. All 100 have been claimed.' });
+
+    const stripe = stripeService.getStripe();
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price: 'price_1TOthJKC9NaQxich3aC1Ch6b',
+        quantity: 1,
+      }],
+      mode: 'subscription',
+      success_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/founders-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/founders.html`,
+      metadata: { type: 'founders_package' },
+    });
+    res.json({ ok: true, url: session.url, session_id: session.id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/stripe/founders-success — handle founders package completion
+app.get('/api/stripe/founders-success', async (req, res) => {
+  const sessionId = req.query.session_id;
+  if (!sessionId) return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Missing session</h1></body></html>');
+
+  try {
+    const stripe = stripeService.getStripe();
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status !== 'paid') {
+      return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not completed</h1></body></html>');
+    }
+
+    // Log the founder
+    try {
+      db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('system', `Founders package purchased (session: ${sessionId.slice(0, 20)})`, req.ip || '', 'UTC', 'decision',
+          JSON.stringify(['founders:purchase', `stripe:${sessionId.slice(0, 20)}`]));
+    } catch(_) {}
+
+    res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Welcome, Founder</title></head>
+      <body style="background:#08111a;color:#e7f1fb;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center">
+      <div>
+        <h1 style="font-size:2.5rem;color:#d4a847">Welcome, Founder</h1>
+        <p style="color:#9cb4c9;font-size:1.1rem;max-width:500px;margin:1rem auto">You are one of the first 100. Your founder badge is permanent. Your rate is locked forever.</p>
+        <p style="color:#69c7b1;font-size:1rem;margin-top:1rem">1,200 Diamond Dust will be loaded to your account monthly.</p>
+        <p style="margin-top:2rem"><a href="https://demipass.com" style="color:#5fb3ff;font-size:1rem">Get started with DemiPass &rarr;</a></p>
+      </div></body></html>`);
+  } catch (e) {
+    res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Error: ' + e.message + '</h1></body></html>');
+  }
+});
+
 // GET /api/stripe/topup-success — handle topup completion
 app.get('/api/stripe/topup-success', async (req, res) => {
   const sessionId = req.query.session_id;
