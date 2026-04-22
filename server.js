@@ -8529,13 +8529,13 @@ app.get('/api/insights/score', rateLimitStandard, (req, res) => {
 
   expireInsightClaims();
 
-  // Pull active claims by type
-  const observations = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'observation' ORDER BY weight DESC, created_at DESC LIMIT 20").all();
-  const constraints = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'constraint' ORDER BY weight DESC, created_at DESC LIMIT 20").all();
-  const heuristics = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'heuristic' ORDER BY weight DESC, created_at DESC LIMIT 20").all();
+  // Scope claims to the caller's DID — agents only see their own claims
+  const observations = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'observation' AND created_by = ? ORDER BY weight DESC, created_at DESC LIMIT 20").all(auth.did);
+  const constraints = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'constraint' AND created_by = ? ORDER BY weight DESC, created_at DESC LIMIT 20").all(auth.did);
+  const heuristics = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'heuristic' AND created_by = ? ORDER BY weight DESC, created_at DESC LIMIT 20").all(auth.did);
 
-  // Recently expired (what_changed)
-  const recentlyExpired = db.prepare("SELECT * FROM insight_claims WHERE status = 'expired' AND expires_at > datetime('now', '-6 hours') ORDER BY expires_at DESC LIMIT 10").all();
+  // Recently expired (what_changed) — also scoped
+  const recentlyExpired = db.prepare("SELECT * FROM insight_claims WHERE status = 'expired' AND created_by = ? AND expires_at > datetime('now', '-6 hours') ORDER BY expires_at DESC LIMIT 10").all(auth.did);
 
   // Score observations against constraints to produce ranked actions
   const why_now = [];
@@ -8600,8 +8600,9 @@ app.get('/api/insights/claims', rateLimitStandard, (req, res) => {
 
   const status = req.query.status || 'active';
   const type = req.query.type;
-  let query = 'SELECT * FROM insight_claims WHERE status = ?';
-  const params = [status];
+  // Scope to caller's DID
+  let query = 'SELECT * FROM insight_claims WHERE status = ? AND created_by = ?';
+  const params = [status, auth.did];
   if (type) { query += ' AND claim_type = ?'; params.push(type); }
   query += ' ORDER BY weight DESC, created_at DESC LIMIT 50';
 
@@ -8618,8 +8619,9 @@ app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
     return res.status(400).json({ error: 'status must be superseded or rejected' });
   }
 
-  const claim = db.prepare('SELECT * FROM insight_claims WHERE id = ?').get(req.params.id);
-  if (!claim) return res.status(404).json({ error: 'claim not found' });
+  // Ownership check — only the creator can supersede/reject their own claims
+  const claim = db.prepare('SELECT * FROM insight_claims WHERE id = ? AND created_by = ?').get(req.params.id, auth.did);
+  if (!claim) return res.status(404).json({ error: 'claim not found or not owned by you' });
 
   db.prepare("UPDATE insight_claims SET status = ? WHERE id = ?").run(status, req.params.id);
 
