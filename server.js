@@ -8635,6 +8635,240 @@ app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
   res.json({ ok: true, claim_id: Number(req.params.id), new_status: status });
 });
 
+// ============================================================
+// Cruise Control — autonomous agent work cycles (card 28)
+// ============================================================
+// Engage: carbon sets cycles + constraints → agent runs scorer loop
+// Disengage: carbon or guardrails stop the loop
+// Resume: re-engage with fresh params, picks up from current ledger
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS cruise_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  status TEXT DEFAULT 'engaged' CHECK(status IN ('engaged', 'paused', 'completed', 'aborted')),
+  max_cycles INTEGER DEFAULT 5,
+  completed_cycles INTEGER DEFAULT 0,
+  max_dd INTEGER DEFAULT 500,
+  spent_dd INTEGER DEFAULT 0,
+  timeout_at TEXT DEFAULT '',
+  last_action TEXT DEFAULT '',
+  last_cycle_at TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  ended_at TEXT DEFAULT ''
+)`); } catch(e) {}
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS cruise_cycle_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id INTEGER NOT NULL,
+  cycle_number INTEGER NOT NULL,
+  action_taken TEXT DEFAULT '',
+  claim_id INTEGER DEFAULT 0,
+  outcome TEXT DEFAULT '',
+  dd_cost INTEGER DEFAULT 0,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// POST /api/insights/cruise/engage — start a cruise session
+app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  // Check for existing active session
+  const existing = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status = 'engaged'").get(auth.did);
+  if (existing) return res.status(409).json({ error: 'Already engaged. Disengage first or check status.', session_id: existing.id });
+
+  const { max_cycles, max_dd, timeout_hours } = req.body || {};
+  const cycles = Math.min(Math.max(Number(max_cycles) || 5, 1), 100);
+  const dd = Math.min(Math.max(Number(max_dd) || 500, 10), 10000);
+  const timeout = Math.min(Math.max(Number(timeout_hours) || 2, 0.5), 24);
+  const timeoutAt = new Date(Date.now() + timeout * 3600000).toISOString();
+
+  const result = db.prepare(
+    'INSERT INTO cruise_sessions (did, max_cycles, max_dd, timeout_at) VALUES (?, ?, ?, ?)'
+  ).run(auth.did, cycles, dd, timeoutAt);
+
+  // Buoy tick
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(auth.did, `Cruise engaged: ${cycles} cycles, ${dd} DD budget, ${timeout}h timeout`, req.ip || '', 'UTC', 'decision',
+        JSON.stringify(['cruise:engage', `cycles:${cycles}`]));
+  } catch(_) {}
+
+  res.json({
+    ok: true,
+    session_id: result.lastInsertRowid,
+    max_cycles: cycles,
+    max_dd: dd,
+    timeout_at: timeoutAt,
+    status: 'engaged',
+    next: 'POST /api/insights/cruise/cycle to execute the next cycle',
+  });
+});
+
+// POST /api/insights/cruise/cycle — execute one cycle of the current session
+app.post('/api/insights/cruise/cycle', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status = 'engaged'").get(auth.did);
+  if (!session) return res.status(404).json({ error: 'No active cruise session. Engage first.' });
+
+  // Guardrails
+  if (session.completed_cycles >= session.max_cycles) {
+    db.prepare("UPDATE cruise_sessions SET status = 'completed', ended_at = datetime('now') WHERE id = ?").run(session.id);
+    return res.json({ status: 'completed', reason: 'max cycles reached', completed: session.completed_cycles });
+  }
+  if (session.spent_dd >= session.max_dd) {
+    db.prepare("UPDATE cruise_sessions SET status = 'completed', ended_at = datetime('now') WHERE id = ?").run(session.id);
+    return res.json({ status: 'completed', reason: 'DD budget exhausted', spent: session.spent_dd });
+  }
+  if (session.timeout_at && new Date(session.timeout_at) < new Date()) {
+    db.prepare("UPDATE cruise_sessions SET status = 'completed', ended_at = datetime('now') WHERE id = ?").run(session.id);
+    return res.json({ status: 'completed', reason: 'timeout reached' });
+  }
+
+  // Run the scorer for this DID
+  expireInsightClaims();
+  const observations = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'observation' AND created_by = ? ORDER BY weight DESC, created_at DESC LIMIT 10").all(auth.did);
+  const constraints = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'constraint' AND created_by = ? ORDER BY weight DESC, created_at DESC LIMIT 10").all(auth.did);
+  const heuristics = db.prepare("SELECT * FROM insight_claims WHERE status = 'active' AND claim_type = 'heuristic' AND created_by = ? ORDER BY weight DESC, created_at DESC LIMIT 10").all(auth.did);
+
+  // Find the top unblocked observation
+  let topAction = null;
+  let topClaim = null;
+  for (const obs of observations) {
+    const blocked = constraints.find(c =>
+      c.claim.toLowerCase().includes('budget') && obs.weight < 3.0 ||
+      c.claim.toLowerCase().includes('unavailable') && obs.weight < 5.0
+    );
+    if (!blocked) {
+      const boost = heuristics.find(h => {
+        const hWords = h.claim.toLowerCase().split(/\s+/);
+        const oWords = obs.claim.toLowerCase().split(/\s+/);
+        return hWords.some(w => w.length > 4 && oWords.includes(w));
+      });
+      topAction = { claim: obs.claim, weight: obs.weight + (boost ? boost.weight * 0.5 : 0), source: obs.source, heuristic: boost?.claim || null };
+      topClaim = obs;
+      break;
+    }
+  }
+
+  if (!topAction) {
+    // Nothing actionable — pause the session
+    db.prepare("UPDATE cruise_sessions SET status = 'paused', last_action = 'no actionable claims' WHERE id = ?").run(session.id);
+    return res.json({ status: 'paused', reason: 'no actionable claims in ledger — add observations or remove constraints', completed: session.completed_cycles });
+  }
+
+  // Log the cycle
+  const cycleNum = session.completed_cycles + 1;
+  const ddCost = req.body?.dd_cost || 0;
+  db.prepare('INSERT INTO cruise_cycle_log (session_id, cycle_number, action_taken, claim_id, dd_cost) VALUES (?, ?, ?, ?, ?)')
+    .run(session.id, cycleNum, topAction.claim, topClaim.id, Number(ddCost));
+
+  // Update session
+  db.prepare("UPDATE cruise_sessions SET completed_cycles = ?, spent_dd = spent_dd + ?, last_action = ?, last_cycle_at = datetime('now') WHERE id = ?")
+    .run(cycleNum, Number(ddCost), topAction.claim.slice(0, 200), session.id);
+
+  // Buoy tick for the cycle
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(auth.did, `Cruise cycle ${cycleNum}/${session.max_cycles}: ${topAction.claim.slice(0, 100)}`, req.ip || '', 'UTC', 'decision',
+        JSON.stringify(['cruise:cycle', `cycle:${cycleNum}`]));
+  } catch(_) {}
+
+  res.json({
+    status: 'cycling',
+    cycle: cycleNum,
+    max_cycles: session.max_cycles,
+    action: topAction,
+    claim_id: topClaim.id,
+    dd_remaining: session.max_dd - session.spent_dd - Number(ddCost),
+    next: 'Execute this action, then POST /api/insights/cruise/outcome with the result. Then call /cycle again.',
+  });
+});
+
+// POST /api/insights/cruise/outcome — report the outcome of a cycle
+app.post('/api/insights/cruise/outcome', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND (status = 'engaged' OR status = 'paused')").get(auth.did);
+  if (!session) return res.status(404).json({ error: 'No active cruise session' });
+
+  const { outcome, dd_cost, claim_id } = req.body || {};
+  if (!outcome) return res.status(400).json({ error: 'outcome required' });
+
+  // Update the latest cycle log
+  const latestCycle = db.prepare('SELECT * FROM cruise_cycle_log WHERE session_id = ? ORDER BY id DESC LIMIT 1').get(session.id);
+  if (latestCycle) {
+    db.prepare('UPDATE cruise_cycle_log SET outcome = ?, dd_cost = ? WHERE id = ?')
+      .run(String(outcome).slice(0, 500), Number(dd_cost) || 0, latestCycle.id);
+  }
+
+  // Update DD spend
+  if (dd_cost) {
+    db.prepare('UPDATE cruise_sessions SET spent_dd = spent_dd + ? WHERE id = ?').run(Number(dd_cost), session.id);
+  }
+
+  // Supersede the acted-on claim if provided
+  if (claim_id) {
+    db.prepare("UPDATE insight_claims SET status = 'superseded' WHERE id = ? AND created_by = ?").run(claim_id, auth.did);
+  }
+
+  // Append outcome as a new observation
+  const ttl = 24;
+  db.prepare('INSERT INTO insight_claims (claim_type, claim, source, provenance, weight, ttl_hours, expires_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run('observation', `Cycle ${session.completed_cycles} outcome: ${String(outcome).slice(0, 500)}`, 'cruise',
+      `session:${session.id}/cycle:${session.completed_cycles}`, 1.0, ttl,
+      new Date(Date.now() + ttl * 3600000).toISOString(), auth.did);
+
+  res.json({ ok: true, session_id: session.id, cycle: session.completed_cycles, dd_spent: session.spent_dd + (Number(dd_cost) || 0) });
+});
+
+// POST /api/insights/cruise/disengage — stop cruise control
+app.post('/api/insights/cruise/disengage', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND (status = 'engaged' OR status = 'paused')").get(auth.did);
+  if (!session) return res.status(404).json({ error: 'No active cruise session' });
+
+  db.prepare("UPDATE cruise_sessions SET status = 'aborted', ended_at = datetime('now') WHERE id = ?").run(session.id);
+
+  // Buoy tick
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(auth.did, `Cruise disengaged after ${session.completed_cycles}/${session.max_cycles} cycles`, req.ip || '', 'UTC', 'decision',
+        JSON.stringify(['cruise:disengage', `cycles:${session.completed_cycles}`]));
+  } catch(_) {}
+
+  res.json({ ok: true, status: 'aborted', completed_cycles: session.completed_cycles, spent_dd: session.spent_dd });
+});
+
+// GET /api/insights/cruise/status — check current cruise state
+app.get('/api/insights/cruise/status', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? ORDER BY id DESC LIMIT 1").get(auth.did);
+  if (!session) return res.json({ status: 'disengaged', message: 'No cruise sessions found' });
+
+  const cycles = db.prepare('SELECT * FROM cruise_cycle_log WHERE session_id = ? ORDER BY cycle_number ASC').all(session.id);
+
+  res.json({
+    session_id: session.id,
+    status: session.status,
+    cycles_completed: session.completed_cycles,
+    cycles_max: session.max_cycles,
+    dd_spent: session.spent_dd,
+    dd_budget: session.max_dd,
+    timeout_at: session.timeout_at,
+    last_action: session.last_action,
+    last_cycle_at: session.last_cycle_at,
+    cycle_log: cycles,
+  });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
