@@ -1817,6 +1817,18 @@ function blindkeyDecrypt(encryptedBase64) {
   return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
 }
 
+// Rotation lifecycle: a secret is redeemable if active OR rotating-within-grace
+function isSecretRedeemable(secret) {
+  if (secret.status === 'active') return true;
+  if (secret.status === 'rotating' && secret.rotate_expires_at) {
+    return new Date(secret.rotate_expires_at) > new Date();
+  }
+  return false;
+}
+
+// SQL clause for redeemable secrets (active OR rotating within grace)
+const REDEEMABLE_STATUS_SQL = "(status = 'active' OR (status = 'rotating' AND rotate_expires_at > datetime('now')))";
+
 // Simple glob matcher for context target patterns (supports * and prefix*)
 function blindkeyPatternMatch(pattern, value) {
   if (!pattern || pattern === '*') return true;
@@ -2417,7 +2429,7 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
 
   // Routed reference mode — parse DP-TYPE-slug-nonce and resolve everything
   if (ref && typeof ref === 'string' && ref.startsWith('DP-')) {
-    const refSecret = db.prepare("SELECT * FROM blindkey_secrets WHERE ref_code = ? AND status = 'active'").get(ref);
+    const refSecret = db.prepare(`SELECT * FROM blindkey_secrets WHERE ref_code = ? AND ${REDEEMABLE_STATUS_SQL}`).get(ref);
     if (!refSecret) return res.status(403).json({ error: 'access denied' }); // same error for not-found and no-delegation
 
     // Check if caller owns it or has delegation
@@ -2610,7 +2622,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     }
 
     // Load the secret from the token's secret_id
-    const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ? AND status = ?').get(tokenRow.secret_id, 'active');
+    const secret = db.prepare(`SELECT * FROM blindkey_secrets WHERE id = ? AND ${REDEEMABLE_STATUS_SQL}`).get(tokenRow.secret_id);
     if (!secret) return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked' });
 
     let decryptedValue;
@@ -8711,6 +8723,122 @@ app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
   }
 
   res.json({ ok: true, claim_id: Number(req.params.id), new_status: status });
+});
+
+// GET /api/blindkey/rotation-status — migration model view for a secret
+// Shows: old version valid until X, new version preferred now, retirement at Y
+app.get('/api/blindkey/rotation-status', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { name, ref } = req.query;
+  if (!name && !ref) return res.status(400).json({ error: 'name or ref required' });
+
+  const ownerDid = actor.did || null;
+  const baseName = name ? name.replace(/_v\d+$/, '') : null;
+
+  let versions;
+  if (ref) {
+    const refSecret = db.prepare('SELECT * FROM blindkey_secrets WHERE ref_code = ?').get(ref);
+    if (!refSecret || refSecret.did !== ownerDid) return res.status(404).json({ error: 'not found' });
+    const bn = refSecret.name.replace(/_v\d+$/, '');
+    versions = db.prepare("SELECT id, name, status, version, ref_code, rotate_expires_at, replaced_by, created_at, updated_at FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) ORDER BY version ASC").all(ownerDid, bn, bn + '_v%');
+  } else {
+    versions = db.prepare("SELECT id, name, status, version, ref_code, rotate_expires_at, replaced_by, created_at, updated_at FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) ORDER BY version ASC").all(ownerDid, baseName, baseName + '_v%');
+  }
+
+  if (!versions.length) return res.status(404).json({ error: 'no secrets found with that name' });
+
+  const active = versions.find(v => v.status === 'active');
+  const rotating = versions.filter(v => v.status === 'rotating');
+  const retired = versions.filter(v => v.status === 'revoked' || v.status === 'retired');
+
+  // Build migration model
+  const model = versions.map(v => {
+    const redeemable = isSecretRedeemable(v);
+    let role = 'retired';
+    if (v.status === 'active') role = 'preferred';
+    else if (v.status === 'rotating' && redeemable) role = 'valid-until-expiry';
+    else if (v.status === 'rotating') role = 'expired-grace';
+
+    return {
+      name: v.name,
+      version: v.version,
+      ref_code: v.ref_code || null,
+      status: v.status,
+      role,
+      redeemable,
+      grace_expires: v.rotate_expires_at || null,
+      created: v.created_at,
+    };
+  });
+
+  // Context summary
+  const activeId = active?.id;
+  const contexts = activeId
+    ? db.prepare("SELECT context_name, action_type, target_host_pattern, status FROM blindkey_contexts WHERE secret_id = ?").all(activeId)
+    : [];
+
+  res.json({
+    base_name: baseName || versions[0].name.replace(/_v\d+$/, ''),
+    total_versions: versions.length,
+    current: active ? { name: active.name, ref: active.ref_code, version: active.version } : null,
+    migration: model,
+    contexts,
+    summary: {
+      active: active ? 1 : 0,
+      rotating_valid: rotating.filter(r => isSecretRedeemable(r)).length,
+      rotating_expired: rotating.filter(r => !isSecretRedeemable(r)).length,
+      retired: retired.length,
+    },
+  });
+});
+
+// GET /api/blindkey/operator-view — dead-simple overview of all secrets lifecycle state
+app.get('/api/blindkey/operator-view', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const ownerDid = actor.did || null;
+
+  const all = db.prepare("SELECT id, name, status, version, ref_code, rotate_expires_at, replaced_by, secret_type, use_count, created_at, updated_at FROM blindkey_secrets WHERE did = ? ORDER BY name ASC, version ASC").all(ownerDid);
+
+  const active = [];
+  const rotating = [];
+  const retired = [];
+
+  for (const s of all) {
+    const redeemable = isSecretRedeemable(s);
+    const contexts = db.prepare("SELECT context_name, action_type, target_host_pattern, status FROM blindkey_contexts WHERE secret_id = ?").all(s.id);
+    const entry = {
+      name: s.name,
+      version: s.version,
+      ref: s.ref_code || null,
+      type: s.secret_type,
+      redeemable,
+      use_count: s.use_count,
+      contexts: contexts.length,
+      active_contexts: contexts.filter(c => c.status === 'active').length,
+      grace_expires: s.rotate_expires_at || null,
+      updated: s.updated_at,
+    };
+
+    if (s.status === 'active') active.push(entry);
+    else if (s.status === 'rotating') rotating.push(entry);
+    else retired.push(entry);
+  }
+
+  // Token compatibility: count live use-tokens for each status
+  const liveTokens = db.prepare("SELECT bt.secret_id, bs.status, bs.name FROM blindkey_tokens bt JOIN blindkey_secrets bs ON bt.secret_id = bs.id WHERE bt.did = ? AND bt.used = 0 AND bt.expires_at > datetime('now')").all(ownerDid);
+
+  res.json({
+    active: { count: active.length, secrets: active },
+    rotating: { count: rotating.length, secrets: rotating },
+    retired: { count: retired.length, secrets: retired.slice(-20) },
+    live_tokens: {
+      total: liveTokens.length,
+      for_active: liveTokens.filter(t => t.status === 'active').length,
+      for_rotating: liveTokens.filter(t => t.status === 'rotating').length,
+    },
+  });
 });
 
 app.get('/api/debug/route-break-check', (_req, res) => res.json({ alive: true, section: 'pre-cruise' }));
