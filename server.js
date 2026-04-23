@@ -1351,6 +1351,38 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       } else {
         console.error('[stripe-webhook] fleet_topup missing fleet_wallet_did in metadata');
       }
+    } else if (meta.type === 'founders_package') {
+      // Founders package fulfillment: grant founder status + DD credit
+      try {
+        const customerEmail = session.customer_email || session.customer_details?.email || '';
+        const idempotencyKey = `founders_stripe_${event.id || session.id}`;
+
+        // Find the identity by customer email, or create a pending founder record
+        let wallet = customerEmail ? db.prepare('SELECT * FROM identity_wallets WHERE email = ?').get(customerEmail) : null;
+
+        if (wallet) {
+          // Mark as founder
+          db.prepare("UPDATE identity_wallets SET status = 'founder' WHERE did = ?").run(wallet.did);
+          // Credit 1200 DD (first month)
+          billing.creditBalance(db, wallet.did, 1200, 'founders_package', 'Founders package — first month DD', idempotencyKey);
+          // Store subscription ID for recurring billing
+          db.prepare("INSERT OR IGNORE INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 10000, 'founders_purchase', ?, ?)")
+            .run(wallet.did, `Founders package subscription: ${session.subscription || session.id}`,
+              (wallet.balance_cents || 0) + 1200);
+          console.log(`[stripe-webhook] founders fulfilled: ${wallet.username} → founder status + 1200 DD`);
+        } else {
+          // No matching wallet yet — store for manual fulfillment
+          console.warn(`[stripe-webhook] founders purchase but no wallet for email: ${customerEmail}. Session: ${session.id}`);
+          db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('system', `Founders purchase needs manual fulfillment: ${customerEmail} session:${session.id}`,
+              '', 'UTC', 'alert', JSON.stringify(['founders:manual-fulfill', `email:${customerEmail}`]));
+        }
+
+        // Buoy tick
+        db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('system', `Founders package fulfilled: ${customerEmail || 'unknown'}`,
+            '', 'UTC', 'decision', JSON.stringify(['founders:fulfilled']));
+      } catch (e) { console.error('[stripe-webhook] founders error:', e.message); }
     } else if (meta.type === 'prepaid_keys') {
       // Prepaid key fulfillment is handled by the success redirect, not webhook
       console.log('[stripe-webhook] prepaid_keys session completed:', session.id);
@@ -4815,8 +4847,10 @@ function getWaitingListCount() {
 }
 
 function getFoundingTierSold() {
+  // Single source of truth: count wallets with founder status
+  // This is what the webhook sets, what the checkout gate checks, and what the UI displays
   try {
-    return db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n;
+    return db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'founder'").get().n;
   } catch (_) {
     return 0;
   }

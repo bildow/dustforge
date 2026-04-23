@@ -1,9 +1,9 @@
-# Brain Audit Handoff — 2026-04-21 Evening
+# Brain Audit Handoff — 2026-04-22 (current)
 
 ## Tips
 | Repo | SHA | npm |
 |------|-----|-----|
-| bildow/dustforge | e74aa3f | — |
+| bildow/dustforge | (this commit) | — |
 | bildow/demipass | b8b69cd | 1.5.0 |
 | bildow/rowen | 107bc40 | — |
 
