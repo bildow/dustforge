@@ -8710,7 +8710,7 @@ app.get('/api/debug/route-break-check', (_req, res) => res.json({ alive: true, s
 // ============================================================
 // Blind Rotation (moved before cruise — route registration issue after cruise)
 // ============================================================
-app.post('/api/demipass/rotate-blind', rateLimitStandard, async (req, res) => {
+app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
 
