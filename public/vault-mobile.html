@@ -122,7 +122,7 @@
     <div class="topbar-left">Demi<span>Pass</span></div>
     <div class="topbar-right">
       <span class="topbar-user" id="app-user"></span>
-      <span class="topbar-out" onclick="logout()">out</span>
+      <span class="topbar-out" onclick="logout()" style="color:var(--red);font-weight:600;cursor:pointer;padding:0.2rem 0.5rem;border:1px solid var(--red);border-radius:6px;font-size:0.75rem">Sign Out</span>
     </div>
   </div>
 
@@ -202,6 +202,10 @@
         <button class="btn-ghost" onclick="loadLedgerSummary()" style="width:100%;text-align:left;padding:0.8rem">Ledger summary</button>
       </div>
       <div id="settings-output" style="margin-top:1rem;font-size:0.8rem"></div>
+
+      <div style="margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border)">
+        <button onclick="logout()" style="width:100%;padding:0.9rem;background:var(--red);border:none;border-radius:10px;color:#fff;font-weight:700;font-size:0.95rem;cursor:pointer">Sign Out</button>
+      </div>
     </div>
   </div>
 
