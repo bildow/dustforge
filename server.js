@@ -1214,6 +1214,16 @@ app.post('/api/stripe/checkout/topup-external', rateLimitStandard, async (req, r
 // POST /api/stripe/checkout/founders — founders package ($100/year, first 100)
 app.post('/api/stripe/checkout/founders', rateLimitStandard, async (req, res) => {
   try {
+    // Require authenticated identity — founders must have a Dustforge account first
+    const auth = getBearerIdentity(req);
+    if (!auth.ok) {
+      return res.status(401).json({ error: 'Authentication required. Create a Dustforge identity first, then purchase the founders package.' });
+    }
+
+    // Check if already a founder
+    const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
+    if (wallet?.status === 'founder') return res.status(409).json({ error: 'You are already a founder.' });
+
     // Check capacity — only 100 founders
     const capacity = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'founder'").get()?.n || 0;
     if (capacity >= 100) return res.status(409).json({ error: 'Founders package sold out. All 100 have been claimed.' });
@@ -1226,9 +1236,10 @@ app.post('/api/stripe/checkout/founders', rateLimitStandard, async (req, res) =>
         quantity: 1,
       }],
       mode: 'subscription',
+      customer_email: wallet?.email || undefined,
       success_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/founders-success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/founders.html`,
-      metadata: { type: 'founders_package' },
+      metadata: { type: 'founders_package', did: auth.did, username: wallet?.username || '' },
     });
     res.json({ ok: true, url: session.url, session_id: session.id });
   } catch (e) {
@@ -1354,11 +1365,13 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     } else if (meta.type === 'founders_package') {
       // Founders package fulfillment: grant founder status + DD credit
       try {
+        const founderDid = meta.did || '';
         const customerEmail = session.customer_email || session.customer_details?.email || '';
         const idempotencyKey = `founders_stripe_${event.id || session.id}`;
 
-        // Find the identity by customer email, or create a pending founder record
-        let wallet = customerEmail ? db.prepare('SELECT * FROM identity_wallets WHERE email = ?').get(customerEmail) : null;
+        // Identity-bound: use DID from metadata (set at checkout). Email is fallback only.
+        let wallet = founderDid ? db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(founderDid)
+          : customerEmail ? db.prepare('SELECT * FROM identity_wallets WHERE email = ?').get(customerEmail) : null;
 
         if (wallet) {
           // Mark as founder
@@ -1386,6 +1399,29 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     } else if (meta.type === 'prepaid_keys') {
       // Prepaid key fulfillment is handled by the success redirect, not webhook
       console.log('[stripe-webhook] prepaid_keys session completed:', session.id);
+    }
+  } else if (event.type === 'invoice.paid') {
+    // Recurring subscription fulfillment — monthly DD credit for founders
+    const invoice = event.data.object;
+    const subId = invoice.subscription;
+    const customerEmail = invoice.customer_email || '';
+
+    if (subId && customerEmail) {
+      // Only credit recurring invoices (not the first one — that's handled by checkout.session.completed)
+      const isRecurring = invoice.billing_reason === 'subscription_cycle';
+      if (isRecurring) {
+        const wallet = db.prepare('SELECT * FROM identity_wallets WHERE email = ? AND status = ?').get(customerEmail, 'founder');
+        if (wallet) {
+          const idempotencyKey = `founders_renewal_${event.id || invoice.id}`;
+          billing.creditBalance(db, wallet.did, 1200, 'founders_renewal', 'Founders package — monthly DD auto-refill', idempotencyKey);
+          console.log(`[stripe-webhook] founders renewal: ${wallet.username} +1200 DD`);
+          try {
+            db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+              .run(wallet.did, 'Founders monthly DD auto-refill: +1200 DD', '', 'UTC', 'decision',
+                JSON.stringify(['founders:renewal', `did:${wallet.did.slice(0, 25)}`]));
+          } catch(_) {}
+        }
+      }
     }
   }
   res.json({ received: true });

@@ -26,6 +26,6 @@
 8. **Codex validated ONBOARDING.md** — self-onboarded from docs alone, found whoami bug (fixed).
 
 ## Known issues
-- Stripe founders checkout route not wired yet (card 34)
-- Progressive barrel auth not enforced on endpoints yet
+- Progressive barrel auth: checkBarrelAuth() exists but not enforced on endpoints yet
 - .mcp.json still has plaintext tokens (ODT genesis designed but not replacing stored tokens yet)
+- Pro/Team Stripe price IDs not created yet (pricing.html buttons are placeholders)
