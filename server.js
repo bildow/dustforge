@@ -8741,6 +8741,7 @@ try {
   )`);
 } catch(e) { console.error('[cruise] table creation:', e.message); }
 
+console.log('[BOOT] registering cruise routes...');
 // POST /api/insights/cruise/engage — start a cruise session
 app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
