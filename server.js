@@ -8715,7 +8715,7 @@ app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
 try { db.exec(`CREATE TABLE IF NOT EXISTS cruise_sessions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
-  status TEXT DEFAULT 'engaged' CHECK(status IN ('engaged', 'paused', 'completed', 'aborted')),
+  status TEXT DEFAULT 'engaged',
   max_cycles INTEGER DEFAULT 5,
   completed_cycles INTEGER DEFAULT 0,
   max_dd INTEGER DEFAULT 500,
