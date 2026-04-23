@@ -9061,6 +9061,8 @@ echo "ROTATED"
   }
 });
 
+app.get('/api/debug/last-route', (_req, res) => res.json({ last: true }));
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
