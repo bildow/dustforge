@@ -8939,6 +8939,122 @@ app.get('/api/insights/cruise/status', rateLimitStandard, (req, res) => {
   });
 });
 
+// ============================================================
+// Blind Rotation — server generates, applies, stores. Agent never sees the secret.
+// ============================================================
+// POST /api/demipass/rotate-blind
+// The agent says "rotate this ref code on this host for this user."
+// DemiPass: generates a random password, SSHes into the target using the OLD
+// password, changes it to the NEW password, stores the new one, revokes the old.
+// Returns: new ref code. The new password never enters any agent context.
+
+app.post('/api/demipass/rotate-blind', rateLimitStandard, async (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  const { ref, target_host, target_user, reason } = req.body || {};
+  if (!ref) return res.status(400).json({ error: 'ref (current ref code) required' });
+  if (!target_host) return res.status(400).json({ error: 'target_host required' });
+
+  const ownerDid = actor.did || null;
+
+  // Find the secret by ref code
+  const secret = db.prepare(
+    "SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'"
+  ).get(ownerDid, ref);
+  if (!secret) return res.status(404).json({ error: 'active secret not found for this ref code' });
+  if (secret.secret_type !== 'password') return res.status(400).json({ error: 'blind rotation only supports password secrets' });
+
+  // Decrypt current password
+  let currentPassword;
+  try { currentPassword = blindkeyDecrypt(secret.encrypted_value); }
+  catch (e) { return res.status(500).json({ error: 'failed to decrypt current secret' }); }
+
+  // Generate new password (32 chars, alphanumeric)
+  const newPassword = crypto.randomBytes(24).toString('base64url');
+
+  // SSH into target using current password, change to new password
+  const sshUser = target_user || 'root';
+  const { execSync } = require('child_process');
+
+  try {
+    // Write temp askpass scripts for old and new passwords
+    const oldAskpass = `/tmp/.dp_rotate_old_${crypto.randomBytes(4).toString('hex')}`;
+    const changeScript = `/tmp/.dp_rotate_cmd_${crypto.randomBytes(4).toString('hex')}`;
+
+    // Create askpass script with current password
+    fs.writeFileSync(oldAskpass, `#!/bin/sh\necho '${currentPassword.replace(/'/g, "'\\''")}'`, { mode: 0o700 });
+
+    // Create the password change script
+    fs.writeFileSync(changeScript, `#!/bin/bash
+echo '${currentPassword.replace(/'/g, "'\\''")}' | sudo -S bash -c "echo '${sshUser}:${newPassword.replace(/'/g, "'\\''")}' | chpasswd" 2>/dev/null
+echo "ROTATED"
+`, { mode: 0o700 });
+
+    // SSH with old password, run the change script
+    const result = execSync(
+      `SSHPASS='${currentPassword.replace(/'/g, "'\\''")}' sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${sshUser}@${target_host} 'bash -s' < ${changeScript}`,
+      { timeout: 30000, encoding: 'utf8' }
+    );
+
+    // Cleanup temp files
+    try { fs.unlinkSync(oldAskpass); } catch(_) {}
+    try { fs.unlinkSync(changeScript); } catch(_) {}
+
+    if (!result.includes('ROTATED')) {
+      return res.status(500).json({ error: 'password change command did not confirm success', output: result.trim() });
+    }
+
+    // Store the new password in DemiPass using the existing rotate logic
+    const baseName = secret.name.replace(/_v\d+$/, '');
+    const newVersion = (secret.version || 1) + 1;
+    const newName = baseName + '_v' + newVersion;
+    const encrypted = blindkeyEncrypt(newPassword);
+
+    db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`
+    ).run(ownerDid, newName, (secret.description || '') + ` (rotated ${new Date().toISOString().slice(0, 10)})`,
+      'password', encrypted, secret.metadata || '{}', newVersion);
+
+    const newSecret = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
+
+    // Copy contexts from old to new
+    const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
+    for (const ctx of oldContexts) {
+      db.prepare(`INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0)`)
+        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
+    }
+
+    // Revoke old secret
+    db.prepare("UPDATE blindkey_secrets SET status = 'revoked', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(secret.id);
+
+    // Buoy tick
+    try {
+      db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(ownerDid, `Blind rotation: ${baseName} on ${target_host} (${reason || 'exposed secret'})`,
+          req.ip || '', 'UTC', 'decision', JSON.stringify(['rotation:blind', `host:${target_host}`]));
+    } catch(_) {}
+
+    res.json({
+      ok: true,
+      old_ref: ref,
+      old_status: 'revoked',
+      new_ref: newSecret.ref_code,
+      new_name: newName,
+      target_host,
+      target_user: sshUser,
+      contexts_transferred: oldContexts.length,
+      note: 'Password rotated. The new password was generated server-side and never entered any agent context. Use the new ref code.',
+    });
+
+  } catch (e) {
+    // Cleanup on failure
+    try { execSync('rm -f /tmp/.dp_rotate_*', { timeout: 5000 }); } catch(_) {}
+    res.status(500).json({ error: 'rotation failed: ' + e.message, note: 'Old password is still active. No changes were made to the target.' });
+  }
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
