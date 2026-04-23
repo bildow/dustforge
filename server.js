@@ -1214,15 +1214,13 @@ app.post('/api/stripe/checkout/topup-external', rateLimitStandard, async (req, r
 // POST /api/stripe/checkout/founders — founders package ($100/year, first 100)
 app.post('/api/stripe/checkout/founders', rateLimitStandard, async (req, res) => {
   try {
-    // Require authenticated identity — founders must have a Dustforge account first
+    // Auth is optional — if provided, we bind the checkout to the DID
     const auth = getBearerIdentity(req);
-    if (!auth.ok) {
-      return res.status(401).json({ error: 'Authentication required. Create a Dustforge identity first, then purchase the founders package.' });
+    let wallet = null;
+    if (auth.ok) {
+      wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
+      if (wallet?.status === 'founder') return res.status(409).json({ error: 'You are already a founder.' });
     }
-
-    // Check if already a founder
-    const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
-    if (wallet?.status === 'founder') return res.status(409).json({ error: 'You are already a founder.' });
 
     // Check capacity — only 100 founders
     const capacity = db.prepare("SELECT COUNT(*) as n FROM identity_wallets WHERE status = 'founder'").get()?.n || 0;
@@ -1239,7 +1237,8 @@ app.post('/api/stripe/checkout/founders', rateLimitStandard, async (req, res) =>
       customer_email: wallet?.email || undefined,
       success_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/api/stripe/founders-success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.PLATFORM_BASE_URL || 'https://dustforge.com'}/founders.html`,
-      metadata: { type: 'founders_package', did: auth.did, username: wallet?.username || '' },
+      metadata: { type: 'founders_package', did: auth.ok ? auth.did : '', username: wallet?.username || '' },
+      subscription_data: { metadata: { type: 'founders_package', did: auth.ok ? auth.did : '', username: wallet?.username || '' } },
     });
     res.json({ ok: true, url: session.url, session_id: session.id });
   } catch (e) {
@@ -1406,11 +1405,20 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     const subId = invoice.subscription;
     const customerEmail = invoice.customer_email || '';
 
-    if (subId && customerEmail) {
-      // Only credit recurring invoices (not the first one — that's handled by checkout.session.completed)
+    if (subId) {
       const isRecurring = invoice.billing_reason === 'subscription_cycle';
       if (isRecurring) {
-        const wallet = db.prepare('SELECT * FROM identity_wallets WHERE email = ? AND status = ?').get(customerEmail, 'founder');
+        // DID-bound: look up subscription metadata for the DID, fall back to email
+        let wallet = null;
+        try {
+          const stripe = stripeService.getStripe();
+          const sub = await stripe.subscriptions.retrieve(subId);
+          const subDid = sub.metadata?.did || '';
+          if (subDid) wallet = db.prepare("SELECT * FROM identity_wallets WHERE did = ? AND status = 'founder'").get(subDid);
+        } catch(_) {}
+        if (!wallet && customerEmail) {
+          wallet = db.prepare("SELECT * FROM identity_wallets WHERE email = ? AND status = 'founder'").get(customerEmail);
+        }
         if (wallet) {
           const idempotencyKey = `founders_renewal_${event.id || invoice.id}`;
           billing.creditBalance(db, wallet.did, 1200, 'founders_renewal', 'Founders package — monthly DD auto-refill', idempotencyKey);
