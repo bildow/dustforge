@@ -8705,6 +8705,8 @@ app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
   res.json({ ok: true, claim_id: Number(req.params.id), new_status: status });
 });
 
+app.get('/api/debug/route-break-check', (_req, res) => res.json({ alive: true, section: 'pre-cruise' }));
+
 // ============================================================
 // Cruise Control — autonomous agent work cycles (card 28)
 // ============================================================
