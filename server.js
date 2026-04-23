@@ -8948,6 +8948,8 @@ app.get('/api/insights/cruise/status', rateLimitStandard, (req, res) => {
 // password, changes it to the NEW password, stores the new one, revokes the old.
 // Returns: new ref code. The new password never enters any agent context.
 
+app.get('/api/demipass/rotate-blind-check', (_req, res) => res.json({ route: 'alive' }));
+
 app.post('/api/demipass/rotate-blind', rateLimitStandard, async (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
