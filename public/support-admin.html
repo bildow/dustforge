@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Support Command — AKStrapped</title>
+<title>Mission Control — AKStrapped</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#e06c75; --yellow:#c8a84b; }
@@ -94,6 +94,7 @@
     <button class="tab-btn active" onclick="showTab('overview')" id="tab-overview" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid var(--accent);color:var(--accent);font-weight:600;font-size:0.8rem;cursor:pointer">Overview</button>
     <button class="tab-btn" onclick="showTab('tickets')" id="tab-tickets" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-weight:600;font-size:0.8rem;cursor:pointer">Tickets</button>
     <button class="tab-btn" onclick="showTab('infra')" id="tab-infra" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-weight:600;font-size:0.8rem;cursor:pointer">Infrastructure</button>
+    <button class="tab-btn" onclick="showTab('secrets')" id="tab-secrets" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-weight:600;font-size:0.8rem;cursor:pointer">Secrets</button>
     <button class="tab-btn" onclick="showTab('cruise')" id="tab-cruise" style="flex:1;padding:0.6rem;background:none;border:none;border-bottom:2px solid transparent;color:var(--text3);font-weight:600;font-size:0.8rem;cursor:pointer">Cruise</button>
   </div>
 
@@ -170,6 +171,24 @@
   <div class="section">
     <div class="section-head"><span class="section-title">RackNerd (Dustforge)</span></div>
     <div id="infra-racknerd"><div class="empty">Loading...</div></div>
+  </div>
+</div>
+
+<!-- Secrets tab (operator view) -->
+<div id="panel-secrets" style="display:none">
+  <div class="stats">
+    <div class="stat"><div class="stat-val" style="color:var(--green)" id="sec-active">--</div><div class="stat-label">Active</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--yellow)" id="sec-rotating">--</div><div class="stat-label">Rotating</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--text3)" id="sec-retired">--</div><div class="stat-label">Retired</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--accent)" id="sec-tokens">--</div><div class="stat-label">Live Tokens</div></div>
+  </div>
+  <div class="section">
+    <div class="section-head"><span class="section-title">Active Secrets</span><button class="ta-btn" onclick="loadSecrets()">Refresh</button></div>
+    <div id="secrets-active"><div class="empty">Loading...</div></div>
+  </div>
+  <div class="section">
+    <div class="section-head"><span class="section-title">Rotating (in grace period)</span></div>
+    <div id="secrets-rotating"><div class="empty">Loading...</div></div>
   </div>
 </div>
 
@@ -375,14 +394,16 @@ function esc(s) { const d = document.createElement('div'); d.textContent = s || 
 
 // Tab switching
 function showTab(name) {
-  ['overview','tickets','infra','cruise'].forEach(t => {
+  ['overview','tickets','infra','secrets','cruise'].forEach(t => {
     document.getElementById('panel-' + t).style.display = t === name ? 'block' : 'none';
     const btn = document.getElementById('tab-' + t);
     btn.style.borderBottomColor = t === name ? 'var(--accent)' : 'transparent';
     btn.style.color = t === name ? 'var(--accent)' : 'var(--text3)';
   });
   if (name === 'infra') loadInfra();
+  if (name === 'secrets') loadSecrets();
   if (name === 'cruise') loadCruise();
+  if (name === 'tickets') loadTicketsFull();
 }
 
 // Infrastructure loading
@@ -413,28 +434,118 @@ async function loadInfra() {
     '</div>';
 }
 
-// Cruise sessions
+// Cruise + Claims
 async function loadCruise() {
   try {
-    // Use admin telemetry to get cruise overview
     const t = await apiFetch('GET', '/api/admin/telemetry');
     document.getElementById('cruise-sessions').innerHTML =
       '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
-      '<div>Total Buoy ticks: ' + (t.platform?.ticks || 0) + '</div>' +
-      '<div>Ticks today: ' + (t.platform?.ticks_today || 0) + '</div>' +
-      '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.5rem">Cruise sessions are per-agent. Use GET /api/insights/cruise/status with agent credentials.</div>' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem">' +
+      '<div>Buoy ticks: <strong>' + (t.platform?.ticks || 0) + '</strong></div>' +
+      '<div>Today: <strong>' + (t.platform?.ticks_today || 0) + '</strong></div>' +
+      '<div>Active secrets: <strong>' + (t.platform?.secrets || 0) + '</strong></div>' +
+      '<div>Users: <strong>' + (t.users?.total || 0) + '</strong></div>' +
+      '</div>' +
+      '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.75rem">Cruise sessions are per-agent DID. Engage via POST /api/insights/cruise/engage.</div>' +
       '</div>';
-  } catch { document.getElementById('cruise-sessions').innerHTML = '<div class="empty">Could not load cruise data</div>'; }
+  } catch { document.getElementById('cruise-sessions').innerHTML = '<div class="empty">Could not load data</div>'; }
 
-  // Claims ledger overview
+  // Claims ledger — try to show active claims
   try {
-    const t = await apiFetch('GET', '/api/admin/telemetry');
-    document.getElementById('claims-ledger').innerHTML =
-      '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
-      '<div>Active secrets: ' + (t.platform?.secrets || 0) + '</div>' +
-      '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.5rem">Claims are scoped per-DID. Admin claims overview endpoint coming in pass 2.</div>' +
-      '</div>';
+    const claims = await apiFetch('GET', '/api/insights/claims?status=active');
+    const list = claims.claims || [];
+    if (list.length) {
+      let html = '';
+      for (const c of list) {
+        const typeColor = c.claim_type === 'observation' ? 'var(--accent)' : c.claim_type === 'constraint' ? 'var(--red)' : 'var(--yellow)';
+        html += '<div style="padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem">';
+        html += '<span style="color:' + typeColor + ';font-weight:600;font-size:0.7rem;text-transform:uppercase">' + c.claim_type + '</span>';
+        html += ' <span style="color:var(--text3);font-size:0.65rem">w:' + c.weight + '</span>';
+        html += '<div style="color:var(--text2);margin-top:0.15rem">' + esc(c.claim) + '</div>';
+        html += '</div>';
+      }
+      document.getElementById('claims-ledger').innerHTML = html;
+    } else {
+      document.getElementById('claims-ledger').innerHTML = '<div class="empty">No active claims. Agents submit via POST /api/insights/claim.</div>';
+    }
   } catch { document.getElementById('claims-ledger').innerHTML = '<div class="empty">Could not load claims</div>'; }
+}
+
+// Secrets operator view
+async function loadSecrets() {
+  try {
+    const data = await apiFetch('GET', '/api/demipass/operator-view');
+    document.getElementById('sec-active').textContent = data.active?.count || 0;
+    document.getElementById('sec-rotating').textContent = data.rotating?.count || 0;
+    document.getElementById('sec-retired').textContent = data.retired?.count || 0;
+    document.getElementById('sec-tokens').textContent = data.live_tokens?.total || 0;
+
+    // Active secrets list
+    const active = data.active?.secrets || [];
+    if (active.length) {
+      let html = '';
+      for (const s of active) {
+        html += '<div style="display:flex;justify-content:space-between;align-items:center;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem">';
+        html += '<div><span style="font-weight:600;color:var(--text)">' + esc(s.name) + '</span>';
+        html += ' <span style="color:var(--text3);font-size:0.7rem">v' + s.version + '</span>';
+        html += (s.ref ? ' <code style="color:var(--accent);font-size:0.65rem;background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">' + esc(s.ref) + '</code>' : '');
+        html += '</div>';
+        html += '<div style="color:var(--text3);font-size:0.7rem">' + s.type + ' &middot; ' + s.use_count + ' uses &middot; ' + s.active_contexts + ' ctx</div>';
+        html += '</div>';
+      }
+      document.getElementById('secrets-active').innerHTML = html;
+    } else {
+      document.getElementById('secrets-active').innerHTML = '<div class="empty">No active secrets.</div>';
+    }
+
+    // Rotating secrets
+    const rotating = data.rotating?.secrets || [];
+    if (rotating.length) {
+      let html = '';
+      for (const s of rotating) {
+        html += '<div style="padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem">';
+        html += '<span style="font-weight:600;color:var(--yellow)">' + esc(s.name) + '</span>';
+        html += ' <span style="color:var(--text3);font-size:0.7rem">' + (s.redeemable ? 'valid until ' + new Date(s.grace_expires).toLocaleString() : 'grace expired') + '</span>';
+        html += '</div>';
+      }
+      document.getElementById('secrets-rotating').innerHTML = html;
+    } else {
+      document.getElementById('secrets-rotating').innerHTML = '<div class="empty">No secrets in rotation.</div>';
+    }
+  } catch (e) {
+    document.getElementById('secrets-active').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
+  }
+}
+
+// Full ticket list for Tickets tab
+async function loadTicketsFull() {
+  try {
+    const data = await apiFetch('GET', '/api/support/tickets');
+    const tickets = data.tickets || [];
+    const el = document.getElementById('ticket-list-full');
+    if (!tickets.length) { el.innerHTML = '<div class="empty">No tickets.</div>'; return; }
+    let html = '';
+    for (const t of tickets) {
+      const statusCls = t.status === 'open' ? 'ts-open' : t.status === 'reviewing' ? 'ts-reviewing' : 'ts-resolved';
+      html += '<div class="ticket">';
+      html += '<div class="ticket-head"><span class="ticket-id">#' + t.id + '</span><span class="ticket-status ' + statusCls + '">' + t.status + '</span><span class="ticket-source">' + esc(t.source) + '</span></div>';
+      html += '<div class="ticket-body"><strong>' + esc(t.subject) + '</strong>' + (t.body ? '<br>' + esc(t.body) : '') + '</div>';
+      html += '<div class="ticket-meta">' + (t.username || t.did?.slice(0, 25) || 'anonymous') + ' &middot; ' + new Date(t.created_at).toLocaleString() + (t.resolution ? '<br>Resolution: ' + esc(t.resolution) : '') + '</div>';
+      html += '<div class="ticket-actions">';
+      if (t.status === 'open') {
+        html += '<button class="ta-btn" onclick="updateTicket(' + t.id + ',\'reviewing\')">Review</button>';
+        html += '<button class="ta-btn ta-btn-green" onclick="updateTicket(' + t.id + ',\'resolved\')">Resolve</button>';
+        html += '<button class="ta-btn ta-btn-red" onclick="updateTicket(' + t.id + ',\'closed\')">Close</button>';
+      } else if (t.status === 'reviewing') {
+        html += '<button class="ta-btn ta-btn-green" onclick="updateTicket(' + t.id + ',\'resolved\')">Resolve</button>';
+        html += '<button class="ta-btn ta-btn-red" onclick="updateTicket(' + t.id + ',\'closed\')">Close</button>';
+      }
+      html += '</div></div>';
+    }
+    el.innerHTML = html;
+  } catch (e) {
+    document.getElementById('ticket-list-full').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
+  }
 }
 
 document.getElementById('a-pass').addEventListener('keydown', e => { if (e.key === 'Enter') adminLogin(); });
