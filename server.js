@@ -8827,7 +8827,10 @@ app.get('/api/blindkey/operator-view', rateLimitStandard, (req, res) => {
   }
 
   // Token compatibility: count live use-tokens for each status
-  const liveTokens = db.prepare("SELECT bt.secret_id, bs.status, bs.name FROM blindkey_tokens bt JOIN blindkey_secrets bs ON bt.secret_id = bs.id WHERE bt.did = ? AND bt.used = 0 AND bt.expires_at > datetime('now')").all(ownerDid);
+  let liveTokens = [];
+  try {
+    liveTokens = db.prepare("SELECT bt.secret_id, bs.status, bs.name FROM blindkey_use_tokens bt JOIN blindkey_secrets bs ON bt.secret_id = bs.id WHERE bt.did = ? AND bt.used = 0 AND bt.expires_at > datetime('now')").all(ownerDid);
+  } catch(_) {}
 
   res.json({
     active: { count: active.length, secrets: active },
