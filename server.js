@@ -8714,31 +8714,32 @@ app.get('/api/debug/route-break-check', (_req, res) => res.json({ alive: true, s
 // Disengage: carbon or guardrails stop the loop
 // Resume: re-engage with fresh params, picks up from current ledger
 
-try { db.exec(`CREATE TABLE IF NOT EXISTS cruise_sessions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  did TEXT NOT NULL,
-  status TEXT DEFAULT 'engaged',
-  max_cycles INTEGER DEFAULT 5,
-  completed_cycles INTEGER DEFAULT 0,
-  max_dd INTEGER DEFAULT 500,
-  spent_dd INTEGER DEFAULT 0,
-  timeout_at TEXT DEFAULT '',
-  last_action TEXT DEFAULT '',
-  last_cycle_at TEXT DEFAULT '',
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  ended_at TEXT DEFAULT ''
-)`); } catch(e) {}
-
-try { db.exec(`CREATE TABLE IF NOT EXISTS cruise_cycle_log (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id INTEGER NOT NULL,
-  cycle_number INTEGER NOT NULL,
-  action_taken TEXT DEFAULT '',
-  claim_id INTEGER DEFAULT 0,
-  outcome TEXT DEFAULT '',
-  dd_cost INTEGER DEFAULT 0,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-)`); } catch(e) {}
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS cruise_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    did TEXT NOT NULL,
+    status TEXT DEFAULT 'engaged',
+    max_cycles INTEGER DEFAULT 5,
+    completed_cycles INTEGER DEFAULT 0,
+    max_dd INTEGER DEFAULT 500,
+    spent_dd INTEGER DEFAULT 0,
+    timeout_at TEXT DEFAULT '',
+    last_action TEXT DEFAULT '',
+    last_cycle_at TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    ended_at TEXT DEFAULT ''
+  )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS cruise_cycle_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL,
+    cycle_number INTEGER NOT NULL,
+    action_taken TEXT DEFAULT '',
+    claim_id INTEGER DEFAULT 0,
+    outcome TEXT DEFAULT '',
+    dd_cost INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )`);
+} catch(e) { console.error('[cruise] table creation:', e.message); }
 
 // POST /api/insights/cruise/engage — start a cruise session
 app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
