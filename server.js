@@ -2613,23 +2613,32 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     }
     if (tokenRow.did !== req.identity.did) return res.status(403).json({ error: 'use-token belongs to a different identity' });
 
-    // Mark token as used
-    db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
-
-    // Defect fix #4: burn delegation quota on REDEMPTION, not issuance
-    if (tokenRow.delegation_id) {
-      db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
-    }
+    // Mark token as in-flight (prevent re-use during execution, but don't fully burn yet)
+    db.prepare("UPDATE blindkey_use_tokens SET status = 'in_flight' WHERE id = ?").run(tokenRow.id);
 
     // Load the secret from the token's secret_id
     const secret = db.prepare(`SELECT * FROM blindkey_secrets WHERE id = ? AND ${REDEEMABLE_STATUS_SQL}`).get(tokenRow.secret_id);
-    if (!secret) return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked' });
+    if (!secret) {
+      // Revert token — secret gone, don't waste the token
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'active' WHERE id = ?").run(tokenRow.id);
+      return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked' });
+    }
 
     let decryptedValue;
     try {
       decryptedValue = blindkeyDecrypt(secret.encrypted_value);
     } catch (e) {
+      // Revert token — decryption failed, don't waste the token
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'active' WHERE id = ?").run(tokenRow.id);
       return res.status(500).json({ error: 'failed to decrypt secret' });
+    }
+
+    // NOW burn the token — decryption succeeded, execution will proceed
+    db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
+
+    // Burn delegation quota on successful redemption
+    if (tokenRow.delegation_id) {
+      db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
     }
 
     // Update usage stats + Buoy last-used tick
@@ -6822,8 +6831,15 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
   if (context_name && typeof context_name !== 'string') return res.status(400).json({ error: 'context_name: must be a string' });
 
   // Resolve the secret — must be owned by the caller (or admin acting on behalf)
-  const ownerDid = actor.did || req.body.owner_did;
-  if (!ownerDid && actor.mode !== 'admin') return res.status(400).json({ error: 'could not determine owner DID' });
+  // Admin MUST specify owner_did explicitly to prevent cross-tenant name collision
+  let ownerDid;
+  if (actor.mode === 'admin') {
+    ownerDid = req.body.owner_did;
+    if (!ownerDid) return res.status(400).json({ error: 'owner_did required for admin delegation (prevents cross-tenant name collision)' });
+  } else {
+    ownerDid = actor.did;
+    if (!ownerDid) return res.status(400).json({ error: 'could not determine owner DID' });
+  }
 
   const secret = resolveLatestBlindkeySecret(ownerDid, secret_name);
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by caller' });
@@ -8891,8 +8907,9 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const newName = baseName + '_v' + newVersion;
     const encrypted = blindkeyEncrypt(newPassword);
 
-    db.prepare('INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion);
+    const newRefCode = generateRefCode('password', newName);
+    db.prepare('INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode);
 
     const newSecret = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
