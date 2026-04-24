@@ -160,17 +160,19 @@
 
 <!-- Infrastructure tab -->
 <div id="panel-infra" style="display:none">
-  <div class="section">
-    <div class="section-head"><span class="section-title">Phasewhip Containers</span><button class="ta-btn" onclick="loadInfra()">Refresh</button></div>
-    <div id="infra-phasewhip"><div class="empty">Loading phasewhip incus status...</div></div>
+  <div class="stats">
+    <div class="stat"><div class="stat-val" style="color:var(--green)" id="inf-phasewhip">--</div><div class="stat-label">Phasewhip</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--green)" id="inf-k1">--</div><div class="stat-label">K1</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--green)" id="inf-racknerd">--</div><div class="stat-label">RackNerd</div></div>
+    <div class="stat"><div class="stat-val" style="color:var(--accent)" id="inf-brain">--</div><div class="stat-label">Brain</div></div>
   </div>
   <div class="section">
-    <div class="section-head"><span class="section-title">K1 Containers</span></div>
-    <div id="infra-k1"><div class="empty">Loading k1 incus status...</div></div>
+    <div class="section-head"><span class="section-title">Containers</span><button class="ta-btn" onclick="loadInfra()">Refresh</button></div>
+    <div id="infra-containers"><div class="empty">Loading...</div></div>
   </div>
   <div class="section">
-    <div class="section-head"><span class="section-title">RackNerd (Dustforge)</span></div>
-    <div id="infra-racknerd"><div class="empty">Loading...</div></div>
+    <div class="section-head"><span class="section-title">Service Details</span></div>
+    <div id="infra-details"><div class="empty">Loading...</div></div>
   </div>
 </div>
 
@@ -406,69 +408,111 @@ function showTab(name) {
   if (name === 'tickets') loadTicketsFull();
 }
 
-// Infrastructure loading
+// Infrastructure loading — real-time from backend
 async function loadInfra() {
-  // RackNerd health
   try {
-    const health = await apiFetch('GET', '/api/health');
-    document.getElementById('infra-racknerd').innerHTML =
-      '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
-      '<div>Status: <span style="color:var(--green)">online</span></div>' +
-      '<div>Uptime: ' + Math.floor(health.uptime / 3600) + 'h ' + Math.floor((health.uptime % 3600) / 60) + 'm</div>' +
-      '<div>Identities: ' + health.identities + '</div>' +
-      '</div>';
-  } catch { document.getElementById('infra-racknerd').innerHTML = '<div class="empty">Could not reach RackNerd</div>'; }
+    const data = await apiFetch('GET', '/api/admin/infrastructure');
+    const h = data.hosts || {};
 
-  // Phasewhip + K1 — these need Tailscale access
-  document.getElementById('infra-phasewhip').innerHTML =
-    '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
-    '<div>Dashboard: <a href="https://phasewhip.taildb5a42.ts.net/incus/" target="_blank" style="color:var(--accent)">phasewhip incus</a></div>' +
-    '<div>Containers: brain, conductor, civitasvox, rowen, lori</div>' +
-    '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.25rem">Requires Tailscale access</div>' +
-    '</div>';
-  document.getElementById('infra-k1').innerHTML =
-    '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
-    '<div>Dashboard: <a href="https://k1.taildb5a42.ts.net/incus/" target="_blank" style="color:var(--accent)">k1 incus</a></div>' +
-    '<div>Services: Conduit (8080)</div>' +
-    '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.25rem">Requires Tailscale access</div>' +
-    '</div>';
-}
+    // Status badges
+    const badge = (s) => s === 'online' ? '<span style="color:var(--green)">ON</span>' : '<span style="color:var(--red)">OFF</span>';
+    document.getElementById('inf-phasewhip').innerHTML = badge(h.phasewhip?.status);
+    document.getElementById('inf-k1').innerHTML = badge(h.k1?.status);
+    document.getElementById('inf-racknerd').innerHTML = badge(h.racknerd?.status);
+    document.getElementById('inf-brain').innerHTML = data.agents?.brain?.status === 'live' ? '<span style="color:var(--green)">LIVE</span>' : '<span style="color:var(--red)">DOWN</span>';
 
-// Cruise + Claims
-async function loadCruise() {
-  try {
-    const t = await apiFetch('GET', '/api/admin/telemetry');
-    document.getElementById('cruise-sessions').innerHTML =
-      '<div style="font-size:0.8rem;color:var(--text2);padding:0.5rem 0">' +
-      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.5rem">' +
-      '<div>Buoy ticks: <strong>' + (t.platform?.ticks || 0) + '</strong></div>' +
-      '<div>Today: <strong>' + (t.platform?.ticks_today || 0) + '</strong></div>' +
-      '<div>Active secrets: <strong>' + (t.platform?.secrets || 0) + '</strong></div>' +
-      '<div>Users: <strong>' + (t.users?.total || 0) + '</strong></div>' +
-      '</div>' +
-      '<div style="color:var(--text3);font-size:0.75rem;margin-top:0.75rem">Cruise sessions are per-agent DID. Engage via POST /api/insights/cruise/engage.</div>' +
-      '</div>';
-  } catch { document.getElementById('cruise-sessions').innerHTML = '<div class="empty">Could not load data</div>'; }
-
-  // Claims ledger — try to show active claims
-  try {
-    const claims = await apiFetch('GET', '/api/insights/claims?status=active');
-    const list = claims.claims || [];
-    if (list.length) {
-      let html = '';
-      for (const c of list) {
-        const typeColor = c.claim_type === 'observation' ? 'var(--accent)' : c.claim_type === 'constraint' ? 'var(--red)' : 'var(--yellow)';
-        html += '<div style="padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem">';
-        html += '<span style="color:' + typeColor + ';font-weight:600;font-size:0.7rem;text-transform:uppercase">' + c.claim_type + '</span>';
-        html += ' <span style="color:var(--text3);font-size:0.65rem">w:' + c.weight + '</span>';
-        html += '<div style="color:var(--text2);margin-top:0.15rem">' + esc(c.claim) + '</div>';
+    // Container grid
+    const containers = h.phasewhip?.containers || [];
+    if (containers.length) {
+      let html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:0.5rem">';
+      for (const c of containers) {
+        const color = c.status === 'Running' ? 'var(--green)' : 'var(--red)';
+        html += '<div style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.8rem">';
+        html += '<div style="display:flex;justify-content:space-between;align-items:center"><strong>' + esc(c.name) + '</strong><span style="color:' + color + ';font-size:0.7rem">' + c.status + '</span></div>';
+        html += '<div style="color:var(--text3);font-size:0.7rem;margin-top:0.25rem">' + (c.ip || '—') + ' &middot; ' + c.mem_mb + 'MB</div>';
         html += '</div>';
       }
-      document.getElementById('claims-ledger').innerHTML = html;
+      html += '</div>';
+      document.getElementById('infra-containers').innerHTML = html;
     } else {
-      document.getElementById('claims-ledger').innerHTML = '<div class="empty">No active claims. Agents submit via POST /api/insights/claim.</div>';
+      document.getElementById('infra-containers').innerHTML = '<div class="empty">No container data</div>';
     }
-  } catch { document.getElementById('claims-ledger').innerHTML = '<div class="empty">Could not load claims</div>'; }
+
+    // Service details
+    let details = '<div style="font-size:0.8rem;color:var(--text2)">';
+    details += '<div style="margin-bottom:0.5rem"><strong>Phasewhip</strong> — ' + (h.phasewhip?.running || 0) + '/' + (h.phasewhip?.container_count || 0) + ' containers running';
+    details += ' &middot; <a href="https://phasewhip.taildb5a42.ts.net/incus/" target="_blank" style="color:var(--accent)">Dashboard</a></div>';
+    details += '<div style="margin-bottom:0.5rem"><strong>K1</strong> — ' + (h.k1?.status || 'unknown') + ' &middot; <a href="https://k1.taildb5a42.ts.net/incus/" target="_blank" style="color:var(--accent)">Dashboard</a></div>';
+    details += '<div style="margin-bottom:0.5rem"><strong>RackNerd</strong> — uptime ' + Math.floor((h.racknerd?.uptime_seconds || 0) / 3600) + 'h &middot; ' + (h.racknerd?.identities || 0) + ' identities</div>';
+    details += '<div><strong>Brain</strong> — ' + (data.agents?.brain?.model || 'unknown') + ' &middot; v' + (data.agents?.brain?.version || '?') + '</div>';
+    details += '</div>';
+    document.getElementById('infra-details').innerHTML = details;
+  } catch (e) {
+    document.getElementById('infra-containers').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
+  }
+}
+
+// Cruise + Claims — admin overview across all DIDs
+async function loadCruise() {
+  // Cruise sessions
+  try {
+    const data = await apiFetch('GET', '/api/admin/cruise-overview');
+    const sessions = data.sessions || [];
+    if (sessions.length) {
+      let html = '<div style="font-size:0.8rem;margin-bottom:0.5rem;color:var(--text2)">Active: <strong style="color:var(--green)">' + data.active + '</strong> &middot; Total: ' + data.total + '</div>';
+      for (const s of sessions.slice(0, 10)) {
+        const statusColor = s.status === 'engaged' ? 'var(--green)' : s.status === 'paused' ? 'var(--yellow)' : s.status === 'completed' ? 'var(--text3)' : 'var(--red)';
+        html += '<div style="display:flex;justify-content:space-between;padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem">';
+        html += '<div><span style="color:' + statusColor + ';font-weight:600">' + s.status + '</span> &middot; ' + s.completed_cycles + '/' + s.max_cycles + ' cycles &middot; ' + s.spent_dd + '/' + s.max_dd + ' DD</div>';
+        html += '<div style="color:var(--text3);font-size:0.7rem">' + (s.did?.slice(0, 25) || '') + '</div>';
+        html += '</div>';
+        if (s.last_action) html += '<div style="font-size:0.7rem;color:var(--text3);padding:0.15rem 0 0.3rem">' + esc(s.last_action).slice(0, 80) + '</div>';
+      }
+      document.getElementById('cruise-sessions').innerHTML = html;
+    } else {
+      document.getElementById('cruise-sessions').innerHTML = '<div class="empty">No cruise sessions yet.</div>';
+    }
+  } catch (e) { document.getElementById('cruise-sessions').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>'; }
+
+  // Claims ledger — admin view across all DIDs
+  try {
+    const data = await apiFetch('GET', '/api/admin/claims-overview');
+    const recent = data.recent || [];
+    const byDid = data.by_did || [];
+    let html = '';
+
+    // Stats
+    if (data.stats?.length) {
+      html += '<div style="display:flex;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.75rem">';
+      for (const s of data.stats) {
+        const color = s.claim_type === 'observation' ? 'var(--accent)' : s.claim_type === 'constraint' ? 'var(--red)' : 'var(--yellow)';
+        html += '<span style="font-size:0.7rem;padding:0.2rem 0.5rem;border-radius:4px;background:rgba(39,68,95,0.3);color:' + color + '">' + s.claim_type + '/' + s.status + ': ' + s.n + '</span>';
+      }
+      html += '</div>';
+    }
+
+    // By DID
+    if (byDid.length) {
+      html += '<div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">Active claims by agent: ';
+      html += byDid.map(d => (d.created_by?.slice(0, 20) || '?') + ' (' + d.n + ')').join(', ');
+      html += '</div>';
+    }
+
+    // Recent claims
+    if (recent.length) {
+      for (const c of recent) {
+        const typeColor = c.claim_type === 'observation' ? 'var(--accent)' : c.claim_type === 'constraint' ? 'var(--red)' : 'var(--yellow)';
+        html += '<div style="padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem">';
+        html += '<span style="color:' + typeColor + ';font-weight:600;font-size:0.7rem;text-transform:uppercase">' + c.claim_type + '</span>';
+        html += ' <span style="color:var(--text3);font-size:0.65rem">w:' + c.weight + ' &middot; ' + c.status + '</span>';
+        html += '<div style="color:var(--text2);margin-top:0.1rem">' + esc(c.claim).slice(0, 120) + '</div>';
+        html += '</div>';
+      }
+    } else {
+      html += '<div class="empty">No claims in ledger.</div>';
+    }
+    document.getElementById('claims-ledger').innerHTML = html;
+  } catch (e) { document.getElementById('claims-ledger').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>'; }
 }
 
 // Secrets operator view

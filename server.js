@@ -9233,6 +9233,111 @@ app.get('/api/insights/cruise/status', rateLimitStandard, (req, res) => {
 
 app.get('/api/debug/last-route', (_req, res) => res.json({ last: true }));
 
+// ============================================================
+// Command & Control — infrastructure health aggregator
+// ============================================================
+
+// GET /api/admin/infrastructure — live container + service health from all hosts
+app.get('/api/admin/infrastructure', rateLimitStandard, async (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  const http = require('http');
+  const fetch = (url, timeout = 5000) => new Promise((resolve) => {
+    const req = http.get(url, { timeout }, (resp) => {
+      let data = '';
+      resp.on('data', c => data += c);
+      resp.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+
+  // Parallel health checks
+  const [phasewhipContainers, phasewhipHealth, brainHealth, k1Health, rackHealth] = await Promise.all([
+    fetch('http://100.83.112.88:7070/api/containers'),
+    fetch('http://100.83.112.88:7070/api/health'),
+    fetch('http://100.83.112.88:8002/health'),
+    fetch('http://100.69.1.78:8080/health'),
+    fetch('http://127.0.0.1:3001/api/health'),
+  ]);
+
+  const containers = (phasewhipContainers?.containers || []).map(c => ({
+    name: c.name,
+    status: c.status,
+    ip: c.ip,
+    cpu: c.cpu_usage,
+    mem_mb: Math.round((c.mem_used || 0) / 1048576),
+    disk_mb: Math.round((c.disk_used || 0) / 1048576),
+  }));
+
+  res.json({
+    timestamp: new Date().toISOString(),
+    hosts: {
+      phasewhip: {
+        status: phasewhipHealth ? 'online' : 'unreachable',
+        ip: '100.83.112.88',
+        containers,
+        container_count: containers.length,
+        running: containers.filter(c => c.status === 'Running').length,
+      },
+      k1: {
+        status: k1Health ? 'online' : 'unreachable',
+        ip: '100.69.1.78',
+        service: k1Health || null,
+      },
+      racknerd: {
+        status: rackHealth ? 'online' : 'unreachable',
+        ip: '192.3.84.103',
+        uptime_seconds: rackHealth?.uptime || 0,
+        identities: rackHealth?.identities || 0,
+      },
+    },
+    agents: {
+      brain: {
+        status: brainHealth?.status || 'unreachable',
+        model: brainHealth?.model || null,
+        worker: brainHealth?.worker || null,
+        version: brainHealth?.version || null,
+      },
+    },
+  });
+});
+
+// GET /api/admin/claims-overview — admin view of all claims across all DIDs
+app.get('/api/admin/claims-overview', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  try {
+    const stats = db.prepare("SELECT claim_type, status, COUNT(*) as n FROM insight_claims GROUP BY claim_type, status").all();
+    const recent = db.prepare("SELECT id, claim_type, claim, source, weight, status, created_by, created_at FROM insight_claims ORDER BY id DESC LIMIT 20").all();
+    const byDid = db.prepare("SELECT created_by, COUNT(*) as n FROM insight_claims WHERE status = 'active' GROUP BY created_by").all();
+
+    res.json({ stats, recent, by_did: byDid });
+  } catch (e) {
+    res.json({ stats: [], recent: [], by_did: [], error: e.message });
+  }
+});
+
+// GET /api/admin/cruise-overview — admin view of all cruise sessions
+app.get('/api/admin/cruise-overview', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required' });
+
+  try {
+    const sessions = db.prepare("SELECT id, did, status, max_cycles, completed_cycles, max_dd, spent_dd, last_action, created_at, ended_at FROM cruise_sessions ORDER BY id DESC LIMIT 20").all();
+    const activeSessions = sessions.filter(s => s.status === 'engaged' || s.status === 'paused');
+
+    res.json({ sessions, active: activeSessions.length, total: sessions.length });
+  } catch (e) {
+    res.json({ sessions: [], active: 0, total: 0, error: e.message });
+  }
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
