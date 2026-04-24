@@ -9096,8 +9096,9 @@ app.post('/api/insights/cruise/outcome', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
 
-  const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND (status = 'engaged' OR status = 'paused')").get(auth.did);
-  if (!session) return res.status(404).json({ error: 'No active cruise session' });
+  // Accept outcomes for active OR recently completed sessions (outcome may arrive after final cycle auto-completes)
+  const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status IN ('engaged', 'paused', 'completed') ORDER BY id DESC LIMIT 1").get(auth.did);
+  if (!session) return res.status(404).json({ error: 'No cruise session found' });
 
   const { outcome, dd_cost, claim_id } = req.body || {};
   if (!outcome) return res.status(400).json({ error: 'outcome required' });
