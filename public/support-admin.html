@@ -18,7 +18,7 @@
   .auth button { width:100%; max-width:320px; padding:0.7rem; background:var(--red); border:none; border-radius:8px; color:#fff; font-weight:700; cursor:pointer; }
   .auth-err { color:var(--red); font-size:0.8rem; margin-top:0.5rem; max-width:320px; text-align:center; }
   .auth-2fa { display:none; margin-top:1rem; text-align:center; }
-  .auth-2fa input { text-align:center; font-size:1.2rem; letter-spacing:0.3em; }
+  .auth-2fa input { text-align:left; font-size:0.8rem; font-family:monospace; }
 
   /* Dashboard */
   .dash { display:none; }
@@ -73,7 +73,7 @@
   <button onclick="adminLogin()">Authenticate</button>
   <div class="auth-2fa" id="2fa-step">
     <p style="color:var(--text2);font-size:0.85rem;margin-bottom:0.5rem">Enter the admin API key (x-admin-key)</p>
-    <input type="text" id="a-2fa" placeholder="000000" maxlength="20">
+    <input type="text" id="a-2fa" placeholder="paste admin API key here" maxlength="128">
     <button onclick="verify2FA()" style="margin-top:0.5rem">Verify</button>
   </div>
   <div id="a-err" class="auth-err"></div>
