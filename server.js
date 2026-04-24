@@ -8899,7 +8899,38 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     try { fs.unlinkSync(scriptPath); } catch(_) {}
 
     if (!result.includes('ROTATED')) {
-      return res.status(500).json({ error: 'password change did not confirm success' });
+      return res.status(500).json({ error: 'password change did not confirm success. Old password is still active.' });
+    }
+
+    // VERIFICATION: SSH in with the NEW password to confirm it actually works
+    let verified = false;
+    try {
+      const verifyResult = execSync(
+        'SSHPASS=' + JSON.stringify(newPassword) + ' sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ' + sshUser + '@' + target_host + ' "echo VERIFIED"',
+        { timeout: 15000, encoding: 'utf8' }
+      );
+      verified = verifyResult.includes('VERIFIED');
+    } catch(_) {}
+
+    if (!verified) {
+      // ROLLBACK: new password didn't work. Revert to old password.
+      try {
+        const rollbackScript = `/tmp/.dp_rollback_${crypto.randomBytes(4).toString('hex')}.sh`;
+        // Try with new password first (in case chpasswd partially worked)
+        const rollbackContent = '#!/bin/bash\necho ' + JSON.stringify(newPassword) + ' | sudo -S bash -c "echo ' + sshUser + ':' + JSON.stringify(currentPassword) + ' | chpasswd" 2>/dev/null\necho ROLLED_BACK\n';
+        fs.writeFileSync(rollbackScript, rollbackContent, { mode: 0o700 });
+        execSync(
+          'SSHPASS=' + JSON.stringify(newPassword) + ' sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ' + sshUser + '@' + target_host + ' "bash -s" < ' + rollbackScript,
+          { timeout: 15000, encoding: 'utf8' }
+        );
+        try { fs.unlinkSync(rollbackScript); } catch(_) {}
+      } catch(_) {}
+
+      return res.status(500).json({
+        error: 'rotation FAILED verification — new password did not work. Attempted rollback to old password. Old ref is still active. DO NOT revoke.',
+        old_ref: ref,
+        old_status: 'still active',
+      });
     }
 
     const baseName = secret.name.replace(/_v\d+$/, '');
