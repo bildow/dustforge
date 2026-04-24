@@ -275,14 +275,14 @@
 
 <script>
 const API='https://api.dustforge.com';
+const TOKEN_TTL = 24 * 60 * 60 * 1000; // 24h in ms
+function isTokenExpired(){const t=localStorage.getItem('dp_token_at');if(!t)return true;return Date.now()-Number(t)>TOKEN_TTL}
+
 let tk=localStorage.getItem('dp_token')||'',did=localStorage.getItem('dp_did')||'',user=localStorage.getItem('dp_user')||'';
 let secrets=[],panic=false;
 
 if(tk&&!isTokenExpired())showApp();
 else if(tk){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}
-
-const TOKEN_TTL = 24 * 60 * 60 * 1000; // 24h in ms
-function isTokenExpired(){const t=localStorage.getItem('dp_token_at');if(!t)return true;return Date.now()-Number(t)>TOKEN_TTL}
 function autoLogoutIfExpired(){if(tk&&isTokenExpired()){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';return true}return false}
 async function api(m,p,b){if(autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const r=await fetch(API+p,o);if(r.status===401){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(r.status>=400)throw new Error(d.error||'failed');return d}
 
