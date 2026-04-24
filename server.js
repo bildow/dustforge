@@ -9338,6 +9338,132 @@ app.get('/api/admin/cruise-overview', rateLimitStandard, (req, res) => {
   }
 });
 
+// ============================================================
+// Password Recovery — email-based reset tokens
+// ============================================================
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  username TEXT NOT NULL,
+  token TEXT NOT NULL UNIQUE,
+  used INTEGER DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// POST /api/identity/forgot-password — request a reset token
+app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
+  const { username } = req.body || {};
+  if (!username) return res.status(400).json({ error: 'username required' });
+
+  const wallet = db.prepare('SELECT did, username, email FROM identity_wallets WHERE username = ?').get(username);
+  if (!wallet) {
+    // Don't reveal whether account exists
+    return res.json({ ok: true, message: 'If that account exists, a reset link has been sent to the associated email.' });
+  }
+
+  const resetToken = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + 3600000).toISOString(); // 1 hour
+
+  db.prepare('INSERT INTO password_reset_tokens (did, username, token, expires_at) VALUES (?, ?, ?, ?)')
+    .run(wallet.did, wallet.username, resetToken, expiresAt);
+
+  // Send reset email via Stalwart
+  const resetUrl = `https://demipass.com/reset-password.html?token=${resetToken}`;
+  try {
+    const dustforge = require('./dustforge-mail');
+    if (dustforge && dustforge.sendMail) {
+      dustforge.sendMail(wallet.email, 'Password Reset — DemiPass',
+        `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`);
+    }
+  } catch(_) {
+    // Fallback: log the reset URL for admin retrieval
+    console.log(`[password-reset] ${wallet.username}: ${resetUrl}`);
+  }
+
+  // Also store reset URL in a tick so admin can find it
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run('system', `Password reset requested for ${wallet.username}`, req.ip || '', 'UTC', 'alert',
+        JSON.stringify(['auth:password-reset', `user:${wallet.username}`]));
+  } catch(_) {}
+
+  res.json({ ok: true, message: 'If that account exists, a reset link has been sent to the associated email.' });
+});
+
+// POST /api/identity/reset-password — use a reset token to set new password
+app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
+  const { token, new_password } = req.body || {};
+  if (!token || !new_password) return res.status(400).json({ error: 'token and new_password required' });
+  if (new_password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+  if (new_password.length > 128) return res.status(400).json({ error: 'password too long' });
+
+  const resetRow = db.prepare('SELECT * FROM password_reset_tokens WHERE token = ? AND used = 0').get(token);
+  if (!resetRow) return res.status(400).json({ error: 'invalid or expired reset token' });
+  if (new Date(resetRow.expires_at) < new Date()) {
+    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
+    return res.status(400).json({ error: 'reset token has expired. Request a new one.' });
+  }
+
+  // Change password via Stalwart
+  try {
+    const http = require('http');
+    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
+    const stalwartPort = Number(process.env.STALWART_PORT || 8090);
+    const stalwartPass = process.env.STALWART_PASS || '';
+    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
+
+    const postData = JSON.stringify([{
+      action: 'set',
+      field: 'secrets',
+      value: [new_password],
+    }]);
+
+    const pReq = http.request({
+      hostname: stalwartHost, port: stalwartPort,
+      path: '/api/principal/' + encodeURIComponent(resetRow.username),
+      method: 'PATCH',
+      headers: { 'Authorization': 'Basic ' + adminAuth, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) },
+    }, (pRes) => {
+      let body = '';
+      pRes.on('data', c => body += c);
+      pRes.on('end', () => {
+        // Mark token as used regardless
+        db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
+
+        if (pRes.statusCode < 300) {
+          // Buoy tick
+          try {
+            db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+              .run(resetRow.did, `Password reset completed for ${resetRow.username}`, req.ip || '', 'UTC', 'decision',
+                JSON.stringify(['auth:password-reset-complete', `user:${resetRow.username}`]));
+          } catch(_) {}
+
+          res.json({ ok: true, message: 'Password reset successfully. You can now log in with your new password.' });
+        } else {
+          res.status(500).json({ error: 'failed to update password. Try again or contact support.' });
+        }
+      });
+    });
+    pReq.on('error', () => res.status(500).json({ error: 'password service unavailable' }));
+    pReq.write(postData);
+    pReq.end();
+  } catch (e) {
+    res.status(500).json({ error: 'reset failed: ' + e.message });
+  }
+});
+
+// GET /api/identity/reset-password/verify — check if a reset token is valid
+app.get('/api/identity/reset-password/verify', (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).json({ error: 'token required' });
+  const row = db.prepare('SELECT username, expires_at, used FROM password_reset_tokens WHERE token = ?').get(token);
+  if (!row || row.used) return res.json({ valid: false });
+  if (new Date(row.expires_at) < new Date()) return res.json({ valid: false, reason: 'expired' });
+  res.json({ valid: true, username: row.username });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
