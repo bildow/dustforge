@@ -2623,24 +2623,20 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     }
     if (tokenRow.did !== req.identity.did) return res.status(403).json({ error: 'use-token belongs to a different identity' });
 
-    // Mark token as in-flight (prevent re-use during execution, but don't fully burn yet)
-    db.prepare("UPDATE blindkey_use_tokens SET status = 'in_flight' WHERE id = ?").run(tokenRow.id);
-
+    // Token stays 'valid' during execution — only burned to 'used' after success
     // Load the secret from the token's secret_id
     const secret = db.prepare(`SELECT * FROM blindkey_secrets WHERE id = ? AND ${REDEEMABLE_STATUS_SQL}`).get(tokenRow.secret_id);
     if (!secret) {
-      // Revert token — secret gone, don't waste the token
-      db.prepare("UPDATE blindkey_use_tokens SET status = 'active' WHERE id = ?").run(tokenRow.id);
-      return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked' });
+      // Don't burn the token — secret is gone but token wasn't the problem
+      return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked', token_preserved: true });
     }
 
     let decryptedValue;
     try {
       decryptedValue = blindkeyDecrypt(secret.encrypted_value);
     } catch (e) {
-      // Revert token — decryption failed, don't waste the token
-      db.prepare("UPDATE blindkey_use_tokens SET status = 'active' WHERE id = ?").run(tokenRow.id);
-      return res.status(500).json({ error: 'failed to decrypt secret' });
+      // Don't burn the token — decryption failed, not the caller's fault
+      return res.status(500).json({ error: 'failed to decrypt secret', token_preserved: true });
     }
 
     // NOW burn the token — decryption succeeded, execution will proceed
