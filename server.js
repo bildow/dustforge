@@ -1579,6 +1579,11 @@ function detectProvider(value) {
 
 // DemiPass routed references — credit-card-style prefix routing
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN ref_code TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN rotatable INTEGER DEFAULT 1"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN ownership TEXT DEFAULT 'sole'"); } catch(_) {}
+// ownership: 'sole' = you own the target, safe to rotate
+//            'shared' = shared credential, do NOT rotate without all parties agreeing
+//            'delegated' = someone delegated this to you, you cannot rotate the source
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_ref ON blindkey_secrets(ref_code) WHERE ref_code != ''"); } catch(_) {}
 
 function generateRefCode(secretType, name) {
@@ -2002,7 +2007,7 @@ function authorizeSecretMediation({ requestorDid, secretName, contextName, actio
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
-  const { name, value, description, secret_type } = req.body || {};
+  const { name, value, description, secret_type, ownership, rotatable } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
   if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
   if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
@@ -2061,17 +2066,22 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       expiresAt = new Date(Date.now() + providerInfo.typical_expiry_days * 86400000).toISOString();
     }
 
+    const resolvedOwnership = ['sole', 'shared', 'delegated'].includes(ownership) ? ownership : 'sole';
+    const resolvedRotatable = rotatable === false || rotatable === 0 ? 0 : 1;
+
     db.prepare(`
-      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(did, name) DO UPDATE SET
         encrypted_value = excluded.encrypted_value,
         description = excluded.description,
         secret_type = excluded.secret_type,
         expires_at = excluded.expires_at,
         provider = excluded.provider,
+        ownership = excluded.ownership,
+        rotatable = excluded.rotatable,
         updated_at = CURRENT_TIMESTAMP
-    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider);
+    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable);
 
     // Generate and store ref_code if not already set
     const stored = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?").get(req.identity.did, name);
@@ -8877,6 +8887,26 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const secret = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'").get(ownerDid, ref);
   if (!secret) return res.status(404).json({ error: 'active secret not found for this ref code' });
   if (secret.secret_type !== 'password') return res.status(400).json({ error: 'blind rotation only supports password secrets' });
+
+  // Guard: shared credentials cannot be blindly rotated
+  if (secret.ownership === 'shared') {
+    return res.status(403).json({
+      error: 'This is a shared credential — blind rotation is disabled. All parties who use this secret must coordinate rotation manually.',
+      ownership: 'shared',
+      hint: 'To enable rotation, update ownership to "sole" via PATCH /api/demipass/secrets/:id or coordinate with the credential owner.',
+    });
+  }
+  if (secret.ownership === 'delegated') {
+    return res.status(403).json({
+      error: 'This credential was delegated to you — you cannot rotate the source. Ask the owner to rotate.',
+      ownership: 'delegated',
+    });
+  }
+  if (secret.rotatable === 0) {
+    return res.status(403).json({
+      error: 'Rotation is disabled for this secret. Set rotatable=1 to enable.',
+    });
+  }
 
   let currentPassword;
   try { currentPassword = blindkeyDecrypt(secret.encrypted_value); }
