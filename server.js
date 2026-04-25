@@ -7122,9 +7122,9 @@ app.post('/api/tick', (req, res) => {
   // Rate limit
   if (!isMember) {
     const recentAnon = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE ip = ? AND created_at > datetime('now', '-1 minute') AND did = ''").get(req.ip || '').n;
-    if (recentAnon >= 10) return res.status(429).json({ error: 'anonymous tick rate limit: 10/min. Onboard at /.well-known/silicon for higher limits and signed timestamps.' });
+    if (recentAnon >= 10) return res.status(429).json({ error: 'anonymous tick rate limit: 10/min', onboard: 'https://demipass.com', note: 'Create a free identity for unlimited signed ticks.' });
     const dailyAnon = db.prepare("SELECT COUNT(*) as n FROM ticks WHERE ip = ? AND created_at > datetime('now', '-1 day') AND did = ''").get(req.ip || '').n;
-    if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day. Onboard for unlimited.' });
+    if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day', onboard: 'https://demipass.com', note: 'Create a free identity for unlimited signed ticks.' });
   }
 
   // Bill member tick (1 DD per tick)
@@ -7211,6 +7211,10 @@ app.post('/api/tick', (req, res) => {
     response.signature = sig;
     response.referral_code = wallet?.referral_code || '';
     response.did = did;
+    // Watermark: referral link embedded in every tick for escrow/sharing/smart contract use
+    if (wallet?.referral_code) {
+      response.referral_url = `https://demipass.com?ref=${wallet.referral_code}`;
+    }
 
     // DemiPass wallet attestation — proves custody without revealing secrets
     const secretCount = db.prepare("SELECT COUNT(*) as n FROM blindkey_secrets WHERE did = ? AND status = 'active'").get(did);
@@ -7239,9 +7243,14 @@ app.post('/api/tick', (req, res) => {
       response.attestation_note = 'No DemiPass wallet and grace period expired. Tick is signed but unattested.';
     }
   } else {
+    // Anonymous tick — include a real onboarding funnel link
     response.signature = null;
     response.referral_code = null;
-    response.onboard_hint = '/.well-known/silicon';
+    response.onboard = {
+      url: 'https://demipass.com',
+      api: 'POST /api/identity/request-invite',
+      note: 'Create a free identity to get signed ticks, wallet attestation, and unlimited usage. Anonymous ticks are rate-limited to 100/day.',
+    };
   }
 
   res.json(response);

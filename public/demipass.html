@@ -351,5 +351,18 @@
   <p style="margin-top:0.5rem">Secrets management for the agentic era.</p>
 </footer>
 
+<script>
+// Capture referral code from URL and store for account creation
+const _ref = new URLSearchParams(window.location.search).get('ref');
+if (_ref) {
+  localStorage.setItem('dp_referral', _ref);
+  // Show a subtle referral notice
+  const notice = document.createElement('div');
+  notice.style.cssText = 'position:fixed;bottom:1rem;right:1rem;background:var(--card);border:1px solid var(--green);border-radius:8px;padding:0.5rem 1rem;font-size:0.75rem;color:var(--green);z-index:100';
+  notice.textContent = 'Referred by ' + _ref.slice(0, 8) + '...';
+  document.body.appendChild(notice);
+  setTimeout(() => notice.remove(), 5000);
+}
+</script>
 </body>
 </html>
