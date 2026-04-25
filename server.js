@@ -9494,6 +9494,153 @@ app.get('/api/identity/reset-password/verify', (req, res) => {
   res.json({ valid: true, username: row.username });
 });
 
+// ============================================================
+// Feature Map — progressive rendering topology (Pass 1 rough)
+// ============================================================
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS feature_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  category TEXT DEFAULT 'core',
+  pass_level INTEGER DEFAULT 1,
+  health INTEGER DEFAULT 0,
+  error_count INTEGER DEFAULT 0,
+  description TEXT DEFAULT '',
+  dependencies TEXT DEFAULT '[]',
+  last_pass_at TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS feature_errors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  node_id INTEGER NOT NULL,
+  claim_id INTEGER DEFAULT NULL,
+  error TEXT NOT NULL,
+  severity TEXT DEFAULT 'medium',
+  pass_found INTEGER DEFAULT 1,
+  pass_fixed INTEGER DEFAULT NULL,
+  status TEXT DEFAULT 'open',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// GET /api/features — the feature map
+app.get('/api/features', rateLimitStandard, (req, res) => {
+  const nodes = db.prepare('SELECT * FROM feature_nodes ORDER BY category, pass_level ASC').all();
+  const errors = db.prepare("SELECT node_id, COUNT(*) as n FROM feature_errors WHERE status = 'open' GROUP BY node_id").all();
+  const errorMap = {};
+  for (const e of errors) errorMap[e.node_id] = e.n;
+
+  const enriched = nodes.map(n => ({
+    ...n,
+    dependencies: JSON.parse(n.dependencies || '[]'),
+    open_errors: errorMap[n.id] || 0,
+    health: Math.max(0, 100 - (errorMap[n.id] || 0) * 10),
+  }));
+
+  const byCategory = {};
+  for (const n of enriched) {
+    if (!byCategory[n.category]) byCategory[n.category] = [];
+    byCategory[n.category].push(n);
+  }
+
+  res.json({
+    nodes: enriched,
+    by_category: byCategory,
+    summary: {
+      total: nodes.length,
+      pass_1: nodes.filter(n => n.pass_level === 1).length,
+      pass_2: nodes.filter(n => n.pass_level === 2).length,
+      pass_3: nodes.filter(n => n.pass_level === 3).length,
+      pass_4: nodes.filter(n => n.pass_level === 4).length,
+      pass_5: nodes.filter(n => n.pass_level === 5).length,
+      total_open_errors: errors.reduce((s, e) => s + e.n, 0),
+    },
+  });
+});
+
+// POST /api/features — create or update a feature node
+app.post('/api/features', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+
+  const { name, category, pass_level, description, dependencies } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+
+  const existing = db.prepare('SELECT id FROM feature_nodes WHERE name = ?').get(name);
+  if (existing) {
+    const updates = [];
+    const params = [];
+    if (category) { updates.push('category = ?'); params.push(category); }
+    if (pass_level) { updates.push('pass_level = ?'); params.push(pass_level); }
+    if (description) { updates.push('description = ?'); params.push(description); }
+    if (dependencies) { updates.push('dependencies = ?'); params.push(JSON.stringify(dependencies)); }
+    updates.push("updated_at = datetime('now')");
+    if (pass_level) updates.push("last_pass_at = datetime('now')");
+    params.push(existing.id);
+    db.prepare(`UPDATE feature_nodes SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    res.json({ ok: true, id: existing.id, updated: true });
+  } else {
+    const result = db.prepare('INSERT INTO feature_nodes (name, category, pass_level, description, dependencies) VALUES (?, ?, ?, ?, ?)')
+      .run(name, category || 'core', pass_level || 1, description || '', JSON.stringify(dependencies || []));
+    res.json({ ok: true, id: result.lastInsertRowid, created: true });
+  }
+});
+
+// POST /api/features/:name/error — track an error against a feature node
+app.post('/api/features/:name/error', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+
+  const node = db.prepare('SELECT id, pass_level FROM feature_nodes WHERE name = ?').get(req.params.name);
+  if (!node) return res.status(404).json({ error: 'feature node not found' });
+
+  const { error, severity, claim_id } = req.body || {};
+  if (!error) return res.status(400).json({ error: 'error description required' });
+
+  const result = db.prepare('INSERT INTO feature_errors (node_id, error, severity, pass_found, claim_id) VALUES (?, ?, ?, ?, ?)')
+    .run(node.id, error, severity || 'medium', node.pass_level, claim_id || null);
+
+  db.prepare('UPDATE feature_nodes SET error_count = error_count + 1, updated_at = datetime(\'now\') WHERE id = ?').run(node.id);
+
+  res.json({ ok: true, error_id: result.lastInsertRowid, node: req.params.name, pass_found: node.pass_level });
+});
+
+// PATCH /api/features/:name/error/:id — resolve an error
+app.patch('/api/features/:name/error/:id', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+
+  const node = db.prepare('SELECT id, pass_level FROM feature_nodes WHERE name = ?').get(req.params.name);
+  if (!node) return res.status(404).json({ error: 'feature node not found' });
+
+  const { status } = req.body || {};
+  if (!['fixed', 'deferred', 'wontfix'].includes(status)) return res.status(400).json({ error: 'status must be fixed, deferred, or wontfix' });
+
+  db.prepare('UPDATE feature_errors SET status = ?, pass_fixed = ? WHERE id = ? AND node_id = ?')
+    .run(status, status === 'fixed' ? node.pass_level : null, req.params.id, node.id);
+
+  res.json({ ok: true });
+});
+
+// GET /api/features/next-pass — Brain's scorer: which pass eliminates the most errors?
+app.get('/api/features/next-pass', rateLimitStandard, (req, res) => {
+  const nodes = db.prepare('SELECT * FROM feature_nodes ORDER BY pass_level ASC, error_count DESC').all();
+  const lowestPass = nodes.length ? nodes[0].pass_level : 1;
+
+  // Find nodes at the lowest pass level — these need the next pass
+  const candidates = nodes.filter(n => n.pass_level === lowestPass);
+
+  // Score by error density — which batch of nodes at this pass level has the most errors?
+  const ranked = candidates.sort((a, b) => b.error_count - a.error_count);
+
+  res.json({
+    recommended_pass: lowestPass + 1,
+    candidates: ranked.map(n => ({ name: n.name, category: n.category, current_pass: n.pass_level, errors: n.error_count })),
+    rationale: `${candidates.length} features at pass ${lowestPass}. Advancing to pass ${lowestPass + 1} would address ${candidates.reduce((s, n) => s + n.error_count, 0)} tracked errors.`,
+  });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
