@@ -262,6 +262,7 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN directory_listed INTEGER 
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN trust_score INTEGER DEFAULT 0"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN email_storage_mode TEXT DEFAULT 'auto_delete'"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_hash TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN recovery_email TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_narrative TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN silicon_ssn TEXT DEFAULT ''"); } catch(_) {}
 
@@ -9369,17 +9370,17 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   db.prepare('INSERT INTO password_reset_tokens (did, username, token, expires_at) VALUES (?, ?, ?, ?)')
     .run(wallet.did, wallet.username, resetToken, expiresAt);
 
-  // Send reset email via Stalwart
+  // Send reset email — prefer recovery_email (external), fall back to @dustforge.com
   const resetUrl = `https://demipass.com/reset-password.html?token=${resetToken}`;
+  const sendTo = wallet.recovery_email || wallet.email;
   try {
     const dustforge = require('./dustforge-mail');
     if (dustforge && dustforge.sendMail) {
-      dustforge.sendMail(wallet.email, 'Password Reset — DemiPass',
+      dustforge.sendMail(sendTo, 'Password Reset — DemiPass',
         `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`);
     }
   } catch(_) {
-    // Fallback: log the reset URL for admin retrieval
-    console.log(`[password-reset] ${wallet.username}: ${resetUrl}`);
+    console.log(`[password-reset] ${wallet.username} → ${sendTo}: ${resetUrl}`);
   }
 
   // Also store reset URL in a tick so admin can find it
@@ -9390,6 +9391,25 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   } catch(_) {}
 
   res.json({ ok: true, message: 'If that account exists, a reset link has been sent to the associated email.' });
+});
+
+// POST /api/identity/set-recovery-email — set an external recovery email
+app.post('/api/identity/set-recovery-email', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const { recovery_email } = req.body || {};
+  if (!recovery_email) return res.status(400).json({ error: 'recovery_email required' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recovery_email)) return res.status(400).json({ error: 'invalid email format' });
+
+  // Circular guard: recovery email cannot be your own @dustforge.com account email
+  const wallet = db.prepare('SELECT email FROM identity_wallets WHERE did = ?').get(auth.did);
+  if (wallet && recovery_email.toLowerCase() === wallet.email.toLowerCase()) {
+    return res.status(400).json({ error: 'Recovery email cannot be the same as your account email. Use an external email (gmail, etc.) so you can still receive reset links if you lose access to your @dustforge.com inbox.' });
+  }
+
+  db.prepare('UPDATE identity_wallets SET recovery_email = ? WHERE did = ?').run(recovery_email, auth.did);
+  res.json({ ok: true, recovery_email, note: 'Password reset links will be sent to this email.' });
 });
 
 // POST /api/identity/reset-password — use a reset token to set new password
