@@ -8008,7 +8008,8 @@ app.get('/api/identity/trust', rateLimitStandard, (req, res) => {
   const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
 
   if (isOwner || isAdmin) {
-    res.json({ did: targetDid, ...gradient, note: 'Advisory only. Does not gate access.' });
+    const wallet = db.prepare('SELECT recovery_email FROM identity_wallets WHERE did = ?').get(targetDid);
+    res.json({ did: targetDid, ...gradient, recovery_email: wallet?.recovery_email || '', note: 'Advisory only. Does not gate access.' });
   } else {
     res.json({ did: targetDid, band: gradient.band, note: 'Advisory only. Authenticate for detailed factors.' });
   }

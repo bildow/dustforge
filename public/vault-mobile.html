@@ -117,6 +117,24 @@
   <a href="https://demipass.com/reset-password.html" style="display:block;text-align:center;margin-top:1rem;color:var(--text3);font-size:0.8rem;text-decoration:none">Forgot password?</a>
 </div>
 
+<!-- Onboarding Wizard -->
+<div id="onboarding-wizard" style="display:none;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:2rem;background:var(--bg)">
+  <div style="max-width:380px;width:100%;text-align:center">
+    <h1 style="font-size:1.5rem;margin-bottom:0.5rem">Welcome to <span style="color:var(--accent)">DemiPass</span></h1>
+    <p style="color:var(--text2);font-size:0.9rem;margin-bottom:2rem">Before we start, let's set up your account recovery.</p>
+
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem;text-align:left">
+      <div style="font-weight:700;font-size:0.9rem;margin-bottom:0.5rem">Recovery Email</div>
+      <p style="font-size:0.8rem;color:var(--text3);margin-bottom:1rem">If you ever forget your password, we'll send a reset link to this email. It must be different from your @dustforge.com address.</p>
+      <input type="email" id="wizard-recovery-email" placeholder="your.email@gmail.com" style="width:100%;padding:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.9rem;margin-bottom:0.5rem">
+      <div id="wizard-msg" style="font-size:0.75rem;min-height:1.2rem;margin-bottom:0.75rem"></div>
+      <button onclick="completeOnboarding()" style="width:100%;padding:0.7rem;background:var(--accent);border:none;border-radius:8px;color:var(--bg);font-weight:700;font-size:0.9rem;cursor:pointer">Continue to Vault</button>
+    </div>
+
+    <p style="color:var(--text3);font-size:0.7rem;margin-top:1rem">This is required for account security.</p>
+  </div>
+</div>
+
 <!-- App -->
 <div id="app" class="app">
   <div class="topbar">
@@ -310,10 +328,21 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
 }));
 
 async function showApp(){
-  document.getElementById('auth').style.display='none';document.getElementById('app').style.display='block';
+  document.getElementById('auth').style.display='none';
   document.getElementById('app-user').textContent=user;
   document.getElementById('set-did').textContent=did;
   document.getElementById('set-email').textContent=user+'@dustforge.com';
+
+  // Check if recovery email is set — if not, show onboarding wizard
+  try {
+    const profile = await api('GET','/api/identity/trust?did='+encodeURIComponent(did));
+    if (!profile.recovery_email) {
+      document.getElementById('onboarding-wizard').style.display='flex';
+      return;
+    }
+  } catch(_) {}
+
+  document.getElementById('app').style.display='block';
   await loadVault()}
 
 async function loadVault(){
@@ -392,6 +421,21 @@ async function armTrigger(){const n=document.getElementById('c-name').value.trim
 async function verifyChain(){const o=document.getElementById('settings-output');try{const r=await api('POST','/api/tick/chain/verify',{did});o.innerHTML=r.valid?'<span style="color:var(--green)">Chain valid — '+r.ticks_checked+' ticks verified</span>':'<span style="color:var(--red)">Chain broken at tick #'+r.broken_at_tick_id+'</span>'}catch(e){o.textContent=e.message}}
 
 async function loadLedgerSummary(){const o=document.getElementById('settings-output');try{const r=await api('GET','/api/ledger/summary');o.innerHTML='Entries: '+r.total_entries+'<br>First: '+(r.first_entry||'—')+'<br>Last: '+(r.last_entry||'—')}catch(e){o.textContent=e.message}}
+
+async function completeOnboarding(){
+  const email=document.getElementById('wizard-recovery-email').value.trim();
+  const msg=document.getElementById('wizard-msg');
+  if(!email){msg.textContent='Recovery email is required';msg.style.color='var(--red)';return}
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){msg.textContent='Enter a valid email';msg.style.color='var(--red)';return}
+  try{
+    const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email});
+    if(r.ok){
+      document.getElementById('onboarding-wizard').style.display='none';
+      document.getElementById('app').style.display='block';
+      await loadVault();
+    }else{msg.textContent=r.error||'failed';msg.style.color='var(--red)'}
+  }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}
+}
 
 async function setRecoveryEmail(){
   const email=document.getElementById('recovery-email').value.trim();
