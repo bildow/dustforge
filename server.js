@@ -9396,7 +9396,7 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
 app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
   const { token, new_password } = req.body || {};
   if (!token || !new_password) return res.status(400).json({ error: 'token and new_password required' });
-  if (new_password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+  if (new_password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
   if (new_password.length > 128) return res.status(400).json({ error: 'password too long' });
 
   const resetRow = db.prepare('SELECT * FROM password_reset_tokens WHERE token = ? AND used = 0').get(token);
