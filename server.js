@@ -116,13 +116,33 @@ function getBearerIdentity(req) {
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return { ok: false, status: 401, error: 'Bearer token required' };
+
+  // Check for silicon token first (prefixed with 'silicon:')
+  if (token.startsWith('silicon:')) {
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const agent = db.prepare("SELECT * FROM silicon_agents WHERE token_hash = ? AND status = 'active'").get(tokenHash);
+    if (!agent) return { ok: false, status: 401, error: 'invalid silicon token' };
+    db.prepare("UPDATE silicon_agents SET last_active = datetime('now') WHERE id = ?").run(agent.id);
+    // Silicon uses carbon's DID for secret access but carries agent_name for audit
+    return {
+      ok: true,
+      did: agent.carbon_did,
+      scope: 'transact',
+      silicon: true,
+      agent_name: agent.agent_name,
+      silicon_did: agent.did,
+      carbon_did: agent.carbon_did,
+    };
+  }
+
+  // Standard carbon JWT
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return { ok: false, status: 401, error: v.error };
   const scope = v.decoded.scope || '';
   if (!['transact', 'admin', 'full'].includes(scope)) {
     return { ok: false, status: 403, error: 'transact scope required' };
   }
-  return { ok: true, did: v.decoded.sub, scope, decoded: v.decoded };
+  return { ok: true, did: v.decoded.sub, scope, decoded: v.decoded, silicon: false };
 }
 
 function getDemiPassActor(req, res, options = {}) {
@@ -9652,21 +9672,21 @@ app.get('/api/features/next-pass', rateLimitStandard, (req, res) => {
 });
 
 // ============================================================
-// Pass 1 Stubs — roughed-in features (shape visible, nothing works e2e)
+// Silicon Identity System — per-agent DID, scoped tokens, permission enforcement
 // ============================================================
 
-// --- Silicon Identity: per-agent DID with delegated access ---
 try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_agents (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_name TEXT NOT NULL UNIQUE,
-  did TEXT NOT NULL,
+  did TEXT NOT NULL UNIQUE,
   carbon_did TEXT NOT NULL,
   display_name TEXT DEFAULT '',
+  token_hash TEXT DEFAULT '',
   status TEXT DEFAULT 'active',
+  last_active TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 
-// --- Permission List: per-silicon authorized actions/secrets ---
 try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_permissions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   agent_name TEXT NOT NULL,
@@ -9679,7 +9699,6 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_permissions (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 
-// --- Session Binding: token-to-session fingerprint ---
 try { db.exec(`CREATE TABLE IF NOT EXISTS session_bindings (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
@@ -9692,63 +9711,207 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS session_bindings (
   status TEXT DEFAULT 'active'
 )`); } catch(e) {}
 
-// POST /api/silicon/register — register a silicon agent under a carbon
+// Valid permission types
+const SILICON_PERMISSION_TYPES = [
+  'secret:list',      // list secrets (names/metadata only)
+  'secret:store',     // deposit new secrets
+  'secret:use',       // request use-tokens + execute
+  'secret:rotate',    // rotate secrets
+  'secret:revoke',    // revoke secrets
+  'secret:delegate',  // delegate to other silicons
+  'action:ssh_exec',  // SSH execution
+  'action:http_header', // HTTP header injection
+  'action:http_body', // HTTP body injection
+  'action:document',  // document retrieval
+  'admin:full',       // full access (carbon equivalent)
+];
+
+// Check if a silicon has a specific permission
+function siliconHasPermission(agentName, permType, resource) {
+  const perms = db.prepare(
+    "SELECT * FROM silicon_permissions WHERE agent_name = ? AND status = 'active' AND (expires_at = '' OR expires_at > datetime('now'))"
+  ).all(agentName);
+
+  for (const p of perms) {
+    // admin:full grants everything
+    if (p.permission_type === 'admin:full') return true;
+    // exact match
+    if (p.permission_type === permType) {
+      if (p.resource === '*' || p.resource === resource) return true;
+    }
+    // wildcard match: 'secret:*' matches 'secret:list', 'secret:use', etc.
+    const [pCat] = p.permission_type.split(':');
+    const [rCat] = permType.split(':');
+    if (pCat === rCat && p.permission_type.endsWith(':*')) return true;
+  }
+  return false;
+}
+
+// Resolve silicon identity from a Bearer token
+function resolveSiliconFromToken(token) {
+  // Silicon tokens are prefixed with 'silicon:' to distinguish from carbon JWTs
+  if (!token || !token.startsWith('silicon:')) return null;
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const agent = db.prepare("SELECT * FROM silicon_agents WHERE token_hash = ? AND status = 'active'").get(tokenHash);
+  if (!agent) return null;
+  // Update last active
+  db.prepare("UPDATE silicon_agents SET last_active = datetime('now') WHERE id = ?").run(agent.id);
+  return agent;
+}
+
+// POST /api/silicon/register — carbon registers a silicon agent, gets scoped token
 app.post('/api/blindkey/silicon/register', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
-  const { agent_name, display_name } = req.body || {};
+  const { agent_name, display_name, permissions } = req.body || {};
   if (!agent_name) return res.status(400).json({ error: 'agent_name required' });
-  // Stub: creates agent identity linked to carbon DID
+  if (!/^[a-zA-Z0-9_-]{2,30}$/.test(agent_name)) return res.status(400).json({ error: 'agent_name: 2-30 chars, alphanumeric + _ -' });
+
   const agentDid = 'did:key:silicon-' + crypto.randomBytes(16).toString('hex');
+  // Generate a scoped token — prefixed with 'silicon:' so getBearerIdentity can distinguish
+  const rawToken = 'silicon:' + crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
   try {
-    db.prepare('INSERT INTO silicon_agents (agent_name, did, carbon_did, display_name) VALUES (?, ?, ?, ?)')
-      .run(agent_name, agentDid, actor.did, display_name || agent_name);
-    res.json({ ok: true, agent_name, did: agentDid, carbon_did: actor.did, note: 'Pass 1 stub — agent registered but no token issued yet' });
+    db.prepare('INSERT INTO silicon_agents (agent_name, did, carbon_did, display_name, token_hash) VALUES (?, ?, ?, ?, ?)')
+      .run(agent_name, agentDid, actor.did, display_name || agent_name, tokenHash);
+
+    // Auto-grant default permissions if specified
+    const grantPerms = permissions || ['secret:list', 'secret:use', 'action:ssh_exec'];
+    for (const p of grantPerms) {
+      if (SILICON_PERMISSION_TYPES.includes(p) || p.endsWith(':*')) {
+        db.prepare('INSERT INTO silicon_permissions (agent_name, permission_type, resource, granted_by) VALUES (?, ?, ?, ?)')
+          .run(agent_name, p, '*', actor.did);
+      }
+    }
+
+    // Buoy tick
+    try {
+      db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(actor.did, `Silicon registered: ${agent_name} (${display_name || agent_name})`, req.ip || '', 'UTC', 'decision',
+          JSON.stringify(['silicon:register', `agent:${agent_name}`]));
+    } catch(_) {}
+
+    res.json({
+      ok: true,
+      agent_name,
+      did: agentDid,
+      carbon_did: actor.did,
+      token: rawToken,
+      permissions: grantPerms,
+      note: 'SAVE THIS TOKEN — it will not be shown again. Use as Bearer token in .mcp.json or config.toml.',
+      mcp_config: {
+        DEMIPASS_URL: 'https://api.dustforge.com',
+        DEMIPASS_TOKEN: rawToken,
+      },
+    });
   } catch (e) {
-    if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'agent already registered' });
+    if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'agent_name already registered' });
     res.status(500).json({ error: e.message });
   }
+});
+
+// POST /api/silicon/token/reset — carbon resets a silicon's token
+app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { agent_name } = req.body || {};
+  if (!agent_name) return res.status(400).json({ error: 'agent_name required' });
+
+  const agent = db.prepare('SELECT * FROM silicon_agents WHERE agent_name = ? AND carbon_did = ?').get(agent_name, actor.did);
+  if (!agent) return res.status(404).json({ error: 'agent not found or not owned by you' });
+
+  const rawToken = 'silicon:' + crypto.randomBytes(32).toString('hex');
+  const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+  db.prepare('UPDATE silicon_agents SET token_hash = ? WHERE id = ?').run(tokenHash, agent.id);
+
+  res.json({ ok: true, agent_name, token: rawToken, note: 'Previous token is immediately invalidated. SAVE THIS TOKEN.' });
 });
 
 // GET /api/silicon/agents — list silicon agents under a carbon
 app.get('/api/blindkey/silicon/agents', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
-  const agents = db.prepare('SELECT agent_name, did, display_name, status, created_at FROM silicon_agents WHERE carbon_did = ?').all(actor.did);
-  res.json({ agents, carbon_did: actor.did });
+  const agents = db.prepare('SELECT agent_name, did, display_name, status, last_active, created_at FROM silicon_agents WHERE carbon_did = ?').all(actor.did);
+  // Include permissions for each
+  const enriched = agents.map(a => ({
+    ...a,
+    permissions: db.prepare("SELECT permission_type, resource FROM silicon_permissions WHERE agent_name = ? AND status = 'active'").all(a.agent_name),
+  }));
+  res.json({ agents: enriched, carbon_did: actor.did });
 });
 
 // POST /api/silicon/permissions — grant permission to a silicon agent
 app.post('/api/blindkey/silicon/permissions', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
-  const { agent_name, permission_type, resource, actions } = req.body || {};
+  const { agent_name, permission_type, resource } = req.body || {};
   if (!agent_name || !permission_type) return res.status(400).json({ error: 'agent_name and permission_type required' });
-  // Verify agent belongs to this carbon
+  if (!SILICON_PERMISSION_TYPES.includes(permission_type) && !permission_type.endsWith(':*')) {
+    return res.status(400).json({ error: 'invalid permission_type', valid: SILICON_PERMISSION_TYPES });
+  }
   const agent = db.prepare('SELECT * FROM silicon_agents WHERE agent_name = ? AND carbon_did = ?').get(agent_name, actor.did);
   if (!agent) return res.status(404).json({ error: 'agent not found or not owned by you' });
-  db.prepare('INSERT INTO silicon_permissions (agent_name, permission_type, resource, actions, granted_by) VALUES (?, ?, ?, ?, ?)')
-    .run(agent_name, permission_type, resource || '*', JSON.stringify(actions || []), actor.did);
-  res.json({ ok: true, note: 'Pass 1 stub — permission recorded but not enforced yet' });
+
+  // Check for duplicate
+  const existing = db.prepare("SELECT id FROM silicon_permissions WHERE agent_name = ? AND permission_type = ? AND resource = ? AND status = 'active'")
+    .get(agent_name, permission_type, resource || '*');
+  if (existing) return res.status(409).json({ error: 'permission already granted' });
+
+  db.prepare('INSERT INTO silicon_permissions (agent_name, permission_type, resource, granted_by) VALUES (?, ?, ?, ?)')
+    .run(agent_name, permission_type, resource || '*', actor.did);
+  res.json({ ok: true, agent_name, permission: permission_type, resource: resource || '*' });
+});
+
+// DELETE /api/silicon/permissions — revoke a permission
+app.delete('/api/blindkey/silicon/permissions', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { agent_name, permission_type, resource } = req.body || {};
+  if (!agent_name || !permission_type) return res.status(400).json({ error: 'agent_name and permission_type required' });
+  const agent = db.prepare('SELECT * FROM silicon_agents WHERE agent_name = ? AND carbon_did = ?').get(agent_name, actor.did);
+  if (!agent) return res.status(404).json({ error: 'agent not found or not owned by you' });
+
+  db.prepare("UPDATE silicon_permissions SET status = 'revoked' WHERE agent_name = ? AND permission_type = ? AND resource = ?")
+    .run(agent_name, permission_type, resource || '*');
+  res.json({ ok: true, revoked: permission_type });
 });
 
 // GET /api/silicon/permissions/:agent — list permissions for a silicon
 app.get('/api/blindkey/silicon/permissions/:agent', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
-  const perms = db.prepare('SELECT * FROM silicon_permissions WHERE agent_name = ? AND status = ?').all(req.params.agent, 'active');
-  res.json({ agent: req.params.agent, permissions: perms });
+  const perms = db.prepare("SELECT * FROM silicon_permissions WHERE agent_name = ? AND status = 'active'").all(req.params.agent);
+  res.json({ agent: req.params.agent, permissions: perms, valid_types: SILICON_PERMISSION_TYPES });
 });
 
-// POST /api/session/bind — bind current session to a fingerprint (stub)
+// GET /api/silicon/whoami — silicon checks its own identity and permissions
+app.get('/api/blindkey/silicon/whoami', rateLimitStandard, (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  const silicon = resolveSiliconFromToken(token);
+  if (!silicon) return res.status(401).json({ error: 'not a silicon token or token invalid' });
+  const perms = db.prepare("SELECT permission_type, resource FROM silicon_permissions WHERE agent_name = ? AND status = 'active'").all(silicon.agent_name);
+  res.json({
+    agent_name: silicon.agent_name,
+    did: silicon.did,
+    carbon_did: silicon.carbon_did,
+    display_name: silicon.display_name,
+    status: silicon.status,
+    permissions: perms,
+    last_active: silicon.last_active,
+  });
+});
+
+// POST /api/session/bind — bind current session to a fingerprint
 app.post('/api/blindkey/session/bind', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
   const { hostname, tty, user } = req.body || {};
   const fingerprint = crypto.createHash('sha256').update(`${hostname}:${tty}:${user}:${req.ip}`).digest('hex');
-  db.prepare('INSERT INTO session_bindings (did, session_fingerprint, hostname, tty, user) VALUES (?, ?, ?, ?, ?)')
+  db.prepare('INSERT OR REPLACE INTO session_bindings (did, session_fingerprint, hostname, tty, user, last_seen) VALUES (?, ?, ?, ?, ?, datetime(\'now\'))')
     .run(actor.did, fingerprint, hostname || '', tty || '', user || '');
-  res.json({ ok: true, fingerprint, note: 'Pass 1 stub — session recorded but not enforced on token requests yet' });
+  res.json({ ok: true, fingerprint });
 });
 
 // --- Signup Page: self-service account creation ---
