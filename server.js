@@ -9647,27 +9647,93 @@ app.patch('/api/features/:name/error/:id', rateLimitStandard, (req, res) => {
   res.json({ ok: true });
 });
 
-// GET /api/features/next-pass — Brain's scorer: which pass eliminates the most errors?
+// GET /api/features/next-pass — topological inspiration scorer
+// Score = error_reduction + dependency_unlocks + blocker_removals
 app.get('/api/features/next-pass', rateLimitStandard, (req, res) => {
-  // Use live open error counts, not denormalized error_count
   const nodes = db.prepare('SELECT * FROM feature_nodes ORDER BY pass_level ASC').all();
   const openErrors = db.prepare("SELECT node_id, COUNT(*) as n FROM feature_errors WHERE status = 'open' GROUP BY node_id").all();
   const errorMap = {};
   for (const e of openErrors) errorMap[e.node_id] = e.n;
 
-  const enriched = nodes.map(n => ({ ...n, open_errors: errorMap[n.id] || 0 }));
-  const lowestPass = enriched.length ? enriched[0].pass_level : 1;
+  // Build dependency graph: which nodes depend on which, and at what pass level?
+  const nodeByName = {};
+  for (const n of nodes) {
+    n.open_errors = errorMap[n.id] || 0;
+    n.deps = JSON.parse(n.dependencies || '[]');
+    nodeByName[n.name] = n;
+  }
 
-  // Find nodes at the lowest pass level — these need the next pass
-  const candidates = enriched.filter(n => n.pass_level === lowestPass);
+  // For each node, calculate: if we advance it one pass, what's the downstream impact?
+  const scored = nodes.map(n => {
+    const nextPass = n.pass_level + 1;
+    if (nextPass > 5) return { ...n, inspiration: 0, breakdown: { error_reduction: 0, dependency_unlocks: 0, blocker_removals: 0 } };
 
-  // Score by live open error density
-  const ranked = candidates.sort((a, b) => b.open_errors - a.open_errors);
+    // 1. Error reduction: open errors on THIS node
+    const errorReduction = n.open_errors;
 
+    // 2. Dependency unlocks: how many nodes list this node as a dependency
+    //    AND are currently at a pass level <= this node's current level?
+    let dependencyUnlocks = 0;
+    let blockerRemovals = 0;
+
+    for (const other of nodes) {
+      if (other.name === n.name) continue;
+      const otherDeps = other.deps || [];
+      if (otherDeps.includes(n.name)) {
+        // This node is a dependency of 'other'
+        // If other is stuck at or below our current level, advancing us unlocks them
+        if (other.pass_level <= n.pass_level) {
+          dependencyUnlocks++;
+        }
+        // If other CANNOT advance because we're too low, we're a blocker
+        // A node is blocked if ANY dependency is at a lower pass level
+        const otherBlocked = otherDeps.some(depName => {
+          const depNode = nodeByName[depName];
+          return depNode && depNode.pass_level < other.pass_level;
+        });
+        if (otherBlocked && n.pass_level < other.pass_level) {
+          blockerRemovals++;
+        }
+      }
+    }
+
+    const inspiration = (errorReduction * 1.0) + (dependencyUnlocks * 2.0) + (blockerRemovals * 3.0);
+
+    return {
+      name: n.name,
+      category: n.category,
+      current_pass: n.pass_level,
+      next_pass: nextPass,
+      open_errors: n.open_errors,
+      inspiration,
+      breakdown: { error_reduction: errorReduction, dependency_unlocks: dependencyUnlocks, blocker_removals: blockerRemovals },
+    };
+  });
+
+  // Rank by inspiration score
+  const ranked = scored.filter(s => s.inspiration > 0 || s.current_pass < 5).sort((a, b) => b.inspiration - a.inspiration);
+  const topCandidates = ranked.slice(0, 10);
+
+  const topInspiration = topCandidates[0];
   res.json({
-    recommended_pass: lowestPass + 1,
-    candidates: ranked.map(n => ({ name: n.name, category: n.category, current_pass: n.pass_level, errors: n.open_errors })),
-    rationale: `${candidates.length} features at pass ${lowestPass}. Advancing to pass ${lowestPass + 1} would address ${candidates.reduce((s, n) => s + n.open_errors, 0)} open errors.`,
+    recommended: topInspiration ? {
+      node: topInspiration.name,
+      action: `Advance ${topInspiration.name} from P${topInspiration.current_pass} to P${topInspiration.next_pass}`,
+      inspiration: topInspiration.inspiration,
+      breakdown: topInspiration.breakdown,
+    } : null,
+    top_10: topCandidates,
+    topology: {
+      total_nodes: nodes.length,
+      total_open_errors: openErrors.reduce((s, e) => s + e.n, 0),
+      pass_distribution: {
+        p1: nodes.filter(n => n.pass_level === 1).length,
+        p2: nodes.filter(n => n.pass_level === 2).length,
+        p3: nodes.filter(n => n.pass_level === 3).length,
+        p4: nodes.filter(n => n.pass_level === 4).length,
+        p5: nodes.filter(n => n.pass_level === 5).length,
+      },
+    },
   });
 });
 
