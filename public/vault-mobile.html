@@ -443,7 +443,7 @@ async function setRecoveryEmail(){
   if(!email){msg.textContent='Enter an email';msg.style.color='var(--red)';return}
   try{
     const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email});
-    msg.textContent=r.ok?'Recovery email saved':'(r.error||'failed');
+    msg.textContent=r.ok?'Recovery email saved':(r.error||'failed');
     msg.style.color=r.ok?'var(--green)':'var(--red)';
   }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}
 }

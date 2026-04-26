@@ -9368,7 +9368,7 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   const { username } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username required' });
 
-  const wallet = db.prepare('SELECT did, username, email FROM identity_wallets WHERE username = ?').get(username);
+  const wallet = db.prepare('SELECT did, username, email, recovery_email FROM identity_wallets WHERE username = ?').get(username);
   if (!wallet) {
     // Don't reveal whether account exists
     return res.json({ ok: true, message: 'If that account exists, a reset link has been sent to the associated email.' });
@@ -9459,10 +9459,9 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
       let body = '';
       pRes.on('data', c => body += c);
       pRes.on('end', () => {
-        // Mark token as used regardless
-        db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
-
         if (pRes.statusCode < 300) {
+          // Only burn token after confirmed password change
+          db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
           // Buoy tick
           try {
             db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
@@ -9620,24 +9619,35 @@ app.patch('/api/features/:name/error/:id', rateLimitStandard, (req, res) => {
   db.prepare('UPDATE feature_errors SET status = ?, pass_fixed = ? WHERE id = ? AND node_id = ?')
     .run(status, status === 'fixed' ? node.pass_level : null, req.params.id, node.id);
 
+  // Decrement error_count on the node when resolving
+  if (['fixed', 'wontfix'].includes(status)) {
+    db.prepare('UPDATE feature_nodes SET error_count = MAX(0, error_count - 1), updated_at = datetime(\'now\') WHERE id = ?').run(node.id);
+  }
+
   res.json({ ok: true });
 });
 
 // GET /api/features/next-pass — Brain's scorer: which pass eliminates the most errors?
 app.get('/api/features/next-pass', rateLimitStandard, (req, res) => {
-  const nodes = db.prepare('SELECT * FROM feature_nodes ORDER BY pass_level ASC, error_count DESC').all();
-  const lowestPass = nodes.length ? nodes[0].pass_level : 1;
+  // Use live open error counts, not denormalized error_count
+  const nodes = db.prepare('SELECT * FROM feature_nodes ORDER BY pass_level ASC').all();
+  const openErrors = db.prepare("SELECT node_id, COUNT(*) as n FROM feature_errors WHERE status = 'open' GROUP BY node_id").all();
+  const errorMap = {};
+  for (const e of openErrors) errorMap[e.node_id] = e.n;
+
+  const enriched = nodes.map(n => ({ ...n, open_errors: errorMap[n.id] || 0 }));
+  const lowestPass = enriched.length ? enriched[0].pass_level : 1;
 
   // Find nodes at the lowest pass level — these need the next pass
-  const candidates = nodes.filter(n => n.pass_level === lowestPass);
+  const candidates = enriched.filter(n => n.pass_level === lowestPass);
 
-  // Score by error density — which batch of nodes at this pass level has the most errors?
-  const ranked = candidates.sort((a, b) => b.error_count - a.error_count);
+  // Score by live open error density
+  const ranked = candidates.sort((a, b) => b.open_errors - a.open_errors);
 
   res.json({
     recommended_pass: lowestPass + 1,
-    candidates: ranked.map(n => ({ name: n.name, category: n.category, current_pass: n.pass_level, errors: n.error_count })),
-    rationale: `${candidates.length} features at pass ${lowestPass}. Advancing to pass ${lowestPass + 1} would address ${candidates.reduce((s, n) => s + n.error_count, 0)} tracked errors.`,
+    candidates: ranked.map(n => ({ name: n.name, category: n.category, current_pass: n.pass_level, errors: n.open_errors })),
+    rationale: `${candidates.length} features at pass ${lowestPass}. Advancing to pass ${lowestPass + 1} would address ${candidates.reduce((s, n) => s + n.open_errors, 0)} open errors.`,
   });
 });
 
