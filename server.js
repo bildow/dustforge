@@ -9651,6 +9651,156 @@ app.get('/api/features/next-pass', rateLimitStandard, (req, res) => {
   });
 });
 
+// ============================================================
+// Pass 1 Stubs — roughed-in features (shape visible, nothing works e2e)
+// ============================================================
+
+// --- Silicon Identity: per-agent DID with delegated access ---
+try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_agents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name TEXT NOT NULL UNIQUE,
+  did TEXT NOT NULL,
+  carbon_did TEXT NOT NULL,
+  display_name TEXT DEFAULT '',
+  status TEXT DEFAULT 'active',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// --- Permission List: per-silicon authorized actions/secrets ---
+try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_permissions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_name TEXT NOT NULL,
+  permission_type TEXT NOT NULL,
+  resource TEXT DEFAULT '*',
+  actions TEXT DEFAULT '[]',
+  granted_by TEXT DEFAULT '',
+  expires_at TEXT DEFAULT '',
+  status TEXT DEFAULT 'active',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// --- Session Binding: token-to-session fingerprint ---
+try { db.exec(`CREATE TABLE IF NOT EXISTS session_bindings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  session_fingerprint TEXT NOT NULL,
+  hostname TEXT DEFAULT '',
+  tty TEXT DEFAULT '',
+  user TEXT DEFAULT '',
+  bound_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+  status TEXT DEFAULT 'active'
+)`); } catch(e) {}
+
+// POST /api/silicon/register — register a silicon agent under a carbon
+app.post('/api/blindkey/silicon/register', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { agent_name, display_name } = req.body || {};
+  if (!agent_name) return res.status(400).json({ error: 'agent_name required' });
+  // Stub: creates agent identity linked to carbon DID
+  const agentDid = 'did:key:silicon-' + crypto.randomBytes(16).toString('hex');
+  try {
+    db.prepare('INSERT INTO silicon_agents (agent_name, did, carbon_did, display_name) VALUES (?, ?, ?, ?)')
+      .run(agent_name, agentDid, actor.did, display_name || agent_name);
+    res.json({ ok: true, agent_name, did: agentDid, carbon_did: actor.did, note: 'Pass 1 stub — agent registered but no token issued yet' });
+  } catch (e) {
+    if (e.message.includes('UNIQUE')) return res.status(409).json({ error: 'agent already registered' });
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/silicon/agents — list silicon agents under a carbon
+app.get('/api/blindkey/silicon/agents', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const agents = db.prepare('SELECT agent_name, did, display_name, status, created_at FROM silicon_agents WHERE carbon_did = ?').all(actor.did);
+  res.json({ agents, carbon_did: actor.did });
+});
+
+// POST /api/silicon/permissions — grant permission to a silicon agent
+app.post('/api/blindkey/silicon/permissions', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { agent_name, permission_type, resource, actions } = req.body || {};
+  if (!agent_name || !permission_type) return res.status(400).json({ error: 'agent_name and permission_type required' });
+  // Verify agent belongs to this carbon
+  const agent = db.prepare('SELECT * FROM silicon_agents WHERE agent_name = ? AND carbon_did = ?').get(agent_name, actor.did);
+  if (!agent) return res.status(404).json({ error: 'agent not found or not owned by you' });
+  db.prepare('INSERT INTO silicon_permissions (agent_name, permission_type, resource, actions, granted_by) VALUES (?, ?, ?, ?, ?)')
+    .run(agent_name, permission_type, resource || '*', JSON.stringify(actions || []), actor.did);
+  res.json({ ok: true, note: 'Pass 1 stub — permission recorded but not enforced yet' });
+});
+
+// GET /api/silicon/permissions/:agent — list permissions for a silicon
+app.get('/api/blindkey/silicon/permissions/:agent', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const perms = db.prepare('SELECT * FROM silicon_permissions WHERE agent_name = ? AND status = ?').all(req.params.agent, 'active');
+  res.json({ agent: req.params.agent, permissions: perms });
+});
+
+// POST /api/session/bind — bind current session to a fingerprint (stub)
+app.post('/api/blindkey/session/bind', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { hostname, tty, user } = req.body || {};
+  const fingerprint = crypto.createHash('sha256').update(`${hostname}:${tty}:${user}:${req.ip}`).digest('hex');
+  db.prepare('INSERT INTO session_bindings (did, session_fingerprint, hostname, tty, user) VALUES (?, ?, ?, ?, ?)')
+    .run(actor.did, fingerprint, hostname || '', tty || '', user || '');
+  res.json({ ok: true, fingerprint, note: 'Pass 1 stub — session recorded but not enforced on token requests yet' });
+});
+
+// --- Signup Page: self-service account creation ---
+// The API exists (POST /api/identity/request-invite + POST /api/identity/create)
+// This stub just confirms the endpoint is documented for the signup page UI
+app.get('/api/identity/signup-info', (_req, res) => {
+  res.json({
+    steps: [
+      { step: 1, method: 'POST', url: '/api/identity/request-invite', body: { referral_code: 'optional' }, returns: 'key' },
+      { step: 2, method: 'POST', url: '/api/identity/create', body: { username: 'your-name', key: 'from step 1' }, returns: 'did, email, referral_code' },
+      { step: 3, method: 'POST', url: '/api/identity/auth-fingerprint', body: { username: 'same', password: 'same key', scope: 'transact' }, returns: 'token' },
+    ],
+    signup_page: 'https://demipass.com/signup.html (not built yet)',
+    note: 'Pass 1 stub — API works, UI not built',
+  });
+});
+
+// --- Dustforge Mail: email sending stub ---
+app.get('/api/mail/status', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res, { allowAdmin: true });
+  if (!actor.ok) return;
+  res.json({
+    status: 'stub',
+    provider: 'stalwart',
+    host: process.env.STALWART_HOST || 'not configured',
+    note: 'Pass 1 stub — mail module not implemented. Reset emails are logged to console.',
+  });
+});
+
+// --- Local Sudo Exec: privileged command execution stub ---
+app.post('/api/blindkey/local-sudo', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  res.status(501).json({
+    error: 'local-sudo-exec is Pass 1 — not implemented yet',
+    design: 'Local agent helper daemon that holds sudo token and executes privileged commands without LLM seeing the password',
+    dependencies: ['session-binding', 'silicon-identity'],
+    note: 'Requires session binding and silicon identity before this can be safely implemented',
+  });
+});
+
+// --- Coordinated Rotation: multi-party rotation stub ---
+app.post('/api/blindkey/rotate-coordinated', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  res.status(501).json({
+    error: 'coordinated-rotation is Pass 1 — not implemented yet',
+    design: 'All parties using a shared credential are notified and updated simultaneously. Includes invitation funnel for non-DemiPass users.',
+    dependencies: ['shared-credentials'],
+  });
+});
+
 module.exports = { app, db, buoyNotifyConduit };
 
 app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
