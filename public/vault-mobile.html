@@ -323,8 +323,12 @@ async function api(m,p,b){if(autoLogoutIfExpired())throw new Error('session expi
 async function login(){
   const u=document.getElementById('auth-user').value.trim(),p=document.getElementById('auth-pass').value,e=document.getElementById('auth-err');
   e.textContent='';if(!u||!p){e.textContent='Username and password required';return}
-  try{const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
-  tk=a.token;did=a.did||'';user=u;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()}catch(x){e.textContent=x.message}}
+  try{
+    e.textContent='Signing in...';e.style.color='var(--text3)';
+    const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
+    if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
+    tk=a.token;did=a.did||'';user=u;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
+  }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
 
 function logout(){tk='';did='';user='';localStorage.removeItem('dp_token');localStorage.removeItem('dp_did');localStorage.removeItem('dp_user');localStorage.removeItem('dp_token_at');document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
 
