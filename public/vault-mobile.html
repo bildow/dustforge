@@ -150,29 +150,39 @@
     <button class="btn-ghost" style="margin-left:0.5rem;font-size:0.7rem" onclick="resetPanic()">Reset</button>
   </div>
 
-  <!-- Page: Vault (home) -->
+  <!-- Page: Vault (home) — Health Dashboard -->
   <div id="page-vault" class="page active">
     <div class="balance-hero">
       <div class="balance-amount" id="bal">--</div>
       <div class="balance-label">Diamond Dust</div>
     </div>
-    <div class="quick-stats">
-      <div class="qs"><div class="qs-val" style="color:var(--accent)" id="qs-secrets">--</div><div class="qs-label">Secrets</div></div>
-      <div class="qs"><div class="qs-val" style="color:var(--yellow)" id="qs-tokens">--</div><div class="qs-label">Tokens 24h</div></div>
-      <div class="qs"><div class="qs-val" style="color:var(--green)" id="qs-streak">--</div><div class="qs-label">Streak</div></div>
+    <!-- Health summary strip -->
+    <div style="display:flex;justify-content:center;gap:1rem;padding:0.5rem 1rem;font-size:0.75rem">
+      <span id="health-red" style="color:var(--red)">● 0 failing</span>
+      <span id="health-yellow" style="color:var(--yellow)">● 0 warning</span>
+      <span id="health-green" style="color:var(--green)">● 0 healthy</span>
+      <span id="health-frozen" style="color:var(--text3)">❄ 0 frozen</span>
     </div>
     <div class="section">
       <div class="section-head">
-        <span class="section-title">Secrets</span>
+        <span class="section-title">Credentials</span>
         <div style="display:flex;gap:0.4rem">
           <button class="btn-ghost" onclick="startScan()" style="font-size:0.75rem">Scan QR</button>
           <button class="btn-primary" onclick="openModal('store')">+ New</button>
         </div>
       </div>
-      <div id="secret-list"><div class="empty">No secrets yet</div></div>
+      <div id="secret-list"><div class="empty">Loading...</div></div>
     </div>
-    <div style="padding:1rem;text-align:center">
-      <button class="btn-danger" onclick="confirmPanic()" style="width:100%;padding:0.8rem;border-radius:10px">Trip All Breakers</button>
+    <div style="padding:0.5rem 1rem;display:flex;gap:0.5rem">
+      <button class="btn-danger" onclick="confirmPanic()" style="flex:1;padding:0.7rem;border-radius:10px;font-size:0.8rem">Trip All Breakers</button>
+    </div>
+  </div>
+
+  <!-- Page: Secret Detail (hidden, shown on tap) -->
+  <div id="page-detail" class="page">
+    <div style="padding:1rem">
+      <button onclick="closeDetail()" style="background:none;border:none;color:var(--accent);font-size:0.9rem;cursor:pointer;padding:0;margin-bottom:1rem">← Back to Vault</button>
+      <div id="detail-content"><div class="empty">Loading...</div></div>
     </div>
   </div>
 
@@ -345,27 +355,140 @@ async function showApp(){
   document.getElementById('app').style.display='block';
   await loadVault()}
 
+let dashboardData = null;
+
 async function loadVault(){
-  const[b,s,h,t]=await Promise.allSettled([api('GET','/api/identity/balance?did='+encodeURIComponent(did)),api('GET','/api/demipass/list'),api('GET','/api/demipass/history?limit=15'),api('GET','/api/tick/stats')]);
-  if(b.status==='fulfilled'){document.getElementById('bal').textContent=b.value.balance_cents||0}
-  if(s.status==='fulfilled'){secrets=s.value.secrets||[];document.getElementById('qs-secrets').textContent=secrets.length;renderSecrets()}else{document.getElementById('qs-secrets').textContent='0'}
-  if(h.status==='fulfilled'){const ev=h.value.events||h.value.history||[];const d=Date.now()-864e5;document.getElementById('qs-tokens').textContent=ev.filter(e=>e.event_type==='token_issued'&&new Date(e.created_at).getTime()>d).length}
-  if(t.status==='fulfilled'){document.getElementById('qs-streak').textContent=t.value.streak_days||0}}
+  try {
+    dashboardData = await api('GET','/api/demipass/dashboard');
+    document.getElementById('bal').textContent = dashboardData.balance_dd || 0;
+    secrets = dashboardData.secrets || [];
+
+    // Health summary
+    const hs = dashboardData.health_summary || {};
+    document.getElementById('health-red').textContent = '● ' + (hs.red||0) + ' failing';
+    document.getElementById('health-yellow').textContent = '● ' + (hs.yellow||0) + ' warning';
+    document.getElementById('health-green').textContent = '● ' + (hs.green||0) + ' healthy';
+    document.getElementById('health-frozen').textContent = '❄ ' + (hs.frozen||0) + ' frozen';
+
+    renderSecrets();
+  } catch(e) {
+    document.getElementById('secret-list').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
+  }
+}
 
 function renderSecrets(){
   if(!secrets.length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}
-  let h='';for(const s of secrets){
-    const on=s.status==='active'&&!panic;
-    let expiryHint = '';
-    if (s.expires_at) {
-      const daysLeft = Math.ceil((new Date(s.expires_at) - Date.now()) / 86400000);
-      if (daysLeft < 0) expiryHint = ' <span style="color:var(--red)">EXPIRED</span>';
-      else if (daysLeft <= 7) expiryHint = ` <span style="color:var(--red)">${daysLeft}d left</span>`;
-      else if (daysLeft <= 30) expiryHint = ` <span style="color:var(--yellow)">${daysLeft}d left</span>`;
+  let h='';
+  for(const s of secrets){
+    const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
+    const healthGlow = s.health==='red'?'0 0 8px var(--red)':s.health==='yellow'?'0 0 8px var(--yellow)':s.health==='green'?'0 0 6px var(--green)':'none';
+    const frozen = s.frozen ? ' ❄' : '';
+    const rec = s.recommendation ? ` <span style="color:var(--yellow);font-size:0.65rem">${s.recommendation}</span>` : '';
+
+    h += `<div class="secret-card" onclick="showDetail('${esc(s.name)}')" style="cursor:pointer">`;
+    h += `<div style="width:14px;height:14px;border-radius:50%;flex-shrink:0;background:${healthColor};box-shadow:${healthGlow}"></div>`;
+    h += `<div class="secret-info">`;
+    h += `<div class="secret-name">${esc(s.name)}${frozen}</div>`;
+    h += `<div class="secret-meta">${esc(s.type||'-')} &middot; ${s.use_count||0} uses${rec}</div>`;
+    h += `</div>`;
+    // Mini outcome indicator
+    h += `<div style="display:flex;gap:2px;align-items:center">`;
+    for(const o of (s.recent_outcomes||[]).slice(0,3)){
+      const c = o.outcome==='success'?'var(--green)':'var(--red)';
+      h += `<div style="width:6px;height:6px;border-radius:50%;background:${c}"></div>`;
     }
-    const providerTag = s.provider ? ` &middot; ${esc(s.provider)}` : '';
-    h+=`<div class="secret-card"><div class="secret-dot ${on?'on':'off'}"></div><div class="secret-info"><div class="secret-name">${esc(s.name)}</div><div class="secret-meta">${esc(s.secret_type||'-')}${providerTag} &middot; used ${s.use_count||0}x${expiryHint}</div></div><div class="secret-actions">${s.status==='active'?`<button class="sa-btn" onclick="revokeSecret('${esc(s.name)}')">revoke</button>`:''}</div></div>`}
-  document.getElementById('secret-list').innerHTML=h}
+    h += `</div>`;
+    h += `</div>`;
+  }
+  document.getElementById('secret-list').innerHTML=h;
+}
+
+function showDetail(name) {
+  const s = secrets.find(x => x.name === name);
+  if(!s) return;
+  const el = document.getElementById('detail-content');
+  const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
+  const healthLabel = s.health==='red'?'FAILING':s.health==='yellow'?'WARNING':s.health==='green'?'HEALTHY':'UNUSED';
+
+  let h = '';
+  h += `<div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:1rem">`;
+  h += `<div style="width:20px;height:20px;border-radius:50%;background:${healthColor};box-shadow:0 0 10px ${healthColor}"></div>`;
+  h += `<div><div style="font-size:1.1rem;font-weight:700">${esc(s.name)}</div>`;
+  h += `<div style="font-size:0.75rem;color:${healthColor};font-weight:600">${healthLabel}${s.frozen?' — FROZEN':''}</div></div>`;
+  h += `</div>`;
+
+  // Info grid
+  h += `<div style="background:var(--card);border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.8rem">`;
+  h += `<div style="color:var(--text3)">Ref Code</div><div style="font-family:monospace;font-size:0.7rem;margin-bottom:0.5rem;color:var(--accent)">${esc(s.ref||'none')}</div>`;
+  h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem">`;
+  h += `<div><span style="color:var(--text3)">Type:</span> ${esc(s.type)}</div>`;
+  h += `<div><span style="color:var(--text3)">Uses:</span> ${s.use_count}</div>`;
+  h += `<div><span style="color:var(--text3)">Ownership:</span> ${s.ownership}</div>`;
+  h += `<div><span style="color:var(--text3)">Rotatable:</span> ${s.rotatable?'yes':'no'}</div>`;
+  h += `</div>`;
+  if(s.expires_at){
+    const dl=Math.ceil((new Date(s.expires_at)-Date.now())/86400000);
+    h+=`<div style="margin-top:0.4rem;color:${dl<=7?'var(--red)':'var(--text3)}">Expires: ${new Date(s.expires_at).toLocaleDateString()} (${dl}d)</div>`;
+  }
+  h += `</div>`;
+
+  // Recent outcomes
+  if(s.recent_outcomes&&s.recent_outcomes.length){
+    h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Recent Attempts</div>`;
+    for(const o of s.recent_outcomes){
+      const c = o.outcome==='success'?'var(--green)':'var(--red)';
+      h += `<div style="display:flex;justify-content:space-between;padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem">`;
+      h += `<span style="color:${c}">${o.outcome} — ${esc(o.action_type||'?')}</span>`;
+      h += `<span style="color:var(--text3)">${o.agent_name||''} ${new Date(o.created_at).toLocaleDateString()}</span>`;
+      h += `</div>`;
+      if(o.error_summary) h += `<div style="font-size:0.65rem;color:var(--red);padding:0.15rem 0">${esc(o.error_summary).slice(0,100)}</div>`;
+    }
+    h += `</div>`;
+  }
+
+  // Contexts
+  if(s.context_list&&s.context_list.length){
+    h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Contexts</div>`;
+    for(const c of s.context_list){
+      h += `<div style="font-size:0.75rem;padding:0.25rem 0;color:var(--text2)">${esc(c.action_type)} → ${esc(c.target_host_pattern||'*')}</div>`;
+    }
+    h += `</div>`;
+  }
+
+  // Authorized silicons
+  if(s.authorized_silicons&&s.authorized_silicons.length){
+    h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Authorized Agents</div>`;
+    for(const a of s.authorized_silicons){
+      h += `<div style="font-size:0.75rem;padding:0.25rem 0;color:var(--text2)">${esc(a.agent_name)} — ${esc(a.permission_type)}</div>`;
+    }
+    h += `</div>`;
+  }
+
+  // Action buttons
+  h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
+  h += `<button onclick="toggleFreeze('${esc(s.name)}',${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
+  if(s.rotatable && !s.frozen) h += `<button onclick="alert('Rotation coming soon')" style="flex:1;padding:0.7rem;border:1px solid var(--yellow);background:none;border-radius:8px;color:var(--yellow);font-weight:600;font-size:0.8rem;cursor:pointer">Rotate</button>`;
+  h += `<button onclick="revokeSecret('${esc(s.name)}')" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Revoke</button>`;
+  h += `</div>`;
+
+  el.innerHTML = h;
+  document.getElementById('page-vault').classList.remove('active');
+  document.getElementById('page-detail').classList.add('active');
+}
+
+function closeDetail(){
+  document.getElementById('page-detail').classList.remove('active');
+  document.getElementById('page-vault').classList.add('active');
+  loadVault();
+}
+
+async function toggleFreeze(name, freeze){
+  try{
+    await api('POST','/api/demipass/freeze',{name,freeze});
+    showDetail(name);
+    loadVault();
+  }catch(e){alert(e.message)}
+}
 
 async function loadActivity(){
   try{const h=await api('GET','/api/demipass/history?limit=20');const ev=h.events||h.history||[];

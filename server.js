@@ -2462,6 +2462,7 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   if (ref && typeof ref === 'string' && ref.startsWith('DP-')) {
     const refSecret = db.prepare(`SELECT * FROM blindkey_secrets WHERE ref_code = ? AND ${REDEEMABLE_STATUS_SQL}`).get(ref);
     if (!refSecret) return res.status(403).json({ error: 'access denied' }); // same error for not-found and no-delegation
+    if (refSecret.frozen) return res.status(423).json({ error: 'secret is frozen — unfreeze before use', frozen: true });
 
     // Check if caller owns it or has delegation
     const callerDid = req.identity.did;
@@ -2939,8 +2940,23 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         JSON.stringify({ action, target_host, target_url, token_id: tokenRow.id })
       );
 
+      // Track outcome for dashboard health
+      const isSuccess = !result?.exit_code && !result?.error;
+      try {
+        db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(secret.id, req.identity.did, action, isSuccess ? 'success' : 'failure',
+            isSuccess ? '' : (result?.stderr || result?.error || '').slice(0, 200),
+            req.identity?.agent_name || '');
+      } catch(_) {}
+
       return res.json({ ok: true, action, via: 'use_token', result });
     } catch (e) {
+      // Track failure outcome
+      try {
+        db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(secret.id, req.identity.did, action, 'failure', e.message.slice(0, 200), req.identity?.agent_name || '');
+      } catch(_) {}
+
       return res.status(500).json({ error: `action failed: ${e.message}` });
     }
   }
@@ -10028,6 +10044,166 @@ app.post('/api/blindkey/rotate-coordinated', rateLimitStandard, (req, res) => {
     design: 'All parties using a shared credential are notified and updated simultaneously. Includes invitation funnel for non-DemiPass users.',
     dependencies: ['shared-credentials'],
   });
+});
+
+// ============================================================
+// Secret Health Tracking — outcome history for dashboard
+// ============================================================
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS secret_outcomes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  secret_id INTEGER NOT NULL,
+  did TEXT NOT NULL,
+  action_type TEXT DEFAULT '',
+  outcome TEXT DEFAULT 'success',
+  error_summary TEXT DEFAULT '',
+  agent_name TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+
+// Add frozen column to secrets
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN frozen INTEGER DEFAULT 0"); } catch(_) {}
+
+// GET /api/demipass/dashboard — secret health dashboard for the mobile app
+app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+
+  const secrets = db.prepare(`
+    SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
+           ownership, rotatable, frozen, created_at, updated_at, expires_at, provider
+    FROM blindkey_secrets WHERE did = ? AND status IN ('active', 'rotating')
+    ORDER BY updated_at DESC
+  `).all(auth.did);
+
+  // Get last 3 outcomes per secret + compute health
+  const enriched = secrets.map(s => {
+    const outcomes = db.prepare(
+      'SELECT outcome, error_summary, action_type, agent_name, created_at FROM secret_outcomes WHERE secret_id = ? ORDER BY id DESC LIMIT 3'
+    ).all(s.id);
+
+    const recent = outcomes.length;
+    const failures = outcomes.filter(o => o.outcome === 'failure').length;
+    let health = 'neutral'; // never used
+    if (recent > 0) {
+      if (failures === 0) health = 'green';
+      else if (failures < recent) health = 'yellow';
+      else health = 'red';
+    }
+
+    // Check for rotation recommendation
+    let recommendation = null;
+    if (s.expires_at) {
+      const daysLeft = Math.ceil((new Date(s.expires_at) - Date.now()) / 86400000);
+      if (daysLeft < 0) recommendation = 'expired';
+      else if (daysLeft <= 7) recommendation = 'expiring_soon';
+    }
+    if (health === 'red') recommendation = recommendation || 'investigate';
+    if (health === 'yellow') recommendation = recommendation || 'monitor';
+
+    // Authorized silicons
+    const silicons = db.prepare(
+      "SELECT agent_name, permission_type FROM silicon_permissions WHERE status = 'active' AND (resource = '*' OR resource = ?) AND permission_type LIKE 'secret:%'"
+    , s.name).all();
+
+    // Contexts
+    const contexts = db.prepare(
+      "SELECT context_name, action_type, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
+    ).all(s.id);
+
+    return {
+      id: s.id,
+      name: s.name,
+      type: s.secret_type,
+      ref: s.ref_code || null,
+      status: s.status,
+      frozen: !!s.frozen,
+      ownership: s.ownership || 'sole',
+      rotatable: s.rotatable !== 0,
+      use_count: s.use_count,
+      last_used: s.last_used_at,
+      health,
+      recommendation,
+      recent_outcomes: outcomes,
+      contexts: contexts.length,
+      context_list: contexts,
+      authorized_silicons: silicons,
+      expires_at: s.expires_at,
+      provider: s.provider,
+    };
+  });
+
+  // Sort: red first, yellow next, green, neutral last
+  const healthOrder = { red: 0, yellow: 1, green: 2, neutral: 3 };
+  enriched.sort((a, b) => healthOrder[a.health] - healthOrder[b.health]);
+
+  // Balance
+  let balance = 0;
+  try {
+    const wallet = db.prepare('SELECT balance_cents FROM identity_wallets WHERE did = ?').get(auth.did);
+    balance = wallet?.balance_cents || 0;
+  } catch(_) {}
+
+  // Identity
+  const identity = {
+    did: auth.did,
+    silicon: auth.silicon || false,
+    agent_name: auth.agent_name || null,
+  };
+
+  res.json({
+    identity,
+    balance_dd: balance,
+    secrets: enriched,
+    total: enriched.length,
+    health_summary: {
+      red: enriched.filter(s => s.health === 'red').length,
+      yellow: enriched.filter(s => s.health === 'yellow').length,
+      green: enriched.filter(s => s.health === 'green').length,
+      neutral: enriched.filter(s => s.health === 'neutral').length,
+      frozen: enriched.filter(s => s.frozen).length,
+    },
+  });
+});
+
+// POST /api/demipass/freeze — freeze/unfreeze a secret
+app.post('/api/blindkey/freeze', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  const { name, ref, freeze } = req.body || {};
+
+  let secret;
+  if (ref) {
+    secret = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status IN ('active', 'rotating')").get(auth.did, ref);
+  } else if (name) {
+    secret = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status IN ('active', 'rotating')").get(auth.did, name);
+  }
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  const frozen = freeze !== false && freeze !== 0 ? 1 : 0;
+  db.prepare('UPDATE blindkey_secrets SET frozen = ? WHERE id = ?').run(frozen, secret.id);
+
+  // Buoy tick
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(auth.did, `Secret ${frozen ? 'frozen' : 'unfrozen'}: ${secret.name}`, req.ip || '', 'UTC', 'decision',
+        JSON.stringify([frozen ? 'secret:freeze' : 'secret:unfreeze', `name:${secret.name}`]));
+  } catch(_) {}
+
+  res.json({ ok: true, name: secret.name, frozen: !!frozen });
+});
+
+// POST /api/demipass/outcome — record a use-token outcome (success/failure)
+app.post('/api/blindkey/outcome', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  const { secret_id, action_type, outcome, error_summary } = req.body || {};
+  if (!secret_id || !outcome) return res.status(400).json({ error: 'secret_id and outcome required' });
+  if (!['success', 'failure'].includes(outcome)) return res.status(400).json({ error: 'outcome must be success or failure' });
+
+  db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(secret_id, auth.did, action_type || '', outcome, error_summary || '', auth.agent_name || '');
+  res.json({ ok: true });
 });
 
 module.exports = { app, db, buoyNotifyConduit };
