@@ -432,7 +432,8 @@ function showDetail(name) {
   h += `</div>`;
   if(s.expires_at){
     const dl=Math.ceil((new Date(s.expires_at)-Date.now())/86400000);
-    h+=`<div style="margin-top:0.4rem;color:${dl<=7?'var(--red)':'var(--text3)}">Expires: ${new Date(s.expires_at).toLocaleDateString()} (${dl}d)</div>`;
+    const expiryColor = dl <= 7 ? 'var(--red)' : 'var(--text3)';
+    h+='<div style="margin-top:0.4rem;color:'+expiryColor+'">Expires: '+new Date(s.expires_at).toLocaleDateString()+' ('+dl+'d)</div>';
   }
   h += `</div>`;
 
