@@ -1,0 +1,6 @@
+/vault-mobile.html
+  Cache-Control: no-cache, no-store, must-revalidate
+  Pragma: no-cache
+
+/*.html
+  Cache-Control: max-age=300
