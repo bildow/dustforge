@@ -34,7 +34,7 @@ const INNER_RING_CONFIG = {
 
 // DemiPass SSH host whitelist — only these hosts can be targeted via ssh_exec
 // Consolidated host whitelists — single source of truth for all DemiPass action types
-const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com', 'flowhook.dustforge.com', 'api.dustforge.com'];
 const BLINDKEY_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
 const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
