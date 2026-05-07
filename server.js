@@ -10104,7 +10104,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
     // Authorized silicons
     const silicons = db.prepare(
       "SELECT agent_name, permission_type FROM silicon_permissions WHERE status = 'active' AND (resource = '*' OR resource = ?) AND permission_type LIKE 'secret:%'"
-    , s.name).all();
+    ).all(s.name);
 
     // Contexts
     const contexts = db.prepare(
