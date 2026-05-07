@@ -402,31 +402,87 @@ async function loadVault(){
   }
 }
 
+function categorizeSecret(s) {
+  const n = s.name.toLowerCase();
+  if (n.includes('brain-') || n.includes('conductor') || n.includes('brain')) return 'Agents';
+  if (n.includes('silicon-')) return 'Silicon';
+  if (n.includes('racknerd') || n.includes('phasewhip') || n.includes('flimflam-sudo') || n.includes('shared-kyle')) return 'Infrastructure';
+  if (n.includes('dustforge') || n.includes('conduit-carbon') || n.includes('stalwart')) return 'Platform';
+  if (n.includes('flowhook') || n.includes('github') || n.includes('npm')) return 'Services';
+  if (n.includes('rubin') || n.includes('evidence')) return 'Evidence';
+  if (n.includes('test') || n.includes('inject') || n.includes('drop')) return 'Test';
+  return 'Other';
+}
+
 function renderSecrets(){
   if(!secrets.length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}
-  let h='';
-  for(const s of secrets){
-    const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
-    const healthGlow = s.health==='red'?'0 0 8px var(--red)':s.health==='yellow'?'0 0 8px var(--yellow)':s.health==='green'?'0 0 6px var(--green)':'none';
-    const frozen = s.frozen ? ' ❄' : '';
-    const rec = s.recommendation ? ` <span style="color:var(--yellow);font-size:0.65rem">${s.recommendation}</span>` : '';
 
-    h += `<div class="secret-card" onclick="showDetail('${esc(s.name)}')" style="cursor:pointer">`;
-    h += `<div style="width:14px;height:14px;border-radius:50%;flex-shrink:0;background:${healthColor};box-shadow:${healthGlow}"></div>`;
-    h += `<div class="secret-info">`;
-    h += `<div class="secret-name">${esc(s.name)}${frozen}</div>`;
-    h += `<div class="secret-meta">${esc(s.type||'-')} &middot; ${s.use_count||0} uses${rec}</div>`;
-    h += `</div>`;
-    // Mini outcome indicator
-    h += `<div style="display:flex;gap:2px;align-items:center">`;
-    for(const o of (s.recent_outcomes||[]).slice(0,3)){
-      const c = o.outcome==='success'?'var(--green)':'var(--red)';
-      h += `<div style="width:6px;height:6px;border-radius:50%;background:${c}"></div>`;
+  // Group secrets by category
+  const groups = {};
+  for(const s of secrets){
+    const cat = categorizeSecret(s);
+    if(!groups[cat]) groups[cat] = [];
+    groups[cat].push(s);
+  }
+
+  // Sort groups: groups with worst health first
+  const healthPriority = {red:0, yellow:1, green:2, neutral:3};
+  const sortedGroups = Object.entries(groups).sort((a,b) => {
+    const worstA = Math.min(...a[1].map(s => healthPriority[s.health] || 3));
+    const worstB = Math.min(...b[1].map(s => healthPriority[s.health] || 3));
+    return worstA - worstB;
+  });
+
+  let h = '';
+  for(const [groupName, items] of sortedGroups){
+    const total = items.length;
+    const healthy = items.filter(s => s.health === 'green' || s.health === 'neutral').length;
+    const pct = Math.round((healthy / total) * 100);
+    const barColor = pct >= 80 ? 'var(--green)' : pct >= 50 ? 'var(--yellow)' : 'var(--red)';
+    const hasIssues = items.some(s => s.health === 'red' || s.health === 'yellow');
+    const frozen = items.filter(s => s.frozen).length;
+
+    h += '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:0.75rem;overflow:hidden">';
+    h += '<div onclick="toggleGroup(\''+esc(groupName)+'\')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
+    h += '<div>';
+    h += '<div style="font-weight:700;font-size:0.9rem">'+esc(groupName)+'</div>';
+    h += '<div style="font-size:0.7rem;color:var(--text3)">'+total+' secret'+(total!==1?'s':'')+(frozen?' &middot; '+frozen+' frozen':'')+'</div>';
+    h += '</div>';
+    h += '<div style="display:flex;align-items:center;gap:0.75rem">';
+    h += '<div style="width:60px;height:6px;background:var(--bg);border-radius:3px;overflow:hidden"><div style="width:'+pct+'%;height:100%;background:'+barColor+';border-radius:3px"></div></div>';
+    h += '<span style="font-size:0.7rem;color:'+barColor+';font-weight:600;min-width:28px;text-align:right">'+pct+'%</span>';
+    h += '<span style="color:var(--text3);font-size:0.8rem" id="chevron-'+esc(groupName)+'">▸</span>';
+    h += '</div>';
+    h += '</div>';
+
+    // Expandable secret list (hidden by default, shown if has issues)
+    const showByDefault = hasIssues;
+    h += '<div id="group-'+esc(groupName)+'" style="display:'+(showByDefault?'block':'none')+';border-top:1px solid var(--border);padding:0 0.5rem 0.5rem">';
+    for(const s of items){
+      const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
+      const fr = s.frozen ? ' ❄' : '';
+      const rec = s.recommendation ? ' <span style="color:var(--yellow);font-size:0.6rem">'+s.recommendation+'</span>' : '';
+
+      h += '<div onclick="event.stopPropagation();showDetail(\''+esc(s.name)+'\')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
+      h += '<div style="width:10px;height:10px;border-radius:50%;flex-shrink:0;background:'+healthColor+'"></div>';
+      h += '<div style="flex:1;min-width:0"><div style="font-size:0.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(s.name)+fr+'</div>';
+      h += '<div style="font-size:0.65rem;color:var(--text3)">'+esc(s.type||'-')+' &middot; '+s.use_count+' uses'+rec+'</div></div>';
+      h += '<div style="display:flex;gap:2px">';
+      for(const o of (s.recent_outcomes||[]).slice(0,3)){
+        h += '<div style="width:5px;height:5px;border-radius:50%;background:'+(o.outcome==='success'?'var(--green)':'var(--red)')+'"></div>';
+      }
+      h += '</div></div>';
     }
-    h += `</div>`;
-    h += `</div>`;
+    h += '</div></div>';
   }
   document.getElementById('secret-list').innerHTML=h;
+}
+
+function toggleGroup(name){
+  const el = document.getElementById('group-'+name);
+  const chev = document.getElementById('chevron-'+name);
+  if(el.style.display==='none'){el.style.display='block';chev.textContent='▾'}
+  else{el.style.display='none';chev.textContent='▸'}
 }
 
 function showDetail(name) {
