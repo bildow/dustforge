@@ -2464,6 +2464,19 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
     if (!refSecret) return res.status(403).json({ error: 'access denied' }); // same error for not-found and no-delegation
     if (refSecret.frozen) return res.status(423).json({ error: 'secret is frozen — unfreeze before use', frozen: true });
 
+    // FINDING 1 FIX: Enforce silicon permissions on secret operations
+    const auth = getBearerIdentity(req);
+    if (auth.silicon) {
+      if (!siliconHasPermission(auth.agent_name, 'secret:use', refSecret.name)) {
+        return res.status(403).json({ error: 'silicon agent lacks secret:use permission for this secret', agent: auth.agent_name });
+      }
+      // Check action-level permission
+      const actionPerm = 'action:' + (action || 'ssh_exec');
+      if (!siliconHasPermission(auth.agent_name, actionPerm, '*')) {
+        return res.status(403).json({ error: 'silicon agent lacks ' + actionPerm + ' permission', agent: auth.agent_name });
+      }
+    }
+
     // Check if caller owns it or has delegation
     const callerDid = req.identity.did;
     if (refSecret.did === callerDid) {
@@ -9598,6 +9611,8 @@ app.get('/api/features', rateLimitStandard, (req, res) => {
 app.post('/api/features', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res, { allowAdmin: true });
   if (!actor.ok) return;
+  // FINDING 2 FIX: Only admin can mutate feature map
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required to modify feature map' });
 
   const { name, category, pass_level, description, dependencies } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
@@ -9626,6 +9641,8 @@ app.post('/api/features', rateLimitStandard, (req, res) => {
 app.post('/api/features/:name/error', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res, { allowAdmin: true });
   if (!actor.ok) return;
+  // FINDING 2 FIX: Only admin can track errors
+  if (actor.mode !== 'admin') return res.status(403).json({ error: 'admin access required to track errors' });
 
   const node = db.prepare('SELECT id, pass_level FROM feature_nodes WHERE name = ?').get(req.params.name);
   if (!node) return res.status(404).json({ error: 'feature node not found' });
@@ -9687,8 +9704,7 @@ app.get('/api/features/next-pass', rateLimitStandard, (req, res) => {
     // 1. Error reduction: open errors on THIS node
     const errorReduction = n.open_errors;
 
-    // 2. Dependency unlocks: how many nodes list this node as a dependency
-    //    AND are currently at a pass level <= this node's current level?
+    // FINDING 3 FIX: Correct dependency unlock + blocker removal logic
     let dependencyUnlocks = 0;
     let blockerRemovals = 0;
 
@@ -9697,17 +9713,19 @@ app.get('/api/features/next-pass', rateLimitStandard, (req, res) => {
       const otherDeps = other.deps || [];
       if (otherDeps.includes(n.name)) {
         // This node is a dependency of 'other'
-        // If other is stuck at or below our current level, advancing us unlocks them
-        if (other.pass_level <= n.pass_level) {
+        // Unlock: advancing n to nextPass would allow other to advance
+        // Only counts if n is currently the LOWEST dependency of other
+        const allDepLevels = otherDeps.map(d => nodeByName[d]?.pass_level || 0);
+        const minDepLevel = Math.min(...allDepLevels);
+        if (n.pass_level === minDepLevel && nextPass > minDepLevel) {
           dependencyUnlocks++;
         }
-        // If other CANNOT advance because we're too low, we're a blocker
-        // A node is blocked if ANY dependency is at a lower pass level
-        const otherBlocked = otherDeps.some(depName => {
-          const depNode = nodeByName[depName];
-          return depNode && depNode.pass_level < other.pass_level;
-        });
-        if (otherBlocked && n.pass_level < other.pass_level) {
+        // Blocker: n is specifically the dependency preventing other from advancing
+        // Only counts if advancing n would actually unblock (n is the sole bottleneck)
+        const otherBlockedByN = n.pass_level < other.pass_level;
+        const otherBlockedByOthers = otherDeps.some(d => d !== n.name && nodeByName[d] && nodeByName[d].pass_level < other.pass_level);
+        if (otherBlockedByN && !otherBlockedByOthers) {
+          // n is the SOLE blocker — advancing it would unblock other
           blockerRemovals++;
         }
       }
