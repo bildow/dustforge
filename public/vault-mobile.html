@@ -111,7 +111,10 @@
   <h1>Demi<span>Pass</span></h1>
   <p>Sign in to your vault</p>
   <input type="text" id="auth-user" placeholder="Username" autocomplete="username">
-  <input type="password" id="auth-pass" placeholder="Password" autocomplete="current-password">
+  <div style="position:relative;width:100%;max-width:320px">
+    <input type="password" id="auth-pass" placeholder="Password" autocomplete="current-password" style="width:100%;padding-right:3rem">
+    <span onclick="togglePassVis()" style="position:absolute;right:0.8rem;top:50%;transform:translateY(-50%);cursor:pointer;font-size:1.1rem;color:var(--text3);user-select:none" id="pass-eye">👁</span>
+  </div>
   <button onclick="login()">Sign in</button>
   <div id="auth-err" class="auth-err"></div>
   <a href="https://demipass.com/reset-password.html" style="display:block;text-align:center;margin-top:1rem;color:var(--text3);font-size:0.8rem;text-decoration:none">Forgot password?</a>
@@ -143,6 +146,15 @@
       <span class="topbar-user" id="app-user"></span>
       <span class="topbar-out" onclick="logout()" style="color:var(--red);font-weight:600;cursor:pointer;padding:0.2rem 0.5rem;border:1px solid var(--red);border-radius:6px;font-size:0.75rem">Sign Out</span>
     </div>
+  </div>
+
+  <!-- Namespace banner — fleet wallet stub -->
+  <div onclick="alert('Fleet wallet coming soon — manage silicon agents and shared DD pools')" style="background:var(--card);border-bottom:1px solid var(--border);padding:0.5rem 1rem;display:flex;justify-content:space-between;align-items:center;cursor:pointer">
+    <div style="display:flex;align-items:center;gap:0.5rem">
+      <div style="width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green)"></div>
+      <span style="font-weight:700;font-size:0.9rem" id="ns-id">—</span>
+    </div>
+    <span style="color:var(--text3);font-size:0.7rem">Fleet ›</span>
   </div>
 
   <div id="panic" class="panic-strip">
@@ -235,8 +247,15 @@
       <div style="display:flex;flex-direction:column;gap:0.5rem">
         <button class="btn-ghost" onclick="verifyChain()" style="width:100%;text-align:left;padding:0.8rem">Verify chain integrity</button>
         <button class="btn-ghost" onclick="loadLedgerSummary()" style="width:100%;text-align:left;padding:0.8rem">Ledger summary</button>
+        <button class="btn-ghost" onclick="runDoctor()" style="width:100%;text-align:left;padding:0.8rem">Run diagnostics (doctor)</button>
       </div>
       <div id="settings-output" style="margin-top:1rem;font-size:0.8rem"></div>
+
+      <!-- Silicon Agents tease -->
+      <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Silicon Agents</div>
+      <div id="silicon-agents" style="background:var(--card);border-radius:12px;padding:1rem">
+        <div class="empty" style="font-size:0.8rem">Loading...</div>
+      </div>
 
       <div style="margin-top:2rem;padding-top:1rem;border-top:1px solid var(--border)">
         <button onclick="logout()" style="width:100%;padding:0.9rem;background:var(--red);border:none;border-radius:10px;color:#fff;font-weight:700;font-size:0.95rem;cursor:pointer">Sign Out</button>
@@ -339,6 +358,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
+  if(n.dataset.page==='settings')loadSiliconAgents();
 }));
 
 async function showApp(){
@@ -357,7 +377,9 @@ async function showApp(){
   } catch(_) {}
 
   document.getElementById('app').style.display='block';
-  await loadVault()}
+  document.getElementById('ns-id').textContent=user;
+  await loadVault();
+  loadSiliconAgents()}
 
 let dashboardData = null;
 
@@ -574,6 +596,49 @@ async function setRecoveryEmail(){
     msg.textContent=r.ok?'Recovery email saved':(r.error||'failed');
     msg.style.color=r.ok?'var(--green)':'var(--red)';
   }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}
+}
+
+function togglePassVis(){
+  const p=document.getElementById('auth-pass');
+  const e=document.getElementById('pass-eye');
+  if(p.type==='password'){p.type='text';e.textContent='🙈'}else{p.type='password';e.textContent='👁'}
+}
+
+async function runDoctor(){
+  const o=document.getElementById('settings-output');
+  o.innerHTML='<div style="color:var(--text3)">Running diagnostics...</div>';
+  try{
+    const d=await api('GET','/api/identity/trust?did='+encodeURIComponent(did));
+    let h='<div style="font-size:0.8rem">';
+    h+='<div style="color:var(--green);font-weight:600;margin-bottom:0.5rem">System Diagnostics</div>';
+    h+='<div>Identity: <strong>'+esc(user)+'</strong></div>';
+    h+='<div>DID: <span style="font-family:monospace;font-size:0.65rem">'+esc(did).slice(0,30)+'...</span></div>';
+    h+='<div>Trust band: <strong>'+(d.band||d.trust_band||'—')+'</strong></div>';
+    h+='<div>Recovery email: '+(d.recovery_email?'<span style="color:var(--green)">set</span>':'<span style="color:var(--red)">NOT SET</span>')+'</div>';
+    h+='<div>Secrets: <strong>'+(dashboardData?.total||'?')+'</strong></div>';
+    h+='<div>Balance: <strong>'+(dashboardData?.balance_dd||'?')+' DD</strong></div>';
+    h+='</div>';
+    o.innerHTML=h;
+  }catch(e){o.textContent=e.message}
+}
+
+async function loadSiliconAgents(){
+  try{
+    const d=await api('GET','/api/demipass/silicon/agents');
+    const el=document.getElementById('silicon-agents');
+    const agents=d.agents||[];
+    if(!agents.length){el.innerHTML='<div style="font-size:0.8rem;color:var(--text3)">No silicon agents registered. <span style="color:var(--accent)">Register agents via API to manage fleet permissions.</span></div>';return}
+    let h='';
+    for(const a of agents){
+      const permList=(a.permissions||[]).map(p=>p.permission_type).join(', ');
+      h+='<div style="display:flex;justify-content:space-between;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.8rem">';
+      h+='<div><strong style="color:var(--accent)">'+esc(a.agent_name)+'</strong> <span style="color:var(--text3);font-size:0.7rem">'+esc(a.display_name)+'</span></div>';
+      h+='<div style="color:var(--text3);font-size:0.7rem">'+(a.last_active?'active':'idle')+'</div>';
+      h+='</div>';
+      if(permList) h+='<div style="font-size:0.65rem;color:var(--text3);padding:0.1rem 0 0.3rem">'+esc(permList)+'</div>';
+    }
+    el.innerHTML=h;
+  }catch(e){document.getElementById('silicon-agents').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 
 function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
