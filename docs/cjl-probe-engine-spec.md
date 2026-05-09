@@ -33,30 +33,73 @@ Probes, identity, and security are not three systems — they are three projecti
 
 Every probe session generates data: model identity, coherence score, canary performance, under real-world adversarial conditions with real stakes. This is a model benchmarking dataset no synthetic benchmark can replicate. Published with wallet holder identity scrubbed but model identity preserved — creating both breach transparency and a competitive pressure for model providers to improve reasoning quality.
 
-## Architecture
+## Architecture (Revised: Observation Over Interrogation)
+
+> Decision trace: [cjl-serendipity-trace-2026-05-09.md](decision-traces/cjl-serendipity-trace-2026-05-09.md)
+
+The original design was a checkpoint model — stop the agent, ask questions, score answers. The immune system analog revealed this is architecturally wrong. The immune system doesn't interrogate cells. It circulates and reads their surfaces continuously.
+
+The CJL has two layers:
+
+### Layer A: Continuous Passive Observation (always on, zero latency)
 
 ```
-Agent requests capability via Oracle
+Agent operates normally
+        |
+  [Every MCP tool call logged as behavioral surface]
+        |
+  [Behavioral profile accumulates over Buoy ticks]
+        |
+  [Statistical deviation detection runs continuously]
+        |
+  [Environmental canaries embedded in tool result metadata]
+        |
+    no deviation -----> normal operation continues
+        |
+    deviation detected -----> trigger Layer B
+        |
+    canary trip -----> DENY + CRITICAL alert + wallet holder notification
+```
+
+- Tool call patterns (which capabilities, what targets, what cadence, what time)
+- Request sequences (what comes before and after each capability use)
+- Error patterns (what errors occur and how the agent responds)
+- Environmental canaries: audit nonces in tool results that should never be echoed back
+
+### Layer B: Active Interrogation (triggered, rare)
+
+```
+Triggered by: Layer A anomaly OR Tier 3 capability request
         |
         v
-  [Oracle resolves credential]
+  [Probe battery assembled: canaries + structured claims]
         |
-        v
-  [Risk assessment: does this need probing?]
+  [Agent responds]
         |
-    low risk -----> grant immediately
+  [Cross-reference against platform data + behavioral profile]
         |
-    elevated -----> CJL Probe Session
-        |                |
-        v                v
-  [Probe battery]   [Agent responds]
-        |                |
-        v                v
-  [Coherence scoring]
-        |
-    pass (>= threshold) -----> grant + judgment hash
+    pass -----> grant + judgment hash
         |
     marginal -----> escalate to Lori/Rowen
+        |
+    fail -----> DENY + log to integrity DB + notify wallet holder
+```
+
+Layer B fires ONLY when Layer A detects something unusual or the operation is high-sensitivity. Most capability requests never reach Layer B.
+
+### Cold Start: Inherited Behavioral Priors
+
+New agents have no behavioral profile. Layer A can't detect deviation from a nonexistent baseline.
+
+Resolution: agents inherit a trust prior from their invitation chain (like maternal antibodies). The inviter's behavioral cluster provides initial expectations. As the agent accumulates Buoy ticks, its own profile gradually replaces the inherited prior.
+
+```
+Invitation graph:
+  Aaron (genesis)
+    -> Brain (200 ticks, deep profile)
+    -> Chad (150 ticks, moderate profile)
+    -> NewAgent (0 ticks, inherits Aaron-cluster prior)
+```
         |
     fail -----> DENY + log to integrity DB + notify wallet holder
 ```
