@@ -1673,6 +1673,44 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_token ON blindkey_use_tokens(t
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_but_did ON blindkey_use_tokens(did)"); } catch(e) {}
 try { db.exec("ALTER TABLE blindkey_use_tokens ADD COLUMN delegation_id INTEGER DEFAULT NULL"); } catch(e) {}
 
+// ── [103b] DemiPass Security Events — error-as-signal pipeline ──
+// Every DemiPass error is a potential breach signal. Log with full context.
+try { db.exec(`CREATE TABLE IF NOT EXISTS demipass_security_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_type TEXT NOT NULL,
+  severity TEXT NOT NULL DEFAULT 'info' CHECK(severity IN ('info', 'warn', 'alert', 'critical')),
+  caller_did TEXT,
+  agent_name TEXT,
+  capability_requested TEXT,
+  target TEXT,
+  error_detail TEXT,
+  context_json TEXT DEFAULT '{}',
+  ip TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dse_type ON demipass_security_events(event_type)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dse_severity ON demipass_security_events(severity)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dse_did ON demipass_security_events(caller_did)"); } catch(e) {}
+
+function logSecurityEvent(event_type, severity, details) {
+  try {
+    db.prepare(
+      `INSERT INTO demipass_security_events (event_type, severity, caller_did, agent_name, capability_requested, target, error_detail, context_json, ip)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      event_type,
+      severity,
+      details.caller_did || null,
+      details.agent_name || null,
+      details.capability || null,
+      details.target || null,
+      details.error || null,
+      JSON.stringify(details.context || {}),
+      details.ip || null
+    );
+  } catch (e) { /* never let security logging break the request */ }
+}
+
 // ── [104] Barrel Cosign Requests ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS barrel_cosign_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2160,8 +2198,76 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
   const secrets = db.prepare(
     `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
-  ).all(ownerDid, 'active').map(s => ({ ...s, description: sanitizeDescription(s.description) }));
-  res.json({ did: ownerDid, secrets, total: secrets.length });
+  ).all(ownerDid, 'active');
+
+  // Oracle mode: strip all identifying metadata, return only capability scopes.
+  // Agents see what they can DO, not what secrets exist.
+  // Activated by ?view=oracle, or automatically for silicon callers.
+  const auth = getBearerIdentity(req);
+  const oracleMode = req.query.view === 'oracle' || (auth && auth.silicon);
+
+  if (oracleMode) {
+    const oracleSecrets = secrets.map(s => {
+      // Gather capability scopes from contexts
+      const contexts = db.prepare(
+        'SELECT action_type, target_host_pattern, target_url_pattern FROM blindkey_contexts WHERE secret_id = ?'
+      ).all(s.id);
+      const capabilities = contexts.map(c => {
+        const target = c.target_host_pattern && c.target_host_pattern !== '*'
+          ? c.target_host_pattern
+          : (c.target_url_pattern && c.target_url_pattern !== '*' ? c.target_url_pattern : '*');
+        return c.action_type + (target !== '*' ? '@' + target : '');
+      });
+      // If no contexts, derive default capability from secret_type
+      if (capabilities.length === 0) {
+        const typeToAction = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
+        capabilities.push(typeToAction[s.secret_type] || 'http_header');
+      }
+      // Opaque handle: first 8 chars of ref_code hash (no name leakage)
+      const handle = s.ref_code ? s.ref_code.split('-').pop() : String(s.id);
+      return {
+        handle: 'DP-' + handle,
+        capabilities,
+        health: s.status === 'active' ? (s.expires_at && new Date(s.expires_at) < new Date(Date.now() + 7 * 86400000) ? 'expiring' : 'green') : 'inactive',
+        use_count: s.use_count,
+        last_used_at: s.last_used_at,
+      };
+    });
+    return res.json({
+      did: ownerDid,
+      mode: 'oracle',
+      _notice: 'Capability scopes only. Secret names, descriptions, and types are not disclosed. Request capabilities by scope.',
+      secrets: oracleSecrets,
+      total: oracleSecrets.length,
+    });
+  }
+
+  // Standard mode: human dashboard / admin — includes names and sanitized descriptions
+  res.json({ did: ownerDid, secrets: secrets.map(s => ({ ...s, description: sanitizeDescription(s.description) })), total: secrets.length });
+});
+
+// GET /api/demipass/security-events — security event feed for wallet holders
+app.get('/api/demipass/security-events', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+  const minSeverity = req.query.severity || 'info';
+  const severityOrder = { info: 0, warn: 1, alert: 2, critical: 3 };
+  const minLevel = severityOrder[minSeverity] || 0;
+  const severities = Object.entries(severityOrder).filter(([, v]) => v >= minLevel).map(([k]) => k);
+  const placeholders = severities.map(() => '?').join(',');
+
+  if (actor.mode === 'admin') {
+    const events = db.prepare(
+      `SELECT * FROM demipass_security_events WHERE severity IN (${placeholders}) ORDER BY id DESC LIMIT ?`
+    ).all(...severities, limit);
+    return res.json({ events, total: events.length });
+  }
+
+  const events = db.prepare(
+    `SELECT * FROM demipass_security_events WHERE caller_did = ? AND severity IN (${placeholders}) ORDER BY id DESC LIMIT ?`
+  ).all(actor.did, ...severities, limit);
+  res.json({ events, total: events.length });
 });
 
 // GET /api/blindkey/expiring — list secrets expiring within a window
@@ -2461,18 +2567,22 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   // Routed reference mode — parse DP-TYPE-slug-nonce and resolve everything
   if (ref && typeof ref === 'string' && ref.startsWith('DP-')) {
     const refSecret = db.prepare(`SELECT * FROM blindkey_secrets WHERE ref_code = ? AND ${REDEEMABLE_STATUS_SQL}`).get(ref);
-    if (!refSecret) return res.status(403).json({ error: 'access denied' }); // same error for not-found and no-delegation
+    if (!refSecret) {
+      logSecurityEvent('token_request_denied', 'warn', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: ref, error: 'ref not found or not redeemable', ip: req.ip });
+      return res.status(403).json({ error: 'access denied' });
+    }
     if (refSecret.frozen) return res.status(423).json({ error: 'secret is frozen — unfreeze before use', frozen: true });
 
     // FINDING 1 FIX: Enforce silicon permissions on secret operations
     const auth = getBearerIdentity(req);
     if (auth.silicon) {
       if (!siliconHasPermission(auth.agent_name, 'secret:use', refSecret.name)) {
+        logSecurityEvent('silicon_permission_denied', 'alert', { caller_did: req.identity?.did, agent_name: auth.agent_name, capability: 'secret:use', target: refSecret.name, error: 'silicon lacks secret:use', ip: req.ip });
         return res.status(403).json({ error: 'silicon agent lacks secret:use permission for this secret', agent: auth.agent_name });
       }
-      // Check action-level permission
       const actionPerm = 'action:' + (action || 'ssh_exec');
       if (!siliconHasPermission(auth.agent_name, actionPerm, '*')) {
+        logSecurityEvent('silicon_permission_denied', 'alert', { caller_did: req.identity?.did, agent_name: auth.agent_name, capability: actionPerm, error: 'silicon lacks action permission', ip: req.ip });
         return res.status(403).json({ error: 'silicon agent lacks ' + actionPerm + ' permission', agent: auth.agent_name });
       }
     }
@@ -2480,13 +2590,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
     // Check if caller owns it or has delegation
     const callerDid = req.identity.did;
     if (refSecret.did === callerDid) {
-      // Direct ownership — use it
       name = refSecret.name;
       owner_did = null;
     } else {
-      // Check delegation
       const del = db.prepare(`SELECT * FROM demipass_delegations WHERE secret_id = ? AND delegate_did = ? AND status = 'active'`).get(refSecret.id, callerDid);
-      if (!del) return res.status(403).json({ error: 'access denied' }); // same error — no enumeration
+      if (!del) {
+        logSecurityEvent('delegation_denied', 'alert', { caller_did: callerDid, agent_name: auth?.agent_name, capability: ref, error: 'no delegation exists', ip: req.ip, context: { owner_did: refSecret.did } });
+        return res.status(403).json({ error: 'access denied' });
+      }
       name = refSecret.name;
       owner_did = refSecret.did;
     }
@@ -2713,6 +2824,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           let urlHost;
           try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
           if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
+            logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'http_header', target: urlHost, error: 'host not in HTTP whitelist', ip: req.ip, context: { url: effectiveUrl } });
             return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
           }
 
@@ -2738,6 +2850,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           const effectiveUser = target_user || 'claude';
 
           if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
+            logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: 'host not in SSH whitelist', ip: req.ip });
             return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
           }
 
