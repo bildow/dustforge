@@ -2247,7 +2247,7 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
 });
 
 // GET /api/demipass/security-events — security event feed for wallet holders
-app.get('/api/demipass/security-events', rateLimitStandard, (req, res) => {
+app.get('/api/blindkey/security-events', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
   const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
