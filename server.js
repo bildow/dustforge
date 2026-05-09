@@ -1711,6 +1711,46 @@ function logSecurityEvent(event_type, severity, details) {
   } catch (e) { /* never let security logging break the request */ }
 }
 
+// ── [103c] CJL Layer A — Behavioral Surface Logging ──
+// Continuous passive observation. Every DemiPass tool call is a surface reading.
+// The behavioral profile that accumulates here IS the agent's identity over time.
+// See docs/cjl-probe-engine-spec.md and docs/decision-traces/cjl-serendipity-trace-2026-05-09.md
+try { db.exec(`CREATE TABLE IF NOT EXISTS demipass_behavioral_surface (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_did TEXT NOT NULL,
+  agent_name TEXT,
+  action TEXT NOT NULL,
+  capability TEXT,
+  target TEXT,
+  outcome TEXT NOT NULL DEFAULT 'ok' CHECK(outcome IN ('ok', 'denied', 'error', 'timeout')),
+  latency_ms INTEGER,
+  session_id TEXT,
+  context_hash TEXT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dbs_agent ON demipass_behavioral_surface(agent_did)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dbs_action ON demipass_behavioral_surface(action)"); } catch(e) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dbs_created ON demipass_behavioral_surface(created_at)"); } catch(e) {}
+
+function logBehavioralSurface(details) {
+  try {
+    db.prepare(
+      `INSERT INTO demipass_behavioral_surface (agent_did, agent_name, action, capability, target, outcome, latency_ms, session_id, context_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      details.agent_did || null,
+      details.agent_name || null,
+      details.action,
+      details.capability || null,
+      details.target || null,
+      details.outcome || 'ok',
+      details.latency_ms || null,
+      details.session_id || null,
+      details.context_hash || null
+    );
+  } catch (e) { /* never let observation break the request */ }
+}
+
 // ── [104] Barrel Cosign Requests ──
 try { db.exec(`CREATE TABLE IF NOT EXISTS barrel_cosign_requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2242,6 +2282,15 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
     });
   }
 
+  // Layer A: log list call as behavioral surface
+  logBehavioralSurface({
+    agent_did: ownerDid,
+    agent_name: auth?.agent_name,
+    action: oracleMode ? 'list_oracle' : 'list_standard',
+    capability: 'read',
+    outcome: 'ok',
+  });
+
   // Standard mode: human dashboard / admin — includes names and sanitized descriptions
   res.json({ did: ownerDid, secrets: secrets.map(s => ({ ...s, description: sanitizeDescription(s.description) })), total: secrets.length });
 });
@@ -2745,6 +2794,16 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
     db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE status = 'valid' AND expires_at < datetime('now')").run();
     db.prepare("DELETE FROM blindkey_use_tokens WHERE status = 'expired' AND expires_at < datetime('now', '-5 minutes')").run();
 
+    // Layer A: log token request as behavioral surface
+    logBehavioralSurface({
+      agent_did: callerDid,
+      agent_name: getBearerIdentity(req)?.agent_name,
+      action: 'token_request',
+      capability: action,
+      target: target_host || target_url || null,
+      outcome: 'ok',
+    });
+
     res.json({ use_token: token, expires_in_seconds: expiresInSeconds, action, context: contextName, delegated: !!delegation });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -3074,6 +3133,16 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             isSuccess ? '' : (result?.stderr || result?.error || '').slice(0, 200),
             req.identity?.agent_name || '');
       } catch(_) {}
+
+      // Layer A: log use-token execution as behavioral surface
+      logBehavioralSurface({
+        agent_did: req.identity.did,
+        agent_name: req.identity?.agent_name,
+        action: 'use_token',
+        capability: action,
+        target: target_host || target_url || null,
+        outcome: isSuccess ? 'ok' : 'error',
+      });
 
       return res.json({ ok: true, action, via: 'use_token', result });
     } catch (e) {

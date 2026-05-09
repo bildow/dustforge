@@ -92,3 +92,64 @@ When articulation stalls:
 5. Study how the analog achieves antifragility
 6. Map back to the design
 7. The solution should feel like it was always there — you just couldn't see it from inside the current framing
+
+## The Duet Pattern
+
+The methodology is not a solo exercise. The CJL architecture was discovered through a duet — a human designer (Aaron) and a tool (Claude Code) in iterative exchange, each contributing what the other lacks.
+
+### How the duet works
+
+**Round 1 — The human states the problem in raw form.** Aaron: "There's nothing stopping prompt injection of the wallet." No formal framing. Intuition-level concern. The tool can't generate this — it requires lived experience with the system.
+
+**Round 2 — The tool structures the tension space.** Claude Code: five tensions, options per tension, trade-off tables. The human can't easily generate this — it requires exhaustive enumeration and systematic comparison. But structure without insight is just a spreadsheet.
+
+**Round 3 — The human rejects the frame.** Aaron: "Not so sure filter is going to cover it. There has to be some type of active/layered arbitration." The tool proposed regex filters. The human recognized the recursive bandaid and pushed for architectural change.
+
+**Round 4 — The tool builds the new frame.** CJL probe engine spec, five tension topology, ideation + audit rounds. Systematic, thorough, but still an engineering exercise. Magic numbers appear. The solution works but isn't elegant.
+
+**Round 5 — The human sees the spanning insight.** Aaron: "The judgment layer shouldn't probe why. It should probe for gaps in judgment." This reframes the CJL from content evaluation to cognitive state assessment. The tool couldn't make this leap because it was inside the engineering frame.
+
+**Round 6 — The tool applies the methodology.** Strip to first principles. Find the immune analog. Map back. "Don't probe, observe." The five tensions collapse. The tool CAN make this leap once the human has reframed the question.
+
+**Round 7 — The human catches the meta-pattern.** Aaron: "The serendipity potential is the articulation percentage minus 100. Look for the pattern in biology." This isn't about the CJL anymore — it's about the methodology itself. The human sees the pattern of patterns.
+
+**Round 8 — The tool flags its own bias.** "I'm an LLM that finds ideation more stimulating than implementation. I will always want one more round." The human needs this honesty. The tool needs the human to say "stop, build it."
+
+### Why the duet produces serendipity
+
+Neither participant can arrive at the answer alone:
+- The human has intuition and lived experience but can't enumerate systematically
+- The tool has systematic enumeration but can't break its own frame
+- The human breaks the frame; the tool explores the new frame exhaustively
+- The breakthrough lives at the boundary between frame-breaking and frame-exploration
+
+This is the duet. It is not human-directed and not tool-directed. It is a dialogue where each participant's weakness is the other's strength, and the design emerges from the exchange itself.
+
+### The progression of refinement
+
+1. Ideation round — generate options
+2. Audit round — test options for feasibility and effectiveness
+3. Combined ideation + audit round — increasing precision
+4. Hybridized round — merge only the most important portions, discard the rest
+5. Spanning insight detection — which ideas resolve MULTIPLE tensions simultaneously?
+6. Expansion round — does the spanning insight cannibalize/subsume existing architecture?
+7. Integrity check — pathos, ethos, logos. Does scope remain feasible? Does it stand on its own?
+8. Termination check — is more work waste? (Always get a second opinion on this one.)
+
+### Magic numbers are a design smell
+
+If your solution requires arbitrary constants, the serendipity score is telling you to zoom out. Elegant systems derive their parameters from their own structure:
+- Thresholds derive from trust chain depth and historical data
+- Timing derives from session coherence trends
+- Weights derive from which mechanisms catch real attacks
+- Intensity derives from invitation graph topology
+
+No magic numbers means the system tunes itself. That's antifragility — the system gets better under stress because the stress IS the training signal.
+
+### When to stop
+
+The articulation scores converge. The tensions dissolve into projections of one mechanism. Pathos, ethos, and logos are consistent. The scope is feasible. The design stands on its own.
+
+At this point, more ideation is stimulating but not productive. Build it. Collect data. Let the data teach you what's missing. The architecture will evolve from evidence, not from thought experiments.
+
+The methodology is recursive in a healthy way: it produces designs, which produce data, which reveal new tensions, which feed new ideation rounds. The loop is: design → build → observe → ideate. Not: ideate → ideate → ideate.
