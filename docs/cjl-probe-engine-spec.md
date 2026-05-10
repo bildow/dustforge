@@ -348,7 +348,33 @@ On FAIL with canary trip:
 - Human override recording
 - Quarterly review dashboard
 
-### Phase 5: Public Transparency
+### Phase 5: Rotating Jury Pool
+- Random selection from pool of detection functions per evaluation
+- Pool includes: statistical tests, canary checks, behavioral deviation measures
+- Pool composition unpredictable to the agent being evaluated
+- Quorum requirement: all selected jurors must agree, any disagreement escalates to human
+- Lori oversight via jury pool (replaces single ombudsman)
+
+### Phase 6: Deliberation Engine (Platform Layer)
+- Background think cycles studying past behavioral data and attack patterns
+- Output: new detection functions (statistical tests, not LLMs) added to jury pool
+- Expansion/contraction rhythm: ideate on new defenses, audit against real data, merge survivors
+- LLMs write the tests, don't run them — the author, not the judge
+
+### Phase 7: Shadow Engine (Cooperative Quality Control)
+- Studies detection functions the deliberation engine produces
+- Attempts to craft inputs that bypass them (thymic selection)
+- Every bypass becomes training data for next deliberation cycle
+- COOPERATIVE framing, not adversarial — the shadow is the system's self-examination
+- Zero-sum framing is carcinogenic; this is quality control, not competition
+
+### Phase 8: Public Transparency
 - Aggregated, scrubbed probe data API
 - Model comparison dashboard
 - Breach/attempt disclosure feed
+
+## Architectural Note
+
+> See [architecture-shift-2026-05-10.md](architecture-shift-2026-05-10.md)
+
+DemiPass is the kernel. Phases 1-5 belong to DemiPass (standalone). Phases 6-7 belong to the CivitasVox platform (deliberation and shadow engines). Phase 8 bridges both. The modularization line is: DemiPass ships the oracle, behavioral surface, and jury pool. The platform ships the engines that evolve the jury pool.
