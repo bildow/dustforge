@@ -2913,7 +2913,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
           }
 
-          const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[\s;]|&&|\|\|)exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
+          const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[;&]|&&|\|\|)\s*exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
           for (const pat of dangerousPatterns) {
             if (pat.test(command)) return res.status(400).json({ error: 'command contains disallowed pattern' });
           }
@@ -3272,7 +3272,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           /\|\s*(curl|wget|nc|ncat)/i,  // pipe to network tools
           />\s*\/dev\/tcp/,             // bash /dev/tcp exfil
           /\beval\b/,                   // eval
-          /(?:^|[\s;]|&&|\|\|)exec\s/,                   // exec
+          /(?:^|[;&]|&&|\|\|)\s*exec\s/,                   // exec
           /\bsource\b/,                // source
           /\b(curl|wget)\b.*\|/i,      // curl/wget piped
         ];
@@ -3963,7 +3963,7 @@ async function handleRowenDeliver(req, res) {
         if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
           return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
         }
-        const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[\s;]|&&|\|\|)exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
+        const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[;&]|&&|\|\|)\s*exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
         for (const pat of dangerousPatterns) {
           if (pat.test(command)) return res.status(400).json({ error: 'command contains disallowed pattern' });
         }
