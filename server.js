@@ -2211,6 +2211,64 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
   }
 });
 
+// POST /api/blindkey/reveal — reveal a secret value (owner only, requires fingerprint re-auth)
+// This is the ONLY path to see a stored value. It requires the owner to re-authenticate
+// with fingerprint, is rate-limited aggressively, and logs a CRITICAL security event.
+app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+
+  // Silicon agents can NEVER reveal secrets
+  const auth = getBearerIdentity(req);
+  if (auth.silicon) {
+    logSecurityEvent('reveal_blocked_silicon', 'critical', { caller_did: actor.did, agent_name: auth.agent_name, error: 'silicon agent attempted reveal', ip: req.ip });
+    return res.status(403).json({ error: 'silicon agents cannot reveal secrets' });
+  }
+
+  // Require fingerprint auth method on the token
+  if (!auth.fingerprint_hash) {
+    return res.status(403).json({ error: 'reveal requires fingerprint authentication. Re-authenticate with biometrics.' });
+  }
+
+  const { name, ref } = req.body || {};
+  if (!name && !ref) return res.status(400).json({ error: 'name or ref required' });
+
+  // Find the secret
+  let secret;
+  if (ref) {
+    secret = db.prepare('SELECT * FROM blindkey_secrets WHERE ref_code = ? AND did = ? AND status = ?').get(ref, actor.did, 'active');
+  } else {
+    secret = db.prepare('SELECT * FROM blindkey_secrets WHERE name = ? AND did = ? AND status = ?').get(name, actor.did, 'active');
+  }
+  if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
+
+  // Decrypt the value
+  let decrypted;
+  try {
+    decrypted = blindkeyDecrypt(secret.encrypted_value);
+  } catch (e) {
+    return res.status(500).json({ error: 'decryption failed' });
+  }
+
+  // Log CRITICAL security event — someone is viewing a raw secret
+  logSecurityEvent('secret_revealed', 'critical', {
+    caller_did: actor.did,
+    capability: 'reveal',
+    target: secret.name,
+    ip: req.ip,
+    context: { ref: secret.ref_code, fingerprint: auth.fingerprint_hash }
+  });
+
+  // Buoy tick for audit trail
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(actor.did, `secret REVEALED: ${secret.name}`, req.ip || '', 'UTC', 'alert', JSON.stringify(['demipass:reveal', `secret:${secret.name}`]));
+  } catch (e) { /* don't break on tick failure */ }
+
+  res.json({ ok: true, name: secret.name, value: decrypted, revealed_at: new Date().toISOString(),
+    warning: 'This value was shown once. It is logged as a CRITICAL security event.' });
+});
+
 // GET /api/blindkey/list — list secret names and metadata (never values)
 app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);

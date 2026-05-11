@@ -547,6 +547,14 @@ function showDetail(name) {
     h += `</div>`;
   }
 
+  // Reveal section — blind by default, MFA-gated
+  h += `<div id="reveal-section" style="margin-bottom:1rem">`;
+  h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center">`;
+  h += `<div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">Secret value is encrypted and hidden</div>`;
+  h += `<div id="reveal-value" style="display:none;background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:0.75rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;word-break:break-all;color:var(--red)"></div>`;
+  h += `<button onclick="revealSecret('${esc(s.name)}')" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">Reveal (requires biometric)</button>`;
+  h += `</div></div>`;
+
   // Action buttons
   h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
   h += `<button onclick="toggleFreeze('${esc(s.name)}',${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
@@ -610,6 +618,59 @@ async function storeSecret(){const n=document.getElementById('s-name').value.tri
     body.value='';document.getElementById('s-value').value='';
     m.textContent=e.message;m.className='modal-msg err';
   }}
+
+async function revealSecret(name) {
+  const btn = document.getElementById('reveal-btn');
+  const valEl = document.getElementById('reveal-value');
+  btn.textContent = 'Authenticating...';
+  btn.disabled = true;
+
+  // Step 1: re-authenticate with fingerprint to get a fresh token
+  try {
+    // Use the fingerprint auth endpoint to get a fresh fingerprint-authed token
+    const fpRes = await fetch(API + '/api/identity/fingerprint-auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tk },
+    });
+    if (!fpRes.ok) {
+      const err = await fpRes.json().catch(() => ({}));
+      throw new Error(err.error || 'Fingerprint auth failed — re-login with biometrics');
+    }
+    const fpData = await fpRes.json();
+    const fpToken = fpData.token || tk;
+
+    // Step 2: call reveal with the fingerprint-authed token
+    const res = await fetch(API + '/api/blindkey/reveal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + fpToken },
+      body: JSON.stringify({ name }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Reveal failed');
+
+    // Step 3: show the value briefly
+    valEl.textContent = data.value;
+    valEl.style.display = 'block';
+    btn.textContent = 'Revealed — auto-hides in 30s';
+    btn.style.borderColor = 'var(--red)';
+    btn.style.color = 'var(--red)';
+
+    // Auto-hide after 30 seconds
+    setTimeout(() => {
+      valEl.textContent = '';
+      valEl.style.display = 'none';
+      btn.textContent = 'Reveal (requires biometric)';
+      btn.style.borderColor = 'var(--orange)';
+      btn.style.color = 'var(--orange)';
+      btn.disabled = false;
+    }, 30000);
+
+  } catch (e) {
+    btn.textContent = 'Reveal (requires biometric)';
+    btn.disabled = false;
+    alert(e.message);
+  }
+}
 
 async function revokeSecret(name){if(!confirm('Revoke '+name+'?'))return;try{await api('DELETE','/api/demipass/revoke',{name});loadVault()}catch(e){alert(e.message)}}
 
