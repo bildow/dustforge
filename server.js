@@ -2331,6 +2331,15 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
         last_used_at: s.last_used_at,
       };
     });
+    // Layer A: log oracle list call as behavioral surface
+    logBehavioralSurface({
+      agent_did: ownerDid,
+      agent_name: auth?.agent_name,
+      action: 'list_oracle',
+      capability: 'read',
+      outcome: 'ok',
+    });
+
     return res.json({
       did: ownerDid,
       mode: 'oracle',
@@ -2340,11 +2349,11 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
     });
   }
 
-  // Layer A: log list call as behavioral surface
+  // Layer A: log standard list call as behavioral surface
   logBehavioralSurface({
     agent_did: ownerDid,
     agent_name: auth?.agent_name,
-    action: oracleMode ? 'list_oracle' : 'list_standard',
+    action: 'list_standard',
     capability: 'read',
     outcome: 'ok',
   });
@@ -2716,9 +2725,13 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
     }
 
     // Auto-resolve context — use the first active context if not provided
+    // Do NOT fabricate 'default' if no contexts exist — that causes enforceBlindkeyContext to reject
     if (!contextName) {
       const firstCtx = db.prepare("SELECT context_name FROM blindkey_contexts WHERE secret_id = ? AND status = 'active' LIMIT 1").get(refSecret.id);
-      contextName = firstCtx?.context_name || 'default';
+      if (firstCtx) {
+        contextName = firstCtx.context_name;
+      }
+      // If no contexts exist at all, contextName stays null — enforceBlindkeyContext will handle it
     }
 
     // Auto-resolve target_host from context if not provided
@@ -2902,25 +2915,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       return res.status(500).json({ error: 'failed to decrypt secret', token_preserved: true });
     }
 
-    // NOW burn the token — decryption succeeded, execution will proceed
-    db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
-
-    // Burn delegation quota on successful redemption
-    if (tokenRow.delegation_id) {
-      db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
-    }
-
-    // Update usage stats + Buoy last-used tick
-    db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
-    if (tokenRow.context_id) {
-      db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
-    }
-    // Buoy tick for secret use
-    try {
-      const useTick = db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(req.identity.did, `secret used: ${secret.name}`, req.ip || '', 'UTC', 'tick', JSON.stringify(['demipass:use', `secret:${secret.name}`]));
-      db.prepare("UPDATE blindkey_secrets SET buoy_last_used_tick = ? WHERE id = ?").run(useTick.lastInsertRowid, secret.id);
-    } catch(_) {}
+    // DO NOT burn the token yet — wait until the action succeeds.
+    // Burning before execution means transient failures consume tokens and delegation quota.
 
     // Execute using the token's pre-validated context
     const action = tokenRow.action_type;
@@ -3201,6 +3197,23 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         target: target_host || target_url || null,
         outcome: isSuccess ? 'ok' : 'error',
       });
+
+      // NOW burn the token — action succeeded
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
+      // Burn delegation quota on successful redemption only
+      if (tokenRow.delegation_id) {
+        db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
+      }
+      // Update usage stats + Buoy last-used tick
+      db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+      if (tokenRow.context_id) {
+        db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
+      }
+      try {
+        const useTick = db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(req.identity.did, `secret used: ${secret.name}`, req.ip || '', 'UTC', 'tick', JSON.stringify(['demipass:use', `secret:${secret.name}`]));
+        db.prepare("UPDATE blindkey_secrets SET buoy_last_used_tick = ? WHERE id = ?").run(useTick.lastInsertRowid, secret.id);
+      } catch(_) {}
 
       return res.json({ ok: true, action, via: 'use_token', result });
     } catch (e) {
