@@ -276,10 +276,17 @@
 <div id="modal-store" class="modal-bg" onclick="if(event.target===this)closeModal()">
   <div class="modal-sheet">
     <h3>Store a Secret</h3>
-    <label>Name</label><input type="text" id="s-name" placeholder="e.g. OPENROUTER_KEY">
-    <label>Value</label><input type="password" id="s-value" placeholder="The secret value">
+    <label>Name</label><input type="text" id="s-name" placeholder="e.g. RackNerd SSH">
     <label>Type</label>
-    <select id="s-type"><option value="api_key">API Key</option><option value="password">Password</option><option value="token">Token</option><option value="other">Other</option></select>
+    <select id="s-type" onchange="updateStoreFields()"><option value="password">Password / Login</option><option value="api_key">API Key</option><option value="token">Token</option><option value="ssh_key">SSH Key</option><option value="other">Other</option></select>
+    <div id="s-login-fields">
+      <label>Username / Email</label><input type="text" id="s-username" placeholder="e.g. root or admin@example.com">
+      <label>Password</label><input type="password" id="s-value" placeholder="The secret value">
+    </div>
+    <div id="s-key-fields" style="display:none">
+      <label>Key / Value</label><input type="password" id="s-key-value" placeholder="API key, token, or secret value">
+    </div>
+    <label>URL / Host (optional)</label><input type="text" id="s-host" placeholder="e.g. 192.3.84.103 or api.example.com">
     <label>Expires in (optional)</label>
     <input type="text" id="s-expires" placeholder="e.g. 30d, 90d, or leave blank">
     <div id="s-msg" class="modal-msg"></div>
@@ -502,6 +509,7 @@ function showDetail(name) {
   // Info grid
   h += `<div style="background:var(--card);border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.8rem">`;
   h += `<div style="color:var(--text3)">Ref Code</div><div style="font-family:monospace;font-size:0.7rem;margin-bottom:0.5rem;color:var(--accent)">${esc(s.ref||'none')}</div>`;
+  if(s.description) h += `<div style="color:var(--text2);margin-bottom:0.5rem;font-size:0.85rem">${esc(s.description)}</div>`;
   h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem">`;
   h += `<div><span style="color:var(--text3)">Type:</span> ${esc(s.type)}</div>`;
   h += `<div><span style="color:var(--text3)">Uses:</span> ${s.use_count}</div>`;
@@ -599,23 +607,63 @@ async function loadBuoy(){
   else{let h='';for(const t of tr){h+=`<div class="activity-item"><div class="activity-top"><span class="activity-type" style="color:${t.status==='armed'?'var(--green)':'var(--text3)'}">${esc(t.name)}</span><span class="activity-time">${t.status}</span></div><div class="activity-detail">fires: ${new Date(t.fire_at).toLocaleString()}</div></div>`}
   document.getElementById('trigger-list').innerHTML=h}}catch{}}
 
+// Store field toggling based on type
+function updateStoreFields() {
+  const t = document.getElementById('s-type').value;
+  const loginFields = document.getElementById('s-login-fields');
+  const keyFields = document.getElementById('s-key-fields');
+  if (t === 'password') {
+    loginFields.style.display = 'block';
+    keyFields.style.display = 'none';
+  } else {
+    loginFields.style.display = 'none';
+    keyFields.style.display = 'block';
+  }
+}
+
 // Actions
-async function storeSecret(){const n=document.getElementById('s-name').value.trim(),v=document.getElementById('s-value').value,t=document.getElementById('s-type').value,exp=document.getElementById('s-expires').value.trim(),m=document.getElementById('s-msg');
+async function storeSecret(){
+  const n = document.getElementById('s-name').value.trim();
+  const t = document.getElementById('s-type').value;
+  const exp = document.getElementById('s-expires').value.trim();
+  const host = document.getElementById('s-host').value.trim();
+  const username = document.getElementById('s-username')?.value.trim() || '';
+  const m = document.getElementById('s-msg');
+
+  // Get value from the right field based on type
+  let v;
+  if (t === 'password') {
+    v = document.getElementById('s-value').value;
+  } else {
+    v = document.getElementById('s-key-value').value;
+  }
+
   if(!n||!v){m.textContent='Name and value required';m.className='modal-msg err';return}
-  const body={name:n,value:v,secret_type:t};if(exp)body.expires_in=exp;
+
+  // Build description from username + host
+  let desc = '';
+  if (username) desc += username;
+  if (host) desc += (desc ? ' @ ' : '') + host;
+
+  const body = { name: n, value: v, secret_type: t };
+  if (exp) body.expires_in = exp;
+  if (desc) body.description = desc;
+
   try{
     const r=await api('POST','/api/demipass/store',body);
     // PURGE: zero the secret from all in-memory locations after confirmed storage
     body.value='';
     document.getElementById('s-value').value='';
-    // Overwrite the JS string reference (best effort — JS doesn't guarantee memory zeroing)
-    for(let i=0;i<v.length;i++){v[i]='\0'} // no-op on immutable strings, but signals intent
+    if(document.getElementById('s-key-value')) document.getElementById('s-key-value').value='';
+    document.getElementById('s-username').value='';
+    document.getElementById('s-host').value='';
     m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');
     m.className='modal-msg ok';
     loadVault();setTimeout(closeModal,1200);
   }catch(e){
     // PURGE on failure too — don't leave the secret in memory after an error
     body.value='';document.getElementById('s-value').value='';
+    if(document.getElementById('s-key-value')) document.getElementById('s-key-value').value='';
     m.textContent=e.message;m.className='modal-msg err';
   }}
 
