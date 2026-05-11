@@ -198,13 +198,23 @@
     </div>
   </div>
 
-  <!-- Page: Activity -->
+  <!-- Page: Activity (Event Feed) -->
   <div id="page-activity" class="page">
     <div class="section" style="padding-top:1rem">
       <div class="section-head">
-        <span class="section-title">Recent Activity</span>
-        <button class="btn-ghost" onclick="loadActivity()">Refresh</button>
+        <span class="section-title">Event Feed</span>
+        <div style="display:flex;gap:0.4rem">
+          <select id="feed-filter" onchange="loadActivity()" style="padding:0.3rem;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem">
+            <option value="all">All Events</option>
+            <option value="uses">Uses Only</option>
+            <option value="security">Security</option>
+            <option value="stores">Stores</option>
+          </select>
+          <button class="btn-ghost" onclick="loadActivity()" style="font-size:0.7rem">Refresh</button>
+        </div>
       </div>
+      <!-- Security alerts banner -->
+      <div id="security-banner" style="display:none;background:rgba(224,108,117,0.1);border:1px solid rgba(224,108,117,0.3);border-radius:8px;padding:0.6rem;margin-bottom:0.75rem;font-size:0.8rem;color:var(--red)"></div>
       <div id="activity-list"><div class="empty">Loading...</div></div>
     </div>
   </div>
@@ -590,12 +600,87 @@ async function toggleFreeze(name, freeze){
 }
 
 async function loadActivity(){
-  try{const h=await api('GET','/api/demipass/history?limit=20');const ev=h.events||h.history||[];
-  if(!ev.length){document.getElementById('activity-list').innerHTML='<div class="empty">No activity yet</div>';return}
-  let html='';for(const e of ev){let det=e.detail||'';try{det=typeof det==='string'?JSON.parse(det):det}catch{}
-  const sum=typeof det==='object'?(det.name||det.secret_name||det.message||JSON.stringify(det).slice(0,60)):String(det).slice(0,60);
-  html+=`<div class="activity-item"><div class="activity-top"><span class="activity-type">${esc(e.event_type||'event')}</span><span class="activity-time">${new Date(e.created_at).toLocaleTimeString()}</span></div><div class="activity-detail">${esc(sum)}</div></div>`}
-  document.getElementById('activity-list').innerHTML=html}catch{document.getElementById('activity-list').innerHTML='<div class="empty">Could not load</div>'}}
+  const filter = document.getElementById('feed-filter')?.value || 'all';
+  const list = document.getElementById('activity-list');
+  const banner = document.getElementById('security-banner');
+  let allEvents = [];
+
+  // Pull from multiple sources in parallel
+  try {
+    const [historyRes, securityRes] = await Promise.allSettled([
+      api('GET', '/api/demipass/history?limit=30'),
+      api('GET', '/api/blindkey/security-events?limit=20'),
+    ]);
+
+    // History events
+    if (historyRes.status === 'fulfilled') {
+      const ev = historyRes.value.events || historyRes.value.history || [];
+      for (const e of ev) {
+        let det = e.detail || '';
+        try { det = typeof det === 'string' ? JSON.parse(det) : det } catch {}
+        const sum = typeof det === 'object' ? (det.name || det.secret_name || det.action || JSON.stringify(det).slice(0, 60)) : String(det).slice(0, 60);
+        allEvents.push({
+          type: e.event_type || 'event',
+          detail: sum,
+          time: new Date(e.created_at),
+          severity: 'info',
+          source: 'history',
+        });
+      }
+    }
+
+    // Security events
+    if (securityRes.status === 'fulfilled') {
+      const se = securityRes.value.events || [];
+      const critCount = se.filter(e => e.severity === 'critical' || e.severity === 'alert').length;
+      if (critCount > 0) {
+        banner.style.display = 'block';
+        banner.innerHTML = critCount + ' security alert' + (critCount > 1 ? 's' : '') + ' detected';
+      } else {
+        banner.style.display = 'none';
+      }
+      for (const e of se) {
+        allEvents.push({
+          type: e.event_type,
+          detail: (e.agent_name ? e.agent_name + ': ' : '') + (e.error_detail || e.capability_requested || ''),
+          time: new Date(e.created_at),
+          severity: e.severity,
+          source: 'security',
+          target: e.target,
+        });
+      }
+    }
+  } catch (err) {
+    list.innerHTML = '<div class="empty">Could not load: ' + esc(err.message) + '</div>';
+    return;
+  }
+
+  // Filter
+  if (filter === 'uses') allEvents = allEvents.filter(e => e.type.includes('use') || e.type.includes('redeem'));
+  else if (filter === 'security') allEvents = allEvents.filter(e => e.source === 'security');
+  else if (filter === 'stores') allEvents = allEvents.filter(e => e.type.includes('store') || e.type.includes('ingest'));
+
+  // Sort by time descending
+  allEvents.sort((a, b) => b.time - a.time);
+
+  if (!allEvents.length) { list.innerHTML = '<div class="empty">No events match filter</div>'; return }
+
+  let html = '';
+  for (const e of allEvents.slice(0, 40)) {
+    const sevColor = e.severity === 'critical' ? 'var(--red)' : e.severity === 'alert' ? 'var(--orange)' : e.severity === 'warn' ? 'var(--yellow)' : 'var(--text3)';
+    const typeColor = e.source === 'security' ? sevColor : 'var(--accent)';
+    html += '<div class="activity-item">';
+    html += '<div class="activity-top">';
+    html += '<span class="activity-type" style="color:' + typeColor + '">' + esc(e.type) + '</span>';
+    html += '<span class="activity-time">' + e.time.toLocaleTimeString() + '</span>';
+    html += '</div>';
+    html += '<div class="activity-detail">' + esc(e.detail);
+    if (e.target) html += ' <span style="color:var(--text3)">→ ' + esc(e.target) + '</span>';
+    html += '</div>';
+    html += '</div>';
+  }
+  list.innerHTML = html;
+}
 
 async function loadBuoy(){
   try{const d=await api('GET','/api/tick/ledger?limit=15');const ticks=d.ticks||[];
