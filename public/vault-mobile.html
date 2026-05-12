@@ -576,7 +576,6 @@ function showDetail(name) {
   // Action buttons
   h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
   h += `<button onclick="toggleFreeze('${esc(s.name)}',${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
-  if(s.rotatable && !s.frozen) h += `<button onclick="alert('Rotation coming soon')" style="flex:1;padding:0.7rem;border:1px solid var(--yellow);background:none;border-radius:8px;color:var(--yellow);font-weight:600;font-size:0.8rem;cursor:pointer">Rotate</button>`;
   h += `<button onclick="revokeSecret('${esc(s.name)}')" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Revoke</button>`;
   h += `</div>`;
 
