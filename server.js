@@ -2190,6 +2190,17 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       db.prepare("UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?").run(refCode, stored.id);
     }
 
+    // Auto-create a default context so the secret is immediately usable.
+    // Without this, secrets stored via the app have no context and can't get tokens.
+    const existingCtx = db.prepare('SELECT id FROM blindkey_contexts WHERE secret_id = ?').get(stored.id);
+    if (!existingCtx) {
+      const typeToAction = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
+      const defaultAction = typeToAction[resolvedType] || 'http_header';
+      db.prepare(
+        "INSERT OR IGNORE INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, 'default', ?, '*', '*', ?)"
+      ).run(stored.id, defaultAction, req.identity.did);
+    }
+
     // Buoy ingestion tick — anchor this deposit in the tick chain
     let buoyTickId = null;
     try {
@@ -10462,6 +10473,12 @@ app.post('/api/blindkey/freeze', rateLimitStandard, (req, res) => {
   } catch(_) {}
 
   res.json({ ok: true, name: secret.name, frozen: !!frozen });
+});
+
+// Alias: /api/demipass/freeze → /api/blindkey/freeze (mobile app uses demipass namespace)
+app.post('/api/demipass/freeze', rateLimitStandard, (req, res) => {
+  req.url = '/api/blindkey/freeze';
+  app.handle(req, res);
 });
 
 // POST /api/demipass/outcome — record a use-token outcome (success/failure)
