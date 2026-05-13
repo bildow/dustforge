@@ -2842,12 +2842,16 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   }
 
   try {
-    // Concurrent token limit: only one active (non-expired, non-used) token per secret per DID
+    // Concurrent token limit: max 5 active (non-expired, non-used) tokens per secret per DID.
+    // Security boundary is the 30s TTL + single-use, not the count.
+    // 5 concurrent allows multi-command SSH workflows without cooldown waits.
+    const MAX_CONCURRENT_TOKENS = 5;
     const outstanding = db.prepare(
       "SELECT COUNT(*) as n FROM blindkey_use_tokens WHERE did = ? AND secret_id = ? AND status = 'valid' AND expires_at > datetime('now')"
     ).get(callerDid, secret.id);
-    if (outstanding && outstanding.n > 0) {
-      return res.status(429).json({ error: 'concurrent token limit: you already have an active token for this secret. Wait for it to expire (30s) or redeem it first.' });
+    if (outstanding && outstanding.n >= MAX_CONCURRENT_TOKENS) {
+      logSecurityEvent('concurrent_token_limit', 'warn', { caller_did: callerDid, capability: action, target: target_host || target_url, error: `${outstanding.n} active tokens`, ip: req.ip });
+      return res.status(429).json({ error: `concurrent token limit (${MAX_CONCURRENT_TOKENS}): wait for active tokens to expire or redeem them.` });
     }
 
     // The token references the OWNER's secret — the delegate never sees the value
