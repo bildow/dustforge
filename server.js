@@ -286,6 +286,17 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN recovery_email TEXT DEFAU
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_narrative TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN silicon_ssn TEXT DEFAULT ''"); } catch(_) {}
 
+try { db.exec(`CREATE TABLE IF NOT EXISTS device_auth (
+  device_code TEXT PRIMARY KEY,
+  user_code TEXT NOT NULL,
+  agent_label TEXT,
+  scope TEXT DEFAULT 'read',
+  status TEXT DEFAULT 'pending',
+  approved_did TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL
+)`); } catch (e) { console.error('device_auth table:', e.message); }
+
 try { db.exec(`CREATE TABLE IF NOT EXISTS refresh_tokens (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
@@ -416,6 +427,14 @@ app.get('/api/health', (req, res) => {
 // ============================================================
 // API — Identity
 // ============================================================
+
+// ── Device-authorization helpers (gh/claude-style) ───────────────────────────
+const DEVICE_CODE_TTL_MIN = 15;
+function _genUserCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no ambiguous chars
+  const pick = n => Array.from({length:n}, () => A[require('crypto').randomInt(A.length)]).join('');
+  return pick(4) + '-' + pick(4);
+}
 
 // ── Refresh-token helpers (OAuth-style) ──────────────────────────────────────
 const REFRESH_TTL_DAYS = 90;
@@ -4685,6 +4704,85 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
 });
 
 // POST /api/identity/request-account — silicon requests account, carbon gets payment link
+// ── Device authorization (approve a new agent without sharing a password) ────
+// POST /api/identity/device/code — agent starts the flow, gets a user_code to show.
+app.post('/api/identity/device/code', rateLimitStandard, (req, res) => {
+  const { agent_label = '', scope = 'read' } = req.body || {};
+  if (typeof scope !== 'string') return res.status(400).json({ error: 'scope must be a string' });
+  const device_code = 'dpd_' + require('crypto').randomBytes(32).toString('base64url');
+  let user_code = _genUserCode();
+  // ensure user_code uniqueness among pending
+  for (let n = 0; n < 5; n++) {
+    const clash = db.prepare("SELECT 1 FROM device_auth WHERE user_code = ? AND status = 'pending'").get(user_code);
+    if (!clash) break; user_code = _genUserCode();
+  }
+  const expires_at = new Date(Date.now() + DEVICE_CODE_TTL_MIN*60*1000).toISOString();
+  db.prepare('INSERT INTO device_auth (device_code, user_code, agent_label, scope, expires_at) VALUES (?,?,?,?,?)')
+    .run(device_code, user_code, String(agent_label).slice(0,80), scope, expires_at);
+  res.json({
+    ok: true, device_code, user_code,
+    verification_url: 'https://demipass.com/device',
+    verification_url_complete: 'https://demipass.com/device?code=' + encodeURIComponent(user_code),
+    interval: 5, expires_in: DEVICE_CODE_TTL_MIN*60,
+  });
+});
+
+// POST /api/identity/device/token — agent polls; returns tokens once approved.
+app.post('/api/identity/device/token', rateLimitStandard, (req, res) => {
+  const { device_code } = req.body || {};
+  if (!device_code || typeof device_code !== 'string') return res.status(400).json({ error: 'device_code required' });
+  const row = db.prepare('SELECT * FROM device_auth WHERE device_code = ?').get(device_code);
+  if (!row) return res.status(400).json({ error: 'invalid device_code' });
+  if (new Date(row.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'expired_token' });
+  if (row.status === 'pending') return res.status(428).json({ error: 'authorization_pending' });
+  if (row.status === 'denied') return res.status(403).json({ error: 'access_denied' });
+  if (row.status === 'claimed') return res.status(400).json({ error: 'already_claimed' });
+  // approved → mint access + refresh for the approving DID, mark claimed (one-time)
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(row.approved_did);
+  if (!wallet) return res.status(404).json({ error: 'approver identity not found' });
+  let token;
+  try {
+    token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+      scope: row.scope, expiresIn: '24h',
+      metadata: { email: wallet.email, username: wallet.username, auth_method: 'device', agent_label: row.agent_label },
+    });
+  } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
+  const rf = issueRefreshToken(wallet.did, row.scope);
+  db.prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ?").run(device_code);
+  res.json({ ok: true, token, refresh_token: rf.refresh_token, refresh_expires_at: rf.refresh_expires_at,
+    did: wallet.did, scope: row.scope, email: wallet.email, auth_method: 'device', agent_label: row.agent_label });
+});
+
+// GET /api/identity/device/pending?user_code=XXXX-XXXX — approval page looks up the request.
+app.get('/api/identity/device/pending', rateLimitStandard, (req, res) => {
+  const uc = (req.query.user_code || '').toString().toUpperCase().trim();
+  if (!uc) return res.status(400).json({ error: 'user_code required' });
+  const row = db.prepare("SELECT user_code, agent_label, scope, status, created_at, expires_at FROM device_auth WHERE user_code = ? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(uc);
+  if (!row) return res.status(404).json({ error: 'no pending request for that code' });
+  if (new Date(row.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'expired' });
+  res.json({ ok: true, ...row });
+});
+
+// POST /api/identity/device/approve — the OPERATOR approves/denies. Requires their bearer token.
+app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
+  const { user_code, decision = 'approve' } = req.body || {};
+  if (!user_code) return res.status(400).json({ error: 'user_code required' });
+  const auth = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!auth) return res.status(401).json({ error: 'operator bearer token required to approve' });
+  const v = identity.verifyTokenStandalone(auth);
+  if (!v.valid) return res.status(401).json({ error: 'invalid operator token' });
+  const approverDid = v.decoded && v.decoded.sub;
+  if (!approverDid) return res.status(401).json({ error: 'operator token has no DID' });
+  const uc = user_code.toString().toUpperCase().trim();
+  const row = db.prepare("SELECT * FROM device_auth WHERE user_code = ? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(uc);
+  if (!row) return res.status(404).json({ error: 'no pending request for that code' });
+  if (new Date(row.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'expired' });
+  const status = decision === 'deny' ? 'denied' : 'approved';
+  db.prepare('UPDATE device_auth SET status = ?, approved_did = ? WHERE device_code = ?')
+    .run(status, status === 'approved' ? approverDid : null, row.device_code);
+  res.json({ ok: true, decision: status, user_code: uc, agent_label: row.agent_label, scope: row.scope });
+});
+
 // POST /api/identity/refresh — swap a valid refresh token for a fresh access token.
 // Single-use rotation: each refresh returns a NEW refresh token and revokes the old one.
 app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
