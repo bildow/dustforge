@@ -286,6 +286,18 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN recovery_email TEXT DEFAU
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_narrative TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN silicon_ssn TEXT DEFAULT ''"); } catch(_) {}
 
+try { db.exec(`CREATE TABLE IF NOT EXISTS refresh_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  scope TEXT DEFAULT 'read',
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  revoked INTEGER DEFAULT 0,
+  last_used_at TEXT,
+  rotated_to TEXT
+)`); } catch (e) { console.error('refresh_tokens table:', e.message); }
+
 db.exec(`CREATE TABLE IF NOT EXISTS identity_2fa_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
@@ -404,6 +416,30 @@ app.get('/api/health', (req, res) => {
 // ============================================================
 // API — Identity
 // ============================================================
+
+// ── Refresh-token helpers (OAuth-style) ──────────────────────────────────────
+const REFRESH_TTL_DAYS = 90;
+function _refreshHash(t) { return require('crypto').createHash('sha256').update(t).digest('hex'); }
+function issueRefreshToken(did, scope) {
+  const raw = 'dpr_' + require('crypto').randomBytes(32).toString('base64url');
+  const exp = new Date(Date.now() + REFRESH_TTL_DAYS*24*3600*1000).toISOString();
+  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at) VALUES (?,?,?,?)')
+    .run(did, _refreshHash(raw), scope || 'read', exp);
+  return { refresh_token: raw, refresh_expires_at: exp };
+}
+// Validate + single-use rotate: returns {did, scope} or null. Old token is revoked + linked to new.
+function consumeRefreshToken(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const row = db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?').get(_refreshHash(raw));
+  if (!row) return null;
+  if (row.revoked) return null;
+  if (new Date(row.expires_at).getTime() < Date.now()) return null;
+  return { id: row.id, did: row.did, scope: row.scope };
+}
+function revokeRefreshToken(id, rotatedToRaw) {
+  db.prepare('UPDATE refresh_tokens SET revoked = 1, last_used_at = datetime(\'now\'), rotated_to = ? WHERE id = ?')
+    .run(rotatedToRaw ? _refreshHash(rotatedToRaw) : null, id);
+}
 
 app.post('/api/identity/create', async (req, res) => {
   const { username, password, key, referral_code } = req.body || {};
@@ -4589,10 +4625,15 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
       req.end();
     });
     if (storedPassword === null) {
-      // Stalwart lookup failed — FAIL CLOSED, never issue token without password verification
-      return res.status(503).json({ error: 'password verification temporarily unavailable' });
-    }
-    if (storedPassword !== password) {
+      if (wallet.password_hash) {
+        const inputHash = require('crypto').createHash('sha256').update(password).digest('hex');
+        if (inputHash !== wallet.password_hash) {
+          return res.status(401).json({ error: 'invalid password' });
+        }
+      } else {
+        return res.status(503).json({ error: 'password verification temporarily unavailable' });
+      }
+    } else if (storedPassword !== password) {
       return res.status(401).json({ error: 'invalid password' });
     }
   } catch(e) {
@@ -4638,10 +4679,44 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
     scope, expiresIn: expires_in,
     metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash },
   });
-  res.json({ ok: true, token, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
+  // REFRESH: issue alongside access token so agents never hit the hour-25 wall
+  const _rf = issueRefreshToken(wallet.did, scope);
+  res.json({ ok: true, token, refresh_token: _rf.refresh_token, refresh_expires_at: _rf.refresh_expires_at, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
 });
 
 // POST /api/identity/request-account — silicon requests account, carbon gets payment link
+// POST /api/identity/refresh — swap a valid refresh token for a fresh access token.
+// Single-use rotation: each refresh returns a NEW refresh token and revokes the old one.
+app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
+  const { refresh_token, expires_in = '24h' } = req.body || {};
+  if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
+  const rec = consumeRefreshToken(refresh_token);
+  if (!rec) return res.status(401).json({ error: 'invalid, expired, or revoked refresh token' });
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(rec.did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  let token;
+  try {
+    token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+      scope: rec.scope, expiresIn: expires_in,
+      metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh' },
+    });
+  } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
+  // Rotate: issue new refresh token, revoke the consumed one (linked for audit)
+  const nrf = issueRefreshToken(wallet.did, rec.scope);
+  revokeRefreshToken(rec.id, nrf.refresh_token);
+  res.json({ ok: true, token, refresh_token: nrf.refresh_token, refresh_expires_at: nrf.refresh_expires_at, did: wallet.did, scope: rec.scope, email: wallet.email, auth_method: 'refresh' });
+});
+
+// POST /api/identity/refresh/revoke — revoke a refresh token (logout / compromise)
+app.post('/api/identity/refresh/revoke', rateLimitStandard, (req, res) => {
+  const { refresh_token } = req.body || {};
+  if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
+  const rec = consumeRefreshToken(refresh_token);
+  if (!rec) return res.json({ ok: true, revoked: false, note: 'token already invalid' });
+  revokeRefreshToken(rec.id, null);
+  res.json({ ok: true, revoked: true });
+});
+
 app.post('/api/identity/request-account', rateLimitStrict, async (req, res) => {
   const { username, password, carbon_email, referral_code } = req.body || {};
   if (!username || !password || !carbon_email) return res.status(400).json({ error: 'username, password, and carbon_email required' });
