@@ -4637,7 +4637,7 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
         path: '/api/principal/' + encodeURIComponent(wallet.username),
         method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
         let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
       });
       req.on('error', () => resolve(null));
       req.setTimeout(5000, () => { req.destroy(); resolve(null); });
@@ -6585,7 +6585,7 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, fingerprint
         path: '/api/principal/' + encodeURIComponent(wallet.username),
         method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
         let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
       });
       req.on('error', () => resolve(null));
       req.setTimeout(5000, () => { req.destroy(); resolve(null); });
@@ -6683,7 +6683,7 @@ app.post('/api/identity/auth-critical', rateLimitStandard, async (req, res) => {
         path: '/api/principal/' + encodeURIComponent(wallet.username),
         method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
         let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
       });
       req.on('error', () => resolve(null));
       req.setTimeout(5000, () => { req.destroy(); resolve(null); });
