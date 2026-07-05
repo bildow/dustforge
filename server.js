@@ -7600,7 +7600,7 @@ function computeTickHash(tickId, did, note, tz, time, prevHash, tickType, refTic
 app.post('/api/tick', (req, res) => {
   const { note = '', tz = 'UTC', type = 'tick', ref_tick = null, tags = [] } = req.body || {};
   const noteClean = String(note).slice(0, 300);
-  const validTypes = ['tick', 'begin', 'complete', 'handoff', 'audit', 'decision', 'block', 'unblock', 'alert'];
+  const validTypes = ['tick', 'begin', 'complete', 'handoff', 'audit', 'decision', 'block', 'unblock', 'alert', 'soul'];
   const tickType = validTypes.includes(type) ? type : 'tick';
   const tagsClean = Array.isArray(tags) ? JSON.stringify(tags.slice(0, 10).map(t => String(t).slice(0, 50))) : '[]';
 
@@ -7617,10 +7617,15 @@ app.post('/api/tick', (req, res) => {
     if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day', onboard: 'https://demipass.com', note: 'Create a free identity for unlimited signed ticks.' });
   }
 
-  // Bill member tick (1 DD per tick)
+  // Bill member tick (1 DD per tick) — free lanes: soul-integrity ticks + first-party infra (Kodiak).
   if (isMember) {
-    const debit = billing.deductBalance(db, did, 1, 'tick', noteClean.slice(0, 50) || 'tick');
-    if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents });
+    const isSoulTick = (tickType === 'soul') && SOUL_DIDS.has(did);
+    const isFirstPartyComp = FIRSTPARTY_DIDS.has(did) && /^kodiak:/i.test(noteClean);
+    if (!isSoulTick && !isFirstPartyComp) {
+      const debit = billing.deductBalance(db, did, 1, 'tick', noteClean.slice(0, 50) || 'tick');
+      if (!debit.ok) { notifyLowBalance(did, debit.balance_cents, 'tick rejected - insufficient balance'); return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents }); }
+      if (typeof debit.balance_after === 'number' && debit.balance_after <= LOW_BALANCE_CENTS) notifyLowBalance(did, debit.balance_after, 'balance low');
+    }
   }
 
   const now = new Date();
@@ -8340,6 +8345,27 @@ app.post('/api/buoy/probe', (req, res) => {
 
 const CONDUIT_URL = process.env.CONDUIT_URL || 'http://100.69.1.78:8080';
 const CONDUIT_CARBON_TOKEN = process.env.CONDUIT_CARBON_TOKEN || '';
+// Free-tick lanes + low-balance alerting (Aaron 2026-07-04): a systemic integrity pulse and first-party infra must never be starved by a metered wallet.
+const SOUL_DIDS = new Set((process.env.SOUL_DIDS || '').split(',').map(function(x){return x.trim();}).filter(Boolean));
+const FIRSTPARTY_DIDS = new Set((process.env.FIRSTPARTY_DIDS || 'did:key:u7QGkcLsNaXM-_aJLhtMuNwfZT4xDl23kZFohcAfOHfwEQg').split(',').map(function(x){return x.trim();}).filter(Boolean));
+const LOW_BALANCE_CENTS = Number(process.env.LOW_BALANCE_CENTS || 100);
+let _lastLowBalanceAlert = 0;
+function notifyLowBalance(did, balance_cents, reason) {
+  try {
+    console.warn('[buoy] LOW BALANCE ' + reason + ': ' + did + ' = ' + balance_cents + 'c');
+    if (!CONDUIT_CARBON_TOKEN) return;
+    const nowMs = new Date().getTime();
+    if (nowMs - _lastLowBalanceAlert < 3600000) return;
+    _lastLowBalanceAlert = nowMs;
+    const bal = (Number(balance_cents) / 100).toFixed(2);
+    fetch(CONDUIT_URL + '/api/messages/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONDUIT_CARBON_TOKEN },
+      body: JSON.stringify({ sender: 'buoy', body: '[Buoy ALERT] ' + reason + ': wallet ' + String(did).slice(0,24) + ' balance ' + bal + ' USD. Top up to keep the heartbeat alive.', metadata: { alert: 'low_balance', did: did, balance_cents: balance_cents, reason: reason } }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(function(err){ console.error('[buoy low-balance alert] relay failed: ' + err.message); });
+  } catch (e) { console.error('[buoy low-balance alert] error: ' + e.message); }
+}
 const BUOY_NOTIFY_TYPES = new Set(['alert', 'handoff', 'block', 'unblock', 'decision']);
 
 function buoyNotifyConduit(tick) {
