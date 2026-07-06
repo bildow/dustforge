@@ -1,0 +1,8 @@
+[Unit]
+Description=Dustforge relay poller — forward Stalwart inbox mail via /api/relay/forward
+After=network-online.target dustforge.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/dustforge/scripts/relay-poller.py
+User=root

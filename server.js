@@ -743,7 +743,17 @@ app.post('/api/identity/request-2fa', (req, res) => {
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
   db.prepare('INSERT INTO identity_2fa_codes (did, code, expires_at) VALUES (?, ?, ?)').run(did, code, expiresAt);
   console.log(`[2fa] ${wallet.username}: ${code} (expires ${expiresAt})`);
-  res.json({ ok: true, expires_in: 600 });
+  if (wallet.email) {
+    const t = createEmailTransport();
+    t.sendMail({
+      from: 'noreply@dustforge.com',
+      to: wallet.email,
+      subject: 'Your Dustforge 2FA code',
+      text: `Your 2FA code is ${code}. It expires in 10 minutes.\n\nIf you did not request this code, ignore this message.`,
+    }).then(() => console.log(`[2fa] code emailed to ${wallet.email}`))
+      .catch(e => console.error(`[2fa] email to ${wallet.email} failed: ${e.message}`));
+  }
+  res.json({ ok: true, expires_in: 600, emailed: Boolean(wallet.email) });
 });
 
 app.post('/api/identity/verify', (req, res) => {
