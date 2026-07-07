@@ -2,11 +2,11 @@
 # backup-all.sh — every 12h, racknerd-orchestrated. Two independent-box copies of
 # everything stateful, so no single machine's death loses data.
 #
-#   dustforge (db + config)  -> racknerd:/opt/backups  AND  mail:/opt/dustforge-backups
+#   dustforge (db + config)  -> racknerd:/opt/backups  AND  prism:/opt/dustforge-backups
 #   stalwart  (all mail data)-> racknerd:/opt/backups   (the OFF-phasewhip copy —
 #                                                        this is "don't lose everyone's email")
 #
-# Complements the daily incus snapshot of the mail container (full consistent
+# Complements the daily incus snapshot of the prism container (full consistent
 # on-box point-in-time). Code is NOT here — it's in git (mirrored separately).
 set -uo pipefail
 
@@ -26,9 +26,9 @@ if sqlite3 /opt/dustforge/data/dustforge.db ".backup '$WORK/dustforge.db'"; then
   ( cd /opt/dustforge && git rev-parse HEAD; git status -sb | head -1 ) > "$WORK/deployed-commit.txt" 2>/dev/null || true
   DF="dustforge-$STAMP.tar.gz"
   tar czf "$DEST/$DF" -C "$WORK" dustforge.db env relay-poller.env deployed-commit.txt 2>/dev/null
-  # second home: the mail container
+  # second home: the prism container
   if scp $SSH_OPTS "$DEST/$DF" "apple@$PHASEWHIP:/tmp/$DF"; then
-    ssh $SSH_OPTS "apple@$PHASEWHIP" "sudo incus exec mail -- mkdir -p /opt/dustforge-backups && sudo incus file push /tmp/$DF mail/opt/dustforge-backups/$DF && rm -f /tmp/$DF && sudo incus exec mail -- sh -c 'cd /opt/dustforge-backups && ls -1t dustforge-*.tar.gz | tail -n +$((KEEP+1)) | xargs -r rm -f'" || { echo "[backup] WARN: dustforge->container push failed"; fail=1; }
+    ssh $SSH_OPTS "apple@$PHASEWHIP" "sudo incus exec prism -- mkdir -p /opt/dustforge-backups && sudo incus file push /tmp/$DF prism/opt/dustforge-backups/$DF && rm -f /tmp/$DF && sudo incus exec prism -- sh -c 'cd /opt/dustforge-backups && ls -1t dustforge-*.tar.gz | tail -n +$((KEEP+1)) | xargs -r rm -f'" || { echo "[backup] WARN: dustforge->container push failed"; fail=1; }
   else echo "[backup] WARN: dustforge scp to phasewhip failed"; fail=1; fi
 else echo "[backup] ERROR: dustforge .backup failed"; fail=1; fi
 
@@ -36,7 +36,7 @@ else echo "[backup] ERROR: dustforge .backup failed"; fail=1; fi
 # tar the live RocksDB store + config + certs. RocksDB recovers via its WAL on
 # restore; the daily incus snapshot is the fully-consistent companion.
 SW="stalwart-$STAMP.tar.gz"
-if ssh $SSH_OPTS "apple@$PHASEWHIP" "sudo incus exec mail -- tar czf - -C /opt stalwart" > "$DEST/$SW" 2>/dev/null && [ -s "$DEST/$SW" ] && gzip -t "$DEST/$SW" 2>/dev/null; then
+if ssh $SSH_OPTS "apple@$PHASEWHIP" "sudo incus exec prism -- tar czf - -C /opt stalwart" > "$DEST/$SW" 2>/dev/null && [ -s "$DEST/$SW" ] && gzip -t "$DEST/$SW" 2>/dev/null; then
   :
 else echo "[backup] ERROR: stalwart export failed"; rm -f "$DEST/$SW"; fail=1; fi
 
