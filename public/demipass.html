@@ -4,42 +4,34 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>DemiPass — Secrets management for the agentic era</title>
-<meta name="description" content="The only secrets manager where the AI never sees the secret. Store credentials, issue use-tokens, inject server-side. The LLM context window never contains the credential.">
+<meta name="description" content="The only secrets manager where the AI never sees the secret. Store credentials, issue use-tokens, inject server-side. Coming soon — join the waitlist.">
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   :root {
-    --bg: #08111a;
-    --surface: #0e1824;
-    --card: #132131;
-    --border: #27445f;
-    --text: #e7f1fb;
-    --text2: #9cb4c9;
-    --text3: #6d8397;
-    --accent: #5fb3ff;
-    --green: #69c7b1;
-    --red: #e06c75;
-    --yellow: #c8a84b;
+    --bg: #08111a; --surface: #0e1824; --card: #132131; --border: #27445f;
+    --text: #e7f1fb; --text2: #9cb4c9; --text3: #6d8397;
+    --accent: #5fb3ff; --green: #69c7b1; --red: #e06c75; --yellow: #c8a84b;
   }
   body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; line-height:1.7; }
-
   .header { padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }
   .logo { font-size:1.5rem; font-weight:800; text-decoration:none; color:var(--text); }
   .logo span { color:var(--accent); }
   .nav { display:flex; gap:1.5rem; font-size:0.9rem; }
   .nav a { color:var(--text2); text-decoration:none; }
   .nav a:hover { color:var(--accent); }
-
-  .hero { text-align:center; padding:5rem 2rem 3rem; max-width:800px; margin:0 auto; }
+  .hero { text-align:center; padding:5rem 2rem 2rem; max-width:800px; margin:0 auto; }
+  .badge { display:inline-block; font-size:0.75rem; letter-spacing:0.08em; text-transform:uppercase; color:var(--green); border:1px solid var(--border); border-radius:999px; padding:0.3rem 0.9rem; margin-bottom:1.5rem; }
   .hero h1 { font-size:2.8rem; font-weight:800; line-height:1.1; margin-bottom:1.5rem; }
   .hero h1 span { color:var(--accent); }
   .hero .tagline { font-size:1.2rem; color:var(--text2); max-width:600px; margin:0 auto 2.5rem; }
-  .hero .pitch { font-size:1rem; color:var(--green); font-weight:600; margin-bottom:2rem; }
-
-  .install-box { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.5rem 2rem; max-width:500px; margin:0 auto 3rem; text-align:left; }
-  .install-box .label { font-size:0.75rem; color:var(--text3); text-transform:uppercase; letter-spacing:0.05em; margin-bottom:0.5rem; }
-  .install-box code { display:block; background:var(--bg); padding:0.75rem 1rem; border-radius:6px; font-size:0.95rem; color:var(--green); margin-bottom:0.75rem; }
-  .install-box .or { text-align:center; color:var(--text3); font-size:0.8rem; margin:0.5rem 0; }
-
+  .waitlist { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:2rem; max-width:480px; margin:0 auto; }
+  .waitlist h2 { font-size:1.3rem; margin-bottom:0.4rem; }
+  .waitlist p { font-size:0.9rem; color:var(--text2); margin-bottom:1.25rem; }
+  .waitlist form { display:flex; gap:0.5rem; flex-wrap:wrap; }
+  .waitlist input { flex:1; min-width:200px; padding:0.75rem 1rem; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); font-family:inherit; font-size:0.95rem; }
+  .waitlist button { padding:0.75rem 1.5rem; background:var(--accent); color:var(--bg); font-weight:700; border:none; border-radius:8px; font-size:0.95rem; cursor:pointer; }
+  .waitlist button:hover { opacity:0.9; }
+  .waitlist .status { font-size:0.85rem; margin-top:0.75rem; min-height:1.2em; }
   .features { background:var(--surface); padding:4rem 2rem; }
   .features-inner { max-width:900px; margin:0 auto; }
   .features h2 { text-align:center; font-size:2rem; margin-bottom:0.5rem; }
@@ -48,37 +40,19 @@
   .feature { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.5rem; }
   .feature h3 { font-size:0.95rem; margin-bottom:0.5rem; color:var(--accent); }
   .feature p { font-size:0.85rem; color:var(--text2); line-height:1.6; }
-
   .how { padding:4rem 2rem; max-width:700px; margin:0 auto; }
   .how h2 { text-align:center; font-size:2rem; margin-bottom:2rem; }
   .step { display:flex; gap:1rem; margin-bottom:1.5rem; align-items:flex-start; }
   .step-num { width:36px; height:36px; border-radius:50%; background:var(--accent); color:var(--bg); display:flex; align-items:center; justify-content:center; font-weight:800; flex-shrink:0; }
   .step-content h4 { font-size:0.95rem; margin-bottom:0.25rem; }
   .step-content p { font-size:0.85rem; color:var(--text2); }
-  .step-content code { background:var(--card); padding:0.2rem 0.5rem; border-radius:4px; font-size:0.8rem; }
-
   .products { padding:4rem 2rem; background:var(--surface); }
-  .products-inner { max-width:900px; margin:0 auto; }
-  .products h2 { text-align:center; font-size:1.5rem; margin-bottom:2rem; }
-  .product-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:1rem; }
-  .product { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.25rem; text-align:center; text-decoration:none; color:var(--text); }
-  .product:hover { border-color:var(--accent); }
-  .product h4 { color:var(--accent); margin-bottom:0.25rem; }
-  .product p { font-size:0.8rem; color:var(--text3); }
-
-  .cta { text-align:center; padding:4rem 2rem; }
-  .cta h2 { font-size:1.8rem; margin-bottom:1rem; }
-  .cta p { color:var(--text2); margin-bottom:2rem; }
-  .cta a { display:inline-block; padding:0.75rem 2rem; background:var(--accent); color:var(--bg); font-weight:700; border-radius:8px; text-decoration:none; font-size:1rem; }
-  .cta a:hover { opacity:0.9; }
-
+  .products-inner { max-width:900px; margin:0 auto; text-align:center; }
+  .products h2 { font-size:1.5rem; margin-bottom:0.75rem; }
+  .products p { color:var(--text2); font-size:0.9rem; max-width:600px; margin:0 auto; }
   footer { text-align:center; padding:2rem; color:var(--text3); font-size:0.8rem; border-top:1px solid var(--border); }
   footer a { color:var(--text3); }
-
-  @media (max-width:600px) {
-    .hero h1 { font-size:2rem; }
-    .header { flex-direction:column; gap:0.5rem; }
-  }
+  @media (max-width:600px) { .hero h1 { font-size:2rem; } .header { flex-direction:column; gap:0.5rem; } }
 </style>
 </head>
 <body>
@@ -86,283 +60,81 @@
 <div class="header">
   <a href="/" class="logo">Demi<span>Pass</span></a>
   <div class="nav">
-    <a href="/vault-mobile.html">Vault</a>
-    <a href="/qr-deposit.html">QR Deposit</a>
     <a href="https://www.npmjs.com/package/demipass">npm</a>
     <a href="https://github.com/bildow/demipass">GitHub</a>
   </div>
 </div>
 
 <div class="hero">
+  <div class="badge">Coming soon</div>
   <h1>Your AI never sees the <span>secret</span></h1>
-  <p class="pitch">The only secrets manager built for LLM context windows.</p>
-  <p class="tagline">Store API keys, passwords, and tokens. Your agent requests a 30-second use-token. DemiPass injects the secret server-side. The credential never enters the prompt, the completion, or the logs.</p>
-
-  <div class="install-box">
-    <div class="label">Install</div>
-    <code>npm install demipass</code>
-    <div class="or">or add to Claude Code as MCP server</div>
-    <code style="font-size:0.8rem;color:var(--text2)">node node_modules/demipass/mcp-server.js</code>
-  </div>
-</div>
-
-<!-- Onboarding Journey -->
-<div style="background:var(--surface);padding:4rem 2rem">
-  <div style="max-width:700px;margin:0 auto">
-    <h2 style="text-align:center;font-size:2rem;margin-bottom:0.5rem">Get started</h2>
-    <p style="text-align:center;color:var(--text2);margin-bottom:2.5rem">Three paths to your first deposit. Pick the one that fits.</p>
-
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1.5rem">
-      <!-- Path 1: Phone app -->
-      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
-        <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x1f4f1;</div>
-        <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--green)">Phone App</h3>
-        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6">
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">1.</strong> Download the APK</p>
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">2.</strong> Sign in or create an account</p>
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> Tap <em>+ New</em> or <em>Scan QR</em></p>
-          <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Secret is in your vault</p>
-          <a href="https://api.dustforge.com/demipass-v3.apk" style="display:inline-block;padding:0.5rem 1rem;background:var(--green);color:var(--bg);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">Download APK</a>
-        </div>
-      </div>
-
-      <!-- Path 2: QR from computer -->
-      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
-        <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x1f4bb;</div>
-        <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--accent)">QR Deposit</h3>
-        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6">
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">1.</strong> Open the QR deposit page</p>
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">2.</strong> Paste your secret &mdash; QR renders locally</p>
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> Scan with the DemiPass app</p>
-          <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Close the tab. Done.</p>
-          <a href="/qr-deposit.html" style="display:inline-block;padding:0.5rem 1rem;background:var(--accent);color:var(--bg);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">Open QR Deposit</a>
-        </div>
-      </div>
-
-      <!-- Path 3: SDK / CLI -->
-      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
-        <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x2328;</div>
-        <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--yellow)">SDK / CLI</h3>
-        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6">
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">1.</strong> <code style="background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">npm install demipass</code></p>
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">2.</strong> Configure with your token</p>
-          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> <code style="background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">demipass.store({name, value})</code></p>
-          <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Use ref code to access anywhere</p>
-          <a href="https://www.npmjs.com/package/demipass" style="display:inline-block;padding:0.5rem 1rem;border:1px solid var(--border);color:var(--text2);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">View on npm</a>
-        </div>
-      </div>
-    </div>
-
-    <!-- Routed reference explainer -->
-    <div style="margin-top:2.5rem;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
-      <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--green)">Your ref code is your key</h3>
-      <p style="font-size:0.85rem;color:var(--text2);margin-bottom:0.75rem">When you store a secret, DemiPass returns a routed reference code:</p>
-      <code style="display:block;background:var(--bg);padding:0.75rem 1rem;border-radius:6px;font-size:1rem;color:var(--green);text-align:center;letter-spacing:0.05em">DP-API-openrout-7f3a9c1e</code>
-      <p style="font-size:0.8rem;color:var(--text3);margin-top:0.75rem;text-align:center">Share this with any agent. It's not the secret &mdash; it's a routing address. The agent uses it to request a use-token. The secret is injected server-side. Nobody sees it.</p>
-    </div>
-  </div>
-</div>
-
-<!-- Agent Onboarding -->
-<div style="padding:4rem 2rem">
-  <div style="max-width:700px;margin:0 auto">
-    <h2 style="text-align:center;font-size:2rem;margin-bottom:0.5rem">Wire up your agent</h2>
-    <p style="text-align:center;color:var(--text2);margin-bottom:2.5rem">Works with Claude Code, Codex, or any MCP-compatible agent. Three steps.</p>
-
-    <div style="display:flex;flex-direction:column;gap:1.5rem">
-      <!-- Step 1 -->
-      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
-        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
-          <div style="width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:800;flex-shrink:0">1</div>
-          <h3 style="font-size:1rem">Install the package</h3>
-        </div>
-        <code style="display:block;background:var(--bg);padding:0.6rem 1rem;border-radius:6px;font-size:0.95rem;color:var(--green)">npm install demipass</code>
-      </div>
-
-      <!-- Step 2 -->
-      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
-        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
-          <div style="width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:800;flex-shrink:0">2</div>
-          <h3 style="font-size:1rem">Add to your MCP config</h3>
-        </div>
-        <p style="font-size:0.8rem;color:var(--text3);margin-bottom:0.75rem">Add to <code style="background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">.mcp.json</code> in your project root:</p>
-        <pre style="background:var(--bg);padding:1rem;border-radius:6px;font-size:0.75rem;color:var(--text2);overflow-x:auto;line-height:1.5">{
-  "mcpServers": {
-    "demipass": {
-      "command": "node",
-      "args": ["node_modules/demipass/mcp-server.js"],
-      "env": {
-        "DEMIPASS_URL": "https://api.dustforge.com",
-        "DEMIPASS_TOKEN": "your-bearer-token"
-      }
-    },
-    "buoy": {
-      "command": "node",
-      "args": ["node_modules/demipass/buoy-mcp.js"],
-      "env": {
-        "BUOY_URL": "https://api.dustforge.com",
-        "BUOY_TOKEN": "your-bearer-token"
-      }
-    }
-  }
-}</pre>
-      </div>
-
-      <!-- Step 3 -->
-      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
-        <div style="display:flex;align-items:center;gap:0.75rem;margin-bottom:0.75rem">
-          <div style="width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--bg);display:flex;align-items:center;justify-content:center;font-weight:800;flex-shrink:0">3</div>
-          <h3 style="font-size:1rem">Your agent gets 11 tools</h3>
-        </div>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0.5rem;font-size:0.8rem">
-          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_store</code> — deposit a secret</div>
-          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_ssh</code> — SSH via ref code</div>
-          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_use</code> — one-step egress</div>
-          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_search</code> — find secrets</div>
-          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_expiring</code> — rotation alerts</div>
-          <div style="color:var(--text2)"><code style="color:var(--green)">demipass_whoami</code> — identity check</div>
-          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_tick</code> — temporal anchor</div>
-          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_verify</code> — verify signatures</div>
-          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_chain_verify</code> — chain integrity</div>
-          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_stats</code> — tick statistics</div>
-          <div style="color:var(--text2)"><code style="color:var(--accent)">buoy_ledger</code> — tick history</div>
-        </div>
-        <p style="font-size:0.75rem;color:var(--text3);margin-top:0.75rem">The tools teach the agent how to handle secrets. The behavioral protocol is built into the tool descriptions — no separate training needed.</p>
-      </div>
-    </div>
-
-    <p style="text-align:center;margin-top:1.5rem"><a href="https://github.com/bildow/demipass/blob/main/ONBOARDING.md" style="color:var(--accent);font-size:0.85rem">Full onboarding guide on GitHub</a></p>
+  <p class="tagline">Store API keys, passwords, and tokens. Your agent requests a 30-second use-token; DemiPass injects the secret server-side. The credential never enters the prompt, the completion, or the logs.</p>
+  <div class="waitlist">
+    <h2>Join the waitlist</h2>
+    <p>DemiPass is launching soon. Leave your email and we'll let you know the moment it's live.</p>
+    <form onsubmit="joinWaitlist(event)">
+      <input id="wl-email" type="email" placeholder="you@example.com" required>
+      <button type="submit" id="wl-btn">Notify me</button>
+    </form>
+    <altcha-widget id="wl-altcha" challengeurl="https://azurecarbon.com/api/altcha/challenge" style="display:block;margin:0.75rem 0 0"></altcha-widget>
+    <div class="status" id="wl-status"></div>
   </div>
 </div>
 
 <div class="features">
   <div class="features-inner">
     <h2>Why DemiPass</h2>
-    <p class="sub">Every other vault gives the caller the plaintext. DemiPass gives the caller a use-token.</p>
+    <p class="sub">Built for the era where autonomous agents hold the keys.</p>
     <div class="feature-grid">
-      <div class="feature">
-        <h3>Use-Tokens</h3>
-        <p>30-second, single-use cryptographic nonces. The secret and the authorization are separate. Token expires, secret stays locked.</p>
-      </div>
-      <div class="feature">
-        <h3>Context Binding</h3>
-        <p>Each secret is bound to approved actions and target hosts. Your OpenRouter key can only go to api.openrouter.ai, nowhere else.</p>
-      </div>
-      <div class="feature">
-        <h3>Bonded Courier</h3>
-        <p>Rowen carries secrets through a dual-barrel architecture. Material and authorization held by separate systems. Assembled at the point of use, destroyed in 30 seconds.</p>
-      </div>
-      <div class="feature">
-        <h3>Honeypot Defense</h3>
-        <p>Exfiltration attempts get fake success responses. The attacker thinks it worked. You see everything. The real secret was destroyed before the fake response was sent.</p>
-      </div>
-      <div class="feature">
-        <h3>Credential Health</h3>
-        <p>When a secret gets a 401 from the target, DemiPass detects it, independently verifies, and alerts you. Dead credentials don't rot silently.</p>
-      </div>
-      <div class="feature">
-        <h3>Circuit Breakers</h3>
-        <p>Per-secret toggle: closed (normal), open (blocked), half-open (approval required). Panic button trips all breakers at once. One tap, everything frozen.</p>
-      </div>
+      <div class="feature"><h3>Use-Tokens</h3><p>Agents get a single-use, 30-second nonce — never the credential itself. The secret is injected server-side at the moment of use.</p></div>
+      <div class="feature"><h3>Context Binding</h3><p>Every use-token is bound to a specific action and target. A token minted for one call can't be replayed against another.</p></div>
+      <div class="feature"><h3>Bonded Courier</h3><p>The secret travels from vault to destination without ever passing through the model's context window, completion, or logs.</p></div>
+      <div class="feature"><h3>Honeypot Defense</h3><p>Decoy credentials detect and flag misuse, surfacing compromised agents before real secrets are ever at risk.</p></div>
+      <div class="feature"><h3>Credential Health</h3><p>Track every secret's age, usage, and exposure. Rotate on a schedule or instantly when something looks wrong.</p></div>
+      <div class="feature"><h3>Circuit Breakers</h3><p>Per-secret rate and scope limits halt runaway or hijacked agents automatically, before a leak becomes a breach.</p></div>
     </div>
   </div>
 </div>
 
 <div class="how">
   <h2>How it works</h2>
-  <div class="step">
-    <div class="step-num">1</div>
-    <div class="step-content">
-      <h4>Carbon deposits a secret</h4>
-      <p>You (the human) store a credential via the vault dashboard or SDK. Encrypted at rest with AES-256-GCM. Never returned in any API response.</p>
-    </div>
-  </div>
-  <div class="step">
-    <div class="step-num">2</div>
-    <div class="step-content">
-      <h4>Silicon requests a use-token</h4>
-      <p>Your agent calls <code>demipass.requestToken()</code> with the secret name and intended action. DemiPass validates the context and issues a 30-second nonce.</p>
-    </div>
-  </div>
-  <div class="step">
-    <div class="step-num">3</div>
-    <div class="step-content">
-      <h4>Secret injected server-side</h4>
-      <p>The agent redeems the token. DemiPass injects the credential into the HTTP header, request body, or SSH command — server-side. The agent gets the result, never the secret.</p>
-    </div>
-  </div>
-  <div class="step">
-    <div class="step-num">4</div>
-    <div class="step-content">
-      <h4>Token burned, audit logged</h4>
-      <p>The use-token is consumed. The secret dose auto-destructs (triple-pass memory wipe). Every action is logged in the audit trail.</p>
-    </div>
-  </div>
+  <div class="step"><div class="step-num">1</div><div class="step-content"><h4>Deposit</h4><p>Store your API keys, passwords, and tokens in the DemiPass vault — encrypted, never exposed to your agent.</p></div></div>
+  <div class="step"><div class="step-num">2</div><div class="step-content"><h4>Request</h4><p>Your agent asks DemiPass for a short-lived use-token bound to the exact action it needs to perform.</p></div></div>
+  <div class="step"><div class="step-num">3</div><div class="step-content"><h4>Inject</h4><p>DemiPass redeems the token and injects the real secret server-side. The credential never enters the prompt.</p></div></div>
 </div>
 
 <div class="products">
   <div class="products-inner">
     <h2>Part of the Dustforge ecosystem</h2>
-    <div class="product-grid">
-      <a href="https://dustforge.com" class="product">
-        <h4>Dustforge</h4>
-        <p>Silicon identity platform — DID:key, email, wallet</p>
-      </a>
-      <div class="product">
-        <h4>DemiPass</h4>
-        <p>Secrets management — credentials never enter context</p>
-      </div>
-      <a href="https://dustforge.com" class="product">
-        <h4>Buoy</h4>
-        <p>Temporal anchors — tick chains, scheduled delivery, dead man's switch</p>
-      </a>
-      <a href="https://dustforge.com" class="product">
-        <h4>Rowen</h4>
-        <p>Bonded courier — secret delivery with chain of custody</p>
-      </a>
-    </div>
-  </div>
-</div>
-
-<div style="background:var(--surface);padding:3rem 2rem">
-  <div style="max-width:500px;margin:0 auto;text-align:center">
-    <h2 style="font-size:1.5rem;margin-bottom:0.5rem">Need help?</h2>
-    <p style="color:var(--text2);font-size:0.9rem;margin-bottom:1.5rem">Account suspended, locked out, or have a question? We're here.</p>
-    <div style="display:flex;flex-direction:column;gap:0.75rem;align-items:center">
-      <a href="mailto:support@dustforge.com" style="display:inline-block;padding:0.6rem 1.5rem;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text2);text-decoration:none;font-size:0.9rem;width:100%;max-width:300px">Email support@dustforge.com</a>
-      <a href="https://api.dustforge.com/api/blindkey/suspension-status?did=YOUR_DID" style="display:inline-block;padding:0.6rem 1.5rem;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text2);text-decoration:none;font-size:0.9rem;width:100%;max-width:300px">Check suspension status</a>
-      <p style="font-size:0.75rem;color:var(--text3)">Suspensions are reviewed within 24 hours. Legitimate activity gets an exemption.</p>
-    </div>
-  </div>
-</div>
-
-<div class="cta">
-  <h2>Start in 30 seconds</h2>
-  <p>Download the app, scan a QR, or npm install. Your agent never sees the secret again.</p>
-  <div style="display:flex;gap:1rem;justify-content:center;flex-wrap:wrap">
-    <a href="https://api.dustforge.com/demipass-v3.apk" style="display:inline-block;padding:0.75rem 2rem;background:var(--green);color:var(--bg);font-weight:700;border-radius:8px;text-decoration:none;font-size:1rem">Get the App</a>
-    <a href="/qr-deposit.html" style="display:inline-block;padding:0.75rem 2rem;background:var(--accent);color:var(--bg);font-weight:700;border-radius:8px;text-decoration:none;font-size:1rem">QR Deposit</a>
-    <a href="/vault-mobile.html" style="display:inline-block;padding:0.75rem 2rem;background:transparent;border:1px solid var(--border);color:var(--text2);font-weight:700;border-radius:8px;text-decoration:none;font-size:1rem">Open Vault</a>
+    <p>DemiPass is one piece of Dustforge — infrastructure for trustworthy autonomous agents. More coming soon.</p>
   </div>
 </div>
 
 <footer>
-  <p>DemiPass &mdash; AKStrapped LLC &middot; <a href="https://dustforge.com/terms.html">Terms</a> &middot; <a href="https://dustforge.com/privacy.html">Privacy</a></p>
-  <p style="margin-top:0.5rem">Secrets management for the agentic era.</p>
+  DemiPass — Secrets management for the agentic era · <a href="https://github.com/bildow/demipass">GitHub</a> · Dustforge
 </footer>
 
+<script async defer src="https://cdn.jsdelivr.net/npm/altcha/dist/altcha.min.js" type="module"></script>
 <script>
-// Capture referral code from URL and store for account creation
-const _ref = new URLSearchParams(window.location.search).get('ref');
-if (_ref) {
-  localStorage.setItem('dp_referral', _ref);
-  // Show a subtle referral notice
-  const notice = document.createElement('div');
-  notice.style.cssText = 'position:fixed;bottom:1rem;right:1rem;background:var(--card);border:1px solid var(--green);border-radius:8px;padding:0.5rem 1rem;font-size:0.75rem;color:var(--green);z-index:100';
-  notice.textContent = 'Referred by ' + _ref.slice(0, 8) + '...';
-  document.body.appendChild(notice);
-  setTimeout(() => notice.remove(), 5000);
+var WLALTCHA='';
+document.addEventListener('DOMContentLoaded',function(){var w=document.getElementById('wl-altcha');if(w)w.addEventListener('statechange',function(e){WLALTCHA=(e.detail&&e.detail.state==='verified')?e.detail.payload:'';});});
+function joinWaitlist(e){
+  e.preventDefault();
+  var email=(document.getElementById('wl-email')||{}).value||'';
+  var st=document.getElementById('wl-status');
+  var btn=document.getElementById('wl-btn');
+  if(!email||email.indexOf('@')<0){st.textContent='Please enter a valid email.';st.style.color='var(--red)';return;}
+  if(!WLALTCHA){st.textContent='Please complete the verification below.';st.style.color='var(--red)';return;}
+  st.textContent='Adding you…';st.style.color='var(--text3)';if(btn)btn.disabled=true;
+  fetch('https://azurecarbon.com/api/waitlist',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email,note:'demipass.com coming-soon',altcha:WLALTCHA})})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d&&d.ok){st.textContent="You're on the list — we'll be in touch at launch.";st.style.color='var(--green)';var i=document.getElementById('wl-email');if(i)i.value='';}
+      else{st.textContent=(d&&d.error)||'Something went wrong — please try again.';st.style.color='var(--red)';if(btn)btn.disabled=false;}
+    })
+    .catch(function(){st.textContent='Network error — please try again.';st.style.color='var(--red)';if(btn)btn.disabled=false;});
 }
 </script>
+
 </body>
 </html>
