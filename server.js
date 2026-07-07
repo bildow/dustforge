@@ -286,6 +286,29 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN recovery_email TEXT DEFAU
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_narrative TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN silicon_ssn TEXT DEFAULT ''"); } catch(_) {}
 
+try { db.exec(`CREATE TABLE IF NOT EXISTS device_auth (
+  device_code TEXT PRIMARY KEY,
+  user_code TEXT NOT NULL,
+  agent_label TEXT,
+  scope TEXT DEFAULT 'read',
+  status TEXT DEFAULT 'pending',
+  approved_did TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL
+)`); } catch (e) { console.error('device_auth table:', e.message); }
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS refresh_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  token_hash TEXT NOT NULL UNIQUE,
+  scope TEXT DEFAULT 'read',
+  created_at TEXT DEFAULT (datetime('now')),
+  expires_at TEXT NOT NULL,
+  revoked INTEGER DEFAULT 0,
+  last_used_at TEXT,
+  rotated_to TEXT
+)`); } catch (e) { console.error('refresh_tokens table:', e.message); }
+
 db.exec(`CREATE TABLE IF NOT EXISTS identity_2fa_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
@@ -404,6 +427,38 @@ app.get('/api/health', (req, res) => {
 // ============================================================
 // API — Identity
 // ============================================================
+
+// ── Device-authorization helpers (gh/claude-style) ───────────────────────────
+const DEVICE_CODE_TTL_MIN = 15;
+function _genUserCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no ambiguous chars
+  const pick = n => Array.from({length:n}, () => A[require('crypto').randomInt(A.length)]).join('');
+  return pick(4) + '-' + pick(4);
+}
+
+// ── Refresh-token helpers (OAuth-style) ──────────────────────────────────────
+const REFRESH_TTL_DAYS = 90;
+function _refreshHash(t) { return require('crypto').createHash('sha256').update(t).digest('hex'); }
+function issueRefreshToken(did, scope) {
+  const raw = 'dpr_' + require('crypto').randomBytes(32).toString('base64url');
+  const exp = new Date(Date.now() + REFRESH_TTL_DAYS*24*3600*1000).toISOString();
+  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at) VALUES (?,?,?,?)')
+    .run(did, _refreshHash(raw), scope || 'read', exp);
+  return { refresh_token: raw, refresh_expires_at: exp };
+}
+// Validate + single-use rotate: returns {did, scope} or null. Old token is revoked + linked to new.
+function consumeRefreshToken(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const row = db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?').get(_refreshHash(raw));
+  if (!row) return null;
+  if (row.revoked) return null;
+  if (new Date(row.expires_at).getTime() < Date.now()) return null;
+  return { id: row.id, did: row.did, scope: row.scope };
+}
+function revokeRefreshToken(id, rotatedToRaw) {
+  db.prepare('UPDATE refresh_tokens SET revoked = 1, last_used_at = datetime(\'now\'), rotated_to = ? WHERE id = ?')
+    .run(rotatedToRaw ? _refreshHash(rotatedToRaw) : null, id);
+}
 
 app.post('/api/identity/create', async (req, res) => {
   const { username, password, key, referral_code } = req.body || {};
@@ -688,7 +743,17 @@ app.post('/api/identity/request-2fa', (req, res) => {
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
   db.prepare('INSERT INTO identity_2fa_codes (did, code, expires_at) VALUES (?, ?, ?)').run(did, code, expiresAt);
   console.log(`[2fa] ${wallet.username}: ${code} (expires ${expiresAt})`);
-  res.json({ ok: true, expires_in: 600 });
+  if (wallet.email) {
+    const t = createEmailTransport();
+    t.sendMail({
+      from: 'noreply@dustforge.com',
+      to: wallet.email,
+      subject: 'Your Dustforge 2FA code',
+      text: `Your 2FA code is ${code}. It expires in 10 minutes.\n\nIf you did not request this code, ignore this message.`,
+    }).then(() => console.log(`[2fa] code emailed to ${wallet.email}`))
+      .catch(e => console.error(`[2fa] email to ${wallet.email} failed: ${e.message}`));
+  }
+  res.json({ ok: true, expires_in: 600, emailed: Boolean(wallet.email) });
 });
 
 app.post('/api/identity/verify', (req, res) => {
@@ -4582,17 +4647,22 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
         path: '/api/principal/' + encodeURIComponent(wallet.username),
         method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
         let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
       });
       req.on('error', () => resolve(null));
       req.setTimeout(5000, () => { req.destroy(); resolve(null); });
       req.end();
     });
     if (storedPassword === null) {
-      // Stalwart lookup failed — FAIL CLOSED, never issue token without password verification
-      return res.status(503).json({ error: 'password verification temporarily unavailable' });
-    }
-    if (storedPassword !== password) {
+      if (wallet.password_hash) {
+        const inputHash = require('crypto').createHash('sha256').update(password).digest('hex');
+        if (inputHash !== wallet.password_hash) {
+          return res.status(401).json({ error: 'invalid password' });
+        }
+      } else {
+        return res.status(503).json({ error: 'password verification temporarily unavailable' });
+      }
+    } else if (storedPassword !== password) {
       return res.status(401).json({ error: 'invalid password' });
     }
   } catch(e) {
@@ -4638,10 +4708,123 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
     scope, expiresIn: expires_in,
     metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash },
   });
-  res.json({ ok: true, token, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
+  // REFRESH: issue alongside access token so agents never hit the hour-25 wall
+  const _rf = issueRefreshToken(wallet.did, scope);
+  res.json({ ok: true, token, refresh_token: _rf.refresh_token, refresh_expires_at: _rf.refresh_expires_at, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
 });
 
 // POST /api/identity/request-account — silicon requests account, carbon gets payment link
+// ── Device authorization (approve a new agent without sharing a password) ────
+// POST /api/identity/device/code — agent starts the flow, gets a user_code to show.
+app.post('/api/identity/device/code', rateLimitStandard, (req, res) => {
+  const { agent_label = '', scope = 'read' } = req.body || {};
+  if (typeof scope !== 'string') return res.status(400).json({ error: 'scope must be a string' });
+  const device_code = 'dpd_' + require('crypto').randomBytes(32).toString('base64url');
+  let user_code = _genUserCode();
+  // ensure user_code uniqueness among pending
+  for (let n = 0; n < 5; n++) {
+    const clash = db.prepare("SELECT 1 FROM device_auth WHERE user_code = ? AND status = 'pending'").get(user_code);
+    if (!clash) break; user_code = _genUserCode();
+  }
+  const expires_at = new Date(Date.now() + DEVICE_CODE_TTL_MIN*60*1000).toISOString();
+  db.prepare('INSERT INTO device_auth (device_code, user_code, agent_label, scope, expires_at) VALUES (?,?,?,?,?)')
+    .run(device_code, user_code, String(agent_label).slice(0,80), scope, expires_at);
+  res.json({
+    ok: true, device_code, user_code,
+    verification_url: 'https://demipass.com/device',
+    verification_url_complete: 'https://demipass.com/device?code=' + encodeURIComponent(user_code),
+    interval: 5, expires_in: DEVICE_CODE_TTL_MIN*60,
+  });
+});
+
+// POST /api/identity/device/token — agent polls; returns tokens once approved.
+app.post('/api/identity/device/token', rateLimitStandard, (req, res) => {
+  const { device_code } = req.body || {};
+  if (!device_code || typeof device_code !== 'string') return res.status(400).json({ error: 'device_code required' });
+  const row = db.prepare('SELECT * FROM device_auth WHERE device_code = ?').get(device_code);
+  if (!row) return res.status(400).json({ error: 'invalid device_code' });
+  if (new Date(row.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'expired_token' });
+  if (row.status === 'pending') return res.status(428).json({ error: 'authorization_pending' });
+  if (row.status === 'denied') return res.status(403).json({ error: 'access_denied' });
+  if (row.status === 'claimed') return res.status(400).json({ error: 'already_claimed' });
+  // approved → mint access + refresh for the approving DID, mark claimed (one-time)
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(row.approved_did);
+  if (!wallet) return res.status(404).json({ error: 'approver identity not found' });
+  let token;
+  try {
+    token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+      scope: row.scope, expiresIn: '24h',
+      metadata: { email: wallet.email, username: wallet.username, auth_method: 'device', agent_label: row.agent_label },
+    });
+  } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
+  const rf = issueRefreshToken(wallet.did, row.scope);
+  db.prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ?").run(device_code);
+  res.json({ ok: true, token, refresh_token: rf.refresh_token, refresh_expires_at: rf.refresh_expires_at,
+    did: wallet.did, scope: row.scope, email: wallet.email, auth_method: 'device', agent_label: row.agent_label });
+});
+
+// GET /api/identity/device/pending?user_code=XXXX-XXXX — approval page looks up the request.
+app.get('/api/identity/device/pending', rateLimitStandard, (req, res) => {
+  const uc = (req.query.user_code || '').toString().toUpperCase().trim();
+  if (!uc) return res.status(400).json({ error: 'user_code required' });
+  const row = db.prepare("SELECT user_code, agent_label, scope, status, created_at, expires_at FROM device_auth WHERE user_code = ? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(uc);
+  if (!row) return res.status(404).json({ error: 'no pending request for that code' });
+  if (new Date(row.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'expired' });
+  res.json({ ok: true, ...row });
+});
+
+// POST /api/identity/device/approve — the OPERATOR approves/denies. Requires their bearer token.
+app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
+  const { user_code, decision = 'approve' } = req.body || {};
+  if (!user_code) return res.status(400).json({ error: 'user_code required' });
+  const auth = (req.headers.authorization || '').replace('Bearer ', '');
+  if (!auth) return res.status(401).json({ error: 'operator bearer token required to approve' });
+  const v = identity.verifyTokenStandalone(auth);
+  if (!v.valid) return res.status(401).json({ error: 'invalid operator token' });
+  const approverDid = v.decoded && v.decoded.sub;
+  if (!approverDid) return res.status(401).json({ error: 'operator token has no DID' });
+  const uc = user_code.toString().toUpperCase().trim();
+  const row = db.prepare("SELECT * FROM device_auth WHERE user_code = ? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(uc);
+  if (!row) return res.status(404).json({ error: 'no pending request for that code' });
+  if (new Date(row.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'expired' });
+  const status = decision === 'deny' ? 'denied' : 'approved';
+  db.prepare('UPDATE device_auth SET status = ?, approved_did = ? WHERE device_code = ?')
+    .run(status, status === 'approved' ? approverDid : null, row.device_code);
+  res.json({ ok: true, decision: status, user_code: uc, agent_label: row.agent_label, scope: row.scope });
+});
+
+// POST /api/identity/refresh — swap a valid refresh token for a fresh access token.
+// Single-use rotation: each refresh returns a NEW refresh token and revokes the old one.
+app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
+  const { refresh_token, expires_in = '24h' } = req.body || {};
+  if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
+  const rec = consumeRefreshToken(refresh_token);
+  if (!rec) return res.status(401).json({ error: 'invalid, expired, or revoked refresh token' });
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(rec.did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  let token;
+  try {
+    token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+      scope: rec.scope, expiresIn: expires_in,
+      metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh' },
+    });
+  } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
+  // Rotate: issue new refresh token, revoke the consumed one (linked for audit)
+  const nrf = issueRefreshToken(wallet.did, rec.scope);
+  revokeRefreshToken(rec.id, nrf.refresh_token);
+  res.json({ ok: true, token, refresh_token: nrf.refresh_token, refresh_expires_at: nrf.refresh_expires_at, did: wallet.did, scope: rec.scope, email: wallet.email, auth_method: 'refresh' });
+});
+
+// POST /api/identity/refresh/revoke — revoke a refresh token (logout / compromise)
+app.post('/api/identity/refresh/revoke', rateLimitStandard, (req, res) => {
+  const { refresh_token } = req.body || {};
+  if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
+  const rec = consumeRefreshToken(refresh_token);
+  if (!rec) return res.json({ ok: true, revoked: false, note: 'token already invalid' });
+  revokeRefreshToken(rec.id, null);
+  res.json({ ok: true, revoked: true });
+});
+
 app.post('/api/identity/request-account', rateLimitStrict, async (req, res) => {
   const { username, password, carbon_email, referral_code } = req.body || {};
   if (!username || !password || !carbon_email) return res.status(400).json({ error: 'username, password, and carbon_email required' });
@@ -6412,7 +6595,7 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, fingerprint
         path: '/api/principal/' + encodeURIComponent(wallet.username),
         method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
         let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
       });
       req.on('error', () => resolve(null));
       req.setTimeout(5000, () => { req.destroy(); resolve(null); });
@@ -6510,7 +6693,7 @@ app.post('/api/identity/auth-critical', rateLimitStandard, async (req, res) => {
         path: '/api/principal/' + encodeURIComponent(wallet.username),
         method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
         let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { resolve(JSON.parse(data).data.secrets[0]); } catch(_) { resolve(null); } });
+        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
       });
       req.on('error', () => resolve(null));
       req.setTimeout(5000, () => { req.destroy(); resolve(null); });
@@ -7427,7 +7610,7 @@ function computeTickHash(tickId, did, note, tz, time, prevHash, tickType, refTic
 app.post('/api/tick', (req, res) => {
   const { note = '', tz = 'UTC', type = 'tick', ref_tick = null, tags = [] } = req.body || {};
   const noteClean = String(note).slice(0, 300);
-  const validTypes = ['tick', 'begin', 'complete', 'handoff', 'audit', 'decision', 'block', 'unblock', 'alert'];
+  const validTypes = ['tick', 'begin', 'complete', 'handoff', 'audit', 'decision', 'block', 'unblock', 'alert', 'soul'];
   const tickType = validTypes.includes(type) ? type : 'tick';
   const tagsClean = Array.isArray(tags) ? JSON.stringify(tags.slice(0, 10).map(t => String(t).slice(0, 50))) : '[]';
 
@@ -7444,10 +7627,15 @@ app.post('/api/tick', (req, res) => {
     if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day', onboard: 'https://demipass.com', note: 'Create a free identity for unlimited signed ticks.' });
   }
 
-  // Bill member tick (1 DD per tick)
+  // Bill member tick (1 DD per tick) — free lanes: soul-integrity ticks + first-party infra (Kodiak).
   if (isMember) {
-    const debit = billing.deductBalance(db, did, 1, 'tick', noteClean.slice(0, 50) || 'tick');
-    if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents });
+    const isSoulTick = (tickType === 'soul') && SOUL_DIDS.has(did);
+    const isFirstPartyComp = FIRSTPARTY_DIDS.has(did) && /^kodiak:/i.test(noteClean);
+    if (!isSoulTick && !isFirstPartyComp) {
+      const debit = billing.deductBalance(db, did, 1, 'tick', noteClean.slice(0, 50) || 'tick');
+      if (!debit.ok) { notifyLowBalance(did, debit.balance_cents, 'tick rejected - insufficient balance'); return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents }); }
+      if (typeof debit.balance_after === 'number' && debit.balance_after <= LOW_BALANCE_CENTS) notifyLowBalance(did, debit.balance_after, 'balance low');
+    }
   }
 
   const now = new Date();
@@ -8167,6 +8355,27 @@ app.post('/api/buoy/probe', (req, res) => {
 
 const CONDUIT_URL = process.env.CONDUIT_URL || 'http://100.69.1.78:8080';
 const CONDUIT_CARBON_TOKEN = process.env.CONDUIT_CARBON_TOKEN || '';
+// Free-tick lanes + low-balance alerting (Aaron 2026-07-04): a systemic integrity pulse and first-party infra must never be starved by a metered wallet.
+const SOUL_DIDS = new Set((process.env.SOUL_DIDS || '').split(',').map(function(x){return x.trim();}).filter(Boolean));
+const FIRSTPARTY_DIDS = new Set((process.env.FIRSTPARTY_DIDS || 'did:key:u7QGkcLsNaXM-_aJLhtMuNwfZT4xDl23kZFohcAfOHfwEQg').split(',').map(function(x){return x.trim();}).filter(Boolean));
+const LOW_BALANCE_CENTS = Number(process.env.LOW_BALANCE_CENTS || 100);
+let _lastLowBalanceAlert = 0;
+function notifyLowBalance(did, balance_cents, reason) {
+  try {
+    console.warn('[buoy] LOW BALANCE ' + reason + ': ' + did + ' = ' + balance_cents + 'c');
+    if (!CONDUIT_CARBON_TOKEN) return;
+    const nowMs = new Date().getTime();
+    if (nowMs - _lastLowBalanceAlert < 3600000) return;
+    _lastLowBalanceAlert = nowMs;
+    const bal = (Number(balance_cents) / 100).toFixed(2);
+    fetch(CONDUIT_URL + '/api/messages/broadcast', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONDUIT_CARBON_TOKEN },
+      body: JSON.stringify({ sender: 'buoy', body: '[Buoy ALERT] ' + reason + ': wallet ' + String(did).slice(0,24) + ' balance ' + bal + ' USD. Top up to keep the heartbeat alive.', metadata: { alert: 'low_balance', did: did, balance_cents: balance_cents, reason: reason } }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(function(err){ console.error('[buoy low-balance alert] relay failed: ' + err.message); });
+  } catch (e) { console.error('[buoy low-balance alert] error: ' + e.message); }
+}
 const BUOY_NOTIFY_TYPES = new Set(['alert', 'handoff', 'block', 'unblock', 'decision']);
 
 function buoyNotifyConduit(tick) {

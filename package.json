@@ -15,7 +15,9 @@
     "better-sqlite3": "^12.8.0",
     "dotenv": "^17.4.1",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.3.2",
     "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^8.0.5",
     "stripe": "^22.0.0"
   }
 }
