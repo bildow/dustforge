@@ -7691,6 +7691,7 @@ app.post('/api/tick', (req, res) => {
   const auth = getBearerIdentity(req);
   const isMember = auth.ok;
   const did = isMember ? auth.did : '';
+  const siliconDid = isMember && auth.silicon ? (auth.silicon_did || '') : '';
 
   // Rate limit
   if (!isMember) {
@@ -7702,7 +7703,7 @@ app.post('/api/tick', (req, res) => {
 
   // Bill member tick (1 DD per tick) — free lanes: soul-integrity ticks + first-party infra (Kodiak).
   if (isMember) {
-    const isSoulTick = (tickType === 'soul') && SOUL_DIDS.has(did);
+    const isSoulTick = (tickType === 'soul') && ((siliconDid && SOUL_DIDS.has(siliconDid)) || SOUL_DIDS.has(did));
     const isFirstPartyComp = FIRSTPARTY_DIDS.has(did) && /^kodiak:/i.test(noteClean);
     if (!isSoulTick && !isFirstPartyComp) {
       const debit = billing.deductBalance(db, did, 1, 'tick', noteClean.slice(0, 50) || 'tick');
@@ -7724,7 +7725,11 @@ app.post('/api/tick', (req, res) => {
   const prevHash = prevTick?.chain_hash || '0'.repeat(64);
 
   // Insert tick
-  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz, created_at, tick_type, ref_tick, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz, timeISO, tickType, ref_tick, tagsClean);
+  let tagsFinal = tagsClean;
+  if (tickType === 'soul' && siliconDid) {
+    try { const t = JSON.parse(tagsClean); t.push('silicon:' + siliconDid); tagsFinal = JSON.stringify(t.slice(0,12)); } catch(_) {}
+  }
+  const result = db.prepare('INSERT INTO ticks (did, note, ip, tz, created_at, tick_type, ref_tick, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(did, noteClean, req.ip || '', tz, timeISO, tickType, ref_tick, tagsFinal);
   const tickId = result.lastInsertRowid;
 
   // Compute and store chain hash (covers ALL fields for tamper evidence)
