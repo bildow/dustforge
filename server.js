@@ -138,6 +138,8 @@ function getBearerIdentity(req) {
   // Standard carbon JWT
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return { ok: false, status: 401, error: v.error };
+  const dead = billing.checkTokenRevocation(db, v.decoded);
+  if (dead.revoked) return { ok: false, status: 401, error: dead.reason };
   const scope = v.decoded.scope || '';
   if (!['transact', 'admin', 'full'].includes(scope)) {
     return { ok: false, status: 403, error: 'transact scope required' };
@@ -177,6 +179,27 @@ function getDemiPassActor(req, res, options = {}) {
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+
+// Issued-token registry + revocation surface: every JWT minted gets a jti row.
+try { db.exec(`CREATE TABLE IF NOT EXISTS issued_tokens (
+  jti TEXT PRIMARY KEY,
+  did TEXT NOT NULL,
+  scope TEXT DEFAULT '',
+  issued_at INTEGER,
+  expires_at INTEGER,
+  revoked INTEGER DEFAULT 0,
+  revoked_at TEXT
+)`); } catch (e) {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_it_did ON issued_tokens(did)'); } catch (e) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS token_revocations (
+  did TEXT PRIMARY KEY,
+  revoke_before INTEGER NOT NULL
+)`); } catch (e) {}
+identity.setTokenRecorder((p) => {
+  if (!p.jti) return;
+  db.prepare('INSERT OR IGNORE INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .run(p.jti, p.sub, p.scope || '', p.iat || null, p.exp || null);
+});
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -766,6 +789,36 @@ app.post('/api/identity/verify', (req, res) => {
   db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE id = ?').run(validCode.id);
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, did, { scope, expiresIn: expires_in, metadata: { email: wallet.email, username: wallet.username } });
   res.json({ ok: true, token, did, scope, email: wallet.email });
+});
+
+// ── Token tracking + revocation surface ──
+// Every token minted since 2026-07-06 carries a jti and is listed here.
+// Older tokens have no jti and are only covered by revoke-all.
+app.get('/api/identity/tokens', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const rows = db.prepare('SELECT jti, scope, issued_at, expires_at, revoked, revoked_at FROM issued_tokens WHERE did = ? ORDER BY issued_at DESC LIMIT 200').all(auth.did);
+  const cut = db.prepare('SELECT revoke_before FROM token_revocations WHERE did = ?').get(auth.did);
+  res.json({ ok: true, did: auth.did, tokens: rows, revoke_all_before: cut ? cut.revoke_before : null });
+});
+
+app.post('/api/identity/tokens/revoke', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const { jti } = req.body || {};
+  if (!jti) return res.status(400).json({ error: 'jti required' });
+  const result = db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ? AND did = ?").run(jti, auth.did);
+  if (result.changes === 0) return res.status(404).json({ error: 'token not found' });
+  res.json({ ok: true, jti, revoked: true });
+});
+
+app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(auth.did, now);
+  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(auth.did);
+  res.json({ ok: true, revoke_before: now, warning: 'ALL tokens for this DID issued before now are dead, including the one that made this call. Re-mint via request-2fa + verify.' });
 });
 
 app.get('/api/identity/lookup', (req, res) => {
@@ -3509,6 +3562,26 @@ app.delete('/api/blindkey/revoke', rateLimitStandard, (req, res) => {
     .run('revoked', ownerDid, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
   res.json({ ok: true, name, did: ownerDid, status: 'revoked' });
+});
+
+// DELETE /api/blindkey/delete — retire a secret permanently by name or ref code.
+// Unlike revoke, delete is the terminal state for cleanup: the entry stops
+// appearing in list/search and its value is never served again.
+app.delete('/api/blindkey/delete', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { name, ref, did, username } = req.body || {};
+  if (!name && !ref) return res.status(400).json({ error: 'name or ref required' });
+  let ownerDid = actor.did || null;
+  if (actor.mode === 'admin') {
+    ownerDid = did || (username ? db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username)?.did : null);
+    if (!ownerDid) return res.status(400).json({ error: 'did or username required when using admin access' });
+  }
+  const result = ref
+    ? db.prepare("UPDATE blindkey_secrets SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE did = ? AND ref_code = ? AND status != 'deleted'").run(ownerDid, ref)
+    : db.prepare("UPDATE blindkey_secrets SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ? AND status != 'deleted'").run(ownerDid, name);
+  if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
+  res.json({ ok: true, ...(ref ? { ref } : { name }), did: ownerDid, status: 'deleted' });
 });
 
 // POST /api/blindkey/rotate — rotate a secret with context transfer and grace period

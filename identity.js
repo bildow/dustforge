@@ -84,6 +84,11 @@ function base64url(buf) {
   return Buffer.from(buf).toString('base64url');
 }
 
+// Host app registers a persistence hook so every minted token lands in the
+// issued_tokens registry (the revocation surface). identity.js stays db-free.
+let tokenRecorder = null;
+function setTokenRecorder(fn) { tokenRecorder = fn; }
+
 function createToken(privateKeyDer, did, options = {}) {
   const {
     scope = 'read',
@@ -105,8 +110,10 @@ function createToken(privateKeyDer, did, options = {}) {
     iss: 'civitasvox',
     iat: now,
     exp: now + parseExpiry(expiresIn),
+    jti: crypto.randomBytes(8).toString('hex'),
     ...metadata,
   };
+  if (tokenRecorder) { try { tokenRecorder(payload); } catch (_) {} }
 
   const headerB64 = base64url(JSON.stringify(header));
   const payloadB64 = base64url(JSON.stringify(payload));
@@ -232,6 +239,7 @@ function createTokenForIdentity(encryptedPrivateKey, did, options) {
 module.exports = {
   createIdentity,
   createTokenForIdentity,
+  setTokenRecorder,
   verifyToken,
   verifyTokenStandalone,
   publicKeyToDID,

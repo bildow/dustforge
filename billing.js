@@ -172,6 +172,23 @@ function reconcile(db) {
  * Express middleware — authenticate via Bearer token, deduct per-call cost.
  * Usage: app.post('/api/something', billingMiddleware(db, 'api_call_compute'), handler)
  */
+// Revocation surface: a token is dead if its jti was revoked, or if the DID
+// issued a revoke-all cut after this token's iat. Tokens minted before jti
+// existed (pre 2026-07-06) are only covered by revoke-all.
+function checkTokenRevocation(db, decoded) {
+  try {
+    if (decoded.jti) {
+      const row = db.prepare('SELECT revoked FROM issued_tokens WHERE jti = ?').get(decoded.jti);
+      if (row && row.revoked) return { revoked: true, reason: 'token revoked' };
+    }
+    const cut = db.prepare('SELECT revoke_before FROM token_revocations WHERE did = ?').get(decoded.sub);
+    if (cut && decoded.iat && decoded.iat < cut.revoke_before) {
+      return { revoked: true, reason: 'token revoked by revoke-all' };
+    }
+  } catch (_) {}
+  return { revoked: false };
+}
+
 function billingMiddleware(db, actionType, options = {}) {
   const identity = require('./identity');
   const cost = options.cost ?? RATE_TABLE[actionType] ?? 0;
@@ -187,6 +204,11 @@ function billingMiddleware(db, actionType, options = {}) {
     const result = identity.verifyTokenStandalone(token);
     if (!result.valid) {
       return res.status(401).json({ error: `token invalid: ${result.error}`, action: actionType });
+    }
+
+    const dead = checkTokenRevocation(db, result.decoded);
+    if (dead.revoked) {
+      return res.status(401).json({ error: dead.reason, action: actionType });
     }
 
     const did = result.decoded.sub;
@@ -227,4 +249,5 @@ module.exports = {
   syncCachedBalance,
   reconcile,
   billingMiddleware,
+  checkTokenRevocation,
 };
