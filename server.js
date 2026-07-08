@@ -1663,6 +1663,10 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             if (pending.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(pending.referral_code); if (r) referredBy = r.did; }
             db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
             db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe webhook', 0)").run(id.did);
+            // Onboarding grant: the $1 they paid IS 100 Diamond Dust — hand it to
+            // them so they can use the product immediately (no second charge).
+            // Idempotent on the Stripe session so a webhook replay can't double-grant.
+            billing.creditBalance(db, id.did, 100, 'onboarding_grant', 'Onboarding: 100 DD included with $1 signup', 'onboard_' + session.id);
             if (referredBy) referral.processReferralPayout(db, referredBy, id.did, pending.username);
             db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', session.id);
             console.log('[stripe-webhook] fulfilled:', pending.username, '->', id.did);
@@ -7946,6 +7950,9 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_ip ON ticks(ip)"); } catch(e
 // Add columns if missing (existing installs)
 try { db.exec("ALTER TABLE ticks ADD COLUMN chain_hash TEXT DEFAULT ''"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN tick_type TEXT DEFAULT 'tick'"); } catch(e) {}
+// Buoy ticks cost 0.001 DD. The ledger is integer-DD, so bill in batches of
+// 1000 ticks = 1 DD; this table holds the per-DID running remainder.
+try { db.exec("CREATE TABLE IF NOT EXISTS tick_billing (did TEXT PRIMARY KEY, pending INTEGER DEFAULT 0)"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN ref_tick INTEGER DEFAULT NULL"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN tags TEXT DEFAULT '[]'"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_type ON ticks(tick_type)"); } catch(e) {}
@@ -7987,14 +7994,28 @@ app.post('/api/tick', (req, res) => {
     if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day', onboard: 'https://demipass.com', note: 'Create a free identity for unlimited signed ticks.' });
   }
 
-  // Bill member tick (1 DD per tick) — free lanes: soul-integrity ticks + first-party infra (Kodiak).
+  // Bill member tick at 0.001 DD — free lanes: soul-integrity ticks + first-party infra (Kodiak).
+  // The ledger is integer-DD, so we accumulate a per-DID counter and charge 1 DD
+  // every 1000 ticks (= 0.001 DD/tick). A heartbeat can tick 1000x on 1 DD.
   if (isMember) {
     const isSoulTick = (tickType === 'soul') && ((siliconDid && SOUL_DIDS.has(siliconDid)) || SOUL_DIDS.has(did));
     const isFirstPartyComp = FIRSTPARTY_DIDS.has(did) && /^kodiak:/i.test(noteClean);
     if (!isSoulTick && !isFirstPartyComp) {
-      const debit = billing.deductBalance(db, did, 1, 'tick', noteClean.slice(0, 50) || 'tick');
-      if (!debit.ok) { notifyLowBalance(did, debit.balance_cents, 'tick rejected - insufficient balance'); return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents }); }
-      if (typeof debit.balance_after === 'number' && debit.balance_after <= LOW_BALANCE_CENTS) notifyLowBalance(did, debit.balance_after, 'balance low');
+      const TICK_BATCH = 1000; // 1 DD per 1000 ticks
+      const cur = db.prepare('SELECT pending FROM tick_billing WHERE did = ?').get(did);
+      let pending = (cur?.pending || 0) + 1;
+      if (pending >= TICK_BATCH) {
+        const debit = billing.deductBalance(db, did, 1, 'tick', `buoy ticks x${TICK_BATCH} @ 0.001 DD`);
+        if (!debit.ok) {
+          // Park just below the threshold so the next tick retries the charge.
+          db.prepare("INSERT INTO tick_billing (did, pending) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET pending = excluded.pending").run(did, TICK_BATCH - 1);
+          notifyLowBalance(did, debit.balance_cents, 'tick rejected - insufficient balance');
+          return res.status(402).json({ error: 'insufficient balance for tick', balance: debit.balance_cents });
+        }
+        pending -= TICK_BATCH;
+        if (typeof debit.balance_after === 'number' && debit.balance_after <= LOW_BALANCE_CENTS) notifyLowBalance(did, debit.balance_after, 'balance low');
+      }
+      db.prepare("INSERT INTO tick_billing (did, pending) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET pending = excluded.pending").run(did, pending);
     }
   }
 
