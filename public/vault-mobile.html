@@ -262,9 +262,14 @@
       <div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Recent forwards</span></div>
       <div id="df-activity"><div class="empty" style="font-size:0.78rem">No forwarding activity yet.</div></div>
 
-      <div class="section-head" style="padding:1.25rem 0 0.5rem"><span class="section-title">Diamond Dust &mdash; where it goes</span></div>
-      <div id="df-dust-summary"></div>
-      <div id="df-dust-ledger"><div class="empty" style="font-size:0.78rem">Loading…</div></div>
+      <div class="section-head" onclick="toggleDust()" style="padding:1.25rem 0 0.5rem;cursor:pointer">
+        <span class="section-title">Diamond Dust ledger</span>
+        <span id="df-dust-toggle" style="color:var(--accent);font-weight:700;font-size:1.1rem;line-height:1">+</span>
+      </div>
+      <div id="df-dust-wrap" style="display:none">
+        <div id="df-dust-summary"></div>
+        <div id="df-dust-ledger"><div class="empty" style="font-size:0.78rem">Loading…</div></div>
+      </div>
     </div>
   </div>
 
@@ -465,7 +470,13 @@ async function loadDustforge(){
       act.innerHTML=h;
     }
   } catch(_){ act.innerHTML=''; }
-  loadDust();
+}
+
+// Diamond Dust ledger is collapsed by default; loads fresh each time it opens.
+function toggleDust(){
+  const w=document.getElementById('df-dust-wrap'), t=document.getElementById('df-dust-toggle');
+  if(w.style.display==='none'){ w.style.display='block'; t.textContent='−'; loadDust(); }
+  else { w.style.display='none'; t.textContent='+'; }
 }
 
 const DUST_LABELS = {
