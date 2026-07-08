@@ -207,6 +207,20 @@ identity.setTokenRecorder((p) => {
     .run(p.jti, p.sub, p.scope || '', p.iat || null, p.exp || null);
 });
 
+// The inbound MTA hook carries whole emails — parse it with a large limit
+// BEFORE the default json parser (which has a small limit and would 413 big mail).
+const _mtaHookParser = express.json({ limit: '30mb' });
+app.use((req, res, next) => {
+  if (req.path === '/api/mail/mta-hook') {
+    // Fail open: if parsing fails (malformed / oversized), still tell Stalwart to
+    // accept so inbound mail is never bounced by a hook problem.
+    return _mtaHookParser(req, res, (err) => {
+      if (err) { try { return res.json({ action: 'accept' }); } catch (_) { return; } }
+      next();
+    });
+  }
+  next();
+});
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -1442,6 +1456,102 @@ app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 
   }
 
   res.json({ ok: true, forwarded: results.length, results, billed: results.length });
+});
+
+// ── Inbound MTA hook: COD mail forwarding ───────────────────────────────────
+// Stalwart calls this during the SMTP DATA stage with the whole message. Per
+// @dustforge.com recipient with active forward rules we bill 1 DD against the
+// EXISTING balance and forward; if the wallet can't pay we REFUSE the forward
+// and log a verbose event the app/API surfaces. We ALWAYS return {action:accept}
+// so the mail still lands in the mailbox and inbound delivery is never blocked —
+// the hook fails open on any error (a dustforge hiccup must not stop mail).
+try { db.exec(`CREATE TABLE IF NOT EXISTS forward_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  forward_to TEXT DEFAULT '',
+  from_addr TEXT DEFAULT '',
+  subject TEXT DEFAULT '',
+  detail TEXT DEFAULT '',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_fe_did ON forward_events(did, id)'); } catch(e) {}
+
+function _mtaHeader(headers, name) {
+  if (!Array.isArray(headers)) return '';
+  const row = headers.find(h => Array.isArray(h) && String(h[0]).toLowerCase() === name.toLowerCase());
+  return row ? String(row[1] || '').trim() : '';
+}
+const MTA_HOOK_KEY = process.env.MTA_HOOK_KEY || '';
+
+app.post('/api/mail/mta-hook', (req, res) => {
+  const accept = () => { try { res.json({ action: 'accept' }); } catch(_) {} };
+  try {
+    // Only Stalwart (holding the shared key) may drive forwarding+billing. On
+    // bad/missing auth we still ACCEPT (never block mail) but do nothing.
+    // Key can come via header or ?k= query (Stalwart hook headers are finicky).
+    const _provided = req.headers['x-mta-hook-key'] || req.query.k || '';
+    if (MTA_HOOK_KEY && _provided !== MTA_HOOK_KEY) return accept();
+    const { envelope, message } = req.body || {};
+    if (!envelope || !message) return accept();
+    const fromAddr = String(envelope.from && envelope.from.address || '').toLowerCase();
+    const subject = _mtaHeader(message.headers, 'Subject');
+    const body = String(message.contents || '');
+    const recips = Array.isArray(envelope.to) ? envelope.to : [];
+
+    for (const r of recips) {
+      const rcpt = String((r && r.address) || '').toLowerCase();
+      if (!rcpt.endsWith('@dustforge.com')) continue;
+      const username = rcpt.split('@')[0];
+      const wallet = db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username);
+      if (!wallet) continue;
+      const rules = db.prepare("SELECT * FROM forward_relays WHERE did = ? AND status = 'active'").all(wallet.did);
+      if (!rules.length) continue;
+
+      for (const rule of rules) {
+        if (rule.filter_from !== '*' && fromAddr && !fromAddr.includes(String(rule.filter_from).toLowerCase())) continue;
+        // COD: charge 1 DD against the existing balance BEFORE forwarding.
+        const debit = billing.deductBalance(db, wallet.did, 1, 'email_send', `mail forward -> ${rule.forward_to}`);
+        if (!debit.ok) {
+          try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject, detail) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(wallet.did, 'blocked_insufficient_balance', rule.forward_to, fromAddr, subject.slice(0, 120),
+                 `balance ${debit.balance_cents ?? 0} DD — top up to resume forwarding`); } catch(_) {}
+          continue;
+        }
+        try { db.prepare('UPDATE forward_relays SET forwarded_count = forwarded_count + 1 WHERE id = ?').run(rule.id); } catch(_) {}
+        try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject) VALUES (?, ?, ?, ?, ?)')
+          .run(wallet.did, 'forwarded', rule.forward_to, fromAddr, subject.slice(0, 120)); } catch(_) {}
+        // Send async so the hook returns fast — an SMTP send must not stall the
+        // inbound DATA stage (Stalwart has a short timeout).
+        const _u = username, _to = rule.forward_to, _did = wallet.did;
+        setImmediate(() => {
+          try {
+            const t = createEmailTransport();
+            t.sendMail({
+              from: `${_u}@dustforge.com`,
+              to: _to,
+              replyTo: fromAddr || undefined,
+              subject: subject || '(no subject)',
+              text: `Forwarded by DemiPass from ${_u}@dustforge.com\nOriginal sender: ${fromAddr || 'unknown'}\n\n${body}`,
+            }).then(() => {}).catch((e) => {
+              try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject, detail) VALUES (?, ?, ?, ?, ?, ?)')
+                .run(_did, 'send_failed', _to, fromAddr, subject.slice(0, 120), String(e && e.message || e).slice(0, 120)); } catch(_) {}
+            });
+          } catch(_) {}
+        });
+      }
+    }
+    return accept();
+  } catch (e) { return accept(); }
+});
+
+// GET /api/mail/forward-events — recent forwarding activity for the app (verbose status)
+app.get('/api/mail/forward-events', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const events = db.prepare('SELECT outcome, forward_to, from_addr, subject, detail, created_at FROM forward_events WHERE did = ? ORDER BY id DESC LIMIT 30').all(auth.did);
+  const blocked = events.filter(e => e.outcome === 'blocked_insufficient_balance').length;
+  res.json({ events, total: events.length, blocked });
 });
 
 // ============================================================
