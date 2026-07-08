@@ -3160,6 +3160,20 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
     return res.status(403).json({ error: ctxCheck.error });
   }
 
+  // Per-credential gate policy for USE (egress). Silicon is exempt inside
+  // checkGatePolicy so blind automation is never broken; carbon callers must
+  // satisfy any 'use' gates the owner set. Default policy is use:[] → no-op
+  // unless the owner explicitly raised the credential's depth on use.
+  {
+    const useGate = checkGatePolicy(callerDid, 'use', secret, getBearerIdentity(req));
+    if (!useGate.ok) {
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'use_gate_denied', callerDid, secret.id, contextName, JSON.stringify({ missing: useGate.missing })
+      );
+      return res.status(403).json(useGate);
+    }
+  }
+
   // Generate a single-use token — 32 bytes of crypto randomness
   const token = crypto.randomBytes(32).toString('hex');
   const expiresInSeconds = 30;
