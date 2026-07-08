@@ -1663,10 +1663,12 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             if (pending.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(pending.referral_code); if (r) referredBy = r.did; }
             db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
             db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe webhook', 0)").run(id.did);
-            // Onboarding grant: the $1 they paid IS 100 Diamond Dust — hand it to
-            // them so they can use the product immediately (no second charge).
+            // Onboarding grant: $1 buys 100 DD, minus a 10 DD creation fee, so
+            // the new user nets 90 DD (usable immediately, no second charge).
+            // The 10 DD fee is either paid to the referrer (processReferralPayout
+            // below, on a referral) or simply not minted (vaporizes) otherwise.
             // Idempotent on the Stripe session so a webhook replay can't double-grant.
-            billing.creditBalance(db, id.did, 100, 'onboarding_grant', 'Onboarding: 100 DD included with $1 signup', 'onboard_' + session.id);
+            billing.creditBalance(db, id.did, 90, 'onboarding_grant', 'Onboarding: 90 DD ($1 signup, 10 DD creation fee)', 'onboard_' + session.id);
             if (referredBy) referral.processReferralPayout(db, referredBy, id.did, pending.username);
             db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', session.id);
             console.log('[stripe-webhook] fulfilled:', pending.username, '->', id.did);
@@ -7950,8 +7952,8 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_ip ON ticks(ip)"); } catch(e
 // Add columns if missing (existing installs)
 try { db.exec("ALTER TABLE ticks ADD COLUMN chain_hash TEXT DEFAULT ''"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN tick_type TEXT DEFAULT 'tick'"); } catch(e) {}
-// Buoy ticks cost 0.001 DD. The ledger is integer-DD, so bill in batches of
-// 1000 ticks = 1 DD; this table holds the per-DID running remainder.
+// Buoy ticks cost 0.01 DD. The ledger is integer-DD, so bill in batches of
+// 100 ticks = 1 DD; this table holds the per-DID running remainder.
 try { db.exec("CREATE TABLE IF NOT EXISTS tick_billing (did TEXT PRIMARY KEY, pending INTEGER DEFAULT 0)"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN ref_tick INTEGER DEFAULT NULL"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN tags TEXT DEFAULT '[]'"); } catch(e) {}
@@ -7994,18 +7996,18 @@ app.post('/api/tick', (req, res) => {
     if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day', onboard: 'https://demipass.com', note: 'Create a free identity for unlimited signed ticks.' });
   }
 
-  // Bill member tick at 0.001 DD — free lanes: soul-integrity ticks + first-party infra (Kodiak).
+  // Bill member tick at 0.01 DD — free lanes: soul-integrity ticks + first-party infra (Kodiak).
   // The ledger is integer-DD, so we accumulate a per-DID counter and charge 1 DD
-  // every 1000 ticks (= 0.001 DD/tick). A heartbeat can tick 1000x on 1 DD.
+  // every 100 ticks (= 0.01 DD/tick). A heartbeat can tick 100x on 1 DD.
   if (isMember) {
     const isSoulTick = (tickType === 'soul') && ((siliconDid && SOUL_DIDS.has(siliconDid)) || SOUL_DIDS.has(did));
     const isFirstPartyComp = FIRSTPARTY_DIDS.has(did) && /^kodiak:/i.test(noteClean);
     if (!isSoulTick && !isFirstPartyComp) {
-      const TICK_BATCH = 1000; // 1 DD per 1000 ticks
+      const TICK_BATCH = 100; // 1 DD per 100 ticks
       const cur = db.prepare('SELECT pending FROM tick_billing WHERE did = ?').get(did);
       let pending = (cur?.pending || 0) + 1;
       if (pending >= TICK_BATCH) {
-        const debit = billing.deductBalance(db, did, 1, 'tick', `buoy ticks x${TICK_BATCH} @ 0.001 DD`);
+        const debit = billing.deductBalance(db, did, 1, 'tick', `buoy ticks x${TICK_BATCH} @ 0.01 DD`);
         if (!debit.ok) {
           // Park just below the threshold so the next tick retries the charge.
           db.prepare("INSERT INTO tick_billing (did, pending) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET pending = excluded.pending").run(did, TICK_BATCH - 1);
