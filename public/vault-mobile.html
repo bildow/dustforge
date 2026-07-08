@@ -237,6 +237,30 @@
     </div>
   </div>
 
+  <!-- Page: Dustforge (identity + email + forwarding) -->
+  <div id="page-dustforge" class="page">
+    <div class="section" style="padding-top:1rem">
+      <div class="section-title" style="padding:0.75rem 0">Dustforge Account</div>
+      <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">
+        <div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">Your identity &amp; email</div>
+        <div id="df-email" style="font-size:1.05rem;font-weight:700;margin:0.35rem 0;font-family:monospace;word-break:break-all">…@dustforge.com</div>
+        <div style="font-size:0.68rem;color:var(--text3);margin-top:0.4rem">DID</div>
+        <div id="df-did" style="font-family:monospace;font-size:0.62rem;color:var(--accent);word-break:break-all"></div>
+        <div style="display:flex;justify-content:space-between;margin-top:0.7rem;padding-top:0.6rem;border-top:1px solid var(--border);font-size:0.85rem">
+          <span style="color:var(--text3)">Diamond Dust balance</span><span id="df-balance" style="font-weight:700">— DD</span>
+        </div>
+      </div>
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:0.85rem;margin-bottom:1rem;font-size:0.78rem;color:var(--text2);line-height:1.55">
+        <strong style="color:var(--text)">Your @dustforge.com inbox is API-only.</strong> There's no webmail to log into — mail is reached programmatically or forwarded to an address you control. Choose where it lands below. Each forwarded email costs 1 DD.
+      </div>
+      <div class="section-head" style="padding:0.25rem 0 0.5rem">
+        <span class="section-title">Mail forwarding</span>
+        <button class="btn-primary" onclick="addForward()">+ Add</button>
+      </div>
+      <div id="df-rules"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
   <!-- Page: Settings -->
   <div id="page-settings" class="page">
     <div class="section" style="padding-top:1rem">
@@ -285,6 +309,7 @@
     <div class="bn-item active" data-page="vault"><span class="bn-icon">&#x1f512;</span>Vault</div>
     <div class="bn-item" data-page="activity"><span class="bn-icon">&#x26a1;</span>Activity</div>
     <div class="bn-item" data-page="buoy"><span class="bn-icon">&#x2693;</span>Buoy</div>
+    <div class="bn-item" data-page="dustforge"><span class="bn-icon">&#x2726;</span>Dustforge</div>
     <div class="bn-item" data-page="settings"><span class="bn-icon">&#x2699;</span>Settings</div>
   </div>
 </div>
@@ -390,7 +415,41 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
   if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();}
+  if(n.dataset.page==='dustforge')loadDustforge();
 }));
+
+async function loadDustforge(){
+  document.getElementById('df-email').textContent = (user||'you')+'@dustforge.com';
+  document.getElementById('df-did').textContent = did||'—';
+  try { const d = await api('GET','/api/demipass/dashboard'); document.getElementById('df-balance').textContent = (d.balance_dd||0)+' DD'; } catch(_){}
+  const el = document.getElementById('df-rules');
+  try {
+    const r = await api('GET','/api/relay/list');
+    const rules = (r.rules||[]).filter(x=>x.status==='active');
+    if(!rules.length){ el.innerHTML='<div class="empty" style="font-size:0.8rem;line-height:1.5">No forwarding set up yet — mail to your @dustforge.com address isn\'t going anywhere. Tap <strong>+ Add</strong> to send it to your real inbox.</div>'; return; }
+    let h='';
+    for(const rule of rules){
+      h += '<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.75rem;margin-bottom:0.5rem;display:flex;justify-content:space-between;align-items:center;gap:0.5rem">';
+      h += '<div style="min-width:0"><div style="font-size:0.85rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">&rarr; '+esc(rule.forward_to)+'</div>';
+      h += '<div style="font-size:0.65rem;color:var(--text3)">'+(rule.filter_from==='*'?'all mail':'from '+esc(rule.filter_from))+' &middot; '+(rule.forwarded_count||0)+' forwarded</div></div>';
+      h += '<button onclick="removeForward('+rule.id+')" style="padding:0.4rem 0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-size:0.72rem;cursor:pointer;flex-shrink:0">Remove</button>';
+      h += '</div>';
+    }
+    el.innerHTML = h;
+  } catch(e){ el.innerHTML='<div class="empty">Could not load forwarding: '+esc(e.message)+'</div>'; }
+}
+async function addForward(){
+  const to = prompt('Forward your @dustforge.com mail to which address?\n(e.g. you@gmail.com)');
+  if(!to) return;
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to.trim())){ alert('That doesn\'t look like an email address.'); return; }
+  try { const r = await api('POST','/api/relay/create',{forward_to:to.trim()}); loadDustforge(); }
+  catch(e){ alert('Could not add forwarding: '+e.message); }
+}
+async function removeForward(id){
+  if(!confirm('Stop forwarding to this address?')) return;
+  try { await api('DELETE','/api/relay/remove',{id}); loadDustforge(); }
+  catch(e){ alert('Could not remove: '+e.message); }
+}
 
 async function loadSmsStatus(){
   const el=document.getElementById('sms-status'); if(!el)return;
