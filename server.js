@@ -492,7 +492,18 @@ function revokeRefreshToken(id, rotatedToRaw) {
 app.post('/api/identity/create', async (req, res) => {
   const { username, password, key, referral_code } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username required' });
-  if (!key && !password) return res.status(400).json({ error: 'key or password required' });
+  // Anti-spam gate: account creation requires payment. The old password-only
+  // path (free $0 account + a real @dustforge.com mailbox, no payment) is
+  // closed — every account must come through a paid invite/prepaid key or the
+  // $1 Stripe checkout. The Stripe webhook creates paid accounts directly and
+  // is unaffected by this.
+  if (!key) {
+    return res.status(402).json({
+      error: 'account creation requires payment. Onboard via the $1 Stripe checkout (POST /api/identity/request-account) or redeem a paid invite/prepaid key.',
+      payment_required: true,
+      onboarding: { paid: 'POST /api/identity/request-account', invite: 'POST /api/identity/request-invite' },
+    });
+  }
   if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'username must be 3-31 chars, lowercase alphanumeric' });
 
   // Resolve invite key if provided (prefer key over password)
