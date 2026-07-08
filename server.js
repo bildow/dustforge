@@ -1203,6 +1203,23 @@ app.get('/api/identity/transactions', (req, res) => {
   res.json(db.prepare('SELECT * FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT ?').all(did, limit));
 });
 
+// GET /api/identity/ledger — the caller's OWN Diamond Dust ledger (bearer-authed):
+// recent transactions + a "where it goes" spend-by-category summary. Powers the
+// app's Diamond Dust activity view.
+app.get('/api/identity/ledger', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const limit = Math.min(100, Number(req.query.limit) || 40);
+  const txns = db.prepare('SELECT amount_cents, type, description, balance_after, created_at FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT ?').all(auth.did, limit);
+  // Spend-by-category (debits only) + credit total, over the full history.
+  const spentRows = db.prepare("SELECT type, SUM(-amount_cents) AS spent FROM identity_transactions WHERE did = ? AND amount_cents < 0 GROUP BY type ORDER BY spent DESC").all(auth.did);
+  const spent_by_type = {}; let total_spent = 0;
+  for (const r of spentRows) { spent_by_type[r.type] = r.spent; total_spent += r.spent; }
+  const credited = db.prepare("SELECT COALESCE(SUM(amount_cents),0) AS c FROM identity_transactions WHERE did = ? AND amount_cents > 0").get(auth.did).c;
+  const wallet = db.prepare('SELECT balance_cents FROM identity_wallets WHERE did = ?').get(auth.did);
+  res.json({ balance: wallet ? wallet.balance_cents : 0, transactions: txns, summary: { spent_by_type, total_spent, total_credited: credited } });
+});
+
 // ============================================================
 // API — Profile
 // ============================================================

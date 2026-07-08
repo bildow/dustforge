@@ -261,6 +261,10 @@
       <div id="df-fwd-banner" style="display:none;margin-top:0.75rem;background:rgba(255,90,90,0.12);border:1px solid var(--red);border-radius:10px;padding:0.75rem;font-size:0.78rem;color:var(--red)"></div>
       <div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Recent forwards</span></div>
       <div id="df-activity"><div class="empty" style="font-size:0.78rem">No forwarding activity yet.</div></div>
+
+      <div class="section-head" style="padding:1.25rem 0 0.5rem"><span class="section-title">Diamond Dust &mdash; where it goes</span></div>
+      <div id="df-dust-summary"></div>
+      <div id="df-dust-ledger"><div class="empty" style="font-size:0.78rem">Loading…</div></div>
     </div>
   </div>
 
@@ -461,6 +465,50 @@ async function loadDustforge(){
       act.innerHTML=h;
     }
   } catch(_){ act.innerHTML=''; }
+  loadDust();
+}
+
+const DUST_LABELS = {
+  email_send:'Mail forward', relay_forward:'Mail forward', api_call_compute:'Secret used',
+  api_call_write:'Write', api_call_read:'Read', tick:'Buoy ticks', onboarding_grant:'Welcome grant',
+  referral_payout:'Referral earned', stripe_topup:'Top-up', wallet_topup:'Top-up', account_created:'Account created',
+  identity_create:'Account fee', transfer_out:'Sent', transfer_in:'Received', test_refund:'Refund',
+  round_dispatch:'Round dispatch', round_collaboration:'Collaboration round'
+};
+function dustLabel(t){ return DUST_LABELS[t] || (t||'activity').replace(/_/g,' '); }
+
+async function loadDust(){
+  const sumEl=document.getElementById('df-dust-summary'), ledEl=document.getElementById('df-dust-ledger');
+  try {
+    const d = await api('GET','/api/identity/ledger?limit=40');
+    // spend-by-category summary (largest first)
+    const s = d.summary||{spent_by_type:{}}; const entries = Object.entries(s.spent_by_type||{}).sort((a,b)=>b[1]-a[1]);
+    if(entries.length){
+      let sh='<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.75rem;margin-bottom:0.75rem">';
+      sh+='<div style="font-size:0.7rem;color:var(--text3);margin-bottom:0.4rem">Spent to date: <span style="color:var(--text2);font-weight:600">'+(s.total_spent||0)+' DD</span></div>';
+      const max=entries[0][1]||1;
+      for(const [type,amt] of entries){
+        const pct=Math.round((amt/max)*100);
+        sh+='<div style="margin:0.35rem 0"><div style="display:flex;justify-content:space-between;font-size:0.75rem"><span>'+esc(dustLabel(type))+'</span><span style="color:var(--text2);font-weight:600">'+amt+' DD</span></div>';
+        sh+='<div style="height:4px;background:var(--bg);border-radius:2px;margin-top:2px;overflow:hidden"><div style="width:'+pct+'%;height:100%;background:var(--accent)"></div></div></div>';
+      }
+      sh+='</div>'; sumEl.innerHTML=sh;
+    } else { sumEl.innerHTML=''; }
+    // recent transactions
+    const txns=d.transactions||[];
+    if(!txns.length){ ledEl.innerHTML='<div class="empty" style="font-size:0.78rem">No Diamond Dust activity yet.</div>'; return; }
+    let h='';
+    for(const t of txns){
+      const credit=t.amount_cents>0; const col=credit?'var(--green)':'var(--text2)';
+      const amt=(credit?'+':'')+t.amount_cents+' DD';
+      h+='<div style="display:flex;justify-content:space-between;gap:0.5rem;padding:0.45rem 0;border-bottom:1px solid rgba(39,68,95,0.2)">';
+      h+='<div style="min-width:0"><div style="font-size:0.82rem;font-weight:600">'+esc(dustLabel(t.type))+'</div>';
+      h+='<div style="font-size:0.65rem;color:var(--text3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc((t.description||'').slice(0,44))+' &middot; '+new Date(t.created_at+'Z').toLocaleDateString()+'</div></div>';
+      h+='<div style="text-align:right;white-space:nowrap"><div style="font-size:0.82rem;font-weight:700;color:'+col+'">'+amt+'</div>';
+      h+='<div style="font-size:0.6rem;color:var(--text3)">bal '+t.balance_after+'</div></div></div>';
+    }
+    ledEl.innerHTML=h;
+  } catch(e){ ledEl.innerHTML='<div class="empty">Could not load ledger: '+esc(e.message)+'</div>'; }
 }
 async function addForward(){
   const to = prompt('Forward your @dustforge.com mail to which address?\n(e.g. you@gmail.com)');
