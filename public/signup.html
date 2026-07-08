@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Create your Dustforge account</title>
+<style>
+  :root{--bg:#08111a;--card:#0f1b28;--surface:#0c1622;--border:#27445f;--text:#e7f1fb;--text2:#a9c0d6;--text3:#5f7893;--accent:#5b9bd5;--green:#69c7b1;--red:#e2645a;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.5;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1.5rem}
+  .card{width:100%;max-width:440px;background:var(--card);border:1px solid var(--border);border-radius:16px;padding:2rem}
+  h1{font-size:1.5rem;margin:0 0 0.35rem}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--text2);font-size:0.9rem;margin-bottom:1.25rem}
+  .pitch{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:0.85rem;font-size:0.82rem;color:var(--text2);margin-bottom:1.25rem;line-height:1.55}
+  .pitch b{color:var(--text)}
+  label{display:block;font-size:0.78rem;color:var(--text3);margin:0.85rem 0 0.3rem}
+  input{width:100%;padding:0.7rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.95rem}
+  input:focus{outline:none;border-color:var(--accent)}
+  .hint{font-size:0.68rem;color:var(--text3);margin-top:0.2rem}
+  .btn{width:100%;margin-top:1.5rem;padding:0.85rem;background:var(--accent);color:var(--bg);border:none;border-radius:10px;font-weight:700;font-size:1rem;cursor:pointer}
+  .btn:disabled{opacity:0.6;cursor:default}
+  .msg{margin-top:0.85rem;font-size:0.82rem;min-height:1.1rem}
+  .msg.err{color:var(--red)}
+  .msg.ok{color:var(--green)}
+  .foot{margin-top:1.25rem;font-size:0.8rem;color:var(--text3);text-align:center}
+  .foot a{color:var(--accent);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Create your <span>Dustforge</span> account</h1>
+  <div class="sub">Cryptographic identity, secure email, and a wallet — and your key to DemiPass.</div>
+  <div class="pitch">
+    A one-time <b>$1</b> gives you a <b>DID identity</b>, a wallet preloaded with <b>90 Diamond Dust</b>, and a <b>you@dustforge.com</b> address. The $1 is the anti-spam gate — no free tier for bots. Your @dustforge.com inbox is API-only; forward it to your real inbox from the DemiPass app.
+  </div>
+
+  <label for="u">Username</label>
+  <input id="u" type="text" autocapitalize="none" autocomplete="username" placeholder="e.g. ada, my-agent" spellcheck="false">
+  <div class="hint">3–31 chars, lowercase letters, digits, dots, dashes. Becomes <code>username@dustforge.com</code>.</div>
+
+  <label for="p">Password</label>
+  <input id="p" type="password" autocomplete="new-password" placeholder="at least 8 characters">
+
+  <label for="p2">Confirm password</label>
+  <input id="p2" type="password" autocomplete="new-password" placeholder="re-enter password">
+
+  <label for="ref">Referral code (optional)</label>
+  <input id="ref" type="text" autocapitalize="none" placeholder="if a friend invited you" spellcheck="false">
+
+  <button class="btn" id="go" onclick="signup()">Continue to payment — $1</button>
+  <div class="msg" id="msg"></div>
+
+  <div class="foot">Already have an account? <a href="/vault-mobile.html">Sign in</a></div>
+</div>
+
+<script>
+const API = 'https://api.dustforge.com';
+function q(id){return document.getElementById(id)}
+async function signup(){
+  const u=q('u').value.trim().toLowerCase(), p=q('p').value, p2=q('p2').value, ref=q('ref').value.trim();
+  const m=q('msg'), btn=q('go');
+  m.className='msg'; m.textContent='';
+  if(!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(u)){ m.className='msg err'; m.textContent='Username: 3–31 chars, lowercase letters/digits/dots/dashes.'; return; }
+  if(p.length<8){ m.className='msg err'; m.textContent='Password must be at least 8 characters.'; return; }
+  if(p!==p2){ m.className='msg err'; m.textContent='Passwords do not match.'; return; }
+  btn.disabled=true; m.className='msg'; m.textContent='Creating your checkout…';
+  try{
+    const body={ username:u, password:p }; if(ref) body.referral_code=ref;
+    const r=await fetch(API+'/api/stripe/checkout/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json().catch(()=>({}));
+    if(r.status===409 && d.waiting_list_active){ m.className='msg err'; m.textContent='Signups are paused (waiting list active). Try again soon.'; btn.disabled=false; return; }
+    if(!r.ok || !d.url){ m.className='msg err'; m.textContent=d.error||'Could not start checkout. Try again.'; btn.disabled=false; return; }
+    m.className='msg ok'; m.textContent='Redirecting to secure payment…';
+    window.location.href=d.url;
+  }catch(e){ m.className='msg err'; m.textContent='Network error — please try again.'; btn.disabled=false; }
+}
+q('p2').addEventListener('keydown',e=>{ if(e.key==='Enter') signup(); });
+</script>
+</body>
+</html>
