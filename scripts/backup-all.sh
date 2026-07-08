@@ -1,13 +1,12 @@
 #!/bin/bash
-# backup-all.sh — every 12h, racknerd-orchestrated. Two independent-box copies of
-# everything stateful, so no single machine's death loses data.
+# backup-all.sh — dustforge (DemiPass) DB + config backup, racknerd-orchestrated, every 12h.
 #
 #   dustforge (db + config)  -> racknerd:/opt/backups  AND  prism:/opt/dustforge-backups
-#   stalwart  (all mail data)-> racknerd:/opt/backups   (the OFF-phasewhip copy —
-#                                                        this is "don't lose everyone's email")
 #
-# Complements the daily incus snapshot of the prism container (full consistent
-# on-box point-in-time). Code is NOT here — it's in git (mirrored separately).
+# CHANGED 2026-07-08: the Stalwart mail backup was MOVED OFF racknerd. Mail is now
+# tarred into the prism2 container on phasewhip by /usr/local/sbin/prism2-mail-backup.sh
+# (prism2-mail-backup.timer, 03:30/15:30 UTC). racknerd no longer produces mail backups.
+# TODO: off-site / cloud DR tier for both dustforge and mail (currently phasewhip-only for mail).
 set -uo pipefail
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
@@ -19,7 +18,7 @@ mkdir -p "$DEST"
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 fail=0
 
-# ── 1. dustforge: consistent DB copy + config ────────────────────────────────
+# ── dustforge: consistent DB copy + config ───────────────────────────────────
 if sqlite3 /opt/dustforge/data/dustforge.db ".backup '$WORK/dustforge.db'"; then
   cp /opt/dustforge/.env "$WORK/env" 2>/dev/null || true
   cp /opt/dustforge/scripts/relay-poller.env "$WORK/relay-poller.env" 2>/dev/null || true
@@ -32,17 +31,8 @@ if sqlite3 /opt/dustforge/data/dustforge.db ".backup '$WORK/dustforge.db'"; then
   else echo "[backup] WARN: dustforge scp to phasewhip failed"; fail=1; fi
 else echo "[backup] ERROR: dustforge .backup failed"; fail=1; fi
 
-# ── 2. stalwart: full mail-server data streamed off phasewhip to racknerd ─────
-# tar the live RocksDB store + config + certs. RocksDB recovers via its WAL on
-# restore; the daily incus snapshot is the fully-consistent companion.
-SW="stalwart-$STAMP.tar.gz"
-if ssh $SSH_OPTS "apple@$PHASEWHIP" "sudo incus exec prism -- tar czf - -C /opt stalwart" > "$DEST/$SW" 2>/dev/null && [ -s "$DEST/$SW" ] && gzip -t "$DEST/$SW" 2>/dev/null; then
-  :
-else echo "[backup] ERROR: stalwart export failed"; rm -f "$DEST/$SW"; fail=1; fi
-
-# ── 3. local retention on racknerd ───────────────────────────────────────────
+# ── local retention on racknerd ──────────────────────────────────────────────
 cd "$DEST" && ls -1t dustforge-*.tar.gz 2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
-cd "$DEST" && ls -1t stalwart-*.tar.gz  2>/dev/null | tail -n +$((KEEP+1)) | xargs -r rm -f
 
-echo "[backup] $STAMP done (fail=$fail). racknerd:$DEST holds $(ls -1 $DEST/dustforge-*.tar.gz 2>/dev/null | wc -l) dustforge + $(ls -1 $DEST/stalwart-*.tar.gz 2>/dev/null | wc -l) stalwart copies."
+echo "[backup] $STAMP done (fail=$fail). racknerd:$DEST holds $(ls -1 $DEST/dustforge-*.tar.gz 2>/dev/null | wc -l) dustforge copies. (Stalwart mail backup now runs on phasewhip -> prism2.)"
 exit $fail
