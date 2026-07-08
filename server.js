@@ -144,7 +144,13 @@ function getBearerIdentity(req) {
   if (!identity.scopeAtLeast(scope, 'transact')) {
     return { ok: false, status: 403, error: 'transact scope required' };
   }
-  return { ok: true, did: v.decoded.sub, scope, decoded: v.decoded, silicon: false };
+  // Surface auth provenance to the top level so gate checks (and the reveal
+  // fingerprint requirement) can read it without digging into decoded.
+  return {
+    ok: true, did: v.decoded.sub, scope, decoded: v.decoded, silicon: false,
+    auth_method: v.decoded.auth_method || null,
+    fingerprint_hash: v.decoded.fingerprint_hash || null,
+  };
 }
 
 function getDemiPassActor(req, res, options = {}) {
@@ -799,7 +805,161 @@ app.post('/api/identity/verify', (req, res) => {
   if (!validCode) return res.status(401).json({ error: 'invalid or expired 2FA code' });
   db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE id = ?').run(validCode.id);
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, did, { scope, expiresIn: expires_in, metadata: { email: wallet.email, username: wallet.username } });
+  // Passing 2FA is also a fresh 'twofa' gate for this DID.
+  recordGate(did, 'twofa');
   res.json({ ok: true, token, did, scope, email: wallet.email });
+});
+
+// ── Gate verification surface (per-credential security depth, item 4/5) ──────
+
+// GET /api/identity/gate/status — which gates are currently fresh for the caller,
+// plus what the SMS/phone situation is. Drives the vault app's gate UI.
+app.get('/api/identity/gate/status', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const wallet = db.prepare('SELECT phone FROM identity_wallets WHERE did = ?').get(auth.did);
+  const fresh = {};
+  for (const g of GATE_TYPES) fresh[g] = gateFresh(auth.did, g, auth);
+  res.json({
+    did: auth.did,
+    window_seconds: GATE_WINDOW_SEC,
+    fresh,
+    phone_set: Boolean(wallet && wallet.phone),
+    phone_hint: wallet && wallet.phone ? '•••' + String(wallet.phone).slice(-4) : null,
+    sms_configured: Boolean(process.env.SW_PROJECT && process.env.SW_TOKEN && process.env.SW_PHONE && process.env.SW_SPACE),
+    gates: GATE_TYPES,
+    presets: SECURITY_DEPTH_PRESETS,
+  });
+});
+
+// POST /api/identity/phone — set/replace the SMS number for this identity.
+// Guarded: requires a fresh password gate so a stolen access token can't
+// silently repoint the second factor.
+app.post('/api/identity/phone', rateLimitStrict, async (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const { phone, password } = req.body || {};
+  if (!phone || typeof phone !== 'string' || !/^\+[1-9]\d{7,14}$/.test(phone.trim())) {
+    return res.status(400).json({ error: 'phone required in E.164 format, e.g. +15551234567' });
+  }
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  // Password required to bind/rebind the second factor.
+  if (!password || typeof password !== 'string') return res.status(400).json({ error: 'password required to change the SMS number' });
+  const okPw = await verifyWalletPassword(wallet, password);
+  if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  if (!okPw) return res.status(401).json({ error: 'invalid password' });
+  db.prepare('UPDATE identity_wallets SET phone = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(phone.trim(), auth.did);
+  recordGate(auth.did, 'password');
+  res.json({ ok: true, phone_hint: '•••' + phone.trim().slice(-4) });
+});
+
+// POST /api/identity/gate/sms/request — send an SMS code to the stored number.
+app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
+  if (!wallet || !wallet.phone) return res.status(400).json({ error: 'no phone on file — set one via POST /api/identity/phone', phone_set: false });
+  const code = dustforge.generate2FACode();
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO identity_sms_codes (did, code, expires_at) VALUES (?, ?, ?)').run(auth.did, code, expiresAt);
+  console.log(`[sms] ${wallet.username}: ${code} (expires ${expiresAt})`);
+  const sent = await sendSMS(wallet.phone, `Your DemiPass verification code is ${code}. Expires in 10 minutes.`);
+  if (!sent.ok && !sent.configured) {
+    return res.status(503).json({ error: sent.error, sms_configured: false,
+      note: 'SMS gate is built and ready; set SW_SPACE/SW_PROJECT/SW_TOKEN/SW_PHONE on the dustforge service to activate.' });
+  }
+  if (!sent.ok) return res.status(502).json({ error: sent.error, sms_configured: true });
+  res.json({ ok: true, expires_in: 600, phone_hint: '•••' + String(wallet.phone).slice(-4) });
+});
+
+// POST /api/identity/gate/verify — satisfy one gate. The unified entry the UI
+// calls for each factor a credential's policy demands.
+//   { gate:'twofa'|'sms', code }
+//   { gate:'password', password }
+//   { gate:'genesis', refraction }
+//   { gate:'fingerprint' }  (proven by presenting a fingerprint-authed token)
+app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const { gate } = req.body || {};
+  if (!GATE_TYPES.includes(gate)) return res.status(400).json({ error: `gate must be one of ${GATE_TYPES.join(', ')}` });
+  const did = auth.did;
+
+  if (gate === 'twofa' || gate === 'sms') {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ error: 'code required' });
+    const table = gate === 'twofa' ? 'identity_2fa_codes' : 'identity_sms_codes';
+    const row = db.prepare(`SELECT * FROM ${table} WHERE did = ? AND code = ? AND used = 0 AND expires_at > datetime('now') ORDER BY id DESC LIMIT 1`).get(did, String(code));
+    if (!row) return res.status(401).json({ error: `invalid or expired ${gate} code` });
+    db.prepare(`UPDATE ${table} SET used = 1 WHERE id = ?`).run(row.id);
+    recordGate(did, gate);
+    return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
+  }
+
+  if (gate === 'password') {
+    const { password } = req.body || {};
+    if (!password) return res.status(400).json({ error: 'password required' });
+    const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
+    if (!wallet) return res.status(404).json({ error: 'identity not found' });
+    const okPw = await verifyWalletPassword(wallet, password);
+    if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+    if (!okPw) return res.status(401).json({ error: 'invalid password' });
+    recordGate(did, 'password');
+    return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
+  }
+
+  if (gate === 'fingerprint') {
+    // Proven intrinsically: the caller must hold a fingerprint-authed token.
+    if (auth.auth_method !== 'fingerprint') {
+      return res.status(403).json({ error: 'present a fingerprint-authed token (re-auth via /api/identity/auth-fingerprint)' });
+    }
+    recordGate(did, 'fingerprint');
+    return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
+  }
+
+  if (gate === 'genesis') {
+    const { refraction } = req.body || {};
+    if (!refraction) return res.status(400).json({ error: 'refraction required' });
+    const genesis = db.prepare('SELECT * FROM genesis_fingerprints WHERE did = ?').get(did);
+    if (!genesis) return res.status(404).json({ error: 'no genesis recorded for this DID' });
+    const exactMatch = hashRefraction(refraction) === genesis.origin_hash;
+    const structuralMatch = structuralHash(refraction) === genesis.structural_hash;
+    if (!exactMatch && !structuralMatch) return res.status(401).json({ error: 'refraction does not match origin' });
+    recordGate(did, 'genesis');
+    return res.json({ ok: true, gate, match: exactMatch ? 'exact' : 'structural', valid_for_seconds: GATE_WINDOW_SEC });
+  }
+});
+
+// POST /api/demipass/secrets/gate-policy — set a secret's security depth.
+//   { name|ref, security_depth:'standard'|'elevated'|'critical' }  OR
+//   { name|ref, gate_policy:{ reveal:[...], rotate:[...], delete:[...], use:[...] } }
+app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  const { name, ref, security_depth, gate_policy } = req.body || {};
+  if (!name && !ref) return res.status(400).json({ error: 'name or ref required' });
+  const ownerDid = actor.did;
+  const secret = ref
+    ? db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status IN ('active','rotating')").get(ownerDid, ref)
+    : db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status IN ('active','rotating')").get(ownerDid, name);
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  if (gate_policy !== undefined) {
+    const err = validateGatePolicy(gate_policy);
+    if (err) return res.status(400).json({ error: err });
+    db.prepare("UPDATE blindkey_secrets SET gate_policy = ?, security_depth = 'custom', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+      .run(JSON.stringify(gate_policy), secret.id);
+    return res.json({ ok: true, security_depth: 'custom', gate_policy, effective: resolveGatePolicy({ gate_policy: JSON.stringify(gate_policy) }) });
+  }
+  if (security_depth !== undefined) {
+    if (!SECURITY_DEPTH_PRESETS[security_depth]) return res.status(400).json({ error: `security_depth must be one of ${Object.keys(SECURITY_DEPTH_PRESETS).join(', ')}` });
+    // Setting a named preset clears any custom policy so the preset is authoritative.
+    db.prepare('UPDATE blindkey_secrets SET security_depth = ?, gate_policy = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(security_depth, secret.id);
+    return res.json({ ok: true, security_depth, effective: SECURITY_DEPTH_PRESETS[security_depth] });
+  }
+  return res.status(400).json({ error: 'provide security_depth or gate_policy' });
 });
 
 // ── Token tracking + revocation surface ──
@@ -2392,11 +2552,6 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
     return res.status(403).json({ error: 'silicon agents cannot reveal secrets' });
   }
 
-  // Require fingerprint auth method on the token
-  if (!auth.fingerprint_hash) {
-    return res.status(403).json({ error: 'reveal requires fingerprint authentication. Re-authenticate with biometrics.' });
-  }
-
   const { name, ref } = req.body || {};
   if (!name && !ref) return res.status(400).json({ error: 'name or ref required' });
 
@@ -2408,6 +2563,11 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
     secret = db.prepare('SELECT * FROM blindkey_secrets WHERE name = ? AND did = ? AND status = ?').get(name, actor.did, 'active');
   }
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
+
+  // Per-credential gate policy. Default depth requires a fresh fingerprint for
+  // reveal (preserving prior intent); elevated/critical add twofa/sms.
+  const gate = checkGatePolicy(actor.did, 'reveal', secret, auth);
+  if (!gate.ok) return res.status(403).json(gate);
 
   // Decrypt the value
   let decrypted;
@@ -3630,6 +3790,15 @@ app.delete('/api/blindkey/delete', rateLimitStandard, (req, res) => {
     ownerDid = did || (username ? db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username)?.did : null);
     if (!ownerDid) return res.status(400).json({ error: 'did or username required when using admin access' });
   }
+  // Per-credential gate policy for delete (admin/service operator bypasses).
+  if (actor.mode !== 'admin') {
+    const target = ref
+      ? db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status != 'deleted'").get(ownerDid, ref)
+      : db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status != 'deleted'").get(ownerDid, name);
+    if (!target) return res.status(404).json({ error: 'secret not found' });
+    const g = checkGatePolicy(ownerDid, 'delete', target, getBearerIdentity(req));
+    if (!g.ok) return res.status(403).json(g);
+  }
   const result = ref
     ? db.prepare("UPDATE blindkey_secrets SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE did = ? AND ref_code = ? AND status != 'deleted'").run(ownerDid, ref)
     : db.prepare("UPDATE blindkey_secrets SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ? AND status != 'deleted'").run(ownerDid, name);
@@ -3664,6 +3833,12 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
 
   if (!existing) return res.status(404).json({ error: 'no active secret found with that name' });
 
+  // Per-credential gate policy for rotate (admin/service operator bypasses).
+  if (actor.mode !== 'admin') {
+    const g = checkGatePolicy(ownerDid, 'rotate', existing, getBearerIdentity(req));
+    if (!g.ok) return res.status(403).json(g);
+  }
+
   const newVersion = (existing.version || 1) + 1;
   const newName = baseName + '_v' + newVersion;
 
@@ -3676,10 +3851,12 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     // NOT carried: the new value has its own (unknown) lifetime.
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version,
-                                    provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                    provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
+                                    security_depth, gate_policy)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
     `).run(ownerDid, newName, existing.description, existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
-           existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days);
+           existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days,
+           existing.security_depth, existing.gate_policy);
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
@@ -9583,6 +9760,12 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   if (!secret) return res.status(404).json({ error: 'active secret not found for this ref code' });
   if (secret.secret_type !== 'password') return res.status(400).json({ error: 'blind rotation only supports password secrets' });
 
+  // Per-credential gate policy for rotate (admin/service operator bypasses).
+  if (actor.mode !== 'admin') {
+    const g = checkGatePolicy(ownerDid, 'rotate', secret, getBearerIdentity(req));
+    if (!g.ok) return res.status(403).json(g);
+  }
+
   // Guard: shared credentials cannot be blindly rotated
   if (secret.ownership === 'shared') {
     return res.status(403).json({
@@ -9665,10 +9848,12 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
 
     const newRefCode = generateRefCode('password', newName);
     db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code,
-                                              provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`)
+                                              provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
+                                              security_depth, gate_policy)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)`)
       .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
-           secret.provider || '', secret.ownership || 'sole', secret.rotatable ?? 1, secret.category, secret.labels, secret.rotation_interval_days);
+           secret.provider || '', secret.ownership || 'sole', secret.rotatable ?? 1, secret.category, secret.labels, secret.rotation_interval_days,
+           secret.security_depth, secret.gate_policy);
 
     const newSecret = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
@@ -10749,6 +10934,170 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS secret_rotations (
 )`); } catch(e) {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_sr_secret ON secret_rotations(secret_id)'); } catch(e) {}
 
+// ══════════════════════════════════════════════════════════════════════════
+// Per-credential gate policy (shakedown item 4) + SMS gate (item 5)
+// ══════════════════════════════════════════════════════════════════════════
+// A gate is a proof-of-presence factor the owner must satisfy FRESHLY (within
+// GATE_WINDOW_SEC) before a protected action runs. Each secret carries a
+// security_depth preset (or a custom gate_policy JSON) mapping actions
+// (reveal/rotate/delete/use) -> required gates. Gates: password, twofa (email),
+// sms, fingerprint, genesis. Silicon agents are exempt from human-factor gates
+// on `use` so blind automation is not broken — see checkGatePolicy.
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN phone TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN security_depth TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN gate_policy TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS identity_sms_codes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  code TEXT NOT NULL,
+  used INTEGER DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS gate_verifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  did TEXT NOT NULL,
+  gate_type TEXT NOT NULL,
+  verified_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_gv_did ON gate_verifications(did, gate_type)'); } catch(e) {}
+
+const GATE_TYPES = ['password', 'twofa', 'sms', 'fingerprint', 'genesis'];
+const GATE_WINDOW_SEC = 300; // a passed gate stays fresh for 5 minutes
+const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
+
+// Presets the UI exposes as a "how much security depth" slider. Custom lets the
+// user hand-pick per action. `standard` preserves historical behavior: reveal
+// needs a fresh fingerprint, everything else just needs the transact token.
+const SECURITY_DEPTH_PRESETS = {
+  standard: { reveal: ['fingerprint'], rotate: [], delete: [], use: [] },
+  elevated: { reveal: ['fingerprint', 'twofa'], rotate: ['twofa'], delete: ['twofa'], use: [] },
+  critical: { reveal: ['fingerprint', 'twofa', 'sms'], rotate: ['fingerprint', 'twofa'], delete: ['fingerprint', 'twofa', 'sms'], use: [] },
+};
+const DEFAULT_DEPTH = 'standard';
+
+function validateGatePolicy(policy) {
+  if (typeof policy !== 'object' || policy === null || Array.isArray(policy)) return 'gate_policy must be an object';
+  for (const [action, gates] of Object.entries(policy)) {
+    if (!GATE_ACTIONS.includes(action)) return `unknown action '${action}' (valid: ${GATE_ACTIONS.join(', ')})`;
+    if (!Array.isArray(gates)) return `gate list for '${action}' must be an array`;
+    for (const g of gates) if (!GATE_TYPES.includes(g)) return `unknown gate '${g}' (valid: ${GATE_TYPES.join(', ')})`;
+  }
+  return null;
+}
+
+// The effective policy for a secret: explicit custom gate_policy wins, else the
+// named preset, else the system default. Always returns all four actions.
+function resolveGatePolicy(secret) {
+  const base = { reveal: [], rotate: [], delete: [], use: [] };
+  let policy = SECURITY_DEPTH_PRESETS[DEFAULT_DEPTH];
+  if (secret && secret.gate_policy) {
+    try { policy = JSON.parse(secret.gate_policy); } catch (_) { /* fall through to preset */ }
+  } else if (secret && secret.security_depth && SECURITY_DEPTH_PRESETS[secret.security_depth]) {
+    policy = SECURITY_DEPTH_PRESETS[secret.security_depth];
+  }
+  return { ...base, ...policy };
+}
+
+function recordGate(did, gate) {
+  try { db.prepare('INSERT INTO gate_verifications (did, gate_type) VALUES (?, ?)').run(did, gate); } catch (_) {}
+}
+
+// A gate is fresh if it was passed within the window. Fingerprint is ALSO
+// satisfied intrinsically by a fingerprint-authed token minted within the
+// window — re-auth via /auth-fingerprint refreshes it without a separate call.
+function gateFresh(did, gate, auth) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (gate === 'fingerprint' && auth && auth.auth_method === 'fingerprint'
+      && auth.decoded && auth.decoded.iat && (nowSec - auth.decoded.iat) < GATE_WINDOW_SEC) {
+    return true;
+  }
+  const row = db.prepare('SELECT verified_at FROM gate_verifications WHERE did = ? AND gate_type = ? ORDER BY id DESC LIMIT 1').get(did, gate);
+  if (!row) return false;
+  const ageMs = Date.now() - new Date((row.verified_at || '').replace(' ', 'T') + 'Z').getTime();
+  return ageMs >= 0 && ageMs / 1000 < GATE_WINDOW_SEC;
+}
+
+// Enforcement gate. Returns {ok:true} or {ok:false, missing:[...], ...}.
+// Silicon callers are exempt from human-factor gates on `use` ONLY — every
+// other action already blocks silicon upstream (reveal) or is owner-initiated.
+function checkGatePolicy(did, action, secret, auth) {
+  const policy = resolveGatePolicy(secret);
+  let required = policy[action] || [];
+  if (auth && auth.silicon && action === 'use') required = []; // don't break blind automation
+  const missing = required.filter(g => !gateFresh(did, g, auth));
+  if (missing.length === 0) return { ok: true, required };
+  return {
+    ok: false,
+    error: `this credential requires fresh ${missing.join(' + ')} verification for '${action}'`,
+    action,
+    required,
+    missing,
+    window_seconds: GATE_WINDOW_SEC,
+    hint: 'satisfy each gate via POST /api/identity/gate/verify (sms first needs /gate/sms/request), then retry within 5 minutes',
+  };
+}
+
+// Verify a wallet password against Stalwart (authoritative) with local-hash
+// fallback. Returns true/false, or null when the verifier is unreachable.
+async function verifyWalletPassword(wallet, password) {
+  try {
+    const http = require('http');
+    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
+    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
+    const stalwartPass = process.env.STALWART_PASS || '';
+    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
+    const stored = await new Promise((resolve) => {
+      const r = http.request({ hostname: stalwartHost, port: stalwartPort,
+        path: '/api/principal/' + encodeURIComponent(wallet.username), method: 'GET',
+        headers: { 'Authorization': 'Basic ' + adminAuth } }, (rs) => {
+        let data = ''; rs.on('data', c => data += c);
+        rs.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch (_) { resolve(null); } });
+      });
+      r.on('error', () => resolve(null));
+      r.setTimeout(5000, () => { r.destroy(); resolve(null); });
+      r.end();
+    });
+    if (stored !== null) return stored === password;
+  } catch (_) { /* fall through to local hash */ }
+  if (wallet.password_hash) {
+    const inputHash = crypto.createHash('sha256').update(password).digest('hex');
+    return inputHash === wallet.password_hash;
+  }
+  return null; // no verifier available
+}
+
+// Send an SMS via SignalWire's Twilio-compatible LaML REST API. Zero SDK
+// dependency — just https. Returns {ok} or {ok:false, error, configured}.
+// Requires SW_SPACE (e.g. yourspace.signalwire.com), SW_PROJECT, SW_TOKEN,
+// SW_PHONE. Dormant until those env vars are set on the dustforge service.
+function sendSMS(toPhone, body) {
+  return new Promise((resolve) => {
+    const space = process.env.SW_SPACE || '';
+    const project = process.env.SW_PROJECT || '';
+    const token = process.env.SW_TOKEN || '';
+    const from = process.env.SW_PHONE || '';
+    if (!space || !project || !token || !from) {
+      return resolve({ ok: false, configured: false, error: 'SMS not configured (SW_SPACE/SW_PROJECT/SW_TOKEN/SW_PHONE unset)' });
+    }
+    const https = require('https');
+    const form = new URLSearchParams({ From: from, To: toPhone, Body: body }).toString();
+    const auth = Buffer.from(project + ':' + token).toString('base64');
+    const r = https.request({
+      hostname: space, port: 443,
+      path: `/api/laml/2010-04-01/Accounts/${encodeURIComponent(project)}/Messages.json`,
+      method: 'POST',
+      headers: { 'Authorization': 'Basic ' + auth, 'Content-Type': 'application/x-www-form-urlencoded', 'Content-Length': Buffer.byteLength(form) },
+    }, (rs) => {
+      let data = ''; rs.on('data', c => data += c);
+      rs.on('end', () => resolve(rs.statusCode < 300 ? { ok: true, configured: true } : { ok: false, configured: true, error: `SignalWire ${rs.statusCode}: ${data.slice(0, 200)}` }));
+    });
+    r.on('error', (e) => resolve({ ok: false, configured: true, error: e.message }));
+    r.setTimeout(8000, () => { r.destroy(); resolve({ ok: false, configured: true, error: 'SignalWire timeout' }); });
+    r.write(form); r.end();
+  });
+}
+
 // GET /api/demipass/dashboard — secret health dashboard for the mobile app
 app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
@@ -10758,7 +11107,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
     SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
            ownership, rotatable, frozen, created_at, updated_at, expires_at, provider,
            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels,
-           last_rotated_at, rotation_interval_days
+           last_rotated_at, rotation_interval_days, security_depth, gate_policy
     FROM blindkey_secrets WHERE did = ? AND status IN ('active', 'rotating')
     ORDER BY updated_at DESC
   `).all(auth.did);
@@ -10833,6 +11182,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       rotatable: s.rotatable !== 0,
       category: s.category || '',
       labels: parsedLabels,
+      security_depth: s.security_depth || 'standard',
+      gate_policy: resolveGatePolicy(s),
       use_count: s.use_count,
       last_used: s.last_used_at,
       health,

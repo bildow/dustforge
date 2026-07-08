@@ -252,6 +252,13 @@
           <button onclick="setRecoveryEmail()" style="padding:0.5rem 0.75rem;background:var(--accent);border:none;border-radius:6px;color:var(--bg);font-weight:600;font-size:0.75rem;cursor:pointer;white-space:nowrap">Save</button>
         </div>
         <div id="recovery-msg" style="font-size:0.7rem;margin-top:0.25rem;margin-bottom:0.75rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">SMS number (for Critical-depth credentials)</div>
+        <div id="sms-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.25rem"></div>
+        <div style="display:flex;gap:0.5rem;align-items:center">
+          <input type="tel" id="sms-phone" placeholder="+15551234567" style="flex:1;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem">
+          <button onclick="setPhone()" style="padding:0.5rem 0.75rem;background:var(--accent);border:none;border-radius:6px;color:var(--bg);font-weight:600;font-size:0.75rem;cursor:pointer;white-space:nowrap">Save</button>
+        </div>
+        <div id="phone-msg" style="font-size:0.7rem;margin-top:0.25rem;margin-bottom:0.75rem"></div>
       </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
@@ -297,8 +304,15 @@
       <label>Key / Value</label><input type="password" id="s-key-value" placeholder="API key, token, or secret value">
     </div>
     <label>URL / Host (optional)</label><input type="text" id="s-host" placeholder="e.g. 192.3.84.103 or api.example.com">
+    <label>Category</label>
+    <select id="s-category"><option value="">— pick a group —</option><option value="infrastructure">Infrastructure</option><option value="platform">Platform</option><option value="agents">Agents</option><option value="services">Services</option><option value="products">Products</option><option value="personal">Personal</option><option value="evidence">Evidence</option><option value="test">Test</option><option value="other">Other</option></select>
+    <label>Labels (optional, comma-separated)</label><input type="text" id="s-labels" placeholder="e.g. prod, kyle-shared">
     <label>Expires in (optional)</label>
     <input type="text" id="s-expires" placeholder="e.g. 30d, 90d, or leave blank">
+    <label>Rotate every (optional, days)</label>
+    <input type="number" id="s-rotate-days" min="1" max="3650" placeholder="e.g. 90 — drives rotation reminders">
+    <label>Security depth</label>
+    <select id="s-depth"><option value="standard">Standard — reveal needs biometric</option><option value="elevated">Elevated — + email code to reveal/rotate/delete</option><option value="critical">Critical — + SMS code, strongest</option></select>
     <div id="s-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="storeSecret()">Store</button></div>
   </div>
@@ -375,8 +389,32 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings')loadSiliconAgents();
+  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();}
 }));
+
+async function loadSmsStatus(){
+  const el=document.getElementById('sms-status'); if(!el)return;
+  try{
+    const s=await api('GET','/api/identity/gate/status');
+    if(!s.sms_configured){ el.innerHTML='<span style="color:var(--yellow)">SMS delivery not yet configured on the server</span>'; }
+    else if(s.phone_set){ el.innerHTML='On file: <span style="color:var(--green)">'+esc(s.phone_hint||'set')+'</span>'; }
+    else { el.textContent='No number on file yet'; }
+  }catch(_){ el.textContent=''; }
+}
+
+async function setPhone(){
+  const phone=document.getElementById('sms-phone').value.trim();
+  const m=document.getElementById('phone-msg');
+  if(!/^\+[1-9]\d{7,14}$/.test(phone)){ m.textContent='Use E.164 format, e.g. +15551234567'; m.style.color='var(--red)'; return; }
+  const pw=prompt('Confirm your account password to bind this number:');
+  if(!pw)return;
+  try{
+    const r=await api('POST','/api/identity/phone',{phone,password:pw});
+    m.textContent='Saved: '+(r.phone_hint||phone); m.style.color='var(--green)';
+    document.getElementById('sms-phone').value='';
+    loadSmsStatus();
+  }catch(e){ m.textContent=e.message; m.style.color='var(--red)'; }
+}
 
 async function showApp(){
   document.getElementById('auth').style.display='none';
@@ -419,16 +457,21 @@ async function loadVault(){
   }
 }
 
+function titleCase(s){ return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }
+
 function categorizeSecret(s) {
+  // Prefer the stored, user-set category (backend). Name-guessing is a fallback
+  // ONLY for legacy secrets stored before categories existed.
+  if (s.category) return titleCase(s.category);
   const n = s.name.toLowerCase();
   if (n.includes('brain-') || n.includes('conductor') || n.includes('brain')) return 'Agents';
-  if (n.includes('silicon-')) return 'Silicon';
+  if (n.includes('silicon-')) return 'Agents';
   if (n.includes('racknerd') || n.includes('phasewhip') || n.includes('flimflam-sudo') || n.includes('shared-kyle')) return 'Infrastructure';
   if (n.includes('dustforge') || n.includes('conduit-carbon') || n.includes('stalwart')) return 'Platform';
   if (n.includes('flowhook') || n.includes('github') || n.includes('npm')) return 'Services';
   if (n.includes('rubin') || n.includes('evidence')) return 'Evidence';
   if (n.includes('test') || n.includes('inject') || n.includes('drop')) return 'Test';
-  return 'Other';
+  return 'Uncategorized';
 }
 
 function renderSecrets(){
@@ -525,13 +568,58 @@ function showDetail(name) {
   h += `<div><span style="color:var(--text3)">Uses:</span> ${s.use_count}</div>`;
   h += `<div><span style="color:var(--text3)">Ownership:</span> ${s.ownership}</div>`;
   h += `<div><span style="color:var(--text3)">Rotatable:</span> ${s.rotatable?'yes':'no'}</div>`;
+  h += `<div><span style="color:var(--text3)">Category:</span> ${esc(s.category||'—')}</div>`;
+  if(s.provider) h += `<div><span style="color:var(--text3)">Provider:</span> ${esc(s.provider)}</div>`;
   h += `</div>`;
+  if(s.labels&&s.labels.length){
+    h += `<div style="margin-top:0.5rem;display:flex;flex-wrap:wrap;gap:0.3rem">`;
+    for(const l of s.labels) h += `<span style="font-size:0.65rem;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:0.1rem 0.5rem;color:var(--text2)">${esc(l)}</span>`;
+    h += `</div>`;
+  }
   if(s.expires_at){
     const dl=Math.ceil((new Date(s.expires_at)-Date.now())/86400000);
     const expiryColor = dl <= 7 ? 'var(--red)' : 'var(--text3)';
     h+='<div style="margin-top:0.4rem;color:'+expiryColor+'">Expires: '+new Date(s.expires_at).toLocaleDateString()+' ('+dl+'d)</div>';
   }
   h += `</div>`;
+
+  // ── Security depth: how much protection this credential demands ──
+  const depth = s.security_depth || 'standard';
+  const gp = s.gate_policy || { reveal:[], rotate:[], delete:[], use:[] };
+  h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Security depth</div>`;
+  h += `<div style="display:flex;gap:0.4rem;margin-bottom:0.6rem">`;
+  for(const d of ['standard','elevated','critical']){
+    const on = depth===d;
+    const col = d==='critical'?'var(--red)':d==='elevated'?'var(--orange)':'var(--accent)';
+    h += `<button onclick="setDepth('${esc(s.name)}','${d}')" style="flex:1;padding:0.5rem 0.3rem;border:1px solid ${on?col:'var(--border)'};background:${on?col:'none'};color:${on?'#08111a':'var(--text2)'};border-radius:8px;font-weight:${on?'700':'500'};font-size:0.72rem;cursor:pointer;text-transform:capitalize">${d}</button>`;
+  }
+  h += `</div>`;
+  if(depth==='custom') h += `<div style="font-size:0.65rem;color:var(--text3);margin-bottom:0.5rem">Custom policy set via API</div>`;
+  // Gate matrix — what each action requires
+  const gateChip = g => `<span style="font-size:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.05rem 0.4rem;color:var(--text2)">${g}</span>`;
+  h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.72rem">`;
+  for(const act of ['reveal','rotate','delete']){
+    const gates = gp[act]||[];
+    h += `<div style="display:flex;justify-content:space-between;align-items:center;padding:0.2rem 0"><span style="color:var(--text3);text-transform:capitalize">${act}</span><span style="display:flex;gap:0.25rem">${gates.length?gates.map(gateChip).join(''):'<span style="color:var(--text3);font-size:0.6rem">token only</span>'}</span></div>`;
+  }
+  h += `</div></div>`;
+
+  // ── Rotation & expiry timeline ──
+  if(s.rotation || s.expires_at){
+    h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Rotation</div>`;
+    h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.75rem">`;
+    if(s.rotation){
+      const r=s.rotation; const rc = r.overdue?'var(--red)':r.due_in_days<=7?'var(--yellow)':'var(--green)';
+      h += `<div style="display:flex;justify-content:space-between;padding:0.15rem 0"><span style="color:var(--text3)">Cadence</span><span>every ${r.interval_days}d</span></div>`;
+      h += `<div style="display:flex;justify-content:space-between;padding:0.15rem 0"><span style="color:var(--text3)">Last rotated</span><span>${r.last_rotated_at?new Date(r.last_rotated_at).toLocaleDateString():'—'}</span></div>`;
+      h += `<div style="display:flex;justify-content:space-between;padding:0.15rem 0"><span style="color:var(--text3)">Next due</span><span style="color:${rc};font-weight:600">${r.overdue?('overdue '+Math.abs(r.due_in_days)+'d'):('in '+r.due_in_days+'d')}</span></div>`;
+    }
+    if(s.expires_at){
+      const ec = (s.days_to_expiry!=null&&s.days_to_expiry<=7)?'var(--red)':'var(--text2)';
+      h += `<div style="display:flex;justify-content:space-between;padding:0.15rem 0"><span style="color:var(--text3)">Expires</span><span style="color:${ec}">${new Date(s.expires_at).toLocaleDateString()}${s.days_to_expiry!=null?' ('+s.days_to_expiry+'d)':''}</span></div>`;
+    }
+    h += `</div></div>`;
+  }
 
   // Recent outcomes
   if(s.recent_outcomes&&s.recent_outcomes.length){
@@ -547,14 +635,17 @@ function showDetail(name) {
     h += `</div>`;
   }
 
-  // Contexts
+  // Scope — what an agent can DO with this credential (never the value)
+  h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Scope — what this credential can do</div>`;
   if(s.context_list&&s.context_list.length){
-    h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Contexts</div>`;
+    const actionLabel = { http_header:'call APIs (as an auth header)', http_body:'post to APIs (in the body)', ssh_exec:'run SSH commands', document:'be handed over as a document', database:'connect to a database' };
     for(const c of s.context_list){
-      h += `<div style="font-size:0.75rem;padding:0.25rem 0;color:var(--text2)">${esc(c.action_type)} → ${esc(c.target_host_pattern||'*')}</div>`;
+      h += `<div style="display:flex;align-items:center;gap:0.5rem;font-size:0.75rem;padding:0.3rem 0;color:var(--text2)"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);flex-shrink:0"></span><span>${esc(actionLabel[c.action_type]||c.action_type)} <span style="color:var(--text3)">on ${esc(c.target_host_pattern||'any host')}</span></span></div>`;
     }
-    h += `</div>`;
+  } else {
+    h += `<div style="font-size:0.72rem;color:var(--text3)">No scope defined yet — a default is created on first use.</div>`;
   }
+  h += `</div>`;
 
   // Authorized silicons
   if(s.authorized_silicons&&s.authorized_silicons.length){
@@ -570,13 +661,14 @@ function showDetail(name) {
   h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center">`;
   h += `<div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">Secret value is encrypted and hidden</div>`;
   h += `<div id="reveal-value" style="display:none;background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:0.75rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;word-break:break-all;color:var(--red)"></div>`;
-  h += `<button onclick="revealSecret('${esc(s.name)}')" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">Reveal (requires biometric)</button>`;
+  const revGates = gp.reveal||[]; const revLabel = revGates.length ? 'Reveal ('+revGates.join(' + ')+')' : 'Reveal';
+  h += `<button onclick="revealSecret('${esc(s.name)}')" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
   h += `</div></div>`;
 
   // Action buttons
   h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
   h += `<button onclick="toggleFreeze('${esc(s.name)}',${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
-  h += `<button onclick="revokeSecret('${esc(s.name)}')" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Revoke</button>`;
+  h += `<button onclick="revokeSecret('${esc(s.name)}')" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Delete</button>`;
   h += `</div>`;
 
   el.innerHTML = h;
@@ -729,9 +821,17 @@ async function storeSecret(){
   if (username) desc += username;
   if (host) desc += (desc ? ' @ ' : '') + host;
 
+  const cat = document.getElementById('s-category').value;
+  const labelsRaw = document.getElementById('s-labels').value.trim();
+  const rotDays = parseInt(document.getElementById('s-rotate-days').value, 10);
+  const depth = document.getElementById('s-depth').value;
+
   const body = { name: n, value: v, secret_type: t };
   if (exp) body.expires_in = exp;
   if (desc) body.description = desc;
+  if (cat) body.category = cat;
+  if (labelsRaw) body.labels = labelsRaw.split(',').map(x => x.trim()).filter(Boolean).slice(0, 10);
+  if (rotDays >= 1) body.rotation_interval_days = rotDays;
 
   try{
     const r=await api('POST','/api/demipass/store',body);
@@ -741,6 +841,12 @@ async function storeSecret(){
     if(document.getElementById('s-key-value')) document.getElementById('s-key-value').value='';
     document.getElementById('s-username').value='';
     document.getElementById('s-host').value='';
+    document.getElementById('s-labels').value='';
+    document.getElementById('s-rotate-days').value='';
+    // Apply non-default security depth after the secret exists.
+    if (depth && depth !== 'standard') {
+      try { await api('POST','/api/demipass/gate-policy',{ name:n, security_depth:depth }); } catch(_) {}
+    }
     m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');
     m.className='modal-msg ok';
     loadVault();setTimeout(closeModal,1200);
@@ -751,60 +857,96 @@ async function storeSecret(){
     m.textContent=e.message;m.className='modal-msg err';
   }}
 
+// Satisfy one security gate interactively. Returns true on success.
+async function satisfyGate(gate){
+  try {
+    if(gate==='twofa'){
+      await api('POST','/api/identity/request-2fa',{did});
+      const code=prompt('A 6-digit code was emailed to you. Enter it:');
+      if(!code) return false;
+      await api('POST','/api/identity/gate/verify',{gate:'twofa',code:code.trim()});
+    } else if(gate==='sms'){
+      const rq=await api('POST','/api/identity/gate/sms/request',{}).catch(e=>({_err:e.message}));
+      if(rq&&rq._err){ alert('SMS: '+rq._err); return false; }
+      const code=prompt('A 6-digit code was texted to you. Enter it:');
+      if(!code) return false;
+      await api('POST','/api/identity/gate/verify',{gate:'sms',code:code.trim()});
+    } else if(gate==='password'){
+      const pw=prompt('Confirm your account password:');
+      if(!pw) return false;
+      await api('POST','/api/identity/gate/verify',{gate:'password',password:pw});
+    } else if(gate==='genesis'){
+      const r=prompt('Enter your genesis refraction:');
+      if(!r) return false;
+      await api('POST','/api/identity/gate/verify',{gate:'genesis',refraction:r});
+    } else if(gate==='fingerprint'){
+      // A fingerprint gate needs a fingerprint-authed token; re-auth with password.
+      const pw=prompt('Confirm your password to satisfy the biometric gate:');
+      if(!pw) return false;
+      const r=await api('POST','/api/identity/auth-fingerprint',{username:user,password:pw,scope:'transact'});
+      if(r&&r.token){ tk=r.token; localStorage.setItem('dp_token',tk); localStorage.setItem('dp_token_at',Date.now()); }
+      await api('POST','/api/identity/gate/verify',{gate:'fingerprint'});
+    } else { return false; }
+    return true;
+  } catch(e){ alert(esc(gate)+' verification failed: '+e.message); return false; }
+}
+
+// Call a gated endpoint. On a 403 listing missing gates, walk the user through
+// each factor and retry once. Returns the parsed JSON on success.
+async function apiGated(method, path, body){
+  const call = async () => {
+    const o={method,headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk}};
+    if(body)o.body=JSON.stringify(body);
+    const r=await fetch(API+path,o); const d=await r.json().catch(()=>({}));
+    return {status:r.status,d};
+  };
+  let {status,d}=await call();
+  if(status===403 && Array.isArray(d.missing) && d.missing.length){
+    for(const g of d.missing){ if(!await satisfyGate(g)) throw new Error('cancelled — '+g+' not verified'); }
+    ({status,d}=await call());
+  }
+  if(status>=400) throw new Error(d.error||'failed');
+  return d;
+}
+
+// Change a credential's security depth from the detail view.
+async function setDepth(name, depth){
+  try {
+    await api('POST','/api/demipass/gate-policy',{name,security_depth:depth});
+    showDetail(name);
+  } catch(e){ alert('Could not set depth: '+e.message); }
+}
+
 async function revealSecret(name) {
   const btn = document.getElementById('reveal-btn');
   const valEl = document.getElementById('reveal-value');
-  btn.textContent = 'Authenticating...';
+  btn.textContent = 'Verifying...';
   btn.disabled = true;
-
-  // Step 1: re-authenticate with fingerprint to get a fresh token
   try {
-    // Use the fingerprint auth endpoint to get a fresh fingerprint-authed token
-    const fpRes = await fetch(API + '/api/identity/fingerprint-auth', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + tk },
-    });
-    if (!fpRes.ok) {
-      const err = await fpRes.json().catch(() => ({}));
-      throw new Error(err.error || 'Fingerprint auth failed — re-login with biometrics');
-    }
-    const fpData = await fpRes.json();
-    const fpToken = fpData.token || tk;
-
-    // Step 2: call reveal with the fingerprint-authed token
-    const res = await fetch(API + '/api/blindkey/reveal', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + fpToken },
-      body: JSON.stringify({ name }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || 'Reveal failed');
-
-    // Step 3: show the value briefly
+    // apiGated walks whatever factors this credential's policy demands
+    // (fingerprint, +email, +SMS) and only then reveals.
+    const data = await apiGated('POST','/api/blindkey/reveal',{ name });
     valEl.textContent = data.value;
     valEl.style.display = 'block';
     btn.textContent = 'Revealed — auto-hides in 30s';
     btn.style.borderColor = 'var(--red)';
     btn.style.color = 'var(--red)';
-
-    // Auto-hide after 30 seconds
     setTimeout(() => {
       valEl.textContent = '';
       valEl.style.display = 'none';
-      btn.textContent = 'Reveal (requires biometric)';
+      btn.textContent = 'Reveal';
       btn.style.borderColor = 'var(--orange)';
       btn.style.color = 'var(--orange)';
       btn.disabled = false;
     }, 30000);
-
   } catch (e) {
-    btn.textContent = 'Reveal (requires biometric)';
+    btn.textContent = 'Reveal';
     btn.disabled = false;
-    alert(e.message);
+    if(!/cancelled/.test(e.message)) alert(e.message);
   }
 }
 
-async function revokeSecret(name){if(!confirm('Revoke '+name+'?'))return;try{await api('DELETE','/api/demipass/revoke',{name});loadVault()}catch(e){alert(e.message)}}
+async function revokeSecret(name){if(!confirm('Delete '+name+'? This retires the credential.'))return;try{await apiGated('DELETE','/api/demipass/delete',{name});closeDetail()}catch(e){if(!/cancelled/.test(e.message))alert(e.message)}}
 
 function confirmPanic(){if(!confirm('TRIP ALL BREAKERS? This revokes every active secret.'))return;(async()=>{for(const s of secrets.filter(x=>x.status==='active')){try{await api('DELETE','/api/demipass/revoke',{name:s.name})}catch{}}panic=true;document.getElementById('panic').style.display='block';loadVault()})()}
 function resetPanic(){panic=false;document.getElementById('panic').style.display='none';loadVault()}
