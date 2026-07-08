@@ -214,10 +214,9 @@ function billingMiddleware(db, actionType, options = {}) {
     const did = result.decoded.sub;
     const scope = result.decoded.scope || 'read';
 
-    const writeScopes = new Set(['write', 'transact', 'admin', 'full']);
     const isWrite = ['email_send', 'email_send_bulk', 'round_dispatch', 'round_collaboration', 'api_call_write', 'api_call_compute'].includes(actionType);
-    if (isWrite && !writeScopes.has(scope)) {
-      return res.status(403).json({ error: `scope '${scope}' cannot perform '${actionType}'`, required_scope: 'transact' });
+    if (isWrite && !identity.scopeAtLeast(scope, 'write')) {
+      return res.status(403).json({ error: `scope '${scope}' cannot perform '${actionType}'`, required_scope: 'write' });
     }
 
     if (cost > 0) {

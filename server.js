@@ -140,8 +140,8 @@ function getBearerIdentity(req) {
   if (!v.valid) return { ok: false, status: 401, error: v.error };
   const dead = billing.checkTokenRevocation(db, v.decoded);
   if (dead.revoked) return { ok: false, status: 401, error: dead.reason };
-  const scope = v.decoded.scope || '';
-  if (!['transact', 'admin', 'full'].includes(scope)) {
+  const scope = v.decoded.scope || 'read';
+  if (!identity.scopeAtLeast(scope, 'transact')) {
     return { ok: false, status: 403, error: 'transact scope required' };
   }
   return { ok: true, did: v.decoded.sub, scope, decoded: v.decoded, silicon: false };
@@ -782,6 +782,17 @@ app.post('/api/identity/request-2fa', (req, res) => {
 app.post('/api/identity/verify', (req, res) => {
   const { did, code, scope = 'read', expires_in = '24h' } = req.body || {};
   if (!did || !code) return res.status(400).json({ error: 'did and code required' });
+  // Issuance policy: scope must be canonical, and a 2FA code alone (single
+  // factor — email possession) cannot mint elevated scopes.
+  if (!identity.ISSUABLE_SCOPES.includes(scope)) {
+    return res.status(400).json({ error: `unknown scope '${scope}'`, valid_scopes: identity.ISSUABLE_SCOPES });
+  }
+  if (identity.scopeAtLeast(scope, 'admin')) {
+    return res.status(403).json({
+      error: `2FA code alone cannot mint '${scope}' — use /api/identity/auth-fingerprint (password + device signals) for elevated scopes`,
+      max_scope: 'transact',
+    });
+  }
   const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
   const validCode = db.prepare(`SELECT * FROM identity_2fa_codes WHERE did = ? AND code = ? AND used = 0 AND expires_at > datetime('now') ORDER BY id DESC LIMIT 1`).get(did, code);
@@ -2224,11 +2235,35 @@ function authorizeSecretMediation({ requestorDid, secretName, contextName, actio
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
-  const { name, value, description, secret_type, ownership, rotatable } = req.body || {};
+  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
   if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
   if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
   if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
+
+  // Metadata standardization — category/labels are stored data, never guessed.
+  // Suggested categories: infrastructure, platform, agents, services, personal, evidence, test, other.
+  let resolvedCategory = null; // null = not provided (preserves existing on re-store)
+  if (category !== undefined && category !== null && category !== '') {
+    if (typeof category !== 'string' || !/^[a-z0-9][a-z0-9-]{0,39}$/.test(category.toLowerCase().trim())) {
+      return res.status(400).json({ error: 'category: lowercase letters/digits/dashes, max 40 chars' });
+    }
+    resolvedCategory = category.toLowerCase().trim();
+  }
+  let resolvedLabels = null;
+  if (labels !== undefined && labels !== null) {
+    if (!Array.isArray(labels) || labels.length > 10 || labels.some(l => typeof l !== 'string' || l.length === 0 || l.length > 32)) {
+      return res.status(400).json({ error: 'labels: array of up to 10 non-empty strings (max 32 chars each)' });
+    }
+    resolvedLabels = JSON.stringify(labels.map(l => l.toLowerCase().trim()));
+  }
+  let resolvedRotationInterval = null;
+  if (rotation_interval_days !== undefined && rotation_interval_days !== null) {
+    if (!Number.isInteger(rotation_interval_days) || rotation_interval_days < 1 || rotation_interval_days > 3650) {
+      return res.status(400).json({ error: 'rotation_interval_days: integer between 1 and 3650' });
+    }
+    resolvedRotationInterval = rotation_interval_days;
+  }
 
   // Code injection detection — reject values that look like executable code.
   // Secrets should be credentials, tokens, keys, or connection strings — not programs.
@@ -2287,8 +2322,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     const resolvedRotatable = rotatable === false || rotatable === 0 ? 0 : 1;
 
     db.prepare(`
-      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(did, name) DO UPDATE SET
         encrypted_value = excluded.encrypted_value,
         description = excluded.description,
@@ -2297,8 +2332,11 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
         provider = excluded.provider,
         ownership = excluded.ownership,
         rotatable = excluded.rotatable,
+        category = COALESCE(excluded.category, blindkey_secrets.category),
+        labels = COALESCE(excluded.labels, blindkey_secrets.labels),
+        rotation_interval_days = COALESCE(excluded.rotation_interval_days, blindkey_secrets.rotation_interval_days),
         updated_at = CURRENT_TIMESTAMP
-    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable);
+    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable, resolvedCategory, resolvedLabels, resolvedRotationInterval);
 
     // Generate and store ref_code if not already set
     const stored = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?").get(req.identity.did, name);
@@ -2423,7 +2461,8 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
   }
 
   const secrets = db.prepare(
-    `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick
+    `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick,
+            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels, last_rotated_at, rotation_interval_days
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
   ).all(ownerDid, 'active');
 
@@ -2536,11 +2575,25 @@ app.get('/api/blindkey/expiring', rateLimitStandard, (req, res) => {
      FROM blindkey_secrets WHERE did = ? AND status = 'active' AND expires_at IS NOT NULL AND expires_at <= ? ORDER BY expires_at ASC`
   ).all(ownerDid, new Date().toISOString());
 
+  // Rotation cadence: secrets whose rotation is due within the window (or overdue)
+  const rotationDue = db.prepare(
+    `SELECT id, name, secret_type, ref_code, provider, rotation_interval_days, last_rotated_at, created_at
+     FROM blindkey_secrets WHERE did = ? AND status = 'active' AND rotation_interval_days IS NOT NULL`
+  ).all(ownerDid).map(s => {
+    const baseIso = (s.last_rotated_at || s.created_at || '').replace(' ', 'T');
+    const baseTs = new Date(baseIso + (baseIso.endsWith('Z') ? '' : 'Z')).getTime();
+    if (Number.isNaN(baseTs)) return null;
+    const dueTs = baseTs + s.rotation_interval_days * 86400000;
+    const dueInDays = Math.ceil((dueTs - Date.now()) / 86400000);
+    return { ...s, rotation_due_at: new Date(dueTs).toISOString(), rotation_due_in_days: dueInDays, rotation_overdue: dueInDays < 0 };
+  }).filter(s => s && s.rotation_due_in_days <= withinDays).sort((a, b) => a.rotation_due_in_days - b.rotation_due_in_days);
+
   res.json({
     did: ownerDid,
     within_days: withinDays,
     expiring,
     already_expired: expired,
+    rotation_due: rotationDue,
     total_expiring: expiring.length,
     total_expired: expired.length,
   });
@@ -3618,13 +3671,30 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     const encrypted = blindkeyEncrypt(new_value);
     const rotateExpiresAt = new Date(Date.now() + graceMins * 60 * 1000).toISOString();
 
-    // Create the new versioned secret
+    // Create the new versioned secret — carry ALL identity/metadata so the new
+    // version doesn't lose provider/category/gating on rotation. expires_at is
+    // NOT carried: the new value has its own (unknown) lifetime.
     db.prepare(`
-      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-    `).run(ownerDid, newName, existing.description, existing.secret_type, encrypted, existing.metadata || '{}', newVersion);
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version,
+                                    provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).run(ownerDid, newName, existing.description, existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
+           existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days);
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
+
+    // The ref code is the STABLE handle agents hold — it must follow the live
+    // version. Move it old→new (old row keeps working by name until retired).
+    if (existing.ref_code) {
+      db.prepare("UPDATE blindkey_secrets SET ref_code = '' WHERE id = ?").run(existing.id);
+      db.prepare('UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?').run(existing.ref_code, newSecret.id);
+    }
+
+    // Rotation telemetry
+    try {
+      db.prepare('INSERT INTO secret_rotations (secret_id, did, method, old_version, new_version, note) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(newSecret.id, ownerDid, 'rotate', existing.version || 1, newVersion, baseName);
+    } catch(_) {}
 
     // Copy only ACTIVE contexts from old secret to new (skip revoked/suspended)
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(existing.id);
@@ -4702,6 +4772,7 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
   if (username && typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
   if (typeof password !== 'string') return res.status(400).json({ error: 'password: must be a string' });
   if (typeof scope !== 'string') return res.status(400).json({ error: 'scope: must be a string' });
+  if (!identity.ISSUABLE_SCOPES.includes(scope)) return res.status(400).json({ error: `unknown scope '${scope}'`, valid_scopes: identity.ISSUABLE_SCOPES });
   if (typeof expires_in !== 'string') return res.status(400).json({ error: 'expires_in: must be a string' });
   const wallet = did
     ? db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did)
@@ -4792,6 +4863,7 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
 app.post('/api/identity/device/code', rateLimitStandard, (req, res) => {
   const { agent_label = '', scope = 'read' } = req.body || {};
   if (typeof scope !== 'string') return res.status(400).json({ error: 'scope must be a string' });
+  if (!identity.ISSUABLE_SCOPES.includes(scope)) return res.status(400).json({ error: `unknown scope '${scope}'`, valid_scopes: identity.ISSUABLE_SCOPES });
   const device_code = 'dpd_' + require('crypto').randomBytes(32).toString('base64url');
   let user_code = _genUserCode();
   // ensure user_code uniqueness among pending
@@ -4854,12 +4926,23 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
   if (!auth) return res.status(401).json({ error: 'operator bearer token required to approve' });
   const v = identity.verifyTokenStandalone(auth);
   if (!v.valid) return res.status(401).json({ error: 'invalid operator token' });
+  const _deadApprover = billing.checkTokenRevocation(db, v.decoded);
+  if (_deadApprover.revoked) return res.status(401).json({ error: _deadApprover.reason });
   const approverDid = v.decoded && v.decoded.sub;
   if (!approverDid) return res.status(401).json({ error: 'operator token has no DID' });
   const uc = user_code.toString().toUpperCase().trim();
   const row = db.prepare("SELECT * FROM device_auth WHERE user_code = ? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(uc);
   if (!row) return res.status(404).json({ error: 'no pending request for that code' });
   if (new Date(row.expires_at).getTime() < Date.now()) return res.status(400).json({ error: 'expired' });
+  // No privilege escalation via device flow: the minted token belongs to the
+  // APPROVER's identity, so the approver's own scope is the ceiling. A read
+  // token must not be able to approve an admin request.
+  const approverScope = v.decoded.scope || 'read';
+  if (decision !== 'deny' && !identity.scopeAtLeast(approverScope, row.scope)) {
+    return res.status(403).json({
+      error: `your token scope '${approverScope}' cannot approve a request for scope '${row.scope}' — approving requires at least the requested scope`,
+    });
+  }
   const status = decision === 'deny' ? 'denied' : 'approved';
   db.prepare('UPDATE device_auth SET status = ?, approved_did = ? WHERE device_code = ?')
     .run(status, status === 'approved' ? approverDid : null, row.device_code);
@@ -4939,7 +5022,7 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
-  if (!['transact','admin','full'].includes(v.decoded.scope || '')) return res.status(403).json({ error: 'transact scope required' });
+  if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required' });
 
   const sender = db.prepare('SELECT did, username, status FROM identity_wallets WHERE did = ?').get(from_did);
   const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
@@ -6649,6 +6732,7 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, fingerprint
   if (username && typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
   if (typeof password !== 'string') return res.status(400).json({ error: 'password: must be a string' });
   if (typeof scope !== 'string') return res.status(400).json({ error: 'scope: must be a string' });
+  if (!identity.ISSUABLE_SCOPES.includes(scope)) return res.status(400).json({ error: `unknown scope '${scope}'`, valid_scopes: identity.ISSUABLE_SCOPES });
   if (typeof expires_in !== 'string') return res.status(400).json({ error: 'expires_in: must be a string' });
   if (channel && typeof channel !== 'string') return res.status(400).json({ error: 'channel: must be a string' });
   const wallet = did
@@ -6834,8 +6918,8 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
-  // Progressive Barrel: require transact/admin/full scope for secure transfers (double barrel tier)
-  if (!['transact', 'admin', 'full'].includes(v.decoded.scope || '')) return res.status(403).json({ error: 'transact scope required (double barrel)' });
+  // Progressive Barrel: require transact-or-above scope for secure transfers (double barrel tier)
+  if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required (double barrel)' });
   const sender = db.prepare('SELECT did, username, balance_cents, status FROM identity_wallets WHERE did = ?').get(from_did);
   const receiver = db.prepare('SELECT did, username FROM identity_wallets WHERE did = ?').get(to_did);
   if (!sender || !receiver) return res.status(404).json({ error: 'identity not found' });
@@ -9580,10 +9664,19 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const encrypted = blindkeyEncrypt(newPassword);
 
     const newRefCode = generateRefCode('password', newName);
-    db.prepare('INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode);
+    db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code,
+                                              provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)`)
+      .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
+           secret.provider || '', secret.ownership || 'sole', secret.rotatable ?? 1, secret.category, secret.labels, secret.rotation_interval_days);
 
     const newSecret = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
+
+    // Rotation telemetry
+    try {
+      db.prepare('INSERT INTO secret_rotations (secret_id, did, method, old_version, new_version, note) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(newSecret.id, ownerDid, 'rotate_blind', secret.version || 1, newVersion, baseName + ' @ ' + target_host);
+    } catch(_) {}
 
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
     for (const ctx of oldContexts) {
@@ -10637,6 +10730,25 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS secret_outcomes (
 // Add frozen column to secrets
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN frozen INTEGER DEFAULT 0"); } catch(_) {}
 
+// Metadata standardization + rotation telemetry (2026-07-07)
+// category/labels are USER-SET data — the UI must never guess grouping from names.
+// NULL means "not provided" so re-stores without these fields don't wipe them.
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN category TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN labels TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN last_rotated_at TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN rotation_interval_days INTEGER DEFAULT NULL"); } catch(_) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS secret_rotations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  secret_id INTEGER NOT NULL,
+  did TEXT NOT NULL,
+  method TEXT DEFAULT 'rotate',
+  old_version INTEGER,
+  new_version INTEGER,
+  note TEXT DEFAULT '',
+  rotated_at TEXT DEFAULT CURRENT_TIMESTAMP
+)`); } catch(e) {}
+try { db.exec('CREATE INDEX IF NOT EXISTS idx_sr_secret ON secret_rotations(secret_id)'); } catch(e) {}
+
 // GET /api/demipass/dashboard — secret health dashboard for the mobile app
 app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
@@ -10644,7 +10756,9 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
   const secrets = db.prepare(`
     SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
-           ownership, rotatable, frozen, created_at, updated_at, expires_at, provider
+           ownership, rotatable, frozen, created_at, updated_at, expires_at, provider,
+           COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels,
+           last_rotated_at, rotation_interval_days
     FROM blindkey_secrets WHERE did = ? AND status IN ('active', 'rotating')
     ORDER BY updated_at DESC
   `).all(auth.did);
@@ -10666,10 +10780,31 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
     // Check for rotation recommendation
     let recommendation = null;
+    let days_to_expiry = null;
     if (s.expires_at) {
-      const daysLeft = Math.ceil((new Date(s.expires_at) - Date.now()) / 86400000);
-      if (daysLeft < 0) recommendation = 'expired';
-      else if (daysLeft <= 7) recommendation = 'expiring_soon';
+      days_to_expiry = Math.ceil((new Date(s.expires_at) - Date.now()) / 86400000);
+      if (days_to_expiry < 0) recommendation = 'expired';
+      else if (days_to_expiry <= 7) recommendation = 'expiring_soon';
+    }
+
+    // Rotation cadence telemetry: due date = (last rotation, or creation) + interval
+    let rotation = null;
+    if (s.rotation_interval_days) {
+      const baseIso = (s.last_rotated_at || s.created_at || '').replace(' ', 'T');
+      const baseTs = new Date(baseIso + (baseIso.endsWith('Z') ? '' : 'Z')).getTime();
+      if (!Number.isNaN(baseTs)) {
+        const dueTs = baseTs + s.rotation_interval_days * 86400000;
+        const dueInDays = Math.ceil((dueTs - Date.now()) / 86400000);
+        rotation = {
+          interval_days: s.rotation_interval_days,
+          last_rotated_at: s.last_rotated_at,
+          due_at: new Date(dueTs).toISOString(),
+          due_in_days: dueInDays,
+          overdue: dueInDays < 0,
+        };
+        if (dueInDays < 0) recommendation = recommendation || 'rotation_overdue';
+        else if (dueInDays <= 7) recommendation = recommendation || 'rotation_due_soon';
+      }
     }
     if (health === 'red') recommendation = recommendation || 'investigate';
     if (health === 'yellow') recommendation = recommendation || 'monitor';
@@ -10684,6 +10819,9 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       "SELECT context_name, action_type, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
     ).all(s.id);
 
+    let parsedLabels = [];
+    try { parsedLabels = JSON.parse(s.labels || '[]'); } catch(_) {}
+
     return {
       id: s.id,
       name: s.name,
@@ -10693,6 +10831,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       frozen: !!s.frozen,
       ownership: s.ownership || 'sole',
       rotatable: s.rotatable !== 0,
+      category: s.category || '',
+      labels: parsedLabels,
       use_count: s.use_count,
       last_used: s.last_used_at,
       health,
@@ -10702,6 +10842,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       context_list: contexts,
       authorized_silicons: silicons,
       expires_at: s.expires_at,
+      days_to_expiry,
+      rotation,
       provider: s.provider,
     };
   });
@@ -10735,6 +10877,10 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       green: enriched.filter(s => s.health === 'green').length,
       neutral: enriched.filter(s => s.health === 'neutral').length,
       frozen: enriched.filter(s => s.frozen).length,
+      expired: enriched.filter(s => s.days_to_expiry !== null && s.days_to_expiry < 0).length,
+      expiring_soon: enriched.filter(s => s.days_to_expiry !== null && s.days_to_expiry >= 0 && s.days_to_expiry <= 14).length,
+      rotation_overdue: enriched.filter(s => s.rotation && s.rotation.overdue).length,
+      no_expiry_telemetry: enriched.filter(s => !s.expires_at && !s.rotation).length,
     },
   });
 });

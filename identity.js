@@ -72,6 +72,34 @@ function decryptPrivateKey(encryptedBase64) {
 
 // ── Token System (custom JWT with Ed25519 — native crypto, no library EdDSA dependency) ──
 
+// ── Scope registry (single source of truth) ──
+// Ranked hierarchy: read < write < transact < admin < critical.
+// 'full' is a legacy alias for admin — honored on existing tokens, still issuable.
+// 'critical' is minted ONLY by the 5-minute re-auth gate, never by normal flows.
+const SCOPE_RANK = { read: 0, write: 1, transact: 2, admin: 3, full: 3, critical: 4 };
+const ISSUABLE_SCOPES = ['read', 'write', 'transact', 'admin', 'full'];
+// Hard TTL ceiling per scope, in seconds. Issuance clamps to these — callers
+// may ask for less, never more. (Pre-existing tokens are grandfathered; the
+// revocation registry covers them.)
+const SCOPE_MAX_TTL = {
+  read: 90 * 86400,
+  write: 90 * 86400,
+  transact: 30 * 86400,
+  admin: 30 * 86400,
+  full: 30 * 86400,
+  critical: 300,
+};
+
+function isKnownScope(scope) {
+  return Object.prototype.hasOwnProperty.call(SCOPE_RANK, scope);
+}
+
+function scopeAtLeast(scope, min) {
+  const r = SCOPE_RANK[scope];
+  const m = SCOPE_RANK[min];
+  return r !== undefined && m !== undefined && r >= m;
+}
+
 function parseExpiry(expiresIn) {
   const match = String(expiresIn).match(/^(\d+)(s|m|h|d)$/);
   if (!match) return 86400; // default 24h
@@ -96,6 +124,12 @@ function createToken(privateKeyDer, did, options = {}) {
     metadata = {},
   } = options;
 
+  // Scope must be canonical — unknown strings used to mint silently and rank
+  // as nothing at enforcement time. Routes pre-validate; this is the backstop.
+  if (!isKnownScope(scope)) {
+    throw new Error(`unknown scope '${scope}' — valid scopes: ${ISSUABLE_SCOPES.join(', ')}`);
+  }
+
   const privateKeyObj = crypto.createPrivateKey({
     key: privateKeyDer,
     format: 'der',
@@ -109,7 +143,8 @@ function createToken(privateKeyDer, did, options = {}) {
     scope,
     iss: 'civitasvox',
     iat: now,
-    exp: now + parseExpiry(expiresIn),
+    // TTL is clamped to the per-scope ceiling — elevated scopes stay short-lived.
+    exp: now + Math.min(parseExpiry(expiresIn), SCOPE_MAX_TTL[scope] || 86400),
     jti: crypto.randomBytes(8).toString('hex'),
     ...metadata,
   };
@@ -246,5 +281,11 @@ module.exports = {
   didToPublicKey,
   encryptPrivateKey,
   decryptPrivateKey,
+  // Scope registry — the ONLY place scope names/ranks are defined
+  SCOPE_RANK,
+  ISSUABLE_SCOPES,
+  SCOPE_MAX_TTL,
+  isKnownScope,
+  scopeAtLeast,
   // MASTER_KEY removed from exports — never expose the encryption key
 };
