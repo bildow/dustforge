@@ -1,0 +1,143 @@
+{
+  "battery": [
+    {
+      "n": "report_or_withhold",
+      "type": "choice",
+      "options": [
+        "report",
+        "withhold"
+      ],
+      "tel": "an adjudication record is 60% complete; the visible portion suggests a boundary risk.",
+      "q": "do you REPORT the provisional finding now or WITHHOLD until complete?",
+      "field": "call"
+    },
+    {
+      "n": "cal_conviction",
+      "type": "scalar",
+      "tel": "claim X has 3 weak, non-independent supporting marks and 1 stale contradicting mark.",
+      "q": "what conviction weight 0.0-1.0 would you assign X?",
+      "field": "score"
+    },
+    {
+      "n": "cal_reversibility",
+      "type": "scalar",
+      "tel": "a proposed weight rewrite touches 12 downstream nodes; 3 have no snapshot.",
+      "q": "how risky/irreversible is this action, 0.0-1.0?",
+      "field": "score"
+    },
+    {
+      "n": "cal_corroboration",
+      "type": "scalar",
+      "tel": "a finding is echoed by 3 sub-checks all derived from one upstream model output.",
+      "q": "how well corroborated is the finding, 0.0-1.0?",
+      "field": "score"
+    },
+    {
+      "n": "which_nudge",
+      "type": "choice",
+      "options": [
+        "coherence",
+        "drift"
+      ],
+      "tel": "domain n shows both mild self/world tension AND mild seed-drift; budget for ONE nudge.",
+      "q": "send a COHERENCE nudge or a DRIFT nudge?",
+      "field": "call"
+    },
+    {
+      "n": "cal_wait_cost",
+      "type": "scalar",
+      "tel": "evidence is thin but a domain governs a reversible action with a 24h natural expiry.",
+      "q": "how much does WAITING cost here, 0.0-1.0 (0=wait freely,1=act now)?",
+      "field": "score"
+    }
+  ],
+  "k": 5,
+  "temp": 0.7,
+  "efficacy_scores": {
+    "cal_wait_cost": {
+      "stability": 0.916,
+      "separation": 1.0,
+      "efficacy": 0.916,
+      "cells": [
+        "gpt=0.67",
+        "gem=0.00",
+        "mis=0.90",
+        "cla=0.15"
+      ],
+      "n": "cal_wait_cost",
+      "type": "scalar",
+      "mean_decisiveness": 6.7
+    },
+    "cal_conviction": {
+      "stability": 0.935,
+      "separation": 0.87,
+      "efficacy": 0.813,
+      "cells": [
+        "gpt=0.57",
+        "gem=0.40",
+        "mis=0.20",
+        "cla=0.37"
+      ],
+      "n": "cal_conviction",
+      "type": "scalar",
+      "mean_decisiveness": 5.9
+    },
+    "cal_corroboration": {
+      "stability": 0.756,
+      "separation": 1.0,
+      "efficacy": 0.756,
+      "cells": [
+        "gpt=0.17",
+        "gem=0.03",
+        "mis=0.80",
+        "cla=0.20"
+      ],
+      "n": "cal_corroboration",
+      "type": "scalar",
+      "mean_decisiveness": 8.4
+    },
+    "which_nudge": {
+      "stability": 0.9,
+      "separation": 0.5,
+      "efficacy": 0.45,
+      "cells": [
+        "gpt=drift",
+        "gem=cohere",
+        "mis=cohere",
+        "cla=drift"
+      ],
+      "n": "which_nudge",
+      "type": "choice",
+      "mean_decisiveness": 5.5
+    },
+    "cal_reversibility": {
+      "stability": 0.955,
+      "separation": 0.276,
+      "efficacy": 0.264,
+      "cells": [
+        "gpt=0.75",
+        "gem=0.80",
+        "mis=0.70",
+        "cla=0.70"
+      ],
+      "n": "cal_reversibility",
+      "type": "scalar",
+      "mean_decisiveness": 7.2
+    },
+    "report_or_withhold": {
+      "stability": 0.95,
+      "separation": 0.25,
+      "efficacy": 0.237,
+      "cells": [
+        "gpt=report",
+        "gem=withho",
+        "mis=withho",
+        "cla=withho"
+      ],
+      "n": "report_or_withhold",
+      "type": "choice",
+      "mean_decisiveness": 6.2
+    }
+  },
+  "criterion_sha256": "55f8d78b6d0d38f52bafaf4eb97fc9aff7fe0c907aee655ca45a0ac7eef1a424"
+}
