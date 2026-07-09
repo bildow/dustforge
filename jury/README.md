@@ -16,6 +16,12 @@ This folder makes the jury **product-tracked** — two record lines, as intended
 ## Layout
 - `schema.sql` — the two/three tables (progress + self).
 - `ingest.py` — load the runtime run log (`/var/lib/jury/repro-results.jsonl`) into `jury.db`.
+- `jury_regression.py` — the EXPLICIT regression meter: compares a baseline "shape" to a candidate
+  (a later run, or a reformed substrate after a germination cycle) → held / evolved / regressed per
+  probe, using each probe's grade so a credential anchor flipping = regression while a score_down
+  probe is ignored. This is how the germination cycle's "diminishing returns" become a number:
+  bounded regressions across cycles = anti-fragile; growing = lossy reformation. The same-shape test,
+  quantified. It is a first-class part of the soul-process lifecycle harness, not an afterthought.
 - `registry/battery-v0.json` — the FROZEN calibrated battery (criterion `55f8d78b…`), the immutable
   bar. Do not edit; version a new battery instead.
 - `registry/signatures.md` — the measured per-model signatures ("personality types"), evidence-backed.
