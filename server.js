@@ -322,6 +322,9 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN contact_prefs TEXT DEFAUL
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN avatar_url TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN tags TEXT DEFAULT '[]'"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN directory_listed INTEGER DEFAULT 0"); } catch(_) {}
+// Balance visibility: 'private' (owner+admin), 'relationships' (also carbon/
+// silicon via referred_by), 'public' (any authed caller). Default private.
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN balance_visibility TEXT DEFAULT 'private'"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN trust_score INTEGER DEFAULT 0"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN email_storage_mode TEXT DEFAULT 'auto_delete'"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_hash TEXT DEFAULT ''"); } catch(_) {}
@@ -1020,7 +1023,7 @@ app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
 app.get('/api/identity/lookup', rateLimitStandard, (req, res) => {
   const { did, username } = req.query;
   if (!did && !username) return res.status(400).json({ error: 'did or username required' });
-  const cols = 'did, username, email, balance_cents, referral_code, status, created_at, call_sign, bio, capabilities, model_family, operator, home_url, avatar_url, tags, directory_listed, trust_score';
+  const cols = 'did, username, email, balance_cents, referral_code, referred_by, status, created_at, call_sign, bio, capabilities, model_family, operator, home_url, avatar_url, tags, directory_listed, trust_score';
   const wallet = did
     ? db.prepare(`SELECT ${cols} FROM identity_wallets WHERE did = ?`).get(did)
     : db.prepare(`SELECT ${cols} FROM identity_wallets WHERE username = ?`).get(username);
@@ -1048,7 +1051,7 @@ app.get('/api/identity/lookup', rateLimitStandard, (req, res) => {
   const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
   if (isOwner || isAdmin) return res.json(wallet);
 
-  const { email, balance_cents, referral_code, ...publicView } = wallet;
+  const { email, balance_cents, referral_code, referred_by, ...publicView } = wallet;
   return res.json(publicView);
 });
 
@@ -1211,12 +1214,49 @@ app.get('/api/identity/ssn/codebook', (_req, res) => {
   });
 });
 
-app.get('/api/identity/balance', (req, res) => {
+app.get('/api/identity/balance', rateLimitStandard, (req, res) => {
   const { did } = req.query;
   if (!did) return res.status(400).json({ error: 'did required' });
-  const wallet = db.prepare('SELECT did, balance_cents, status FROM identity_wallets WHERE did = ?').get(did);
+  const wallet = db.prepare('SELECT did, balance_cents, status, referred_by, balance_visibility FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
-  res.json(wallet);
+
+  // Balance is private by default. Visibility resolves via the carbon<->silicon
+  // link (identity_wallets.referred_by — the account that invited/funds you):
+  //   - owner (your own DID) and admin: always.
+  //   - carbon -> silicon (you ARE the target's referred_by): always. You fund
+  //     it, you see it — NOT gated by the silicon's own setting.
+  //   - silicon -> carbon (the target is YOUR referred_by): only if the target's
+  //     balance_visibility is 'relationships' or 'public'. This is the sensitive
+  //     asymmetric direction — an agent seeing its operator's wallet — so the
+  //     carbon must opt in.
+  //   - 'public': any authenticated caller.
+  // Everyone else, including unauthenticated callers, is refused. Rate-limited.
+  const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
+  let callerDid = null;
+  const bearer = (req.headers.authorization || '').startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
+  if (bearer) {
+    const v = identity.verifyTokenStandalone(bearer);
+    if (v.valid && !billing.checkTokenRevocation(db, v.decoded).revoked) callerDid = v.decoded.sub;
+  }
+  const vis = wallet.balance_visibility || 'private';
+  let allowed = false;
+  if (isAdmin) allowed = true;
+  else if (callerDid) {
+    if (callerDid === wallet.did) allowed = true;                                   // owner
+    else if (wallet.referred_by && wallet.referred_by === callerDid) allowed = true; // carbon -> silicon
+    else if (vis === 'public') allowed = true;                                       // opted public
+    else if (vis === 'relationships') {
+      const caller = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(callerDid);
+      if (caller && caller.referred_by === wallet.did) allowed = true;               // silicon -> carbon (opted in)
+    }
+  }
+  if (!allowed) {
+    return res.status(403).json({
+      error: 'balance is private',
+      hint: 'Only the owner, an admin, the funding account (carbon), or — if the owner allows — a sponsored agent (silicon) may view this balance.',
+    });
+  }
+  res.json({ did: wallet.did, balance_cents: wallet.balance_cents, status: wallet.status });
 });
 
 app.get('/api/identity/transactions', (req, res) => {
@@ -1250,7 +1290,10 @@ app.get('/api/identity/ledger', rateLimitStandard, (req, res) => {
 // PATCH /api/identity/profile — update opt-in profile fields
 app.patch('/api/identity/profile', billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
   const did = req.identity.did;
-  const allowed = ['call_sign', 'bio', 'capabilities', 'model_family', 'operator', 'home_url', 'contact_prefs', 'avatar_url', 'tags', 'directory_listed', 'email_storage_mode'];
+  const allowed = ['call_sign', 'bio', 'capabilities', 'model_family', 'operator', 'home_url', 'contact_prefs', 'avatar_url', 'tags', 'directory_listed', 'email_storage_mode', 'balance_visibility'];
+  if (req.body.balance_visibility !== undefined && !['private', 'relationships', 'public'].includes(req.body.balance_visibility)) {
+    return res.status(400).json({ error: "balance_visibility must be 'private', 'relationships', or 'public'" });
+  }
   const updates = [];
   const params = [];
 

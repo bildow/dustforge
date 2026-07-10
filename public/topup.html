@@ -127,10 +127,20 @@ async function lookupSilicon() {
     selectedDid = data.did;
     document.getElementById('topup-username').textContent = data.username;
 
-    // Get balance
-    const balRes = await fetch(API + '/api/identity/balance?did=' + encodeURIComponent(data.did));
-    const balData = await balRes.json();
-    document.getElementById('current-balance').textContent = (balData.balance_cents || 0) + ' DD';
+    // Balance is private by default — an anonymous funder isn't authorized to
+    // see it. Show it only if the lookup returns it; otherwise hide the line.
+    try {
+      const balRes = await fetch(API + '/api/identity/balance?did=' + encodeURIComponent(data.did));
+      const balData = await balRes.json();
+      const balEl = document.getElementById('current-balance');
+      const balRow = balEl.closest('.balance-row') || balEl.parentElement;
+      if (balRes.ok && typeof balData.balance_cents === 'number') {
+        balEl.textContent = balData.balance_cents + ' DD';
+        if (balRow) balRow.style.display = '';
+      } else if (balRow) {
+        balRow.style.display = 'none';
+      }
+    } catch (_) { /* balance is optional to display */ }
 
     document.getElementById('lookup').style.display = 'none';
     document.getElementById('topup-form').style.display = 'block';
