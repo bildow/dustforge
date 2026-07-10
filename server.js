@@ -1017,16 +1017,39 @@ app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
   res.json({ ok: true, revoke_before: now, warning: 'ALL tokens for this DID issued before now are dead, including the one that made this call. Re-mint via request-2fa + verify.' });
 });
 
-app.get('/api/identity/lookup', (req, res) => {
+app.get('/api/identity/lookup', rateLimitStandard, (req, res) => {
   const { did, username } = req.query;
   if (!did && !username) return res.status(400).json({ error: 'did or username required' });
+  const cols = 'did, username, email, balance_cents, referral_code, status, created_at, call_sign, bio, capabilities, model_family, operator, home_url, avatar_url, tags, directory_listed, trust_score';
   const wallet = did
-    ? db.prepare('SELECT did, username, email, balance_cents, referral_code, status, created_at, call_sign, bio, capabilities, model_family, operator, home_url, avatar_url, tags, directory_listed, trust_score FROM identity_wallets WHERE did = ?').get(did)
-    : db.prepare('SELECT did, username, email, balance_cents, referral_code, status, created_at, call_sign, bio, capabilities, model_family, operator, home_url, avatar_url, tags, directory_listed, trust_score FROM identity_wallets WHERE username = ?').get(username);
+    ? db.prepare(`SELECT ${cols} FROM identity_wallets WHERE did = ?`).get(did)
+    : db.prepare(`SELECT ${cols} FROM identity_wallets WHERE username = ?`).get(username);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
   try { wallet.capabilities = JSON.parse(wallet.capabilities || '[]'); } catch(_) { wallet.capabilities = []; }
   try { wallet.tags = JSON.parse(wallet.tags || '[]'); } catch(_) { wallet.tags = []; }
-  res.json(wallet);
+
+  // Who is asking? The account OWNER (bearer DID matches the target) or an admin
+  // sees the full record. Everyone else — including unauthenticated callers —
+  // gets a PUBLIC PROFILE only. This closes the email + balance harvest: before,
+  // anyone with a username could GET ?username=X and read that account's email,
+  // wallet balance, and referral code. Now those three are owner/admin-only.
+  // Public profile fields (handle, bio, capabilities, avatar) stay open so the
+  // funding/lookup pages (topup, deposit) still work. Rate-limited to stop
+  // enumeration/scraping. NOTE: /api/identity/balance is still public by design
+  // for the topup UX — gate it separately if balance should be private too.
+  const bearer = (req.headers.authorization || '').startsWith('Bearer ')
+    ? req.headers.authorization.slice(7) : null;
+  let callerDid = null;
+  if (bearer) {
+    const v = identity.verifyTokenStandalone(bearer);
+    if (v.valid && !billing.checkTokenRevocation(db, v.decoded).revoked) callerDid = v.decoded.sub;
+  }
+  const isOwner = callerDid && callerDid === wallet.did;
+  const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
+  if (isOwner || isAdmin) return res.json(wallet);
+
+  const { email, balance_cents, referral_code, ...publicView } = wallet;
+  return res.json(publicView);
 });
 
 app.post('/api/identity/verify-token', (req, res) => {
