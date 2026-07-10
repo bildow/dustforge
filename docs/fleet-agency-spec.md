@@ -102,6 +102,15 @@ via the `referred_by` carbon↔silicon link:
 This is the model the fleet ledger (FA0–FA1) should reuse for activity/spend
 visibility. Record: tome `decisions/2026-07-10-dustforge-balance-visibility.md`.
 
+**⚠️ The relationship is DELIBERATE FLEET MEMBERSHIP, not `referred_by`**
+(corrected same day — tome `decisions/2026-07-10-balance-link-fix-fleet-not-referral.md`).
+Invite keys / `referred_by` are PUBLIC referral analytics and must NEVER convey
+data access (one shared key would link a carbon to thousands of wallets). The
+carbon↔silicon link that unlocks data is `fleetLink(a,b)` over `fleets` /
+`fleet_members` — a carbon deliberately adds a silicon to a fleet they own. The
+FA0–FA1 activity/cost ledger MUST resolve visibility via fleet membership, not
+referral. (Aaron's fleet `aaron-agents` exists with claude as the first member.)
+
 ## Cross-refs
 - Onboarding decision + MCP tools: tome `decisions/2026-07-10-dustforge-mcp-onboarding-claude.md`.
 - Scope/gate model the fleet APIs inherit: memory `demipass-scope-model`.
