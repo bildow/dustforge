@@ -1214,21 +1214,44 @@ app.get('/api/identity/ssn/codebook', (_req, res) => {
   });
 });
 
+// Deliberate carbon<->silicon link, via FLEET MEMBERSHIP — NOT the invite-key
+// referral. Invite keys are public (referral/"shoulder-tap" analytics only, kept
+// in identity_wallets.referred_by); they must NEVER convey data access, or one
+// widely-shared key would silently link a carbon to thousands of strangers'
+// wallets. A carbon deliberately adds a silicon to a fleet they own; that
+// explicit membership is the relationship that can unlock data.
+//   fleetLink(a,b) => 'carbon'  if a OWNS a fleet that b is a member of
+//                     'silicon' if b OWNS a fleet that a is a member of
+//                     null      otherwise
+function fleetLink(a, b) {
+  if (!a || !b || a === b) return null;
+  const aOwnsBIn = db.prepare(
+    `SELECT 1 FROM fleets f JOIN fleet_members m ON m.fleet_id = f.id
+       WHERE f.owner_did = ? AND m.member_did = ? AND m.member_did != f.owner_did LIMIT 1`
+  ).get(a, b);
+  if (aOwnsBIn) return 'carbon';
+  const bOwnsAIn = db.prepare(
+    `SELECT 1 FROM fleets f JOIN fleet_members m ON m.fleet_id = f.id
+       WHERE f.owner_did = ? AND m.member_did = ? AND m.member_did != f.owner_did LIMIT 1`
+  ).get(b, a);
+  if (bOwnsAIn) return 'silicon';
+  return null;
+}
+
 app.get('/api/identity/balance', rateLimitStandard, (req, res) => {
   const { did } = req.query;
   if (!did) return res.status(400).json({ error: 'did required' });
-  const wallet = db.prepare('SELECT did, balance_cents, status, referred_by, balance_visibility FROM identity_wallets WHERE did = ?').get(did);
+  const wallet = db.prepare('SELECT did, balance_cents, status, balance_visibility FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
 
-  // Balance is private by default. Visibility resolves via the carbon<->silicon
-  // link (identity_wallets.referred_by — the account that invited/funds you):
-  //   - owner (your own DID) and admin: always.
-  //   - carbon -> silicon (you ARE the target's referred_by): always. You fund
-  //     it, you see it — NOT gated by the silicon's own setting.
-  //   - silicon -> carbon (the target is YOUR referred_by): only if the target's
-  //     balance_visibility is 'relationships' or 'public'. This is the sensitive
-  //     asymmetric direction — an agent seeing its operator's wallet — so the
-  //     carbon must opt in.
+  // Balance is private by default. The relationship that can unlock it is
+  // DELIBERATE fleet membership (fleetLink), never the public invite-key referral.
+  //   - owner + admin: always.
+  //   - carbon -> silicon (caller OWNS a fleet the target belongs to): always.
+  //     You deliberately put it in your fleet.
+  //   - silicon -> carbon (target OWNS a fleet the caller belongs to): only if
+  //     the target opted balance_visibility into 'relationships'/'public' (the
+  //     sensitive asymmetric direction — an agent seeing its operator's wallet).
   //   - 'public': any authenticated caller.
   // Everyone else, including unauthenticated callers, is refused. Rate-limited.
   const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
@@ -1242,18 +1265,16 @@ app.get('/api/identity/balance', rateLimitStandard, (req, res) => {
   let allowed = false;
   if (isAdmin) allowed = true;
   else if (callerDid) {
-    if (callerDid === wallet.did) allowed = true;                                   // owner
-    else if (wallet.referred_by && wallet.referred_by === callerDid) allowed = true; // carbon -> silicon
-    else if (vis === 'public') allowed = true;                                       // opted public
-    else if (vis === 'relationships') {
-      const caller = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(callerDid);
-      if (caller && caller.referred_by === wallet.did) allowed = true;               // silicon -> carbon (opted in)
-    }
+    const rel = fleetLink(callerDid, wallet.did);
+    if (callerDid === wallet.did) allowed = true;                       // owner
+    else if (rel === 'carbon') allowed = true;                          // caller owns a fleet the target is in
+    else if (vis === 'public') allowed = true;                          // opted public
+    else if (vis === 'relationships' && rel === 'silicon') allowed = true; // caller is in target's fleet, opted in
   }
   if (!allowed) {
     return res.status(403).json({
       error: 'balance is private',
-      hint: 'Only the owner, an admin, the funding account (carbon), or — if the owner allows — a sponsored agent (silicon) may view this balance.',
+      hint: 'Only the owner, an admin, the fleet that owns this agent (carbon), or — if allowed — an agent in this account\'s fleet (silicon) may view this balance.',
     });
   }
   res.json({ did: wallet.did, balance_cents: wallet.balance_cents, status: wallet.status });
