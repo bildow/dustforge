@@ -90,6 +90,18 @@ All fleet-scoped, owner/admin-gated (caller must be `owner`/`admin` of the fleet
 - Retention of the activity feed (transactions are permanent; a feed table may
   want a window).
 
+## Built ahead of the rest: balance visibility (2026-07-10)
+The relationship-authorized **balance** view is DONE (didn't wait for the fleet
+UI). `/api/identity/balance` is now private by default with a per-wallet
+`balance_visibility` setting (`private` | `relationships` | `public`), resolved
+via the `referred_by` carbon↔silicon link:
+- owner + admin always; carbon→silicon always (you fund it); silicon→carbon only
+  if the carbon opted into `relationships`/`public` (asymmetric); else 403.
+- Settable via `PATCH /api/identity/profile`. MCP `dustforge_balance` takes an
+  optional `did` (a silicon can check its carbon's balance).
+This is the model the fleet ledger (FA0–FA1) should reuse for activity/spend
+visibility. Record: tome `decisions/2026-07-10-dustforge-balance-visibility.md`.
+
 ## Cross-refs
 - Onboarding decision + MCP tools: tome `decisions/2026-07-10-dustforge-mcp-onboarding-claude.md`.
 - Scope/gate model the fleet APIs inherit: memory `demipass-scope-model`.
