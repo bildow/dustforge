@@ -10,6 +10,17 @@ const Stripe = require('stripe');
 
 const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 
+// The statement descriptor to set as the ACCOUNT default in the Stripe
+// dashboard (Settings → Public details / Statement descriptor). Since
+// 2024-02-01 Stripe REJECTS a per-transaction `statement_descriptor` on card
+// PaymentIntents (400 error) — card charges use the account prefix (+ optional
+// `statement_descriptor_suffix`). So this is documentation of the value to set
+// in the dashboard, NOT something we send per checkout. <=22 chars, Latin only.
+// Bundles both brands so the charge is recognizable whether they bought on
+// demipass.com or dustforge.com; matches the "DEMIPASS DUSTFORGE" text on the
+// pay-page footers.
+const STATEMENT_DESCRIPTOR = 'DEMIPASS DUSTFORGE';
+
 // Pricing
 const PRICES = {
   account_single: 100,    // $1.00
@@ -39,14 +50,14 @@ function getStripe() {
 async function createAccountCheckout(options) {
   const { username, password, referral_code, bulk = false } = options;
   const price = bulk ? PRICES.account_bulk_10 : PRICES.account_single;
-  const label = bulk ? 'Civitasvox — 10 Silicon Accounts' : 'Civitasvox — Silicon Account';
+  const label = bulk ? 'DemiPass Accounts ×10 — a Dustforge product' : 'DemiPass Account — a Dustforge product';
 
   const session = await getStripe().checkout.sessions.create({
     payment_method_types: ['card'],
     line_items: [{
       price_data: {
         currency: 'usd',
-        product_data: { name: label, description: 'DID:key identity + Dustforge email + wallet' },
+        product_data: { name: label, description: 'Cryptographic identity (DID:key) + @dustforge.com email + prepaid service wallet. Non-refundable digital goods.' },
         unit_amount: price,
       },
       quantity: 1,
@@ -81,7 +92,7 @@ async function createTopupCheckout(did, amount_cents) {
     line_items: [{
       price_data: {
         currency: 'usd',
-        product_data: { name: `Civitasvox Wallet Topup`, description: `Add $${(amount_cents / 100).toFixed(2)} to your wallet` },
+        product_data: { name: `Dustforge Wallet Top-Up`, description: `Add $${(amount_cents / 100).toFixed(2)} of Diamond Dust — prepaid, non-refundable service credit for your @dustforge.com account.` },
         unit_amount: amount_cents,
       },
       quantity: 1,
@@ -113,6 +124,7 @@ function constructWebhookEvent(rawBody, signature) {
 module.exports = {
   getStripe,
   PRICES,
+  STATEMENT_DESCRIPTOR,
   createAccountCheckout,
   createTopupCheckout,
   constructWebhookEvent,

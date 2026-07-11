@@ -48,10 +48,16 @@
   <label for="ref">Referral code (optional)</label>
   <input id="ref" type="text" autocapitalize="none" placeholder="if a friend invited you" spellcheck="false">
 
-  <button class="btn" id="go" onclick="signup()">Continue to payment — $1</button>
+  <button class="btn" id="go" onclick="signup()">Continue to payment — $1 USD</button>
   <div class="msg" id="msg"></div>
 
   <div class="foot">Already have an account? <a href="/vault-mobile.html">Sign in</a></div>
+
+  <div style="margin-top:1.25rem;padding-top:1rem;border-top:1px solid rgba(255,255,255,0.08);font-size:0.72rem;line-height:1.5;color:#6d8397">
+    <div><strong>DemiPass</strong> is a product of <strong>Dustforge</strong>. Payment is processed securely by Stripe and appears on your card statement as <strong>DEMIPASS DUSTFORGE</strong>. Price shown in <strong>USD</strong>.</div>
+    <div style="margin-top:0.4rem">Accounts and Diamond Dust are digital goods delivered instantly and are <strong>non-refundable</strong>.</div>
+    <div style="margin-top:0.5rem"><a href="/terms" style="color:#5fb3ff">Terms</a> &middot; <a href="/privacy.html" style="color:#5fb3ff">Privacy</a> &middot; <a href="mailto:support@dustforge.com" style="color:#5fb3ff">Contact</a></div>
+  </div>
 </div>
 
 <script>
