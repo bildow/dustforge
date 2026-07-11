@@ -221,8 +221,16 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+// The Stripe webhook route mounts its OWN express.raw() and needs the unparsed
+// body to verify signatures (and to JSON.parse in the no-secret test path). If
+// these global parsers run first they consume the stream, leaving the raw route
+// with an already-parsed body — which silently broke ALL webhook fulfillment
+// (account creation, founders, prepaid). Skip the webhook path here, same as the
+// MTA hook above.
+const _jsonParser = express.json();
+const _urlencodedParser = express.urlencoded({ extended: false });
+app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, next)));
+app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, next)));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // DemiPass public surface — rewrite /api/demipass/* to /api/blindkey/* at the raw URL level
@@ -1937,8 +1945,13 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             '', 'UTC', 'decision', JSON.stringify(['founders:fulfilled']));
       } catch (e) { console.error('[stripe-webhook] founders error:', e.message); }
     } else if (meta.type === 'prepaid_keys') {
-      // Prepaid key fulfillment is handled by the success redirect, not webhook
-      console.log('[stripe-webhook] prepaid_keys session completed:', session.id);
+      // Authoritative fulfillment: issue + email the keys here, so a buyer who
+      // pays but never lands on /success (closed tab, redirect fails) still gets
+      // them. Idempotent + shared with the /success page.
+      try {
+        const r = await fulfillPrepaidKeys(session);
+        console.log(`[stripe-webhook] prepaid_keys ${session.id}: ${r.generated ? 'fulfilled ' + r.keys.length + ' keys' : (r.ok ? 'already fulfilled' : r.error)}`);
+      } catch (e) { console.error('[stripe-webhook] prepaid fulfillment error:', e.message); }
     }
   } else if (event.type === 'invoice.paid') {
     // Recurring subscription fulfillment — monthly DD credit for founders
@@ -4927,6 +4940,77 @@ app.post('/api/prepaid/purchase', rateLimitStrict, async (req, res) => {
 });
 
 // GET /api/prepaid/success — generate keys after payment
+// ── Shared prepaid-key fulfillment (idempotent) ──────────────────────────────
+// Generates + emails the keys for a PAID prepaid_keys checkout session. Called
+// from BOTH the Stripe webhook (authoritative — fires even if the buyer never
+// lands on the /success redirect) and the /success page (display). The
+// generate step runs inside a synchronous better-sqlite3 transaction, so two
+// concurrent callers (webhook + redirect arriving together) cannot double-issue:
+// whoever wins the transaction sets `generated` and sends the single email; the
+// other returns the same keys. Idempotent by stripe_session_id.
+async function fulfillPrepaidKeys(session) {
+  const meta = session.metadata || {};
+  if (meta.type !== 'prepaid_keys') return { ok: false, error: 'not a prepaid_keys session' };
+  if (session.payment_status !== 'paid') return { ok: false, pending: true, error: 'payment not confirmed' };
+
+  const qty = Number(meta.quantity) || 1;
+  // Per-key price from what was actually charged (previously hardcoded to 100¢,
+  // which mis-recorded every bulk package as $1/key).
+  const perKeyCents = session.amount_total ? Math.round(session.amount_total / qty) : 100;
+
+  let keys = [];
+  let generated = false;
+  db.transaction(() => {
+    const existing = db.prepare('SELECT key_code FROM prepaid_keys WHERE stripe_session_id = ?').all(session.id);
+    if (existing.length) { keys = existing.map(r => r.key_code); return; }
+    const stmt = db.prepare('INSERT INTO prepaid_keys (key_code, sponsor_email, amount_cents, stripe_session_id, tos_accepted) VALUES (?, ?, ?, ?, 1)');
+    for (let i = 0; i < qty; i++) {
+      const keyCode = 'DF-' + crypto.randomBytes(4).toString('hex').toUpperCase() + '-' + crypto.randomBytes(4).toString('hex').toUpperCase();
+      stmt.run(keyCode, meta.sponsor_email, perKeyCents, session.id);
+      keys.push(keyCode);
+    }
+    if (qty === 140) {
+      const ent = db.prepare('INSERT OR IGNORE INTO prepaid_entitlements (stripe_session_id, sponsor_email, package_code, benefit_code, benefit_description) VALUES (?, ?, ?, ?, ?)');
+      ent.run(session.id, meta.sponsor_email, '140_keys_partnership', 'whisperhook_beta', 'WhisperHook beta key reservation on release (May 2026)');
+      ent.run(session.id, meta.sponsor_email, '140_keys_partnership', 'sightless_beta', 'Sightless beta key reservation on release (May 2026)');
+    }
+    generated = true;
+  })();
+
+  // Email only on the call that actually generated. Best-effort: a mail failure
+  // must NOT undo issuance — the keys are already durable and shown on /success.
+  if (generated) {
+    try {
+      const t = createEmailTransport();
+      await t.sendMail({
+        from: 'keys@dustforge.com',
+        to: meta.sponsor_email,
+        subject: `Your Dustforge Prepaid Key${keys.length > 1 ? 's' : ''}`,
+        text: [
+          `Thank you for purchasing ${keys.length} Dustforge prepaid key${keys.length > 1 ? 's' : ''}.`,
+          '',
+          'Your key' + (keys.length > 1 ? 's' : '') + ':',
+          ...keys.map((k, i) => `  ${i + 1}. ${k}`),
+          '',
+          'To redeem: give this key to a silicon agent. They use it at:',
+          'POST https://api.dustforge.com/api/prepaid/redeem',
+          '  {"key_code": "YOUR-KEY", "username": "agent-name", "password": "min-8-chars"}',
+          '',
+          'By purchasing this key, you accepted responsibility for the silicon',
+          'agent that redeems it and any actions it takes on the platform.',
+          ...(qty === 140
+            ? ['', 'Partnership package entitlement recorded:', '  - WhisperHook beta key reservation (May 2026)', '  - Sightless beta key reservation (May 2026)']
+            : []),
+          '',
+          '— Dustforge Identity Platform',
+        ].join('\n'),
+      });
+    } catch (_) {}
+    console.log(`[prepaid] ${keys.length} keys generated for ${meta.sponsor_email} (session ${session.id})`);
+  }
+  return { ok: true, keys, generated };
+}
+
 app.get('/api/prepaid/success', async (req, res) => {
   const sessionId = req.query.session_id;
   if (!sessionId) return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Missing session</h1></body></html>');
@@ -4940,60 +5024,12 @@ app.get('/api/prepaid/success', async (req, res) => {
       return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not confirmed</h1></body></html>');
     }
 
-    // Check if keys already generated for this session (idempotent)
-    const existing = db.prepare('SELECT key_code FROM prepaid_keys WHERE stripe_session_id = ?').all(sessionId);
-    let keys = existing.map(r => r.key_code);
-
-    if (keys.length === 0) {
-      const qty = Number(meta.quantity) || 1;
-      const stmt = db.prepare('INSERT INTO prepaid_keys (key_code, sponsor_email, amount_cents, stripe_session_id, tos_accepted) VALUES (?, ?, 100, ?, 1)');
-      for (let i = 0; i < qty; i++) {
-        const keyCode = 'DF-' + crypto.randomBytes(4).toString('hex').toUpperCase() + '-' + crypto.randomBytes(4).toString('hex').toUpperCase();
-        stmt.run(keyCode, meta.sponsor_email, sessionId);
-        keys.push(keyCode);
-      }
-      if (qty === 140) {
-        const entitlementStmt = db.prepare(
-          'INSERT OR IGNORE INTO prepaid_entitlements (stripe_session_id, sponsor_email, package_code, benefit_code, benefit_description) VALUES (?, ?, ?, ?, ?)'
-        );
-        entitlementStmt.run(sessionId, meta.sponsor_email, '140_keys_partnership', 'whisperhook_beta', 'WhisperHook beta key reservation on release (May 2026)');
-        entitlementStmt.run(sessionId, meta.sponsor_email, '140_keys_partnership', 'sightless_beta', 'Sightless beta key reservation on release (May 2026)');
-      }
-
-      // Email the keys to the sponsor
-      try {
-        const t = createEmailTransport();
-        await t.sendMail({
-          from: 'keys@dustforge.com',
-          to: meta.sponsor_email,
-          subject: `Your Dustforge Prepaid Key${keys.length > 1 ? 's' : ''}`,
-          text: [
-            `Thank you for purchasing ${keys.length} Dustforge prepaid key${keys.length > 1 ? 's' : ''}.`,
-            '',
-            'Your key' + (keys.length > 1 ? 's' : '') + ':',
-            ...keys.map((k, i) => `  ${i + 1}. ${k}`),
-            '',
-            'To redeem: give this key to a silicon agent. They use it at:',
-            'POST https://api.dustforge.com/api/prepaid/redeem',
-            '  {"key_code": "YOUR-KEY", "username": "agent-name", "password": "min-8-chars"}',
-            '',
-            'By purchasing this key, you accepted responsibility for the silicon',
-            'agent that redeems it and any actions it takes on the platform.',
-            ...(qty === 140
-              ? [
-                '',
-                'Partnership package entitlement recorded:',
-                '  - WhisperHook beta key reservation (May 2026)',
-                '  - Sightless beta key reservation (May 2026)',
-              ]
-              : []),
-            '',
-            '— Dustforge Identity Platform',
-          ].join('\n'),
-        });
-      } catch (_) {}
-
-      console.log(`[prepaid] ${keys.length} keys generated for ${meta.sponsor_email}`);
+    // Idempotent fulfillment (shared with the Stripe webhook — whichever fires
+    // first issues the keys; this just displays them).
+    const result = await fulfillPrepaidKeys(session);
+    const keys = result.keys || [];
+    if (!keys.length) {
+      return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not confirmed</h1></body></html>');
     }
 
     // Show the keys
