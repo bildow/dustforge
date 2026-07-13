@@ -186,6 +186,9 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
+// DD provenance ledger — lineage for chargeback clawback, keyed-hash identity.
+try { require('./dd_ledger').initSchema(db); } catch (e) { console.error('dd_ledger schema:', e.message); }
+
 // Issued-token registry + revocation surface: every JWT minted gets a jti row.
 try { db.exec(`CREATE TABLE IF NOT EXISTS issued_tokens (
   jti TEXT PRIMARY KEY,
@@ -593,7 +596,9 @@ app.post('/api/identity/create', async (req, res) => {
         .run(id.did, username, inviteKey.id);
     }
 
-    if (referredBy) referral.processReferralPayout(db, referredBy, id.did, username);
+    // Referral payout is FUNDED-ONLY — it fires on the $1 Stripe signup (in the
+    // webhook), never on key-based/$0 creates. Attribution (referred_by) is still
+    // recorded above; only the 10 DD payout is gated to a funded conversion.
 
     // Track conversion
     const callerClass = conversion.classifyCaller(req);
@@ -1891,7 +1896,14 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             // below, on a referral) or simply not minted (vaporizes) otherwise.
             // Idempotent on the Stripe session so a webhook replay can't double-grant.
             billing.creditBalance(db, id.did, 90, 'onboarding_grant', 'Onboarding: 90 DD ($1 signup, 10 DD creation fee)', 'onboard_' + session.id);
-            if (referredBy) referral.processReferralPayout(db, referredBy, id.did, pending.username);
+            try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: 90, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {}
+            // FUNDED referral payout: 10 DD to the referrer ONLY on this $1 conversion,
+            // its lot tied to the SAME funding event so a chargeback claws back both the
+            // 90 DD grant and this 10 DD payout (across any fleet transfers).
+            if (referredBy) {
+              const _rp = referral.processReferralPayout(db, referredBy, id.did, pending.username);
+              if (_rp && _rp.ok && _rp.credited > 0) { try { require('./dd_ledger').recordCredit(db, { did: referredBy, amount_cents: referral.REFERRAL_PAYOUT_CENTS, source: 'referral_payout', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {} }
+            }
             db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', session.id);
             console.log('[stripe-webhook] fulfilled:', pending.username, '->', id.did);
           }
@@ -1953,6 +1965,26 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         console.log(`[stripe-webhook] prepaid_keys ${session.id}: ${r.generated ? 'fulfilled ' + r.keys.length + ' keys' : (r.ok ? 'already fulfilled' : r.error)}`);
       } catch (e) { console.error('[stripe-webhook] prepaid fulfillment error:', e.message); }
     }
+  } else if (event.type === 'charge.dispute.created' || event.type === 'charge.refunded') {
+    // A funding event was reversed → claw back all DD derived from it. Resolve the
+    // checkout session from the charge's payment_intent (that session id is the
+    // origin_event_id the lots were recorded under), then evaporate tainted-first.
+    try {
+      const obj = event.data.object || {};
+      const paymentIntent = obj.payment_intent || null;
+      let sessionId = null;
+      if (paymentIntent) {
+        const stripe = stripeService.getStripe();
+        const sessions = await stripe.checkout.sessions.list({ payment_intent: paymentIntent, limit: 1 });
+        if (sessions.data && sessions.data[0]) sessionId = sessions.data[0].id;
+      }
+      if (sessionId) {
+        const r = require('./dd_ledger').clawback(db, sessionId, billing);
+        console.log(`[stripe-webhook] chargeback clawback ${sessionId}: ${r.total_charged_cents} DD evaporated across ${r.evaporated_lots} lots`);
+      } else {
+        console.warn('[stripe-webhook] dispute/refund but no checkout session resolved for clawback:', obj.id);
+      }
+    } catch (e) { console.error('[stripe-webhook] clawback error:', e.message); }
   } else if (event.type === 'invoice.paid') {
     // Recurring subscription fulfillment — monthly DD credit for founders
     const invoice = event.data.object;
@@ -5891,8 +5923,28 @@ function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, descriptio
     return debit;
   });
 
-  return txn();
+  const out = txn();
+  // Preserve DD lineage across the transfer (incl. fleet-wallet hops) so a
+  // chargeback can follow the dust into the recipient's wallet. Best-effort.
+  try { require('./dd_ledger').recordTransfer(db, fromDid, toDid, amountCents); } catch (_) {}
+  return out;
 }
+
+// POST /api/admin/clawback — reverse a funding event (chargeback / "evaporation").
+// Evaporates ALL DD derived from it (funded grant + referral payout) across every
+// transfer incl. fleet hops, tainted-first, driving spent-through holders negative.
+// Idempotent + audited. origin_event_id = the Stripe checkout session id.
+app.post('/api/admin/clawback', (req, res) => {
+  const provided = req.headers['x-admin-key'] || req.body?.admin_key || '';
+  if (!safeSecretEqual(provided, ADMIN_API_KEY)) return res.status(403).json({ error: 'admin key required' });
+  const { origin_event_id } = req.body || {};
+  if (!origin_event_id) return res.status(400).json({ error: 'origin_event_id required' });
+  try {
+    const result = require('./dd_ledger').clawback(db, origin_event_id, billing);
+    console.log(`[clawback] ${origin_event_id}: ${result.evaporated_lots} lots, ${result.total_charged_cents} DD evaporated`);
+    res.json(result);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 function requireBarrel(minTier) {
   const minIndex = BARREL_TIERS.indexOf(minTier);

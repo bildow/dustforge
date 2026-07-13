@@ -92,6 +92,36 @@ function deductBalance(db, did, amount_cents, type, description = '') {
     return { ok: true, balance_after: newBalance, deducted: amount_cents };
   });
 
+  const result = txn();
+  // Provenance (best-effort, never blocks the spend): attribute this deduction
+  // to the holder's DD lots, tainted-first, so clawback knows what was spent.
+  // Transfers are NOT spends — barrelGuardedTransfer records them as lineage
+  // (recordTransfer) so the lot isn't double-consumed here.
+  if (result.ok && !/transfer/i.test(type)) { try { require('./dd_ledger').recordSpend(db, did, amount_cents); } catch (_) {} }
+  return result;
+}
+
+/**
+ * Evaporate (clawback debit). Reduces balance by amount_cents, BYPASSING the
+ * insufficient-balance floor so a holder who already spent tainted dust is
+ * driven NEGATIVE (recoverable debt). Idempotent via idempotency_key. Used only
+ * by the chargeback clawback engine (dd_ledger.clawback).
+ */
+function evaporate(db, did, amount_cents, description = '', idempotency_key = null) {
+  const wallet = db.prepare('SELECT id FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return { ok: false, error: 'identity not found' };
+  const txn = db.transaction(() => {
+    db.prepare('UPDATE identity_wallets SET updated_at = updated_at WHERE id = ?').run(wallet.id);
+    if (idempotency_key) {
+      const existing = db.prepare('SELECT id FROM identity_transactions WHERE idempotency_key = ?').get(idempotency_key);
+      if (existing) return { ok: true, balance_after: getDerivedBalance(db, did), idempotent: true };
+    }
+    const newBalance = getDerivedBalance(db, did) - amount_cents; // may go negative — intended
+    db.prepare('INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, idempotency_key, provenance) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(did, -amount_cents, 'clawback_evaporation', description, newBalance, idempotency_key || null, 'clawback');
+    db.prepare('UPDATE identity_wallets SET balance_cents = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newBalance, wallet.id);
+    return { ok: true, balance_after: newBalance };
+  });
   return txn();
 }
 
@@ -244,6 +274,7 @@ module.exports = {
   RATE_TABLE,
   deductBalance,
   creditBalance,
+  evaporate,
   getDerivedBalance,
   syncCachedBalance,
   reconcile,
