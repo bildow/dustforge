@@ -188,6 +188,8 @@ db.pragma('journal_mode = WAL');
 
 // DD provenance ledger — lineage for chargeback clawback, keyed-hash identity.
 try { require('./dd_ledger').initSchema(db); } catch (e) { console.error('dd_ledger schema:', e.message); }
+// Onboarding: single-use prepaid links + lightweight (account-less) referral IDs.
+try { require('./onboarding').initSchema(db); } catch (e) { console.error('onboarding schema:', e.message); }
 
 // Issued-token registry + revocation surface: every JWT minted gets a jti row.
 try { db.exec(`CREATE TABLE IF NOT EXISTS issued_tokens (
@@ -234,7 +236,7 @@ const _jsonParser = express.json();
 const _urlencodedParser = express.urlencoded({ extended: false });
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, next)));
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, next)));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
 // DemiPass public surface — rewrite /api/demipass/* to /api/blindkey/* at the raw URL level
 // This runs before Express route matching so all blindkey endpoints are accessible via both paths.
@@ -1886,23 +1888,34 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           if (!emailResult.ok) { console.error('[stripe-webhook] email failed:', emailResult.error); }
           else {
             const rc = crypto.randomBytes(6).toString('hex');
+            // Referral attribution: an existing account's referral_code, or an invite
+            // hash that maps to an account. A hash with no account = a lightweight
+            // (account-less) sponsor, handled after the grant.
+            const _refToken = pending.referral_code || '';
             let referredBy = '';
-            if (pending.referral_code) { const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(pending.referral_code); if (r) referredBy = r.did; }
+            if (_refToken) {
+              const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(_refToken);
+              referredBy = r ? r.did : (require('./onboarding').resolveInviteToAccount(db, _refToken) || '');
+            }
             db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
             db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe webhook', 0)").run(id.did);
-            // Onboarding grant: $1 buys 100 DD, minus a 10 DD creation fee, so
-            // the new user nets 90 DD (usable immediately, no second charge).
-            // The 10 DD fee is either paid to the referrer (processReferralPayout
-            // below, on a referral) or simply not minted (vaporizes) otherwise.
-            // Idempotent on the Stripe session so a webhook replay can't double-grant.
-            billing.creditBalance(db, id.did, 90, 'onboarding_grant', 'Onboarding: 90 DD ($1 signup, 10 DD creation fee)', 'onboard_' + session.id);
-            try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: 90, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {}
-            // FUNDED referral payout: 10 DD to the referrer ONLY on this $1 conversion,
-            // its lot tied to the SAME funding event so a chargeback claws back both the
-            // 90 DD grant and this 10 DD payout (across any fleet transfers).
+            // Onboarding grant: $1 buys 100 DD. If REFERRED, a 10 DD creation fee goes
+            // to the referrer and the new user nets 90 DD. If NOT referred, the fee is
+            // not taken — the user keeps the full 100 DD. Idempotent on the Stripe
+            // session so a webhook replay can't double-grant.
+            const _grant = referredBy ? 90 : 100;
+            billing.creditBalance(db, id.did, _grant, 'onboarding_grant', `Onboarding: ${_grant} DD ($1 signup)`, 'onboard_' + session.id);
+            try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: _grant, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {}
             if (referredBy) {
+              // FUNDED referral payout to an existing account, tied to this funding event
+              // so a chargeback claws back both the grant and this 10 DD payout.
               const _rp = referral.processReferralPayout(db, referredBy, id.did, pending.username);
               if (_rp && _rp.ok && _rp.credited > 0) { try { require('./dd_ledger').recordCredit(db, { did: referredBy, amount_cents: referral.REFERRAL_PAYOUT_CENTS, source: 'referral_payout', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {} }
+            } else if (_refToken) {
+              // Invite hash with NO account = lightweight sponsor: accrue 10 DD (capped)
+              // against their email hash, tied to THIS funding event for clawback. They
+              // collect it when they mint their own account (POST /api/referral/claim).
+              try { require('./onboarding').recordLightweightReferral(db, _refToken, id.did, session.id); } catch (_) {}
             }
             db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', session.id);
             console.log('[stripe-webhook] fulfilled:', pending.username, '->', id.did);
@@ -4990,16 +5003,24 @@ async function fulfillPrepaidKeys(session) {
   // which mis-recorded every bulk package as $1/key).
   const perKeyCents = session.amount_total ? Math.round(session.amount_total / qty) : 100;
 
-  let keys = [];
+  const ONBOARD_BASE = process.env.ONBOARD_BASE_URL || 'https://demipass.com';
+  const onb = require('./onboarding');
+  let keys = [];    // raw key codes (internal only — never emailed)
+  let links = [];   // single-use onboarding links (what the sponsor receives)
   let generated = false;
   db.transaction(() => {
-    const existing = db.prepare('SELECT key_code FROM prepaid_keys WHERE stripe_session_id = ?').all(session.id);
-    if (existing.length) { keys = existing.map(r => r.key_code); return; }
+    const existing = db.prepare('SELECT k.key_code, l.token FROM prepaid_keys k LEFT JOIN prepaid_links l ON l.key_code = k.key_code WHERE k.stripe_session_id = ?').all(session.id);
+    if (existing.length) {
+      keys = existing.map(r => r.key_code);
+      links = existing.filter(r => r.token).map(r => `${ONBOARD_BASE}/onboard.html?p=${r.token}`);
+      return;
+    }
     const stmt = db.prepare('INSERT INTO prepaid_keys (key_code, sponsor_email, amount_cents, stripe_session_id, tos_accepted) VALUES (?, ?, ?, ?, 1)');
     for (let i = 0; i < qty; i++) {
       const keyCode = 'DF-' + crypto.randomBytes(4).toString('hex').toUpperCase() + '-' + crypto.randomBytes(4).toString('hex').toUpperCase();
       stmt.run(keyCode, meta.sponsor_email, perKeyCents, session.id);
       keys.push(keyCode);
+      try { links.push(`${ONBOARD_BASE}/onboard.html?p=${onb.createPrepaidLink(db, keyCode)}`); } catch (_) {}
     }
     if (qty === 140) {
       const ent = db.prepare('INSERT OR IGNORE INTO prepaid_entitlements (stripe_session_id, sponsor_email, package_code, benefit_code, benefit_description) VALUES (?, ?, ?, ?, ?)');
@@ -5009,38 +5030,49 @@ async function fulfillPrepaidKeys(session) {
     generated = true;
   })();
 
-  // Email only on the call that actually generated. Best-effort: a mail failure
-  // must NOT undo issuance — the keys are already durable and shown on /success.
+  // Email only on the call that actually generated. NO raw keys — single-use
+  // links + MCP onboarding + the sponsor's invite/claim links. Best-effort.
   if (generated) {
+    const inviteH = onb.inviteHash(meta.sponsor_email);
     try {
       const t = createEmailTransport();
       await t.sendMail({
         from: 'keys@dustforge.com',
         to: meta.sponsor_email,
-        subject: `Your Dustforge Prepaid Key${keys.length > 1 ? 's' : ''}`,
+        subject: `Your Dustforge onboarding link${links.length > 1 ? 's' : ''}`,
         text: [
-          `Thank you for purchasing ${keys.length} Dustforge prepaid key${keys.length > 1 ? 's' : ''}.`,
+          `You have ${links.length} Dustforge onboarding link${links.length > 1 ? 's' : ''}.`,
           '',
-          'Your key' + (keys.length > 1 ? 's' : '') + ':',
-          ...keys.map((k, i) => `  ${i + 1}. ${k}`),
+          'Give each link to an AI agent to onboard it with a Dustforge identity (a DID,',
+          'a @dustforge.com mailbox, and a wallet). Each link is SINGLE-USE and opens a',
+          'page that works for both a person and an agent:',
           '',
-          'To redeem: give this key to a silicon agent. They use it at:',
-          'POST https://api.dustforge.com/api/prepaid/redeem',
-          '  {"key_code": "YOUR-KEY", "username": "agent-name", "password": "min-8-chars"}',
+          ...links.map((l, i) => `  ${i + 1}. ${l}`),
           '',
-          'By purchasing this key, you accepted responsibility for the silicon',
-          'agent that redeems it and any actions it takes on the platform.',
+          '— Connect the Dustforge MCP server (for agents) —',
+          '  Add to your MCP config, or run:  npx -y dustforge',
+          '  Tools: dustforge_onboard, dustforge_whoami, dustforge_balance,',
+          '         dustforge_mail_check, dustforge_mail_read, dustforge_mail_send.',
+          '',
+          '— Invite others & earn 10 Diamond Dust —',
+          '  Share your invite link. When someone signs up AND funds their account ($1),',
+          '  you earn 10 Diamond Dust:',
+          `    ${ONBOARD_BASE}/join.html?ref=${inviteH}`,
+          '  When you create your own account, collect what you have earned with:',
+          `    ${ONBOARD_BASE}/signup.html?claim=${inviteH}`,
+          '',
+          'By purchasing, you accepted responsibility for the agents that redeem these links.',
           ...(qty === 140
             ? ['', 'Partnership package entitlement recorded:', '  - WhisperHook beta key reservation (May 2026)', '  - Sightless beta key reservation (May 2026)']
             : []),
           '',
-          '— Dustforge Identity Platform',
+          '— Dustforge, a DemiPass product',
         ].join('\n'),
       });
     } catch (_) {}
-    console.log(`[prepaid] ${keys.length} keys generated for ${meta.sponsor_email} (session ${session.id})`);
+    console.log(`[prepaid] ${links.length} onboarding links generated for ${meta.sponsor_email} (session ${session.id})`);
   }
-  return { ok: true, keys, generated };
+  return { ok: true, keys, links, generated };
 }
 
 app.get('/api/prepaid/success', async (req, res) => {
@@ -5059,26 +5091,26 @@ app.get('/api/prepaid/success', async (req, res) => {
     // Idempotent fulfillment (shared with the Stripe webhook — whichever fires
     // first issues the keys; this just displays them).
     const result = await fulfillPrepaidKeys(session);
-    const keys = result.keys || [];
-    if (!keys.length) {
+    const links = result.links || [];
+    if (!links.length) {
       return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not confirmed</h1></body></html>');
     }
 
-    // Show the keys
-    const keyCards = keys.map(k => `<div style="background:#132131;border:1px solid #27445f;border-radius:8px;padding:1rem;margin:0.5rem 0;font-family:monospace;font-size:1.1rem;text-align:center;color:#c8a84b;letter-spacing:0.1em;user-select:all">${k}</div>`).join('');
+    // Show the single-use onboarding LINKS (never the raw keys).
+    const linkCards = links.map((l, i) => `<div style="background:#132131;border:1px solid #27445f;border-radius:8px;padding:0.75rem 1rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;text-align:left;color:#5fb3ff;word-break:break-all"><a href="${l}" style="color:#5fb3ff;text-decoration:none">${i + 1}. ${l}</a></div>`).join('');
     const entitlementNote = (Number(meta.quantity) || 1) === 140
       ? '<div style="margin-top:1rem;background:#132131;border:1px solid #27445f;border-radius:8px;padding:1rem;color:#9cb4c9"><strong style="color:#69c7b1">Partnership package recorded</strong><br>WhisperHook beta and Sightless beta entitlements have been reserved for ' + meta.sponsor_email + ' for May 2026 release delivery.</div>'
       : '';
 
     res.send(`<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
-<div style="text-align:center;max-width:500px;padding:2rem">
-  <h1 style="color:#69c7b1;font-size:1.8rem">Keys Generated</h1>
-  <p style="color:#9cb4c9">Your prepaid silicon key${keys.length > 1 ? 's' : ''}:</p>
-  ${keyCards}
+<div style="text-align:center;max-width:560px;padding:2rem">
+  <h1 style="color:#69c7b1;font-size:1.8rem">Onboarding link${links.length > 1 ? 's' : ''} ready</h1>
+  <p style="color:#9cb4c9">Give each single-use link to an AI agent (or open it yourself) to create a Dustforge identity:</p>
+  ${linkCards}
   ${entitlementNote}
-  <p style="font-size:0.85rem;color:#6d8397;margin-top:1.5rem">Give this key to a silicon agent to onboard. A copy has been emailed to ${meta.sponsor_email}.</p>
-  <p style="font-size:0.75rem;color:#6d8397;margin-top:1rem">By purchasing, you accepted responsibility for the silicon agent that redeems this key.</p>
+  <p style="font-size:0.85rem;color:#6d8397;margin-top:1.5rem">A copy has been emailed to ${meta.sponsor_email}. Each link is single-use.</p>
+  <p style="font-size:0.75rem;color:#6d8397;margin-top:1rem">By purchasing, you accepted responsibility for the agents that redeem these links.</p>
   <p style="margin-top:1.5rem"><a href="/" style="color:#5fb3ff">Back to Dustforge</a></p>
 </div></body></html>`);
   } catch (e) {
@@ -5088,8 +5120,16 @@ app.get('/api/prepaid/success', async (req, res) => {
 
 // POST /api/prepaid/redeem — silicon redeems a key to create an account
 app.post('/api/prepaid/redeem', rateLimitStrict, async (req, res) => {
-  const { key_code, username, password } = req.body || {};
-  if (!key_code || !username || !password) return res.status(400).json({ error: 'key_code, username, and password required' });
+  let { key_code, username, password, link_token } = req.body || {};
+  // Single-use onboarding link: resolve the token to its key server-side (the raw
+  // key is never exposed to the client); consumed on success below.
+  if (link_token && !key_code) {
+    const lk = require('./onboarding').resolvePrepaidLink(db, link_token);
+    if (!lk) return res.status(404).json({ error: 'invalid link' });
+    if (lk.status !== 'active') return res.status(410).json({ error: 'link already used' });
+    key_code = lk.key_code;
+  }
+  if (!key_code || !username || !password) return res.status(400).json({ error: 'key_code (or link_token), username, and password required' });
   if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'invalid username (3-31 chars, lowercase alphanumeric)' });
   if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
   if (isSoftCapReached()) {
@@ -5121,6 +5161,8 @@ app.post('/api/prepaid/redeem', rateLimitStrict, async (req, res) => {
     // Mark key as redeemed
     db.prepare('UPDATE prepaid_keys SET status = ?, redeemed_by_did = ?, redeemed_at = CURRENT_TIMESTAMP WHERE id = ?')
       .run('redeemed', id.did, key.id);
+    // Consume the single-use link (if this redemption came via one).
+    if (link_token) { try { require('./onboarding').consumePrepaidLink(db, link_token); } catch (_) {} }
 
     // Send welcome email
     try {
@@ -5148,6 +5190,27 @@ app.post('/api/prepaid/redeem', rateLimitStrict, async (req, res) => {
 });
 
 // GET /api/prepaid/check?key=... — check key status
+// GET /api/prepaid/link?token=… — landing page checks a single-use link's state
+// (never returns the raw key).
+app.get('/api/prepaid/link', (req, res) => {
+  const lk = require('./onboarding').resolvePrepaidLink(db, req.query.token || '');
+  if (!lk) return res.status(404).json({ error: 'invalid link' });
+  res.json({ ok: true, status: lk.status, redeemable: lk.status === 'active' });
+});
+
+// POST /api/referral/claim {claim_hash} — an account collects the lightweight
+// referral DD it earned inviting others (deposited one-time). Authed as the claimer.
+app.post('/api/referral/claim', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const { claim_hash } = req.body || {};
+  if (!claim_hash) return res.status(400).json({ error: 'claim_hash required' });
+  try {
+    const deposited = require('./onboarding').depositLightweightReferral(db, claim_hash, auth.did, billing, require('./dd_ledger'));
+    res.json({ ok: true, deposited_cents: deposited });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/prepaid/check', (req, res) => {
   const { key } = req.query;
   if (!key) return res.status(400).json({ error: 'key required' });

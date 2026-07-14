@@ -64,7 +64,7 @@
 const API = 'https://api.dustforge.com';
 function q(id){return document.getElementById(id)}
 async function signup(){
-  const u=q('u').value.trim().toLowerCase(), p=q('p').value, p2=q('p2').value, ref=q('ref').value.trim();
+  const u=q('u').value.trim().toLowerCase(), p=q('p').value, p2=q('p2').value, ref=(q('ref').value.trim()||new URLSearchParams(location.search).get('ref')||'');
   const m=q('msg'), btn=q('go');
   m.className='msg'; m.textContent='';
   if(!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(u)){ m.className='msg err'; m.textContent='Username: 3–31 chars, lowercase letters/digits/dots/dashes.'; return; }
