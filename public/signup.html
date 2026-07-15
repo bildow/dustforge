@@ -73,6 +73,7 @@ async function signup(){
   btn.disabled=true; m.className='msg'; m.textContent='Creating your checkout…';
   try{
     const body={ username:u, password:p }; if(ref) body.referral_code=ref;
+    const claim=new URLSearchParams(location.search).get('claim'); if(claim) body.claim_hash=claim;
     const r=await fetch(API+'/api/stripe/checkout/account',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const d=await r.json().catch(()=>({}));
     if(r.status===409 && d.waiting_list_active){ m.className='msg err'; m.textContent='Signups are paused (waiting list active). Try again soon.'; btn.disabled=false; return; }

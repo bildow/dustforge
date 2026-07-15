@@ -22,23 +22,21 @@ Cards since 2024-02-01 reject per-transaction descriptors, so it MUST be set at 
 account level in the Stripe dashboard. Set it to **`DEMIPASS DUSTFORGE`** (the
 pay-page footers already promise this text). Required for Stripe activation.
 
-### 4. 🔴→🟡 Mail delivery is DEGRADED — prepaid keys deliver unreliably
-**Found 2026-07-15.** Prepaid purchases email the buyer their onboarding links.
-Delivery WORKS but is intermittent: Stalwart on the `prism` container
-intermittently drops the inbound SMTP connection at EHLO (measured **~3/10
-connections fail** in back-to-back probes). Effect: `@dustforge.com` mail
-(including key delivery) queues on racknerd and only drains when Stalwart hits a
-good window; postfix retries, so mail eventually arrives but can sit stuck for
-minutes+. Two test emails were stuck until a postfix restart + a good window.
-- **NOT a Stalwart resource issue** — 171 MB / 32 GB used, up 7 days, no app
-  errors.
-- **Likely cause:** connection drops on the racknerd→phasewhip (Tailscale) path —
-  same signature as the 2026-07-11 TP-Link Archer C7 DoS-filter incident
-  ([[incident-phasewhip-tplink-dos-block-20260711]]). "Connection unexpectedly
-  closed" ≈ a firewall/DoS filter killing ~30% of connections.
-- **Next step:** diagnose the racknerd→phasewhip path (router DoS/SPI filter,
-  tailnet health) and/or add resilience (postfix retry tuning, or a fallback
-  submission path). A launch that emails keys can't rely on a 70%-first-try relay.
+### 4. ✅ RESOLVED — mail delivery under bursts (was: "degraded")
+**Found + FIXED 2026-07-15.** Symptom: prepaid/onboarding emails stuck in the
+racknerd queue. Root cause was NOT the network (TCP + tailnet ping were 100%) —
+it was **Stalwart's default inbound rate limit `queue.limiter.inbound.ip.rate =
+5/1s`**. Because the incus proxy fronts Stalwart, ALL inbound mail arrives as
+`127.0.0.1`, so that per-IP 5/sec cap throttled every inbound connection
+collectively; under a burst (postfix opens up to 20 concurrent) the 6th+/sec was
+dropped → deferred. Single deliveries always worked (spaced EHLO 15/15); bursts
+didn't (rapid EHLO 22/30).
+- **Fix:** raised `inbound.ip.rate` → `500/1s` and `inbound.sender.rate`
+  `25/1h` → `1000/1h` in prism's `config.toml` (`config.toml.bak-pre-ratelimit-
+  20260715`) + full Stalwart restart (a reload only re-reads the DB; a restart
+  re-imports config.toml). Verified: rapid EHLO now **30/30**. The per-IP limit
+  gave no spam protection here anyway (all inbound is loopback-masked); the
+  sender-domain+rcpt limit remains the real anti-flood control.
 
 ## 🟡 Fix before real volume
 
@@ -57,10 +55,10 @@ It's now the public contact on the pay/landing pages. Ensure it's read/forwarded
 
 - **100/90 grant** not integration-tested on a real funded Stripe webhook (logic
   is a one-line branch; the referral/ledger paths around it ARE tested).
-- **Auto-claim on signup** not wired — a sponsor collects lightweight referral DD
-  via the authed `POST /api/referral/claim` after minting, rather than the deposit
-  happening automatically during signup. Wiring the claim hash through Stripe
-  checkout metadata would make it one-step. (See onboarding decision record.)
+- ~~Auto-claim on signup~~ ✅ **DONE 2026-07-15**: `?claim=<hash>` flows
+  signup.html → checkout → `identity_pending_checkouts.claim_hash` → webhook
+  auto-deposits the lightweight referral DD on mint (no separate call). Manual
+  `POST /api/referral/claim` still works as a fallback.
 - **Multi-terminal project mailbox** = spec only
   (`tome/decisions/2026-07-12-spec-multiterminal-project-mailbox.md`).
 - **Roundcube on prism** works but was never login-tested.

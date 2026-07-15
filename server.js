@@ -1696,7 +1696,7 @@ app.get('/api/referral/link', (req, res) => {
 // ============================================================
 
 app.post('/api/stripe/checkout/account', async (req, res) => {
-  const { username, password, referral_code, bulk } = req.body || {};
+  const { username, password, referral_code, claim_hash, bulk } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   if (password.length < 8) return res.status(400).json({ error: 'password must be 8+ chars' });
   const existing = db.prepare('SELECT id FROM identity_wallets WHERE username = ?').get(username);
@@ -1708,8 +1708,8 @@ app.post('/api/stripe/checkout/account', async (req, res) => {
     const checkout = await stripeService.createAccountCheckout({ username, password, referral_code, bulk: Boolean(bulk) });
     // Store password server-side (encrypted), not in Stripe metadata
     const encryptedPw = identity.encryptPrivateKey(Buffer.from(password, 'utf8'));
-    db.prepare('INSERT OR REPLACE INTO identity_pending_checkouts (session_id, username, encrypted_password, referral_code, status) VALUES (?, ?, ?, ?, ?)').run(
-      checkout.session_id, username, encryptedPw, referral_code || '', 'pending'
+    db.prepare('INSERT OR REPLACE INTO identity_pending_checkouts (session_id, username, encrypted_password, referral_code, claim_hash, status) VALUES (?, ?, ?, ?, ?, ?)').run(
+      checkout.session_id, username, encryptedPw, referral_code || '', claim_hash || '', 'pending'
     );
     res.json(checkout);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1916,6 +1916,15 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
               // against their email hash, tied to THIS funding event for clawback. They
               // collect it when they mint their own account (POST /api/referral/claim).
               try { require('./onboarding').recordLightweightReferral(db, _refToken, id.did, session.id); } catch (_) {}
+            }
+            // AUTO-CLAIM: if the minter came through their own claim link
+            // (/signup?claim=…), deposit the lightweight referral DD they earned
+            // inviting others — one-time, on mint, no separate call. (+10 → 110/100.)
+            if (pending.claim_hash) {
+              try {
+                const _dep = require('./onboarding').depositLightweightReferral(db, pending.claim_hash, id.did, billing, require('./dd_ledger'));
+                if (_dep > 0) console.log(`[referral] auto-deposited ${_dep} DD to ${pending.username} on mint`);
+              } catch (_) {}
             }
             db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', session.id);
             console.log('[stripe-webhook] fulfilled:', pending.username, '->', id.did);
@@ -5835,6 +5844,9 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS identity_pending_checkouts (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   completed_at TEXT
 )`); } catch(e) {}
+// claim_hash: the sponsor's invite hash, carried from /signup?claim=… so the
+// webhook deposits the lightweight referral DD they earned, on mint (auto-claim).
+try { db.exec("ALTER TABLE identity_pending_checkouts ADD COLUMN claim_hash TEXT DEFAULT ''"); } catch(e) {}
 
 // GET /api/identity/resonance/methodology — opaque verification
 // SECURITY: signal names, weights, and spoofability ratings are NOT exposed.
