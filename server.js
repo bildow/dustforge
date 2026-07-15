@@ -5097,7 +5097,9 @@ app.get('/api/prepaid/success', async (req, res) => {
     }
 
     // Show the single-use onboarding LINKS (never the raw keys).
-    const linkCards = links.map((l, i) => `<div style="background:#132131;border:1px solid #27445f;border-radius:8px;padding:0.75rem 1rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;text-align:left;color:#5fb3ff;word-break:break-all"><a href="${l}" style="color:#5fb3ff;text-decoration:none">${i + 1}. ${l}</a></div>`).join('');
+    // Click-to-reveal: links are blurred until clicked, so a screen-grab of this
+    // page doesn't capture them. Click reveals + copies; a second click re-hides.
+    const linkCards = links.map((l, i) => `<div style="background:#132131;border:1px solid #27445f;border-radius:8px;padding:0.75rem 1rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;text-align:left;word-break:break-all;cursor:pointer" onclick="rv(this)" data-link="${l.replace(/"/g, '&quot;')}" title="click to reveal / copy"><span style="color:#6d8397">${i + 1}. </span><span class="lk" style="color:#5fb3ff;filter:blur(5px);transition:filter .12s;user-select:none">${l}</span> <span class="rvhint" style="color:#c8a84b;font-size:0.7rem">🔒 click to reveal</span></div>`).join('');
     const entitlementNote = (Number(meta.quantity) || 1) === 140
       ? '<div style="margin-top:1rem;background:#132131;border:1px solid #27445f;border-radius:8px;padding:1rem;color:#9cb4c9"><strong style="color:#69c7b1">Partnership package recorded</strong><br>WhisperHook beta and Sightless beta entitlements have been reserved for ' + meta.sponsor_email + ' for May 2026 release delivery.</div>'
       : '';
@@ -5112,7 +5114,13 @@ app.get('/api/prepaid/success', async (req, res) => {
   <p style="font-size:0.85rem;color:#6d8397;margin-top:1.5rem">A copy has been emailed to ${meta.sponsor_email}. Each link is single-use.</p>
   <p style="font-size:0.75rem;color:#6d8397;margin-top:1rem">By purchasing, you accepted responsibility for the agents that redeem these links.</p>
   <p style="margin-top:1.5rem"><a href="/" style="color:#5fb3ff">Back to Dustforge</a></p>
-</div></body></html>`);
+</div>
+<script>
+function rv(el){var lk=el.querySelector('.lk'),h=el.querySelector('.rvhint');
+if(lk.style.filter==='none'){lk.style.filter='blur(5px)';lk.style.userSelect='none';h.textContent='🔒 click to reveal';}
+else{lk.style.filter='none';lk.style.userSelect='all';try{navigator.clipboard.writeText(el.getAttribute('data-link'));h.textContent='✓ revealed + copied';}catch(e){h.textContent='✓ revealed';}}}
+</script>
+</body></html>`);
   } catch (e) {
     res.status(500).send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Error: ' + e.message + '</h1></body></html>');
   }
