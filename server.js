@@ -1465,13 +1465,20 @@ app.post('/api/billing/topup', (req, res) => {
 });
 
 app.post('/api/email/send', billing.billingMiddleware(db, 'email_send'), async (req, res) => {
-  const { to, subject, body, format = 'text' } = req.body || {};
+  const { to, subject, body, format = 'text', from } = req.body || {};
   if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject, and body required' });
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
     const t = createEmailTransport();
     const senderWallet = db.prepare("SELECT username FROM identity_wallets WHERE did = ?").get(req.identity.did);
-    const fromAddr = senderWallet ? senderWallet.username + "@dustforge.com" : "noreply@dustforge.com";
+    const un = senderWallet ? senderWallet.username : null;
+    let fromAddr = un ? un + "@dustforge.com" : "noreply@dustforge.com";
+    // Optional `from`: only the caller's OWN address or a lane alias of it
+    // (<username>@ or <project>.<username>@dustforge.com). Prevents spoofing others.
+    if (from && un && /^[^@\s]+@dustforge\.com$/.test(from)) {
+      const local = from.slice(0, from.indexOf('@'));
+      if (local === un || local.endsWith('.' + un)) fromAddr = from;
+    }
     const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
     await t.sendMail({ from: fromAddr, to, subject, text: injectedBody });
     console.log("[email] sent: " + fromAddr + " -> " + to);
