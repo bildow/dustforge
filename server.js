@@ -6780,6 +6780,31 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS fleet_members (
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_fm_fleet ON fleet_members(fleet_id)"); } catch(_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_fm_did ON fleet_members(member_did)"); } catch(_) {}
 
+// Fleet board — canonical project→(owner_did, lane, wallet, operators) mapping
+try { db.exec(`CREATE TABLE IF NOT EXISTS fleet_projects (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  fleet_id INTEGER NOT NULL REFERENCES fleets(id),
+  project TEXT NOT NULL,
+  owner_did TEXT NOT NULL,
+  lane_address TEXT NOT NULL,
+  wallet_did TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(fleet_id, project)
+)`); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fp_fleet ON fleet_projects(fleet_id)"); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fp_owner ON fleet_projects(owner_did)"); } catch(_) {}
+
+try { db.exec(`CREATE TABLE IF NOT EXISTS fleet_project_operators (
+  project_id INTEGER NOT NULL REFERENCES fleet_projects(id),
+  operator_did TEXT NOT NULL,
+  added_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(project_id, operator_did)
+)`); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fpo_project ON fleet_project_operators(project_id)"); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fpo_op ON fleet_project_operators(operator_did)"); } catch(_) {}
+
+
 // ── Fleet Endpoints ──
 
 // POST /api/fleet/create — create a new fleet
@@ -7236,6 +7261,108 @@ app.post('/api/fleet/:slug/fund/qr', async (req, res) => {
 });
 
 // ── F5: Fleet Analytics Dashboard ──
+
+
+// GET /api/fleet/:slug/board — canonical project→owner_did/lane/wallet/operators map
+// Auth: bearer token from a fleet member (owner/admin/agent).
+app.get('/api/fleet/:slug/board', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const fleet = db.prepare('SELECT id, slug, name, owner_did FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership) return res.status(403).json({ error: 'fleet membership required' });
+
+  const rows = db.prepare(`SELECT id, project, owner_did, lane_address, wallet_did, created_at, updated_at
+                            FROM fleet_projects WHERE fleet_id = ? ORDER BY project`).all(fleet.id);
+
+  const opsStmt = db.prepare('SELECT operator_did, added_at FROM fleet_project_operators WHERE project_id = ? ORDER BY added_at');
+  const balStmt = db.prepare('SELECT balance_cents, username, email FROM identity_wallets WHERE did = ?');
+
+  const projects = rows.map(r => {
+    const operators = opsStmt.all(r.id);
+    const wallet = balStmt.get(r.wallet_did) || {};
+    const owner = r.owner_did === r.wallet_did ? wallet : (balStmt.get(r.owner_did) || {});
+    return {
+      project: r.project,
+      owner_did: r.owner_did,
+      owner_username: owner.username || null,
+      lane_address: r.lane_address,
+      wallet_did: r.wallet_did,
+      wallet_balance_cents: wallet.balance_cents ?? 0,
+      operator_agents: operators.map(o => o.operator_did),
+      created_at: r.created_at,
+      updated_at: r.updated_at
+    };
+  });
+
+  res.json({
+    ok: true,
+    fleet: { id: Number(fleet.id), slug: fleet.slug, name: fleet.name, owner_did: fleet.owner_did },
+    projects
+  });
+});
+
+// POST /api/fleet/:slug/board/:project/operators — add an operator DID (fleet owner/admin)
+app.post('/api/fleet/:slug/board/:project/operators', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const { operator_did } = req.body || {};
+  if (!operator_did) return res.status(400).json({ error: 'operator_did required' });
+
+  const fleet = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+    return res.status(403).json({ error: 'owner or admin role required' });
+  }
+
+  const project = db.prepare('SELECT id FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(fleet.id, req.params.project);
+  if (!project) return res.status(404).json({ error: 'project not found on this fleet board' });
+
+  try {
+    db.prepare('INSERT OR IGNORE INTO fleet_project_operators (project_id, operator_did) VALUES (?, ?)').run(project.id, operator_did);
+    db.prepare("UPDATE fleet_projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(project.id);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE /api/fleet/:slug/board/:project/operators/:did — remove an operator DID (fleet owner/admin)
+app.delete('/api/fleet/:slug/board/:project/operators/:did', (req, res) => {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Bearer token required' });
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return res.status(401).json({ error: v.error });
+  const caller_did = v.decoded.sub;
+
+  const fleet = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
+  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+    return res.status(403).json({ error: 'owner or admin role required' });
+  }
+  const project = db.prepare('SELECT id FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(fleet.id, req.params.project);
+  if (!project) return res.status(404).json({ error: 'project not found' });
+
+  db.prepare('DELETE FROM fleet_project_operators WHERE project_id = ? AND operator_did = ?').run(project.id, req.params.did);
+  db.prepare("UPDATE fleet_projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(project.id);
+  res.json({ ok: true });
+});
 
 // GET /api/fleet/:slug/analytics — fleet analytics (members only)
 app.get('/api/fleet/:slug/analytics', (req, res) => {
