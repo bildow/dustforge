@@ -28,24 +28,40 @@ function generateKeypair() {
   return { publicKey, privateKey };
 }
 
-function publicKeyToDID(publicKeyDer) {
-  // DID:key format — multicodec ed25519-pub (0xed01) + raw public key
-  // The raw public key is the last 32 bytes of the SPKI DER encoding
+// Multibase-aware DID:key encoding. Default output is z-base58btc — the
+// form every stock did:key resolver accepts. u-base64url is still accepted
+// on input for compatibility with pre-2026-07-17 DIDs. Reencode any DID to
+// a target form losslessly via reencodeDid().
+function publicKeyToDID(publicKeyDer, form = 'z') {
+  // DID:key = multicodec ed25519-pub (0xed01) + raw 32-byte pubkey
   const rawPubKey = publicKeyDer.slice(-32);
   const multicodec = Buffer.concat([Buffer.from([0xed, 0x01]), rawPubKey]);
-  // Use base64url with 'u' multibase prefix (per multibase spec)
-  return `did:key:u${multicodec.toString('base64url')}`;
+  if (form === 'u') return `did:key:u${multicodec.toString('base64url')}`;
+  if (form === 'z') return `did:key:z${base58Encode(multicodec)}`;
+  throw new Error(`unknown DID multibase form: ${form}`);
 }
 
 function didToPublicKey(did) {
-  if (!did.startsWith('did:key:u')) throw new Error('invalid DID:key format');
-  const encoded = did.slice(9); // remove 'did:key:u' (9 chars)
-  const decoded = Buffer.from(encoded, 'base64url');
+  if (!did.startsWith('did:key:')) throw new Error('invalid DID:key format');
+  const prefix = did[8]; // multibase char after 'did:key:'
+  const encoded = did.slice(9);
+  let decoded;
+  if (prefix === 'u') decoded = Buffer.from(encoded, 'base64url');
+  else if (prefix === 'z') decoded = base58Decode(encoded);
+  else throw new Error(`unsupported DID:key multibase prefix: ${prefix}`);
   if (decoded.length < 34 || decoded[0] !== 0xed || decoded[1] !== 0x01) throw new Error('not an ed25519 DID:key');
   const rawPubKey = decoded.slice(2);
-  // Reconstruct SPKI DER for Ed25519
   const spkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
   return Buffer.concat([spkiPrefix, rawPubKey]);
+}
+
+// Reencode a DID:key string to a target multibase form ('z' or 'u') without
+// changing the underlying key. Use before publishing a DID to any surface a
+// third-party resolver may consume (ARD/agent-cards/A2A/ai-catalog). The
+// resulting DID resolves to the same key as the input.
+function reencodeDid(did, form = 'z') {
+  const pkSpki = didToPublicKey(did);
+  return publicKeyToDID(pkSpki, form);
 }
 
 // ── Encryption (private keys at rest) ──
@@ -279,6 +295,7 @@ module.exports = {
   verifyTokenStandalone,
   publicKeyToDID,
   didToPublicKey,
+  reencodeDid,
   encryptPrivateKey,
   decryptPrivateKey,
   // Scope registry — the ONLY place scope names/ranks are defined
