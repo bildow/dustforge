@@ -9,7 +9,7 @@ const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 const FLEET_SLUG = 'aaron-agents';
-const PROJECTS = ['dustforge', 'demipass', 'kodiak', 'brain', '11ov3', 'ops'];
+const PROJECTS = ['dustforge', 'demipass', 'kodiak', 'brain', '11ov3', 'ops', 'bench'];
 const OPERATOR_DID = 'did:key:u7QF8gmIMlzgt6BAdDHUJ5AOpO0RvwtJL_IDhB31eKpZU0A';
 
 const fleet = db.prepare('SELECT id, owner_did FROM fleets WHERE slug = ?').get(FLEET_SLUG);
