@@ -12,6 +12,70 @@
  * Returns 402 Payment Required when balance is insufficient.
  */
 
+// ── Zero-balance notice ───────────────────────────────────────────────────────
+// A 402 is invisible to an agent operator: the call just fails somewhere in a
+// script. 54 of 61 accounts sat at zero balance on 2026-07-30 with nobody
+// aware. This mails the account once per 24h with concrete deposit steps.
+let _zbReady = false;
+function _zbInit(db) {
+  if (_zbReady) return;
+  db.prepare(`CREATE TABLE IF NOT EXISTS zero_balance_notices (
+    did TEXT PRIMARY KEY, last_sent_at TEXT NOT NULL, send_count INTEGER NOT NULL DEFAULT 1
+  )`).run();
+  _zbReady = true;
+}
+
+function maybeNotifyZeroBalance(db, did, actionType, required) {
+  try {
+    _zbInit(db);
+    const prev = db.prepare(`SELECT last_sent_at FROM zero_balance_notices WHERE did = ?`).get(did);
+    if (prev) {
+      const ageMs = Date.now() - new Date(prev.last_sent_at + `Z`).getTime();
+      if (!(ageMs > 24 * 60 * 60 * 1000)) return;   // already told them today
+    }
+    const w = db.prepare(`SELECT username, email, recovery_email FROM identity_wallets WHERE did = ?`).get(did);
+    if (!w) return;
+    const to = w.recovery_email || w.email;
+    if (!to) return;
+
+    const nodemailer = require(`nodemailer`);
+    const t = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || `localhost`,
+      port: Number(process.env.SMTP_PORT || 25),
+      tls: { rejectUnauthorized: false },
+    });
+    const body = [
+      `Your Dustforge account \`${w.username}\` has a zero Diamond Dust balance.`,
+      ``,
+      `A \`${actionType}\` call was refused because it costs ${required} DD and the balance is 0.`,
+      `Calls will keep failing with HTTP 402 until the account is funded.`,
+      ``,
+      `To deposit:`,
+      `  1. Card top-up      https://dustforge.com/prepay.html`,
+      `  2. Transfer from another account you control:`,
+      `     POST https://api.dustforge.com/api/identity/transfer`,
+      `     { "to_username": "${w.username}", "amount_cents": 500 }`,
+      `     (Bearer token, scope: transact)`,
+      ``,
+      `1 Diamond Dust = 1 cent. Email costs 1 DD; most API calls cost less.`,
+      `Check your balance any time: GET https://api.dustforge.com/api/identity/balance`,
+      ``,
+      `You will not get another one of these for 24 hours.`,
+    ].join(`\n`);
+
+    t.sendMail({
+      from: `Dustforge <support@dustforge.com>`,
+      to, subject: `Dustforge: ${w.username} is out of Diamond Dust`, text: body,
+    }).catch(() => {});
+
+    db.prepare(`INSERT INTO zero_balance_notices (did, last_sent_at, send_count)
+                VALUES (?, datetime('now'), 1)
+                ON CONFLICT(did) DO UPDATE SET last_sent_at = datetime('now'),
+                                               send_count = send_count + 1`).run(did);
+  } catch (_) { /* notification must never break the billed call */ }
+}
+
+
 const crypto = require('crypto');
 
 // ── Rate Table (Diamond Dust — 1 DD = 1¢ = $0.01) ──
@@ -252,6 +316,7 @@ function billingMiddleware(db, actionType, options = {}) {
     if (cost > 0) {
       const deduction = deductBalance(db, did, cost, actionType, `API call: ${actionType}`);
       if (!deduction.ok) {
+        maybeNotifyZeroBalance(db, did, actionType, deduction.required || cost);
         return res.status(402).json({
           error: 'payment required',
           detail: deduction.error,

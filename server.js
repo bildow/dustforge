@@ -588,8 +588,13 @@ app.post('/api/identity/create', async (req, res) => {
       if (referrer) referredBy = referrer.did;
     }
 
-    db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)`)
-      .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, referredBy, emailResult.stalwart_id);
+    // Persist password_hash at creation. auth-fingerprint prefers the Stalwart
+    // admin API and only falls back to this column, so an account created
+    // without it cannot authenticate at all whenever Stalwart is unreachable.
+    // 59 of 61 accounts were in that state before 2026-07-30.
+    const pwHashAtCreate = require(crypto).createHash(sha256).update(effectivePassword).digest(hex);
+    db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`)
+      .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, referredBy, emailResult.stalwart_id, pwHashAtCreate);
     db.prepare(`INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Account created', 0)`).run(id.did);
 
     // Mark invite key as fully used (was 'claiming' from atomic grab)
@@ -3591,9 +3596,14 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     try {
       let result;
 
+      // Action params arrived in two different shapes historically: ssh_exec read
+      // req.body directly while http_header/http_body/git_clone read req.body.params.
+      // Callers that guessed wrong got a silent empty-body failure that impersonated
+      // a bad credential. Normalise once here so every case accepts either shape.
+      const action_params = { ...(req.body || {}), ...((req.body || {}).params || {}) };
       switch (action) {
         case 'http_header': {
-          const { method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = req.body.params || {};
+          const { method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params;
           // FIX #4: use ONLY the token's pre-validated URL, never caller override
           const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'params.url or token target_url required for http_header action' });
@@ -3623,7 +3633,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         case 'ssh_exec': {
-          const { command, target_user, key_name } = req.body;
+          const { command, target_user, key_name } = action_params;
           if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
           const effectiveUser = target_user || 'claude';
 
@@ -3679,7 +3689,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'http_body': {
           // Inject secret into the POST body of an HTTP request
-          const { url: bodyUrl, method: bodyMethod = 'POST', body_template, content_type = 'application/json' } = req.body.params || {};
+          const { url: bodyUrl, method: bodyMethod = 'POST', body_template, content_type = 'application/json' } = action_params;
           // FIX #4: use ONLY the token's pre-validated URL, never caller override
           const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'target_url must be set on the use-token for http_body action' });
@@ -3693,8 +3703,12 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
 
           // Replace {{SECRET}} placeholder in body template with the actual value
+          // JSON-escape the secret before splicing it into an already-stringified
+          // template, otherwise a secret containing a quote, backslash or newline
+          // produces invalid JSON and the target sees an empty body.
+          const secretJsonSafe = JSON.stringify(decryptedValue).slice(1, -1);
           const bodyStr = body_template
-            ? JSON.stringify(body_template).replace(/\{\{SECRET\}\}/g, decryptedValue)
+            ? JSON.stringify(body_template).replace(/\{\{SECRET\}\}/g, secretJsonSafe)
             : JSON.stringify({ key: decryptedValue });
 
           const bodyResponse = await fetch(effectiveUrl, {
@@ -3724,7 +3738,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'git_clone': {
           // Clone a private repo using the secret as a token in the URL
-          const { repo_url, branch } = req.body.params || {};
+          const { repo_url, branch } = action_params;
           if (!repo_url) return res.status(400).json({ error: 'params.repo_url required for git_clone action' });
 
           // FIX #1: whitelist git hosts
@@ -3763,7 +3777,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'smtp_auth': {
           // Send an email through an external SMTP server using stored credentials
-          const { smtp_host, smtp_port = 587, to, subject, body: emailBody, from } = req.body.params || {};
+          const { smtp_host, smtp_port = 587, to, subject, body: emailBody, from } = action_params;
           if (!smtp_host || !to || !subject) return res.status(400).json({ error: 'params.smtp_host, to, subject required for smtp_auth action' });
 
           // FIX #1: smtp host must match token's target_host or be whitelisted
@@ -4784,8 +4798,15 @@ async function handleRowenDeliver(req, res) {
       }
 
       case 'http_body': {
-        result = { note: 'http_body action type reserved for future implementation' };
-        break;
+        // Was a success-shaped no-op: callers got HTTP 200 and a note, so a
+        // Rowen agent asking for http_body believed the request had been made
+        // when nothing happened. Fail loudly instead. Use /api/demipass/use,
+        // which implements http_body properly.
+        return res.status(501).json({
+          error: 'http_body is not implemented on the rowen deliver path',
+          detail: 'use POST /api/demipass/use (blindkey/use) for http_body actions',
+          action: 'http_body',
+        });
       }
 
       default:
