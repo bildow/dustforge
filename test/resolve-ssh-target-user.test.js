@@ -42,18 +42,20 @@ void vm; // silence unused-import warning
 
 // ── Case tables ────────────────────────────────────────────────────────────
 
-test('bound secret + no explicit → resolves to bound username, no override', () => {
+test('bound secret + no explicit → resolves to bound username, no override, attribution=bound', () => {
   const r = resolve({ secret: { username: 'flimflam' }, context: null });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.effective_user, 'flimflam');
   assert.strictEqual(r.override, null);
+  assert.strictEqual(r.attribution, 'bound');
 });
 
-test('bound secret + matching explicit → no override event, resolves to explicit', () => {
+test('bound secret + matching explicit → no override event, attribution=bound', () => {
   const r = resolve({ explicit: 'flimflam', secret: { username: 'flimflam' }, context: null });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.effective_user, 'flimflam');
   assert.strictEqual(r.override, null);
+  assert.strictEqual(r.attribution, 'bound');
 });
 
 test('bound secret + different explicit + no reason → HARD ERROR (override required)', () => {
@@ -63,7 +65,7 @@ test('bound secret + different explicit + no reason → HARD ERROR (override req
   assert.match(r.error, /override_reason/);
 });
 
-test('bound secret + different explicit + reason → override event emitted', () => {
+test('bound secret + different explicit + reason → override event emitted, attribution=override', () => {
   const r = resolve({ explicit: 'root', secret: { username: 'flimflam' }, context: null, override_reason: 'need to fix sudoers as root' });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.effective_user, 'root');
@@ -71,13 +73,15 @@ test('bound secret + different explicit + reason → override event emitted', ()
   assert.strictEqual(r.override.bound_username, 'flimflam');
   assert.strictEqual(r.override.explicit, 'root');
   assert.strictEqual(r.override.reason, 'need to fix sudoers as root');
+  assert.strictEqual(r.attribution, 'override');
 });
 
-test('legacy secret (username=\"\") + explicit → resolves to explicit, no override', () => {
+test('legacy secret (username=\"\") + explicit → resolves to explicit, attribution=legacy', () => {
   const r = resolve({ explicit: 'flimflam', secret: { username: '' }, context: null });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.effective_user, 'flimflam');
   assert.strictEqual(r.override, null);
+  assert.strictEqual(r.attribution, 'legacy');
 });
 
 test('legacy secret + no explicit + no context default → HARD ERROR (no claude fallback)', () => {
@@ -88,17 +92,39 @@ test('legacy secret + no explicit + no context default → HARD ERROR (no claude
   assert.notStrictEqual(r.effective_user, 'claude', 'the "claude" fallback must not resurface');
 });
 
-test('legacy secret + no explicit + context default → resolves to context default', () => {
+test('legacy secret + no explicit + context default → resolves to context default, attribution=legacy', () => {
   const r = resolve({ secret: { username: '' }, context: { target_user_default: 'apple' } });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.effective_user, 'apple');
   assert.strictEqual(r.override, null);
+  assert.strictEqual(r.attribution, 'legacy');
 });
 
 test('bound secret shadows context default (bound wins over context fallback)', () => {
   const r = resolve({ secret: { username: 'flimflam' }, context: { target_user_default: 'root' } });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.effective_user, 'flimflam');
+  assert.strictEqual(r.attribution, 'bound');
+});
+
+// Shadow round #2 item 1 (grammar drift): store/set-username/mobile/MCP now all
+// use the same SSH-safe grammar as the resolver ([a-zA-Z0-9._-]). Previously
+// @ and + were accepted at store but rejected by the resolver, producing a
+// hard-error on later use with an "invalid bound username" message that
+// looked like a resolver bug rather than a validation drift. Aligned.
+
+test('SHADOW#1 GRAMMAR: @ in stored username is now rejected at store (aligned with resolver)', () => {
+  // The resolver still shape-rejects @ if it somehow got persisted from a pre-fix DB;
+  // that's the invariant it enforces. This test guards the resolver behavior.
+  const r = resolve({ secret: { username: 'admin@example.com' }, context: null });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /invalid bound username/);
+});
+
+test('SHADOW#1 GRAMMAR: + in stored username is now rejected at store (aligned with resolver)', () => {
+  const r = resolve({ secret: { username: 'user+role' }, context: null });
+  assert.strictEqual(r.ok, false);
+  assert.match(r.error, /invalid bound username/);
 });
 
 test('shape-invalid explicit target_user → HARD ERROR', () => {
@@ -131,4 +157,48 @@ test('TERMINATION: flimflam-sudo bound + no explicit ⇒ effective_user is "flim
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.effective_user, 'flimflam');
   assert.notStrictEqual(r.effective_user, 'claude');
+});
+
+// ── Source-level regressions for Shadow round #2 items 2, 4, 5 ─────────────
+// These grep the server source directly. They can't fail on runtime input, but
+// they catch the specific structural regressions Shadow flagged: accounting
+// happening before resolver validation, dashboard omitting target_user_default,
+// rotate-blind carrying the 'root' fallback outside the resolver.
+
+test('SHADOW#2 ACCOUNTING: no pre-switch use_count bump in /use direct or Rowen paths', () => {
+  // In BOTH the /use direct-path (~4055 area, was `// Update usage stats` before
+  // `// Execute the action`) and the Rowen deliver path (~4881 area), the
+  // UPDATE blindkey_secrets SET use_count must NOT appear between decryptedValue
+  // being computed and the switch statement. Enforce structurally.
+  const patterns = [
+    // /use direct: was between the decrypt catch and `try { let result; switch`
+    /decryptedValue = blindkeyDecrypt\(secret\.encrypted_value\);\s*\}\s*catch \(e\) \{\s*return[^}]*\}\s*\n\s*(?:\/\/[^\n]*\n\s*)*db\.prepare\('UPDATE blindkey_secrets SET use_count/,
+    // Rowen: same structural signature
+    /decryptedValue = blindkeyDecrypt\(secret\.encrypted_value\);\s*\}\s*catch \(e\) \{\s*return[^}]*\}\s*\n\s*(?:\/\/[^\n]*\n\s*)*db\.prepare\('UPDATE blindkey_secrets SET use_count/,
+  ];
+  for (const p of patterns) {
+    assert.ok(!p.test(src), `pre-switch use_count bump reintroduced — Shadow #2 item 2 regression: ${p}`);
+  }
+});
+
+test('SHADOW#2 DASHBOARD: /api/blindkey/dashboard context_list SELECT includes target_user_default', () => {
+  const dashboardCtxQuery = /SELECT context_name, action_type, target_host_pattern[^"]*target_user_default[^"]*FROM blindkey_contexts WHERE secret_id = \? AND status = 'active'/;
+  assert.match(src, dashboardCtxQuery, 'dashboard context_list must expose target_user_default');
+});
+
+test('SHADOW#2 ROTATE-BLIND: /rotate-blind routes through resolveSshTargetUser, no root fallback', () => {
+  // Locate the rotate-blind handler and verify it invokes the resolver rather
+  // than the old `target_user || 'root'` shortcut. Grep is coarse but the two
+  // signatures cannot coexist for this fix to be correct.
+  const rotBlindStart = src.indexOf("app.post('/api/blindkey/rotate-blind'");
+  assert.ok(rotBlindStart > 0, 'rotate-blind endpoint must exist');
+  // Bound rotate-blind body to the next app.post (roughly)
+  const rotBlindEnd = src.indexOf("app.post('", rotBlindStart + 1);
+  const body = src.slice(rotBlindStart, rotBlindEnd > 0 ? rotBlindEnd : rotBlindStart + 8000);
+  assert.doesNotMatch(body, /target_user \|\| 'root'/, "rotate-blind still has the 'root' fallback — Shadow #2 item 5");
+  assert.match(body, /resolveSshTargetUser\(/, 'rotate-blind must call the resolver');
+});
+
+test('SHADOW#2 ATTRIBUTION: secret_outcomes ALTER TABLE adds attribution column', () => {
+  assert.match(src, /ALTER TABLE secret_outcomes ADD COLUMN attribution/, 'attribution column ALTER missing');
 });

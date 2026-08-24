@@ -1069,16 +1069,19 @@ async function setDepth(name, depth){
   } catch(e){ alert('Could not set depth: '+e.message); }
 }
 
-// Account binding (2026-08-24): set/edit the username the secret targets.
-// Free edit — does NOT rotate the secret value. Empty string clears the binding.
+// Account binding (2026-08-24, grammar narrowed post-Shadow): set/edit the username
+// the secret targets. Free edit — does NOT rotate the secret value. Empty clears.
+// Canonical grammar is SSH-safe: [a-zA-Z0-9._-]. Email-style logins (imap, etc.)
+// go via http_header and don't need a bound username here — leave empty and put
+// the address in description.
 async function editUsername(name){
   const s = secrets.find(x => x.name === name);
   const current = (s && s.username) || '';
-  const next = prompt('Account / username for this credential\n(letters, digits, and . _ @ + - only; leave empty to clear binding):', current);
+  const next = prompt('Account / username for this credential\n(letters, digits, and . _ - only; leave empty to clear binding):', current);
   if (next === null) return; // cancelled
   const trimmed = next.trim();
-  if (trimmed !== '' && !/^[a-zA-Z0-9._@+-]+$/.test(trimmed)) {
-    alert('Invalid characters. Allowed: letters, digits, and . _ @ + -');
+  if (trimmed !== '' && !/^[a-zA-Z0-9._-]+$/.test(trimmed)) {
+    alert('Invalid characters. Allowed: letters, digits, and . _ - (SSH-safe grammar)');
     return;
   }
   try {
