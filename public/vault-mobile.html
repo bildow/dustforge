@@ -704,6 +704,13 @@ function showDetail(name) {
   // Info grid
   h += `<div style="background:var(--card);border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.8rem">`;
   h += `<div style="color:var(--text3)">Ref Code</div><div style="font-family:monospace;font-size:0.7rem;margin-bottom:0.5rem;color:var(--accent)">${esc(s.ref||'none')}</div>`;
+  // Account binding (2026-08-24): first-class field, edit does not rotate value.
+  // Empty username on password/ssh_key = legacy row that hasn't been bound; surface a soft nudge.
+  const boundLabel = s.username_bound ? esc(s.username) : (s.type==='password'||s.type==='ssh_key' ? '<span style="color:var(--yellow)">not bound</span>' : '<span style="color:var(--text3)">—</span>');
+  h += `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">`;
+  h += `<div><span style="color:var(--text3)">Account:</span> ${boundLabel}</div>`;
+  h += `<button onclick="editUsername('${esc(s.name)}')" style="font-size:0.65rem;background:none;border:1px solid var(--border);border-radius:6px;padding:0.2rem 0.5rem;color:var(--text2);cursor:pointer">${s.username_bound?'edit':'set'}</button>`;
+  h += `</div>`;
   if(s.description) h += `<div style="color:var(--text2);margin-bottom:0.5rem;font-size:0.85rem">${esc(s.description)}</div>`;
   h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem">`;
   h += `<div><span style="color:var(--text3)">Type:</span> ${esc(s.type)}</div>`;
@@ -958,10 +965,12 @@ async function storeSecret(){
 
   if(!n||!v){m.textContent='Name and value required';m.className='modal-msg err';return}
 
-  // Build description from username + host
+  // Description = optional free text describing what this secret is for.
+  // Username is a first-class field now (2026-08-24 account-binding invariant); do not
+  // fold it into description. Host stays in description as a human hint until it too
+  // becomes a first-class field.
   let desc = '';
-  if (username) desc += username;
-  if (host) desc += (desc ? ' @ ' : '') + host;
+  if (host) desc = host;
 
   const cat = document.getElementById('s-category').value;
   const labelsRaw = document.getElementById('s-labels').value.trim();
@@ -971,6 +980,7 @@ async function storeSecret(){
   const body = { name: n, value: v, secret_type: t };
   if (exp) body.expires_in = exp;
   if (desc) body.description = desc;
+  if (username) body.username = username; // account-binding: sent as top-level, not smashed into desc
   if (cat) body.category = cat;
   if (labelsRaw) body.labels = labelsRaw.split(',').map(x => x.trim()).filter(Boolean).slice(0, 10);
   if (rotDays >= 1) body.rotation_interval_days = rotDays;
@@ -1057,6 +1067,25 @@ async function setDepth(name, depth){
     await api('POST','/api/demipass/gate-policy',{name,security_depth:depth});
     showDetail(name);
   } catch(e){ alert('Could not set depth: '+e.message); }
+}
+
+// Account binding (2026-08-24): set/edit the username the secret targets.
+// Free edit — does NOT rotate the secret value. Empty string clears the binding.
+async function editUsername(name){
+  const s = secrets.find(x => x.name === name);
+  const current = (s && s.username) || '';
+  const next = prompt('Account / username for this credential\n(letters, digits, and . _ @ + - only; leave empty to clear binding):', current);
+  if (next === null) return; // cancelled
+  const trimmed = next.trim();
+  if (trimmed !== '' && !/^[a-zA-Z0-9._@+-]+$/.test(trimmed)) {
+    alert('Invalid characters. Allowed: letters, digits, and . _ @ + -');
+    return;
+  }
+  try {
+    await api('POST','/api/blindkey/set-username',{ name, username: trimmed });
+    await loadVault();
+    showDetail(name);
+  } catch(e){ alert('Could not update account: '+e.message); }
 }
 
 async function revealSecret(name) {
