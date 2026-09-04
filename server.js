@@ -34,7 +34,7 @@ const INNER_RING_CONFIG = {
 
 // DemiPass SSH host whitelist — only these hosts can be targeted via ssh_exec
 // Consolidated host whitelists — single source of truth for all DemiPass action types
-const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com', 'flowhook.dustforge.com', 'api.dustforge.com'];
+const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com', 'flowhook.dustforge.com', 'api.dustforge.com', 'api.resend.com', 'api.cloudflare.com'];
 const BLINDKEY_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
 const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
@@ -2548,12 +2548,13 @@ function blindkeyPatternMatch(pattern, value) {
 // Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
 function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   const insertCtx = db.prepare(`
-    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, target_user_default, allowed_by, max_uses)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(secret_id, context_name) DO UPDATE SET
       action_type = excluded.action_type,
       target_url_pattern = excluded.target_url_pattern,
       target_host_pattern = excluded.target_host_pattern,
+      target_user_default = excluded.target_user_default,
       allowed_by = excluded.allowed_by,
       max_uses = excluded.max_uses
   `);
@@ -2568,6 +2569,7 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       ctx.action_type,
       ctx.target_url_pattern || '*',
       ctx.target_host_pattern || '*',
+      typeof ctx.target_user_default === 'string' ? ctx.target_user_default : '',
       allowedBy,
       ctx.max_uses || 0
     );
@@ -2575,6 +2577,60 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   }
   return created;
 }
+
+// Account-binding resolution (2026-08-24, single gate for ssh_exec target_user).
+// Predicate: explicit → secret.username → context.target_user_default → HARD ERROR.
+// Legacy rows (secret.username === '') accept any explicit target_user without override event.
+// Bound rows (secret.username !== '') require explicit === secret.username OR override_reason present.
+// See tome/handoffs/2026-08-24-design-note-demipass-account-binding-invariant.md §3.
+function resolveSshTargetUser({ explicit, secret, context, override_reason }) {
+  const bound = secret && typeof secret.username === 'string' && secret.username !== '';
+  const explicitStr = (typeof explicit === 'string' && explicit.trim() !== '') ? explicit.trim() : '';
+  const ctxDefault = context && typeof context.target_user_default === 'string' && context.target_user_default !== ''
+    ? context.target_user_default : '';
+
+  // Validate shape once, wherever the value comes from
+  const shapeOk = (u) => /^[a-zA-Z0-9._-]+$/.test(u);
+
+  if (explicitStr) {
+    if (!shapeOk(explicitStr)) return { ok: false, status: 400, error: 'invalid target_user' };
+    if (bound && explicitStr !== secret.username) {
+      const reason = (typeof override_reason === 'string' && override_reason.trim() !== '') ? override_reason.trim() : '';
+      if (!reason) {
+        return {
+          ok: false, status: 400,
+          error: 'target_user override requires override_reason',
+          detail: `secret is bound to account "${secret.username}"; explicit target_user "${explicitStr}" differs. Pass params.override_reason (≤128 chars) to proceed.`,
+        };
+      }
+      if (reason.length > 128 || !/^[\w .,:;/@'"()!?-]+$/.test(reason)) {
+        return { ok: false, status: 400, error: 'override_reason: max 128 chars, printable ASCII' };
+      }
+      return { ok: true, effective_user: explicitStr, attribution: 'override', override: { bound_username: secret.username, explicit: explicitStr, reason } };
+    }
+    // Explicit-and-bound-and-matching = bound; explicit-and-legacy = legacy
+    return { ok: true, effective_user: explicitStr, attribution: bound ? 'bound' : 'legacy', override: null };
+  }
+
+  if (bound) {
+    if (!shapeOk(secret.username)) return { ok: false, status: 400, error: 'invalid bound username on secret' };
+    return { ok: true, effective_user: secret.username, attribution: 'bound', override: null };
+  }
+
+  if (ctxDefault) {
+    if (!shapeOk(ctxDefault)) return { ok: false, status: 400, error: 'invalid target_user_default on context' };
+    return { ok: true, effective_user: ctxDefault, attribution: 'legacy', override: null };
+  }
+
+  return {
+    ok: false, status: 400,
+    error: 'target_user unresolved',
+    detail: 'no explicit target_user, no secret.username, no context.target_user_default. This secret is not account-bound; call /api/blindkey/set-username or pass an explicit target_user.',
+  };
+}
+// TEST HOOK: expose the resolver for verification without an HTTP round-trip.
+// Attached to module.exports if this file is required rather than run directly.
+try { if (typeof module !== 'undefined' && module.exports) { module.exports.resolveSshTargetUser = resolveSshTargetUser; } } catch(_) {}
 
 // Enforce context rules on a blindkey/use request. Returns { allowed, error }
 function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost) {
@@ -2705,11 +2761,29 @@ function authorizeSecretMediation({ requestorDid, secretName, contextName, actio
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
-  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days } = req.body || {};
+  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days, username } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
   if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
   if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
   if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
+
+  // Account binding (2026-08-24, grammar narrowed 2026-08-24 after Shadow round #2):
+  // canonical grammar is [a-zA-Z0-9._-] — the same charset resolveSshTargetUser accepts.
+  // @ and + previously slipped through here, then the resolver would hard-error the
+  // stored value at use time as 'invalid bound username on secret'. Aligning both.
+  // For email-style accounts (e.g. IMAP), the credential is used via http_header, not
+  // ssh_exec, and doesn't hit the resolver — leave username empty and put the full
+  // address in description. Empty string = legacy/unbound.
+  let resolvedUsername = null; // null = don't touch existing value on upsert
+  if (username !== undefined && username !== null) {
+    if (typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
+    const u = username.trim();
+    if (u.length > 128) return res.status(400).json({ error: 'username: max 128 characters' });
+    if (u !== '' && !/^[a-zA-Z0-9._-]+$/.test(u)) {
+      return res.status(400).json({ error: 'username: letters, digits, and . _ - only (SSH-safe; empty allowed to clear binding)' });
+    }
+    resolvedUsername = u;
+  }
 
   // Metadata standardization — category/labels are stored data, never guessed.
   // Suggested categories: infrastructure, platform, agents, services, personal, evidence, test, other.
@@ -2792,8 +2866,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     const resolvedRotatable = rotatable === false || rotatable === 0 ? 0 : 1;
 
     db.prepare(`
-      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days, username)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(did, name) DO UPDATE SET
         encrypted_value = excluded.encrypted_value,
         description = excluded.description,
@@ -2805,8 +2879,9 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
         category = COALESCE(excluded.category, blindkey_secrets.category),
         labels = COALESCE(excluded.labels, blindkey_secrets.labels),
         rotation_interval_days = COALESCE(excluded.rotation_interval_days, blindkey_secrets.rotation_interval_days),
+        username = COALESCE(excluded.username, blindkey_secrets.username),
         updated_at = CURRENT_TIMESTAMP
-    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable, resolvedCategory, resolvedLabels, resolvedRotationInterval);
+    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable, resolvedCategory, resolvedLabels, resolvedRotationInterval, resolvedUsername);
 
     // Generate and store ref_code if not already set
     const stored = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?").get(req.identity.did, name);
@@ -2836,16 +2911,57 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       db.prepare("UPDATE blindkey_secrets SET buoy_ingested_tick = ? WHERE id = ?").run(buoyTickId, stored.id);
     } catch(_) {}
 
+    // Report the *effective* username after upsert (may differ from resolvedUsername if COALESCE preserved an existing value).
+    const effectiveUsername = db.prepare("SELECT username FROM blindkey_secrets WHERE id = ?").get(stored.id)?.username || '';
     res.json({
       ok: true, name, ref: refCode, secret_type: resolvedType, description: description || '',
       provider: providerInfo.provider || null,
       expires_at: expiresAt,
       buoy_tick: buoyTickId,
+      username: effectiveUsername,
       note: 'Secret stored. It will never be returned in any API response.',
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// POST /api/blindkey/set-username — update the account binding on a secret without rotating its value.
+// (2026-08-24, per tome/handoffs/2026-08-24-design-note-demipass-account-binding-invariant.md §4.)
+// Idempotent. Owner-only. Emits a `username_changed` audit event so the dashboard health
+// metric can factor it. Does NOT trigger rotation grace periods — the secret value is untouched.
+app.post('/api/blindkey/set-username', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  if (actor.mode === 'admin') return res.status(400).json({ error: 'admin mode not permitted for set-username; call as the owner' });
+
+  const { ref, name, username } = req.body || {};
+  if (!ref && !name) return res.status(400).json({ error: 'ref or name required' });
+  if (typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string (empty string clears binding)' });
+  const u = username.trim();
+  if (u.length > 128) return res.status(400).json({ error: 'username: max 128 characters' });
+  if (u !== '' && !/^[a-zA-Z0-9._-]+$/.test(u)) {
+    return res.status(400).json({ error: 'username: letters, digits, and . _ - only (SSH-safe; empty allowed to clear binding)' });
+  }
+
+  const secret = ref
+    ? db.prepare('SELECT id, name, username FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status IN (?, ?)').get(actor.did, ref, 'active', 'rotating')
+    : db.prepare('SELECT id, name, username FROM blindkey_secrets WHERE did = ? AND name = ? AND status IN (?, ?)').get(actor.did, name, 'active', 'rotating');
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  const previous = secret.username || '';
+  if (previous === u) {
+    return res.json({ ok: true, name: secret.name, username: u, changed: false, note: 'no-op: username already set to this value' });
+  }
+
+  db.prepare('UPDATE blindkey_secrets SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(u, secret.id);
+
+  try {
+    db.prepare("INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES ('username_changed', ?, ?, '', ?)")
+      .run(actor.did, secret.id, JSON.stringify({ previous, current: u }));
+  } catch(_) {}
+
+  res.json({ ok: true, name: secret.name, username: u, changed: true, previous });
 });
 
 // POST /api/blindkey/reveal — reveal a secret value (owner only, requires fingerprint re-auth)
@@ -2932,7 +3048,8 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
 
   const secrets = db.prepare(
     `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick,
-            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels, last_rotated_at, rotation_interval_days
+            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels, last_rotated_at, rotation_interval_days,
+            COALESCE(username, '') AS username
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
   ).all(ownerDid, 'active');
 
@@ -3601,6 +3718,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       // Callers that guessed wrong got a silent empty-body failure that impersonated
       // a bad credential. Normalise once here so every case accepts either shape.
       const action_params = { ...(req.body || {}), ...((req.body || {}).params || {}) };
+      // Attribution defaults to 'bound' for non-ssh actions; ssh_exec overwrites
+      // from resolveSshTargetUser (bound / legacy / override). See secret_outcomes
+      // ALTER TABLE + design note addendum (2026-08-24 Shadow round #2 item 6).
+      let actionAttribution = 'bound';
       switch (action) {
         case 'http_header': {
           const { method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params;
@@ -3633,9 +3754,25 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         case 'ssh_exec': {
-          const { command, target_user, key_name } = action_params;
+          const { command, target_user, key_name, override_reason } = action_params;
           if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
-          const effectiveUser = target_user || 'claude';
+
+          // Account binding (2026-08-24): single resolver replaces the old `|| 'claude'` fallback.
+          // Order: explicit target_user → secret.username → context.target_user_default → hard error.
+          let contextRow = null;
+          if (tokenRow && tokenRow.context_id) {
+            try { contextRow = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(tokenRow.context_id); } catch(_) {}
+          }
+          const resolution = resolveSshTargetUser({ explicit: target_user, secret, context: contextRow, override_reason });
+          if (!resolution.ok) return res.status(resolution.status || 400).json({ error: resolution.error, detail: resolution.detail });
+          const effectiveUser = resolution.effective_user;
+          actionAttribution = resolution.attribution || 'bound';
+          if (resolution.override) {
+            try {
+              db.prepare("INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES ('ssh_exec_account_override', ?, ?, ?, ?)")
+                .run(req.identity?.did || '', secret.id, contextRow?.context_name || '', JSON.stringify({ ...resolution.override, target_host, ip: req.ip }));
+            } catch(_) {}
+          }
 
           if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
             logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: 'host not in SSH whitelist', ip: req.ip });
@@ -3649,9 +3786,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           if (!/^[a-zA-Z0-9\s\/_\-.:=,@+*?[\]{}()#<>|&;'"%!\\\n]+$/.test(command)) {
             return res.status(400).json({ error: 'command contains disallowed characters' });
           }
-          if (!/^[a-zA-Z0-9._-]+$/.test(effectiveUser)) {
-            return res.status(400).json({ error: 'invalid target_user' });
-          }
+          // shape of effectiveUser already validated inside resolveSshTargetUser
 
           let password = decryptedValue;
           if (key_name) {
@@ -3861,10 +3996,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       // Track outcome for dashboard health
       const isSuccess = !result?.exit_code && !result?.error;
       try {
-        db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
+        db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name, attribution) VALUES (?, ?, ?, ?, ?, ?, ?)')
           .run(secret.id, req.identity.did, action, isSuccess ? 'success' : 'failure',
             isSuccess ? '' : (result?.stderr || result?.error || '').slice(0, 200),
-            req.identity?.agent_name || '');
+            req.identity?.agent_name || '', actionAttribution);
       } catch(_) {}
 
       // Layer A: log use-token execution as behavioral surface
@@ -3928,17 +4063,13 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     return res.status(500).json({ error: 'failed to decrypt secret' });
   }
 
-  // Update usage stats
-  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
-
-  // Increment context use_count if a context was used
-  if (ctxCheck.context_id) {
-    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
-  }
-
-  // Execute the action with the secret injected
+  // Execute the action with the secret injected. Usage accounting is deferred until
+  // AFTER the switch completes successfully — matches use-token semantics and
+  // prevents hard-error paths (e.g. unresolved target_user in ssh_exec) from
+  // inflating use_count / last_used_at. (2026-08-24 Shadow round #2 item 2.)
   try {
     let result;
+    let actionAttribution = 'bound'; // ssh_exec overwrites from resolver (Shadow #2 item 6)
 
     switch (action) {
       case 'http_header': {
@@ -4003,9 +4134,26 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       case 'ssh_exec': {
         // SSH into a whitelisted host using stored credentials and run a command
         // The credentials NEVER appear in the response
-        const { target_host, target_user, command, key_name } = req.body;
-        if (!target_host || !target_user || !command) {
-          return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
+        const { target_host, target_user, command, key_name, override_reason } = req.body;
+        if (!target_host || !command) {
+          return res.status(400).json({ error: 'target_host and command required for ssh_exec' });
+        }
+
+        // Account binding (2026-08-24): single resolver replaces the old requirement
+        // that target_user always be explicit. Same order as the use-token path.
+        let contextRow_direct = null;
+        if (ctxCheck.context_id) {
+          try { contextRow_direct = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(ctxCheck.context_id); } catch(_) {}
+        }
+        const resolution_direct = resolveSshTargetUser({ explicit: target_user, secret, context: contextRow_direct, override_reason });
+        if (!resolution_direct.ok) return res.status(resolution_direct.status || 400).json({ error: resolution_direct.error, detail: resolution_direct.detail });
+        const effectiveUser_direct = resolution_direct.effective_user;
+        actionAttribution = resolution_direct.attribution || 'bound';
+        if (resolution_direct.override) {
+          try {
+            db.prepare("INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES ('ssh_exec_account_override', ?, ?, ?, ?)")
+              .run(req.identity?.did || '', secret.id, contextRow_direct?.context_name || '', JSON.stringify({ ...resolution_direct.override, target_host, ip: req.ip, path: 'direct' }));
+          } catch(_) {}
         }
 
         // Host whitelist check
@@ -4051,15 +4199,12 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
         }
 
-        // Sanitize user and host to prevent injection in the ssh command itself
-        if (!/^[a-zA-Z0-9._-]+$/.test(target_user)) {
-          return res.status(400).json({ error: 'invalid target_user' });
-        }
+        // effectiveUser_direct already shape-validated inside resolveSshTargetUser
 
         try {
           // SECURITY: pass password via SSHPASS env var, never on command line
           const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser_direct}@${target_host} '${escapedCommand}'`;
           const output = execSync(sshCmd, {
             timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
             env: { ...process.env, SSHPASS: password },
@@ -4086,6 +4231,23 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       default:
         return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, sign, verify_match, inject_env, ssh_exec` });
     }
+
+    // POST-success accounting (2026-08-24 Shadow #2 item 2): action completed
+    // without throwing and without an early-return error. Bump usage stats now.
+    db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+    if (ctxCheck.context_id) {
+      db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
+    }
+
+    // Track outcome for dashboard health (Shadow #2 item 6: attribution column
+    // records whether the action ran as bound / legacy / override).
+    try {
+      const isSuccess = !result?.exit_code && !result?.error;
+      db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name, attribution) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(secret.id, req.identity?.did || '', action, isSuccess ? 'success' : 'failure',
+          isSuccess ? '' : (result?.stderr || result?.error || '').slice(0, 200),
+          req.identity?.agent_name || '', actionAttribution);
+    } catch(_) {}
 
     res.json({ ok: true, action, secret_name: name, result });
   } catch (e) {
@@ -4378,7 +4540,18 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
 // POST /api/blindkey/context/add — add a context to an existing secret
 // Requires admin auth OR Bearer token from the secret owner
 app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
-  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, target_host, target_url, max_uses } = req.body || {};
+  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, target_host, target_url, max_uses, target_user_default } = req.body || {};
+  // Account binding on the context (2026-08-24): fallback when the secret carries no username.
+  let resolvedTargetUserDefault = '';
+  if (target_user_default !== undefined && target_user_default !== null) {
+    if (typeof target_user_default !== 'string') return res.status(400).json({ error: 'target_user_default: must be a string' });
+    const t = target_user_default.trim();
+    if (t.length > 128) return res.status(400).json({ error: 'target_user_default: max 128 characters' });
+    if (t !== '' && !/^[a-zA-Z0-9._-]+$/.test(t)) {
+      return res.status(400).json({ error: 'target_user_default: letters, digits, and . _ - only (empty allowed)' });
+    }
+    resolvedTargetUserDefault = t;
+  }
   if (!secret_name || !context_name || !action_type) {
     return res.status(400).json({ error: 'secret_name, context_name, and action_type required' });
   }
@@ -4416,13 +4589,14 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
       action_type,
       target_url_pattern: target_url_pattern || target_url || '*',
       target_host_pattern: target_host_pattern || target_host || '*',
+      target_user_default: resolvedTargetUserDefault,
       max_uses: max_uses || 0,
     }], isAdmin ? 'admin' : 'owner');
 
     if (created === 0) return res.status(400).json({ error: 'failed to create context' });
 
     const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, context_name);
-    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, max_uses: ctx.max_uses, status: ctx.status } });
+    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, target_user_default: ctx.target_user_default || '', max_uses: ctx.max_uses, status: ctx.status } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4452,6 +4626,7 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     action_type: req.body?.action_type ?? row.action_type,
     target_url_pattern: req.body?.target_url_pattern ?? row.target_url_pattern,
     target_host_pattern: req.body?.target_host_pattern ?? row.target_host_pattern,
+    target_user_default: req.body?.target_user_default ?? row.target_user_default ?? '',
     max_uses: req.body?.max_uses ?? row.max_uses,
     status: req.body?.status ?? row.status,
   };
@@ -4463,12 +4638,21 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
   if (!['active', 'revoked', 'pending'].includes(next.status)) {
     return res.status(400).json({ error: 'status must be active, revoked, or pending' });
   }
+  if (typeof next.target_user_default !== 'string') {
+    return res.status(400).json({ error: 'target_user_default: must be a string' });
+  }
+  const tud = next.target_user_default.trim();
+  if (tud.length > 128) return res.status(400).json({ error: 'target_user_default: max 128 characters' });
+  if (tud !== '' && !/^[a-zA-Z0-9._-]+$/.test(tud)) {
+    return res.status(400).json({ error: 'target_user_default: letters, digits, and . _ - only (empty allowed)' });
+  }
+  next.target_user_default = tud;
 
   db.prepare(`
     UPDATE blindkey_contexts
-    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?
+    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, target_user_default = ?, max_uses = ?, status = ?
     WHERE id = ?
-  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status, contextId);
+  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', next.target_user_default, Number(next.max_uses) || 0, next.status, contextId);
 
   const updated = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(contextId);
   res.json({ ok: true, context: updated });
@@ -4529,7 +4713,7 @@ app.get('/api/blindkey/contexts', rateLimitStandard, (req, res) => {
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
   const contexts = db.prepare(
-    'SELECT id, context_name, action_type, target_url_pattern, target_host_pattern, status, max_uses, use_count, created_at FROM blindkey_contexts WHERE secret_id = ?'
+    "SELECT id, context_name, action_type, target_url_pattern, target_host_pattern, COALESCE(target_user_default, '') AS target_user_default, status, max_uses, use_count, created_at FROM blindkey_contexts WHERE secret_id = ?"
   ).all(secret.id);
 
   res.json({ secret_name, contexts, total: contexts.length });
@@ -4714,15 +4898,13 @@ async function handleRowenDeliver(req, res) {
     return res.status(500).json({ error: 'failed to decrypt secret' });
   }
 
-  // Update usage stats
-  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
-  if (ctxCheck.context_id) {
-    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
-  }
-
-  // Execute the action — delegates to the same logic as blindkey/use
+  // Execute the action — delegates to the same logic as blindkey/use.
+  // Usage accounting is deferred until AFTER the switch succeeds — matches the
+  // /use direct-path and use-token semantics; prevents hard-error paths from
+  // inflating use_count / last_used_at. (2026-08-24 Shadow round #2 item 2.)
   try {
     let result;
+    let actionAttribution = 'bound'; // ssh_exec overwrites from resolver (Shadow #2 item 6)
 
     switch (action) {
       case 'http_header': {
@@ -4760,10 +4942,27 @@ async function handleRowenDeliver(req, res) {
       }
 
       case 'ssh_exec': {
-        const { target_host, target_user, command } = action_params || {};
-        if (!target_host || !target_user || !command) {
-          return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
+        const { target_host, target_user, command, override_reason } = action_params || {};
+        if (!target_host || !command) {
+          return res.status(400).json({ error: 'target_host and command required for ssh_exec' });
         }
+
+        // Account binding (2026-08-24): same resolver as /use paths.
+        let contextRow_rowen = null;
+        if (ctxCheck.context_id) {
+          try { contextRow_rowen = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(ctxCheck.context_id); } catch(_) {}
+        }
+        const resolution_rowen = resolveSshTargetUser({ explicit: target_user, secret, context: contextRow_rowen, override_reason });
+        if (!resolution_rowen.ok) return res.status(resolution_rowen.status || 400).json({ error: resolution_rowen.error, detail: resolution_rowen.detail });
+        const effectiveUser_rowen = resolution_rowen.effective_user;
+        actionAttribution = resolution_rowen.attribution || 'bound';
+        if (resolution_rowen.override) {
+          try {
+            db.prepare("INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES ('ssh_exec_account_override', ?, ?, ?, ?)")
+              .run(`${mediator.actor}:${requestor_did}`, secret.id, contextRow_rowen?.context_name || '', JSON.stringify({ ...resolution_rowen.override, target_host, ip: req.ip, path: 'rowen' }));
+          } catch(_) {}
+        }
+
         if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
           return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
         }
@@ -4777,7 +4976,7 @@ async function handleRowenDeliver(req, res) {
         try {
           // SECURITY: pass password via SSHPASS env var, never on command line
           const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser_rowen}@${target_host} '${escapedCommand}'`;
           const output = execSync(sshCmd, {
             timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
             env: { ...process.env, SSHPASS: decryptedValue },
@@ -4813,6 +5012,22 @@ async function handleRowenDeliver(req, res) {
         return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, ssh_exec, env_inject, http_body, git_clone, smtp_auth, database_connect` });
     }
 
+    // POST-success accounting (2026-08-24 Shadow #2 item 2): action completed
+    // without throwing and without an early-return error. Bump usage stats now.
+    db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+    if (ctxCheck.context_id) {
+      db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
+    }
+
+    // Track outcome for dashboard health (Shadow #2 item 6: attribution column).
+    try {
+      const isSuccess = !result?.exit_code && !result?.error;
+      db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name, attribution) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(secret.id, secret.did || '', action, isSuccess ? 'success' : 'failure',
+          isSuccess ? '' : (result?.stderr || result?.error || '').slice(0, 200),
+          `${mediator.actor}:${requestor_did}`, actionAttribution);
+    } catch(_) {}
+
     // Log the deliver event (with token reference for audit trail)
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
       'rowen_deliver',
@@ -4827,6 +5042,7 @@ async function handleRowenDeliver(req, res) {
         request_reason: String(request_reason || '').slice(0, 500),
         runtime_context,
         mediator: mediator.actor,
+        attribution: actionAttribution,
       })
     );
 
@@ -10339,7 +10555,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
 
-  const { ref, target_host, target_user, reason } = req.body || {};
+  const { ref, target_host, target_user, reason, override_reason } = req.body || {};
   if (!ref) return res.status(400).json({ error: 'ref (current ref code) required' });
   if (!target_host) return res.status(400).json({ error: 'target_host required' });
 
@@ -10379,7 +10595,22 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   catch (e) { return res.status(500).json({ error: 'failed to decrypt current secret' }); }
 
   const newPassword = crypto.randomBytes(24).toString('base64url');
-  const sshUser = target_user || 'root';
+
+  // Account binding (2026-08-24 Shadow round #2 item 5): rotate-blind is a
+  // credential-mediated SSH action with a silent 'root' default was allowing
+  // a caller to change the wrong account's password. Bring under the resolver.
+  // Resolution: explicit target_user → secret.username → HARD ERROR. Context
+  // isn't relevant here (rotate-blind acts against a host, not a stored context).
+  const rotateResolution = resolveSshTargetUser({ explicit: target_user, secret, context: null, override_reason });
+  if (!rotateResolution.ok) return res.status(rotateResolution.status || 400).json({ error: rotateResolution.error, detail: rotateResolution.detail });
+  const sshUser = rotateResolution.effective_user;
+  if (rotateResolution.override) {
+    try {
+      db.prepare("INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES ('ssh_exec_account_override', ?, ?, '', ?)")
+        .run(ownerDid || '', secret.id, JSON.stringify({ ...rotateResolution.override, target_host, ip: req.ip, path: 'rotate-blind' }));
+    } catch(_) {}
+  }
+
   const { execSync } = require('child_process');
 
   try {
@@ -11499,6 +11730,13 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS secret_outcomes (
   agent_name TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
+// Account attribution on outcomes (2026-08-24 Shadow round #2 item 6):
+// 'bound' = secret.username matched effective_user, 'legacy' = no bound username,
+// 'override' = explicit target_user differed from bound (override_reason supplied).
+// Distinct from outcome; a bound override that succeeded records
+// outcome='success' + attribution='override' so the dashboard can factor
+// overrides into health without ambiguity.
+try { db.exec("ALTER TABLE secret_outcomes ADD COLUMN attribution TEXT DEFAULT 'bound'"); } catch(_) {}
 
 // Add frozen column to secrets
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN frozen INTEGER DEFAULT 0"); } catch(_) {}
@@ -11534,6 +11772,12 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_sr_secret ON secret_rotations(secr
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN phone TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN security_depth TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN gate_policy TEXT DEFAULT NULL"); } catch(_) {}
+
+// Account-binding (2026-08-24, per tome/handoffs/2026-08-24-design-note-demipass-account-binding-invariant.md).
+// A password secret carries the identity of the account it is for.
+// Empty string = legacy row, not yet backfilled (silent-accept explicit target_user; hard-error on omit).
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN username TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_contexts ADD COLUMN target_user_default TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS identity_sms_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
@@ -11695,7 +11939,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
     SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
            ownership, rotatable, frozen, created_at, updated_at, expires_at, provider,
            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels,
-           last_rotated_at, rotation_interval_days, security_depth, gate_policy
+           last_rotated_at, rotation_interval_days, security_depth, gate_policy,
+           COALESCE(username, '') AS username
     FROM blindkey_secrets WHERE did = ? AND status IN ('active', 'rotating')
     ORDER BY updated_at DESC
   `).all(auth.did);
@@ -11703,11 +11948,15 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   // Get last 3 outcomes per secret + compute health
   const enriched = secrets.map(s => {
     const outcomes = db.prepare(
-      'SELECT outcome, error_summary, action_type, agent_name, created_at FROM secret_outcomes WHERE secret_id = ? ORDER BY id DESC LIMIT 3'
+      "SELECT outcome, error_summary, action_type, agent_name, created_at, COALESCE(attribution, 'bound') AS attribution FROM secret_outcomes WHERE secret_id = ? ORDER BY id DESC LIMIT 3"
     ).all(s.id);
 
     const recent = outcomes.length;
     const failures = outcomes.filter(o => o.outcome === 'failure').length;
+    // Account-attribution rate over the sampled outcomes (Shadow #2 item 6).
+    // Overrides are neither clean-bound nor failure — surfaced separately so the
+    // recommendation engine can suggest "review overrides" when they cluster.
+    const overrides = outcomes.filter(o => o.attribution === 'override').length;
     let health = 'neutral'; // never used
     if (recent > 0) {
       if (failures === 0) health = 'green';
@@ -11745,6 +11994,9 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
     }
     if (health === 'red') recommendation = recommendation || 'investigate';
     if (health === 'yellow') recommendation = recommendation || 'monitor';
+    // If a majority of sampled uses were overrides, suggest reviewing bindings
+    // rather than accepting them as clean signal (Shadow #2 item 6).
+    if (overrides > 0 && overrides * 2 >= recent) recommendation = recommendation || 'review_overrides';
 
     // Authorized silicons
     const silicons = db.prepare(
@@ -11753,7 +12005,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
     // Contexts
     const contexts = db.prepare(
-      "SELECT context_name, action_type, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
+      "SELECT context_name, action_type, target_host_pattern, COALESCE(target_user_default, '') AS target_user_default FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
     ).all(s.id);
 
     let parsedLabels = [];
@@ -11776,7 +12028,10 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       last_used: s.last_used_at,
       health,
       recommendation,
+      username: s.username || '',
+      username_bound: !!(s.username && s.username !== ''),
       recent_outcomes: outcomes,
+      override_count: overrides, // Shadow #2 item 6 — surfaced for mobile display
       contexts: contexts.length,
       context_list: contexts,
       authorized_silicons: silicons,
