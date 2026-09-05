@@ -304,6 +304,17 @@
       </div>
       <div id="settings-output" style="margin-top:1rem;font-size:0.8rem"></div>
 
+      <!-- Device login approval: the agent shows a code, you approve it here with this identity -->
+      <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Approve an agent login</div>
+      <div style="background:var(--card);border-radius:12px;padding:1rem">
+        <div style="font-size:0.8rem;color:var(--text3);margin-bottom:0.5rem">An agent (Claude Code, the SDK, a CLI) showed you a code like <span style="font-family:monospace">ABCD-EFGH</span>? Enter it to review and approve it as this identity — no password sharing.</div>
+        <div style="display:flex;gap:0.5rem;align-items:center">
+          <input id="device-code" placeholder="ABCD-EFGH" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="9" style="flex:1;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.95rem;font-family:monospace;letter-spacing:0.1em;text-transform:uppercase">
+          <button onclick="approveDevice()" style="padding:0.5rem 0.75rem;background:var(--accent);border:none;border-radius:6px;color:var(--bg);font-weight:600;font-size:0.75rem;cursor:pointer;white-space:nowrap">Review</button>
+        </div>
+        <div id="device-msg" style="font-size:0.7rem;margin-top:0.25rem;color:var(--red)"></div>
+      </div>
+
       <!-- Silicon Agents tease -->
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Silicon Agents</div>
       <div id="silicon-agents" style="background:var(--card);border-radius:12px;padding:1rem">
@@ -416,6 +427,10 @@ async function login(){
     if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
     tk=a.token;did=a.did||'';user=u;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
+
+// Device login approval: hand off to /device.html on this same origin, which reuses this
+// vault session (dp_token in localStorage) so approving is one tap.
+function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
 function logout(){tk='';did='';user='';localStorage.removeItem('dp_token');localStorage.removeItem('dp_did');localStorage.removeItem('dp_user');localStorage.removeItem('dp_token_at');document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
 
