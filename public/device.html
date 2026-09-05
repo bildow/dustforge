@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Approve an agent — DemiPass</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root { --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f; --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397; --accent:#5fb3ff; --green:#69c7b1; --red:#e06c75; --yellow:#c8a84b; }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; line-height:1.6; min-height:100vh; display:flex; flex-direction:column; }
+  .header { padding:1.1rem 1.4rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }
+  .logo { font-size:1.3rem; font-weight:800; text-decoration:none; color:var(--text); }
+  .logo span { color:var(--accent); }
+  .header a.vault { color:var(--text2); text-decoration:none; font-size:0.85rem; }
+  main { flex:1; display:flex; justify-content:center; padding:1.5rem 1rem 3rem; }
+  .card { width:100%; max-width:480px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1.5rem; align-self:flex-start; }
+  h1 { font-size:1.35rem; margin-bottom:0.35rem; }
+  .sub { color:var(--text2); font-size:0.9rem; margin-bottom:1rem; }
+  .sub b { color:var(--text); }
+  label { display:block; font-size:0.75rem; color:var(--text3); text-transform:uppercase; letter-spacing:0.05em; margin:0.9rem 0 0.35rem; }
+  input { width:100%; padding:0.75rem 0.9rem; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:1rem; font-family:inherit; }
+  input:focus { outline:none; border-color:var(--accent); }
+  input.code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:1.5rem; letter-spacing:0.18em; text-transform:uppercase; text-align:center; }
+  button { width:100%; padding:0.8rem; border:none; border-radius:8px; font-size:0.95rem; font-weight:700; cursor:pointer; margin-top:0.9rem; font-family:inherit; }
+  .primary { background:var(--accent); color:var(--bg); }
+  .approve { background:var(--green); color:var(--bg); }
+  .ghost { background:transparent; color:var(--text2); border:1px solid var(--border); }
+  .deny { background:transparent; color:var(--red); border:1px solid var(--red); }
+  button:disabled { opacity:0.5; cursor:default; }
+  .req { background:var(--bg); border:1px solid var(--border); border-radius:10px; padding:1rem; margin-top:0.5rem; }
+  .req .row { display:flex; justify-content:space-between; gap:1rem; font-size:0.9rem; padding:0.3rem 0; }
+  .req .k { color:var(--text3); white-space:nowrap; }
+  .req .v { text-align:right; word-break:break-word; }
+  .scope { display:inline-block; padding:0.1rem 0.6rem; border-radius:999px; font-size:0.8rem; font-weight:700; }
+  .scope.low { background:rgba(105,199,177,0.15); color:var(--green); }
+  .scope.mid { background:rgba(95,179,255,0.15); color:var(--accent); }
+  .scope.high { background:rgba(224,108,117,0.15); color:var(--red); }
+  .scope-desc { font-size:0.8rem; color:var(--text2); margin-top:0.5rem; }
+  .countdown { color:var(--text3); font-size:0.78rem; margin-top:0.5rem; }
+  .msg { font-size:0.85rem; margin-top:0.75rem; min-height:1.2em; color:var(--text2); }
+  .msg.err { color:var(--red); }
+  .who { font-size:0.85rem; color:var(--text2); margin-top:1rem; }
+  .who b { color:var(--text); }
+  .who a, .foot a { color:var(--accent); text-decoration:none; }
+  .foot { font-size:0.78rem; color:var(--text3); margin-top:1.25rem; line-height:1.5; }
+  .done { text-align:center; padding:0.5rem 0; }
+  .done .big { font-size:2.5rem; }
+  .done h2 { font-size:1.25rem; margin:0.5rem 0; }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div class="header">
+  <a class="logo" href="/">Demi<span>Pass</span></a>
+  <a class="vault" href="/vault-mobile.html">Vault</a>
+</div>
+<main>
+<div class="card">
+
+  <section id="s-code">
+    <h1>Approve an agent</h1>
+    <div class="sub">An agent showed you a code? Enter it here. <b>You are the second factor</b> — nothing gets a token until you say so, and no password ever reaches the agent.</div>
+    <label for="code">Code</label>
+    <input id="code" class="code" placeholder="ABCD-EFGH" maxlength="9" autocomplete="off" autocapitalize="characters" spellcheck="false">
+    <button class="primary" id="btn-lookup" onclick="lookup()">Look up request</button>
+    <div class="msg" id="m-code"></div>
+    <div class="foot">Codes expire 15 minutes after the agent asks for them. If yours expired, have the agent start a new login.</div>
+  </section>
+
+  <section id="s-review" class="hidden">
+    <h1>Review the request</h1>
+    <div class="sub">Approving mints a token <b>for your identity</b>, limited to the scope below, that this agent will use to act as you. It can be revoked any time from the vault.</div>
+    <div class="req">
+      <div class="row"><span class="k">Agent</span><span class="v" id="r-agent"></span></div>
+      <div class="row"><span class="k">Scope</span><span class="v"><span class="scope" id="r-scope"></span></span></div>
+      <div class="row"><span class="k">Requested</span><span class="v" id="r-when"></span></div>
+      <div class="scope-desc" id="r-scope-desc"></div>
+      <div class="countdown" id="r-expires"></div>
+    </div>
+
+    <div id="who-known" class="hidden">
+      <div class="who">Approving as <b id="who-user"></b> · <a href="#" onclick="return useOther()">not you? sign in differently</a></div>
+      <button class="approve" onclick="decide('approve', 'known')">Approve</button>
+      <button class="deny" onclick="decide('deny', 'known')">Deny</button>
+    </div>
+
+    <div id="who-login" class="hidden">
+      <label for="u">Username</label>
+      <input id="u" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="your DemiPass username">
+      <label for="p">Password</label>
+      <input id="p" type="password" autocomplete="current-password" placeholder="••••••••">
+      <button class="approve" onclick="decide('approve', 'login')">Sign in &amp; approve</button>
+      <button class="deny" onclick="decide('deny', 'login')">Sign in &amp; deny</button>
+      <div class="who">No DemiPass identity yet? <a href="/signup.html">Create one</a>, then come back — the code stays valid until it expires.</div>
+    </div>
+    <div class="msg" id="m-review"></div>
+    <div class="foot">Your password goes only to api.dustforge.com, to mint a short-lived approval token. This page stores nothing.</div>
+  </section>
+
+  <section id="s-done" class="hidden">
+    <div class="done">
+      <div class="big" id="d-icon">✅</div>
+      <h2 id="d-title">You're good to go</h2>
+      <div class="sub" id="d-text"></div>
+      <button class="ghost" onclick="location.href='/vault-mobile.html'">Open the vault</button>
+      <button class="ghost" onclick="reset()">Approve another code</button>
+    </div>
+  </section>
+
+</div>
+</main>
+<script>
+const API = 'https://api.dustforge.com';
+const VAULT_TOKEN_TTL = 24 * 60 * 60 * 1000; // mirrors vault-mobile.html
+const SCOPES = {
+  read:     { level: 'low',  text: 'List secrets and read metadata. Cannot use or reveal secret values.' },
+  write:    { level: 'mid',  text: 'Store, edit, and delete secrets — plus everything read can do.' },
+  transact: { level: 'mid',  text: 'Use secrets through use-tokens (injected server-side, never shown), spend from your wallet, and everything below. The usual scope for a working agent.' },
+  admin:    { level: 'high', text: 'Manage your identity, tokens, and delegations. Elevated — only approve for an agent you fully control.' },
+  full:     { level: 'high', text: 'Everything, with no ceiling. Elevated — only approve for an agent you fully control.' },
+};
+let req = null, tick = null;
+
+const $ = (id) => document.getElementById(id);
+const show = (id, on) => $(id).classList.toggle('hidden', !on);
+const msg = (id, text, cls) => { const e = $(id); e.textContent = text || ''; e.className = 'msg' + (cls ? ' ' + cls : ''); };
+
+function normalizeCode(v) {
+  const s = String(v || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
+  return s.length > 4 ? s.slice(0, 4) + '-' + s.slice(4) : s;
+}
+$('code').addEventListener('input', (e) => { e.target.value = normalizeCode(e.target.value); });
+$('code').addEventListener('keydown', (e) => { if (e.key === 'Enter') lookup(); });
+$('p').addEventListener('keydown', (e) => { if (e.key === 'Enter') decide('approve', 'login'); });
+
+async function api(method, path, body, bearer) {
+  const o = { method, headers: { 'Content-Type': 'application/json' } };
+  if (bearer) o.headers.Authorization = 'Bearer ' + bearer;
+  if (body) o.body = JSON.stringify(body);
+  const r = await fetch(API + path, o);
+  const d = await r.json().catch(() => ({}));
+  return { status: r.status, d };
+}
+
+// A vault session in this browser (same origin as vault-mobile.html, so the phone app shares it).
+function vaultSession() {
+  try {
+    const t = localStorage.getItem('dp_token'), at = Number(localStorage.getItem('dp_token_at') || 0);
+    if (t && at && Date.now() - at < VAULT_TOKEN_TTL) return { token: t, user: localStorage.getItem('dp_user') || 'your vault identity' };
+  } catch (_) {}
+  return null;
+}
+
+async function lookup() {
+  const code = normalizeCode($('code').value);
+  if (code.length !== 9) { msg('m-code', 'Enter the full 8-character code.', 'err'); return; }
+  $('btn-lookup').disabled = true; msg('m-code', 'Looking up…');
+  try {
+    const { status, d } = await api('GET', '/api/identity/device/pending?user_code=' + encodeURIComponent(code));
+    if (status === 404) { msg('m-code', 'No pending request for that code. Check the letters, or have the agent start a new login.', 'err'); return; }
+    if (status >= 400) { msg('m-code', d.error || 'Lookup failed', 'err'); return; }
+    req = { ...d, user_code: code };
+    render();
+  } catch (e) { msg('m-code', 'Connection error: ' + e.message, 'err'); }
+  finally { $('btn-lookup').disabled = false; }
+}
+
+function render() {
+  const sc = SCOPES[req.scope] || { level: 'high', text: 'Unknown scope — treat as elevated.' };
+  $('r-agent').textContent = req.agent_label || '(unlabelled agent)';
+  const s = $('r-scope'); s.textContent = req.scope; s.className = 'scope ' + sc.level;
+  $('r-scope-desc').textContent = sc.text;
+  let when = '—';
+  if (req.created_at) { const iso = req.created_at.includes('T') ? req.created_at : req.created_at.replace(' ', 'T') + 'Z'; const dt = new Date(iso); if (!isNaN(dt)) when = dt.toLocaleString(); }
+  $('r-when').textContent = when;
+  const vs = vaultSession();
+  if (vs) { $('who-user').textContent = vs.user; show('who-known', true); show('who-login', false); }
+  else { show('who-known', false); show('who-login', true); }
+  msg('m-review', '');
+  show('s-code', false); show('s-review', true); show('s-done', false);
+  clearInterval(tick);
+  const update = () => {
+    const left = Math.floor((new Date(req.expires_at).getTime() - Date.now()) / 1000);
+    if (!(left > 0)) { $('r-expires').textContent = 'This code has expired — have the agent start a new login.'; clearInterval(tick); disableButtons(true); return; }
+    $('r-expires').textContent = 'Expires in ' + Math.floor(left / 60) + 'm ' + String(left % 60).padStart(2, '0') + 's';
+  };
+  update(); tick = setInterval(update, 1000);
+  if (!vs) setTimeout(() => $('u').focus(), 50);
+}
+
+function disableButtons(on) { document.querySelectorAll('#s-review button').forEach((b) => { b.disabled = on; }); }
+function useOther() { show('who-known', false); show('who-login', true); $('u').focus(); return false; }
+
+async function decide(decision, mode) {
+  disableButtons(true); msg('m-review', decision === 'approve' ? 'Approving…' : 'Denying…');
+  try {
+    let bearer = '';
+    if (mode === 'known') {
+      bearer = (vaultSession() || {}).token || '';
+      if (!bearer) { msg('m-review', 'Your vault session has expired — sign in below.', 'err'); useOther(); return; }
+    } else {
+      const u = $('u').value.trim(), p = $('p').value;
+      if (!u || !p) { msg('m-review', 'Username and password required.', 'err'); return; }
+      const { status, d } = await api('POST', '/api/identity/auth-fingerprint', { username: u, password: p, scope: req.scope, expires_in: '30m' });
+      if (status >= 400 || !d.token) { msg('m-review', status === 404 ? 'No identity with that username.' : (d.error || 'Sign-in failed'), 'err'); return; }
+      bearer = d.token; $('p').value = '';
+    }
+    const { status, d } = await api('POST', '/api/identity/device/approve', { user_code: req.user_code, decision }, bearer);
+    if (status === 403 && mode === 'known') { msg('m-review', 'Your vault session cannot approve "' + req.scope + '" — sign in with your password to approve at that scope.', 'err'); useOther(); return; }
+    if (status === 401 && mode === 'known') { msg('m-review', 'Your vault session has expired — sign in below.', 'err'); useOther(); return; }
+    if (status >= 400) { msg('m-review', d.error || 'Request failed', 'err'); return; }
+    clearInterval(tick);
+    done(decision);
+  } catch (e) { msg('m-review', 'Connection error: ' + e.message, 'err'); }
+  finally { disableButtons(false); }
+}
+
+function done(decision) {
+  const agent = req.agent_label || 'The agent';
+  if (decision === 'approve') {
+    $('d-icon').textContent = '✅'; $('d-title').textContent = "You're good to go";
+    $('d-text').textContent = agent + ' will finish signing in on its own within a few seconds. You can close this tab.';
+  } else {
+    $('d-icon').textContent = '⛔'; $('d-title').textContent = 'Denied';
+    $('d-text').textContent = agent + ' was told no. Nothing was issued.';
+  }
+  show('s-code', false); show('s-review', false); show('s-done', true);
+}
+
+function reset() { req = null; clearInterval(tick); $('code').value = ''; msg('m-code', ''); show('s-done', false); show('s-review', false); show('s-code', true); $('code').focus(); }
+
+// Deep link: /device?code=ABCD-EFGH — look it up straight away.
+const qp = new URLSearchParams(location.search).get('code');
+if (qp) { $('code').value = normalizeCode(qp); lookup(); } else { $('code').focus(); }
+</script>
+</body>
+</html>
