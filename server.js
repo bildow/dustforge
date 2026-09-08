@@ -44,6 +44,7 @@ const BLINDKEY_SSH_HOSTS = new Set([
   '100.94.192.51',     // ky7
   '100.69.1.78',       // k1
   '100.103.90.79',     // flimflam
+  '100.73.92.12',      // skypie (Aaron's laptop, tailnet)
 ]);
 
 const rateLimit = require('express-rate-limit');
