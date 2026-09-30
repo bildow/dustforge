@@ -8,6 +8,13 @@ As of September 30, the existing Resend account reports `dustforge.com` as
 `azurecarbon.com` is verified. Do not configure that account as the Dustforge
 relay until the domain records pass verification.
 
+DemiPass lists an Atlas Cloudflare API token and a Resend API key. This branch
+adds `api.cloudflare.com` and `api.resend.com` to the DemiPass HTTP host
+allowlist so those credentials can be checked through vault mediated requests
+after deployment. The Cloudflare token belongs to Aaron's Atlas account; its
+access to the `dustforge.com` zone has not been verified. The keys remain in
+DemiPass and are not copied into this repository.
+
 Set `SMTP_RELAY_HOST`, `SMTP_RELAY_PORT`, `SMTP_RELAY_USER`, and
 `SMTP_RELAY_PASSWORD` to use an authenticated SMTP provider. The connection
 requires TLS and verifies the provider certificate. The provider must verify
