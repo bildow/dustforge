@@ -3,6 +3,10 @@
 The default outbound path is local Postfix. Microsoft rejected the RackNerd IP
 `192.3.84.103` with `550 5.7.1 S3140`, so direct sending to Hotmail cannot be
 treated as delivered merely because `/api/email/send` returns `ok: true`.
+As of September 30, the existing Resend account reports `dustforge.com` as
+`failed` (DKIM `resend._domainkey` and both `send` SPF records), while
+`azurecarbon.com` is verified. Do not configure that account as the Dustforge
+relay until the domain records pass verification.
 
 Set `SMTP_RELAY_HOST`, `SMTP_RELAY_PORT`, `SMTP_RELAY_USER`, and
 `SMTP_RELAY_PASSWORD` to use an authenticated SMTP provider. The connection
