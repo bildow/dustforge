@@ -4782,7 +4782,7 @@ async function handleRowenDeliver(req, res) {
         const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params || {};
         if (!url) return res.status(400).json({ error: 'action_params.url required for http_header action' });
 
-        const ALLOWED_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com'];
+        const ALLOWED_HOSTS = BLINDKEY_HTTP_HOSTS;
         let urlHost;
         try { urlHost = new URL(url).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
         if (!ALLOWED_HOSTS.some(h => urlHost === h || urlHost.endsWith('.' + h))) {
