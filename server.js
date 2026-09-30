@@ -54,12 +54,64 @@ const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 500, message: {
 const rateLimitInvite = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many invite requests. Try again later.' } });
 
 function createEmailTransport() {
+  // An authenticated provider carries outbound mail when the direct-send IP
+  // is blocked. Keep the local MTA path for installations without a relay.
+  if (process.env.SMTP_RELAY_HOST) {
+    const host = process.env.SMTP_RELAY_HOST;
+    const port = Number(process.env.SMTP_RELAY_PORT || 587);
+    const user = process.env.SMTP_RELAY_USER;
+    const pass = process.env.SMTP_RELAY_PASSWORD;
+    if (!user || !pass || !Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error('SMTP relay configuration is incomplete');
+    }
+    return nodemailer.createTransport({
+      host, port, secure: port === 465, requireTLS: port !== 465,
+      auth: { user, pass }, tls: { servername: host, rejectUnauthorized: true },
+    });
+  }
   return nodemailer.createTransport({
     host: process.env.SMTP_HOST || 'localhost',
     port: Number(process.env.SMTP_PORT || 25),
     secure: false,
     tls: { rejectUnauthorized: false },
   });
+}
+
+// Ramp routine API mail from a newly configured sending domain. Reserve the
+// daily slot before billing, and return it on any failed response. Security
+// mail and internal alerts use the same relay but are exempt from this cap.
+function emailWarmupGuard(req, res, next) {
+  const start = process.env.MAIL_WARMUP_START_UTC;
+  if (!start) return next();
+  const startMs = Date.parse(start);
+  if (!Number.isFinite(startMs)) return res.status(503).json({ error: 'mail warmup start is invalid' });
+  const initial = Number(process.env.MAIL_WARMUP_INITIAL_DAILY_LIMIT || 10);
+  const maximum = Number(process.env.MAIL_WARMUP_MAX_DAILY_LIMIT || 100);
+  if (!Number.isInteger(initial) || !Number.isInteger(maximum) || initial < 1 || maximum < initial) {
+    return res.status(503).json({ error: 'mail warmup limits are invalid' });
+  }
+  const now = Date.now();
+  const day = new Date(now).toISOString().slice(0, 10);
+  const weeks = Math.max(0, Math.floor((now - startMs) / (7 * 86400000)));
+  const limit = Math.min(maximum, initial * (2 ** Math.min(weeks, 30)));
+  try {
+    db.exec('CREATE TABLE IF NOT EXISTS email_warmup_daily (day TEXT PRIMARY KEY, sent INTEGER NOT NULL)');
+    const reserved = db.transaction(() => {
+      db.prepare('INSERT INTO email_warmup_daily (day, sent) VALUES (?, 0) ON CONFLICT(day) DO NOTHING').run(day);
+      return db.prepare('UPDATE email_warmup_daily SET sent = sent + 1 WHERE day = ? AND sent < ?').run(day, limit).changes === 1;
+    })();
+    if (!reserved) return res.status(429).json({ error: 'daily mail warmup cap reached', day, limit });
+    res.once('finish', () => {
+      if (res.statusCode >= 400) {
+        try { db.prepare('UPDATE email_warmup_daily SET sent = MAX(0, sent - 1) WHERE day = ?').run(day); }
+        catch (error) { console.error('[email] warmup reservation release failed:', error.message); }
+      }
+    });
+    next();
+  } catch (error) {
+    console.error('[email] warmup guard failed:', error.message);
+    res.status(503).json({ error: 'mail warmup unavailable' });
+  }
 }
 
 function safeSecretEqual(provided, expected) {
@@ -1470,7 +1522,7 @@ app.post('/api/billing/topup', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/email/send', billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+app.post('/api/email/send', emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject, and body required' });
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
