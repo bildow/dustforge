@@ -645,7 +645,7 @@ app.post('/api/identity/create', async (req, res) => {
     // admin API and only falls back to this column, so an account created
     // without it cannot authenticate at all whenever Stalwart is unreachable.
     // 59 of 61 accounts were in that state before 2026-07-30.
-    const pwHashAtCreate = require(crypto).createHash(sha256).update(effectivePassword).digest(hex);
+    const pwHashAtCreate = require('crypto').createHash('sha256').update(effectivePassword).digest('hex');
     db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`)
       .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, referredBy, emailResult.stalwart_id, pwHashAtCreate);
     db.prepare(`INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Account created', 0)`).run(id.did);
@@ -6877,6 +6877,29 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS fleet_project_operators (
 )`); } catch(_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_fpo_project ON fleet_project_operators(project_id)"); } catch(_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_fpo_op ON fleet_project_operators(operator_did)"); } catch(_) {}
+
+// ── Fleet billing: silicon subpages, hashed silicon ids, refill rules,
+//    attributed billing (who pays), tick-scoped work links. Money logic lives in
+//    ./fleet_billing (unit-tested); HTTP surface in ./fleet_routes.
+const fleetBilling = require('./fleet_billing');
+try { fleetBilling.initSchema(db); } catch (e) { console.error('[fleet] schema init failed:', e.message); }
+billing.setAttribution(fleetBilling, require('./dd_ledger'));
+const fleetRoutes = require('./fleet_routes')({
+  app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
+  rateLimitStandard, adminKey: ADMIN_API_KEY, crypto,
+});
+// Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
+function fleetRefillPass() {
+  try {
+    const r = fleetBilling.runRefills(db, billing, { ledger: require('./dd_ledger'), mailer: fleetRoutes.sendMail });
+    const refilled = (r.silicons || []).filter(x => x.ok);
+    if ((r.owner || []).length || refilled.length || (r.token_warnings || []).length || r.work_links_expired) {
+      console.log('[fleet] pass:', JSON.stringify({ owner: r.owner, refilled, warned: r.token_warnings, expired_links: r.work_links_expired }));
+    }
+  } catch (e) { console.error('[fleet] refill pass failed:', e.message); }
+}
+setTimeout(fleetRefillPass, 30 * 1000);
+setInterval(fleetRefillPass, 5 * 60 * 1000);
 
 
 // ── Fleet Endpoints ──
