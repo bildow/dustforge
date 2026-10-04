@@ -3553,6 +3553,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
     // Concurrent token limit: max 5 active (non-expired, non-used) tokens per secret per DID.
     // Security boundary is the 30s TTL + single-use, not the count.
     // 5 concurrent allows multi-command SSH workflows without cooldown waits.
+    // Worker tokens (a silicon's scoped sub-agent) may only touch the secrets on their allow-list.
+    if (req.identity && req.identity.decoded && req.identity.decoded.wrk) {
+      const wchk = fleetBilling.workerMayUseSecret(db, req.identity.decoded, secret);
+      if (!wchk.ok) {
+        logSecurityEvent('worker_secret_denied', 'alert', { caller_did: callerDid, capability: action, target: secret.name, error: wchk.error, ip: req.ip });
+        return res.status(wchk.status || 403).json({ error: wchk.error, worker_id: req.identity.decoded.wrk });
+      }
+    }
     const MAX_CONCURRENT_TOKENS = 5;
     const outstanding = db.prepare(
       "SELECT COUNT(*) as n FROM blindkey_use_tokens WHERE did = ? AND secret_id = ? AND status = 'valid' AND expires_at > datetime('now')"

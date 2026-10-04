@@ -233,7 +233,9 @@ module.exports = function registerFleetRoutes(deps) {
       silicon: fb.siliconView(db, billing, s, { fleet: a.fleet }),
       recent: fb.recentSpend(db, s.member_did, 30),
       attribution: fb.attributionReport(db, { actorDids: [s.member_did], sinceDays: 30 }),
-      delegations, work_links: fb.listWorkLinks(db, s.member_did),
+      delegations, secrets: fb.siliconSecrets(db, s.member_did),
+      workers: fb.listWorkers(db, s.member_did).map(fb.workerView),
+      work_links: fb.listWorkLinks(db, s.member_did),
       current_tick: fb.currentTick(db),
     });
   });
@@ -353,9 +355,106 @@ module.exports = function registerFleetRoutes(deps) {
   app.get('/api/silicons/me', rateLimitStandard, (req, res) => {
     const who = bearer(req, res); if (!who) return;
     const rows = db.prepare("SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.member_did = ? AND s.status = 'active'").all(who.did);
+    const wr = fb.resolveWorker(db, who.decoded);
     res.json({ ok: true, did: who.did, silicon_id: fb.siliconId(who.did), balance_cents: billing.getDerivedBalance(db, who.did),
                memberships: rows.map(s => fb.siliconView(db, billing, s, { fleet: { slug: s.fleet_slug, name: s.fleet_name } })),
+               secrets: fb.siliconSecrets(db, who.did),
+               workers: who.decoded.wrk ? [] : fb.listWorkers(db, who.did).map(fb.workerView),
+               worker: wr.ok && wr.worker ? fb.workerView(wr.worker) : (who.decoded.wrk ? { worker_id: who.decoded.wrk, status: 'invalid', error: wr.error } : null),
                work_links: fb.listWorkLinks(db, who.did), token: fb.tokenStatus(db, who.did), current_tick: fb.currentTick(db) });
+  });
+
+  // ── Subordinate workers: a silicon scopes tokens for its own sub-agents / test environments ──
+  function workerManager(req, res) {
+    const who = bearer(req, res); if (!who) return null;
+    if (who.decoded.wrk) { res.status(403).json({ error: 'a worker token cannot manage workers' }); return null; }
+    if (!identity.scopeAtLeast(who.scope, 'transact')) { res.status(403).json({ error: 'transact scope required' }); return null; }
+    return who;
+  }
+  function mintWorkerToken(res, worker, body, mintedBy) {
+    const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(worker.parent_did);
+    if (!wallet) { res.status(404).json({ error: 'parent identity not found' }); return null; }
+    try {
+      const claims = fb.workerTokenClaims(worker, { scope: (body && body.scope) || 'transact', expiresIn: (body && body.expires_in) || '24h' });
+      claims.metadata.minted_by = mintedBy;
+      const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, claims);
+      const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString());
+      fb.recordWorkerToken(db, worker, payload);
+      log(`worker token minted: ${worker.worker_id} (${worker.name}) scope=${payload.scope} by ${mintedBy}`);
+      return { token, worker_id: worker.worker_id, scope: payload.scope, expires_at: new Date(payload.exp * 1000).toISOString(),
+               usage: 'give this token to the worker (DEMIPASS_TOKEN env or its token file); its calls run as the parent identity, are billed to the parent and tagged with the worker id; only the allow-listed secrets are reachable' };
+    } catch (e) { fail(res, e); return null; }
+  }
+  function createWorkerFrom(res, parentDid, body, createdBy) {
+    try {
+      const w = fb.createWorker(db, { parentDid, name: String((body && body.name) || '').toLowerCase(), purpose: body && body.purpose,
+        allowedSecrets: body && body.allowed_secrets, scopeCap: (body && body.scope_cap) || 'transact', maxSpendCents: body && body.max_spend_cents, createdBy });
+      log(`worker created: ${w.worker_id} (${w.name}) under ${parentDid} by ${createdBy}`);
+      let minted = null;
+      if (body && body.mint) { minted = mintWorkerToken(res, w, body.mint === true ? {} : body.mint, createdBy); if (!minted) return null; }
+      return { worker: fb.workerView(fb.getWorker(db, w.worker_id)), minted };
+    } catch (e) { fail(res, e); return null; }
+  }
+  app.get('/api/silicons/workers', rateLimitStandard, (req, res) => {
+    const who = bearer(req, res); if (!who) return;
+    res.json({ ok: true, workers: fb.listWorkers(db, who.did).map(fb.workerView) });
+  });
+  app.post('/api/silicons/workers', rateLimitStandard, (req, res) => {
+    const who = workerManager(req, res); if (!who) return;
+    const r = createWorkerFrom(res, who.did, req.body || {}, who.did); if (!r) return;
+    res.json({ ok: true, ...r });
+  });
+  app.post('/api/silicons/workers/:wid/token', rateLimitStandard, (req, res) => {
+    const who = workerManager(req, res); if (!who) return;
+    const w = fb.getWorker(db, req.params.wid);
+    if (!w || w.parent_did !== who.did) return res.status(404).json({ error: 'worker not found' });
+    if (w.status !== 'active') return res.status(409).json({ error: `worker is ${w.status}` });
+    const m = mintWorkerToken(res, w, req.body || {}, who.did); if (!m) return;
+    res.json({ ok: true, ...m });
+  });
+  app.post('/api/silicons/workers/:wid/revoke', rateLimitStandard, (req, res) => {
+    const who = workerManager(req, res); if (!who) return;
+    const w = fb.getWorker(db, req.params.wid);
+    if (!w || w.parent_did !== who.did) return res.status(404).json({ error: 'worker not found' });
+    res.json({ ok: true, worker: fb.workerView(fb.revokeWorker(db, { wid: w.worker_id, byDid: who.did })) });
+  });
+  // Owner side of the same thing (the fleet holds the silicon's key).
+  app.get('/api/fleet/:slug/silicons/:handle/workers', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner', 'admin'] }); if (!a) return;
+    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    res.json({ ok: true, workers: fb.listWorkers(db, s.member_did).map(fb.workerView) });
+  });
+  app.post('/api/fleet/:slug/silicons/:handle/workers', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
+    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    const r = createWorkerFrom(res, s.member_did, req.body || {}, a.did); if (!r) return;
+    res.json({ ok: true, ...r });
+  });
+  app.post('/api/fleet/:slug/silicons/:handle/workers/:wid/token', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
+    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    const w = fb.getWorker(db, req.params.wid);
+    if (!w || w.parent_did !== s.member_did) return res.status(404).json({ error: 'worker not found' });
+    if (w.status !== 'active') return res.status(409).json({ error: `worker is ${w.status}` });
+    const m = mintWorkerToken(res, w, req.body || {}, a.did); if (!m) return;
+    res.json({ ok: true, ...m });
+  });
+  app.post('/api/fleet/:slug/silicons/:handle/workers/:wid/revoke', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
+    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    const w = fb.getWorker(db, req.params.wid);
+    if (!w || w.parent_did !== s.member_did) return res.status(404).json({ error: 'worker not found' });
+    res.json({ ok: true, worker: fb.workerView(fb.revokeWorker(db, { wid: w.worker_id, byDid: a.did })) });
+  });
+  // Owner revokes one of their delegations to the silicon.
+  app.delete('/api/fleet/:slug/silicons/:handle/delegations/:id', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
+    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    const d = db.prepare('SELECT * FROM demipass_delegations WHERE id = ? AND owner_did = ? AND delegate_did = ?').get(Number(req.params.id), a.did, s.member_did);
+    if (!d) return res.status(404).json({ error: 'delegation not found' });
+    db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(d.id);
+    try { db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run('delegation_revoked', a.did, d.secret_id, '*', JSON.stringify({ delegation_id: d.id, delegate_did: s.member_did, via: 'fleet' })); } catch (_) {}
+    res.json({ ok: true, delegation_id: d.id, status: 'revoked' });
   });
   app.get('/api/silicons/resolve/:sid', rateLimitStandard, (req, res) => {
     const who = bearer(req, res); if (!who) return;

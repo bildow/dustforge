@@ -37,6 +37,17 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
    linked with consent (its own token, the admin key, or a one-time claim link emailed to its mailbox); otherwise
    a new identity (mailbox + wallet) is created for 100 DD. Either way the DID record is emailed to the contact.
 
+10. **Secrets a silicon uses** show on its subpage: its own stored secrets plus the ones delegated to it (use
+    counts, status), with delegate / revoke controls for the owner.
+11. **Subordinate workers.** A silicon (or its fleet owner) creates a *worker* for a sub-agent or test
+    environment, e.g. Brain → `brain2`. The worker gets a hashed id `wrk_<16 hex>` = HMAC(FLEET_ID_SECRET,
+    parent DID + name) and a token minted for the **parent's** DID carrying a `wrk` claim, with: a scope cap
+    (≤ transact), a TTL cap (≤ 30 d), an optional secret allow-list (ref codes or names; enforced on
+    `request-token`), and an optional spend cap. Calls run as the parent, are billed to the parent (or to the
+    owner / a work-link requester under the usual rules) and are tagged with the worker id in
+    `billing_attributions`. Revoking the worker kills its last token and every future call. Worker tokens cannot
+    create workers or mint tokens.
+
 ## Endpoints (all Bearer; owner/admin of the fleet unless noted)
 
 | Method | Path | Notes |
@@ -57,6 +68,11 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
 | GET | `/api/silicons/resolve/:sid` | hashed id → handle/fleet (+DID for same-fleet) |
 | POST/GET | `/api/work-links` | create (`provider` = sil_ id, DID, username or `handle@fleet`; `ttl_ticks`, `ttl_seconds?`, `project?`, `note?`, `max_spend_cents?`) / list mine |
 | POST | `/api/work-links/:id/accept\|decline\|revoke` | accept returns the work token once |
+| GET/POST | `/api/silicons/workers` | a silicon lists / creates its workers (`name`, `purpose?`, `allowed_secrets?`, `scope_cap?`, `max_spend_cents?`, `mint?: {scope, expires_in}`) |
+| POST | `/api/silicons/workers/:wid/token\|revoke` | mint a worker token (shown once) / revoke the worker |
+| GET/POST | `/api/fleet/:slug/silicons/:handle/workers` | owner side of the same |
+| POST | `/api/fleet/:slug/silicons/:handle/workers/:wid/token\|revoke` | owner side of the same |
+| DELETE | `/api/fleet/:slug/silicons/:handle/delegations/:id` | owner revokes a delegation |
 
 Errors worth knowing: `402 payment required` now carries `payer_did` and `payer` (`self` / `operator` /
 `work_link`) so an agent can tell *whose* wallet is empty; `403 not an operator on project 'x'` when a silicon
@@ -72,6 +88,10 @@ claims operator-initiated work on a project it is not listed on.
   work for another silicon → `{"work_link": "..."}`. Add `X-DemiPass-Agent: <name>/<version>` for reporting.
 - Host access for Brain: the owner delegates `phasewhip-ssh` to Brain; Brain calls `request-token` + `use` with
   its **own** token and the billing header. No more bouncing through the owner's machine or identity.
+- Testing environments (Brain2): the parent creates a worker (`POST /api/silicons/workers` with
+  `allowed_secrets: ["DP-PWD-phasewhi-c4b276f9"]`, a spend cap and `mint: {expires_in: "7d"}`), drops the token
+  into the worker's environment, and the worker runs the same lane script. Its spend shows under the parent,
+  tagged with the worker id; revoke it when the trial ends.
 
 ## Deploy checklist
 

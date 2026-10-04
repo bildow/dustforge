@@ -105,6 +105,32 @@ function initSchema(db) {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_fwl_token ON fleet_work_links(token_hash)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_fwl_parties ON fleet_work_links(requester_did, provider_did)`);
 
+  // Subordinate workers: a silicon scopes tokens for its own sub-agents / test environments.
+  // The token is minted for the PARENT's DID with a `wrk` claim; the registry row says what the
+  // worker may touch (secret allow-list), its scope cap, spend cap, and whether it is revoked.
+  db.exec(`CREATE TABLE IF NOT EXISTS fleet_workers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_id TEXT NOT NULL UNIQUE,
+    parent_did TEXT NOT NULL,
+    name TEXT NOT NULL,
+    purpose TEXT DEFAULT '',
+    allowed_secrets TEXT DEFAULT '[]',
+    scope_cap TEXT DEFAULT 'transact',
+    max_spend_cents INTEGER DEFAULT 0,
+    spent_cents INTEGER DEFAULT 0,
+    use_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'active',
+    last_jti TEXT DEFAULT '',
+    token_expires_at TEXT,
+    created_by TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TEXT,
+    revoked_by TEXT,
+    UNIQUE(parent_did, name)
+  )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_fw_parent ON fleet_workers(parent_did)`);
+  try { db.exec(`ALTER TABLE billing_attributions ADD COLUMN worker_id TEXT DEFAULT ''`); } catch (_) {}
+
   // Per-project billing mode on the existing fleet board:
   //   owner          — the fleet owner's wallet pays, the project is a cost tag (default)
   //   project_wallet — the project's own wallet pays when it can, else overflow to the owner
@@ -145,6 +171,8 @@ function parseAttribution(req) {
   }
   const a = req.headers && req.headers['x-demipass-agent'];
   if (a) out.agent = String(a).slice(0, 100);
+  const wrk = req.identity && req.identity.decoded && req.identity.decoded.wrk;
+  if (wrk) out.worker = String(wrk);
   return out;
 }
 
@@ -170,6 +198,21 @@ function findProjectForCaller(db, project, callerDid) {
 //      or { ok:false, status, error }
 function resolvePayer(db, billing, { callerDid, attribution = {}, cost = 0 }) {
   const a = attribution || {};
+  let worker = null;
+  if (a.worker) {
+    const w = resolveWorker(db, { wrk: a.worker, sub: callerDid });
+    if (!w.ok) return { ok: false, status: w.status || 403, error: w.error };
+    worker = w.worker;
+    if (worker.max_spend_cents > 0 && worker.spent_cents + cost > worker.max_spend_cents) {
+      return { ok: false, status: 402, error: `worker ${worker.worker_id} spend cap reached`, worker_id: worker.worker_id };
+    }
+  }
+  const base = _resolvePayerBase(db, billing, { callerDid, a, cost });
+  if (!base.ok) return base;
+  return { ...base, worker };
+}
+
+function _resolvePayerBase(db, billing, { callerDid, a, cost }) {
   if (a.work_link) {
     const v = validateWorkLink(db, a.work_link, callerDid);
     if (!v.ok) return { ok: false, status: 403, error: `work link rejected: ${v.error}` };
@@ -212,14 +255,19 @@ function chargeAttributed(db, billing, { callerDid, cost, actionType, descriptio
     const d = billing.deductBalance(db, r.payer_did, cost, actionType, description || `API call: ${actionType}`);
     if (!d.ok) return { ...d, ok: false, payer_did: r.payer_did, initiator: r.initiator, project: r.project };
     const tx = db.prepare('SELECT id FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT 1').get(r.payer_did);
-    const ins = db.prepare(`INSERT INTO billing_attributions (tx_id, payer_did, actor_did, fleet_id, project, initiator, work_link_id, agent, action_type, cost_cents)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    const ins = db.prepare(`INSERT INTO billing_attributions (tx_id, payer_did, actor_did, fleet_id, project, initiator, work_link_id, agent, action_type, cost_cents, worker_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(tx ? tx.id : null, r.payer_did, callerDid, r.fleet_id, r.project || '', r.initiator,
-           r.work_link ? r.work_link.id : null, (attribution && attribution.agent) || '', actionType, cost);
+           r.work_link ? r.work_link.id : null, (attribution && attribution.agent) || '', actionType, cost,
+           r.worker ? r.worker.worker_id : '');
     if (r.work_link) {
       db.prepare('UPDATE fleet_work_links SET use_count = use_count + 1, spent_cents = spent_cents + ? WHERE id = ?').run(cost, r.work_link.id);
     }
-    return { ...d, payer_did: r.payer_did, initiator: r.initiator, project: r.project, attribution_id: Number(ins.lastInsertRowid), reason: r.reason };
+    if (r.worker) {
+      db.prepare('UPDATE fleet_workers SET use_count = use_count + 1, spent_cents = spent_cents + ? WHERE id = ?').run(cost, r.worker.id);
+    }
+    return { ...d, payer_did: r.payer_did, initiator: r.initiator, project: r.project, attribution_id: Number(ins.lastInsertRowid), reason: r.reason,
+             worker_id: r.worker ? r.worker.worker_id : undefined };
   });
   const out = txn();
   if (out.ok) {
@@ -570,6 +618,115 @@ function resolveSiliconId(db, sid) {
   return null;
 }
 
+// ── Subordinate workers ──────────────────────────────────────────────────────
+const WORKER_NAME_RE = /^[a-z0-9][a-z0-9-]{1,30}$/;
+const SCOPE_ORDER = ['read', 'write', 'transact'];
+
+function workerId(parentDid, name, secret) {
+  const key = secret || process.env.FLEET_ID_SECRET || process.env.IDENTITY_MASTER_KEY || 'dustforge-fleet-id';
+  return 'wrk_' + crypto.createHmac('sha256', key).update(`${parentDid}:${name}`).digest('hex').slice(0, 16);
+}
+
+function _normalizeAllowed(list) {
+  if (!list) return [];
+  const arr = Array.isArray(list) ? list : String(list).split(',');
+  return [...new Set(arr.map(x => String(x).trim()).filter(Boolean).map(x => x.slice(0, 120)))].slice(0, 50);
+}
+
+function createWorker(db, { parentDid, name, purpose = '', allowedSecrets = [], scopeCap = 'transact', maxSpendCents = 0, createdBy = '' }) {
+  if (!WORKER_NAME_RE.test(name || '')) throw Object.assign(new Error('name: 2-31 chars, lowercase alphanumeric and hyphens'), { statusCode: 400 });
+  if (!SCOPE_ORDER.includes(scopeCap)) throw Object.assign(new Error('scope_cap: read | write | transact'), { statusCode: 400 });
+  const cap = Number(maxSpendCents || 0);
+  if (!Number.isInteger(cap) || cap < 0 || cap > 1000000) throw Object.assign(new Error('max_spend_cents: integer 0-1000000'), { statusCode: 400 });
+  const existing = db.prepare('SELECT * FROM fleet_workers WHERE parent_did = ? AND name = ?').get(parentDid, name);
+  if (existing && existing.status === 'active') throw Object.assign(new Error('worker name already in use'), { statusCode: 409 });
+  if (existing) db.prepare('DELETE FROM fleet_workers WHERE id = ?').run(existing.id);
+  const wid = workerId(parentDid, name);
+  db.prepare(`INSERT INTO fleet_workers (worker_id, parent_did, name, purpose, allowed_secrets, scope_cap, max_spend_cents, created_by)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(wid, parentDid, name, String(purpose || '').slice(0, 200), JSON.stringify(_normalizeAllowed(allowedSecrets)), scopeCap, cap, createdBy || parentDid);
+  return getWorker(db, wid);
+}
+
+function getWorker(db, wid) {
+  const w = db.prepare('SELECT * FROM fleet_workers WHERE worker_id = ?').get(wid);
+  if (!w) return null;
+  try { w.allowed = JSON.parse(w.allowed_secrets || '[]'); } catch (_) { w.allowed = []; }
+  return w;
+}
+
+function listWorkers(db, parentDid) {
+  return db.prepare('SELECT * FROM fleet_workers WHERE parent_did = ? ORDER BY id DESC').all(parentDid).map(w => {
+    try { w.allowed = JSON.parse(w.allowed_secrets || '[]'); } catch (_) { w.allowed = []; }
+    return w;
+  });
+}
+
+function revokeWorker(db, { wid, byDid }) {
+  const w = getWorker(db, wid);
+  if (!w) throw Object.assign(new Error('worker not found'), { statusCode: 404 });
+  if (w.status !== 'active') return w;
+  db.prepare("UPDATE fleet_workers SET status = 'revoked', revoked_at = datetime('now'), revoked_by = ? WHERE id = ?").run(byDid || '', w.id);
+  try { db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ? AND revoked = 0").run(w.last_jti || ''); } catch (_) {}
+  return getWorker(db, wid);
+}
+
+// Claims to mint for a worker token: scope capped, TTL capped at 30 days (identity.js clamps per scope too).
+function workerTokenClaims(worker, { scope = 'transact', expiresIn = '24h' } = {}) {
+  if (!SCOPE_ORDER.includes(scope)) throw Object.assign(new Error('scope: read | write | transact'), { statusCode: 400 });
+  const capIdx = SCOPE_ORDER.indexOf(worker.scope_cap);
+  const effScope = SCOPE_ORDER[Math.min(SCOPE_ORDER.indexOf(scope), capIdx)];
+  if (!/^\d+[smhd]$/.test(String(expiresIn))) throw Object.assign(new Error('expires_in: e.g. 1h, 24h, 7d (max 30d)'), { statusCode: 400 });
+  const m = String(expiresIn).match(/^(\d+)([smhd])$/);
+  const secs = Number(m[1]) * ({ s: 1, m: 60, h: 3600, d: 86400 })[m[2]];
+  const eff = Math.min(secs, 30 * 86400);
+  return { scope: effScope, expiresIn: `${eff}s`, metadata: { wrk: worker.worker_id, wname: worker.name, auth_method: 'worker' } };
+}
+
+function recordWorkerToken(db, worker, claims) {
+  db.prepare('UPDATE fleet_workers SET last_jti = ?, token_expires_at = ? WHERE id = ?')
+    .run(claims.jti || '', claims.exp ? new Date(claims.exp * 1000).toISOString() : null, worker.id);
+}
+
+// A decoded token with a `wrk` claim must match a live worker whose parent is the token subject.
+function resolveWorker(db, decoded) {
+  if (!decoded || !decoded.wrk) return { ok: true, worker: null };
+  const w = getWorker(db, String(decoded.wrk));
+  if (!w) return { ok: false, status: 401, error: 'unknown worker' };
+  if (w.parent_did !== decoded.sub) return { ok: false, status: 401, error: 'worker/parent mismatch' };
+  if (w.status !== 'active') return { ok: false, status: 401, error: `worker ${w.worker_id} is ${w.status}` };
+  return { ok: true, worker: w };
+}
+
+// Worker tokens may only touch the secrets on their allow-list (by ref code or name); an empty list means
+// "whatever the parent may use".
+function workerMayUseSecret(db, decoded, secret) {
+  const r = resolveWorker(db, decoded);
+  if (!r.ok) return r;
+  if (!r.worker) return { ok: true };
+  const allowed = r.worker.allowed || [];
+  if (!allowed.length) return { ok: true, worker: r.worker };
+  const ok = allowed.includes(secret.ref_code) || allowed.includes(secret.name);
+  return ok ? { ok: true, worker: r.worker } : { ok: false, status: 403, error: `worker ${r.worker.worker_id} may not use secret '${secret.name}'`, worker: r.worker };
+}
+
+function workerView(w) {
+  return { worker_id: w.worker_id, name: w.name, purpose: w.purpose, allowed_secrets: w.allowed || [], scope_cap: w.scope_cap,
+           max_spend_cents: w.max_spend_cents, spent_cents: w.spent_cents, use_count: w.use_count, status: w.status,
+           token_expires_at: w.token_expires_at, created_at: w.created_at, created_by: w.created_by, revoked_at: w.revoked_at };
+}
+
+// Secrets a silicon uses: its own stored secrets + the ones delegated to it.
+function siliconSecrets(db, did) {
+  const own = db.prepare(`SELECT id, name, ref_code, secret_type, status, use_count, last_used_at, category, created_at
+                          FROM blindkey_secrets WHERE did = ? AND status IN ('active','frozen') ORDER BY name`).all(did);
+  const delegated = db.prepare(`SELECT d.id AS delegation_id, d.status, d.max_uses, d.use_count, d.granted_at, d.expires_at, d.owner_did,
+                                       b.name AS secret_name, b.ref_code, b.secret_type, b.last_used_at
+                                FROM demipass_delegations d JOIN blindkey_secrets b ON b.id = d.secret_id
+                                WHERE d.delegate_did = ? ORDER BY d.granted_at DESC LIMIT 100`).all(did);
+  return { own, delegated };
+}
+
 // ── Claims (mailbox-consent link for existing identities) ───────────────────
 function issueClaim(db, siliconRow, { ttlHours = 72 } = {}) {
   const code = 'clm_' + crypto.randomBytes(18).toString('base64url');
@@ -660,6 +817,7 @@ module.exports = {
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
   issueClaim, redeemClaim, claimEmail, hashToken,
+  workerId, createWorker, getWorker, listWorkers, revokeWorker, workerTokenClaims, recordWorkerToken, resolveWorker, workerMayUseSecret, workerView, siliconSecrets,
   didRecordEmail, tokenWarningEmail,
   HANDLE_RE, PROJECT_RE, INITIATORS, TOKEN_WARN_DAYS, REFILL_COOLDOWN_MS,
 };

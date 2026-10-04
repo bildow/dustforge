@@ -316,6 +316,7 @@ function billingMiddleware(db, actionType, options = {}) {
     if (isWrite && !identity.scopeAtLeast(scope, 'write')) {
       return res.status(403).json({ error: `scope '${scope}' cannot perform '${actionType}'`, required_scope: 'write' });
     }
+    req.identity = { did, scope, decoded: result.decoded };   // visible to attribution (worker claim) before the charge
 
     if (cost > 0) {
       // Attributed billing (./fleet_billing): the payer may be the caller, a fleet

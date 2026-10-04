@@ -24,7 +24,9 @@ function mkdb() {
   db.exec(`CREATE TABLE fleet_projects (id INTEGER PRIMARY KEY AUTOINCREMENT, fleet_id INTEGER, project TEXT, owner_did TEXT, lane_address TEXT DEFAULT '', wallet_did TEXT, UNIQUE(fleet_id, project))`);
   db.exec(`CREATE TABLE fleet_project_operators (project_id INTEGER, operator_did TEXT, UNIQUE(project_id, operator_did))`);
   db.exec(`CREATE TABLE ticks (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP)`);
-  db.exec(`CREATE TABLE issued_tokens (jti TEXT PRIMARY KEY, did TEXT, scope TEXT, issued_at INTEGER, expires_at INTEGER, revoked INTEGER DEFAULT 0)`);
+  db.exec(`CREATE TABLE issued_tokens (jti TEXT PRIMARY KEY, did TEXT, scope TEXT, issued_at INTEGER, expires_at INTEGER, revoked INTEGER DEFAULT 0, revoked_at TEXT)`);
+  db.exec(`CREATE TABLE blindkey_secrets (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT, name TEXT, ref_code TEXT DEFAULT '', secret_type TEXT DEFAULT 'password', status TEXT DEFAULT 'active', use_count INTEGER DEFAULT 0, last_used_at TEXT, category TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)`);
+  db.exec(`CREATE TABLE demipass_delegations (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_did TEXT, delegate_did TEXT, secret_id INTEGER, status TEXT DEFAULT 'active', max_uses INTEGER DEFAULT 0, use_count INTEGER DEFAULT 0, granted_at TEXT DEFAULT CURRENT_TIMESTAMP, expires_at TEXT, revoked_at TEXT)`);
   fb.initSchema(db);
   const w = db.prepare('INSERT INTO identity_wallets (did, username, email) VALUES (?, ?, ?)');
   w.run(OWNER, 'aaron', 'aaron@dustforge.com');
@@ -247,4 +249,61 @@ test('runRefills runs every engine and attributionReport/recentSpend read back',
   const view = fb.siliconView(db, billing, fb.getSilicon(db, 1, 'brain'), { fleet: { slug: 'aaron-agents', name: 'Aaron Agents' } });
   assert.equal(view.balance_cents, 498); assert.equal(view.refill.threshold_cents, 50); assert.equal(view.token.status, 'none');
   assert.match(fb.didRecordEmail({ silicon: fb.getSilicon(db, 1, 'brain'), fleet: { name: 'Aaron Agents', slug: 'aaron-agents', owner_did: OWNER }, wallet: { username: 'brain', email: 'brain@dustforge.com' } }), /Silicon id:\s+sil_/);
+});
+
+test('workers: hashed id, capped token claims, allow-list, spend cap, revoke, name reuse', () => {
+  const db = mkdb();
+  fund(db, BRAIN, 100);
+  const w = fb.createWorker(db, { parentDid: BRAIN, name: 'brain2', purpose: 'testing', allowedSecrets: ['DP-PWD-phasewhi-c4b276f9'], scopeCap: 'transact', maxSpendCents: 3 });
+  assert.match(w.worker_id, /^wrk_[0-9a-f]{16}$/);
+  assert.equal(fb.workerId(BRAIN, 'brain2'), w.worker_id);
+  assert.notEqual(fb.workerId(OTHER, 'brain2'), w.worker_id);
+  const claims = fb.workerTokenClaims(w, { scope: 'transact', expiresIn: '90d' });
+  assert.equal(claims.scope, 'transact'); assert.equal(claims.expiresIn, `${30 * 86400}s`);
+  assert.equal(claims.metadata.wrk, w.worker_id); assert.equal(claims.metadata.auth_method, 'worker');
+  const reader = fb.createWorker(db, { parentDid: BRAIN, name: 'reader', scopeCap: 'read' });
+  assert.equal(fb.workerTokenClaims(reader, { scope: 'transact' }).scope, 'read', 'scope is capped by the worker');
+  assert.throws(() => fb.workerTokenClaims(w, { scope: 'admin' }), /scope/);
+  const decoded = { sub: BRAIN, wrk: w.worker_id };
+  assert.equal(fb.workerMayUseSecret(db, decoded, { ref_code: 'DP-PWD-phasewhi-c4b276f9', name: 'phasewhip-ssh' }).ok, true);
+  const denied = fb.workerMayUseSecret(db, decoded, { ref_code: 'DP-X', name: 'other' });
+  assert.equal(denied.ok, false); assert.equal(denied.status, 403);
+  assert.equal(fb.workerMayUseSecret(db, { sub: BRAIN, wrk: reader.worker_id }, { ref_code: 'DP-X', name: 'other' }).ok, true, 'empty allow-list = parent\'s access');
+  const mismatch = fb.resolveWorker(db, { sub: OTHER, wrk: w.worker_id });
+  assert.equal(mismatch.ok, false); assert.equal(mismatch.status, 401);
+  // charges through a worker token: the parent pays, the worker's spend is tracked and capped
+  const r1 = fb.chargeAttributed(db, billing, { callerDid: BRAIN, cost: 2, actionType: 'api_call_compute', attribution: { worker: w.worker_id } });
+  assert.equal(r1.ok, true); assert.equal(r1.payer_did, BRAIN); assert.equal(r1.worker_id, w.worker_id);
+  assert.equal(db.prepare('SELECT worker_id FROM billing_attributions WHERE id = ?').get(r1.attribution_id).worker_id, w.worker_id);
+  assert.equal(fb.getWorker(db, w.worker_id).spent_cents, 2);
+  const r2 = fb.chargeAttributed(db, billing, { callerDid: BRAIN, cost: 2, actionType: 'api_call_compute', attribution: { worker: w.worker_id } });
+  assert.equal(r2.ok, false); assert.equal(r2.status, 402); assert.match(r2.error, /spend cap/);
+  assert.equal(bal(db, BRAIN), 98);
+  // worker + operator project attribution compose: owner pays, worker recorded
+  fund(db, OWNER, 10);
+  const r3 = fb.chargeAttributed(db, billing, { callerDid: BRAIN, cost: 1, actionType: 'api_call_compute', attribution: { worker: w.worker_id, project: 'brain', initiator: 'operator' } });
+  assert.equal(r3.ok, true); assert.equal(r3.payer_did, OWNER); assert.equal(r3.worker_id, w.worker_id);
+  // revoke closes the token path and revokes the last minted jti
+  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('wj1', BRAIN, 'transact', 0, 9999999999);
+  fb.recordWorkerToken(db, w, { jti: 'wj1', exp: 9999999999 });
+  fb.revokeWorker(db, { wid: w.worker_id, byDid: BRAIN });
+  assert.equal(db.prepare("SELECT revoked FROM issued_tokens WHERE jti = 'wj1'").get().revoked, 1);
+  const r4 = fb.resolvePayer(db, billing, { callerDid: BRAIN, attribution: { worker: w.worker_id }, cost: 1 });
+  assert.equal(r4.ok, false); assert.equal(r4.status, 401);
+  assert.equal(fb.createWorker(db, { parentDid: BRAIN, name: 'brain2' }).status, 'active', 'a revoked name can be reused');
+  assert.throws(() => fb.createWorker(db, { parentDid: BRAIN, name: 'brain2' }), /already in use/);
+  assert.throws(() => fb.createWorker(db, { parentDid: BRAIN, name: 'Bad Name' }), /name/);
+  assert.equal(fb.parseAttribution({ headers: {}, body: {}, identity: { decoded: { wrk: 'wrk_x' } } }).worker, 'wrk_x');
+  assert.equal(fb.listWorkers(db, BRAIN).length, 2);
+});
+
+test('siliconSecrets lists own and delegated secrets', () => {
+  const db = mkdb();
+  db.prepare("INSERT INTO blindkey_secrets (did, name, ref_code, secret_type, use_count) VALUES (?, 'brain-openrouter', 'DP-API-brainope-1', 'api_key', 7)").run(BRAIN);
+  db.prepare("INSERT INTO blindkey_secrets (did, name, ref_code, secret_type, status) VALUES (?, 'old', 'DP-X', 'password', 'deleted')").run(BRAIN);
+  db.prepare("INSERT INTO blindkey_secrets (did, name, ref_code, secret_type) VALUES (?, 'phasewhip-ssh', 'DP-PWD-phasewhi-c4b276f9', 'password')").run(OWNER);
+  db.prepare("INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id) VALUES (?, ?, 3)").run(OWNER, BRAIN);
+  const s = fb.siliconSecrets(db, BRAIN);
+  assert.deepEqual(s.own.map(x => x.name), ['brain-openrouter']);
+  assert.equal(s.delegated.length, 1); assert.equal(s.delegated[0].secret_name, 'phasewhip-ssh'); assert.equal(s.delegated[0].owner_did, OWNER);
 });
