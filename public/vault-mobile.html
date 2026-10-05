@@ -115,8 +115,15 @@
     <input type="password" id="auth-pass" placeholder="Password" autocomplete="current-password" style="width:100%;padding-right:3rem">
     <span onclick="togglePassVis()" style="position:absolute;right:0.8rem;top:50%;transform:translateY(-50%);cursor:pointer;font-size:1.1rem;color:var(--text3);user-select:none" id="pass-eye">👁</span>
   </div>
-  <button onclick="login()">Sign in</button>
+  <button onclick="login()" id="auth-btn">Sign in</button>
   <div id="auth-err" class="auth-err"></div>
+  <div id="auth-2fa" style="display:none;width:100%;max-width:320px;margin-top:0.5rem">
+    <div id="auth-2fa-msg" style="font-size:0.8rem;color:var(--text2);margin-bottom:0.4rem">Second step: enter the 6-digit code from your authenticator app, or one of your recovery codes.</div>
+    <input type="text" id="auth-otp" placeholder="123456 or recovery code" inputmode="numeric" autocomplete="one-time-code" style="width:100%">
+    <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.75rem;color:var(--text3);margin:0.4rem 0"><input type="checkbox" id="auth-remember" checked style="width:auto;margin:0">Remember this device for 30 days</label>
+    <button onclick="login()">Verify</button>
+    <button onclick="sendEmailCode()" style="margin-top:0.4rem;background:none;border:1px solid var(--border);color:var(--text2)">Email me a code instead</button>
+  </div>
   <a href="https://demipass.com/reset-password.html" style="display:block;text-align:center;margin-top:1rem;color:var(--text3);font-size:0.8rem;text-decoration:none">Forgot password?</a>
 </div>
 
@@ -318,6 +325,11 @@
         </div>
         <div id="phone-msg" style="font-size:0.7rem;margin-top:0.25rem;margin-bottom:0.75rem"></div>
       </div>
+      <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Security</div>
+      <div style="background:var(--card);border-radius:12px;padding:1rem">
+        <div id="twofa-status" style="font-size:0.8rem;color:var(--text3)">Loading…</div>
+        <div id="twofa-box" style="margin-top:0.6rem"></div>
+      </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
         <button class="btn-ghost" onclick="verifyChain()" style="width:100%;text-align:left;padding:0.8rem">Verify chain integrity</button>
@@ -476,14 +488,34 @@ else if(tk){logout();document.getElementById('auth-err').textContent='Please sig
 function autoLogoutIfExpired(){if(tk&&isTokenExpired()){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';return true}return false}
 async function api(m,p,b){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const r=await fetch(API+p,o);if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(r.status>=400)throw new Error(d.error||(r.status===401?'wrong username or password':'failed'));return d}
 
+let _otpMode='totp';
 async function login(){
   const u=document.getElementById('auth-user').value.trim(),p=document.getElementById('auth-pass').value,e=document.getElementById('auth-err');
   e.textContent='';if(!u||!p){e.textContent='Username and password required';return}
+  const otpEl=document.getElementById('auth-otp'),otp=(otpEl.value||'').trim();
+  const body={username:u,password:p,scope:'transact',expires_in:'24h'};
+  const dev=localStorage.getItem('dp_device_'+u);if(dev)body.device_token=dev;
+  if(otp){if(/^\d{6}$/.test(otp))body[_otpMode==='email'?'email_code':'otp']=otp;else body.recovery_code=otp;body.remember_device=document.getElementById('auth-remember').checked}
   try{
     e.textContent='Signing in...';e.style.color='var(--text3)';
-    const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
+    const r=await fetch(API+'/api/identity/auth-fingerprint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const a=await r.json().catch(()=>({}));
+    if(r.status===401&&a.twofa_required){
+      document.getElementById('auth-2fa').style.display='block';document.getElementById('auth-btn').style.display='none';
+      if(otp){e.textContent=a.detail||'Code not accepted';e.style.color='var(--red)';otpEl.value='';}else{e.textContent='';}
+      otpEl.focus();return}
     if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
+    if(a.device_token)localStorage.setItem('dp_device_'+u,a.device_token);
+    otpEl.value='';document.getElementById('auth-2fa').style.display='none';document.getElementById('auth-btn').style.display='';_otpMode='totp';
     tk=a.token;did=a.did||'';user=u;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
+  }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
+async function sendEmailCode(){
+  const u=document.getElementById('auth-user').value.trim(),p=document.getElementById('auth-pass').value,e=document.getElementById('auth-err');
+  try{e.textContent='Sending…';e.style.color='var(--text3)';
+    const r=await fetch(API+'/api/identity/2fa/email/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const a=await r.json().catch(()=>({}));
+    if(!a.ok){e.textContent=a.error||'Could not send the code';e.style.color='var(--red)';return}
+    _otpMode='email';document.getElementById('auth-2fa-msg').textContent='Enter the 6-digit code we emailed to '+(a.sent_to||'your recovery email')+'.';e.textContent='';document.getElementById('auth-otp').focus();
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
 
 // Device login approval: hand off to /device.html on this same origin, which reuses this
@@ -684,7 +716,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();}
+  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadTwofa();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -1433,6 +1465,37 @@ async function loadSiliconAgents(){
   }catch(e){document.getElementById('silicon-agents').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 
+// ── Two-factor (Settings → Security) ──
+async function loadTwofa(){
+  const st=document.getElementById('twofa-status'),box=document.getElementById('twofa-box');
+  try{
+    const d=await api('GET','/api/identity/2fa/status');
+    if(!d.enabled){
+      st.innerHTML='<span style="color:var(--red)">Two-factor authentication is OFF.</span> This vault holds your passwords; a second factor keeps a stolen password from opening it.';
+      box.innerHTML='<button class="btn-primary" onclick="twofaSetup()" style="width:100%;padding:0.6rem">Set up an authenticator app</button>'+(d.recovery_email_set?'':'<div style="font-size:0.7rem;color:var(--yellow);margin-top:0.4rem">Set a recovery email above first: emailed codes go there if you lose the authenticator.</div>');
+      return}
+    st.innerHTML='<span style="color:var(--green)">Two-factor is ON</span> since '+esc((d.enabled_at||'').slice(0,10))+' · authenticator '+(d.totp?'✓':'—')+' · '+d.recovery_codes_left+' recovery codes left · emailed codes go to '+esc(d.email_hint||'—');
+    let h='';
+    if((d.trusted_devices||[]).length){h+='<div style="font-size:0.7rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem">Trusted devices (skip the code for 30 days)</div>';
+      for(const v of d.trusted_devices)h+='<div style="display:flex;justify-content:space-between;align-items:center;font-size:0.75rem;padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.25)"><span>'+esc((v.label||'device').slice(0,40))+'<div style="font-size:0.62rem;color:var(--text3)">added '+esc((v.created_at||'').slice(0,10))+(v.last_used_at?' · used '+esc(v.last_used_at.slice(0,10)):'')+'</div></span><button class="btn-ghost" onclick="twofaRevokeDevice('+v.id+')" style="font-size:0.65rem">Revoke</button></div>'}
+    h+='<div style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-ghost" onclick="twofaNewCodes()" style="flex:1;font-size:0.75rem">New recovery codes</button><button class="btn-ghost" onclick="twofaDisable()" style="flex:1;font-size:0.75rem;color:var(--red)">Turn off</button></div>';
+    box.innerHTML=h;
+  }catch(e){st.textContent=e.message}}
+async function twofaSetup(){
+  const box=document.getElementById('twofa-box');
+  try{const d=await api('POST','/api/identity/2fa/totp/setup');
+    box.innerHTML='<div style="font-size:0.78rem;color:var(--text2);line-height:1.5">1. Open your authenticator app (Aegis, Google Authenticator, 1Password, Bitwarden…).<br>2. <a href="'+esc(d.otpauth_uri)+'" style="color:var(--accent)">Tap here to add DemiPass</a>, or enter this key by hand:</div>'
+      +'<div style="font-family:monospace;font-size:0.8rem;word-break:break-all;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.5rem;margin:0.5rem 0">'+esc(d.secret.replace(/(.{4})/g,"$1 ").trim())+' <button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(d.secret)+'\')" style="font-size:0.6rem;padding:0.1rem 0.4rem">copy</button></div>'
+      +'<div style="font-size:0.78rem;color:var(--text2)">3. Enter the 6-digit code the app shows now:</div><div style="display:flex;gap:0.5rem;margin-top:0.4rem"><input type="text" id="twofa-code" inputmode="numeric" placeholder="123456" style="flex:1;margin:0;padding:0.5rem"><button class="btn-primary" onclick="twofaConfirm()" style="font-size:0.78rem">Confirm</button></div><div id="twofa-msg" style="font-size:0.72rem;margin-top:0.3rem"></div>';
+  }catch(e){alert(e.message)}}
+async function twofaConfirm(){
+  const m=document.getElementById('twofa-msg');
+  try{const d=await api('POST','/api/identity/2fa/totp/confirm',{code:document.getElementById('twofa-code').value.trim()});
+    document.getElementById('twofa-box').innerHTML='<div style="font-size:0.8rem;color:var(--green);font-weight:700">Two-factor is on.</div><div style="font-size:0.75rem;color:var(--red);margin:0.4rem 0">Save these recovery codes now. They are shown once; each opens the vault one time if you lose the authenticator.</div><textarea readonly style="width:100%;height:7rem;font-family:monospace;font-size:0.8rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:8px">'+esc(d.recovery_codes.join("\n"))+'</textarea><div style="display:flex;gap:0.5rem;margin-top:0.4rem"><button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(d.recovery_codes.join("\\n"))+'\')" style="flex:1;font-size:0.75rem">Copy</button><button class="btn-primary" onclick="loadTwofa()" style="flex:1;font-size:0.75rem">I saved them</button></div>';
+  }catch(e){m.textContent=e.message;m.style.color='var(--red)'}}
+async function twofaNewCodes(){const c=prompt('Enter a current authenticator code (or a recovery code) to issue new recovery codes:');if(!c)return;try{const d=await api('POST','/api/identity/2fa/recovery-codes',/^\d{6}$/.test(c.trim())?{otp:c.trim()}:{recovery_code:c.trim()});alert('New recovery codes (the old ones no longer work):\n\n'+d.recovery_codes.join('\n'));loadTwofa()}catch(e){alert(e.message)}}
+async function twofaDisable(){const c=prompt('Turning two-factor OFF. Enter a current authenticator code (or a recovery code):');if(!c)return;try{await api('POST','/api/identity/2fa/disable',/^\d{6}$/.test(c.trim())?{otp:c.trim()}:{recovery_code:c.trim()});loadTwofa()}catch(e){alert(e.message)}}
+async function twofaRevokeDevice(id){try{await api('DELETE','/api/identity/2fa/devices/'+id);loadTwofa()}catch(e){alert(e.message)}}
 function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
 function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
