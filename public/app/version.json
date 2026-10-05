@@ -2,7 +2,7 @@
   "package": "com.dustforge.demipass",
   "versionCode": 2,
   "versionName": "1.1.0",
-  "apkUrl": "https://demipass.com/app/demipass.apk",
+  "apkUrl": "https://demipass.com/app/demipass.apk?v=2",
   "sha256": "19a2ad5b88c32e88c1ab4e69ef2c32a2025d525b57820f28e7fdad8b30d4d931",
   "size": 141142,
   "released": "2026-10-05",
