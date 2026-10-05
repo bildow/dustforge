@@ -7,3 +7,6 @@ IDENTITY_MASTER_KEY
 
 # Local Netlify folder
 .netlify
+
+# Android APK is published by demipass-android/release.sh (scp), never committed
+public/app/*.apk
