@@ -149,7 +149,7 @@
   </div>
 
   <!-- Namespace banner — fleet wallet stub -->
-  <div onclick="alert('Fleet wallet coming soon — manage silicon agents and shared DD pools')" style="background:var(--card);border-bottom:1px solid var(--border);padding:0.5rem 1rem;display:flex;justify-content:space-between;align-items:center;cursor:pointer">
+  <div onclick="goPage('fleet');loadFleet()" style="background:var(--card);border-bottom:1px solid var(--border);padding:0.5rem 1rem;display:flex;justify-content:space-between;align-items:center;cursor:pointer">
     <div style="display:flex;align-items:center;gap:0.5rem">
       <div style="width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green)"></div>
       <span style="font-weight:700;font-size:0.9rem" id="ns-id">—</span>
@@ -273,6 +273,28 @@
     </div>
   </div>
 
+  <!-- Page: Fleet (owner view: silicons, refills, attribution, work links) -->
+  <div id="page-fleet" class="page">
+    <div class="section" style="padding-top:1rem">
+      <div class="section-head">
+        <span class="section-title" id="fleet-title">Fleet</span>
+        <div style="display:flex;gap:0.4rem">
+          <button class="btn-ghost" onclick="loadFleet()" style="font-size:0.7rem">Refresh</button>
+          <button class="btn-primary" onclick="openAddSilicon()">+ Silicon</button>
+        </div>
+      </div>
+      <div id="fleet-content"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
+  <!-- Page: Silicon subpage -->
+  <div id="page-silicon" class="page">
+    <div style="padding:1rem">
+      <button onclick="closeSilicon()" style="background:none;border:none;color:var(--accent);font-size:0.9rem;cursor:pointer;padding:0;margin-bottom:1rem">← Back to Fleet</button>
+      <div id="silicon-content"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
   <!-- Page: Settings -->
   <div id="page-settings" class="page">
     <div class="section" style="padding-top:1rem">
@@ -333,7 +355,43 @@
     <div class="bn-item" data-page="activity"><span class="bn-icon">&#x26a1;</span>Activity</div>
     <div class="bn-item" data-page="buoy"><span class="bn-icon">&#x2693;</span>Buoy</div>
     <div class="bn-item" data-page="dustforge"><span class="bn-icon">&#x2726;</span>Dustforge</div>
+    <div class="bn-item" data-page="fleet"><span class="bn-icon">&#x1f6f0;</span>Fleet</div>
     <div class="bn-item" data-page="settings"><span class="bn-icon">&#x2699;</span>Settings</div>
+  </div>
+</div>
+
+<!-- Add Silicon Modal -->
+<div id="modal-silicon" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Add a Silicon</h3>
+    <div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">A silicon gets its own subpage, its own wallet, a hashed silicon id, and a record of its DID by email.</div>
+    <label>Name (subpage title)</label><input type="text" id="sil-name" placeholder="e.g. Brain">
+    <label>Handle</label><input type="text" id="sil-handle" placeholder="e.g. brain (lowercase, hyphens ok)">
+    <label>Contact email</label><input type="email" id="sil-email" placeholder="e.g. brain@dustforge.com">
+    <label>Identity</label>
+    <select id="sil-mode" onchange="updateSiliconFields()">
+      <option value="existing">Existing identity — matched by contact email or DID</option>
+      <option value="create">Create a new identity (mailbox + wallet, 100 DD)</option>
+    </select>
+    <div id="sil-existing-fields">
+      <label>DID (optional, if the email doesn't match)</label><input type="text" id="sil-did" placeholder="did:key:…">
+      <label>Proof (optional): a token of that identity</label><input type="password" id="sil-member-token" placeholder="paste its bearer token — otherwise a confirm link is emailed">
+    </div>
+    <div id="sil-create-fields" style="display:none">
+      <label>Username</label><input type="text" id="sil-username" placeholder="defaults to the handle">
+    </div>
+    <label>Auto-refill from your wallet</label>
+    <div style="display:flex;gap:0.5rem;align-items:center;margin-bottom:0.5rem">
+      <input type="checkbox" id="sil-refill-enabled" checked style="width:auto">
+      <span style="font-size:0.75rem;color:var(--text3)">when below</span><input type="number" id="sil-refill-threshold" value="50" min="0" style="width:5rem;margin:0">
+      <span style="font-size:0.75rem;color:var(--text3)">DD, add</span><input type="number" id="sil-refill-amount" value="500" min="0" style="width:5rem;margin:0">
+      <span style="font-size:0.75rem;color:var(--text3)">DD</span>
+    </div>
+    <div id="sil-msg" style="font-size:0.75rem;margin:0.25rem 0"></div>
+    <div style="display:flex;gap:0.5rem;margin-top:0.75rem">
+      <button class="btn-ghost" onclick="closeModal()" style="flex:1">Cancel</button>
+      <button class="btn-primary" onclick="addSilicon()" style="flex:1">Add</button>
+    </div>
   </div>
 </div>
 
@@ -434,6 +492,191 @@ function approveDevice(){const raw=(document.getElementById('device-code').value
 
 function logout(){tk='';did='';user='';localStorage.removeItem('dp_token');localStorage.removeItem('dp_did');localStorage.removeItem('dp_user');localStorage.removeItem('dp_token_at');document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
 
+// ── Fleet tab ──────────────────────────────────────────────────────────────
+let fleetSlug=null, fleetData=null, siliconHandle=null;
+function dd(c){return (Number(c)||0).toLocaleString()}
+function tokenChip(t){
+  const m={valid:['var(--green)','token ok'],expiring:['var(--yellow)','token expiring'],expired:['var(--red)','token expired'],none:['var(--text3)','no token']};
+  const [c,l]=m[t&&t.status]||m.none;
+  return '<span style="color:'+c+';font-size:0.65rem;border:1px solid '+c+';border-radius:6px;padding:0.05rem 0.35rem">'+l+(t&&t.days_left!=null&&t.status!=='expired'?' · '+t.days_left+'d':'')+'</span>';
+}
+function goPage(p){document.querySelectorAll('.bn-item').forEach(x=>x.classList.toggle('active',x.dataset.page===p));document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById('page-'+p).classList.add('active')}
+async function pickFleet(){
+  if(fleetSlug)return fleetSlug;
+  const r=await api('GET','/api/fleets/mine');
+  const mine=(r.fleets||[]);
+  const owned=mine.find(f=>f.role==='owner')||mine[0];
+  fleetSlug=owned?owned.slug:null;
+  return fleetSlug;
+}
+async function loadFleet(){
+  const el=document.getElementById('fleet-content');
+  try{
+    const slug=await pickFleet();
+    if(!slug){el.innerHTML='<div class="empty">You have no fleet yet. Create one via the API (POST /api/fleet/create) — silicons live under a fleet.</div>';return}
+    const d=await api('GET','/api/fleet/'+encodeURIComponent(slug)+'/overview');
+    fleetData=d;
+    document.getElementById('fleet-title').textContent=d.fleet.name;
+    const owner=d.owner, rule=owner&&owner.refill_rule;
+    let h='';
+    // Owner wallet + weekly refill
+    if(owner){
+      h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:baseline"><span style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">Your wallet</span><span style="font-weight:700;font-size:1.1rem">'+dd(owner.balance_cents)+' DD</span></div>';
+      h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.6rem;text-transform:uppercase;letter-spacing:0.05em">Auto-refill your wallet</div>';
+      h+='<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;margin-top:0.3rem;font-size:0.78rem">';
+      h+='<input type="checkbox" id="own-refill-enabled" '+(rule&&rule.enabled?'checked':'')+' style="width:auto;margin:0"> <span>every</span>';
+      h+='<select id="own-refill-cadence" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.75rem;margin:0">'+['daily','weekly','monthly'].map(c=>'<option value="'+c+'"'+((rule?rule.cadence:'weekly')===c?' selected':'')+'>'+c+'</option>').join('')+'</select>';
+      h+='<span>add</span><input type="number" id="own-refill-amount" value="'+(rule?rule.amount_cents:1000)+'" min="0" style="width:5.5rem;margin:0;padding:0.3rem"><span>DD</span>';
+      h+='<button class="btn-primary" onclick="saveOwnerRefill()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Save</button></div>';
+      h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.35rem">'+(rule&&rule.enabled?('next: '+new Date(rule.next_run_at).toLocaleString()+(rule.last_error?' · <span style="color:var(--red)">'+esc(rule.last_error)+'</span>':'')):'off')+' · funding: operator grant</div>';
+      h+='</div>';
+    }
+    // Silicons
+    h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">Silicons</span><span style="font-size:0.7rem;color:var(--text3)">'+d.silicons.length+' / '+d.fleet.max_agents+'</span></div>';
+    if(!d.silicons.length)h+='<div class="empty">No silicons yet. Tap + Silicon to add one.</div>';
+    for(const s of d.silicons){
+      h+='<div onclick="openSilicon(\''+esc(s.handle)+'\')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong style="color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700">'+dd(s.balance_cents)+' DD</div></div>';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.35rem;font-size:0.68rem;color:var(--text3)"><span>'+(s.refill.enabled?('refill +'+dd(s.refill.amount_cents)+' below '+dd(s.refill.threshold_cents)):'no auto-refill')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</span>'+tokenChip(s.token)+'</div>';
+      h+='</div>';
+    }
+    // Projects
+    if(d.projects&&d.projects.length){
+      h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Projects (cost centers)</span></div>';
+      for(const p of d.projects){
+        h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.45rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">';
+        h+='<div><strong>'+esc(p.project)+'</strong><div style="font-size:0.65rem;color:var(--text3)">'+p.operators.length+' operator'+(p.operators.length===1?'':'s')+' · wallet '+dd(p.wallet_balance_cents)+' DD</div></div>';
+        h+='<select onchange="setBillMode(\''+esc(p.project)+'\',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
+        h+='</div>';
+      }
+    }
+    // Attribution
+    const rows=(d.attribution&&d.attribution.rows)||[];
+    h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Who paid for what (30d)</span></div>';
+    if(!rows.length)h+='<div class="empty" style="font-size:0.75rem">No attributed spend yet.</div>';
+    const name=did=>{const s=d.silicons.find(x=>x.did===did);return s?'@'+s.handle:(did===d.fleet.owner_did?'you':did.slice(8,20)+'…')};
+    for(const r of rows.slice(0,25)){
+      h+='<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+name(r.actor_did)+' → '+(r.project?esc(r.project):'—')+' <span style="color:var(--text3)">'+esc(r.initiator)+'</span></span><span><span style="color:var(--text3)">'+name(r.payer_did)+' paid</span> <strong>'+dd(r.cents)+' DD</strong> <span style="color:var(--text3)">('+r.calls+')</span></span></div>';
+    }
+    // Work links
+    const links=d.work_links||[];
+    if(links.length){
+      h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Work links</span><span style="font-size:0.7rem;color:var(--text3)">tick '+d.current_tick+'</span></div>';
+      for(const l of links.slice(0,20))h+=workLinkRow(l,d.current_tick);
+    }
+    el.innerHTML=h;
+  }catch(e){el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+}
+function workLinkRow(l,tick){
+  const live=l.status==='active';
+  let h='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem">';
+  h+='<div>#'+l.id+' '+esc(l.requester||l.requester_did.slice(8,18))+' → '+esc(l.provider||l.provider_did.slice(8,18))+(l.project?' · '+esc(l.project):'')+'<div style="font-size:0.65rem;color:var(--text3)">'+esc(l.status)+(live?' · until tick '+l.end_tick+' ('+Math.max(0,l.end_tick-tick)+' left)':'')+' · spent '+dd(l.spent_cents)+' DD'+(l.note?' · '+esc(l.note):'')+'</div></div>';
+  if(['pending','active'].includes(l.status))h+='<button class="btn-ghost" onclick="revokeWorkLink('+l.id+')" style="font-size:0.65rem">Revoke</button>';
+  return h+'</div>';
+}
+async function saveOwnerRefill(){
+  try{
+    await api('PUT','/api/fleet/'+encodeURIComponent(fleetSlug)+'/owner-refill',{cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:'operator_grant'});
+    loadFleet();
+  }catch(e){alert(e.message)}
+}
+async function setBillMode(project,mode){try{await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(project),{bill_mode:mode})}catch(e){alert(e.message);loadFleet()}}
+async function revokeWorkLink(id){if(!confirm('Revoke work link #'+id+'?'))return;try{await api('POST','/api/work-links/'+id+'/revoke');siliconHandle?openSilicon(siliconHandle):loadFleet()}catch(e){alert(e.message)}}
+function openAddSilicon(){if(!fleetSlug){alert('No fleet yet');return}document.getElementById('sil-msg').textContent='';openModal('silicon')}
+function updateSiliconFields(){const c=document.getElementById('sil-mode').value==='create';document.getElementById('sil-create-fields').style.display=c?'block':'none';document.getElementById('sil-existing-fields').style.display=c?'none':'block'}
+async function addSilicon(){
+  const m=document.getElementById('sil-msg');
+  const body={handle:document.getElementById('sil-handle').value.trim().toLowerCase(),display_name:document.getElementById('sil-name').value.trim(),contact_email:document.getElementById('sil-email').value.trim(),
+    refill:{enabled:document.getElementById('sil-refill-enabled').checked,threshold_cents:Number(document.getElementById('sil-refill-threshold').value||0),amount_cents:Number(document.getElementById('sil-refill-amount').value||0)}};
+  if(document.getElementById('sil-mode').value==='create'){body.create={username:document.getElementById('sil-username').value.trim()||undefined}}
+  else{const d=document.getElementById('sil-did').value.trim();if(d)body.did=d;const t=document.getElementById('sil-member-token').value.trim();if(t)body.member_token=t}
+  if(!body.handle){m.textContent='Handle required';m.style.color='var(--red)';return}
+  try{
+    m.textContent='Working…';m.style.color='var(--text3)';
+    const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons',body);
+    if(r.mode==='pending_claim'){alert('A confirmation link was emailed to '+r.claim_sent_to+'. The silicon appears once that link is opened.')}
+    else if(r.mode==='created'){alert('Created '+r.email+'\nDID: '+r.did+(r.password_once?'\n\nOne-time password (not stored, not emailed):\n'+r.password_once:''))}
+    closeModal();document.getElementById('sil-member-token').value='';loadFleet();
+  }catch(e){m.textContent=e.message;m.style.color='var(--red)'}
+}
+async function openSilicon(handle){
+  siliconHandle=handle;goPage('fleet');document.getElementById('page-fleet').classList.remove('active');document.getElementById('page-silicon').classList.add('active');
+  const el=document.getElementById('silicon-content');el.innerHTML='<div class="empty">Loading…</div>';
+  try{
+    const d=await api('GET','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(handle));
+    const s=d.silicon;
+    let h='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:baseline"><div><strong style="font-size:1.05rem;color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700;font-size:1.2rem">'+dd(s.balance_cents)+' DD</div></div>';
+    h+='<div style="font-size:0.72rem;color:var(--text3);margin-top:0.3rem">'+esc(s.contact_email||s.email||'')+'</div>';
+    h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">Silicon id (share this, not the DID)</div><div style="font-family:monospace;font-size:0.75rem;word-break:break-all">'+esc(s.silicon_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(s.silicon_id)+'\')" style="font-size:0.6rem;padding:0.1rem 0.4rem">copy</button></div>';
+    h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">DID</div><div style="font-family:monospace;font-size:0.62rem;word-break:break-all;color:var(--accent)">'+esc(s.did)+'</div>';
+    h+='<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.75rem"><input type="number" id="sil-refill-now" value="'+(s.refill.amount_cents||100)+'" min="1" style="width:6rem;margin:0;padding:0.4rem"><button class="btn-primary" onclick="refillNow()" style="font-size:0.75rem">Refill now from my wallet</button></div>';
+    h+='</div>';
+    // refill settings
+    h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
+    h+='<div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">Auto-refill</div>';
+    h+='<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;margin-top:0.4rem;font-size:0.78rem"><input type="checkbox" id="sil-set-enabled" '+(s.refill.enabled?'checked':'')+' style="width:auto;margin:0"><span>when below</span><input type="number" id="sil-set-threshold" value="'+s.refill.threshold_cents+'" min="0" style="width:5rem;margin:0;padding:0.3rem"><span>DD add</span><input type="number" id="sil-set-amount" value="'+s.refill.amount_cents+'" min="0" style="width:5rem;margin:0;padding:0.3rem"><span>DD from</span>';
+    h+='<select id="sil-set-source" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.72rem;margin:0"><option value="owner"'+(s.refill.source==='owner'?' selected':'')+'>my wallet</option><option value="fleet"'+(s.refill.source==='fleet'?' selected':'')+'>fleet wallet</option></select>';
+    h+='<button class="btn-primary" onclick="saveSiliconSettings()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Save</button></div>';
+    h+='<div style="font-size:0.66rem;color:var(--text3);margin-top:0.35rem">'+(s.refill.last_refill_at?'last refill '+esc(s.refill.last_refill_at)+' UTC':'never refilled')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</div>';
+    h+='</div>';
+    // token
+    h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center"><div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">Access token</div>'+tokenChip(s.token)+'</div>';
+    h+='<div style="font-size:0.72rem;margin-top:0.3rem">'+(s.token.expires_at?('scope '+esc(s.token.scope)+' · expires '+new Date(s.token.expires_at).toLocaleString()):'none on record')+'</div>';
+    h+='<div style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-ghost" onclick="mintSiliconToken()" style="font-size:0.72rem">Mint a 30-day token</button></div><div id="sil-token-out" style="display:none;margin-top:0.5rem"><div style="font-size:0.65rem;color:var(--red)">Shown once. Hand it to the silicon now.</div><textarea id="sil-token-text" readonly style="width:100%;height:4.5rem;font-family:monospace;font-size:0.6rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px"></textarea></div>';
+    h+='</div>';
+    // secrets this silicon uses: its own + the ones delegated to it
+    const own=(d.secrets&&d.secrets.own)||[], del=(d.secrets&&d.secrets.delegated)||d.delegations||[];
+    h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">Secrets this silicon uses</span><span style="font-size:0.7rem;color:var(--text3)">'+own.length+' own · '+del.length+' delegated</span></div>';
+    if(!own.length&&!del.length)h+='<div class="empty" style="font-size:0.75rem">None yet.</div>';
+    for(const sc of own)h+='<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(sc.name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(sc.ref_code||'')+' · own</span></span><span style="color:'+(sc.status==='active'?'var(--green)':'var(--yellow)')+'">'+esc(sc.status)+' · '+(sc.use_count||0)+' uses</span></div>';
+    for(const g of del)h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(g.secret_name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(g.ref_code||'')+' · delegated by you</span></span><span style="color:'+(g.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(g.status)+' · '+g.use_count+(g.max_uses?'/'+g.max_uses:'')+' uses'+(g.status==='active'?' <button class="btn-ghost" onclick="revokeDelegation('+(g.delegation_id||g.id)+')" style="font-size:0.6rem;padding:0.1rem 0.4rem">revoke</button>':'')+'</span></div>';
+    h+='<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem"><input type="text" id="sil-delegate-name" placeholder="delegate one of your secrets: name or DP- ref" style="flex:1;margin:0;padding:0.4rem"><button class="btn-ghost" onclick="delegateToSilicon()" style="font-size:0.72rem">Delegate</button></div>';
+    // workers: scoped tokens this silicon hands to its own sub-agents / test environments
+    const ws=d.workers||[];
+    h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Workers</span><span style="font-size:0.7rem;color:var(--text3)">scoped tokens for sub-agents &amp; testing</span></div>';
+    if(!ws.length)h+='<div class="empty" style="font-size:0.75rem">No workers. A worker runs as this silicon with a token limited to listed secrets and a spend cap.</div>';
+    for(const w of ws){
+      h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.6rem 0.8rem;margin-bottom:0.4rem;font-size:0.75rem">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong>'+esc(w.name)+'</strong> <span style="color:var(--text3);font-size:0.65rem">'+esc(w.purpose||'')+'</span></div><span style="color:'+(w.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(w.status)+'</span></div>';
+      h+='<div style="font-family:monospace;font-size:0.65rem;color:var(--accent);word-break:break-all">'+esc(w.worker_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(w.worker_id)+'\')" style="font-size:0.6rem;padding:0.05rem 0.35rem">copy</button></div>';
+      h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.2rem">scope ≤ '+esc(w.scope_cap)+' · spent '+dd(w.spent_cents)+(w.max_spend_cents?' / '+dd(w.max_spend_cents):'')+' DD · '+w.use_count+' calls · secrets: '+(w.allowed_secrets&&w.allowed_secrets.length?esc(w.allowed_secrets.join(', ')):'all of the parent\'s')+(w.token_expires_at?' · token until '+new Date(w.token_expires_at).toLocaleString():'')+'</div>';
+      if(w.status==='active')h+='<div style="display:flex;gap:0.4rem;margin-top:0.4rem"><button class="btn-ghost" onclick="mintWorkerToken(\''+esc(w.worker_id)+'\')" style="font-size:0.65rem">Mint token</button><button class="btn-ghost" onclick="revokeWorker(\''+esc(w.worker_id)+'\')" style="font-size:0.65rem;color:var(--red)">Revoke</button></div>';
+      h+='</div>';
+    }
+    h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:0.7rem;margin-top:0.5rem"><div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem">New worker</div>';
+    h+='<div style="display:flex;gap:0.4rem;flex-wrap:wrap"><input type="text" id="wk-name" placeholder="name, e.g. brain2" style="flex:1;min-width:7rem;margin:0;padding:0.4rem"><input type="text" id="wk-purpose" placeholder="purpose" style="flex:1;min-width:7rem;margin:0;padding:0.4rem"></div>';
+    h+='<input type="text" id="wk-secrets" placeholder="allowed secrets: DP- refs or names, comma-separated (blank = all)" style="width:100%;margin:0.4rem 0 0;padding:0.4rem">';
+    h+='<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;margin-top:0.4rem;font-size:0.72rem"><span>spend cap</span><input type="number" id="wk-cap" value="100" min="0" style="width:5rem;margin:0;padding:0.3rem"><span>DD · token</span><select id="wk-ttl" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.72rem;margin:0"><option value="1h">1 hour</option><option value="24h" selected>24 hours</option><option value="7d">7 days</option><option value="30d">30 days</option></select><button class="btn-primary" onclick="createWorker()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Create + mint</button></div>';
+    h+='<div id="wk-token-out" style="display:none;margin-top:0.5rem"><div style="font-size:0.65rem;color:var(--red)">Worker token, shown once. Put it in the worker\'s environment.</div><textarea id="wk-token-text" readonly style="width:100%;height:4rem;font-family:monospace;font-size:0.6rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px"></textarea></div></div>';
+    // recent spend
+    h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Recent activity</span></div>';
+    if(!d.recent.length)h+='<div class="empty" style="font-size:0.75rem">No transactions.</div>';
+    for(const t of d.recent.slice(0,30)){
+      const tag=t.project?(' · '+esc(t.project)+' / '+esc(t.initiator||'')):'';
+      h+='<div style="display:flex;justify-content:space-between;padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.72rem"><span>'+esc(t.type)+'<span style="color:var(--text3)">'+tag+'</span><div style="font-size:0.62rem;color:var(--text3)">'+esc(t.created_at)+'</div></span><span style="color:'+(t.amount_cents<0?'var(--red)':'var(--green)')+'">'+(t.amount_cents>0?'+':'')+dd(t.amount_cents)+' <span style="color:var(--text3)">→ '+dd(t.balance_after)+'</span></span></div>';
+    }
+    // work links
+    if(d.work_links.length){h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Work links</span><span style="font-size:0.7rem;color:var(--text3)">tick '+d.current_tick+'</span></div>';for(const l of d.work_links.slice(0,20))h+=workLinkRow(l,d.current_tick)}
+    h+='<div style="margin-top:1.25rem"><button class="btn-danger" onclick="removeSilicon()" style="width:100%;padding:0.6rem;border-radius:10px;font-size:0.78rem">Remove from fleet</button></div>';
+    el.innerHTML=h;
+  }catch(e){el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+}
+function closeSilicon(){siliconHandle=null;goPage('fleet');loadFleet()}
+async function saveSiliconSettings(){try{await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle),{refill_enabled:document.getElementById('sil-set-enabled').checked,refill_threshold_cents:Number(document.getElementById('sil-set-threshold').value||0),refill_amount_cents:Number(document.getElementById('sil-set-amount').value||0),refill_source:document.getElementById('sil-set-source').value});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
+async function refillNow(){const a=Number(document.getElementById('sil-refill-now').value||0);if(!(a>0))return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/refill',{amount_cents:a});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
+async function mintSiliconToken(){if(!confirm('Mint a 30-day transact token for @'+siliconHandle+'? It is shown once.'))return;try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/token',{scope:'transact',expires_in:'30d'});document.getElementById('sil-token-out').style.display='block';document.getElementById('sil-token-text').value=r.token}catch(e){alert(e.message)}}
+async function delegateToSilicon(){const v=document.getElementById('sil-delegate-name').value.trim();if(!v)return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/delegate',v.startsWith('DP-')?{ref:v}:{secret_name:v});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
+async function revokeDelegation(id){if(!confirm('Revoke this delegation?'))return;try{await api('DELETE','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/delegations/'+id);openSilicon(siliconHandle)}catch(e){alert(e.message)}}
+async function createWorker(){const name=document.getElementById('wk-name').value.trim().toLowerCase();if(!name){alert('Worker name required');return}
+  const body={name,purpose:document.getElementById('wk-purpose').value.trim(),allowed_secrets:document.getElementById('wk-secrets').value.split(',').map(x=>x.trim()).filter(Boolean),max_spend_cents:Number(document.getElementById('wk-cap').value||0),mint:{scope:'transact',expires_in:document.getElementById('wk-ttl').value}};
+  try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers',body);const tok=r.minted&&r.minted.token;await openSilicon(siliconHandle);if(tok){document.getElementById('wk-token-out').style.display='block';document.getElementById('wk-token-text').value=tok;document.getElementById('wk-token-out').scrollIntoView({block:'center'})}}catch(e){alert(e.message)}}
+async function mintWorkerToken(wid){const ttl=prompt('Token lifetime (1h, 24h, 7d, 30d)','24h');if(!ttl)return;try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers/'+encodeURIComponent(wid)+'/token',{scope:'transact',expires_in:ttl});document.getElementById('wk-token-out').style.display='block';document.getElementById('wk-token-text').value=r.token;document.getElementById('wk-token-out').scrollIntoView({block:'center'})}catch(e){alert(e.message)}}
+async function revokeWorker(wid){if(!confirm('Revoke worker '+wid+'? Its tokens stop working immediately.'))return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers/'+encodeURIComponent(wid)+'/revoke');openSilicon(siliconHandle)}catch(e){alert(e.message)}}
+async function removeSilicon(){if(!confirm('Remove @'+siliconHandle+' from the fleet? Its wallet and identity stay; only the fleet link and auto-refill go.'))return;try{await api('DELETE','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle));closeSilicon()}catch(e){alert(e.message)}}
+
 // Nav
 document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>{
   document.querySelectorAll('.bn-item').forEach(x=>x.classList.remove('active'));
@@ -443,6 +686,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   if(n.dataset.page==='buoy')loadBuoy();
   if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();}
   if(n.dataset.page==='dustforge')loadDustforge();
+  if(n.dataset.page==='fleet')loadFleet();
 }));
 
 async function loadDustforge(){

@@ -1,6 +1,9 @@
 # Fleet Agency — DemiPass fleet activity + cost ledger (SPEC, not yet built)
 
-Status: **spec only** (2026-07-10). No code in this document is deployed.
+Status: **spec (2026-07-10)** → **FA2 + money side built 2026-10-03** on `feat/fleet-silicon-wallets`:
+Fleet tab with per-silicon subpages, hashed silicon ids, refill rules, attributed billing and tick-scoped
+work links. See `docs/fleet-billing.md` for what shipped; the read-time roll-ups below are served by
+`GET /api/fleet/:slug/overview`, `/silicons/:handle` and `/attribution`.
 Owner concept: Aaron. Motivating case: **Claude as a fleet agent** — Aaron wants
 to open the DemiPass **fleet section** and see, for each agent he runs (starting
 with Claude, `did:key:u7QF8gmIMlzgt6BAdDHUJ5AOpO0RvwtJL_IDhB31eKpZU0A`,

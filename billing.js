@@ -283,6 +283,10 @@ function checkTokenRevocation(db, decoded) {
   return { revoked: false };
 }
 
+// Registered by the host once ./fleet_billing is loaded (keeps this module free of circular requires).
+let _attribution = null;
+function setAttribution(fb, ledger) { _attribution = fb ? { fb, ledger: ledger || null } : null; }
+
 function billingMiddleware(db, actionType, options = {}) {
   const identity = require('./identity');
   const cost = options.cost ?? RATE_TABLE[actionType] ?? 0;
@@ -312,20 +316,41 @@ function billingMiddleware(db, actionType, options = {}) {
     if (isWrite && !identity.scopeAtLeast(scope, 'write')) {
       return res.status(403).json({ error: `scope '${scope}' cannot perform '${actionType}'`, required_scope: 'write' });
     }
+    req.identity = { did, scope, decoded: result.decoded };   // visible to attribution (worker claim) before the charge
 
     if (cost > 0) {
-      const deduction = deductBalance(db, did, cost, actionType, `API call: ${actionType}`);
+      // Attributed billing (./fleet_billing): the payer may be the caller, a fleet
+      // owner (operator-requested project work), a project wallet, or a work-link
+      // requester. Without a registered attribution engine, the caller pays.
+      let deduction;
+      let attribution = null;
+      if (_attribution && options.attributed !== false) {
+        attribution = _attribution.fb.parseAttribution(req);
+        deduction = _attribution.fb.chargeAttributed(db, module.exports, {
+          callerDid: did, cost, actionType, description: `API call: ${actionType}`, attribution, ledger: _attribution.ledger,
+        });
+        if (!deduction.ok && deduction.status && deduction.status !== 402) {
+          return res.status(deduction.status).json({ error: deduction.error, action: actionType });
+        }
+      } else {
+        deduction = deductBalance(db, did, cost, actionType, `API call: ${actionType}`);
+      }
       if (!deduction.ok) {
-        maybeNotifyZeroBalance(db, did, actionType, deduction.required || cost);
+        const payer = deduction.payer_did || did;
+        maybeNotifyZeroBalance(db, payer, actionType, deduction.required || cost);
         return res.status(402).json({
           error: 'payment required',
           detail: deduction.error,
           balance_cents: deduction.balance_cents,
           required_cents: deduction.required || cost,
           action: actionType,
+          payer_did: payer,
+          payer: payer === did ? 'self' : (deduction.initiator || 'other'),
+          project: deduction.project || undefined,
         });
       }
-      req.billing = { did, deducted: cost, balance_after: deduction.balance_after };
+      req.billing = { did, deducted: cost, balance_after: deduction.balance_after,
+                      payer_did: deduction.payer_did || did, initiator: deduction.initiator || 'self', project: deduction.project || '' };
     } else {
       req.billing = { did, deducted: 0, balance_after: null };
     }
@@ -336,6 +361,7 @@ function billingMiddleware(db, actionType, options = {}) {
 }
 
 module.exports = {
+  setAttribution,
   RATE_TABLE,
   deductBalance,
   creditBalance,
