@@ -40,6 +40,7 @@ const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
 // The whitelist, name→IP resolution and context choice live in ssh_targets.js
 const sshTargets = require('./ssh_targets');
+const sshAccount = require('./ssh_account');
 
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
@@ -2595,14 +2596,15 @@ function blindkeyPatternMatch(pattern, value) {
 // Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
 function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   const insertCtx = db.prepare(`
-    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, target_user_default)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(secret_id, context_name) DO UPDATE SET
       action_type = excluded.action_type,
       target_url_pattern = excluded.target_url_pattern,
       target_host_pattern = excluded.target_host_pattern,
       allowed_by = excluded.allowed_by,
-      max_uses = excluded.max_uses
+      max_uses = excluded.max_uses,
+      target_user_default = COALESCE(NULLIF(excluded.target_user_default, ''), blindkey_contexts.target_user_default)
   `);
   let created = 0;
   for (const ctx of contexts) {
@@ -2616,7 +2618,8 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       ctx.target_url_pattern || '*',
       sshTargets.canonicalHostPattern(ctx.action_type, ctx.target_host_pattern || '*'),
       allowedBy,
-      ctx.max_uses || 0
+      ctx.max_uses || 0,
+      sshAccount.validUsername(ctx.target_user_default || '') ? ctx.target_user_default : ''
     );
     created++;
   }
@@ -2752,7 +2755,7 @@ function authorizeSecretMediation({ requestorDid, secretName, contextName, actio
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
-  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days } = req.body || {};
+  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days, username } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
   if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
   if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
@@ -2780,6 +2783,14 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       return res.status(400).json({ error: 'rotation_interval_days: integer between 1 and 3650' });
     }
     resolvedRotationInterval = rotation_interval_days;
+  }
+  // Account binding: which login an SSH credential belongs to. null = not provided (keeps the existing binding on re-store).
+  let resolvedUsername = null;
+  if (username !== undefined && username !== null) {
+    if (typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
+    const u = username.trim();
+    if (u !== '' && !sshAccount.validUsername(u)) return res.status(400).json({ error: 'username: letters, digits, and . _ - only (max 128); empty clears the binding' });
+    resolvedUsername = u;
   }
 
   // Code injection detection — reject values that look like executable code.
@@ -2839,8 +2850,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     const resolvedRotatable = rotatable === false || rotatable === 0 ? 0 : 1;
 
     db.prepare(`
-      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days, username)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(did, name) DO UPDATE SET
         encrypted_value = excluded.encrypted_value,
         description = excluded.description,
@@ -2852,8 +2863,9 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
         category = COALESCE(excluded.category, blindkey_secrets.category),
         labels = COALESCE(excluded.labels, blindkey_secrets.labels),
         rotation_interval_days = COALESCE(excluded.rotation_interval_days, blindkey_secrets.rotation_interval_days),
+        username = COALESCE(excluded.username, blindkey_secrets.username),
         updated_at = CURRENT_TIMESTAMP
-    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable, resolvedCategory, resolvedLabels, resolvedRotationInterval);
+    `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable, resolvedCategory, resolvedLabels, resolvedRotationInterval, resolvedUsername);
 
     // Generate and store ref_code if not already set
     const stored = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?").get(req.identity.did, name);
@@ -3682,6 +3694,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
     try {
       let result;
+      let accountAttribution = '';
 
       // Action params arrived in two different shapes historically: ssh_exec read
       // req.body directly while http_header/http_body/git_clone read req.body.params.
@@ -3720,9 +3733,19 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         case 'ssh_exec': {
-          const { command, target_user, key_name } = action_params;
+          const { command, target_user, key_name, override_reason } = action_params;
           if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
-          const effectiveUser = target_user || 'claude';
+          // Account: explicit → bound on the secret → context default → hard error. No 'claude' fallback.
+          const tokenCtx = tokenRow.context_id ? db.prepare('SELECT target_user_default FROM blindkey_contexts WHERE id = ?').get(tokenRow.context_id) : null;
+          const who = sshAccount.resolveSshTargetUser({ explicit: target_user, secret, context: tokenCtx, override_reason });
+          if (!who.ok) return res.status(who.status || 400).json({ error: who.error, detail: who.detail, bound_username: secret.username || '', token_preserved: true });
+          const effectiveUser = who.effective_user;
+          accountAttribution = who.attribution;
+          if (who.override) {
+            db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+              'ssh_exec_account_override', req.identity.did, secret.id, null, JSON.stringify({ ...who.override, target_host })
+            );
+          }
 
           const sshTarget = sshTargets.resolveSshTarget(target_host);
           if (!sshTarget) {
@@ -3949,10 +3972,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       // Track outcome for dashboard health
       const isSuccess = !result?.exit_code && !result?.error;
       try {
-        db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
+        db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name, attribution) VALUES (?, ?, ?, ?, ?, ?, ?)')
           .run(secret.id, req.identity.did, action, isSuccess ? 'success' : 'failure',
             isSuccess ? '' : (result?.stderr || result?.error || '').slice(0, 200),
-            req.identity?.agent_name || '');
+            req.identity?.agent_name || '', accountAttribution);
       } catch(_) {}
 
       // Layer A: log use-token execution as behavioral surface
@@ -4272,11 +4295,11 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version,
                                     provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
-                                    security_depth, gate_policy)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+                                    security_depth, gate_policy, username)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
     `).run(ownerDid, newName, existing.description, existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
            existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days,
-           existing.security_depth, existing.gate_policy);
+           existing.security_depth, existing.gate_policy, existing.username || '');
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
@@ -4298,9 +4321,9 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     let contextsTransferred = 0;
     for (const ctx of oldContexts) {
       db.prepare(`
-        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
+        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, target_user_default)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.target_user_default || '');
       contextsTransferred++;
     }
 
@@ -4324,7 +4347,7 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
       JSON.stringify({ old_name: existing.name, new_name: newName, new_secret_id: newSecret.id, new_version: newVersion, grace_period_minutes: graceMins, contexts_transferred: contextsTransferred })
     );
 
-    res.json({ ok: true, new_secret_id: newSecret.id, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins });
+    res.json({ ok: true, new_secret_id: newSecret.id, new_name: newName, new_version: newVersion, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4465,7 +4488,10 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
 // POST /api/blindkey/context/add — add a context to an existing secret
 // Requires admin auth OR Bearer token from the secret owner
 app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
-  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, target_host, target_url, max_uses } = req.body || {};
+  const { secret_name, context_name, action_type, target_url_pattern, target_host_pattern, target_host, target_url, max_uses, target_user_default } = req.body || {};
+  if (target_user_default !== undefined && target_user_default !== null && target_user_default !== '' && !sshAccount.validUsername(target_user_default)) {
+    return res.status(400).json({ error: 'target_user_default: letters, digits, and . _ - only (max 128)' });
+  }
   if (!secret_name || !context_name || !action_type) {
     return res.status(400).json({ error: 'secret_name, context_name, and action_type required' });
   }
@@ -4504,6 +4530,7 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
       target_url_pattern: target_url_pattern || target_url || '*',
       target_host_pattern: target_host_pattern || target_host || '*',
       max_uses: max_uses || 0,
+      target_user_default: target_user_default || '',
     }], isAdmin ? 'admin' : 'owner');
 
     if (created === 0) return res.status(400).json({ error: 'failed to create context' });
@@ -4541,7 +4568,11 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     target_host_pattern: req.body?.target_host_pattern ?? row.target_host_pattern,
     max_uses: req.body?.max_uses ?? row.max_uses,
     status: req.body?.status ?? row.status,
+    target_user_default: req.body?.target_user_default ?? row.target_user_default ?? '',
   };
+  if (typeof next.target_user_default !== 'string' || (next.target_user_default !== '' && !sshAccount.validUsername(next.target_user_default))) {
+    return res.status(400).json({ error: 'target_user_default: letters, digits, and . _ - only (max 128); empty clears it' });
+  }
 
   const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
   if (!validActions.includes(next.action_type)) {
@@ -4553,9 +4584,9 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
 
   db.prepare(`
     UPDATE blindkey_contexts
-    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?
+    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?, target_user_default = ?
     WHERE id = ?
-  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status, contextId);
+  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', sshTargets.canonicalHostPattern(next.action_type, next.target_host_pattern || '*'), Number(next.max_uses) || 0, next.status, next.target_user_default, contextId);
 
   const updated = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(contextId);
   res.json({ ok: true, context: updated });
@@ -11797,6 +11828,11 @@ function sendSMS(toPhone, body) {
   });
 }
 
+// Account binding + scope defaults (2026-10-14, ssh_account.js). Idempotent; prod already carries these columns.
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN username TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_contexts ADD COLUMN target_user_default TEXT DEFAULT ''"); } catch(_) {}
+try { db.exec("ALTER TABLE secret_outcomes ADD COLUMN attribution TEXT DEFAULT ''"); } catch(_) {}
+
 // GET /api/demipass/dashboard — secret health dashboard for the mobile app
 app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
@@ -11806,7 +11842,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
     SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
            ownership, rotatable, frozen, created_at, updated_at, expires_at, provider,
            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels,
-           last_rotated_at, rotation_interval_days, security_depth, gate_policy
+           last_rotated_at, rotation_interval_days, security_depth, gate_policy, COALESCE(username, '') AS username
     FROM blindkey_secrets WHERE did = ? AND status IN ('active', 'rotating')
     ORDER BY updated_at DESC
   `).all(auth.did);
@@ -11864,7 +11900,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
     // Contexts
     const contexts = db.prepare(
-      "SELECT context_name, action_type, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
+      "SELECT id, context_name, action_type, target_host_pattern, target_url_pattern, COALESCE(target_user_default, '') AS target_user_default, use_count, max_uses FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
     ).all(s.id);
 
     let parsedLabels = [];
@@ -11895,6 +11931,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       days_to_expiry,
       rotation,
       provider: s.provider,
+      username: s.username || '',
+      username_bound: !!s.username,
     };
   });
 
@@ -11933,6 +11971,37 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       no_expiry_telemetry: enriched.filter(s => !s.expires_at && !s.rotation).length,
     },
   });
+});
+
+// POST /api/blindkey/set-username — bind (or clear) the account an SSH credential logs in as.
+// Owner only, idempotent, no value change. Logged as username_changed.
+app.post('/api/blindkey/set-username', rateLimitStandard, (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  if (actor.mode === 'admin') return res.status(400).json({ error: 'admin mode not permitted for set-username; call as the owner' });
+
+  const { ref, name, username } = req.body || {};
+  if (!ref && !name) return res.status(400).json({ error: 'ref or name required' });
+  if (typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string (empty string clears the binding)' });
+  const u = username.trim();
+  if (u !== '' && !sshAccount.validUsername(u)) {
+    return res.status(400).json({ error: 'username: letters, digits, and . _ - only (max 128); empty clears the binding' });
+  }
+
+  const secret = ref
+    ? db.prepare("SELECT id, name, username FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status IN ('active', 'rotating')").get(actor.did, ref)
+    : db.prepare("SELECT id, name, username FROM blindkey_secrets WHERE did = ? AND name = ? AND status IN ('active', 'rotating')").get(actor.did, name);
+  if (!secret) return res.status(404).json({ error: 'secret not found' });
+
+  const previous = secret.username || '';
+  if (previous === u) return res.json({ ok: true, name: secret.name, username: u, changed: false });
+
+  db.prepare('UPDATE blindkey_secrets SET username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(u, secret.id);
+  try {
+    db.prepare("INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES ('username_changed', ?, ?, '', ?)")
+      .run(actor.did, secret.id, JSON.stringify({ previous, current: u }));
+  } catch(_) {}
+  res.json({ ok: true, name: secret.name, username: u, changed: true, previous });
 });
 
 // POST /api/demipass/freeze — freeze/unfreeze a secret
