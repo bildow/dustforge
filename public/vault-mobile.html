@@ -984,6 +984,18 @@ function showDetail(name) {
   }
   h += `</div>`;
 
+  // ── Account — which login this credential belongs to (the binding, never the value) ──
+  if (s.type === 'password' || s.type === 'ssh_key') {
+    const bound = s.username_bound ? s.username : '';
+    h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Account</div>`;
+    h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.75rem">`;
+    h += `<div style="color:var(--text3);margin-bottom:0.4rem">${bound ? 'Agents log in as <b style="color:var(--text)">'+esc(bound)+'</b> unless they give a reason to use another account.' : '<span style="color:var(--yellow)">Not bound</span> — agents must name the login on every use.'}</div>`;
+    h += `<div style="display:flex;gap:0.4rem"><input type="text" id="acct-user" value="${attr(bound)}" placeholder="e.g. flimflam, claude, root" autocapitalize="none" autocorrect="off" spellcheck="false" style="flex:1;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.85rem">`;
+    h += `<button onclick="saveUsername('${esc(s.name)}')" style="padding:0.5rem 0.9rem;border:1px solid var(--accent);background:none;border-radius:8px;color:var(--accent);font-weight:600;font-size:0.75rem;cursor:pointer">Save</button></div>`;
+    h += `<div id="acct-msg" style="font-size:0.65rem;margin-top:0.3rem;color:var(--text3)"></div>`;
+    h += `</div></div>`;
+  }
+
   // ── Security depth: how much protection this credential demands ──
   const depth = s.security_depth || 'standard';
   const gp = s.gate_policy || { reveal:[], rotate:[], delete:[], use:[] };
@@ -1036,17 +1048,39 @@ function showDetail(name) {
     h += `</div>`;
   }
 
-  // Scope — what an agent can DO with this credential (never the value)
-  h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Scope — what this credential can do</div>`;
+  // ── Scope — where and how agents may use this credential (never the value) ──
+  const actionLabel = { ssh_exec:'run SSH commands', http_header:'call APIs (auth header)', http_body:'post to APIs (in the body)', git_clone:'clone git repos', smtp_auth:'send mail (SMTP)', database_connect:'connect to a database', env_inject:'be injected as an env var' };
+  h += `<div style="margin-bottom:1rem"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem"><div style="font-weight:600;font-size:0.85rem">Scope — where this credential can be used</div>`;
+  h += `<button onclick="toggleScopeForm()" style="font-size:0.65rem;background:none;border:1px solid var(--border);border-radius:6px;padding:0.15rem 0.45rem;color:var(--text2);cursor:pointer">+ add</button></div>`;
+  h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.75rem">`;
   if(s.context_list&&s.context_list.length){
-    const actionLabel = { http_header:'call APIs (as an auth header)', http_body:'post to APIs (in the body)', ssh_exec:'run SSH commands', document:'be handed over as a document', database:'connect to a database' };
     for(const c of s.context_list){
-      h += `<div style="display:flex;align-items:center;gap:0.5rem;font-size:0.75rem;padding:0.3rem 0;color:var(--text2)"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);flex-shrink:0"></span><span>${esc(actionLabel[c.action_type]||c.action_type)} <span style="color:var(--text3)">on ${esc(c.target_host_pattern||'any host')}</span></span></div>`;
+      const isSsh = c.action_type==='ssh_exec';
+      const where = isSsh ? (c.target_host_pattern||'*') : (c.target_url_pattern||'*');
+      const whereLabel = where==='*' ? (isSsh?'any allowed host':'any allowed URL') : where;
+      h += `<div style="padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2)">`;
+      h += `<div style="display:flex;align-items:center;gap:0.5rem;color:var(--text2)"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);flex-shrink:0"></span>`;
+      h += `<span style="flex:1">${esc(actionLabel[c.action_type]||c.action_type)} on <b style="color:var(--text)">${esc(whereLabel)}</b>${isSsh&&c.target_user_default?' as '+esc(c.target_user_default):''}<span style="color:var(--text3)"> · ${c.use_count||0} uses</span></span>`;
+      h += `<button onclick="editScope(${c.id},'${esc(s.name)}')" style="font-size:0.65rem;background:none;border:1px solid var(--border);border-radius:6px;padding:0.15rem 0.45rem;color:var(--text2);cursor:pointer">edit</button>`;
+      h += `<button onclick="revokeScope(${c.id},'${esc(s.name)}')" style="font-size:0.65rem;background:none;border:1px solid var(--red);border-radius:6px;padding:0.15rem 0.45rem;color:var(--red);cursor:pointer">remove</button></div>`;
+      h += `<div id="ctx-edit-${c.id}" style="display:none;margin-top:0.4rem"></div>`;
+      h += `</div>`;
     }
   } else {
-    h += `<div style="font-size:0.72rem;color:var(--text3)">No scope defined yet — a default is created on first use.</div>`;
+    h += `<div style="color:var(--text3)">No scope yet — add one, or a default is created on first use.</div>`;
   }
+  // Add-scope form, hidden until "+ add"
+  const defAction = (s.type==='password'||s.type==='ssh_key') ? 'ssh_exec' : 'http_header';
+  h += `<div id="scope-form" style="display:none;margin-top:0.6rem;padding-top:0.6rem;border-top:1px solid var(--border)">`;
+  h += `<select id="scope-action" onchange="scopeFormMode()" style="width:100%;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.85rem;margin-bottom:0.4rem">`;
+  for(const [k,v] of Object.entries(actionLabel)) h += `<option value="${k}"${k===defAction?' selected':''}>${esc(v)}</option>`;
+  h += `</select>`;
+  h += `<input type="text" id="scope-where" placeholder="host (k1, 100.69.1.78) or URL pattern (https://api.github.com/*)" autocapitalize="none" autocorrect="off" spellcheck="false" style="width:100%;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.85rem;margin-bottom:0.4rem">`;
+  h += `<input type="text" id="scope-user" placeholder="login for this host (optional — the Account above is used otherwise)" autocapitalize="none" autocorrect="off" spellcheck="false" style="width:100%;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.85rem;margin-bottom:0.4rem">`;
+  h += `<div style="display:flex;gap:0.4rem"><button onclick="toggleScopeForm()" style="flex:1;padding:0.5rem;border:1px solid var(--border);background:none;border-radius:8px;color:var(--text2);font-size:0.75rem;cursor:pointer">Cancel</button><button onclick="addScope('${esc(s.name)}')" style="flex:1;padding:0.5rem;border:1px solid var(--accent);background:none;border-radius:8px;color:var(--accent);font-weight:600;font-size:0.75rem;cursor:pointer">Add scope</button></div>`;
+  h += `<div id="scope-msg" style="font-size:0.65rem;margin-top:0.3rem;color:var(--text3)"></div>`;
   h += `</div>`;
+  h += `</div></div>`;
 
   // Authorized silicons
   if(s.authorized_silicons&&s.authorized_silicons.length){
@@ -1066,6 +1100,17 @@ function showDetail(name) {
   h += `<button onclick="revealSecret('${esc(s.name)}')" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
   h += `</div></div>`;
 
+  // ── Change value — the next version of the credential; the old one keeps working for an hour ──
+  const rotGates = gp.rotate||[]; const rotLabel = rotGates.length ? 'Change value ('+rotGates.join(' + ')+')' : 'Change value';
+  const valueWord = s.type==='password' ? 'password' : 'value';
+  h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Change value</div>`;
+  h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.75rem">`;
+  h += `<div style="font-size:0.7rem;color:var(--text3);margin-bottom:0.4rem">Use this after the ${valueWord} changed on the target. It is stored as the next version and the ref code moves to it; the old ${valueWord} keeps working for 60 minutes, then retires. Account and scope carry over.${s.ownership==='shared'?' <span style="color:var(--yellow)">Shared credential — agree the change with the other party first.</span>':''}</div>`;
+  h += `<input type="password" id="rot-value" placeholder="New ${valueWord}" autocomplete="new-password" style="width:100%;padding:0.55rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.9rem;margin-bottom:0.4rem">`;
+  h += `<button onclick="rotateValue('${esc(s.name)}')" id="rot-btn" style="width:100%;padding:0.6rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${rotLabel}</button>`;
+  h += `<div id="rot-msg" style="font-size:0.65rem;margin-top:0.3rem;color:var(--text3)"></div>`;
+  h += `</div></div>`;
+
   // Action buttons
   h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
   h += `<button onclick="toggleFreeze('${esc(s.name)}',${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
@@ -1081,6 +1126,80 @@ function closeDetail(){
   document.getElementById('page-detail').classList.remove('active');
   document.getElementById('page-vault').classList.add('active');
   loadVault();
+}
+
+// Re-fetch the dashboard and re-render the open detail (or fall back to the list if the secret was renamed/retired).
+async function refreshDetail(name){ await loadVault(); if(secrets.find(x=>x.name===name)) showDetail(name); else closeDetail(); }
+const LOGIN_RE = /^[a-zA-Z0-9._-]{1,128}$/;
+function noteIn(id, txt, err){ const m=document.getElementById(id); if(!m) return; m.style.color=err?'var(--red)':'var(--text3)'; m.textContent=txt; }
+
+async function saveUsername(name){
+  const u=(document.getElementById('acct-user').value||'').trim();
+  if(u && !LOGIN_RE.test(u)){ noteIn('acct-msg','Letters, digits, . _ - only',true); return; }
+  noteIn('acct-msg','Saving…');
+  try{
+    const r=await api('POST','/api/demipass/set-username',{name,username:u});
+    noteIn('acct-msg', r.changed ? (u ? 'Bound to '+u : 'Binding cleared') : 'Unchanged');
+    await refreshDetail(name);
+  }catch(e){ noteIn('acct-msg',e.message,true); }
+}
+
+async function rotateValue(name){
+  const el=document.getElementById('rot-value'); const btn=document.getElementById('rot-btn');
+  const v=el.value; if(!v){ noteIn('rot-msg','Enter the new value first',true); return; }
+  if(!confirm('Store a new value for '+name+'? The old value keeps working for 60 minutes.')) return;
+  btn.disabled=true; noteIn('rot-msg','Verifying…');
+  try{
+    const r=await apiGated('POST','/api/demipass/rotate',{name,new_value:v});
+    el.value='';
+    noteIn('rot-msg','Stored as '+(r.new_name||'the next version')+' — ref code moved; old value retires in '+(r.grace_period_minutes||60)+' min.');
+    setTimeout(closeDetail, 1500);
+  }catch(e){ btn.disabled=false; el.value=''; noteIn('rot-msg', /cancelled/.test(e.message)?'Cancelled':e.message, true); }
+}
+
+function toggleScopeForm(){ const f=document.getElementById('scope-form'); const open=f.style.display==='none'; f.style.display=open?'block':'none'; if(open) scopeFormMode(); }
+function scopeFormMode(){ const a=document.getElementById('scope-action').value; document.getElementById('scope-user').style.display=(a==='ssh_exec')?'block':'none'; }
+function scopeName(action, where){ return (action+'-'+where.replace(/^https?:\/\//,'')).replace(/[^a-zA-Z0-9.*-]/g,'-').replace(/-+/g,'-').slice(0,90); }
+
+async function addScope(name){
+  const action=document.getElementById('scope-action').value;
+  const where=(document.getElementById('scope-where').value||'').trim()||'*';
+  const user=(document.getElementById('scope-user').value||'').trim();
+  const isSsh=action==='ssh_exec';
+  if(isSsh && user && !LOGIN_RE.test(user)){ noteIn('scope-msg','Login: letters, digits, . _ - only',true); return; }
+  const body={ secret_name:name, action_type:action, context_name:scopeName(action,where) };
+  if(isSsh){ body.target_host_pattern=where; body.target_user_default=user; } else { body.target_url_pattern=where; }
+  noteIn('scope-msg','Adding…');
+  try{ await api('POST','/api/demipass/context/add',body); await refreshDetail(name); }
+  catch(e){ noteIn('scope-msg',e.message,true); }
+}
+
+function editScope(id,name){
+  const s=secrets.find(x=>x.name===name); const c=s&&(s.context_list||[]).find(x=>x.id===id); if(!c) return;
+  const box=document.getElementById('ctx-edit-'+id); if(box.style.display!=='none'){ box.style.display='none'; return; }
+  const isSsh=c.action_type==='ssh_exec';
+  const field='style="width:100%;padding:0.45rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.85rem;margin-bottom:0.35rem"';
+  let f=`<input type="text" id="ctx-where-${id}" value="${attr(isSsh?(c.target_host_pattern||'*'):(c.target_url_pattern||'*'))}" placeholder="${isSsh?'host or IP (* = any allowed host)':'URL pattern'}" autocapitalize="none" autocorrect="off" spellcheck="false" ${field}>`;
+  if(isSsh) f+=`<input type="text" id="ctx-user-${id}" value="${attr(c.target_user_default||'')}" placeholder="login for this host (optional)" autocapitalize="none" autocorrect="off" spellcheck="false" ${field}>`;
+  f+=`<div style="display:flex;gap:0.4rem"><button onclick="document.getElementById('ctx-edit-${id}').style.display='none'" style="flex:1;padding:0.5rem;border:1px solid var(--border);background:none;border-radius:8px;color:var(--text2);font-size:0.75rem;cursor:pointer">Cancel</button><button onclick="saveScope(${id},'${esc(name)}')" style="flex:1;padding:0.5rem;border:1px solid var(--accent);background:none;border-radius:8px;color:var(--accent);font-weight:600;font-size:0.75rem;cursor:pointer">Save</button></div>`;
+  f+=`<div id="ctx-msg-${id}" style="font-size:0.65rem;margin-top:0.3rem;color:var(--text3)"></div>`;
+  box.innerHTML=f; box.style.display='block';
+}
+
+async function saveScope(id,name){
+  const s=secrets.find(x=>x.name===name); const c=s&&(s.context_list||[]).find(x=>x.id===id); if(!c) return;
+  const isSsh=c.action_type==='ssh_exec';
+  const where=(document.getElementById('ctx-where-'+id).value||'').trim()||'*';
+  const body=isSsh?{target_host_pattern:where}:{target_url_pattern:where};
+  if(isSsh){ const u=(document.getElementById('ctx-user-'+id).value||'').trim(); if(u && !LOGIN_RE.test(u)){ noteIn('ctx-msg-'+id,'Login: letters, digits, . _ - only',true); return; } body.target_user_default=u; }
+  noteIn('ctx-msg-'+id,'Saving…');
+  try{ await api('PATCH','/api/demipass/context/'+id,body); await refreshDetail(name); }
+  catch(e){ noteIn('ctx-msg-'+id,e.message,true); }
+}
+
+async function revokeScope(id,name){
+  if(!confirm('Remove this scope? Agents lose this route until you add it again.')) return;
+  try{ await api('DELETE','/api/demipass/context/'+id); await refreshDetail(name); }catch(e){ alert(e.message); }
 }
 
 async function toggleFreeze(name, freeze){
@@ -1217,9 +1336,10 @@ async function storeSecret(){
 
   if(!n||!v){m.textContent='Name and value required';m.className='modal-msg err';return}
 
-  // Build description from username + host
+  // An SSH-style login travels as the account binding; an email-style login (web password) stays in the description.
+  const sshLogin = !!(username && (t === 'password' || t === 'ssh_key') && /^[a-zA-Z0-9._-]{1,128}$/.test(username));
   let desc = '';
-  if (username) desc += username;
+  if (username && !sshLogin) desc += username;
   if (host) desc += (desc ? ' @ ' : '') + host;
 
   const cat = document.getElementById('s-category').value;
@@ -1228,6 +1348,7 @@ async function storeSecret(){
   const depth = document.getElementById('s-depth').value;
 
   const body = { name: n, value: v, secret_type: t };
+  if (sshLogin) body.username = username;
   if (exp) body.expires_in = exp;
   if (desc) body.description = desc;
   if (cat) body.category = cat;
@@ -1236,6 +1357,10 @@ async function storeSecret(){
 
   try{
     const r=await api('POST','/api/demipass/store',body);
+    // A host on an SSH credential is its first scope right away
+    if (host && (t === 'password' || t === 'ssh_key')) {
+      try { await api('POST','/api/demipass/context/add',{ secret_name:n, action_type:'ssh_exec', context_name:('ssh_exec-'+host).replace(/[^a-zA-Z0-9.*-]/g,'-').slice(0,90), target_host_pattern:host, target_user_default:'' }); } catch(_) {}
+    }
     // PURGE: zero the secret from all in-memory locations after confirmed storage
     body.value='';
     document.getElementById('s-value').value='';
@@ -1436,6 +1561,7 @@ async function loadSiliconAgents(){
 function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
 function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function attr(s){return esc(s).replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 
 document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeModal()}});
