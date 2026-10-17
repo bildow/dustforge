@@ -38,14 +38,8 @@ const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.c
 const BLINDKEY_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
 const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
-const BLINDKEY_SSH_HOSTS = new Set([
-  '192.3.84.103',      // RackNerd
-  '100.83.112.88',     // phasewhip
-  '100.94.192.51',     // ky7
-  '100.69.1.78',       // k1
-  '100.103.90.79',     // flimflam
-  '100.73.92.12',      // skypie (Aaron's laptop, tailnet)
-]);
+// The whitelist, name→IP resolution and context choice live in ssh_targets.js
+const sshTargets = require('./ssh_targets');
 
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
@@ -2620,7 +2614,7 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       ctx.context_name,
       ctx.action_type,
       ctx.target_url_pattern || '*',
-      ctx.target_host_pattern || '*',
+      sshTargets.canonicalHostPattern(ctx.action_type, ctx.target_host_pattern || '*'),
       allowedBy,
       ctx.max_uses || 0
     );
@@ -3429,12 +3423,44 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
       action = typeToAction[refSecret.secret_type] || 'http_header';
     }
 
-    // Auto-resolve context — use the first active context if not provided
+    // ssh_exec targets canonicalise to the whitelisted IP before anything looks at
+    // them: agents send hostnames ("flimflam-All-Series", "k1") as readily as IPs,
+    // contexts store IPs, and /use checks the whitelist by IP. A host that does
+    // not resolve is refused here, with the allowed list, before a token exists.
+    let requestedHost = null;
+    if (action === 'ssh_exec' && target_host) {
+      requestedHost = target_host;
+      const resolved = sshTargets.resolveSshTarget(target_host);
+      if (!resolved) {
+        logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: callerDid, agent_name: auth?.agent_name, capability: 'ssh_exec', target: target_host, error: 'host not in SSH whitelist', ip: req.ip });
+        return res.status(403).json({ error: sshTargets.sshWhitelistError(target_host), allowed_hosts: sshTargets.listSshTargets() });
+      }
+      target_host = resolved.ip;
+    }
+
+    // Auto-resolve context — the active context whose pattern covers the requested
+    // target, most specific first. (Taking the first row by table order left every
+    // host but the first unreachable on multi-host secrets such as shared-kyle-ssh.)
     // Do NOT fabricate 'default' if no contexts exist — that causes enforceBlindkeyContext to reject
     if (!contextName) {
-      const firstCtx = db.prepare("SELECT context_name FROM blindkey_contexts WHERE secret_id = ? AND status = 'active' LIMIT 1").get(refSecret.id);
-      if (firstCtx) {
-        contextName = firstCtx.context_name;
+      const contexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active' ORDER BY id").all(refSecret.id);
+      const pick = sshTargets.chooseContext(contexts, {
+        action,
+        targetHost: requestedHost ? [target_host, requestedHost] : target_host,
+        targetUrl: target_url,
+        patternMatch: blindkeyPatternMatch,
+      });
+      if (pick.context) {
+        contextName = pick.context.context_name;
+      } else if (pick.candidates.length > 0) {
+        const target = action === 'ssh_exec' ? (requestedHost || target_host) : target_url;
+        const covered = pick.candidates.map(c => `${c.context_name} → ${action === 'ssh_exec' ? c.target_host_pattern : c.target_url_pattern}`).join(', ');
+        db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+          'use_token_denied', callerDid, refSecret.id, null,
+          JSON.stringify({ action, target_host, target_url, error: `no context covers ${target}`, candidates: pick.candidates.map(c => c.context_name) })
+        );
+        // "context … not found" is the phrase the SDK's self-heal looks for: it adds a context scoped to this target and retries.
+        return res.status(403).json({ error: `context not found for ${action} target ${target} on this secret — existing contexts cover: ${covered}. Add a context for ${target} (POST /api/blindkey/context/add) or pass context explicitly.` });
       }
       // If no contexts exist at all, contextName stays null — enforceBlindkeyContext will handle it
     }
@@ -3698,9 +3724,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
           const effectiveUser = target_user || 'claude';
 
-          if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
+          const sshTarget = sshTargets.resolveSshTarget(target_host);
+          if (!sshTarget) {
             logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: 'host not in SSH whitelist', ip: req.ip });
-            return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
+            return res.status(403).json({ error: sshTargets.sshWhitelistError(target_host), allowed_hosts: sshTargets.listSshTargets() });
           }
 
           const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[;&]|&&|\|\|)\s*exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
@@ -3730,7 +3757,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             // SECURITY: pass password via SSHPASS env var, never on command line.
             // This prevents shell injection via crafted secret values.
             const escapedCommand = command.replace(/'/g, "'\"'\"'");
-            const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser}@${target_host} '${escapedCommand}'`;
+            const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser}@${sshTarget.ip} '${escapedCommand}'`;
             const output = execSync(sshCmd, {
               timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
               env: { ...process.env, SSHPASS: password },
@@ -4069,11 +4096,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
         }
 
-        // Host whitelist check
-        if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
-          return res.status(403).json({
-            error: `host ${target_host} not in SSH whitelist. Allowed: ${[...BLINDKEY_SSH_HOSTS].join(', ')}`,
-          });
+        // Host whitelist check — names and IPs both canonicalise to the whitelisted IP
+        const sshTarget = sshTargets.resolveSshTarget(target_host);
+        if (!sshTarget) {
+          return res.status(403).json({ error: sshTargets.sshWhitelistError(target_host), allowed_hosts: sshTargets.listSshTargets() });
         }
 
         // Command sanitization — reject exfiltration vectors
@@ -4120,7 +4146,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         try {
           // SECURITY: pass password via SSHPASS env var, never on command line
           const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${sshTarget.ip} '${escapedCommand}'`;
           const output = execSync(sshCmd, {
             timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
             env: { ...process.env, SSHPASS: password },
@@ -4825,8 +4851,9 @@ async function handleRowenDeliver(req, res) {
         if (!target_host || !target_user || !command) {
           return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
         }
-        if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
-          return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
+        const sshTarget = sshTargets.resolveSshTarget(target_host);
+        if (!sshTarget) {
+          return res.status(403).json({ error: sshTargets.sshWhitelistError(target_host), allowed_hosts: sshTargets.listSshTargets() });
         }
         const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[;&]|&&|\|\|)\s*exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
         for (const pat of dangerousPatterns) {
@@ -4838,7 +4865,7 @@ async function handleRowenDeliver(req, res) {
         try {
           // SECURITY: pass password via SSHPASS env var, never on command line
           const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
+          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${sshTarget.ip} '${escapedCommand}'`;
           const output = execSync(sshCmd, {
             timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
             env: { ...process.env, SSHPASS: decryptedValue },
