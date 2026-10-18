@@ -558,18 +558,59 @@ function issueRefreshToken(did, scope) {
     .run(did, _refreshHash(raw), scope || 'read', exp);
   return { refresh_token: raw, refresh_expires_at: exp };
 }
-// Validate + single-use rotate: returns {did, scope} or null. Old token is revoked + linked to new.
+// Single-use consumption as ONE guarded UPDATE: the row flips revoked 0→1 in the same statement that
+// validates it, so two presenters of the same token can never both succeed — regardless of whether the
+// handlers stay synchronous or the service ever runs as more than one process. (Before this, consumption
+// was a SELECT and the single-use guarantee rested on the single-process + no-await shape by accident.)
+// Returns {id, did, scope} or null. A consumed token presented again is logged as a reuse: that is
+// compromise evidence (a copy holds the token), not a mere miss. The caller's response is unchanged.
 function consumeRefreshToken(raw) {
   if (!raw || typeof raw !== 'string') return null;
-  const row = db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?').get(_refreshHash(raw));
-  if (!row) return null;
-  if (row.revoked) return null;
-  if (new Date(row.expires_at).getTime() < Date.now()) return null;
-  return { id: row.id, did: row.did, scope: row.scope };
+  const h = _refreshHash(raw);
+  const r = db.prepare("UPDATE refresh_tokens SET revoked = 1, last_used_at = datetime('now') WHERE token_hash = ? AND revoked = 0 AND expires_at > ?")
+    .run(h, new Date().toISOString());
+  if (r.changes === 1) {
+    const row = db.prepare('SELECT id, did, scope FROM refresh_tokens WHERE token_hash = ?').get(h);
+    return row ? { id: row.id, did: row.did, scope: row.scope } : null;
+  }
+  const stale = db.prepare('SELECT id, did, revoked, expires_at FROM refresh_tokens WHERE token_hash = ?').get(h);
+  if (stale && stale.revoked) console.error(`[refresh-reuse] consumed refresh token presented again did=${stale.did} id=${stale.id}`);
+  return null;
 }
+// Explicit revocation (logout / compromise) — consumption already revokes; this only records the rotation link.
 function revokeRefreshToken(id, rotatedToRaw) {
   db.prepare('UPDATE refresh_tokens SET revoked = 1, last_used_at = datetime(\'now\'), rotated_to = ? WHERE id = ?')
     .run(rotatedToRaw ? _refreshHash(rotatedToRaw) : null, id);
+}
+// Rotation as one transaction: consume → mint → issue successor → link. If `mint` throws, the consumption
+// rolls back and the presenter may retry with the same token — nothing is burned without a delivered result.
+// `mint(rec)` returns whatever the caller needs (access token + wallet); it may throw with `.status` set.
+function rotateRefreshToken(raw, mint) {
+  return db.transaction(() => {
+    const rec = consumeRefreshToken(raw);
+    if (!rec) return null;
+    const minted = mint(rec);
+    const nrf = issueRefreshToken(rec.did, rec.scope);
+    db.prepare('UPDATE refresh_tokens SET rotated_to = ? WHERE id = ?').run(_refreshHash(nrf.refresh_token), rec.id);
+    return { rec, minted, nrf };
+  })();
+}
+// Device-code claim as ONE guarded UPDATE (approved → claimed, unexpired). Returns the row or null.
+function claimDeviceAuth(device_code) {
+  const r = db.prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ? AND status = 'approved' AND expires_at > ?")
+    .run(device_code, new Date().toISOString());
+  if (r.changes !== 1) return null;
+  return db.prepare('SELECT * FROM device_auth WHERE device_code = ?').get(device_code);
+}
+// Redemption as one transaction: claim → mint → issue refresh. A failed mint rolls the claim back to 'approved'.
+function redeemDeviceCode(device_code, mint) {
+  return db.transaction(() => {
+    const row = claimDeviceAuth(device_code);
+    if (!row) return null;
+    const minted = mint(row);
+    const rf = issueRefreshToken(row.approved_did, row.scope);
+    return { row, minted, rf };
+  })();
 }
 
 app.post('/api/identity/create', async (req, res) => {
@@ -5551,20 +5592,25 @@ app.post('/api/identity/device/token', rateLimitStandard, (req, res) => {
   if (row.status === 'pending') return res.status(428).json({ error: 'authorization_pending' });
   if (row.status === 'denied') return res.status(403).json({ error: 'access_denied' });
   if (row.status === 'claimed') return res.status(400).json({ error: 'already_claimed' });
-  // approved → mint access + refresh for the approving DID, mark claimed (one-time)
-  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(row.approved_did);
-  if (!wallet) return res.status(404).json({ error: 'approver identity not found' });
-  let token;
+  // approved → claim (guarded UPDATE) → mint → issue refresh, in ONE transaction (see redeemDeviceCode).
+  // The claim flips approved→claimed in the same statement that checks it, so the code is redeemable exactly
+  // once even under concurrent polls; a failed mint rolls the claim back so the agent's next poll can retry.
+  let out;
   try {
-    token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
-      scope: row.scope, expiresIn: '24h',
-      metadata: { email: wallet.email, username: wallet.username, auth_method: 'device', agent_label: row.agent_label },
+    out = redeemDeviceCode(device_code, (r) => {
+      const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(r.approved_did);
+      if (!wallet) throw Object.assign(new Error('approver identity not found'), { status: 404 });
+      const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+        scope: r.scope, expiresIn: '24h',
+        metadata: { email: wallet.email, username: wallet.username, auth_method: 'device', agent_label: r.agent_label },
+      });
+      return { wallet, token };
     });
-  } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
-  const rf = issueRefreshToken(wallet.did, row.scope);
-  db.prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ?").run(device_code);
+  } catch (e) { return res.status(e.status || 500).json({ error: e.status ? e.message : 'token mint failed' }); }
+  if (!out) return res.status(400).json({ error: 'already_claimed' }); // lost the race to a concurrent poll
+  const { row: claimed, minted: { wallet, token }, rf } = out;
   res.json({ ok: true, token, refresh_token: rf.refresh_token, refresh_expires_at: rf.refresh_expires_at,
-    did: wallet.did, scope: row.scope, email: wallet.email, auth_method: 'device', agent_label: row.agent_label });
+    did: wallet.did, scope: claimed.scope, email: wallet.email, auth_method: 'device', agent_label: claimed.agent_label });
 });
 
 // GET /api/identity/device/pending?user_code=XXXX-XXXX — approval page looks up the request.
@@ -5613,20 +5659,22 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
 app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
   const { refresh_token, expires_in = '24h' } = req.body || {};
   if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
-  const rec = consumeRefreshToken(refresh_token);
-  if (!rec) return res.status(401).json({ error: 'invalid, expired, or revoked refresh token' });
-  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(rec.did);
-  if (!wallet) return res.status(404).json({ error: 'identity not found' });
-  let token;
+  // Consume → mint → issue → link in ONE transaction (see rotateRefreshToken): a lost identity or a failed
+  // mint rolls the consumption back, so the presenter can retry and nothing is burned without a result.
+  let out;
   try {
-    token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
-      scope: rec.scope, expiresIn: expires_in,
-      metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh' },
+    out = rotateRefreshToken(refresh_token, (rec) => {
+      const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(rec.did);
+      if (!wallet) throw Object.assign(new Error('identity not found'), { status: 404 });
+      const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+        scope: rec.scope, expiresIn: expires_in,
+        metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh' },
+      });
+      return { wallet, token };
     });
-  } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
-  // Rotate: issue new refresh token, revoke the consumed one (linked for audit)
-  const nrf = issueRefreshToken(wallet.did, rec.scope);
-  revokeRefreshToken(rec.id, nrf.refresh_token);
+  } catch (e) { return res.status(e.status || 500).json({ error: e.status ? e.message : 'token mint failed' }); }
+  if (!out) return res.status(401).json({ error: 'invalid, expired, or revoked refresh token' });
+  const { rec, minted: { wallet, token }, nrf } = out;
   res.json({ ok: true, token, refresh_token: nrf.refresh_token, refresh_expires_at: nrf.refresh_expires_at, did: wallet.did, scope: rec.scope, email: wallet.email, auth_method: 'refresh' });
 });
 
@@ -5634,9 +5682,9 @@ app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
 app.post('/api/identity/refresh/revoke', rateLimitStandard, (req, res) => {
   const { refresh_token } = req.body || {};
   if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
+  // consumeRefreshToken revokes in the same guarded UPDATE that validates; nothing further to do.
   const rec = consumeRefreshToken(refresh_token);
   if (!rec) return res.json({ ok: true, revoked: false, note: 'token already invalid' });
-  revokeRefreshToken(rec.id, null);
   res.json({ ok: true, revoked: true });
 });
 
