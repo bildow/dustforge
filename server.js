@@ -5438,38 +5438,23 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
     : db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
 
-  // Verify password via Stalwart admin API
-  try {
-    const http = require('http');
-    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
-    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
-    const stalwartPass = process.env.STALWART_PASS || '';
-    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
-    const storedPassword = await new Promise((resolve) => {
-      const req = http.request({ hostname: stalwartHost, port: stalwartPort,
-        path: '/api/principal/' + encodeURIComponent(wallet.username),
-        method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
-        let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
-      req.end();
-    });
-    if (storedPassword === null) {
-      if (wallet.password_hash) {
-        const inputHash = require('crypto').createHash('sha256').update(password).digest('hex');
-        if (inputHash !== wallet.password_hash) {
-          return res.status(401).json({ error: 'invalid password' });
-        }
-      } else {
-        return res.status(503).json({ error: 'password verification temporarily unavailable' });
-      }
-    } else if (storedPassword !== password) {
-      return res.status(401).json({ error: 'invalid password' });
-    }
-  } catch(e) {
-    return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  // Password: Stalwart principal secret, sha256 fallback when Stalwart is unreachable (shared helper).
+  const _pwOk = await verifyWalletPassword(wallet, password);
+  if (_pwOk === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  if (!_pwOk) return res.status(401).json({ error: 'invalid password' });
+
+  // Second factor for the vault (carbon) login: authenticator code, emailed code, recovery
+  // code, or a trusted-device token issued at an earlier full sign-in. Accounts without 2FA
+  // enabled pass straight through.
+  const _twofa = twofa.gate(db, wallet, req.body || {}, { decryptSecret: (sec) => identity.decryptPrivateKey(sec).toString('utf8') });
+  if (!_twofa.ok) {
+    return res.status(401).json({ error: '2fa_required', twofa_required: true, methods: _twofa.methods, detail: _twofa.error,
+      email_hint: twofaRoutes.maskEmail(wallet.recovery_email || wallet.email) });
+  }
+  let _twofaExtra = { amr: _twofa.method };
+  if (wallet.twofa_enabled && req.body && req.body.remember_device && _twofa.method !== 'device') {
+    const dev = twofa.issueDeviceToken(db, wallet.did, (req.headers['user-agent'] || '').slice(0, 100));
+    _twofaExtra = { ..._twofaExtra, device_token: dev.token, device_expires_at: dev.expires_at };
   }
 
   // Capture fingerprint profile on every auth
@@ -5509,11 +5494,11 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
 
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
     scope, expiresIn: expires_in,
-    metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash },
+    metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash, amr: _twofa.method },
   });
   // REFRESH: issue alongside access token so agents never hit the hour-25 wall
   const _rf = issueRefreshToken(wallet.did, scope);
-  res.json({ ok: true, token, refresh_token: _rf.refresh_token, refresh_expires_at: _rf.refresh_expires_at, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
+  res.json({ ok: true, token, ..._twofaExtra, refresh_token: _rf.refresh_token, refresh_expires_at: _rf.refresh_expires_at, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
 });
 
 // POST /api/identity/request-account — silicon requests account, carbon gets payment link
@@ -6908,6 +6893,11 @@ function fleetRefillPass() {
 }
 setTimeout(fleetRefillPass, 30 * 1000);
 setInterval(fleetRefillPass, 5 * 60 * 1000);
+
+// ── Vault second factor (TOTP / email code / recovery codes / trusted devices): ./twofa + ./twofa_routes.
+const twofa = require('./twofa');
+try { twofa.initSchema(db); } catch (e) { console.error('[2fa] schema init failed:', e.message); }
+const twofaRoutes = require('./twofa_routes')({ app, db, identity, twofa, createEmailTransport, rateLimitStandard, rateLimitStrict, verifyWalletPassword });
 
 
 // ── Fleet Endpoints ──
@@ -10938,13 +10928,13 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   const resetUrl = `https://demipass.com/reset-password.html?token=${resetToken}`;
   const sendTo = wallet.recovery_email || wallet.email;
   try {
-    const dustforge = require('./dustforge-mail');
-    if (dustforge && dustforge.sendMail) {
-      dustforge.sendMail(sendTo, 'Password Reset — DemiPass',
-        `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`);
-    }
-  } catch(_) {
-    console.log(`[password-reset] ${wallet.username} → ${sendTo}: ${resetUrl}`);
+    createEmailTransport().sendMail({
+      from: 'DemiPass <noreply@dustforge.com>', to: sendTo, subject: 'Password Reset — DemiPass',
+      text: `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`,
+    }).then(() => console.log(`[password-reset] ${wallet.username}: reset link emailed to ${sendTo}`))
+      .catch(e => console.error(`[password-reset] ${wallet.username}: email to ${sendTo} FAILED: ${e.message}`));
+  } catch(e) {
+    console.error(`[password-reset] ${wallet.username}: transport error: ${e.message}`);
   }
 
   // Also store reset URL in a tick so admin can find it
@@ -10989,6 +10979,14 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
     db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
     return res.status(400).json({ error: 'reset token has expired. Request a new one.' });
   }
+  // An enrolled account proves a second factor here too: mailbox access alone must not reset
+  // the password of a two-factor account. Email codes are not accepted for this (the link
+  // already proved the mailbox); an authenticator or recovery code is required.
+  const resetWallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(resetRow.did);
+  if (resetWallet && resetWallet.twofa_enabled) {
+    const g = twofa.gate(db, resetWallet, { otp: req.body.otp, recovery_code: req.body.recovery_code }, { decryptSecret: (sec) => identity.decryptPrivateKey(sec).toString('utf8') });
+    if (!g.ok) return res.status(401).json({ error: '2fa_required', twofa_required: true, methods: ['totp', 'recovery'], detail: g.error });
+  }
 
   // Change password via Stalwart
   try {
@@ -11016,6 +11014,8 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
         if (pRes.statusCode < 300) {
           // Only burn token after confirmed password change
           db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
+          try { db.prepare('UPDATE identity_wallets SET password_hash = ? WHERE did = ?').run(crypto.createHash('sha256').update(new_password).digest('hex'), resetRow.did); } catch (_) {}
+          try { twofa.revokeAllDevices(db, resetRow.did); } catch (_) {}   // a password reset forgets trusted devices
           // Buoy tick
           try {
             db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
@@ -11044,7 +11044,8 @@ app.get('/api/identity/reset-password/verify', (req, res) => {
   const row = db.prepare('SELECT username, expires_at, used FROM password_reset_tokens WHERE token = ?').get(token);
   if (!row || row.used) return res.json({ valid: false });
   if (new Date(row.expires_at) < new Date()) return res.json({ valid: false, reason: 'expired' });
-  res.json({ valid: true, username: row.username });
+  const w = db.prepare('SELECT twofa_enabled FROM identity_wallets WHERE username = ?').get(row.username);
+  res.json({ valid: true, username: row.username, twofa_required: !!(w && w.twofa_enabled) });
 });
 
 // ============================================================
