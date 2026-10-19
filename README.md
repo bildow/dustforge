@@ -31,6 +31,15 @@ cp .env.example .env   # fill in your keys
 npm start
 ```
 
+## DemiPass Android app downloads
+
+`https://demipass.com/app/` (the APK the download buttons link to, plus `version.json` that installed copies
+poll to update themselves) is **not** part of this repository. nginx serves it from `/opt/dustforge/public/app`,
+which on the server is a symlink to `/var/www/demipass-releases`; the files there are written only by
+`release.sh` in [bildow/demipass-android](https://github.com/bildow/demipass-android) (immutable hash-named
+APKs + the manifest). Nothing under `public/app/` is tracked here, so a release never dirties the server checkout
+and `git pull` never fights a release.
+
 ## API
 
 | Endpoint | Method | Description |
