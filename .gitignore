@@ -10,4 +10,4 @@ IDENTITY_MASTER_KEY
 
 # Android app releases (APKs + version.json) are published by demipass-android/release.sh
 # into /var/www/demipass-releases on racknerd; /opt/dustforge/public/app is a symlink to it.
-public/app/
+public/app
