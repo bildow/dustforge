@@ -317,6 +317,9 @@
           <button onclick="setPhone()" style="padding:0.5rem 0.75rem;background:var(--accent);border:none;border-radius:6px;color:var(--bg);font-weight:600;font-size:0.75rem;cursor:pointer;white-space:nowrap">Save</button>
         </div>
         <div id="phone-msg" style="font-size:0.7rem;margin-top:0.25rem;margin-bottom:0.75rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked before a secret is revealed)</div>
+        <div id="pin-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.4rem"></div>
+        <button class="btn-ghost" onclick="openPinChange()" style="width:100%;text-align:left;padding:0.6rem">Change PIN</button>
       </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
@@ -418,9 +421,42 @@
     <label>Rotate every (optional, days)</label>
     <input type="number" id="s-rotate-days" min="1" max="3650" placeholder="e.g. 90 — drives rotation reminders">
     <label>Security depth</label>
-    <select id="s-depth"><option value="standard">Standard — reveal needs biometric</option><option value="elevated">Elevated — + email code to reveal/rotate/delete</option><option value="critical">Critical — + SMS code, strongest</option></select>
+    <select id="s-depth"><option value="standard">Standard — reveal needs your PIN</option><option value="elevated">Elevated — + email code to reveal/rotate/delete</option><option value="critical">Critical — + SMS code, strongest</option></select>
     <div id="s-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="storeSecret()">Store</button></div>
+  </div>
+</div>
+
+<!-- Vault PIN: unlock (asked by a gate), first-time setup (mandatory), change (settings) -->
+<div id="modal-pin" class="modal-bg" onclick="if(event.target===this)cancelPin()">
+  <div class="modal-sheet">
+    <h3>Enter your vault PIN</h3>
+    <div id="pin-unlock-what" style="font-size:0.8rem;color:var(--text3)">This credential reveals only after your PIN.</div>
+    <label>PIN</label><input type="password" id="pin-unlock" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits" onkeydown="if(event.key==='Enter')submitPin()">
+    <div id="pin-unlock-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="cancelPin()">Cancel</button><button class="btn-primary" onclick="submitPin()">Unlock</button></div>
+  </div>
+</div>
+<div id="modal-pin-setup" class="modal-bg">
+  <div class="modal-sheet">
+    <h3>Set your vault PIN</h3>
+    <div style="font-size:0.8rem;color:var(--text3)">Every secret reveal asks for this PIN first. 4 to 8 digits, known only to you. You cannot use the vault until one is set.</div>
+    <label>New PIN</label><input type="password" id="pin-new" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits">
+    <label>Repeat PIN</label><input type="password" id="pin-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="same digits again" onkeydown="if(event.key==='Enter')savePinSetup()">
+    <div id="pin-setup-pw-row"><label>Account password (confirms it is you)</label><input type="password" id="pin-setup-pw" autocomplete="current-password" onkeydown="if(event.key==='Enter')savePinSetup()"></div>
+    <div id="pin-setup-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="logout()">Sign out</button><button class="btn-primary" onclick="savePinSetup()">Save PIN</button></div>
+  </div>
+</div>
+<div id="modal-pin-change" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Change your vault PIN</h3>
+    <label>Current PIN</label><input type="password" id="pin-cur" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="leave empty if forgotten">
+    <label>Account password (only if the current PIN is forgotten)</label><input type="password" id="pin-change-pw" autocomplete="current-password">
+    <label>New PIN</label><input type="password" id="pin-change-new" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits">
+    <label>Repeat new PIN</label><input type="password" id="pin-change-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" onkeydown="if(event.key==='Enter')savePinChange()">
+    <div id="pin-change-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="savePinChange()">Save</button></div>
   </div>
 </div>
 
@@ -470,6 +506,7 @@ function isTokenExpired(){const t=localStorage.getItem('dp_token_at');if(!t)retu
 
 let tk=localStorage.getItem('dp_token')||'',did=localStorage.getItem('dp_did')||'',user=localStorage.getItem('dp_user')||'';
 let secrets=[],panic=false;
+let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
 
 if(tk&&!isTokenExpired())showApp();
 else if(tk){logout();document.getElementById('auth-err').textContent='Please sign in'}
@@ -483,7 +520,7 @@ async function login(){
     e.textContent='Signing in...';e.style.color='var(--text3)';
     const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
     if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
-    tk=a.token;did=a.did||'';user=u;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
+    tk=a.token;did=a.did||'';user=u;loginPw=p;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
 
 // Device login approval: hand off to /device.html on this same origin, which reuses this
@@ -797,6 +834,8 @@ async function loadSmsStatus(){
   const el=document.getElementById('sms-status'); if(!el)return;
   try{
     const s=await api('GET','/api/identity/gate/status');
+    const ps=document.getElementById('pin-status');
+    if(ps) ps.innerHTML = s.pin_set ? (s.pin_locked_for_seconds>0 ? '<span style="color:var(--red)">Set — locked for '+Math.ceil(s.pin_locked_for_seconds/60)+' min after wrong tries</span>' : '<span style="color:var(--green)">Set</span>') : '<span style="color:var(--yellow)">Not set</span>';
     if(!s.sms_configured){ el.innerHTML='<span style="color:var(--yellow)">SMS delivery not yet configured on the server</span>'; }
     else if(s.phone_set){ el.innerHTML='On file: <span style="color:var(--green)">'+esc(s.phone_hint||'set')+'</span>'; }
     else { el.textContent='No number on file yet'; }
@@ -832,10 +871,78 @@ async function showApp(){
     }
   } catch(_) {}
 
+  // The vault PIN is mandatory: it is the factor behind every reveal. No PIN yet → set one before the vault opens.
+  try {
+    const gs = await api('GET','/api/identity/gate/status');
+    if (gs && gs.pin_set === false) await requirePinSetup();
+  } catch(_) {}
+  loginPw='';
+
   document.getElementById('app').style.display='block';
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents()}
+
+// ── Vault PIN ──────────────────────────────────────────────────────────────
+let pinSetupDone=null, pinUnlockDone=null;
+const PIN_OK=/^\d{4,8}$/;
+function requirePinSetup(){
+  return new Promise(resolve=>{
+    pinSetupDone=resolve;
+    document.getElementById('pin-setup-pw-row').style.display=loginPw?'none':'block';
+    for(const i of ['pin-new','pin-confirm','pin-setup-pw']) document.getElementById(i).value='';
+    const m=document.getElementById('pin-setup-msg'); m.textContent=''; m.className='modal-msg';
+    openModal('pin-setup'); setTimeout(()=>document.getElementById('pin-new').focus(),80);
+  });
+}
+async function savePinSetup(){
+  const a=document.getElementById('pin-new').value, b=document.getElementById('pin-confirm').value, m=document.getElementById('pin-setup-msg');
+  const pw=loginPw||document.getElementById('pin-setup-pw').value;
+  if(!PIN_OK.test(a)){m.textContent='Use 4 to 8 digits';m.className='modal-msg err';return}
+  if(a!==b){m.textContent='The two PINs differ';m.className='modal-msg err';return}
+  if(!pw){m.textContent='Enter your account password';m.className='modal-msg err';return}
+  try{
+    m.textContent='Saving…';m.className='modal-msg';
+    await api('POST','/api/identity/pin',{pin:a,password:pw});
+    loginPw=''; for(const i of ['pin-new','pin-confirm','pin-setup-pw']) document.getElementById(i).value='';
+    closeModal(); const d=pinSetupDone; pinSetupDone=null; if(d) d(true);
+  }catch(e){ m.textContent=e.message; m.className='modal-msg err'; }
+}
+function unlockWithPin(){
+  return new Promise(resolve=>{
+    pinUnlockDone=resolve;
+    document.getElementById('pin-unlock').value=''; const m=document.getElementById('pin-unlock-msg'); m.textContent=''; m.className='modal-msg';
+    openModal('pin'); setTimeout(()=>document.getElementById('pin-unlock').focus(),80);
+  });
+}
+function cancelPin(){ closeModal(); const d=pinUnlockDone; pinUnlockDone=null; if(d) d(false); }
+async function submitPin(){
+  const el=document.getElementById('pin-unlock'), m=document.getElementById('pin-unlock-msg');
+  const pin=el.value;
+  if(!PIN_OK.test(pin)){m.textContent='4 to 8 digits';m.className='modal-msg err';return}
+  try{
+    await api('POST','/api/identity/gate/verify',{gate:'pin',pin});
+    el.value=''; closeModal(); const d=pinUnlockDone; pinUnlockDone=null; if(d) d(true);
+  }catch(e){ el.value=''; m.textContent=e.message; m.className='modal-msg err'; el.focus(); }
+}
+function openPinChange(){
+  for(const i of ['pin-cur','pin-change-pw','pin-change-new','pin-change-confirm']) document.getElementById(i).value='';
+  const m=document.getElementById('pin-change-msg'); m.textContent=''; m.className='modal-msg';
+  openModal('pin-change'); setTimeout(()=>document.getElementById('pin-cur').focus(),80);
+}
+async function savePinChange(){
+  const cur=document.getElementById('pin-cur').value, pw=document.getElementById('pin-change-pw').value;
+  const a=document.getElementById('pin-change-new').value, b=document.getElementById('pin-change-confirm').value, m=document.getElementById('pin-change-msg');
+  if(!PIN_OK.test(a)){m.textContent='New PIN: 4 to 8 digits';m.className='modal-msg err';return}
+  if(a!==b){m.textContent='The two new PINs differ';m.className='modal-msg err';return}
+  if(!cur&&!pw){m.textContent='Enter your current PIN, or your password if you forgot it';m.className='modal-msg err';return}
+  try{
+    m.textContent='Saving…';m.className='modal-msg';
+    await api('POST','/api/identity/pin', cur?{pin:a,current_pin:cur}:{pin:a,password:pw});
+    closeModal(); loadSmsStatus();
+    alert('PIN changed.');
+  }catch(e){ m.textContent=e.message; m.className='modal-msg err'; }
+}
 
 let dashboardData = null;
 
@@ -997,7 +1104,7 @@ function showDetail(name) {
   h += `</div>`;
   if(depth==='custom') h += `<div style="font-size:0.65rem;color:var(--text3);margin-bottom:0.5rem">Custom policy set via API</div>`;
   // Gate matrix — what each action requires
-  const gateChip = g => `<span style="font-size:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.05rem 0.4rem;color:var(--text2)">${g}</span>`;
+  const gateChip = g => `<span style="font-size:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.05rem 0.4rem;color:var(--text2)">${gateName(g)}</span>`;
   h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.72rem">`;
   for(const act of ['reveal','rotate','delete']){
     const gates = gp[act]||[];
@@ -1062,7 +1169,7 @@ function showDetail(name) {
   h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center">`;
   h += `<div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">Secret value is encrypted and hidden</div>`;
   h += `<div id="reveal-value" style="display:none;background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:0.75rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;word-break:break-all;color:var(--red)"></div>`;
-  const revGates = gp.reveal||[]; const revLabel = revGates.length ? 'Reveal ('+revGates.join(' + ')+')' : 'Reveal';
+  const revGates = gp.reveal||[]; const revLabel = revGates.length ? 'Reveal ('+revGates.map(gateName).join(' + ')+')' : 'Reveal';
   h += `<button onclick="revealSecret('${esc(s.name)}')" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
   h += `</div></div>`;
 
@@ -1280,9 +1387,11 @@ async function satisfyGate(gate){
       const r=prompt('Enter your genesis refraction:');
       if(!r) return false;
       await api('POST','/api/identity/gate/verify',{gate:'genesis',refraction:r});
+    } else if(gate==='pin'){
+      return await unlockWithPin();
     } else if(gate==='fingerprint'){
-      // A fingerprint gate needs a fingerprint-authed token; re-auth with password.
-      const pw=prompt('Confirm your password to satisfy the biometric gate:');
+      // Legacy server: a fingerprint gate needs a fingerprint-authed token; re-auth with password.
+      const pw=prompt('Confirm your password to continue:');
       if(!pw) return false;
       const r=await api('POST','/api/identity/auth-fingerprint',{username:user,password:pw,scope:'transact'});
       if(r&&r.token){ tk=r.token; localStorage.setItem('dp_token',tk); localStorage.setItem('dp_token_at',Date.now()); }
@@ -1325,7 +1434,7 @@ async function revealSecret(name) {
   btn.disabled = true;
   try {
     // apiGated walks whatever factors this credential's policy demands
-    // (fingerprint, +email, +SMS) and only then reveals.
+    // (PIN, +email, +SMS) and only then reveals.
     const data = await apiGated('POST','/api/blindkey/reveal',{ name });
     valEl.textContent = data.value;
     valEl.style.display = 'block';
@@ -1436,6 +1545,7 @@ async function loadSiliconAgents(){
 function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
 function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
 function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function gateName(g){return ({pin:'PIN',fingerprint:'PIN',twofa:'email code',sms:'SMS code',password:'password',genesis:'genesis'})[g]||esc(g)}
 
 document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeModal()}});

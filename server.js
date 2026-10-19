@@ -47,6 +47,7 @@ const BLINDKEY_SSH_HOSTS = new Set([
   '100.73.92.12',      // skypie (Aaron's laptop, tailnet)
 ]);
 
+const pinGate = require('./pin_gate');   // vault PIN: hash/verify/lockout helpers for the 'pin' gate
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 50, message: { error: 'Too many requests' } });
@@ -918,13 +919,15 @@ app.post('/api/identity/verify', (req, res) => {
 app.get('/api/identity/gate/status', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-  const wallet = db.prepare('SELECT phone FROM identity_wallets WHERE did = ?').get(auth.did);
+  const wallet = db.prepare('SELECT phone, pin_hash, pin_locked_until FROM identity_wallets WHERE did = ?').get(auth.did);
   const fresh = {};
   for (const g of GATE_TYPES) fresh[g] = gateFresh(auth.did, g, auth);
   res.json({
     did: auth.did,
     window_seconds: GATE_WINDOW_SEC,
     fresh,
+    pin_set: Boolean(wallet && wallet.pin_hash),
+    pin_locked_for_seconds: pinGate.lockedFor(wallet),
     phone_set: Boolean(wallet && wallet.phone),
     phone_hint: wallet && wallet.phone ? '•••' + String(wallet.phone).slice(-4) : null,
     sms_configured: Boolean(process.env.SW_PROJECT && process.env.SW_TOKEN && process.env.SW_PHONE && process.env.SW_SPACE),
@@ -979,7 +982,8 @@ app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => 
 //   { gate:'twofa'|'sms', code }
 //   { gate:'password', password }
 //   { gate:'genesis', refraction }
-//   { gate:'fingerprint' }  (proven by presenting a fingerprint-authed token)
+//   { gate:'pin', pin }     (the vault PIN set via POST /api/identity/pin)
+//   { gate:'fingerprint' }  (legacy: proven by presenting a fingerprint-authed token; policies now read it as 'pin')
 app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
@@ -1010,8 +1014,29 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
   }
 
+  if (gate === 'pin') {
+    // Wrong answers are 403, not 401: the vault app treats 401 as an expired session and signs out.
+    if (auth.silicon) return res.status(403).json({ error: 'silicon agents have no PIN' });
+    const { pin } = req.body || {};
+    const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
+    if (!wallet) return res.status(404).json({ error: 'identity not found' });
+    if (!wallet.pin_hash) return res.status(409).json({ error: 'no PIN set yet — set one via POST /api/identity/pin', pin_set: false });
+    const locked = pinGate.lockedFor(wallet);
+    if (locked > 0) return res.status(429).json({ error: `PIN locked after too many wrong tries; try again in ${Math.ceil(locked / 60)} min`, locked_for_seconds: locked });
+    if (!pinGate.validPin(String(pin ?? '')) || !pinGate.verifyPin(wallet.pin_hash, String(pin))) {
+      const next = pinGate.afterFailure(wallet);
+      db.prepare('UPDATE identity_wallets SET pin_failures = ?, pin_locked_until = ? WHERE did = ?').run(next.pin_failures, next.pin_locked_until, did);
+      logSecurityEvent('pin_failed', next.locked ? 'alert' : 'warn', { caller_did: did, ip: req.ip, locked: next.locked, attempts_left: next.attempts_left });
+      if (next.locked) return res.status(429).json({ error: 'incorrect PIN — locked for 15 minutes', locked_for_seconds: pinGate.LOCK_SECONDS, attempts_left: 0 });
+      return res.status(403).json({ error: `incorrect PIN (${next.attempts_left} ${next.attempts_left === 1 ? 'try' : 'tries'} left)`, attempts_left: next.attempts_left });
+    }
+    db.prepare('UPDATE identity_wallets SET pin_failures = 0, pin_locked_until = NULL WHERE did = ?').run(did);
+    recordGate(did, 'pin');
+    return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
+  }
+
   if (gate === 'fingerprint') {
-    // Proven intrinsically: the caller must hold a fingerprint-authed token.
+    // Legacy. Proven intrinsically: the caller must hold a fingerprint-authed token.
     if (auth.auth_method !== 'fingerprint') {
       return res.status(403).json({ error: 'present a fingerprint-authed token (re-auth via /api/identity/auth-fingerprint)' });
     }
@@ -1030,6 +1055,43 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     recordGate(did, 'genesis');
     return res.json({ ok: true, gate, match: exactMatch ? 'exact' : 'structural', valid_for_seconds: GATE_WINDOW_SEC });
   }
+});
+
+// POST /api/identity/pin — set or change the vault PIN (4–8 digits), the human-presence factor behind
+// `reveal`. The phone vault insists one exists before it opens. Setting it needs the account password;
+// changing it needs the current PIN (or the password, for a forgotten PIN). Wrong answers are 403 (see above).
+//   { pin, password }  |  { pin, current_pin }
+app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (auth.silicon) return res.status(403).json({ error: 'silicon agents cannot set the owner PIN' });
+  const { pin, password, current_pin } = req.body || {};
+  if (!pinGate.validPin(String(pin ?? ''))) return res.status(400).json({ error: 'pin must be 4 to 8 digits' });
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  if (current_pin !== undefined && current_pin !== null && current_pin !== '') {
+    if (!wallet.pin_hash) return res.status(400).json({ error: 'no PIN set yet; send the account password instead' });
+    const locked = pinGate.lockedFor(wallet);
+    if (locked > 0) return res.status(429).json({ error: `PIN locked; try again in ${Math.ceil(locked / 60)} min`, locked_for_seconds: locked });
+    if (!pinGate.validPin(String(current_pin)) || !pinGate.verifyPin(wallet.pin_hash, String(current_pin))) {
+      const next = pinGate.afterFailure(wallet);
+      db.prepare('UPDATE identity_wallets SET pin_failures = ?, pin_locked_until = ? WHERE did = ?').run(next.pin_failures, next.pin_locked_until, auth.did);
+      logSecurityEvent('pin_failed', next.locked ? 'alert' : 'warn', { caller_did: auth.did, ip: req.ip, locked: next.locked, context: 'change' });
+      if (next.locked) return res.status(429).json({ error: 'current PIN is incorrect — locked for 15 minutes', locked_for_seconds: pinGate.LOCK_SECONDS });
+      return res.status(403).json({ error: `current PIN is incorrect (${next.attempts_left} left)`, attempts_left: next.attempts_left });
+    }
+  } else {
+    if (!password || typeof password !== 'string') {
+      return res.status(400).json({ error: wallet.pin_hash ? 'current_pin or password required to change the PIN' : 'password required to set the PIN' });
+    }
+    const okPw = await verifyWalletPassword(wallet, password);
+    if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+    if (!okPw) return res.status(403).json({ error: 'invalid password' });
+  }
+  db.prepare("UPDATE identity_wallets SET pin_hash = ?, pin_failures = 0, pin_locked_until = NULL, pin_set_at = datetime('now'), updated_at = CURRENT_TIMESTAMP WHERE did = ?")
+    .run(pinGate.hashPin(String(pin)), auth.did);
+  logSecurityEvent(wallet.pin_hash ? 'pin_changed' : 'pin_set', 'warn', { caller_did: auth.did, ip: req.ip });
+  res.json({ ok: true, pin_set: true, changed: Boolean(wallet.pin_hash) });
 });
 
 // POST /api/demipass/secrets/gate-policy — set a secret's security depth.
@@ -2901,9 +2963,9 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
   }
 });
 
-// POST /api/blindkey/reveal — reveal a secret value (owner only, requires fingerprint re-auth)
-// This is the ONLY path to see a stored value. It requires the owner to re-authenticate
-// with fingerprint, is rate-limited aggressively, and logs a CRITICAL security event.
+// POST /api/blindkey/reveal — reveal a secret value (owner only; the gate policy decides what the owner
+// must prove first — the vault PIN at standard depth, plus email/SMS codes at higher depths).
+// This is the ONLY path to see a stored value. It is rate-limited and logs a CRITICAL security event.
 app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
@@ -2927,8 +2989,8 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
   }
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
 
-  // Per-credential gate policy. Default depth requires a fresh fingerprint for
-  // reveal (preserving prior intent); elevated/critical add twofa/sms.
+  // Per-credential gate policy. Default depth requires a fresh PIN for reveal;
+  // elevated/critical add twofa/sms.
   const gate = checkGatePolicy(actor.did, 'reveal', secret, auth);
   if (!gate.ok) return res.status(403).json(gate);
 
@@ -11613,9 +11675,15 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_sr_secret ON secret_rotations(secr
 // GATE_WINDOW_SEC) before a protected action runs. Each secret carries a
 // security_depth preset (or a custom gate_policy JSON) mapping actions
 // (reveal/rotate/delete/use) -> required gates. Gates: password, twofa (email),
-// sms, fingerprint, genesis. Silicon agents are exempt from human-factor gates
-// on `use` so blind automation is not broken — see checkGatePolicy.
+// sms, pin (the vault PIN; 'fingerprint' in stored policies is read as pin),
+// genesis. Silicon agents are exempt from human-factor gates on `use` so blind
+// automation is not broken — see checkGatePolicy.
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN phone TEXT DEFAULT ''"); } catch(_) {}
+// Vault PIN: scrypt hash + lockout counters on the wallet row (pin_gate.js).
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN pin_hash TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN pin_failures INTEGER DEFAULT 0"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN pin_locked_until TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN pin_set_at TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN security_depth TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN gate_policy TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec(`CREATE TABLE IF NOT EXISTS identity_sms_codes (
@@ -11634,17 +11702,17 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS gate_verifications (
 )`); } catch(e) {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_gv_did ON gate_verifications(did, gate_type)'); } catch(e) {}
 
-const GATE_TYPES = ['password', 'twofa', 'sms', 'fingerprint', 'genesis'];
+const GATE_TYPES = ['password', 'twofa', 'sms', 'pin', 'fingerprint', 'genesis'];   // fingerprint = legacy spelling of pin
 const GATE_WINDOW_SEC = 300; // a passed gate stays fresh for 5 minutes
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 
 // Presets the UI exposes as a "how much security depth" slider. Custom lets the
-// user hand-pick per action. `standard` preserves historical behavior: reveal
-// needs a fresh fingerprint, everything else just needs the transact token.
+// user hand-pick per action. `standard`: reveal needs the vault PIN, everything
+// else just needs the transact token.
 const SECURITY_DEPTH_PRESETS = {
-  standard: { reveal: ['fingerprint'], rotate: [], delete: [], use: [] },
-  elevated: { reveal: ['fingerprint', 'twofa'], rotate: ['twofa'], delete: ['twofa'], use: [] },
-  critical: { reveal: ['fingerprint', 'twofa', 'sms'], rotate: ['fingerprint', 'twofa'], delete: ['fingerprint', 'twofa', 'sms'], use: [] },
+  standard: { reveal: ['pin'], rotate: [], delete: [], use: [] },
+  elevated: { reveal: ['pin', 'twofa'], rotate: ['twofa'], delete: ['twofa'], use: [] },
+  critical: { reveal: ['pin', 'twofa', 'sms'], rotate: ['pin', 'twofa'], delete: ['pin', 'twofa', 'sms'], use: [] },
 };
 const DEFAULT_DEPTH = 'standard';
 
@@ -11668,7 +11736,9 @@ function resolveGatePolicy(secret) {
   } else if (secret && secret.security_depth && SECURITY_DEPTH_PRESETS[secret.security_depth]) {
     policy = SECURITY_DEPTH_PRESETS[secret.security_depth];
   }
-  return { ...base, ...policy };
+  const out = { ...base, ...policy };
+  for (const a of GATE_ACTIONS) out[a] = pinGate.normalizeGates(out[a]);   // legacy 'fingerprint' → 'pin'
+  return out;
 }
 
 function recordGate(did, gate) {
@@ -11706,7 +11776,7 @@ function checkGatePolicy(did, action, secret, auth) {
     required,
     missing,
     window_seconds: GATE_WINDOW_SEC,
-    hint: 'satisfy each gate via POST /api/identity/gate/verify (sms first needs /gate/sms/request), then retry within 5 minutes',
+    hint: 'satisfy each gate via POST /api/identity/gate/verify ({gate:"pin",pin} for the vault PIN; sms first needs /gate/sms/request), then retry within 5 minutes',
   };
 }
 
