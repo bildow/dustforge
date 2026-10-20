@@ -907,8 +907,8 @@ app.post('/api/identity/verify', (req, res) => {
   if (!validCode) return res.status(401).json({ error: 'invalid or expired 2FA code' });
   db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE id = ?').run(validCode.id);
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, did, { scope, expiresIn: expires_in, metadata: { email: wallet.email, username: wallet.username } });
-  // Passing 2FA is also a fresh 'twofa' gate for this DID.
-  recordGate(did, 'twofa');
+  // Passing 2FA is also a fresh 'twofa' gate for the session this token opens.
+  recordGate(did, 'twofa', tokenJti(token));
   res.json({ ok: true, token, did, scope, email: wallet.email });
 });
 
@@ -928,6 +928,7 @@ app.get('/api/identity/gate/status', rateLimitStandard, (req, res) => {
     fresh,
     pin_set: Boolean(wallet && wallet.pin_hash),
     pin_locked_for_seconds: pinGate.lockedFor(wallet),
+    pin_single_use: true,   // a PIN proof is spent by the first gated action; codes stay fresh window_seconds
     phone_set: Boolean(wallet && wallet.phone),
     phone_hint: wallet && wallet.phone ? '•••' + String(wallet.phone).slice(-4) : null,
     sms_configured: Boolean(process.env.SW_PROJECT && process.env.SW_TOKEN && process.env.SW_PHONE && process.env.SW_SPACE),
@@ -954,7 +955,7 @@ app.post('/api/identity/phone', rateLimitStrict, async (req, res) => {
   if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
   if (!okPw) return res.status(401).json({ error: 'invalid password' });
   db.prepare('UPDATE identity_wallets SET phone = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(phone.trim(), auth.did);
-  recordGate(auth.did, 'password');
+  recordGate(auth.did, 'password', gateSession(auth));
   res.json({ ok: true, phone_hint: '•••' + phone.trim().slice(-4) });
 });
 
@@ -998,7 +999,7 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     const row = db.prepare(`SELECT * FROM ${table} WHERE did = ? AND code = ? AND used = 0 AND expires_at > datetime('now') ORDER BY id DESC LIMIT 1`).get(did, String(code));
     if (!row) return res.status(401).json({ error: `invalid or expired ${gate} code` });
     db.prepare(`UPDATE ${table} SET used = 1 WHERE id = ?`).run(row.id);
-    recordGate(did, gate);
+    recordGate(did, gate, gateSession(auth));
     return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
   }
 
@@ -1010,7 +1011,7 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     const okPw = await verifyWalletPassword(wallet, password);
     if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
     if (!okPw) return res.status(401).json({ error: 'invalid password' });
-    recordGate(did, 'password');
+    recordGate(did, 'password', gateSession(auth));
     return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
   }
 
@@ -1026,13 +1027,16 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     if (!pinGate.validPin(String(pin ?? '')) || !pinGate.verifyPin(wallet.pin_hash, String(pin))) {
       const next = pinGate.afterFailure(wallet);
       db.prepare('UPDATE identity_wallets SET pin_failures = ?, pin_locked_until = ? WHERE did = ?').run(next.pin_failures, next.pin_locked_until, did);
+      if (next.locked) invalidatePinProofs(did);   // a locked PIN unlocks nothing, in any session
       logSecurityEvent('pin_failed', next.locked ? 'alert' : 'warn', { caller_did: did, ip: req.ip, locked: next.locked, attempts_left: next.attempts_left });
       if (next.locked) return res.status(429).json({ error: 'incorrect PIN — locked for 15 minutes', locked_for_seconds: pinGate.LOCK_SECONDS, attempts_left: 0 });
       return res.status(403).json({ error: `incorrect PIN (${next.attempts_left} ${next.attempts_left === 1 ? 'try' : 'tries'} left)`, attempts_left: next.attempts_left });
     }
+    const session = gateSession(auth);
+    if (!session) return res.status(403).json({ error: 'this token cannot hold a PIN proof — sign in again' });
     db.prepare('UPDATE identity_wallets SET pin_failures = 0, pin_locked_until = NULL WHERE did = ?').run(did);
-    recordGate(did, 'pin');
-    return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
+    recordGate(did, 'pin', session);
+    return res.json({ ok: true, gate, single_use: true, valid_for_seconds: GATE_WINDOW_SEC, note: 'good for the next gated action in this session' });
   }
 
   if (gate === 'fingerprint') {
@@ -1040,7 +1044,7 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     if (auth.auth_method !== 'fingerprint') {
       return res.status(403).json({ error: 'present a fingerprint-authed token (re-auth via /api/identity/auth-fingerprint)' });
     }
-    recordGate(did, 'fingerprint');
+    recordGate(did, 'fingerprint', gateSession(auth));
     return res.json({ ok: true, gate, valid_for_seconds: GATE_WINDOW_SEC });
   }
 
@@ -1052,7 +1056,7 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     const exactMatch = hashRefraction(refraction) === genesis.origin_hash;
     const structuralMatch = structuralHash(refraction) === genesis.structural_hash;
     if (!exactMatch && !structuralMatch) return res.status(401).json({ error: 'refraction does not match origin' });
-    recordGate(did, 'genesis');
+    recordGate(did, 'genesis', gateSession(auth));
     return res.json({ ok: true, gate, match: exactMatch ? 'exact' : 'structural', valid_for_seconds: GATE_WINDOW_SEC });
   }
 });
@@ -1076,6 +1080,7 @@ app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
     if (!pinGate.validPin(String(current_pin)) || !pinGate.verifyPin(wallet.pin_hash, String(current_pin))) {
       const next = pinGate.afterFailure(wallet);
       db.prepare('UPDATE identity_wallets SET pin_failures = ?, pin_locked_until = ? WHERE did = ?').run(next.pin_failures, next.pin_locked_until, auth.did);
+      if (next.locked) invalidatePinProofs(auth.did);
       logSecurityEvent('pin_failed', next.locked ? 'alert' : 'warn', { caller_did: auth.did, ip: req.ip, locked: next.locked, context: 'change' });
       if (next.locked) return res.status(429).json({ error: 'current PIN is incorrect — locked for 15 minutes', locked_for_seconds: pinGate.LOCK_SECONDS });
       return res.status(403).json({ error: `current PIN is incorrect (${next.attempts_left} left)`, attempts_left: next.attempts_left });
@@ -1088,8 +1093,12 @@ app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
     if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
     if (!okPw) return res.status(403).json({ error: 'invalid password' });
   }
-  db.prepare("UPDATE identity_wallets SET pin_hash = ?, pin_failures = 0, pin_locked_until = NULL, pin_set_at = datetime('now'), updated_at = CURRENT_TIMESTAMP WHERE did = ?")
-    .run(pinGate.hashPin(String(pin)), auth.did);
+  // The new PIN replaces the old one everywhere at once: proofs earned with the old PIN (any session) die with it.
+  db.transaction(() => {
+    db.prepare("UPDATE identity_wallets SET pin_hash = ?, pin_failures = 0, pin_locked_until = NULL, pin_set_at = datetime('now'), updated_at = CURRENT_TIMESTAMP WHERE did = ?")
+      .run(pinGate.hashPin(String(pin)), auth.did);
+    invalidatePinProofs(auth.did);
+  })();
   logSecurityEvent(wallet.pin_hash ? 'pin_changed' : 'pin_set', 'warn', { caller_did: auth.did, ip: req.ip });
   res.json({ ok: true, pin_set: true, changed: Boolean(wallet.pin_hash) });
 });
@@ -1097,9 +1106,15 @@ app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
 // POST /api/demipass/secrets/gate-policy — set a secret's security depth.
 //   { name|ref, security_depth:'standard'|'elevated'|'critical' }  OR
 //   { name|ref, gate_policy:{ reveal:[...], rotate:[...], delete:[...], use:[...] } }
+// Strengthening (adding factors) needs only the owner token. Weakening an action's protection
+// first requires opening it: every gate currently guarding that action must be fresh for this
+// session (403 with `missing`, same shape as a gated action, so the vault walks the factors).
+// The vault PIN is a floor on reveal — a custom policy can add to it, never remove it.
 app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
+  const auth = getBearerIdentity(req);
+  if (auth.silicon) return res.status(403).json({ error: 'silicon agents cannot change gate policies' });
   const { name, ref, security_depth, gate_policy } = req.body || {};
   if (!name && !ref) return res.status(400).json({ error: 'name or ref required' });
   const ownerDid = actor.did;
@@ -1108,21 +1123,39 @@ app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
     : db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status IN ('active','rotating')").get(ownerDid, name);
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
+  let update, reply;
   if (gate_policy !== undefined) {
     const err = validateGatePolicy(gate_policy);
     if (err) return res.status(400).json({ error: err });
-    db.prepare("UPDATE blindkey_secrets SET gate_policy = ?, security_depth = 'custom', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .run(JSON.stringify(gate_policy), secret.id);
-    return res.json({ ok: true, security_depth: 'custom', gate_policy, effective: resolveGatePolicy({ gate_policy: JSON.stringify(gate_policy) }) });
-  }
-  if (security_depth !== undefined) {
+    const stored = JSON.stringify(gate_policy);
+    update = () => db.prepare("UPDATE blindkey_secrets SET gate_policy = ?, security_depth = 'custom', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(stored, secret.id);
+    reply = { ok: true, security_depth: 'custom', gate_policy, effective: resolveGatePolicy({ gate_policy: stored }) };
+    if (!pinGate.normalizeGates(gate_policy.reveal).includes('pin')) reply.note = 'the vault PIN is always required to reveal; a custom policy can only add factors to it';
+  } else if (security_depth !== undefined) {
     if (!SECURITY_DEPTH_PRESETS[security_depth]) return res.status(400).json({ error: `security_depth must be one of ${Object.keys(SECURITY_DEPTH_PRESETS).join(', ')}` });
     // Setting a named preset clears any custom policy so the preset is authoritative.
-    db.prepare('UPDATE blindkey_secrets SET security_depth = ?, gate_policy = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
-      .run(security_depth, secret.id);
-    return res.json({ ok: true, security_depth, effective: SECURITY_DEPTH_PRESETS[security_depth] });
+    update = () => db.prepare('UPDATE blindkey_secrets SET security_depth = ?, gate_policy = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(security_depth, secret.id);
+    reply = { ok: true, security_depth, effective: resolveGatePolicy({ security_depth }) };
+  } else {
+    return res.status(400).json({ error: 'provide security_depth or gate_policy' });
   }
-  return res.status(400).json({ error: 'provide security_depth or gate_policy' });
+
+  const current = resolveGatePolicy(secret);
+  const weakened = pinGate.weakenedGates(current, reply.effective);
+  if (weakened.actions.length) {
+    const missing = weakened.prove.filter(g => !gateFresh(ownerDid, g, auth));
+    if (missing.length) {
+      logSecurityEvent('gate_policy_change_blocked', 'warn', { caller_did: ownerDid, target: secret.name, ip: req.ip, weakens: weakened.actions, missing });
+      const out = gateMissing('gate-policy', weakened.prove, missing);
+      out.error = `lowering this credential's protection for ${weakened.actions.join(', ')} first requires fresh ${missing.join(' + ')} verification`;
+      out.weakens = weakened.actions;
+      return res.status(403).json(out);
+    }
+    for (const g of weakened.prove) if (GATE_SINGLE_USE.has(g)) consumeGate(ownerDid, g, gateSession(auth));
+    logSecurityEvent('gate_policy_weakened', 'alert', { caller_did: ownerDid, target: secret.name, ip: req.ip, weakens: weakened.actions, from: current, to: reply.effective });
+  }
+  update();
+  res.json(reply);
 });
 
 // ── Token tracking + revocation surface ──
@@ -11701,9 +11734,13 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS gate_verifications (
   verified_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_gv_did ON gate_verifications(did, gate_type)'); } catch(e) {}
+// A proof belongs to the session (token jti) that produced it: another token for the same DID cannot borrow it.
+try { db.exec("ALTER TABLE gate_verifications ADD COLUMN session TEXT DEFAULT NULL"); } catch(_) {}
 
 const GATE_TYPES = ['password', 'twofa', 'sms', 'pin', 'fingerprint', 'genesis'];   // fingerprint = legacy spelling of pin
-const GATE_WINDOW_SEC = 300; // a passed gate stays fresh for 5 minutes
+const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 minutes (per session)
+// The PIN is a confirmation, not an unlock window: each gated action consumes it, so every reveal asks again.
+const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 
 // Presets the UI exposes as a "how much security depth" slider. Custom lets the
@@ -11738,23 +11775,55 @@ function resolveGatePolicy(secret) {
   }
   const out = { ...base, ...policy };
   for (const a of GATE_ACTIONS) out[a] = pinGate.normalizeGates(out[a]);   // legacy 'fingerprint' → 'pin'
+  // The vault PIN is mandatory on reveal: a custom policy can add factors to it, never remove it.
+  if (!out.reveal.includes('pin')) out.reveal = ['pin', ...out.reveal];
   return out;
 }
 
-function recordGate(did, gate) {
-  try { db.prepare('INSERT INTO gate_verifications (did, gate_type) VALUES (?, ?)').run(did, gate); } catch (_) {}
+// The session a proof is bound to: the token's jti (every JWT minted since 2026-07-06 carries one), or the
+// agent identity for a silicon token. Tokens without either cannot hold proofs — re-authenticate for a jti.
+function gateSession(auth) {
+  if (!auth || !auth.ok) return null;
+  if (auth.silicon) return auth.silicon_did ? 'silicon:' + auth.silicon_did : null;
+  return (auth.decoded && auth.decoded.jti) || null;
+}
+// jti of a freshly minted token (for routes that pass a gate while minting, e.g. 2FA login).
+function tokenJti(token) {
+  try { return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString()).jti || null; } catch (_) { return null; }
 }
 
-// A gate is fresh if it was passed within the window. Fingerprint is ALSO
+// Record a passed gate for one session. A proof without a session is never usable, so it is not stored.
+function recordGate(did, gate, session) {
+  if (!session) return;
+  try { db.prepare('INSERT INTO gate_verifications (did, gate_type, session) VALUES (?, ?, ?)').run(did, gate, session); } catch (_) {}
+}
+// Spend a single-use proof (the PIN) once the action it unlocked has been authorized.
+function consumeGate(did, gate, session) {
+  if (!session) return;
+  try { db.prepare('DELETE FROM gate_verifications WHERE did = ? AND gate_type = ? AND session = ?').run(did, gate, session); } catch (_) {}
+}
+// Drop every PIN proof this DID holds, in every session: on PIN set/change and on lockout.
+function invalidatePinProofs(did) {
+  try { db.prepare("DELETE FROM gate_verifications WHERE did = ? AND gate_type IN ('pin', 'fingerprint')").run(did); } catch (_) {}
+}
+
+// A gate is fresh if THIS session passed it within the window. Fingerprint is ALSO
 // satisfied intrinsically by a fingerprint-authed token minted within the
 // window — re-auth via /auth-fingerprint refreshes it without a separate call.
+// A PIN proof additionally dies with the PIN: none while the PIN is locked or unset.
 function gateFresh(did, gate, auth) {
   const nowSec = Math.floor(Date.now() / 1000);
   if (gate === 'fingerprint' && auth && auth.auth_method === 'fingerprint'
       && auth.decoded && auth.decoded.iat && (nowSec - auth.decoded.iat) < GATE_WINDOW_SEC) {
     return true;
   }
-  const row = db.prepare('SELECT verified_at FROM gate_verifications WHERE did = ? AND gate_type = ? ORDER BY id DESC LIMIT 1').get(did, gate);
+  const session = gateSession(auth);
+  if (!session) return false;
+  if (gate === 'pin') {
+    const w = db.prepare('SELECT pin_hash, pin_locked_until FROM identity_wallets WHERE did = ?').get(did);
+    if (!w || !w.pin_hash || pinGate.lockedFor(w) > 0) return false;
+  }
+  const row = db.prepare('SELECT verified_at FROM gate_verifications WHERE did = ? AND gate_type = ? AND session = ? ORDER BY id DESC LIMIT 1').get(did, gate, session);
   if (!row) return false;
   const ageMs = Date.now() - new Date((row.verified_at || '').replace(' ', 'T') + 'Z').getTime();
   return ageMs >= 0 && ageMs / 1000 < GATE_WINDOW_SEC;
@@ -11763,12 +11832,20 @@ function gateFresh(did, gate, auth) {
 // Enforcement gate. Returns {ok:true} or {ok:false, missing:[...], ...}.
 // Silicon callers are exempt from human-factor gates on `use` ONLY — every
 // other action already blocks silicon upstream (reveal) or is owner-initiated.
+// When every required gate is fresh, single-use proofs (the PIN) are consumed
+// right here: the action is authorized exactly once per PIN entry.
 function checkGatePolicy(did, action, secret, auth) {
   const policy = resolveGatePolicy(secret);
   let required = policy[action] || [];
   if (auth && auth.silicon && action === 'use') required = []; // don't break blind automation
   const missing = required.filter(g => !gateFresh(did, g, auth));
-  if (missing.length === 0) return { ok: true, required };
+  if (missing.length === 0) {
+    for (const g of required) if (GATE_SINGLE_USE.has(g)) consumeGate(did, g, gateSession(auth));
+    return { ok: true, required };
+  }
+  return gateMissing(action, required, missing);
+}
+function gateMissing(action, required, missing) {
   return {
     ok: false,
     error: `this credential requires fresh ${missing.join(' + ')} verification for '${action}'`,
@@ -11776,7 +11853,7 @@ function checkGatePolicy(did, action, secret, auth) {
     required,
     missing,
     window_seconds: GATE_WINDOW_SEC,
-    hint: 'satisfy each gate via POST /api/identity/gate/verify ({gate:"pin",pin} for the vault PIN; sms first needs /gate/sms/request), then retry within 5 minutes',
+    hint: 'satisfy each gate via POST /api/identity/gate/verify ({gate:"pin",pin} for the vault PIN; sms first needs /gate/sms/request), then retry — the PIN is asked for every gated action, codes stay fresh 5 minutes',
   };
 }
 

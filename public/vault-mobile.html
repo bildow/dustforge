@@ -317,7 +317,7 @@
           <button onclick="setPhone()" style="padding:0.5rem 0.75rem;background:var(--accent);border:none;border-radius:6px;color:var(--bg);font-weight:600;font-size:0.75rem;cursor:pointer;white-space:nowrap">Save</button>
         </div>
         <div id="phone-msg" style="font-size:0.7rem;margin-top:0.25rem;margin-bottom:0.75rem"></div>
-        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked before a secret is revealed)</div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked for every reveal; email/SMS codes stay fresh 5 minutes)</div>
         <div id="pin-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.4rem"></div>
         <button class="btn-ghost" onclick="openPinChange()" style="width:100%;text-align:left;padding:0.6rem">Change PIN</button>
       </div>
@@ -431,7 +431,7 @@
 <div id="modal-pin" class="modal-bg" onclick="if(event.target===this)cancelPin()">
   <div class="modal-sheet">
     <h3>Enter your vault PIN</h3>
-    <div id="pin-unlock-what" style="font-size:0.8rem;color:var(--text3)">This credential reveals only after your PIN.</div>
+    <div id="pin-unlock-what" style="font-size:0.8rem;color:var(--text3)">This credential reveals only after your PIN. It is asked for every reveal.</div>
     <label>PIN</label><input type="password" id="pin-unlock" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits" onkeydown="if(event.key==='Enter')submitPin()">
     <div id="pin-unlock-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="cancelPin()">Cancel</button><button class="btn-primary" onclick="submitPin()">Unlock</button></div>
@@ -440,7 +440,7 @@
 <div id="modal-pin-setup" class="modal-bg">
   <div class="modal-sheet">
     <h3>Set your vault PIN</h3>
-    <div style="font-size:0.8rem;color:var(--text3)">Every secret reveal asks for this PIN first. 4 to 8 digits, known only to you. You cannot use the vault until one is set.</div>
+    <div style="font-size:0.8rem;color:var(--text3)">Every secret reveal asks for this PIN, every time. 4 to 8 digits, known only to you. You cannot use the vault until one is set.</div>
     <label>New PIN</label><input type="password" id="pin-new" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits">
     <label>Repeat PIN</label><input type="password" id="pin-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="same digits again" onkeydown="if(event.key==='Enter')savePinSetup()">
     <div id="pin-setup-pw-row"><label>Account password (confirms it is you)</label><input type="password" id="pin-setup-pw" autocomplete="current-password" onkeydown="if(event.key==='Enter')savePinSetup()"></div>
@@ -457,6 +457,15 @@
     <label>Repeat new PIN</label><input type="password" id="pin-change-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" onkeydown="if(event.key==='Enter')savePinChange()">
     <div id="pin-change-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="savePinChange()">Save</button></div>
+  </div>
+</div>
+
+<div id="modal-pin-error" class="modal-bg">
+  <div class="modal-sheet">
+    <h3>Can't check your vault PIN</h3>
+    <div style="font-size:0.8rem;color:var(--text3)">The vault stays closed until the server confirms a PIN is set. Check your connection and retry.</div>
+    <div id="pin-error-why" class="modal-msg err"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="logout()">Sign out</button><button class="btn-primary" onclick="retryPinCheck()">Retry</button></div>
   </div>
 </div>
 
@@ -507,6 +516,8 @@ function isTokenExpired(){const t=localStorage.getItem('dp_token_at');if(!t)retu
 let tk=localStorage.getItem('dp_token')||'',did=localStorage.getItem('dp_did')||'',user=localStorage.getItem('dp_user')||'';
 let secrets=[],panic=false;
 let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
+let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
+let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 
 if(tk&&!isTokenExpired())showApp();
 else if(tk){logout();document.getElementById('auth-err').textContent='Please sign in'}
@@ -527,7 +538,13 @@ async function login(){
 // vault session (dp_token in localStorage) so approving is one tap.
 function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
-function logout(){tk='';did='';user='';localStorage.removeItem('dp_token');localStorage.removeItem('dp_did');localStorage.removeItem('dp_user');localStorage.removeItem('dp_token_at');document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
+function logout(){
+  sessionEpoch++; tk='';did='';user='';loginPw='';
+  for(const k of ['dp_token','dp_did','dp_user','dp_token_at']) localStorage.removeItem(k);
+  closeModal();   // PIN setup/unlock/change and every other sheet
+  for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass']){const e=document.getElementById(i);if(e)e.value=''}
+  const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; if(s)s(false); if(u)u(false);
+  document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
 
 // ── Fleet tab ──────────────────────────────────────────────────────────────
 let fleetSlug=null, fleetData=null, siliconHandle=null;
@@ -857,6 +874,7 @@ async function setPhone(){
 }
 
 async function showApp(){
+  const epoch=sessionEpoch, live=()=>!!tk&&epoch===sessionEpoch;   // false once logout() ran under us
   document.getElementById('auth').style.display='none';
   document.getElementById('app-user').textContent=user;
   document.getElementById('set-did').textContent=did;
@@ -865,26 +883,36 @@ async function showApp(){
   // Check if recovery email is set — if not, show onboarding wizard
   try {
     const profile = await api('GET','/api/identity/trust?did='+encodeURIComponent(did));
+    if (!live()) return;
     if (!profile.recovery_email) {
       document.getElementById('onboarding-wizard').style.display='flex';
       return;
     }
   } catch(_) {}
+  if (!live()) return;
 
-  // The vault PIN is mandatory: it is the factor behind every reveal. No PIN yet → set one before the vault opens.
-  try {
-    const gs = await api('GET','/api/identity/gate/status');
-    if (gs && gs.pin_set === false) await requirePinSetup();
-  } catch(_) {}
+  // The vault PIN is mandatory: it is the factor behind every reveal. The vault opens only once the server
+  // has said whether a PIN exists — and, if none does, once one has been set. Unknown = closed.
+  let gs=null, why='';
+  try { gs = await api('GET','/api/identity/gate/status'); } catch(e) { why=e.message||'no reply'; }
+  if (!live()) return;
+  if (!gs || typeof gs.pin_set !== 'boolean') { showPinCheckError(why||'unexpected reply from the server'); return; }
+  if (gs.pin_set === false) { const set = await requirePinSetup(); if (!set || !live()) return; }
   loginPw='';
 
   document.getElementById('app').style.display='block';
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents()}
+// Could not learn whether a PIN exists: stay closed, offer retry or sign out.
+function showPinCheckError(why){
+  document.getElementById('app').style.display='none';
+  document.getElementById('pin-error-why').textContent=why||'';
+  openModal('pin-error');
+}
+function retryPinCheck(){ closeModal(); showApp(); }
 
 // ── Vault PIN ──────────────────────────────────────────────────────────────
-let pinSetupDone=null, pinUnlockDone=null;
 const PIN_OK=/^\d{4,8}$/;
 function requirePinSetup(){
   return new Promise(resolve=>{
@@ -908,9 +936,10 @@ async function savePinSetup(){
     closeModal(); const d=pinSetupDone; pinSetupDone=null; if(d) d(true);
   }catch(e){ m.textContent=e.message; m.className='modal-msg err'; }
 }
-function unlockWithPin(){
+function unlockWithPin(what){
   return new Promise(resolve=>{
     pinUnlockDone=resolve;
+    document.getElementById('pin-unlock-what').textContent=what||'This credential reveals only after your PIN. It is asked for every reveal.';
     document.getElementById('pin-unlock').value=''; const m=document.getElementById('pin-unlock-msg'); m.textContent=''; m.className='modal-msg';
     openModal('pin'); setTimeout(()=>document.getElementById('pin-unlock').focus(),80);
   });
@@ -1366,7 +1395,7 @@ async function storeSecret(){
   }}
 
 // Satisfy one security gate interactively. Returns true on success.
-async function satisfyGate(gate){
+async function satisfyGate(gate, what){
   try {
     if(gate==='twofa'){
       await api('POST','/api/identity/request-2fa',{did});
@@ -1388,7 +1417,7 @@ async function satisfyGate(gate){
       if(!r) return false;
       await api('POST','/api/identity/gate/verify',{gate:'genesis',refraction:r});
     } else if(gate==='pin'){
-      return await unlockWithPin();
+      return await unlockWithPin(what);
     } else if(gate==='fingerprint'){
       // Legacy server: a fingerprint gate needs a fingerprint-authed token; re-auth with password.
       const pw=prompt('Confirm your password to continue:');
@@ -1403,7 +1432,7 @@ async function satisfyGate(gate){
 
 // Call a gated endpoint. On a 403 listing missing gates, walk the user through
 // each factor and retry once. Returns the parsed JSON on success.
-async function apiGated(method, path, body){
+async function apiGated(method, path, body, what){
   const call = async () => {
     const o={method,headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk}};
     if(body)o.body=JSON.stringify(body);
@@ -1412,19 +1441,20 @@ async function apiGated(method, path, body){
   };
   let {status,d}=await call();
   if(status===403 && Array.isArray(d.missing) && d.missing.length){
-    for(const g of d.missing){ if(!await satisfyGate(g)) throw new Error('cancelled — '+g+' not verified'); }
+    for(const g of d.missing){ if(!await satisfyGate(g, what)) throw new Error('cancelled — '+g+' not verified'); }
     ({status,d}=await call());
   }
   if(status>=400) throw new Error(d.error||'failed');
   return d;
 }
 
-// Change a credential's security depth from the detail view.
+// Change a credential's security depth from the detail view. Raising it is free; lowering it first
+// asks for every factor currently protecting the credential (the server answers 403 + missing).
 async function setDepth(name, depth){
   try {
-    await api('POST','/api/demipass/gate-policy',{name,security_depth:depth});
+    await apiGated('POST','/api/demipass/gate-policy',{name,security_depth:depth},'Lowering the protection on '+name+' needs your PIN first.');
     showDetail(name);
-  } catch(e){ alert('Could not set depth: '+e.message); }
+  } catch(e){ if(!/cancelled/.test(e.message)) alert('Could not set depth: '+e.message); }
 }
 
 async function revealSecret(name) {
@@ -1482,8 +1512,7 @@ async function completeOnboarding(){
     const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email});
     if(r.ok){
       document.getElementById('onboarding-wizard').style.display='none';
-      document.getElementById('app').style.display='block';
-      await loadVault();
+      await showApp();   // continues with the mandatory PIN check, then opens the vault
     }else{msg.textContent=r.error||'failed';msg.style.color='var(--red)'}
   }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}
 }

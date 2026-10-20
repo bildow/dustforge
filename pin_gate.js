@@ -61,4 +61,20 @@ function normalizeGates(list) {
   return out;
 }
 
-module.exports = { PIN_RE, MAX_FAILURES, LOCK_SECONDS, validPin, hashPin, verifyPin, lockedFor, afterFailure, normalizeGate, normalizeGates };
+// What a policy change takes away. For every action whose protection the proposed policy weakens (any gate
+// currently required but no longer), the caller must first open that lock: prove EVERY gate currently guarding
+// the action. Adding factors weakens nothing and needs only the owner token. Both inputs are effective
+// (resolved) policies: { action: [gates] }.
+function weakenedGates(current, proposed) {
+  const actions = [], prove = [];
+  for (const action of Object.keys(current || {})) {
+    const cur = normalizeGates(current[action]);
+    const next = normalizeGates((proposed || {})[action]);
+    if (!cur.some(g => !next.includes(g))) continue;
+    actions.push(action);
+    for (const g of cur) if (!prove.includes(g)) prove.push(g);
+  }
+  return { actions, prove };
+}
+
+module.exports = { PIN_RE, MAX_FAILURES, LOCK_SECONDS, validPin, hashPin, verifyPin, lockedFor, afterFailure, normalizeGate, normalizeGates, weakenedGates };

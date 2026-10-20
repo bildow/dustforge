@@ -51,3 +51,18 @@ test('normalizeGates: legacy fingerprint becomes pin, deduplicated, order kept',
   assert.deepEqual(pg.normalizeGates(undefined), []);
   assert.equal(pg.normalizeGate('password'), 'password');
 });
+
+test('weakenedGates: removing a gate demands every gate currently on that action; adding needs nothing', () => {
+  const std = { reveal: ['pin'], rotate: [], delete: [], use: [] };
+  const elev = { reveal: ['pin', 'twofa'], rotate: ['twofa'], delete: ['twofa'], use: [] };
+  const crit = { reveal: ['pin', 'twofa', 'sms'], rotate: ['pin', 'twofa'], delete: ['pin', 'twofa', 'sms'], use: [] };
+  assert.deepEqual(pg.weakenedGates(std, elev), { actions: [], prove: [] }, 'strengthening');
+  assert.deepEqual(pg.weakenedGates(std, std), { actions: [], prove: [] }, 'no change');
+  assert.deepEqual(pg.weakenedGates(elev, std), { actions: ['reveal', 'rotate', 'delete'], prove: ['pin', 'twofa'] });
+  assert.deepEqual(pg.weakenedGates(crit, elev), { actions: ['reveal', 'rotate', 'delete'], prove: ['pin', 'twofa', 'sms'] });
+  assert.deepEqual(pg.weakenedGates(std, { reveal: [], rotate: [], delete: [], use: [] }), { actions: ['reveal'], prove: ['pin'] });
+  // legacy spelling counts as the same gate; reordering is not a weakening
+  assert.deepEqual(pg.weakenedGates({ reveal: ['fingerprint', 'twofa'] }, { reveal: ['twofa', 'pin'] }), { actions: [], prove: [] });
+  assert.deepEqual(pg.weakenedGates({ reveal: ['pin'] }, {}), { actions: ['reveal'], prove: ['pin'] }, 'missing action = empty list');
+  assert.deepEqual(pg.weakenedGates(null, null), { actions: [], prove: [] });
+});
