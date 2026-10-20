@@ -522,7 +522,9 @@ let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN she
 if(tk&&!isTokenExpired())showApp();
 else if(tk){logout();document.getElementById('auth-err').textContent='Please sign in'}
 function autoLogoutIfExpired(){if(tk&&isTokenExpired()){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';return true}return false}
-async function api(m,p,b){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const r=await fetch(API+p,o);if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(r.status>=400)throw new Error(d.error||(r.status===401?'wrong username or password':'failed'));return d}
+async function api(m,p,b){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw new Error(d.error||(r.status===401?'wrong username or password':'failed'));return d}
+// A reply from a session that has since ended (signed out, or replaced by another sign-in): handlers stop here.
+function sessionEnded(e){return !!e&&/^session (ended|expired)$/.test(e.message||'')}
 
 async function login(){
   const u=document.getElementById('auth-user').value.trim(),p=document.getElementById('auth-pass').value,e=document.getElementById('auth-err');
@@ -926,15 +928,17 @@ function requirePinSetup(){
 async function savePinSetup(){
   const a=document.getElementById('pin-new').value, b=document.getElementById('pin-confirm').value, m=document.getElementById('pin-setup-msg');
   const pw=loginPw||document.getElementById('pin-setup-pw').value;
+  const mine=pinSetupDone;   // the one setup flow this save belongs to; never settles any other
   if(!PIN_OK.test(a)){m.textContent='Use 4 to 8 digits';m.className='modal-msg err';return}
   if(a!==b){m.textContent='The two PINs differ';m.className='modal-msg err';return}
   if(!pw){m.textContent='Enter your account password';m.className='modal-msg err';return}
   try{
     m.textContent='Saving…';m.className='modal-msg';
     await api('POST','/api/identity/pin',{pin:a,password:pw});
+    if(pinSetupDone!==mine) return;   // this flow was already settled (signed out, or saved twice)
     loginPw=''; for(const i of ['pin-new','pin-confirm','pin-setup-pw']) document.getElementById(i).value='';
-    closeModal(); const d=pinSetupDone; pinSetupDone=null; if(d) d(true);
-  }catch(e){ m.textContent=e.message; m.className='modal-msg err'; }
+    closeModal(); pinSetupDone=null; if(mine) mine(true);
+  }catch(e){ if(sessionEnded(e)||pinSetupDone!==mine) return; m.textContent=e.message; m.className='modal-msg err'; }
 }
 function unlockWithPin(what){
   return new Promise(resolve=>{
@@ -947,12 +951,13 @@ function unlockWithPin(what){
 function cancelPin(){ closeModal(); const d=pinUnlockDone; pinUnlockDone=null; if(d) d(false); }
 async function submitPin(){
   const el=document.getElementById('pin-unlock'), m=document.getElementById('pin-unlock-msg');
-  const pin=el.value;
+  const pin=el.value, mine=pinUnlockDone;
   if(!PIN_OK.test(pin)){m.textContent='4 to 8 digits';m.className='modal-msg err';return}
   try{
     await api('POST','/api/identity/gate/verify',{gate:'pin',pin});
-    el.value=''; closeModal(); const d=pinUnlockDone; pinUnlockDone=null; if(d) d(true);
-  }catch(e){ el.value=''; m.textContent=e.message; m.className='modal-msg err'; el.focus(); }
+    if(pinUnlockDone!==mine) return;
+    el.value=''; closeModal(); pinUnlockDone=null; if(mine) mine(true);
+  }catch(e){ if(sessionEnded(e)||pinUnlockDone!==mine) return; el.value=''; m.textContent=e.message; m.className='modal-msg err'; el.focus(); }
 }
 function openPinChange(){
   for(const i of ['pin-cur','pin-change-pw','pin-change-new','pin-change-confirm']) document.getElementById(i).value='';
@@ -970,7 +975,7 @@ async function savePinChange(){
     await api('POST','/api/identity/pin', cur?{pin:a,current_pin:cur}:{pin:a,password:pw});
     closeModal(); loadSmsStatus();
     alert('PIN changed.');
-  }catch(e){ m.textContent=e.message; m.className='modal-msg err'; }
+  }catch(e){ if(sessionEnded(e)) return; m.textContent=e.message; m.className='modal-msg err'; }
 }
 
 let dashboardData = null;
@@ -1436,7 +1441,9 @@ async function apiGated(method, path, body, what){
   const call = async () => {
     const o={method,headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk}};
     if(body)o.body=JSON.stringify(body);
+    const epoch=sessionEpoch;
     const r=await fetch(API+path,o); const d=await r.json().catch(()=>({}));
+    if(epoch!==sessionEpoch) throw new Error('session ended');
     return {status:r.status,d};
   };
   let {status,d}=await call();
@@ -1454,7 +1461,7 @@ async function setDepth(name, depth){
   try {
     await apiGated('POST','/api/demipass/gate-policy',{name,security_depth:depth},'Lowering the protection on '+name+' needs your PIN first.');
     showDetail(name);
-  } catch(e){ if(!/cancelled/.test(e.message)) alert('Could not set depth: '+e.message); }
+  } catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert('Could not set depth: '+e.message); }
 }
 
 async function revealSecret(name) {
@@ -1482,11 +1489,11 @@ async function revealSecret(name) {
   } catch (e) {
     btn.textContent = 'Reveal';
     btn.disabled = false;
-    if(!/cancelled/.test(e.message)) alert(e.message);
+    if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message);
   }
 }
 
-async function revokeSecret(name){if(!confirm('Delete '+name+'? This retires the credential.'))return;try{await apiGated('DELETE','/api/demipass/delete',{name});closeDetail()}catch(e){if(!/cancelled/.test(e.message))alert(e.message)}}
+async function revokeSecret(name){if(!confirm('Delete '+name+'? This retires the credential.'))return;try{await apiGated('DELETE','/api/demipass/delete',{name});closeDetail()}catch(e){if(!/cancelled/.test(e.message)&&!sessionEnded(e))alert(e.message)}}
 
 function confirmPanic(){if(!confirm('TRIP ALL BREAKERS? This revokes every active secret.'))return;(async()=>{for(const s of secrets.filter(x=>x.status==='active')){try{await api('DELETE','/api/demipass/revoke',{name:s.name})}catch{}}panic=true;document.getElementById('panic').style.display='block';loadVault()})()}
 function resetPanic(){panic=false;document.getElementById('panic').style.display='none';loadVault()}

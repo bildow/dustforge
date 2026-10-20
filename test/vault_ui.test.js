@@ -240,3 +240,88 @@ test('lowering a credential\'s depth walks the PIN gate; wrong PIN shows tries l
   const policyCalls = pg.calls.filter(c => c.path === '/api/demipass/gate-policy');
   assert.equal(policyCalls.length, 2, 'refused once, retried once after the PIN');
 });
+
+// ── replies from an ended session ──────────────────────────────────────────────────────────────────────
+// Account-scoped login route: tokens and DIDs differ per username, so A's and B's sessions are distinct.
+const loginFor = (p, body) => (p === '/api/identity/auth-fingerprint' ? { json: { token: 'fixture.token.' + body.username, did: 'did:key:z' + body.username } } : null);
+async function signInAs(pg, name) {
+  pg.el('auth-user').value = name; pg.el('auth-pass').value = 'pw-' + name;
+  await pg.ctx.login();
+  await settle();
+}
+
+test('A\'s late PIN-setup reply cannot finish B\'s setup: B stays on the sheet, vault shut, no stray text', async () => {
+  let releaseA, setupWrites = 0;
+  const pg = page({ routes: async (p, body) => {
+    if (loginFor(p, body)) return loginFor(p, body);
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: false } };
+    if (p === '/api/identity/pin') { setupWrites++; return new Promise(r => { releaseA = () => r({ json: { ok: true, pin_set: true } }); }); }
+    throw new Error('unexpected ' + p);
+  } });
+  await signInAs(pg, 'accountA');
+  assert.equal(pg.shown('modal-pin-setup'), true);
+  pg.el('pin-new').value = '4821'; pg.el('pin-confirm').value = '4821';
+  const aSave = pg.ctx.savePinSetup();
+  await settle();
+  assert.ok(releaseA, 'A\'s setup request is in flight');
+  pg.ctx.logout();
+  await signInAs(pg, 'accountB');
+  assert.equal(pg.shown('modal-pin-setup'), true, 'B must set a PIN');
+  assert.equal(pg.appOpen(), false);
+  pg.el('pin-new').value = '77';   // B is mid-typing
+  releaseA();
+  await aSave;
+  await settle();
+  assert.equal(pg.shown('modal-pin-setup'), true, 'B\'s sheet still up after A\'s reply');
+  assert.equal(pg.appOpen(), false, 'B\'s vault still shut');
+  assert.equal(pg.ctx.__loads || 0, 0);
+  assert.equal(pg.el('pin-new').value, '77', 'B\'s typing untouched');
+  assert.equal(pg.el('pin-setup-msg').textContent, '', 'no error text from A\'s flow on B\'s sheet');
+  assert.equal(setupWrites, 1, 'only A ever submitted');
+  assert.equal(pg.calls.filter(c => c.path === '/api/identity/pin')[0].auth, 'Bearer fixture.token.accountA');
+  pg.ctx.logout();
+});
+
+test('A\'s late PIN-unlock reply cannot unlock for B, and a failed one shows B nothing', async () => {
+  for (const outcome of ['ok', 'wrong']) {
+    let releaseA;
+    let pinOk = false;
+    const pg = page({ routes: async (p, body) => {
+      if (loginFor(p, body)) return loginFor(p, body);
+      if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+      if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+      if (p === '/api/demipass/gate-policy') return pinOk ? { json: { ok: true } } : { status: 403, json: { error: 'lowering needs pin', missing: ['pin'], required: ['pin'] } };
+      if (p === '/api/identity/gate/verify') return new Promise(r => { releaseA = () => r(outcome === 'ok' ? { json: { ok: true } } : { status: 403, json: { error: 'incorrect PIN (4 tries left)' } }); });
+      throw new Error('unexpected ' + p);
+    } });
+    await signInAs(pg, 'accountA');
+    pg.ctx.showDetail = () => {};
+    const aDepth = pg.ctx.setDepth('sightless', 'standard');   // A: 403 → PIN sheet
+    await settle();
+    assert.equal(pg.shown('modal-pin'), true);
+    pg.el('pin-unlock').value = '2468';
+    const aSubmit = pg.ctx.submitPin();
+    await settle();
+    assert.ok(releaseA, 'A\'s verify in flight');
+    pg.ctx.logout();
+    await signInAs(pg, 'accountB');
+    assert.equal(pg.appOpen(), true, 'B signed in (B has a PIN)');
+    const bDepth = pg.ctx.setDepth('other', 'standard');        // B: own PIN sheet, own pending unlock
+    await settle();
+    assert.equal(pg.shown('modal-pin'), true, 'B\'s PIN sheet up');
+    pg.el('pin-unlock').value = '13';
+    releaseA();
+    await aSubmit;
+    await aDepth.catch(() => {});
+    await settle();
+    assert.equal(pg.shown('modal-pin'), true, `B's sheet still up (A ${outcome})`);
+    assert.equal(pg.el('pin-unlock').value, '13', 'B\'s typing untouched');
+    assert.equal(pg.el('pin-unlock-msg').textContent, '', 'no message from A\'s attempt');
+    const policyCalls = pg.calls.filter(c => c.path === '/api/demipass/gate-policy');
+    assert.equal(policyCalls.filter(c => c.auth === 'Bearer fixture.token.accountB').length, 1, 'B\'s policy change was not retried on A\'s proof');
+    pg.ctx.cancelPin();
+    await bDepth.catch(() => {});
+    pg.ctx.logout();
+  }
+});

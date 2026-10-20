@@ -3,7 +3,8 @@
 # master key, creates one wallet through identity.js (password checked by the local sha256 fallback because
 # Stalwart is pointed at a closed port), then drives the real HTTP routes with TWO sessions (two tokens, two
 # jtis) of the same account: set / verify / lockout / change PIN, reveal gating, single-use and per-session
-# proofs, the PIN floor on reveal, step-up before a policy downgrade, legacy 'fingerprint' policies.
+# proofs, the PIN floor on reveal, step-up before a policy downgrade, legacy 'fingerprint' policies, and injected
+# storage faults (triggers that abort proof INSERT/DELETE), which must refuse and never pass.
 # Needs node_modules (or NODE_PATH). No network, nothing persists.
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -123,5 +124,32 @@ call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] &
 python3 - "$DB_PATH" <<'PY' && ok "every stored proof carries a session" || fail "proof rows without session"
 import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); n=c.execute("SELECT COUNT(*) FROM gate_verifications WHERE session IS NULL").fetchone()[0]; sys.exit(1 if n else 0)
 PY
-grep -q "pin_failed\|pin_set\|pin_changed" "$S/server.log" && ok "security events logged" || true
+
+# ── storage faults close, never open (the re-audit's injected-trigger controls) ───────────────────────
+call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"2468"}'; [ "$CODE" = 200 ] && ok "fault controls: A holds a proof" || fail "pre-fault verify: $CODE $BODY"
+SQL "CREATE TRIGGER deny_delete BEFORE DELETE ON gate_verifications BEGIN SELECT RAISE(ABORT, 'injected proof deletion failure'); END"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 503 ] && [ "$(echo "$BODY" | J value)" = None ] && ok "proof cannot be spent → 503, no value" || fail "delete-fault reveal: $CODE $BODY"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 503 ] && [ "$(echo "$BODY" | J value)" = None ] && ok "…and still nothing on a repeat" || fail "delete-fault repeat: $CODE $BODY"
+call POST /api/identity/pin "$TK" '{"pin":"1357","current_pin":"2468"}'; [ "$CODE" = 503 ] && ok "PIN change refused while old proofs cannot be revoked → 503" || fail "change under fault: $CODE $BODY"
+call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"elevated"}'; [ "$CODE" = 200 ] || fail "raise for fault control: $CODE"
+call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"standard"}'; [ "$CODE" = 503 ] || [ "$CODE" = 403 ] && ok "policy cannot be lowered while the proof cannot be spent ($CODE)" || fail "policy under fault: $CODE $BODY"
+SQL "DROP TRIGGER deny_delete"
+call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"1357"}'; [ "$CODE" = 403 ] && ok "the refused change never took: new PIN unknown" || fail "new pin after refused change: $CODE $BODY"
+SQL "UPDATE identity_wallets SET pin_failures=0"
+call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"2468"}'; [ "$CODE" = 200 ] && ok "old PIN still the PIN" || fail "old pin after refused change: $CODE $BODY"
+SQL "UPDATE blindkey_secrets SET security_depth=NULL, gate_policy=NULL"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 200 ] && ok "fault gone: the unspent proof reveals once" || fail "post-fault reveal: $CODE $BODY"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "…once" || fail "post-fault repeat: $CODE"
+SQL "CREATE TRIGGER deny_insert BEFORE INSERT ON gate_verifications BEGIN SELECT RAISE(ABORT, 'injected proof insert failure'); END"
+call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"2468"}'; [ "$CODE" = 503 ] && ok "proof cannot be stored → verify says 503, not ok" || fail "insert-fault verify: $CODE $BODY"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "nothing recorded, reveal refused" || fail "insert-fault reveal: $CODE"
+SQL "DROP TRIGGER deny_insert"
+# backstop: a proof row that predates the current PIN is dead even if a revocation ever missed it
+call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"2468"}'; [ "$CODE" = 200 ] || fail "verify for backstop: $CODE"
+SQL "UPDATE identity_wallets SET pin_set_at = strftime('%Y-%m-%d %H:%M:%f', 'now', '+1 second')"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "a proof older than pin_set_at never reveals (generation backstop)" || fail "backstop: $CODE $BODY"
+python3 - "$DB_PATH" <<'PY' && ok "security events recorded (pin_set, pin_changed, pin_failed, gate_policy_change_blocked, gate_policy_weakened)" || fail "security events missing"
+import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); have={r[0] for r in c.execute("SELECT DISTINCT event_type FROM demipass_security_events")}
+need={'pin_set','pin_changed','pin_failed','gate_policy_change_blocked','gate_policy_weakened'}; missing=need-have; print('missing:',missing) if missing else None; sys.exit(1 if missing else 0)
+PY
 echo "$fails failure(s)"; [ "$fails" = 0 ]
