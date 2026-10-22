@@ -518,11 +518,16 @@ let secrets=[],panic=false;
 let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
+let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
+let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
+let vaultOpen=false;        // true only once the vault is past the PIN gate; the background refresh runs only then
+let dashboardData=null, fleetSlug=null, fleetData=null, siliconHandle=null;   // per-account state (sign-out clears it)
+let scanStream=null, scanInterval=null, revealTimer=null;
 
 if(tk&&!isTokenExpired())showApp();
 else if(tk){logout();document.getElementById('auth-err').textContent='Please sign in'}
 function autoLogoutIfExpired(){if(tk&&isTokenExpired()){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';return true}return false}
-async function api(m,p,b){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw new Error(d.error||(r.status===401?'wrong username or password':'failed'));return d}
+async function api(m,p,b){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
 // A reply from a session that has since ended (signed out, or replaced by another sign-in): handlers stop here.
 function sessionEnded(e){return !!e&&/^session (ended|expired)$/.test(e.message||'')}
 
@@ -541,15 +546,23 @@ async function login(){
 function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
 function logout(){
-  sessionEpoch++; tk='';did='';user='';loginPw='';
+  sessionEpoch++; tk='';did='';user='';loginPw='';vaultOpen=false;
   for(const k of ['dp_token','dp_did','dp_user','dp_token_at']) localStorage.removeItem(k);
-  closeModal();   // PIN setup/unlock/change and every other sheet
+  closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
   for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass']){const e=document.getElementById(i);if(e)e.value=''}
-  const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; if(s)s(false); if(u)u(false);
+  const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; if(s)s(false); if(u)u(false);
+  // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
+  // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
+  if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status']){const e=document.getElementById(i);if(e)e.innerHTML=''}
+  for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen']){const e=document.getElementById(i);if(e)e.textContent=''}
+  for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
+  for(const i of ['df-fwd-banner','security-banner','panic','onboarding-wizard']){const e=document.getElementById(i);if(e)e.style.display='none'}
+  secrets=[]; dashboardData=null; fleetSlug=null; fleetData=null; siliconHandle=null; panic=false;
+  goPage('vault');
   document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
 
 // ── Fleet tab ──────────────────────────────────────────────────────────────
-let fleetSlug=null, fleetData=null, siliconHandle=null;
 function dd(c){return (Number(c)||0).toLocaleString()}
 function tokenChip(t){
   const m={valid:['var(--green)','token ok'],expiring:['var(--yellow)','token expiring'],expired:['var(--red)','token expired'],none:['var(--text3)','no token']};
@@ -592,7 +605,7 @@ async function loadFleet(){
     h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">Silicons</span><span style="font-size:0.7rem;color:var(--text3)">'+d.silicons.length+' / '+d.fleet.max_agents+'</span></div>';
     if(!d.silicons.length)h+='<div class="empty">No silicons yet. Tap + Silicon to add one.</div>';
     for(const s of d.silicons){
-      h+='<div onclick="openSilicon(\''+esc(s.handle)+'\')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
+      h+='<div onclick="openSilicon('+jsArg(s.handle)+')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong style="color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700">'+dd(s.balance_cents)+' DD</div></div>';
       h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.35rem;font-size:0.68rem;color:var(--text3)"><span>'+(s.refill.enabled?('refill +'+dd(s.refill.amount_cents)+' below '+dd(s.refill.threshold_cents)):'no auto-refill')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</span>'+tokenChip(s.token)+'</div>';
       h+='</div>';
@@ -603,7 +616,7 @@ async function loadFleet(){
       for(const p of d.projects){
         h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.45rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">';
         h+='<div><strong>'+esc(p.project)+'</strong><div style="font-size:0.65rem;color:var(--text3)">'+p.operators.length+' operator'+(p.operators.length===1?'':'s')+' · wallet '+dd(p.wallet_balance_cents)+' DD</div></div>';
-        h+='<select onchange="setBillMode(\''+esc(p.project)+'\',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
+        h+='<select onchange="setBillMode('+jsArg(p.project)+',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
         h+='</div>';
       }
     }
@@ -611,7 +624,7 @@ async function loadFleet(){
     const rows=(d.attribution&&d.attribution.rows)||[];
     h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Who paid for what (30d)</span></div>';
     if(!rows.length)h+='<div class="empty" style="font-size:0.75rem">No attributed spend yet.</div>';
-    const name=did=>{const s=d.silicons.find(x=>x.did===did);return s?'@'+s.handle:(did===d.fleet.owner_did?'you':did.slice(8,20)+'…')};
+    const name=did=>{const s=d.silicons.find(x=>x.did===did);return esc(s?'@'+s.handle:(did===d.fleet.owner_did?'you':String(did).slice(8,20)+'…'))};
     for(const r of rows.slice(0,25)){
       h+='<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+name(r.actor_did)+' → '+(r.project?esc(r.project):'—')+' <span style="color:var(--text3)">'+esc(r.initiator)+'</span></span><span><span style="color:var(--text3)">'+name(r.payer_did)+' paid</span> <strong>'+dd(r.cents)+' DD</strong> <span style="color:var(--text3)">('+r.calls+')</span></span></div>';
     }
@@ -622,13 +635,13 @@ async function loadFleet(){
       for(const l of links.slice(0,20))h+=workLinkRow(l,d.current_tick);
     }
     el.innerHTML=h;
-  }catch(e){el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+  }catch(e){if(!sessionEnded(e))el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 function workLinkRow(l,tick){
   const live=l.status==='active';
   let h='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem">';
   h+='<div>#'+l.id+' '+esc(l.requester||l.requester_did.slice(8,18))+' → '+esc(l.provider||l.provider_did.slice(8,18))+(l.project?' · '+esc(l.project):'')+'<div style="font-size:0.65rem;color:var(--text3)">'+esc(l.status)+(live?' · until tick '+l.end_tick+' ('+Math.max(0,l.end_tick-tick)+' left)':'')+' · spent '+dd(l.spent_cents)+' DD'+(l.note?' · '+esc(l.note):'')+'</div></div>';
-  if(['pending','active'].includes(l.status))h+='<button class="btn-ghost" onclick="revokeWorkLink('+l.id+')" style="font-size:0.65rem">Revoke</button>';
+  if(['pending','active'].includes(l.status))h+='<button class="btn-ghost" onclick="revokeWorkLink('+Number(l.id)+')" style="font-size:0.65rem">Revoke</button>';
   return h+'</div>';
 }
 async function saveOwnerRefill(){
@@ -653,7 +666,7 @@ async function addSilicon(){
     const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons',body);
     if(r.mode==='pending_claim'){alert('A confirmation link was emailed to '+r.claim_sent_to+'. The silicon appears once that link is opened.')}
     else if(r.mode==='created'){alert('Created '+r.email+'\nDID: '+r.did+(r.password_once?'\n\nOne-time password (not stored, not emailed):\n'+r.password_once:''))}
-    closeModal();document.getElementById('sil-member-token').value='';loadFleet();
+    closeSheet('silicon');document.getElementById('sil-member-token').value='';loadFleet();
   }catch(e){m.textContent=e.message;m.style.color='var(--red)'}
 }
 async function openSilicon(handle){
@@ -665,7 +678,7 @@ async function openSilicon(handle){
     let h='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
     h+='<div style="display:flex;justify-content:space-between;align-items:baseline"><div><strong style="font-size:1.05rem;color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700;font-size:1.2rem">'+dd(s.balance_cents)+' DD</div></div>';
     h+='<div style="font-size:0.72rem;color:var(--text3);margin-top:0.3rem">'+esc(s.contact_email||s.email||'')+'</div>';
-    h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">Silicon id (share this, not the DID)</div><div style="font-family:monospace;font-size:0.75rem;word-break:break-all">'+esc(s.silicon_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(s.silicon_id)+'\')" style="font-size:0.6rem;padding:0.1rem 0.4rem">copy</button></div>';
+    h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">Silicon id (share this, not the DID)</div><div style="font-family:monospace;font-size:0.75rem;word-break:break-all">'+esc(s.silicon_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText('+jsArg(s.silicon_id)+')" style="font-size:0.6rem;padding:0.1rem 0.4rem">copy</button></div>';
     h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">DID</div><div style="font-family:monospace;font-size:0.62rem;word-break:break-all;color:var(--accent)">'+esc(s.did)+'</div>';
     h+='<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.75rem"><input type="number" id="sil-refill-now" value="'+(s.refill.amount_cents||100)+'" min="1" style="width:6rem;margin:0;padding:0.4rem"><button class="btn-primary" onclick="refillNow()" style="font-size:0.75rem">Refill now from my wallet</button></div>';
     h+='</div>';
@@ -688,7 +701,7 @@ async function openSilicon(handle){
     h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">Secrets this silicon uses</span><span style="font-size:0.7rem;color:var(--text3)">'+own.length+' own · '+del.length+' delegated</span></div>';
     if(!own.length&&!del.length)h+='<div class="empty" style="font-size:0.75rem">None yet.</div>';
     for(const sc of own)h+='<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(sc.name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(sc.ref_code||'')+' · own</span></span><span style="color:'+(sc.status==='active'?'var(--green)':'var(--yellow)')+'">'+esc(sc.status)+' · '+(sc.use_count||0)+' uses</span></div>';
-    for(const g of del)h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(g.secret_name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(g.ref_code||'')+' · delegated by you</span></span><span style="color:'+(g.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(g.status)+' · '+g.use_count+(g.max_uses?'/'+g.max_uses:'')+' uses'+(g.status==='active'?' <button class="btn-ghost" onclick="revokeDelegation('+(g.delegation_id||g.id)+')" style="font-size:0.6rem;padding:0.1rem 0.4rem">revoke</button>':'')+'</span></div>';
+    for(const g of del)h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(g.secret_name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(g.ref_code||'')+' · delegated by you</span></span><span style="color:'+(g.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(g.status)+' · '+g.use_count+(g.max_uses?'/'+g.max_uses:'')+' uses'+(g.status==='active'?' <button class="btn-ghost" onclick="revokeDelegation('+Number(g.delegation_id||g.id)+')" style="font-size:0.6rem;padding:0.1rem 0.4rem">revoke</button>':'')+'</span></div>';
     h+='<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem"><input type="text" id="sil-delegate-name" placeholder="delegate one of your secrets: name or DP- ref" style="flex:1;margin:0;padding:0.4rem"><button class="btn-ghost" onclick="delegateToSilicon()" style="font-size:0.72rem">Delegate</button></div>';
     // workers: scoped tokens this silicon hands to its own sub-agents / test environments
     const ws=d.workers||[];
@@ -697,9 +710,9 @@ async function openSilicon(handle){
     for(const w of ws){
       h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.6rem 0.8rem;margin-bottom:0.4rem;font-size:0.75rem">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong>'+esc(w.name)+'</strong> <span style="color:var(--text3);font-size:0.65rem">'+esc(w.purpose||'')+'</span></div><span style="color:'+(w.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(w.status)+'</span></div>';
-      h+='<div style="font-family:monospace;font-size:0.65rem;color:var(--accent);word-break:break-all">'+esc(w.worker_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(w.worker_id)+'\')" style="font-size:0.6rem;padding:0.05rem 0.35rem">copy</button></div>';
+      h+='<div style="font-family:monospace;font-size:0.65rem;color:var(--accent);word-break:break-all">'+esc(w.worker_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText('+jsArg(w.worker_id)+')" style="font-size:0.6rem;padding:0.05rem 0.35rem">copy</button></div>';
       h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.2rem">scope ≤ '+esc(w.scope_cap)+' · spent '+dd(w.spent_cents)+(w.max_spend_cents?' / '+dd(w.max_spend_cents):'')+' DD · '+w.use_count+' calls · secrets: '+(w.allowed_secrets&&w.allowed_secrets.length?esc(w.allowed_secrets.join(', ')):'all of the parent\'s')+(w.token_expires_at?' · token until '+new Date(w.token_expires_at).toLocaleString():'')+'</div>';
-      if(w.status==='active')h+='<div style="display:flex;gap:0.4rem;margin-top:0.4rem"><button class="btn-ghost" onclick="mintWorkerToken(\''+esc(w.worker_id)+'\')" style="font-size:0.65rem">Mint token</button><button class="btn-ghost" onclick="revokeWorker(\''+esc(w.worker_id)+'\')" style="font-size:0.65rem;color:var(--red)">Revoke</button></div>';
+      if(w.status==='active')h+='<div style="display:flex;gap:0.4rem;margin-top:0.4rem"><button class="btn-ghost" onclick="mintWorkerToken('+jsArg(w.worker_id)+')" style="font-size:0.65rem">Mint token</button><button class="btn-ghost" onclick="revokeWorker('+jsArg(w.worker_id)+')" style="font-size:0.65rem;color:var(--red)">Revoke</button></div>';
       h+='</div>';
     }
     h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:0.7rem;margin-top:0.5rem"><div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem">New worker</div>';
@@ -718,7 +731,7 @@ async function openSilicon(handle){
     if(d.work_links.length){h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Work links</span><span style="font-size:0.7rem;color:var(--text3)">tick '+d.current_tick+'</span></div>';for(const l of d.work_links.slice(0,20))h+=workLinkRow(l,d.current_tick)}
     h+='<div style="margin-top:1.25rem"><button class="btn-danger" onclick="removeSilicon()" style="width:100%;padding:0.6rem;border-radius:10px;font-size:0.78rem">Remove from fleet</button></div>';
     el.innerHTML=h;
-  }catch(e){el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+  }catch(e){if(!sessionEnded(e))el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 function closeSilicon(){siliconHandle=null;goPage('fleet');loadFleet()}
 async function saveSiliconSettings(){try{await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle),{refill_enabled:document.getElementById('sil-set-enabled').checked,refill_threshold_cents:Number(document.getElementById('sil-set-threshold').value||0),refill_amount_cents:Number(document.getElementById('sil-set-amount').value||0),refill_source:document.getElementById('sil-set-source').value});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
@@ -759,7 +772,7 @@ async function loadDustforge(){
       h += '<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.75rem;margin-bottom:0.5rem;display:flex;justify-content:space-between;align-items:center;gap:0.5rem">';
       h += '<div style="min-width:0"><div style="font-size:0.85rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">&rarr; '+esc(rule.forward_to)+'</div>';
       h += '<div style="font-size:0.65rem;color:var(--text3)">'+(rule.filter_from==='*'?'all mail':'from '+esc(rule.filter_from))+' &middot; '+(rule.forwarded_count||0)+' forwarded</div></div>';
-      h += '<button onclick="removeForward('+rule.id+')" style="padding:0.4rem 0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-size:0.72rem;cursor:pointer;flex-shrink:0">Remove</button>';
+      h += '<button onclick="removeForward('+Number(rule.id)+')" style="padding:0.4rem 0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-size:0.72rem;cursor:pointer;flex-shrink:0">Remove</button>';
       h += '</div>';
     }
     el.innerHTML = h;
@@ -877,6 +890,7 @@ async function setPhone(){
 
 async function showApp(){
   const epoch=sessionEpoch, live=()=>!!tk&&epoch===sessionEpoch;   // false once logout() ran under us
+  vaultOpen=false;
   document.getElementById('auth').style.display='none';
   document.getElementById('app-user').textContent=user;
   document.getElementById('set-did').textContent=did;
@@ -903,16 +917,18 @@ async function showApp(){
   loginPw='';
 
   document.getElementById('app').style.display='block';
+  vaultOpen=true;
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents()}
 // Could not learn whether a PIN exists: stay closed, offer retry or sign out.
 function showPinCheckError(why){
+  vaultOpen=false;
   document.getElementById('app').style.display='none';
   document.getElementById('pin-error-why').textContent=why||'';
   openModal('pin-error');
 }
-function retryPinCheck(){ closeModal(); showApp(); }
+function retryPinCheck(){ closeSheet('pin-error'); showApp(); }
 
 // ── Vault PIN ──────────────────────────────────────────────────────────────
 const PIN_OK=/^\d{4,8}$/;
@@ -937,27 +953,39 @@ async function savePinSetup(){
     await api('POST','/api/identity/pin',{pin:a,password:pw});
     if(pinSetupDone!==mine) return;   // this flow was already settled (signed out, or saved twice)
     loginPw=''; for(const i of ['pin-new','pin-confirm','pin-setup-pw']) document.getElementById(i).value='';
-    closeModal(); pinSetupDone=null; if(mine) mine(true);
-  }catch(e){ if(sessionEnded(e)||pinSetupDone!==mine) return; m.textContent=e.message; m.className='modal-msg err'; }
+    closeSheet('pin-setup'); pinSetupDone=null; if(mine) mine(true);
+  }catch(e){
+    if(sessionEnded(e)||pinSetupDone!==mine) return;
+    // Password refused (403) — even the one typed at sign-in: stop resending it and ask for it on the sheet.
+    if(e.status===403){ loginPw=''; document.getElementById('pin-setup-pw').value=''; document.getElementById('pin-setup-pw-row').style.display='block'; }
+    m.textContent=e.message; m.className='modal-msg err';
+  }
 }
-function unlockWithPin(what){
+function unlockWithPin(what, intent){
+  settleUnlock(false);   // a sheet still pending from an earlier flow is cancelled, never left hanging
   return new Promise(resolve=>{
-    pinUnlockDone=resolve;
+    pinUnlockDone=resolve; pinUnlockIntent=intent||null;
     document.getElementById('pin-unlock-what').textContent=what||'This credential reveals only after your PIN. It is asked for every reveal.';
     document.getElementById('pin-unlock').value=''; const m=document.getElementById('pin-unlock-msg'); m.textContent=''; m.className='modal-msg';
     openModal('pin'); setTimeout(()=>document.getElementById('pin-unlock').focus(),80);
   });
 }
-function cancelPin(){ closeModal(); const d=pinUnlockDone; pinUnlockDone=null; if(d) d(false); }
+function settleUnlock(ok){ const d=pinUnlockDone; pinUnlockDone=null; pinUnlockIntent=null; if(d) d(ok); }
+function cancelPin(){ closeSheet('pin'); settleUnlock(false); }
 async function submitPin(){
   const el=document.getElementById('pin-unlock'), m=document.getElementById('pin-unlock-msg');
-  const pin=el.value, mine=pinUnlockDone;
+  const pin=el.value, mine=pinUnlockDone, intent=pinUnlockIntent;
+  if(!mine) return;
+  if(pinBusy===mine) return;   // this sheet's check is in flight: a double tap must not mint a second proof
   if(!PIN_OK.test(pin)){m.textContent='4 to 8 digits';m.className='modal-msg err';return}
+  pinBusy=mine; m.textContent='Checking…'; m.className='modal-msg';
   try{
-    await api('POST','/api/identity/gate/verify',{gate:'pin',pin});
+    // The proof opens only `intent` (the action that asked), once, within a minute.
+    await api('POST','/api/identity/gate/verify',{gate:'pin',pin,intent});
     if(pinUnlockDone!==mine) return;
-    el.value=''; closeModal(); pinUnlockDone=null; if(mine) mine(true);
+    el.value=''; m.textContent=''; closeSheet('pin'); settleUnlock(true);
   }catch(e){ if(sessionEnded(e)||pinUnlockDone!==mine) return; el.value=''; m.textContent=e.message; m.className='modal-msg err'; el.focus(); }
+  finally{ if(pinBusy===mine) pinBusy=null; }
 }
 function openPinChange(){
   for(const i of ['pin-cur','pin-change-pw','pin-change-new','pin-change-confirm']) document.getElementById(i).value='';
@@ -973,12 +1001,10 @@ async function savePinChange(){
   try{
     m.textContent='Saving…';m.className='modal-msg';
     await api('POST','/api/identity/pin', cur?{pin:a,current_pin:cur}:{pin:a,password:pw});
-    closeModal(); loadSmsStatus();
+    closeSheet('pin-change'); loadSmsStatus();
     alert('PIN changed.');
   }catch(e){ if(sessionEnded(e)) return; m.textContent=e.message; m.className='modal-msg err'; }
 }
-
-let dashboardData = null;
 
 async function loadVault(){
   try {
@@ -995,6 +1021,7 @@ async function loadVault(){
 
     renderSecrets();
   } catch(e) {
+    if(sessionEnded(e)) return;
     document.getElementById('secret-list').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
   }
 }
@@ -1045,7 +1072,7 @@ function renderSecrets(){
     const frozen = items.filter(s => s.frozen).length;
 
     h += '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:0.75rem;overflow:hidden">';
-    h += '<div onclick="toggleGroup(\''+esc(groupName)+'\')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
+    h += '<div onclick="toggleGroup('+jsArg(groupName)+')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
     h += '<div>';
     h += '<div style="font-weight:700;font-size:0.9rem">'+esc(groupName)+'</div>';
     h += '<div style="font-size:0.7rem;color:var(--text3)">'+total+' secret'+(total!==1?'s':'')+(frozen?' &middot; '+frozen+' frozen':'')+'</div>';
@@ -1063,9 +1090,9 @@ function renderSecrets(){
     for(const s of items){
       const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
       const fr = s.frozen ? ' ❄' : '';
-      const rec = s.recommendation ? ' <span style="color:var(--yellow);font-size:0.6rem">'+s.recommendation+'</span>' : '';
+      const rec = s.recommendation ? ' <span style="color:var(--yellow);font-size:0.6rem">'+esc(s.recommendation)+'</span>' : '';
 
-      h += '<div onclick="event.stopPropagation();showDetail(\''+esc(s.name)+'\')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
+      h += '<div onclick="event.stopPropagation();showDetail('+jsArg(s.name)+')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
       h += '<div style="width:10px;height:10px;border-radius:50%;flex-shrink:0;background:'+healthColor+'"></div>';
       h += '<div style="flex:1;min-width:0"><div style="font-size:0.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(s.name)+fr+'</div>';
       h += '<div style="font-size:0.65rem;color:var(--text3)">'+esc(s.type||'-')+' &middot; '+s.use_count+' uses'+rec+'</div></div>';
@@ -1108,7 +1135,7 @@ function showDetail(name) {
   h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem">`;
   h += `<div><span style="color:var(--text3)">Type:</span> ${esc(s.type)}</div>`;
   h += `<div><span style="color:var(--text3)">Uses:</span> ${s.use_count}</div>`;
-  h += `<div><span style="color:var(--text3)">Ownership:</span> ${s.ownership}</div>`;
+  h += `<div><span style="color:var(--text3)">Ownership:</span> ${esc(s.ownership)}</div>`;
   h += `<div><span style="color:var(--text3)">Rotatable:</span> ${s.rotatable?'yes':'no'}</div>`;
   h += `<div><span style="color:var(--text3)">Category:</span> ${esc(s.category||'—')}</div>`;
   if(s.provider) h += `<div><span style="color:var(--text3)">Provider:</span> ${esc(s.provider)}</div>`;
@@ -1133,7 +1160,7 @@ function showDetail(name) {
   for(const d of ['standard','elevated','critical']){
     const on = depth===d;
     const col = d==='critical'?'var(--red)':d==='elevated'?'var(--orange)':'var(--accent)';
-    h += `<button onclick="setDepth('${esc(s.name)}','${d}')" style="flex:1;padding:0.5rem 0.3rem;border:1px solid ${on?col:'var(--border)'};background:${on?col:'none'};color:${on?'#08111a':'var(--text2)'};border-radius:8px;font-weight:${on?'700':'500'};font-size:0.72rem;cursor:pointer;text-transform:capitalize">${d}</button>`;
+    h += `<button onclick="setDepth(${jsArg(s.name)},'${d}')" style="flex:1;padding:0.5rem 0.3rem;border:1px solid ${on?col:'var(--border)'};background:${on?col:'none'};color:${on?'#08111a':'var(--text2)'};border-radius:8px;font-weight:${on?'700':'500'};font-size:0.72rem;cursor:pointer;text-transform:capitalize">${d}</button>`;
   }
   h += `</div>`;
   if(depth==='custom') h += `<div style="font-size:0.65rem;color:var(--text3);margin-bottom:0.5rem">Custom policy set via API</div>`;
@@ -1169,10 +1196,10 @@ function showDetail(name) {
     for(const o of s.recent_outcomes){
       const c = o.outcome==='success'?'var(--green)':'var(--red)';
       h += `<div style="display:flex;justify-content:space-between;padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem">`;
-      h += `<span style="color:${c}">${o.outcome} — ${esc(o.action_type||'?')}</span>`;
-      h += `<span style="color:var(--text3)">${o.agent_name||''} ${new Date(o.created_at).toLocaleDateString()}</span>`;
+      h += `<span style="color:${c}">${esc(o.outcome)} — ${esc(o.action_type||'?')}</span>`;
+      h += `<span style="color:var(--text3)">${esc(o.agent_name)} ${new Date(o.created_at).toLocaleDateString()}</span>`;
       h += `</div>`;
-      if(o.error_summary) h += `<div style="font-size:0.65rem;color:var(--red);padding:0.15rem 0">${esc(o.error_summary).slice(0,100)}</div>`;
+      if(o.error_summary) h += `<div style="font-size:0.65rem;color:var(--red);padding:0.15rem 0">${esc(String(o.error_summary).slice(0,100))}</div>`;
     }
     h += `</div>`;
   }
@@ -1204,13 +1231,13 @@ function showDetail(name) {
   h += `<div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">Secret value is encrypted and hidden</div>`;
   h += `<div id="reveal-value" style="display:none;background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:0.75rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;word-break:break-all;color:var(--red)"></div>`;
   const revGates = gp.reveal||[]; const revLabel = revGates.length ? 'Reveal ('+revGates.map(gateName).join(' + ')+')' : 'Reveal';
-  h += `<button onclick="revealSecret('${esc(s.name)}')" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
+  h += `<button onclick="revealSecret(${jsArg(s.name)})" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
   h += `</div></div>`;
 
   // Action buttons
   h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
-  h += `<button onclick="toggleFreeze('${esc(s.name)}',${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
-  h += `<button onclick="revokeSecret('${esc(s.name)}')" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Delete</button>`;
+  h += `<button onclick="toggleFreeze(${jsArg(s.name)},${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
+  h += `<button onclick="revokeSecret(${jsArg(s.name)})" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Delete</button>`;
   h += `</div>`;
 
   el.innerHTML = h;
@@ -1322,7 +1349,7 @@ async function loadBuoy(){
   document.getElementById('tick-list').innerHTML=h}}catch{document.getElementById('tick-list').innerHTML='<div class="empty">Could not load</div>'}
   try{const d=await api('GET','/api/chrono/list');const tr=d.triggers||[];
   if(!tr.length){document.getElementById('trigger-list').innerHTML='<div class="empty">No triggers armed</div>'}
-  else{let h='';for(const t of tr){h+=`<div class="activity-item"><div class="activity-top"><span class="activity-type" style="color:${t.status==='armed'?'var(--green)':'var(--text3)'}">${esc(t.name)}</span><span class="activity-time">${t.status}</span></div><div class="activity-detail">fires: ${new Date(t.fire_at).toLocaleString()}</div></div>`}
+  else{let h='';for(const t of tr){h+=`<div class="activity-item"><div class="activity-top"><span class="activity-type" style="color:${t.status==='armed'?'var(--green)':'var(--text3)'}">${esc(t.name)}</span><span class="activity-time">${esc(t.status)}</span></div><div class="activity-detail">fires: ${new Date(t.fire_at).toLocaleString()}</div></div>`}
   document.getElementById('trigger-list').innerHTML=h}}catch{}}
 
 // Store field toggling based on type
@@ -1391,7 +1418,7 @@ async function storeSecret(){
     }
     m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');
     m.className='modal-msg ok';
-    loadVault();setTimeout(closeModal,1200);
+    loadVault();setTimeout(()=>closeSheet('store'),1200);
   }catch(e){
     // PURGE on failure too — don't leave the secret in memory after an error
     body.value='';document.getElementById('s-value').value='';
@@ -1400,7 +1427,7 @@ async function storeSecret(){
   }}
 
 // Satisfy one security gate interactively. Returns true on success.
-async function satisfyGate(gate, what){
+async function satisfyGate(gate, what, intent){
   try {
     if(gate==='twofa'){
       await api('POST','/api/identity/request-2fa',{did});
@@ -1422,7 +1449,7 @@ async function satisfyGate(gate, what){
       if(!r) return false;
       await api('POST','/api/identity/gate/verify',{gate:'genesis',refraction:r});
     } else if(gate==='pin'){
-      return await unlockWithPin(what);
+      return await unlockWithPin(what, intent);
     } else if(gate==='fingerprint'){
       // Legacy server: a fingerprint gate needs a fingerprint-authed token; re-auth with password.
       const pw=prompt('Confirm your password to continue:');
@@ -1432,23 +1459,29 @@ async function satisfyGate(gate, what){
       await api('POST','/api/identity/gate/verify',{gate:'fingerprint'});
     } else { return false; }
     return true;
-  } catch(e){ alert(esc(gate)+' verification failed: '+e.message); return false; }
+  } catch(e){ if(!sessionEnded(e)) alert(gateName(gate)+' verification failed: '+e.message); return false; }
 }
 
 // Call a gated endpoint. On a 403 listing missing gates, walk the user through
 // each factor and retry once. Returns the parsed JSON on success.
 async function apiGated(method, path, body, what){
+  if(autoLogoutIfExpired()) throw new Error('session expired');
+  const epoch=sessionEpoch;
   const call = async () => {
+    if(epoch!==sessionEpoch) throw new Error('session ended');
     const o={method,headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk}};
     if(body)o.body=JSON.stringify(body);
-    const epoch=sessionEpoch;
     const r=await fetch(API+path,o); const d=await r.json().catch(()=>({}));
     if(epoch!==sessionEpoch) throw new Error('session ended');
+    if(r.status===401){ logout(); document.getElementById('auth-err').textContent='Session expired — please sign in again'; throw new Error('session expired'); }
     return {status:r.status,d};
   };
   let {status,d}=await call();
   if(status===403 && Array.isArray(d.missing) && d.missing.length){
-    for(const g of d.missing){ if(!await satisfyGate(g, what)) throw new Error('cancelled — '+g+' not verified'); }
+    // Codes first, the PIN last: its proof opens only this action (d.intent), once, so it is typed right
+    // before the retry — never ahead of a code step that might still be cancelled.
+    const order=[...d.missing.filter(g=>g!=='pin'), ...d.missing.filter(g=>g==='pin')];
+    for(const g of order){ if(!await satisfyGate(g, what, d.intent)) throw new Error('cancelled — '+g+' not verified'); }
     ({status,d}=await call());
   }
   if(status>=400) throw new Error(d.error||'failed');
@@ -1478,7 +1511,8 @@ async function revealSecret(name) {
     btn.textContent = 'Revealed — auto-hides in 30s';
     btn.style.borderColor = 'var(--red)';
     btn.style.color = 'var(--red)';
-    setTimeout(() => {
+    revealTimer = setTimeout(() => {
+      revealTimer = null;
       valEl.textContent = '';
       valEl.style.display = 'none';
       btn.textContent = 'Reveal';
@@ -1493,22 +1527,22 @@ async function revealSecret(name) {
   }
 }
 
-async function revokeSecret(name){if(!confirm('Delete '+name+'? This retires the credential.'))return;try{await apiGated('DELETE','/api/demipass/delete',{name});closeDetail()}catch(e){if(!/cancelled/.test(e.message)&&!sessionEnded(e))alert(e.message)}}
+async function revokeSecret(name){if(!confirm('Delete '+name+'? This retires the credential.'))return;try{await apiGated('DELETE','/api/demipass/delete',{name},'Deleting '+name+' needs your PIN first.');closeDetail()}catch(e){if(!/cancelled/.test(e.message)&&!sessionEnded(e))alert(e.message)}}
 
 function confirmPanic(){if(!confirm('TRIP ALL BREAKERS? This revokes every active secret.'))return;(async()=>{for(const s of secrets.filter(x=>x.status==='active')){try{await api('DELETE','/api/demipass/revoke',{name:s.name})}catch{}}panic=true;document.getElementById('panic').style.display='block';loadVault()})()}
 function resetPanic(){panic=false;document.getElementById('panic').style.display='none';loadVault()}
 
 async function dropTick(){const t=document.getElementById('t-type').value,n=document.getElementById('t-note').value.trim(),m=document.getElementById('t-msg');
   if(!n){m.textContent='Note required';m.className='modal-msg err';return}
-  try{const r=await api('POST','/api/tick',{type:t,note:n});m.textContent='Tick #'+r.tick_id;m.className='modal-msg ok';loadBuoy();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+  try{const r=await api('POST','/api/tick',{type:t,note:n});m.textContent='Tick #'+r.tick_id;m.className='modal-msg ok';loadBuoy();setTimeout(()=>closeSheet('tick'),800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
 
 async function armTrigger(){const n=document.getElementById('c-name').value.trim(),f=document.getElementById('c-fire').value.trim(),a=document.getElementById('c-action').value,t=document.getElementById('c-target').value.trim(),m=document.getElementById('c-msg');
   if(!n||!f){m.textContent='Name and fire time required';m.className='modal-msg err';return}
-  try{const r=await api('POST','/api/chrono/create',{name:n,fire_in:f,action:a,target:t||'self'});m.textContent='Armed';m.className='modal-msg ok';loadBuoy();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+  try{const r=await api('POST','/api/chrono/create',{name:n,fire_in:f,action:a,target:t||'self'});m.textContent='Armed';m.className='modal-msg ok';loadBuoy();setTimeout(()=>closeSheet('chrono'),800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
 
 async function verifyChain(){const o=document.getElementById('settings-output');try{const r=await api('POST','/api/tick/chain/verify',{did});o.innerHTML=r.valid?'<span style="color:var(--green)">Chain valid — '+r.ticks_checked+' ticks verified</span>':'<span style="color:var(--red)">Chain broken at tick #'+r.broken_at_tick_id+'</span>'}catch(e){o.textContent=e.message}}
 
-async function loadLedgerSummary(){const o=document.getElementById('settings-output');try{const r=await api('GET','/api/ledger/summary');o.innerHTML='Entries: '+r.total_entries+'<br>First: '+(r.first_entry||'—')+'<br>Last: '+(r.last_entry||'—')}catch(e){o.textContent=e.message}}
+async function loadLedgerSummary(){const o=document.getElementById('settings-output');try{const r=await api('GET','/api/ledger/summary');o.innerHTML='Entries: '+r.total_entries+'<br>First: '+esc(r.first_entry||'—')+'<br>Last: '+esc(r.last_entry||'—')}catch(e){o.textContent=e.message}}
 
 async function completeOnboarding(){
   const email=document.getElementById('wizard-recovery-email').value.trim();
@@ -1550,7 +1584,7 @@ async function runDoctor(){
     h+='<div style="color:var(--green);font-weight:600;margin-bottom:0.5rem">System Diagnostics</div>';
     h+='<div>Identity: <strong>'+esc(user)+'</strong></div>';
     h+='<div>DID: <span style="font-family:monospace;font-size:0.65rem">'+esc(did).slice(0,30)+'...</span></div>';
-    h+='<div>Trust band: <strong>'+(d.band||d.trust_band||'—')+'</strong></div>';
+    h+='<div>Trust band: <strong>'+esc(d.band||d.trust_band||'—')+'</strong></div>';
     h+='<div>Recovery email: '+(d.recovery_email?'<span style="color:var(--green)">set</span>':'<span style="color:var(--red)">NOT SET</span>')+'</div>';
     h+='<div>Secrets: <strong>'+(dashboardData?.total||'?')+'</strong></div>';
     h+='<div>Balance: <strong>'+(dashboardData?.balance_dd||'?')+' DD</strong></div>';
@@ -1579,17 +1613,22 @@ async function loadSiliconAgents(){
 }
 
 function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
-function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
-function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function closeSheet(id){document.getElementById('modal-'+id).classList.remove('show')}
+// Cancel / Escape / backdrop. The blocking PIN sheets (setup, status error) stay: only their own buttons or
+// sign-out end them. An open PIN unlock counts as cancelled, so the action waiting on it settles too.
+function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error')m.classList.remove('show')});settleUnlock(false)}
+function closeAllSheets(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
+// HTML-escape for text AND attribute values (quotes included).
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+// A string argument for an inline handler: a JSON string literal, escaped for the attribute it sits in.
+function jsArg(v){return esc(JSON.stringify(String(v??'')))}
 function gateName(g){return ({pin:'PIN',fingerprint:'PIN',twofa:'email code',sms:'SMS code',password:'password',genesis:'genesis'})[g]||esc(g)}
 
 document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeModal()}});
-setInterval(()=>{if(tk)loadVault()},30000);
+setInterval(()=>{if(tk&&vaultOpen)loadVault()},30000);   // never behind a closed PIN gate
 
 // ── QR Scanner ──
-let scanStream = null;
-let scanInterval = null;
 
 async function startScan() {
   openModal('scan');
@@ -1641,7 +1680,7 @@ async function handleScannedData(raw) {
     data.v = ''; data.n = '';
     msg.textContent = 'Deposited! Secret is in your vault.'; msg.className = 'modal-msg ok';
     loadVault();
-    setTimeout(() => closeModal(), 1500);
+    setTimeout(() => closeSheet('scan'), 1500);
   } catch (e) {
     msg.textContent = e.message; msg.className = 'modal-msg err';
   }
