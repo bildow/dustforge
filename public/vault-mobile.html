@@ -520,6 +520,7 @@ let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the pre
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
 let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
+let pinSentFor=null;        // the unlock flow that has sent a PIN: cancelling it hands back any proof that minted
 let pinSaveBusy=null, pinChangeBusy=null;   // a PIN setup (its flow) / PIN change (its session) save in flight
 let vaultOpen=false;        // true only once the vault is past the PIN gate; the background refresh runs only then
 let dashboardData=null, fleetSlug=null, fleetData=null, siliconHandle=null;   // per-account state (sign-out clears it)
@@ -528,7 +529,7 @@ let scanStream=null, scanInterval=null, revealTimer=null;
 if(tk&&!isTokenExpired())showApp();
 else if(tk){logout();document.getElementById('auth-err').textContent='Please sign in'}
 function autoLogoutIfExpired(){if(tk&&isTokenExpired()){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';return true}return false}
-async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs&&typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
+async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
 // A reply from a session that has since ended (signed out, or replaced by another sign-in): handlers stop here.
 function sessionEnded(e){return !!e&&/^session (ended|expired)$/.test(e.message||'')}
 
@@ -871,7 +872,7 @@ async function loadSmsStatus(){
   try{
     const s=await api('GET','/api/identity/gate/status');
     const ps=document.getElementById('pin-status');
-    if(ps) ps.innerHTML = s.pin_set ? (s.pin_locked_for_seconds>0 ? '<span style="color:var(--red)">Set — locked for '+Math.ceil(s.pin_locked_for_seconds/60)+' min after wrong tries</span>' : '<span style="color:var(--green)">Set</span>') : '<span style="color:var(--yellow)">Not set</span>';
+    if(ps) ps.innerHTML = s.pin_set ? (s.pin_hard_locked ? '<span style="color:var(--red)">Locked after repeated wrong tries — use Change PIN with your account password</span>' : s.pin_locked_for_seconds>0 ? '<span style="color:var(--red)">Set — locked for '+Math.ceil(s.pin_locked_for_seconds/60)+' min after wrong tries</span>' : '<span style="color:var(--green)">Set</span>') : '<span style="color:var(--yellow)">Not set</span>';
     if(!s.sms_configured){ el.innerHTML='<span style="color:var(--yellow)">SMS delivery not yet configured on the server</span>'; }
     else if(s.phone_set){ el.innerHTML='On file: <span style="color:var(--green)">'+esc(s.phone_hint||'set')+'</span>'; }
     else { el.textContent='No number on file yet'; }
@@ -976,27 +977,34 @@ function unlockWithPin(what, intent){
     openModal('pin'); setTimeout(()=>document.getElementById('pin-unlock').focus(),80);
   });
 }
-function settleUnlock(ok){ const d=pinUnlockDone; pinUnlockDone=null; pinUnlockIntent=null; if(d) d(ok); }
-// While this sheet's PIN check is in flight, Cancel/Escape wait for its answer: abandoning it would leave the
-// server's proof minted and unspent. The check times out after 15 s, so the sheet is never stuck.
-function pinChecking(){ return !!pinBusy && pinBusy===pinUnlockDone; }
-function cancelPin(){
-  if(pinChecking()){ const m=document.getElementById('pin-unlock-msg'); m.textContent='Checking your PIN — one moment'; m.className='modal-msg'; return; }
-  closeSheet('pin'); settleUnlock(false);
+// Cancelling a flow that already sent a PIN hands back whatever proof it minted (best effort; unspent proofs also
+// expire within a minute), so Cancel really cancels — even with the check still in flight.
+function discardPin(intent){ if(intent&&tk) api('POST','/api/identity/gate/discard',{gate:'pin',intent}).catch(()=>{}); }
+function settleUnlock(ok){
+  const d=pinUnlockDone, intent=pinUnlockIntent, sent=!!d&&pinSentFor===d;
+  pinUnlockDone=null; pinUnlockIntent=null; if(sent) pinSentFor=null;
+  if(sent&&!ok) discardPin(intent);
+  if(d) d(ok);
 }
+function cancelPin(){ closeSheet('pin'); settleUnlock(false); }
+const isTimeout=e=>!!e&&(e.name==='TimeoutError'||e.name==='AbortError');
 async function submitPin(){
   const el=document.getElementById('pin-unlock'), m=document.getElementById('pin-unlock-msg');
   const pin=el.value, mine=pinUnlockDone, intent=pinUnlockIntent;
   if(!mine) return;
   if(pinBusy===mine) return;   // this sheet's check is in flight: a double tap must not mint a second proof
   if(!PIN_OK.test(pin)){m.textContent='4 to 8 digits';m.className='modal-msg err';return}
-  pinBusy=mine; m.textContent='Checking…'; m.className='modal-msg';
+  pinBusy=mine; pinSentFor=mine; m.textContent='Checking…'; m.className='modal-msg';
   try{
     // The proof opens only `intent` (the action that asked), once, within a minute.
     await api('POST','/api/identity/gate/verify',{gate:'pin',pin,intent},{timeoutMs:15000});
-    if(pinUnlockDone!==mine) return;
+    if(pinUnlockDone!==mine){ discardPin(intent); return; }   // cancelled while it ran: give the new proof back
     el.value=''; m.textContent=''; closeSheet('pin'); settleUnlock(true);
-  }catch(e){ if(sessionEnded(e)||pinUnlockDone!==mine) return; el.value=''; m.textContent=e.name==='TimeoutError'?'No answer from the server — try again':e.message; m.className='modal-msg err'; el.focus(); }
+  }catch(e){
+    if(sessionEnded(e)) return;
+    if(pinUnlockDone!==mine){ if(isTimeout(e)) discardPin(intent); return; }
+    el.value=''; m.textContent=isTimeout(e)?'No answer from the server — try again':e.message; m.className='modal-msg err'; el.focus();
+  }
   finally{ if(pinBusy===mine) pinBusy=null; }
 }
 function openPinChange(){
@@ -1010,13 +1018,15 @@ async function savePinChange(){
   if(!PIN_OK.test(a)){m.textContent='New PIN: 4 to 8 digits';m.className='modal-msg err';return}
   if(a!==b){m.textContent='The two new PINs differ';m.className='modal-msg err';return}
   if(!cur&&!pw){m.textContent='Enter your current PIN, or your password if you forgot it';m.className='modal-msg err';return}
-  const epoch=sessionEpoch; if(pinChangeBusy===epoch) return; pinChangeBusy=epoch;
+  const epoch=sessionEpoch;
+  if(pinChangeBusy===epoch){ m.textContent='A PIN change is still being saved — one moment'; m.className='modal-msg'; return; }
+  pinChangeBusy=epoch;
   try{
     m.textContent='Saving…';m.className='modal-msg';
-    await api('POST','/api/identity/pin', cur?{pin:a,current_pin:cur}:{pin:a,password:pw});
+    await api('POST','/api/identity/pin', cur?{pin:a,current_pin:cur}:{pin:a,password:pw}, {timeoutMs:15000});
     closeSheet('pin-change'); loadSmsStatus();
     alert('PIN changed.');
-  }catch(e){ if(sessionEnded(e)) return; m.textContent=e.message; m.className='modal-msg err'; }
+  }catch(e){ if(sessionEnded(e)) return; m.textContent=isTimeout(e)?'No answer from the server — check Settings before trying again':e.message; m.className='modal-msg err'; }
   finally{ if(pinChangeBusy===epoch) pinChangeBusy=null; }
 }
 
@@ -1427,12 +1437,13 @@ async function storeSecret(){
     document.getElementById('s-labels').value='';
     document.getElementById('s-rotate-days').value='';
     // Apply non-default security depth after the secret exists.
+    let depthErr='';
     if (depth && depth !== 'standard') {
-      try { await api('POST','/api/demipass/gate-policy',{ name:n, security_depth:depth }); } catch(_) {}
+      try { await api('POST','/api/demipass/gate-policy',{ name:n, security_depth:depth }); } catch(e) { if(sessionEnded(e)) return; depthErr=e.message; }
     }
-    m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');
-    m.className='modal-msg ok';
-    loadVault();setTimeout(()=>closeSheet('store'),1200);
+    m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'')+(depthErr?' — kept at Standard: '+depthErr:'');
+    m.className=depthErr?'modal-msg err':'modal-msg ok';
+    loadVault(); if(!depthErr) setTimeout(()=>closeSheet('store'),1200);
   }catch(e){
     // PURGE on failure too — don't leave the secret in memory after an error
     body.value='';document.getElementById('s-value').value='';
@@ -1631,7 +1642,7 @@ function openModal(id){document.getElementById('modal-'+id).classList.add('show'
 function closeSheet(id){document.getElementById('modal-'+id).classList.remove('show')}
 // Cancel / Escape / backdrop. The blocking PIN sheets (setup, status error) stay: only their own buttons or
 // sign-out end them. An open PIN unlock counts as cancelled, so the action waiting on it settles too.
-function closeModal(){const checking=pinChecking();document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error'&&!(checking&&m.id==='modal-pin'))m.classList.remove('show')});if(!checking)settleUnlock(false)}
+function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error')m.classList.remove('show')});settleUnlock(false)}
 function closeAllSheets(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
 // HTML-escape for text AND attribute values (quotes included).
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}

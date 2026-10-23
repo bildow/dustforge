@@ -3,9 +3,11 @@
 # master key, creates one wallet through identity.js (password checked by the local sha256 fallback because
 # Stalwart is pointed at a closed port), then drives the real HTTP routes with TWO sessions (two tokens, two
 # jtis) of the same account: set / verify / lockout / change PIN, reveal gating, single-use and per-session
-# proofs bound to one intent (action:secret) and one minute, the PIN floor on reveal, step-up before a policy
-# downgrade, legacy 'fingerprint' policies, a database from before the session/intent columns, and injected
-# storage faults (triggers that abort proof INSERT/DELETE), which must refuse and never pass.
+# proofs bound to one intent (action:secret), one minute and one PIN generation, discarding a proof, escalating
+# locks up to a password-only hard lock, the PIN floor on reveal, step-up before a policy downgrade, policies that
+# may only ask for provable factors (and older ones that can still be lowered), legacy 'fingerprint' policies, a
+# database from before the session/intent columns, and injected storage faults (triggers that abort proof
+# INSERT/DELETE or wallet writes), which must refuse and never pass.
 # Needs node_modules (or NODE_PATH). No network, nothing persists.
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -46,6 +48,7 @@ call(){ # method path token body → sets CODE and BODY
   CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}
 }
 PINB(){ printf '{"gate":"pin","pin":"%s","intent":"%s"}' "$1" "$2"; }   # pin, intent
+DISC(){ printf '{"gate":"pin","intent":"%s"}' "$1"; }
 login(){ call POST /api/identity/auth-fingerprint "" '{"username":"pintester","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
 TK=$(login); [ -n "$TK" ] && [ "$TK" != None ] && ok "login: session A (transact token)" || { fail "login A: $CODE $BODY"; exit 1; }
 TK2=$(login); [ -n "$TK2" ] && [ "$TK2" != "$TK" ] && ok "login: session B (second token, own jti)" || { fail "login B: $CODE $BODY"; exit 1; }
@@ -83,6 +86,7 @@ call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J fresh.pin)" = Fa
 call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"9999"}'; [ "$CODE" = 400 ] && ok "verify pin without an intent → 400" || fail "no intent: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"9999","intent":"reveal:abc"}'; [ "$CODE" = 400 ] && ok "malformed intent → 400" || fail "bad intent: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK" '{"gate":"pin","pin":"9999","intent":"admin:1"}'; [ "$CODE" = 400 ] && ok "unknown intent action → 400" || fail "unknown intent: $CODE $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINB 12 "$RI")"; [ "$CODE" = 400 ] && ok "malformed PIN → 400" || fail "malformed pin: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK" "$(PINB 9999 "$RI")"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J attempts_left)" = 4 ] && ok "wrong PIN → 403, 4 tries left (the 400s never counted)" || fail "wrong pin: $CODE $BODY"
 
 # ── a proof belongs to one session and one action ─────────────────────────────────────────────────────
@@ -110,6 +114,11 @@ SQL "UPDATE gate_verifications SET verified_at = strftime('%Y-%m-%d %H:%M:%f', '
 call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "a 61 s old proof is dead" || fail "expired proof: $CODE $BODY"
 call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J fresh.pin)" = False ] && [ "$(echo "$BODY" | J pin_window_seconds)" = 60 ] && ok "gate/status agrees (60 s PIN window)" || fail "expired status: $BODY"
 SQL "DELETE FROM gate_verifications WHERE gate_type = 'pin' AND intent IS NOT NULL"   # the minute passes
+call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 200 ] || fail "verify for discard: $CODE"
+call POST /api/identity/gate/discard "$TK" "$(DISC "$RI")"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J discarded)" = 1 ] && ok "discard gives back the unspent proof" || fail "discard: $CODE $BODY"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "a discarded proof opens nothing" || fail "after discard: $CODE $BODY"
+call POST /api/identity/gate/discard "$TK" "$(DISC "$RI")"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J discarded)" = 0 ] && ok "discard again → 0 (idempotent)" || fail "discard twice: $CODE $BODY"
+call POST /api/identity/gate/discard "$TK" '{"gate":"twofa","intent":"reveal:1"}'; [ "$CODE" = 400 ] && ok "discard is for PIN proofs only" || fail "discard twofa: $CODE $BODY"
 
 # ── lockout: no new proofs, and every held proof dies ─────────────────────────────────────────────────
 call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 200 ] && ok "A holds a fresh proof" || fail "pre-lock verify: $CODE"
@@ -120,7 +129,20 @@ call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] &
 call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 429 ] && [ "$(echo "$BODY" | J locked_for_seconds)" -gt 800 ] && ok "correct PIN while locked → 429 (~15 min)" || fail "locked-correct: $CODE $BODY"
 call POST /api/identity/pin "$TK" '{"pin":"5678","current_pin":"1234"}'; [ "$CODE" = 429 ] && ok "change with current PIN while locked → 429" || fail "change-locked: $CODE"
 call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J pin_locked_for_seconds)" -gt 800 ] && ok "gate/status reports the lock" || fail "status lock: $BODY"
-SQL "UPDATE identity_wallets SET pin_locked_until=NULL WHERE username='pintester'"   # the 15 minutes pass
+LOCK_ENDED="UPDATE identity_wallets SET pin_locked_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') WHERE username='pintester'"
+SQL "$LOCK_ENDED"   # the 15 minutes pass (the lock's end stays on record)
+
+# ── locks escalate: a lock within a day of the last doubles, the third in a row only the password clears ──
+for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; done
+[ "$CODE" = 429 ] && [ "$(echo "$BODY" | J locked_for_seconds)" = 1800 ] && ok "a second lock within a day lasts 30 min" || fail "lock 2: $CODE $BODY"
+SQL "$LOCK_ENDED"
+for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; done
+[ "$CODE" = 429 ] && [ "$(echo "$BODY" | J hard_locked)" = True ] && ok "the third lock in a row is a hard lock" || fail "lock 3: $CODE $BODY"
+call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J pin_hard_locked)" = True ] && [ "$(echo "$BODY" | J pin_locked_for_seconds)" = None ] && ok "gate/status reports the hard lock" || fail "hard status: $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 429 ] && [ "$(echo "$BODY" | J hard_locked)" = True ] && ok "even the right PIN is refused while hard-locked" || fail "hard right pin: $CODE $BODY"
+call POST /api/identity/pin "$TK" '{"pin":"5678","current_pin":"1234"}'; [ "$CODE" = 429 ] && ok "no change with the current PIN while hard-locked" || fail "hard change: $CODE $BODY"
+call POST /api/identity/pin "$TK" '{"pin":"1234","password":"hunter22"}'; [ "$CODE" = 200 ] && ok "the account password clears a hard lock (sets the PIN)" || fail "hard reset: $CODE $BODY"
+call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J pin_hard_locked)" = False ] && [ "$(echo "$BODY" | J pin_locked_for_seconds)" = 0 ] && ok "…lock and history cleared" || fail "after hard reset: $BODY"
 
 # ── changing the PIN voids proofs earned with the old one ─────────────────────────────────────────────
 call POST /api/identity/pin "$TK" '{"pin":"5678","current_pin":"1111"}'; [ "$CODE" = 403 ] && ok "change with wrong current PIN → 403" || fail "change-wrong: $CODE $BODY"
@@ -157,10 +179,21 @@ call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J effective.reveal)" = "['pin']" ] && ok "with pin + twofa fresh → lowered to standard" || fail "downgrade proven: $CODE $BODY"
 call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J fresh.pin)" = False ] && ok "the policy change spent its PIN proof" || fail "spent by policy: $BODY"
 call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "reveal asks for the PIN again" || fail "reveal after policy: $CODE $BODY"
-call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"critical"}'; [ "$CODE" = 200 ] && ok "raise to critical: no proof needed" || fail "critical: $CODE $BODY"
+call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"critical"}'
+[ "$CODE" = 400 ] && echo "$BODY" | J unprovable | grep -q sms && ok "critical refused: SMS cannot be proven on this server (it would lock the secret for good)" || fail "critical: $CODE $BODY"
+call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","gate_policy":{"reveal":["pin","genesis"],"rotate":[],"delete":[],"use":[]}}'
+[ "$CODE" = 400 ] && echo "$BODY" | J unprovable | grep -q genesis && ok "a genesis factor without a genesis record is refused" || fail "genesis policy: $CODE $BODY"
+# an older policy may already hold a factor nobody can prove: lowering skips it, the provable ones still count
+SQL "UPDATE blindkey_secrets SET security_depth='critical', gate_policy=NULL WHERE name='sightless' AND status='active'"
 call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"elevated"}'
-[ "$CODE" = 403 ] && echo "$BODY" | J missing | grep -q "sms" && ok "critical → elevated needs pin + twofa + sms fresh" || fail "crit→elev: $CODE $BODY"
-SQL "UPDATE blindkey_secrets SET security_depth=NULL, gate_policy=NULL"   # fixture reset (owner would prove pin+twofa+sms)
+[ "$CODE" = 403 ] && ! echo "$BODY" | J required | grep -q sms && echo "$BODY" | J missing | grep -q pin && ok "an older critical policy lowers without the unprovable SMS factor (asks: $(echo "$BODY" | J missing))" || fail "legacy crit→elev: $CODE $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$PI")"; [ "$CODE" = 200 ] || fail "verify for legacy lowering: $CODE"
+call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"elevated"}'; [ "$CODE" = 200 ] && ok "…and lowers once the provable factors are proven" || fail "legacy lowering: $CODE $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$PI")"; call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"standard"}'; [ "$CODE" = 200 ] || fail "back to standard: $CODE $BODY"
+SQL "UPDATE blindkey_secrets SET security_depth='custom', gate_policy='{\"reveal\":[\"pin\"],\"rotate\":[\"genesis\"],\"delete\":[],\"use\":[]}' WHERE name='sightless' AND status='active'"
+call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"standard"}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing)" = "['pin']" ] && ok "lowering a factor nobody can prove still needs the PIN (never free)" || fail "genesis floor: $CODE $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$PI")"; call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"standard"}'; [ "$CODE" = 200 ] && ok "…and goes through with it" || fail "genesis lowering: $CODE $BODY"
 grep -q '"gate_policy_change_blocked"\|gate_policy_change_blocked' "$S/server.log" 2>/dev/null; true
 
 # ── legacy fingerprint tokens, final round trip ───────────────────────────────────────────────────────
@@ -196,6 +229,14 @@ SQL "CREATE TRIGGER deny_insert BEFORE INSERT ON gate_verifications BEGIN SELECT
 call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$RI")"; [ "$CODE" = 503 ] && ok "proof cannot be stored → verify says 503, not ok" || fail "insert-fault verify: $CODE $BODY"
 call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "nothing recorded, reveal refused" || fail "insert-fault reveal: $CODE"
 SQL "DROP TRIGGER deny_insert"
+FAILS(){ python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"SELECT pin_failures FROM identity_wallets WHERE username='pintester'\").fetchone()[0])" "$DB_PATH"; }
+F0=$(FAILS)
+SQL "CREATE TRIGGER deny_wallet_update BEFORE UPDATE ON identity_wallets BEGIN SELECT RAISE(ABORT, 'injected wallet write failure'); END"
+call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$RI")"; C1=$CODE B1=$BODY
+call POST /api/identity/gate/verify "$TK" "$(PINB 9999 "$RI")"; C2=$CODE B2=$BODY
+[ "$C1" = 503 ] && [ "$C2" = 503 ] && [ "$B1" = "$B2" ] && ok "a try that cannot be counted → the same 503 for a right and a wrong PIN" || fail "uncounted try: $C1 $B1 / $C2 $B2"
+SQL "DROP TRIGGER deny_wallet_update"
+[ "$(FAILS)" = "$F0" ] && ok "…and nothing was checked or counted" || fail "failures moved: $F0 → $(FAILS)"
 # backstop: a proof row that predates the current PIN is dead even if a revocation ever missed it
 call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$RI")"; [ "$CODE" = 200 ] || fail "verify for backstop: $CODE"
 SQL "UPDATE identity_wallets SET pin_set_at = strftime('%Y-%m-%d %H:%M:%f', 'now', '+1 second')"

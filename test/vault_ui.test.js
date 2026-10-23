@@ -17,7 +17,7 @@ const tick = () => new Promise(r => setTimeout(r, 0));
 const settle = async (n = 6) => { for (let i = 0; i < n; i++) await tick(); };
 
 // A page instance: fake document (elements materialise on first lookup), localStorage, fetch router.
-function page({ storage = {}, routes } = {}) {
+function page({ storage = {}, routes, abortable = false } = {}) {
   const els = new Map();
   const el = (id) => {
     if (!els.has(id)) {
@@ -32,10 +32,10 @@ function page({ storage = {}, routes } = {}) {
     return els.get(id);
   };
   const store = new Map(Object.entries(storage));
-  const calls = [], intervals = [], listeners = {}, qsa = {};
+  const calls = [], intervals = [], listeners = {}, qsa = {}, timers = [];
   const ctx = {
     console, clearTimeout,
-    setTimeout: (f, ms, ...a) => (ms > 5000 ? 0 : setTimeout(f, ms, ...a)),   // the 30 s reveal auto-hide never fires here
+    setTimeout: (f, ms, ...a) => (ms > 5000 ? (timers.push(f), 0) : setTimeout(f, ms, ...a)),   // long timers fire only when a test runs them
     setInterval: (f) => { intervals.push(f); return 0; }, clearInterval() {},
     alert: () => {}, confirm: () => true, prompt: () => null,
     localStorage: { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)), removeItem: k => store.delete(k) },
@@ -49,10 +49,16 @@ function page({ storage = {}, routes } = {}) {
       const p = url.replace(/^https?:\/\/[^/]+/, '');
       const body = o.body ? JSON.parse(o.body) : null;
       calls.push({ method: o.method || 'GET', path: p, body, auth: (o.headers || {}).Authorization || null });
-      const r = await routes(p, body, o);
+      const routed = routes(p, body, o);
+      const r = o.signal ? await new Promise((resolve, reject) => {   // a fetch the page aborts rejects like a browser's
+        const abort = () => reject(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }));
+        if (o.signal.aborted) abort(); else o.signal.addEventListener('abort', abort);
+        Promise.resolve(routed).then(resolve, reject);
+      }) : await routed;
       return { status: r.status || 200, json: async () => (r.json === undefined ? {} : r.json) };
     },
   };
+  if (abortable) ctx.AbortController = AbortController;   // an older WebView: AbortController, no AbortSignal.timeout
   vm.createContext(ctx);
   vm.runInContext(script, ctx, { filename: 'vault-mobile.inline.js' });
   // Vault contents are not under test here (the real loader stays reachable for the rendering test).
@@ -61,7 +67,7 @@ function page({ storage = {}, routes } = {}) {
   ctx.loadSiliconAgents = () => {};
   ctx.loadSmsStatus = async () => {};
   const key = k => { for (const f of listeners.keydown || []) f({ key: k }); };
-  return { ctx, el, calls, store, intervals, qsa, key, shown: id => el(id).classList.contains('show'), appOpen: () => el('app').style.display === 'block', authOpen: () => el('auth').style.display === 'flex' };
+  return { ctx, el, calls, store, intervals, qsa, key, timers, shown: id => el(id).classList.contains('show'), appOpen: () => el('app').style.display === 'block', authOpen: () => el('auth').style.display === 'flex' };
 }
 const signedIn = { dp_token: 'fixture.token.a', dp_did: 'did:key:zFixture', dp_user: 'fixture', dp_token_at: String(Date.now()) };
 const trustOk = { recovery_email: 'fixture@example.invalid' };
@@ -373,31 +379,88 @@ test('elevated reveal: email code first, PIN last with the 403\'s intent; a canc
   assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/reveal').length, 3, 'refused, refused, revealed');
 });
 
-test('double-tap Unlock sends one PIN check; Cancel/Escape wait for it, so no proof is left unspent', async () => {
-  let release, verifies = 0, pinOk = false;
-  const pg = page({ storage: signedIn, routes: vaultRoutes((p) => {
-    if (p === '/api/blindkey/reveal') { if (pinOk) { pinOk = false; return { json: { value: 'the-value' } }; } return needPin(); }
-    if (p === '/api/identity/gate/verify') { verifies++; return new Promise(r => { release = () => { pinOk = true; r({ json: { ok: true } }); }; }); }
+test('double-tap Unlock sends one PIN check; Cancel cancels at once and hands back the proof a late check minted', async () => {
+  let release, verifies = 0; const discards = [];
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p, body) => {
+    if (p === '/api/blindkey/reveal') return needPin('reveal:7');
+    if (p === '/api/identity/gate/verify') { verifies++; return new Promise(r => { release = () => r({ json: { ok: true } }); }); }
+    if (p === '/api/identity/gate/discard') { discards.push(body); return { json: { ok: true, discarded: 1 } }; }
   }) });
   await settle();
   const done = pg.ctx.revealSecret('sightless');
   await settle();
-  assert.equal(pg.shown('modal-pin'), true);
   pg.el('pin-unlock').value = '2468';
   const a = pg.ctx.submitPin(), b = pg.ctx.submitPin();
   await settle();
   assert.equal(verifies, 1, 'the second tap sent nothing');
   pg.ctx.cancelPin();
-  pg.key('Escape');
-  pg.ctx.closeModal();
+  await done;
+  assert.equal(pg.shown('modal-pin'), false, 'Cancel closes at once');
+  assert.equal(pg.el('reveal-btn').textContent, 'Reveal', 'the reveal settled as cancelled');
+  release(); await a; await b; await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/reveal').length, 1, 'no retry on the late proof');
+  assert.equal(discards.length, 2, 'handed back at Cancel and again when the late check answered');
+  assert.ok(discards.every(d => d.gate === 'pin' && d.intent === 'reveal:7'));
+});
+
+test('a hung PIN check times out (AbortController fallback, no AbortSignal.timeout); Cancel then hands back', async () => {
+  const discards = [];
+  const pg = page({ storage: signedIn, abortable: true, routes: vaultRoutes((p, body) => {
+    if (p === '/api/blindkey/reveal') return needPin('reveal:9');
+    if (p === '/api/identity/gate/verify') return new Promise(() => {});   // never answers
+    if (p === '/api/identity/gate/discard') { discards.push(body); return { json: { ok: true } }; }
+  }) });
   await settle();
-  assert.equal(pg.shown('modal-pin'), true, 'the sheet waits for the check in flight');
-  assert.match(pg.el('pin-unlock-msg').textContent, /one moment/);
-  release(); await a; await b; await done;
-  assert.equal(pg.shown('modal-pin'), false);
-  assert.equal(pg.el('reveal-value').textContent, 'the-value', 'the answered check is spent by its own action');
-  assert.equal(pinOk, false, 'no proof left over');
-  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/reveal').length, 2);
+  const done = pg.ctx.revealSecret('sightless');
+  await settle();
+  pg.el('pin-unlock').value = '2468';
+  const sub = pg.ctx.submitPin();
+  await settle();
+  assert.ok(pg.timers.length >= 1, 'a 15 s timeout was armed');
+  for (const f of pg.timers.splice(0)) f();   // 15 s pass
+  await sub; await settle();
+  assert.match(pg.el('pin-unlock-msg').textContent, /No answer from the server/);
+  assert.equal(pg.shown('modal-pin'), true, 'the sheet is usable again');
+  pg.ctx.cancelPin();
+  await done; await settle();
+  assert.deepEqual(discards.map(d => d.intent), ['reveal:9'], 'a proof the lost check may have minted is handed back');
+});
+
+test('Cancel during the PIN check of a delete stops the delete and hands back the proof', async () => {
+  let release; const deletes = [], discards = [];
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p, body) => {
+    if (p === '/api/demipass/delete') { deletes.push(body); return needPin('delete:5'); }
+    if (p === '/api/identity/gate/verify') return new Promise(r => { release = () => r({ json: { ok: true } }); });
+    if (p === '/api/identity/gate/discard') { discards.push(body); return { json: { ok: true } }; }
+  }) });
+  await settle();
+  pg.ctx.closeDetail = () => {};
+  const del = pg.ctx.revokeSecret('sightless');
+  await settle();
+  assert.match(pg.el('pin-unlock-what').textContent, /Deleting sightless/);
+  pg.el('pin-unlock').value = '2468';
+  const sub = pg.ctx.submitPin();
+  await settle();
+  pg.key('Escape');
+  await del;
+  release(); await sub; await settle();
+  assert.equal(deletes.length, 1, 'the delete was never retried');
+  assert.ok(discards.length >= 1 && discards.every(d => d.intent === 'delete:5'));
+});
+
+test('store: a depth the server refuses is reported and the sheet stays open', async () => {
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p) => {
+    if (p === '/api/demipass/store') return { json: { ok: true, ref: 'DP-PWD-x-1' } };
+    if (p === '/api/demipass/gate-policy') return { status: 400, json: { error: "this account can't prove an SMS code (SMS is not set up on this server) — choose protection without it" } };
+  }) });
+  await settle();
+  pg.ctx.openModal('store');
+  pg.el('s-name').value = 'x'; pg.el('s-type').value = 'password'; pg.el('s-value').value = 'v'; pg.el('s-depth').value = 'critical';
+  await pg.ctx.storeSecret();
+  assert.match(pg.el('s-msg').textContent, /Stored — ref: DP-PWD-x-1 — kept at Standard: .*SMS is not set up/);
+  assert.equal(pg.el('s-msg').className, 'modal-msg err');
+  await new Promise(r => setTimeout(r, 1300));
+  assert.equal(pg.shown('modal-store'), true, 'not auto-closed over the error');
 });
 
 test('Escape: the blocking PIN sheets stay; on the unlock sheet it cancels the waiting action', async () => {
@@ -654,6 +717,7 @@ test('Change PIN: a double tap sends one change (a second would send the old PIN
   const a = pg.ctx.savePinChange(), b = pg.ctx.savePinChange();
   await settle();
   assert.equal(changes.length, 1, 'one request');
+  assert.match(pg.el('pin-change-msg').textContent, /still being saved/, 'the second tap says why nothing happened');
   release(); await a; await b; await settle();
   assert.equal(pg.shown('modal-pin-change'), false);
   const setupTaps = [];

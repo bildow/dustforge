@@ -37,6 +37,23 @@ test('afterFailure: counts up, 5th miss locks for 15 min and resets the counter'
   assert.equal(pg.lockedFor({ ...w, ...fifth }, now + 900_000), 0, 'lock expires');
 });
 
+test('locks escalate: doubling within a day of the last lock, the third in a row is hard; a day later they start over', () => {
+  const now = Date.parse('2026-10-22T10:00:00Z');
+  const l1 = pg.afterFailure({ pin_failures: 4 }, now);
+  assert.equal(l1.lock_seconds, 900); assert.equal(l1.pin_lock_count, 1); assert.equal(l1.hard, false);
+  const l2 = pg.afterFailure({ pin_failures: 4, pin_locked_until: l1.pin_locked_until, pin_lock_count: 1 }, now + 3600e3);
+  assert.equal(l2.lock_seconds, 1800); assert.equal(l2.pin_lock_count, 2); assert.equal(l2.hard, false);
+  const l3 = pg.afterFailure({ pin_failures: 4, pin_locked_until: l2.pin_locked_until, pin_lock_count: 2 }, now + 7200e3);
+  assert.equal(l3.hard, true); assert.equal(l3.pin_locked_until, pg.HARD_LOCK_UNTIL); assert.equal(pg.isHardLocked(l3), true);
+  assert.ok(pg.lockedFor(l3, now + 365 * 86400e3) > 0, 'a hard lock does not expire');
+  const later = pg.afterFailure({ pin_failures: 4, pin_locked_until: '2026-10-20T09:00:00.000Z', pin_lock_count: 2 }, now);
+  assert.equal(later.lock_seconds, 900); assert.equal(later.pin_lock_count, 1, 'over a day since the last lock: start over');
+  const miss = pg.afterFailure({ pin_failures: 1, pin_locked_until: l1.pin_locked_until, pin_lock_count: 1 }, now);
+  assert.equal(miss.locked, false); assert.equal(miss.pin_locked_until, l1.pin_locked_until, 'a miss keeps the lock history'); assert.equal(miss.pin_lock_count, 1);
+  assert.equal(pg.lockAfterMiss({ pin_failures: 5 }, now).pin_lock_count, 1, 'lockAfterMiss takes the already-counted state');
+  assert.equal(pg.isHardLocked({ pin_locked_until: l1.pin_locked_until }), false);
+});
+
 test('lockedFor: tolerant of missing or garbage state', () => {
   assert.equal(pg.lockedFor(null), 0);
   assert.equal(pg.lockedFor({}), 0);
