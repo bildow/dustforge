@@ -735,3 +735,52 @@ test('Change PIN: a double tap sends one change (a second would send the old PIN
   assert.equal(setupTaps.length, 1, 'PIN setup: a double tap sends one save');
   fresh.ctx.logout();
 });
+
+// ── attempt-scoped cancels ─────────────────────────────────────────────────────────────────────────────
+test('each PIN check carries an attempt id; Cancel discards exactly that attempt (also after a network error)', async () => {
+  let fail; const verifies = [], discards = [];
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p, body) => {
+    if (p === '/api/blindkey/reveal') return needPin('reveal:3');
+    if (p === '/api/identity/gate/verify') { verifies.push(body); return new Promise((_, rej) => { fail = () => rej(new TypeError('Failed to fetch')); }); }
+    if (p === '/api/identity/gate/discard') { discards.push(body); return { json: { ok: true } }; }
+  }) });
+  await settle();
+  const done = pg.ctx.revealSecret('sightless');
+  await settle();
+  pg.el('pin-unlock').value = '2468';
+  const sub = pg.ctx.submitPin();
+  await settle();
+  assert.match(verifies[0].attempt || '', /^[A-Za-z0-9_-]{8,64}$/, 'the check names its attempt');
+  pg.ctx.cancelPin();
+  await done;
+  fail(); await sub; await settle();   // the check's answer is lost to a network error (no HTTP status)
+  assert.equal(discards.length, 2, 'cancelled at Cancel, and again when the check failed without an answer');
+  assert.ok(discards.every(d => d.attempt === verifies[0].attempt && d.intent === 'reveal:3'), 'always that one attempt');
+});
+
+test('a check that times out after sign-out sends no discard under the next account', async () => {
+  const discards = [];
+  const pg = page({ abortable: true, routes: async (p, body, o) => {
+    if (loginFor(p, body)) return loginFor(p, body);
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/demipass/gate-policy') return { status: 403, json: { error: 'needs pin', missing: ['pin'], required: ['pin'], intent: 'gate-policy:4' } };
+    if (p === '/api/identity/gate/verify') return new Promise(() => {});
+    if (p === '/api/identity/gate/discard') { discards.push({ body, auth: o.headers.Authorization }); return { json: { ok: true } }; }
+    throw new Error('unexpected ' + p);
+  } });
+  await signInAs(pg, 'accountA');
+  pg.ctx.showDetail = () => {};
+  const depth = pg.ctx.setDepth('sightless', 'standard');
+  await settle();
+  pg.el('pin-unlock').value = '2468';
+  const sub = pg.ctx.submitPin();
+  await settle();
+  pg.ctx.logout();
+  await depth.catch(() => {});
+  await signInAs(pg, 'accountB');
+  for (const f of pg.timers.splice(0)) f();   // A's 15 s timeout fires while B is signed in
+  await sub; await settle();
+  assert.equal(discards.filter(d => d.auth === 'Bearer fixture.token.accountB').length, 0, 'nothing sent with B\'s token');
+  pg.ctx.logout();
+});

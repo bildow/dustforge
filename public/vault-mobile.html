@@ -520,7 +520,7 @@ let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the pre
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
 let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
-let pinSentFor=null;        // the unlock flow that has sent a PIN: cancelling it hands back any proof that minted
+let pinSentFor=null, pinOpenAttempts=[];   // the unlock flow that sent PINs, and its checks that may have minted a proof
 let pinSaveBusy=null, pinChangeBusy=null;   // a PIN setup (its flow) / PIN change (its session) save in flight
 let vaultOpen=false;        // true only once the vault is past the PIN gate; the background refresh runs only then
 let dashboardData=null, fleetSlug=null, fleetData=null, siliconHandle=null;   // per-account state (sign-out clears it)
@@ -552,7 +552,7 @@ function logout(){
   for(const k of ['dp_token','dp_did','dp_user','dp_token_at']) localStorage.removeItem(k);
   closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
   for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass']){const e=document.getElementById(i);if(e)e.value=''}
-  const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; if(s)s(false); if(u)u(false);
+  const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; pinSentFor=null; pinOpenAttempts=[]; if(s)s(false); if(u)u(false);
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
@@ -977,13 +977,15 @@ function unlockWithPin(what, intent){
     openModal('pin'); setTimeout(()=>document.getElementById('pin-unlock').focus(),80);
   });
 }
-// Cancelling a flow that already sent a PIN hands back whatever proof it minted (best effort; unspent proofs also
-// expire within a minute), so Cancel really cancels — even with the check still in flight.
-function discardPin(intent){ if(intent&&tk) api('POST','/api/identity/gate/discard',{gate:'pin',intent}).catch(()=>{}); }
+// Each PIN check carries a random attempt id. Cancelling a flow cancels its open checks by id on the server: a
+// proof one already minted is removed, and one still on its way will mint none — whichever arrives first — so
+// Cancel really cancels, and never touches another check's proof. Only ever sent in the session that made them.
+function newAttempt(){ try{ const b=new Uint8Array(12); crypto.getRandomValues(b); return Array.from(b,x=>x.toString(16).padStart(2,'0')).join(''); }catch(_){ return (Date.now().toString(36)+Math.random().toString(36).slice(2)+'00000000').slice(0,24); } }
+function discardPin(intent, attempt, epoch){ if(intent&&tk&&epoch===sessionEpoch) api('POST','/api/identity/gate/discard',{gate:'pin',intent,attempt}).catch(()=>{}); }
 function settleUnlock(ok){
-  const d=pinUnlockDone, intent=pinUnlockIntent, sent=!!d&&pinSentFor===d;
-  pinUnlockDone=null; pinUnlockIntent=null; if(sent) pinSentFor=null;
-  if(sent&&!ok) discardPin(intent);
+  const d=pinUnlockDone, intent=pinUnlockIntent, sent=!!d&&pinSentFor===d, open=pinOpenAttempts;
+  pinUnlockDone=null; pinUnlockIntent=null; if(sent){ pinSentFor=null; pinOpenAttempts=[]; }
+  if(sent&&!ok) for(const a of open) discardPin(intent, a, sessionEpoch);
   if(d) d(ok);
 }
 function cancelPin(){ closeSheet('pin'); settleUnlock(false); }
@@ -994,15 +996,19 @@ async function submitPin(){
   if(!mine) return;
   if(pinBusy===mine) return;   // this sheet's check is in flight: a double tap must not mint a second proof
   if(!PIN_OK.test(pin)){m.textContent='4 to 8 digits';m.className='modal-msg err';return}
-  pinBusy=mine; pinSentFor=mine; m.textContent='Checking…'; m.className='modal-msg';
+  const attempt=newAttempt(), epoch=sessionEpoch;
+  if(pinSentFor!==mine){ pinSentFor=mine; pinOpenAttempts=[]; }
+  pinOpenAttempts.push(attempt); pinBusy=mine; m.textContent='Checking…'; m.className='modal-msg';
   try{
     // The proof opens only `intent` (the action that asked), once, within a minute.
-    await api('POST','/api/identity/gate/verify',{gate:'pin',pin,intent},{timeoutMs:15000});
-    if(pinUnlockDone!==mine){ discardPin(intent); return; }   // cancelled while it ran: give the new proof back
+    await api('POST','/api/identity/gate/verify',{gate:'pin',pin,intent,attempt},{timeoutMs:15000});
+    if(pinUnlockDone!==mine){ discardPin(intent, attempt, epoch); return; }   // cancelled while it ran: cancel it again
     el.value=''; m.textContent=''; closeSheet('pin'); settleUnlock(true);
   }catch(e){
     if(sessionEnded(e)) return;
-    if(pinUnlockDone!==mine){ if(isTimeout(e)) discardPin(intent); return; }
+    const answered=!!e.status;   // an HTTP refusal minted nothing; no answer (timeout, network) may have
+    if(pinUnlockDone!==mine){ if(!answered) discardPin(intent, attempt, epoch); return; }
+    if(answered) pinOpenAttempts=pinOpenAttempts.filter(a=>a!==attempt);
     el.value=''; m.textContent=isTimeout(e)?'No answer from the server — try again':e.message; m.className='modal-msg err'; el.focus();
   }
   finally{ if(pinBusy===mine) pinBusy=null; }

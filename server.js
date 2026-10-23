@@ -987,7 +987,8 @@ app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => 
 //   { gate:'twofa'|'sms', code }
 //   { gate:'password', password }
 //   { gate:'genesis', refraction }
-//   { gate:'pin', pin, intent }  (the vault PIN set via POST /api/identity/pin; intent = the 403's intent, e.g. 'reveal:42')
+//   { gate:'pin', pin, intent[, attempt] }  (the vault PIN set via POST /api/identity/pin; intent = the 403's intent,
+//                                            e.g. 'reveal:42'; attempt = a random id the caller can cancel it by)
 //   { gate:'fingerprint' }  (legacy: proven by presenting a fingerprint-authed token; policies now read it as 'pin')
 // Wrong answers are 403, never 401: the vault app reads 401 as an expired session and signs out.
 app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
@@ -1027,11 +1028,12 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
 
   if (gate === 'pin') {
     if (auth.silicon) return res.status(403).json({ error: 'silicon agents have no PIN' });
-    const { pin, intent } = req.body || {};
+    const { pin, intent, attempt } = req.body || {};
     // Malformed requests are refused before the PIN is looked at and never count as a wrong try.
     if (typeof intent !== 'string' || !PIN_INTENT_RE.test(intent)) {
       return res.status(400).json({ error: "intent required: the action this PIN is for, as named in the 403 that asked for it (e.g. 'reveal:42')" });
     }
+    if (attempt !== undefined && (typeof attempt !== 'string' || !PIN_ATTEMPT_RE.test(attempt))) return res.status(400).json({ error: 'attempt must be 8 to 64 characters of A-Z a-z 0-9 _ -' });
     if (!pinGate.validPin(String(pin ?? ''))) return res.status(400).json({ error: 'pin must be 4 to 8 digits' });
     const session = gateSession(auth);
     if (!session) return res.status(403).json({ error: 'this token cannot hold a PIN proof — sign in again' });
@@ -1042,13 +1044,17 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     if (locked > 0) return res.status(429).json(pinLockedBody(wallet, locked));
     const t = tryPin(did, String(pin), req, 'verify');
     if (!t.ok) return res.status(t.status).json(t.body);
-    // The counter goes back to 0 and the proof is stored together, or neither (503, nothing proven).
+    // The counter goes back to 0 and the proof is stored together, or neither (503, nothing proven). An attempt the
+    // caller already cancelled (gate/discard) mints nothing; IMMEDIATE so a discard cannot slip in between.
+    let cancelled = false;
     try {
       db.transaction(() => {
         db.prepare('UPDATE identity_wallets SET pin_failures = 0 WHERE did = ?').run(did);
-        if (!recordGate(did, 'pin', session, intent, t.gen)) throw new Error('proof not stored');
-      })();
+        cancelled = Boolean(attempt && db.prepare('SELECT 1 FROM gate_discards WHERE did = ? AND session = ? AND attempt = ?').get(did, session, attempt));
+        if (!cancelled && !recordGate(did, 'pin', session, intent, t.gen, attempt || null)) throw new Error('proof not stored');
+      }).immediate();
     } catch (e) { return res.status(503).json({ error: 'could not record the PIN verification; try again', retry: true }); }
+    if (cancelled) return res.status(409).json({ error: 'this PIN attempt was cancelled; nothing was recorded', cancelled: true });
     return res.json({ ok: true, gate, single_use: true, intent, valid_for_seconds: PIN_PROOF_SEC, note: `opens ${intent} once, in this session, within ${PIN_PROOF_SEC} s` });
   }
 
@@ -1074,17 +1080,30 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
   }
 });
 
-// POST /api/identity/gate/discard — give back an unspent PIN proof: the vault calls it when the user cancels after
-// the PIN already went out, so Cancel really cancels. It only ever removes authority (this session's PIN proofs
-// for that intent).   { gate:'pin', intent }
+// POST /api/identity/gate/discard — cancel a PIN check: the vault calls it when the user cancels after the PIN
+// already went out, so Cancel really cancels. With an attempt id it cancels that one check: its proof is removed
+// and, if the check has not reached the server yet, it will mint none (the marker lives 10 minutes). Without one
+// it removes every proof of this session for the intent. It only ever removes authority.
+//   { gate:'pin', intent[, attempt] }
 app.post('/api/identity/gate/discard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-  const { gate, intent } = req.body || {};
+  const { gate, intent, attempt } = req.body || {};
   if (gate !== 'pin') return res.status(400).json({ error: "only gate 'pin' proofs can be discarded" });
   if (typeof intent !== 'string' || !PIN_INTENT_RE.test(intent)) return res.status(400).json({ error: 'intent required' });
-  try { res.json({ ok: true, discarded: consumeGate(auth.did, 'pin', gateSession(auth), intent) }); }
-  catch (e) { res.status(503).json({ error: `could not discard; the proof expires within ${PIN_PROOF_SEC} s anyway`, retry: true }); }
+  if (attempt !== undefined && (typeof attempt !== 'string' || !PIN_ATTEMPT_RE.test(attempt))) return res.status(400).json({ error: 'attempt must be 8 to 64 characters of A-Z a-z 0-9 _ -' });
+  const session = gateSession(auth);
+  if (!session) return res.json({ ok: true, discarded: 0 });
+  try {
+    let discarded = 0;
+    db.transaction(() => {
+      if (!attempt) { discarded = consumeGate(auth.did, 'pin', session, intent); return; }
+      db.prepare("DELETE FROM gate_discards WHERE created_at < datetime('now', '-10 minutes')").run();
+      db.prepare('INSERT OR IGNORE INTO gate_discards (did, session, attempt) VALUES (?, ?, ?)').run(auth.did, session, attempt);
+      discarded = db.prepare("DELETE FROM gate_verifications WHERE did = ? AND gate_type = 'pin' AND session = ? AND intent = ? AND attempt = ?").run(auth.did, session, intent, attempt).changes;
+    }).immediate();
+    res.json({ ok: true, discarded });
+  } catch (e) { res.status(503).json({ error: `could not discard; the proof expires within ${PIN_PROOF_SEC} s anyway`, retry: true }); }
 });
 
 // POST /api/identity/pin — set or change the vault PIN (4–8 digits), the human-presence factor behind
@@ -11786,6 +11805,16 @@ try { db.exec("ALTER TABLE gate_verifications ADD COLUMN session TEXT DEFAULT NU
 try { db.exec("ALTER TABLE gate_verifications ADD COLUMN intent TEXT DEFAULT NULL"); } catch(_) {}
 // ...and the PIN generation (the wallet's pin_set_at) it was checked against: a PIN change leaves it dead.
 try { db.exec("ALTER TABLE gate_verifications ADD COLUMN pin_gen TEXT DEFAULT NULL"); } catch(_) {}
+// ...and the vault's id for the PIN attempt that minted it. A cancelled attempt is remembered (gate_discards) and
+// never mints a proof, whichever of the check and the discard the server sees first.
+try { db.exec("ALTER TABLE gate_verifications ADD COLUMN attempt TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec(`CREATE TABLE IF NOT EXISTS gate_discards (
+  did TEXT NOT NULL,
+  session TEXT NOT NULL,
+  attempt TEXT NOT NULL,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (did, session, attempt)
+)`); } catch(e) {}
 
 const GATE_TYPES = ['password', 'twofa', 'sms', 'pin', 'fingerprint', 'genesis'];   // fingerprint = legacy spelling of pin
 const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 minutes (per session)
@@ -11794,6 +11823,7 @@ const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
 const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy):\d{1,12}$/;
+const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
 // Presets the UI exposes as a "how much security depth" slider. Custom lets the
@@ -11851,10 +11881,10 @@ function tokenJti(token) {
 // Record a passed gate for one session. A proof without a session is never usable, so it is not stored.
 // Returns true only when the row is in the database.
 const GATE_NOW = "strftime('%Y-%m-%d %H:%M:%f', 'now')";   // ms precision: pin_set_at doubles as the PIN generation
-function recordGate(did, gate, session, intent = null, pinGen = null) {
+function recordGate(did, gate, session, intent = null, pinGen = null, attempt = null) {
   if (!session) return false;
   try {
-    return db.prepare(`INSERT INTO gate_verifications (did, gate_type, session, intent, pin_gen, verified_at) VALUES (?, ?, ?, ?, ?, ${GATE_NOW})`).run(did, gate, session, intent, pinGen).changes === 1;
+    return db.prepare(`INSERT INTO gate_verifications (did, gate_type, session, intent, pin_gen, attempt, verified_at) VALUES (?, ?, ?, ?, ?, ?, ${GATE_NOW})`).run(did, gate, session, intent, pinGen, attempt).changes === 1;
   } catch (e) { console.error('[gate] proof not recorded:', e.message); return false; }
 }
 // Spend a single-use proof (the PIN) for one intent. Returns how many proof rows were removed: 0 means another

@@ -49,6 +49,8 @@ call(){ # method path token body → sets CODE and BODY
 }
 PINB(){ printf '{"gate":"pin","pin":"%s","intent":"%s"}' "$1" "$2"; }   # pin, intent
 DISC(){ printf '{"gate":"pin","intent":"%s"}' "$1"; }
+PINA(){ printf '{"gate":"pin","pin":"%s","intent":"%s","attempt":"%s"}' "$1" "$2" "$3"; }   # pin, intent, attempt
+DISCA(){ printf '{"gate":"pin","intent":"%s","attempt":"%s"}' "$1" "$2"; }
 login(){ call POST /api/identity/auth-fingerprint "" '{"username":"pintester","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
 TK=$(login); [ -n "$TK" ] && [ "$TK" != None ] && ok "login: session A (transact token)" || { fail "login A: $CODE $BODY"; exit 1; }
 TK2=$(login); [ -n "$TK2" ] && [ "$TK2" != "$TK" ] && ok "login: session B (second token, own jti)" || { fail "login B: $CODE $BODY"; exit 1; }
@@ -119,6 +121,15 @@ call POST /api/identity/gate/discard "$TK" "$(DISC "$RI")"; [ "$CODE" = 200 ] &&
 call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "a discarded proof opens nothing" || fail "after discard: $CODE $BODY"
 call POST /api/identity/gate/discard "$TK" "$(DISC "$RI")"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J discarded)" = 0 ] && ok "discard again → 0 (idempotent)" || fail "discard twice: $CODE $BODY"
 call POST /api/identity/gate/discard "$TK" '{"gate":"twofa","intent":"reveal:1"}'; [ "$CODE" = 400 ] && ok "discard is for PIN proofs only" || fail "discard twofa: $CODE $BODY"
+# cancelling one attempt works in either order and never touches another attempt's proof
+call POST /api/identity/gate/verify "$TK" "$(PINA 1234 "$RI" 'bad attempt!')"; [ "$CODE" = 400 ] && ok "malformed attempt id → 400" || fail "bad attempt: $CODE $BODY"
+call POST /api/identity/gate/discard "$TK" "$(DISCA "$RI" attemptAAAA01)"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J discarded)" = 0 ] || fail "early discard: $CODE $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINA 1234 "$RI" attemptAAAA01)"; [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J cancelled)" = True ] && ok "a check that arrives after its discard mints nothing (409 cancelled)" || fail "late check: $CODE $BODY"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "…so it opens nothing" || fail "after cancelled attempt: $CODE $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINA 1234 "$RI" attemptBBBB01)"; [ "$CODE" = 200 ] || fail "verify B: $CODE $BODY"
+call POST /api/identity/gate/verify "$TK" "$(PINA 1234 "$RI" attemptCCCC01)"; [ "$CODE" = 200 ] || fail "verify C: $CODE $BODY"
+call POST /api/identity/gate/discard "$TK" "$(DISCA "$RI" attemptBBBB01)"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J discarded)" = 1 ] && ok "a discard after its check removes that attempt's proof" || fail "discard B: $CODE $BODY"
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 200 ] && ok "…and leaves another attempt's fresh proof alone" || fail "C survives: $CODE $BODY"
 
 # ── lockout: no new proofs, and every held proof dies ─────────────────────────────────────────────────
 call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 200 ] && ok "A holds a fresh proof" || fail "pre-lock verify: $CODE"
