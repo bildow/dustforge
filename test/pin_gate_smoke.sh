@@ -248,6 +248,16 @@ call POST /api/identity/gate/verify "$TK" "$(PINB 9999 "$RI")"; C2=$CODE B2=$BOD
 [ "$C1" = 503 ] && [ "$C2" = 503 ] && [ "$B1" = "$B2" ] && ok "a try that cannot be counted → the same 503 for a right and a wrong PIN" || fail "uncounted try: $C1 $B1 / $C2 $B2"
 SQL "DROP TRIGGER deny_wallet_update"
 [ "$(FAILS)" = "$F0" ] && ok "…and nothing was checked or counted" || fail "failures moved: $F0 → $(FAILS)"
+# a lock is saved even when voiding the proofs fails: the sweep is best effort, the lock alone shuts every proof
+call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$RI")"; [ "$CODE" = 200 ] || fail "proof before the sweep fault: $CODE $BODY"
+SQL "CREATE TRIGGER deny_sweep BEFORE DELETE ON gate_verifications BEGIN SELECT RAISE(ABORT, 'injected sweep failure'); END"
+for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; done; C5=$CODE
+SQL "DROP TRIGGER deny_sweep"
+python3 - "$DB_PATH" <<'PY' && [ "$C5" = 429 ] && ok "the lock is saved even though the proof sweep failed" || fail "lock lost with the sweep (5th miss $C5)"
+import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); v=c.execute("SELECT pin_locked_until FROM identity_wallets WHERE username='pintester'").fetchone()[0]; sys.exit(0 if v else 1)
+PY
+call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "…and the proof that survived the sweep opens nothing while it stands" || fail "survivor under lock: $CODE $BODY"
+SQL "UPDATE identity_wallets SET pin_locked_until = NULL, pin_lock_count = 0, pin_failures = 0 WHERE username='pintester'"   # the lock ends (fresh history for the checks below)
 # backstop: a proof row that predates the current PIN is dead even if a revocation ever missed it
 call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$RI")"; [ "$CODE" = 200 ] || fail "verify for backstop: $CODE"
 SQL "UPDATE identity_wallets SET pin_set_at = strftime('%Y-%m-%d %H:%M:%f', 'now', '+1 second')"

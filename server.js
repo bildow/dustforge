@@ -11908,14 +11908,12 @@ function tryPin(did, pin, req, context) {
   if (w.pin_failures <= pinGate.MAX_FAILURES && pinGate.verifyPin(w.pin_hash, pin)) return { ok: true, gen: w.pin_set_at };
   const next = pinGate.lockAfterMiss({ ...w, pin_failures: Math.min(w.pin_failures, pinGate.MAX_FAILURES) });
   if (next.locked) {
-    // A lock voids every PIN proof the DID holds. If it cannot be saved the counter stays past the limit, so no
-    // PIN is checked until a later miss saves it.
-    try {
-      db.transaction(() => {
-        db.prepare('UPDATE identity_wallets SET pin_failures = 0, pin_locked_until = ?, pin_lock_count = ? WHERE did = ?').run(next.pin_locked_until, next.pin_lock_count, did);
-        invalidatePinProofs(did);
-      })();
-    } catch (e) { console.error('[pin] lock not saved:', e.message); }
+    // The lock is saved on its own: while it stands gateFresh refuses every PIN proof, so voiding them after is
+    // tidying, best effort — a failed sweep can neither cost the lock nor reopen anything. If the lock itself
+    // cannot be saved, the counter stays past the limit and no PIN is checked until a later miss saves it.
+    try { db.prepare('UPDATE identity_wallets SET pin_failures = 0, pin_locked_until = ?, pin_lock_count = ? WHERE did = ?').run(next.pin_locked_until, next.pin_lock_count, did); }
+    catch (e) { console.error('[pin] lock not saved:', e.message); }
+    try { invalidatePinProofs(did); } catch (e) { console.error('[gate] lockout sweep failed:', e.message); }
   }
   logSecurityEvent('pin_failed', next.locked ? 'alert' : 'warn', { caller_did: did, ip: req.ip, context, locked: next.locked, hard: Boolean(next.hard), attempts_left: next.attempts_left });
   if (next.hard) return { status: 429, body: { error: 'incorrect PIN — locked after repeated wrong tries; set a new PIN with your account password', hard_locked: true, locked_for_seconds: null, attempts_left: 0 } };
