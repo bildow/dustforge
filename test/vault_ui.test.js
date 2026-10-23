@@ -373,11 +373,11 @@ test('elevated reveal: email code first, PIN last with the 403\'s intent; a canc
   assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/reveal').length, 3, 'refused, refused, revealed');
 });
 
-test('double-tap Unlock sends one PIN check; Cancel while it is in flight settles the reveal, no retry on the late proof', async () => {
-  let release, verifies = 0;
+test('double-tap Unlock sends one PIN check; Cancel/Escape wait for it, so no proof is left unspent', async () => {
+  let release, verifies = 0, pinOk = false;
   const pg = page({ storage: signedIn, routes: vaultRoutes((p) => {
-    if (p === '/api/blindkey/reveal') return needPin();
-    if (p === '/api/identity/gate/verify') { verifies++; return new Promise(r => { release = () => r({ json: { ok: true } }); }); }
+    if (p === '/api/blindkey/reveal') { if (pinOk) { pinOk = false; return { json: { value: 'the-value' } }; } return needPin(); }
+    if (p === '/api/identity/gate/verify') { verifies++; return new Promise(r => { release = () => { pinOk = true; r({ json: { ok: true } }); }; }); }
   }) });
   await settle();
   const done = pg.ctx.revealSecret('sightless');
@@ -388,11 +388,16 @@ test('double-tap Unlock sends one PIN check; Cancel while it is in flight settle
   await settle();
   assert.equal(verifies, 1, 'the second tap sent nothing');
   pg.ctx.cancelPin();
-  await done;
-  assert.equal(pg.el('reveal-btn').textContent, 'Reveal', 'reveal settled, not stuck on Verifying');
-  release(); await a; await b; await settle();
-  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/reveal').length, 1, 'the late proof triggered no retry');
+  pg.key('Escape');
+  pg.ctx.closeModal();
+  await settle();
+  assert.equal(pg.shown('modal-pin'), true, 'the sheet waits for the check in flight');
+  assert.match(pg.el('pin-unlock-msg').textContent, /one moment/);
+  release(); await a; await b; await done;
   assert.equal(pg.shown('modal-pin'), false);
+  assert.equal(pg.el('reveal-value').textContent, 'the-value', 'the answered check is spent by its own action');
+  assert.equal(pinOk, false, 'no proof left over');
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/reveal').length, 2);
 });
 
 test('Escape: the blocking PIN sheets stay; on the unlock sheet it cancels the waiting action', async () => {
@@ -575,4 +580,94 @@ test('hostile secret names stay inert: handlers get JSON string literals, data n
   assert.ok(hs.includes(`setDepth(${lit},'elevated')`));
   for (const h of hs) assert.doesNotThrow(() => new Function(h), h);   // each handler parses whole: nothing broke out
   for (const html of [list, detail]) assert.doesNotMatch(html, /<img|<i>|<b>|<u>|<s>/, 'no markup from data');
+});
+
+// ── follow-ups from the b615065 UI audit ───────────────────────────────────────────────────────────────
+test('Trip All Breakers stops at sign-out: nothing is revoked with the next account\'s token, no banner for it', async () => {
+  let releaseFirst; const revokes = [];
+  const pg = page({ routes: async (p, body, o) => {
+    if (loginFor(p, body)) return loginFor(p, body);
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/demipass/dashboard') return { json: { balance_dd: 1, health_summary: {}, secrets: [{ name: 'openai', status: 'active', use_count: 0 }, { name: 'racknerd', status: 'active', use_count: 0 }] } };
+    if (p === '/api/demipass/revoke') { revokes.push({ name: body.name, auth: o.headers.Authorization }); if (revokes.length === 1) return new Promise(r => { releaseFirst = () => r({ json: { ok: true } }); }); return { json: { ok: true } }; }
+    throw new Error('unexpected ' + p);
+  } });
+  await signInAs(pg, 'accountA');
+  await pg.ctx.__realLoadVault();
+  pg.ctx.confirmPanic();
+  await settle();
+  assert.equal(revokes.length, 1, 'A\'s loop started');
+  pg.ctx.logout();
+  await signInAs(pg, 'accountB');
+  releaseFirst();
+  await settle(12);
+  assert.deepEqual(revokes.map(r => r.auth), ['Bearer fixture.token.accountA'], 'no revoke ever ran with B\'s token');
+  assert.notEqual(pg.el('panic').style.display, 'block', 'B sees no breaker banner');
+  pg.ctx.logout();
+});
+
+test('a worker token minted before sign-out never lands on the next account\'s screen', async () => {
+  let releaseSilicon;
+  const pg = page({ routes: async (p, body) => {
+    if (loginFor(p, body)) return loginFor(p, body);
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (/\/workers$/.test(p)) return { json: { minted: { token: 'dpw_A_WORKER_SECRET' } } };
+    if (/\/silicons\/[^/]+$/.test(p)) return new Promise(r => { releaseSilicon = () => r({ status: 500, json: { error: 'late' } }); });
+    throw new Error('unexpected ' + p);
+  } });
+  await signInAs(pg, 'accountA');
+  pg.el('wk-name').value = 'brain2';
+  const minting = pg.ctx.createWorker();
+  await settle();
+  assert.ok(releaseSilicon, 'A\'s silicon page re-fetch is in flight');
+  pg.ctx.logout();
+  await signInAs(pg, 'accountB');
+  releaseSilicon(); await minting; await settle();
+  assert.equal(pg.el('wk-token-text').value, '', 'A\'s worker token is not shown to B');
+  assert.notEqual(pg.el('wk-token-out').style.display, 'block');
+  pg.ctx.logout();
+});
+
+test('sign-out also clears sheet messages and re-syncs the store/silicon field sets', async () => {
+  const pg = page({ storage: signedIn, routes: vaultRoutes(() => null) });
+  await settle();
+  pg.el('s-msg').textContent = 'Stored — ref: DP-PWD-racknerd-1234'; pg.el('phone-msg').textContent = 'Saved: •••4567'; pg.el('sil-msg').textContent = 'Working…';
+  pg.el('s-type').value = 'password'; pg.el('s-login-fields').style.display = 'none'; pg.el('s-key-fields').style.display = 'block';   // A left "API key" up; the reset put the dropdown back
+  pg.el('sil-mode').value = 'existing'; pg.el('sil-create-fields').style.display = 'block';
+  pg.ctx.logout();
+  for (const id of ['s-msg', 'phone-msg', 'sil-msg']) assert.equal(pg.el(id).textContent, '', id);
+  assert.equal(pg.el('s-login-fields').style.display, 'block', 'store sheet shows the login fields again');
+  assert.equal(pg.el('s-key-fields').style.display, 'none');
+  assert.equal(pg.el('sil-create-fields').style.display, 'none', 'silicon sheet matches "existing"');
+});
+
+test('Change PIN: a double tap sends one change (a second would send the old PIN as current)', async () => {
+  let release; const changes = [];
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p, body) => {
+    if (p === '/api/identity/pin') { changes.push(body); return new Promise(r => { release = () => r({ json: { ok: true, changed: true } }); }); }
+  }) });
+  await settle();
+  pg.ctx.openPinChange();
+  pg.el('pin-cur').value = '2468'; pg.el('pin-change-new').value = '1357'; pg.el('pin-change-confirm').value = '1357';
+  const a = pg.ctx.savePinChange(), b = pg.ctx.savePinChange();
+  await settle();
+  assert.equal(changes.length, 1, 'one request');
+  release(); await a; await b; await settle();
+  assert.equal(pg.shown('modal-pin-change'), false);
+  const setupTaps = [];
+  const fresh = page({ routes: async (p, body) => {
+    if (loginRoute(p)) return loginRoute(p);
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: false } };
+    if (p === '/api/identity/pin') { setupTaps.push(body); return new Promise(() => {}); }
+    throw new Error('unexpected ' + p);
+  } });
+  await signIn(fresh);
+  fresh.el('pin-new').value = '4821'; fresh.el('pin-confirm').value = '4821';
+  fresh.ctx.savePinSetup(); fresh.ctx.savePinSetup();
+  await settle();
+  assert.equal(setupTaps.length, 1, 'PIN setup: a double tap sends one save');
+  fresh.ctx.logout();
 });
