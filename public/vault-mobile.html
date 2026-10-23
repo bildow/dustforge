@@ -1003,6 +1003,7 @@ async function submitPin(){
     // The proof opens only `intent` (the action that asked), once, within a minute.
     await api('POST','/api/identity/gate/verify',{gate:'pin',pin,intent,attempt},{timeoutMs:15000});
     if(pinUnlockDone!==mine){ discardPin(intent, attempt, epoch); return; }   // cancelled while it ran: cancel it again
+    for(const a of pinOpenAttempts) if(a!==attempt) discardPin(intent, a, epoch);   // an earlier check still in transit mints no spare proof
     el.value=''; m.textContent=''; closeSheet('pin'); settleUnlock(true);
   }catch(e){
     if(sessionEnded(e)) return;

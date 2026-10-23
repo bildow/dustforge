@@ -784,3 +784,25 @@ test('a check that times out after sign-out sends no discard under the next acco
   assert.equal(discards.filter(d => d.auth === 'Bearer fixture.token.accountB').length, 0, 'nothing sent with B\'s token');
   pg.ctx.logout();
 });
+
+test('a check that timed out is cancelled once a later attempt in the same flow succeeds', async () => {
+  const verifies = [], discards = []; let n = 0;
+  const pg = page({ storage: signedIn, abortable: true, routes: vaultRoutes((p, body) => {
+    if (p === '/api/blindkey/reveal') return n >= 2 ? { json: { value: 'the-value' } } : needPin('reveal:6');
+    if (p === '/api/identity/gate/verify') { verifies.push(body); n++; return n === 1 ? new Promise(() => {}) : { json: { ok: true } }; }
+    if (p === '/api/identity/gate/discard') { discards.push(body); return { json: { ok: true } }; }
+  }) });
+  await settle();
+  const done = pg.ctx.revealSecret('sightless');
+  await settle();
+  pg.el('pin-unlock').value = '2468';
+  const first = pg.ctx.submitPin();
+  await settle();
+  for (const f of pg.timers.splice(0)) f();   // attempt 1 times out (it may still reach the server later)
+  await first; await settle();
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();                   // attempt 2 succeeds
+  await done; await settle();
+  assert.equal(pg.el('reveal-value').textContent, 'the-value');
+  assert.deepEqual(discards.map(d => d.attempt), [verifies[0].attempt], 'only the timed-out attempt is cancelled, never the winner');
+});
