@@ -317,6 +317,9 @@
           <button onclick="setPhone()" style="padding:0.5rem 0.75rem;background:var(--accent);border:none;border-radius:6px;color:var(--bg);font-weight:600;font-size:0.75rem;cursor:pointer;white-space:nowrap">Save</button>
         </div>
         <div id="phone-msg" style="font-size:0.7rem;margin-top:0.25rem;margin-bottom:0.75rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked for every reveal; email/SMS codes stay fresh 5 minutes)</div>
+        <div id="pin-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.4rem"></div>
+        <button class="btn-ghost" onclick="openPinChange()" style="width:100%;text-align:left;padding:0.6rem">Change PIN</button>
       </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
@@ -418,9 +421,51 @@
     <label>Rotate every (optional, days)</label>
     <input type="number" id="s-rotate-days" min="1" max="3650" placeholder="e.g. 90 — drives rotation reminders">
     <label>Security depth</label>
-    <select id="s-depth"><option value="standard">Standard — reveal needs biometric</option><option value="elevated">Elevated — + email code to reveal/rotate/delete</option><option value="critical">Critical — + SMS code, strongest</option></select>
+    <select id="s-depth"><option value="standard">Standard — reveal needs your PIN</option><option value="elevated">Elevated — + email code to reveal/rotate/delete</option><option value="critical">Critical — + SMS code, strongest</option></select>
     <div id="s-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="storeSecret()">Store</button></div>
+  </div>
+</div>
+
+<!-- Vault PIN: unlock (asked by a gate), first-time setup (mandatory), change (settings) -->
+<div id="modal-pin" class="modal-bg" onclick="if(event.target===this)cancelPin()">
+  <div class="modal-sheet">
+    <h3>Enter your vault PIN</h3>
+    <div id="pin-unlock-what" style="font-size:0.8rem;color:var(--text3)">This credential reveals only after your PIN. It is asked for every reveal.</div>
+    <label>PIN</label><input type="password" id="pin-unlock" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits" onkeydown="if(event.key==='Enter')submitPin()">
+    <div id="pin-unlock-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="cancelPin()">Cancel</button><button class="btn-primary" onclick="submitPin()">Unlock</button></div>
+  </div>
+</div>
+<div id="modal-pin-setup" class="modal-bg">
+  <div class="modal-sheet">
+    <h3>Set your vault PIN</h3>
+    <div style="font-size:0.8rem;color:var(--text3)">Every secret reveal asks for this PIN, every time. 4 to 8 digits, known only to you. You cannot use the vault until one is set.</div>
+    <label>New PIN</label><input type="password" id="pin-new" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits">
+    <label>Repeat PIN</label><input type="password" id="pin-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="same digits again" onkeydown="if(event.key==='Enter')savePinSetup()">
+    <div id="pin-setup-pw-row"><label>Account password (confirms it is you)</label><input type="password" id="pin-setup-pw" autocomplete="current-password" onkeydown="if(event.key==='Enter')savePinSetup()"></div>
+    <div id="pin-setup-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="logout()">Sign out</button><button class="btn-primary" onclick="savePinSetup()">Save PIN</button></div>
+  </div>
+</div>
+<div id="modal-pin-change" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Change your vault PIN</h3>
+    <label>Current PIN</label><input type="password" id="pin-cur" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="leave empty if forgotten">
+    <label>Account password (only if the current PIN is forgotten)</label><input type="password" id="pin-change-pw" autocomplete="current-password">
+    <label>New PIN</label><input type="password" id="pin-change-new" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits">
+    <label>Repeat new PIN</label><input type="password" id="pin-change-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" onkeydown="if(event.key==='Enter')savePinChange()">
+    <div id="pin-change-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="savePinChange()">Save</button></div>
+  </div>
+</div>
+
+<div id="modal-pin-error" class="modal-bg">
+  <div class="modal-sheet">
+    <h3>Can't check your vault PIN</h3>
+    <div style="font-size:0.8rem;color:var(--text3)">The vault stays closed until the server confirms a PIN is set. Check your connection and retry.</div>
+    <div id="pin-error-why" class="modal-msg err"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="logout()">Sign out</button><button class="btn-primary" onclick="retryPinCheck()">Retry</button></div>
   </div>
 </div>
 
@@ -470,11 +515,23 @@ function isTokenExpired(){const t=localStorage.getItem('dp_token_at');if(!t)retu
 
 let tk=localStorage.getItem('dp_token')||'',did=localStorage.getItem('dp_did')||'',user=localStorage.getItem('dp_user')||'';
 let secrets=[],panic=false;
+let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
+let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
+let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
+let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
+let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
+let pinSentFor=null, pinOpenAttempts=[];   // the unlock flow that sent PINs, and its checks that may have minted a proof
+let pinSaveBusy=null, pinChangeBusy=null;   // a PIN setup (its flow) / PIN change (its session) save in flight
+let vaultOpen=false;        // true only once the vault is past the PIN gate; the background refresh runs only then
+let dashboardData=null, fleetSlug=null, fleetData=null, siliconHandle=null;   // per-account state (sign-out clears it)
+let scanStream=null, scanInterval=null, revealTimer=null;
 
 if(tk&&!isTokenExpired())showApp();
 else if(tk){logout();document.getElementById('auth-err').textContent='Please sign in'}
 function autoLogoutIfExpired(){if(tk&&isTokenExpired()){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';return true}return false}
-async function api(m,p,b){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);const r=await fetch(API+p,o);if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(r.status>=400)throw new Error(d.error||(r.status===401?'wrong username or password':'failed'));return d}
+async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
+// A reply from a session that has since ended (signed out, or replaced by another sign-in): handlers stop here.
+function sessionEnded(e){return !!e&&/^session (ended|expired)$/.test(e.message||'')}
 
 async function login(){
   const u=document.getElementById('auth-user').value.trim(),p=document.getElementById('auth-pass').value,e=document.getElementById('auth-err');
@@ -483,17 +540,33 @@ async function login(){
     e.textContent='Signing in...';e.style.color='var(--text3)';
     const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
     if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
-    tk=a.token;did=a.did||'';user=u;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
+    tk=a.token;did=a.did||'';user=u;loginPw=p;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
 
 // Device login approval: hand off to /device.html on this same origin, which reuses this
 // vault session (dp_token in localStorage) so approving is one tap.
 function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
-function logout(){tk='';did='';user='';localStorage.removeItem('dp_token');localStorage.removeItem('dp_did');localStorage.removeItem('dp_user');localStorage.removeItem('dp_token_at');document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
+function logout(){
+  sessionEpoch++; tk='';did='';user='';loginPw='';vaultOpen=false;
+  for(const k of ['dp_token','dp_did','dp_user','dp_token_at']) localStorage.removeItem(k);
+  closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
+  for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass']){const e=document.getElementById(i);if(e)e.value=''}
+  const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; pinSentFor=null; pinOpenAttempts=[]; if(s)s(false); if(u)u(false);
+  // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
+  // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
+  if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status']){const e=document.getElementById(i);if(e)e.innerHTML=''}
+  for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
+                  's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why']){const e=document.getElementById(i);if(e)e.textContent=''}
+  for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
+  for(const i of ['df-fwd-banner','security-banner','panic','onboarding-wizard']){const e=document.getElementById(i);if(e)e.style.display='none'}
+  updateStoreFields(); updateSiliconFields();   // the sheets' field sets follow their reset dropdowns
+  secrets=[]; dashboardData=null; fleetSlug=null; fleetData=null; siliconHandle=null; panic=false;
+  goPage('vault');
+  document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
 
 // ── Fleet tab ──────────────────────────────────────────────────────────────
-let fleetSlug=null, fleetData=null, siliconHandle=null;
 function dd(c){return (Number(c)||0).toLocaleString()}
 function tokenChip(t){
   const m={valid:['var(--green)','token ok'],expiring:['var(--yellow)','token expiring'],expired:['var(--red)','token expired'],none:['var(--text3)','no token']};
@@ -536,7 +609,7 @@ async function loadFleet(){
     h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">Silicons</span><span style="font-size:0.7rem;color:var(--text3)">'+d.silicons.length+' / '+d.fleet.max_agents+'</span></div>';
     if(!d.silicons.length)h+='<div class="empty">No silicons yet. Tap + Silicon to add one.</div>';
     for(const s of d.silicons){
-      h+='<div onclick="openSilicon(\''+esc(s.handle)+'\')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
+      h+='<div onclick="openSilicon('+jsArg(s.handle)+')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong style="color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700">'+dd(s.balance_cents)+' DD</div></div>';
       h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.35rem;font-size:0.68rem;color:var(--text3)"><span>'+(s.refill.enabled?('refill +'+dd(s.refill.amount_cents)+' below '+dd(s.refill.threshold_cents)):'no auto-refill')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</span>'+tokenChip(s.token)+'</div>';
       h+='</div>';
@@ -547,7 +620,7 @@ async function loadFleet(){
       for(const p of d.projects){
         h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.45rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">';
         h+='<div><strong>'+esc(p.project)+'</strong><div style="font-size:0.65rem;color:var(--text3)">'+p.operators.length+' operator'+(p.operators.length===1?'':'s')+' · wallet '+dd(p.wallet_balance_cents)+' DD</div></div>';
-        h+='<select onchange="setBillMode(\''+esc(p.project)+'\',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
+        h+='<select onchange="setBillMode('+jsArg(p.project)+',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
         h+='</div>';
       }
     }
@@ -555,7 +628,7 @@ async function loadFleet(){
     const rows=(d.attribution&&d.attribution.rows)||[];
     h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Who paid for what (30d)</span></div>';
     if(!rows.length)h+='<div class="empty" style="font-size:0.75rem">No attributed spend yet.</div>';
-    const name=did=>{const s=d.silicons.find(x=>x.did===did);return s?'@'+s.handle:(did===d.fleet.owner_did?'you':did.slice(8,20)+'…')};
+    const name=did=>{const s=d.silicons.find(x=>x.did===did);return esc(s?'@'+s.handle:(did===d.fleet.owner_did?'you':String(did).slice(8,20)+'…'))};
     for(const r of rows.slice(0,25)){
       h+='<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+name(r.actor_did)+' → '+(r.project?esc(r.project):'—')+' <span style="color:var(--text3)">'+esc(r.initiator)+'</span></span><span><span style="color:var(--text3)">'+name(r.payer_did)+' paid</span> <strong>'+dd(r.cents)+' DD</strong> <span style="color:var(--text3)">('+r.calls+')</span></span></div>';
     }
@@ -566,13 +639,13 @@ async function loadFleet(){
       for(const l of links.slice(0,20))h+=workLinkRow(l,d.current_tick);
     }
     el.innerHTML=h;
-  }catch(e){el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+  }catch(e){if(!sessionEnded(e))el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 function workLinkRow(l,tick){
   const live=l.status==='active';
   let h='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem">';
   h+='<div>#'+l.id+' '+esc(l.requester||l.requester_did.slice(8,18))+' → '+esc(l.provider||l.provider_did.slice(8,18))+(l.project?' · '+esc(l.project):'')+'<div style="font-size:0.65rem;color:var(--text3)">'+esc(l.status)+(live?' · until tick '+l.end_tick+' ('+Math.max(0,l.end_tick-tick)+' left)':'')+' · spent '+dd(l.spent_cents)+' DD'+(l.note?' · '+esc(l.note):'')+'</div></div>';
-  if(['pending','active'].includes(l.status))h+='<button class="btn-ghost" onclick="revokeWorkLink('+l.id+')" style="font-size:0.65rem">Revoke</button>';
+  if(['pending','active'].includes(l.status))h+='<button class="btn-ghost" onclick="revokeWorkLink('+Number(l.id)+')" style="font-size:0.65rem">Revoke</button>';
   return h+'</div>';
 }
 async function saveOwnerRefill(){
@@ -597,7 +670,7 @@ async function addSilicon(){
     const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons',body);
     if(r.mode==='pending_claim'){alert('A confirmation link was emailed to '+r.claim_sent_to+'. The silicon appears once that link is opened.')}
     else if(r.mode==='created'){alert('Created '+r.email+'\nDID: '+r.did+(r.password_once?'\n\nOne-time password (not stored, not emailed):\n'+r.password_once:''))}
-    closeModal();document.getElementById('sil-member-token').value='';loadFleet();
+    closeSheet('silicon');document.getElementById('sil-member-token').value='';loadFleet();
   }catch(e){m.textContent=e.message;m.style.color='var(--red)'}
 }
 async function openSilicon(handle){
@@ -609,7 +682,7 @@ async function openSilicon(handle){
     let h='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
     h+='<div style="display:flex;justify-content:space-between;align-items:baseline"><div><strong style="font-size:1.05rem;color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700;font-size:1.2rem">'+dd(s.balance_cents)+' DD</div></div>';
     h+='<div style="font-size:0.72rem;color:var(--text3);margin-top:0.3rem">'+esc(s.contact_email||s.email||'')+'</div>';
-    h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">Silicon id (share this, not the DID)</div><div style="font-family:monospace;font-size:0.75rem;word-break:break-all">'+esc(s.silicon_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(s.silicon_id)+'\')" style="font-size:0.6rem;padding:0.1rem 0.4rem">copy</button></div>';
+    h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">Silicon id (share this, not the DID)</div><div style="font-family:monospace;font-size:0.75rem;word-break:break-all">'+esc(s.silicon_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText('+jsArg(s.silicon_id)+')" style="font-size:0.6rem;padding:0.1rem 0.4rem">copy</button></div>';
     h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.5rem">DID</div><div style="font-family:monospace;font-size:0.62rem;word-break:break-all;color:var(--accent)">'+esc(s.did)+'</div>';
     h+='<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.75rem"><input type="number" id="sil-refill-now" value="'+(s.refill.amount_cents||100)+'" min="1" style="width:6rem;margin:0;padding:0.4rem"><button class="btn-primary" onclick="refillNow()" style="font-size:0.75rem">Refill now from my wallet</button></div>';
     h+='</div>';
@@ -632,7 +705,7 @@ async function openSilicon(handle){
     h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">Secrets this silicon uses</span><span style="font-size:0.7rem;color:var(--text3)">'+own.length+' own · '+del.length+' delegated</span></div>';
     if(!own.length&&!del.length)h+='<div class="empty" style="font-size:0.75rem">None yet.</div>';
     for(const sc of own)h+='<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(sc.name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(sc.ref_code||'')+' · own</span></span><span style="color:'+(sc.status==='active'?'var(--green)':'var(--yellow)')+'">'+esc(sc.status)+' · '+(sc.use_count||0)+' uses</span></div>';
-    for(const g of del)h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(g.secret_name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(g.ref_code||'')+' · delegated by you</span></span><span style="color:'+(g.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(g.status)+' · '+g.use_count+(g.max_uses?'/'+g.max_uses:'')+' uses'+(g.status==='active'?' <button class="btn-ghost" onclick="revokeDelegation('+(g.delegation_id||g.id)+')" style="font-size:0.6rem;padding:0.1rem 0.4rem">revoke</button>':'')+'</span></div>';
+    for(const g of del)h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+esc(g.secret_name)+' <span style="color:var(--text3);font-size:0.65rem">'+esc(g.ref_code||'')+' · delegated by you</span></span><span style="color:'+(g.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(g.status)+' · '+g.use_count+(g.max_uses?'/'+g.max_uses:'')+' uses'+(g.status==='active'?' <button class="btn-ghost" onclick="revokeDelegation('+Number(g.delegation_id||g.id)+')" style="font-size:0.6rem;padding:0.1rem 0.4rem">revoke</button>':'')+'</span></div>';
     h+='<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.5rem"><input type="text" id="sil-delegate-name" placeholder="delegate one of your secrets: name or DP- ref" style="flex:1;margin:0;padding:0.4rem"><button class="btn-ghost" onclick="delegateToSilicon()" style="font-size:0.72rem">Delegate</button></div>';
     // workers: scoped tokens this silicon hands to its own sub-agents / test environments
     const ws=d.workers||[];
@@ -641,9 +714,9 @@ async function openSilicon(handle){
     for(const w of ws){
       h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.6rem 0.8rem;margin-bottom:0.4rem;font-size:0.75rem">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong>'+esc(w.name)+'</strong> <span style="color:var(--text3);font-size:0.65rem">'+esc(w.purpose||'')+'</span></div><span style="color:'+(w.status==='active'?'var(--green)':'var(--text3)')+'">'+esc(w.status)+'</span></div>';
-      h+='<div style="font-family:monospace;font-size:0.65rem;color:var(--accent);word-break:break-all">'+esc(w.worker_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText(\''+esc(w.worker_id)+'\')" style="font-size:0.6rem;padding:0.05rem 0.35rem">copy</button></div>';
+      h+='<div style="font-family:monospace;font-size:0.65rem;color:var(--accent);word-break:break-all">'+esc(w.worker_id)+' <button class="btn-ghost" onclick="navigator.clipboard.writeText('+jsArg(w.worker_id)+')" style="font-size:0.6rem;padding:0.05rem 0.35rem">copy</button></div>';
       h+='<div style="font-size:0.65rem;color:var(--text3);margin-top:0.2rem">scope ≤ '+esc(w.scope_cap)+' · spent '+dd(w.spent_cents)+(w.max_spend_cents?' / '+dd(w.max_spend_cents):'')+' DD · '+w.use_count+' calls · secrets: '+(w.allowed_secrets&&w.allowed_secrets.length?esc(w.allowed_secrets.join(', ')):'all of the parent\'s')+(w.token_expires_at?' · token until '+new Date(w.token_expires_at).toLocaleString():'')+'</div>';
-      if(w.status==='active')h+='<div style="display:flex;gap:0.4rem;margin-top:0.4rem"><button class="btn-ghost" onclick="mintWorkerToken(\''+esc(w.worker_id)+'\')" style="font-size:0.65rem">Mint token</button><button class="btn-ghost" onclick="revokeWorker(\''+esc(w.worker_id)+'\')" style="font-size:0.65rem;color:var(--red)">Revoke</button></div>';
+      if(w.status==='active')h+='<div style="display:flex;gap:0.4rem;margin-top:0.4rem"><button class="btn-ghost" onclick="mintWorkerToken('+jsArg(w.worker_id)+')" style="font-size:0.65rem">Mint token</button><button class="btn-ghost" onclick="revokeWorker('+jsArg(w.worker_id)+')" style="font-size:0.65rem;color:var(--red)">Revoke</button></div>';
       h+='</div>';
     }
     h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:0.7rem;margin-top:0.5rem"><div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem">New worker</div>';
@@ -662,18 +735,19 @@ async function openSilicon(handle){
     if(d.work_links.length){h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Work links</span><span style="font-size:0.7rem;color:var(--text3)">tick '+d.current_tick+'</span></div>';for(const l of d.work_links.slice(0,20))h+=workLinkRow(l,d.current_tick)}
     h+='<div style="margin-top:1.25rem"><button class="btn-danger" onclick="removeSilicon()" style="width:100%;padding:0.6rem;border-radius:10px;font-size:0.78rem">Remove from fleet</button></div>';
     el.innerHTML=h;
-  }catch(e){el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+  }catch(e){if(!sessionEnded(e))el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 function closeSilicon(){siliconHandle=null;goPage('fleet');loadFleet()}
 async function saveSiliconSettings(){try{await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle),{refill_enabled:document.getElementById('sil-set-enabled').checked,refill_threshold_cents:Number(document.getElementById('sil-set-threshold').value||0),refill_amount_cents:Number(document.getElementById('sil-set-amount').value||0),refill_source:document.getElementById('sil-set-source').value});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
 async function refillNow(){const a=Number(document.getElementById('sil-refill-now').value||0);if(!(a>0))return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/refill',{amount_cents:a});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
-async function mintSiliconToken(){if(!confirm('Mint a 30-day transact token for @'+siliconHandle+'? It is shown once.'))return;try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/token',{scope:'transact',expires_in:'30d'});document.getElementById('sil-token-out').style.display='block';document.getElementById('sil-token-text').value=r.token}catch(e){alert(e.message)}}
+async function mintSiliconToken(){if(!confirm('Mint a 30-day transact token for @'+siliconHandle+'? It is shown once.'))return;try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/token',{scope:'transact',expires_in:'30d'});document.getElementById('sil-token-out').style.display='block';document.getElementById('sil-token-text').value=r.token}catch(e){if(!sessionEnded(e))alert(e.message)}}
 async function delegateToSilicon(){const v=document.getElementById('sil-delegate-name').value.trim();if(!v)return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/delegate',v.startsWith('DP-')?{ref:v}:{secret_name:v});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
 async function revokeDelegation(id){if(!confirm('Revoke this delegation?'))return;try{await api('DELETE','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/delegations/'+id);openSilicon(siliconHandle)}catch(e){alert(e.message)}}
 async function createWorker(){const name=document.getElementById('wk-name').value.trim().toLowerCase();if(!name){alert('Worker name required');return}
   const body={name,purpose:document.getElementById('wk-purpose').value.trim(),allowed_secrets:document.getElementById('wk-secrets').value.split(',').map(x=>x.trim()).filter(Boolean),max_spend_cents:Number(document.getElementById('wk-cap').value||0),mint:{scope:'transact',expires_in:document.getElementById('wk-ttl').value}};
-  try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers',body);const tok=r.minted&&r.minted.token;await openSilicon(siliconHandle);if(tok){document.getElementById('wk-token-out').style.display='block';document.getElementById('wk-token-text').value=tok;document.getElementById('wk-token-out').scrollIntoView({block:'center'})}}catch(e){alert(e.message)}}
-async function mintWorkerToken(wid){const ttl=prompt('Token lifetime (1h, 24h, 7d, 30d)','24h');if(!ttl)return;try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers/'+encodeURIComponent(wid)+'/token',{scope:'transact',expires_in:ttl});document.getElementById('wk-token-out').style.display='block';document.getElementById('wk-token-text').value=r.token;document.getElementById('wk-token-out').scrollIntoView({block:'center'})}catch(e){alert(e.message)}}
+  const epoch=sessionEpoch;   // the minted token is shown only to the session that minted it
+  try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers',body);const tok=r.minted&&r.minted.token;await openSilicon(siliconHandle);if(epoch!==sessionEpoch)return;if(tok){document.getElementById('wk-token-out').style.display='block';document.getElementById('wk-token-text').value=tok;document.getElementById('wk-token-out').scrollIntoView({block:'center'})}}catch(e){if(!sessionEnded(e))alert(e.message)}}
+async function mintWorkerToken(wid){const ttl=prompt('Token lifetime (1h, 24h, 7d, 30d)','24h');if(!ttl)return;try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers/'+encodeURIComponent(wid)+'/token',{scope:'transact',expires_in:ttl});document.getElementById('wk-token-out').style.display='block';document.getElementById('wk-token-text').value=r.token;document.getElementById('wk-token-out').scrollIntoView({block:'center'})}catch(e){if(!sessionEnded(e))alert(e.message)}}
 async function revokeWorker(wid){if(!confirm('Revoke worker '+wid+'? Its tokens stop working immediately.'))return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/workers/'+encodeURIComponent(wid)+'/revoke');openSilicon(siliconHandle)}catch(e){alert(e.message)}}
 async function removeSilicon(){if(!confirm('Remove @'+siliconHandle+' from the fleet? Its wallet and identity stay; only the fleet link and auto-refill go.'))return;try{await api('DELETE','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle));closeSilicon()}catch(e){alert(e.message)}}
 
@@ -703,11 +777,11 @@ async function loadDustforge(){
       h += '<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.75rem;margin-bottom:0.5rem;display:flex;justify-content:space-between;align-items:center;gap:0.5rem">';
       h += '<div style="min-width:0"><div style="font-size:0.85rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">&rarr; '+esc(rule.forward_to)+'</div>';
       h += '<div style="font-size:0.65rem;color:var(--text3)">'+(rule.filter_from==='*'?'all mail':'from '+esc(rule.filter_from))+' &middot; '+(rule.forwarded_count||0)+' forwarded</div></div>';
-      h += '<button onclick="removeForward('+rule.id+')" style="padding:0.4rem 0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-size:0.72rem;cursor:pointer;flex-shrink:0">Remove</button>';
+      h += '<button onclick="removeForward('+Number(rule.id)+')" style="padding:0.4rem 0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-size:0.72rem;cursor:pointer;flex-shrink:0">Remove</button>';
       h += '</div>';
     }
     el.innerHTML = h;
-  } catch(e){ el.innerHTML='<div class="empty">Could not load forwarding: '+esc(e.message)+'</div>'; }
+  } catch(e){ if(sessionEnded(e)) return; el.innerHTML='<div class="empty">Could not load forwarding: '+esc(e.message)+'</div>'; }
   // Forwarding activity + insufficient-balance banner (verbose status)
   const act = document.getElementById('df-activity'), banner = document.getElementById('df-fwd-banner');
   try {
@@ -778,7 +852,7 @@ async function loadDust(){
       h+='<div style="font-size:0.6rem;color:var(--text3)">bal '+t.balance_after+'</div></div></div>';
     }
     ledEl.innerHTML=h;
-  } catch(e){ ledEl.innerHTML='<div class="empty">Could not load ledger: '+esc(e.message)+'</div>'; }
+  } catch(e){ if(!sessionEnded(e)) ledEl.innerHTML='<div class="empty">Could not load ledger: '+esc(e.message)+'</div>'; }
 }
 async function addForward(){
   const to = prompt('Forward your @dustforge.com mail to which address?\n(e.g. you@gmail.com)');
@@ -797,6 +871,8 @@ async function loadSmsStatus(){
   const el=document.getElementById('sms-status'); if(!el)return;
   try{
     const s=await api('GET','/api/identity/gate/status');
+    const ps=document.getElementById('pin-status');
+    if(ps) ps.innerHTML = s.pin_set ? (s.pin_hard_locked ? '<span style="color:var(--red)">Locked after repeated wrong tries — use Change PIN with your account password</span>' : s.pin_locked_for_seconds>0 ? '<span style="color:var(--red)">Set — locked for '+Math.ceil(s.pin_locked_for_seconds/60)+' min after wrong tries</span>' : '<span style="color:var(--green)">Set</span>') : '<span style="color:var(--yellow)">Not set</span>';
     if(!s.sms_configured){ el.innerHTML='<span style="color:var(--yellow)">SMS delivery not yet configured on the server</span>'; }
     else if(s.phone_set){ el.innerHTML='On file: <span style="color:var(--green)">'+esc(s.phone_hint||'set')+'</span>'; }
     else { el.textContent='No number on file yet'; }
@@ -818,6 +894,8 @@ async function setPhone(){
 }
 
 async function showApp(){
+  const epoch=sessionEpoch, live=()=>!!tk&&epoch===sessionEpoch;   // false once logout() ran under us
+  vaultOpen=false;
   document.getElementById('auth').style.display='none';
   document.getElementById('app-user').textContent=user;
   document.getElementById('set-did').textContent=did;
@@ -826,18 +904,138 @@ async function showApp(){
   // Check if recovery email is set — if not, show onboarding wizard
   try {
     const profile = await api('GET','/api/identity/trust?did='+encodeURIComponent(did));
+    if (!live()) return;
     if (!profile.recovery_email) {
       document.getElementById('onboarding-wizard').style.display='flex';
       return;
     }
   } catch(_) {}
+  if (!live()) return;
+
+  // The vault PIN is mandatory: it is the factor behind every reveal. The vault opens only once the server
+  // has said whether a PIN exists — and, if none does, once one has been set. Unknown = closed.
+  let gs=null, why='';
+  try { gs = await api('GET','/api/identity/gate/status'); } catch(e) { why=e.message||'no reply'; }
+  if (!live()) return;
+  if (!gs || typeof gs.pin_set !== 'boolean') { showPinCheckError(why||'unexpected reply from the server'); return; }
+  if (gs.pin_set === false) { const set = await requirePinSetup(); if (!set || !live()) return; }
+  loginPw='';
 
   document.getElementById('app').style.display='block';
+  vaultOpen=true;
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents()}
+// Could not learn whether a PIN exists: stay closed, offer retry or sign out.
+function showPinCheckError(why){
+  vaultOpen=false;
+  document.getElementById('app').style.display='none';
+  document.getElementById('pin-error-why').textContent=why||'';
+  openModal('pin-error');
+}
+function retryPinCheck(){ closeSheet('pin-error'); showApp(); }
 
-let dashboardData = null;
+// ── Vault PIN ──────────────────────────────────────────────────────────────
+const PIN_OK=/^\d{4,8}$/;
+function requirePinSetup(){
+  return new Promise(resolve=>{
+    pinSetupDone=resolve;
+    document.getElementById('pin-setup-pw-row').style.display=loginPw?'none':'block';
+    for(const i of ['pin-new','pin-confirm','pin-setup-pw']) document.getElementById(i).value='';
+    const m=document.getElementById('pin-setup-msg'); m.textContent=''; m.className='modal-msg';
+    openModal('pin-setup'); setTimeout(()=>document.getElementById('pin-new').focus(),80);
+  });
+}
+async function savePinSetup(){
+  const a=document.getElementById('pin-new').value, b=document.getElementById('pin-confirm').value, m=document.getElementById('pin-setup-msg');
+  const pw=loginPw||document.getElementById('pin-setup-pw').value;
+  const mine=pinSetupDone;   // the one setup flow this save belongs to; never settles any other
+  if(!mine||pinSaveBusy===mine) return;   // no setup open, or this one's save is already in flight
+  if(!PIN_OK.test(a)){m.textContent='Use 4 to 8 digits';m.className='modal-msg err';return}
+  if(a!==b){m.textContent='The two PINs differ';m.className='modal-msg err';return}
+  if(!pw){m.textContent='Enter your account password';m.className='modal-msg err';return}
+  pinSaveBusy=mine;
+  try{
+    m.textContent='Saving…';m.className='modal-msg';
+    await api('POST','/api/identity/pin',{pin:a,password:pw});
+    if(pinSetupDone!==mine) return;   // this flow was already settled (signed out, or saved twice)
+    loginPw=''; for(const i of ['pin-new','pin-confirm','pin-setup-pw']) document.getElementById(i).value='';
+    closeSheet('pin-setup'); pinSetupDone=null; if(mine) mine(true);
+  }catch(e){
+    if(sessionEnded(e)||pinSetupDone!==mine) return;
+    // Password refused (403) — even the one typed at sign-in: stop resending it and ask for it on the sheet.
+    if(e.status===403){ loginPw=''; document.getElementById('pin-setup-pw').value=''; document.getElementById('pin-setup-pw-row').style.display='block'; }
+    m.textContent=e.message; m.className='modal-msg err';
+  }finally{ if(pinSaveBusy===mine) pinSaveBusy=null; }
+}
+function unlockWithPin(what, intent){
+  settleUnlock(false);   // a sheet still pending from an earlier flow is cancelled, never left hanging
+  return new Promise(resolve=>{
+    pinUnlockDone=resolve; pinUnlockIntent=intent||null;
+    document.getElementById('pin-unlock-what').textContent=what||'This credential reveals only after your PIN. It is asked for every reveal.';
+    document.getElementById('pin-unlock').value=''; const m=document.getElementById('pin-unlock-msg'); m.textContent=''; m.className='modal-msg';
+    openModal('pin'); setTimeout(()=>document.getElementById('pin-unlock').focus(),80);
+  });
+}
+// Each PIN check carries a random attempt id. Cancelling a flow cancels its open checks by id on the server: a
+// proof one already minted is removed, and one still on its way will mint none — whichever arrives first — so
+// Cancel really cancels, and never touches another check's proof. Only ever sent in the session that made them.
+function newAttempt(){ try{ const b=new Uint8Array(12); crypto.getRandomValues(b); return Array.from(b,x=>x.toString(16).padStart(2,'0')).join(''); }catch(_){ return (Date.now().toString(36)+Math.random().toString(36).slice(2)+'00000000').slice(0,24); } }
+function discardPin(intent, attempt, epoch){ if(intent&&tk&&epoch===sessionEpoch) api('POST','/api/identity/gate/discard',{gate:'pin',intent,attempt}).catch(()=>{}); }
+function settleUnlock(ok){
+  const d=pinUnlockDone, intent=pinUnlockIntent, sent=!!d&&pinSentFor===d, open=pinOpenAttempts;
+  pinUnlockDone=null; pinUnlockIntent=null; if(sent){ pinSentFor=null; pinOpenAttempts=[]; }
+  if(sent&&!ok) for(const a of open) discardPin(intent, a, sessionEpoch);
+  if(d) d(ok);
+}
+function cancelPin(){ closeSheet('pin'); settleUnlock(false); }
+const isTimeout=e=>!!e&&(e.name==='TimeoutError'||e.name==='AbortError');
+async function submitPin(){
+  const el=document.getElementById('pin-unlock'), m=document.getElementById('pin-unlock-msg');
+  const pin=el.value, mine=pinUnlockDone, intent=pinUnlockIntent;
+  if(!mine) return;
+  if(pinBusy===mine) return;   // this sheet's check is in flight: a double tap must not mint a second proof
+  if(!PIN_OK.test(pin)){m.textContent='4 to 8 digits';m.className='modal-msg err';return}
+  const attempt=newAttempt(), epoch=sessionEpoch;
+  if(pinSentFor!==mine){ pinSentFor=mine; pinOpenAttempts=[]; }
+  pinOpenAttempts.push(attempt); pinBusy=mine; m.textContent='Checking…'; m.className='modal-msg';
+  try{
+    // The proof opens only `intent` (the action that asked), once, within a minute.
+    await api('POST','/api/identity/gate/verify',{gate:'pin',pin,intent,attempt},{timeoutMs:15000});
+    if(pinUnlockDone!==mine){ discardPin(intent, attempt, epoch); return; }   // cancelled while it ran: cancel it again
+    for(const a of pinOpenAttempts) if(a!==attempt) discardPin(intent, a, epoch);   // an earlier check still in transit mints no spare proof
+    el.value=''; m.textContent=''; closeSheet('pin'); settleUnlock(true);
+  }catch(e){
+    if(sessionEnded(e)) return;
+    const answered=!!e.status;   // an HTTP refusal minted nothing; no answer (timeout, network) may have
+    if(pinUnlockDone!==mine){ if(!answered) discardPin(intent, attempt, epoch); return; }
+    if(answered) pinOpenAttempts=pinOpenAttempts.filter(a=>a!==attempt);
+    el.value=''; m.textContent=isTimeout(e)?'No answer from the server — try again':e.message; m.className='modal-msg err'; el.focus();
+  }
+  finally{ if(pinBusy===mine) pinBusy=null; }
+}
+function openPinChange(){
+  for(const i of ['pin-cur','pin-change-pw','pin-change-new','pin-change-confirm']) document.getElementById(i).value='';
+  const m=document.getElementById('pin-change-msg'); m.textContent=''; m.className='modal-msg';
+  openModal('pin-change'); setTimeout(()=>document.getElementById('pin-cur').focus(),80);
+}
+async function savePinChange(){
+  const cur=document.getElementById('pin-cur').value, pw=document.getElementById('pin-change-pw').value;
+  const a=document.getElementById('pin-change-new').value, b=document.getElementById('pin-change-confirm').value, m=document.getElementById('pin-change-msg');
+  if(!PIN_OK.test(a)){m.textContent='New PIN: 4 to 8 digits';m.className='modal-msg err';return}
+  if(a!==b){m.textContent='The two new PINs differ';m.className='modal-msg err';return}
+  if(!cur&&!pw){m.textContent='Enter your current PIN, or your password if you forgot it';m.className='modal-msg err';return}
+  const epoch=sessionEpoch;
+  if(pinChangeBusy===epoch){ m.textContent='A PIN change is still being saved — one moment'; m.className='modal-msg'; return; }
+  pinChangeBusy=epoch;
+  try{
+    m.textContent='Saving…';m.className='modal-msg';
+    await api('POST','/api/identity/pin', cur?{pin:a,current_pin:cur}:{pin:a,password:pw}, {timeoutMs:15000});
+    closeSheet('pin-change'); loadSmsStatus();
+    alert('PIN changed.');
+  }catch(e){ if(sessionEnded(e)) return; m.textContent=isTimeout(e)?'No answer from the server — check Settings before trying again':e.message; m.className='modal-msg err'; }
+  finally{ if(pinChangeBusy===epoch) pinChangeBusy=null; }
+}
 
 async function loadVault(){
   try {
@@ -854,6 +1052,7 @@ async function loadVault(){
 
     renderSecrets();
   } catch(e) {
+    if(sessionEnded(e)) return;
     document.getElementById('secret-list').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
   }
 }
@@ -904,7 +1103,7 @@ function renderSecrets(){
     const frozen = items.filter(s => s.frozen).length;
 
     h += '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:0.75rem;overflow:hidden">';
-    h += '<div onclick="toggleGroup(\''+esc(groupName)+'\')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
+    h += '<div onclick="toggleGroup('+jsArg(groupName)+')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
     h += '<div>';
     h += '<div style="font-weight:700;font-size:0.9rem">'+esc(groupName)+'</div>';
     h += '<div style="font-size:0.7rem;color:var(--text3)">'+total+' secret'+(total!==1?'s':'')+(frozen?' &middot; '+frozen+' frozen':'')+'</div>';
@@ -922,9 +1121,9 @@ function renderSecrets(){
     for(const s of items){
       const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
       const fr = s.frozen ? ' ❄' : '';
-      const rec = s.recommendation ? ' <span style="color:var(--yellow);font-size:0.6rem">'+s.recommendation+'</span>' : '';
+      const rec = s.recommendation ? ' <span style="color:var(--yellow);font-size:0.6rem">'+esc(s.recommendation)+'</span>' : '';
 
-      h += '<div onclick="event.stopPropagation();showDetail(\''+esc(s.name)+'\')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
+      h += '<div onclick="event.stopPropagation();showDetail('+jsArg(s.name)+')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
       h += '<div style="width:10px;height:10px;border-radius:50%;flex-shrink:0;background:'+healthColor+'"></div>';
       h += '<div style="flex:1;min-width:0"><div style="font-size:0.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(s.name)+fr+'</div>';
       h += '<div style="font-size:0.65rem;color:var(--text3)">'+esc(s.type||'-')+' &middot; '+s.use_count+' uses'+rec+'</div></div>';
@@ -967,7 +1166,7 @@ function showDetail(name) {
   h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem">`;
   h += `<div><span style="color:var(--text3)">Type:</span> ${esc(s.type)}</div>`;
   h += `<div><span style="color:var(--text3)">Uses:</span> ${s.use_count}</div>`;
-  h += `<div><span style="color:var(--text3)">Ownership:</span> ${s.ownership}</div>`;
+  h += `<div><span style="color:var(--text3)">Ownership:</span> ${esc(s.ownership)}</div>`;
   h += `<div><span style="color:var(--text3)">Rotatable:</span> ${s.rotatable?'yes':'no'}</div>`;
   h += `<div><span style="color:var(--text3)">Category:</span> ${esc(s.category||'—')}</div>`;
   if(s.provider) h += `<div><span style="color:var(--text3)">Provider:</span> ${esc(s.provider)}</div>`;
@@ -992,12 +1191,12 @@ function showDetail(name) {
   for(const d of ['standard','elevated','critical']){
     const on = depth===d;
     const col = d==='critical'?'var(--red)':d==='elevated'?'var(--orange)':'var(--accent)';
-    h += `<button onclick="setDepth('${esc(s.name)}','${d}')" style="flex:1;padding:0.5rem 0.3rem;border:1px solid ${on?col:'var(--border)'};background:${on?col:'none'};color:${on?'#08111a':'var(--text2)'};border-radius:8px;font-weight:${on?'700':'500'};font-size:0.72rem;cursor:pointer;text-transform:capitalize">${d}</button>`;
+    h += `<button onclick="setDepth(${jsArg(s.name)},'${d}')" style="flex:1;padding:0.5rem 0.3rem;border:1px solid ${on?col:'var(--border)'};background:${on?col:'none'};color:${on?'#08111a':'var(--text2)'};border-radius:8px;font-weight:${on?'700':'500'};font-size:0.72rem;cursor:pointer;text-transform:capitalize">${d}</button>`;
   }
   h += `</div>`;
   if(depth==='custom') h += `<div style="font-size:0.65rem;color:var(--text3);margin-bottom:0.5rem">Custom policy set via API</div>`;
   // Gate matrix — what each action requires
-  const gateChip = g => `<span style="font-size:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.05rem 0.4rem;color:var(--text2)">${g}</span>`;
+  const gateChip = g => `<span style="font-size:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.05rem 0.4rem;color:var(--text2)">${gateName(g)}</span>`;
   h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:0.6rem;font-size:0.72rem">`;
   for(const act of ['reveal','rotate','delete']){
     const gates = gp[act]||[];
@@ -1028,10 +1227,10 @@ function showDetail(name) {
     for(const o of s.recent_outcomes){
       const c = o.outcome==='success'?'var(--green)':'var(--red)';
       h += `<div style="display:flex;justify-content:space-between;padding:0.3rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem">`;
-      h += `<span style="color:${c}">${o.outcome} — ${esc(o.action_type||'?')}</span>`;
-      h += `<span style="color:var(--text3)">${o.agent_name||''} ${new Date(o.created_at).toLocaleDateString()}</span>`;
+      h += `<span style="color:${c}">${esc(o.outcome)} — ${esc(o.action_type||'?')}</span>`;
+      h += `<span style="color:var(--text3)">${esc(o.agent_name)} ${new Date(o.created_at).toLocaleDateString()}</span>`;
       h += `</div>`;
-      if(o.error_summary) h += `<div style="font-size:0.65rem;color:var(--red);padding:0.15rem 0">${esc(o.error_summary).slice(0,100)}</div>`;
+      if(o.error_summary) h += `<div style="font-size:0.65rem;color:var(--red);padding:0.15rem 0">${esc(String(o.error_summary).slice(0,100))}</div>`;
     }
     h += `</div>`;
   }
@@ -1062,14 +1261,14 @@ function showDetail(name) {
   h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem;text-align:center">`;
   h += `<div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">Secret value is encrypted and hidden</div>`;
   h += `<div id="reveal-value" style="display:none;background:var(--bg);border:1px solid var(--red);border-radius:8px;padding:0.75rem;margin:0.5rem 0;font-family:monospace;font-size:0.8rem;word-break:break-all;color:var(--red)"></div>`;
-  const revGates = gp.reveal||[]; const revLabel = revGates.length ? 'Reveal ('+revGates.join(' + ')+')' : 'Reveal';
-  h += `<button onclick="revealSecret('${esc(s.name)}')" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
+  const revGates = gp.reveal||[]; const revLabel = revGates.length ? 'Reveal ('+revGates.map(gateName).join(' + ')+')' : 'Reveal';
+  h += `<button onclick="revealSecret(${jsArg(s.name)})" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
   h += `</div></div>`;
 
   // Action buttons
   h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
-  h += `<button onclick="toggleFreeze('${esc(s.name)}',${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
-  h += `<button onclick="revokeSecret('${esc(s.name)}')" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Delete</button>`;
+  h += `<button onclick="toggleFreeze(${jsArg(s.name)},${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
+  h += `<button onclick="revokeSecret(${jsArg(s.name)})" style="flex:1;padding:0.7rem;border:1px solid var(--red);background:none;border-radius:8px;color:var(--red);font-weight:600;font-size:0.8rem;cursor:pointer">Delete</button>`;
   h += `</div>`;
 
   el.innerHTML = h;
@@ -1181,7 +1380,7 @@ async function loadBuoy(){
   document.getElementById('tick-list').innerHTML=h}}catch{document.getElementById('tick-list').innerHTML='<div class="empty">Could not load</div>'}
   try{const d=await api('GET','/api/chrono/list');const tr=d.triggers||[];
   if(!tr.length){document.getElementById('trigger-list').innerHTML='<div class="empty">No triggers armed</div>'}
-  else{let h='';for(const t of tr){h+=`<div class="activity-item"><div class="activity-top"><span class="activity-type" style="color:${t.status==='armed'?'var(--green)':'var(--text3)'}">${esc(t.name)}</span><span class="activity-time">${t.status}</span></div><div class="activity-detail">fires: ${new Date(t.fire_at).toLocaleString()}</div></div>`}
+  else{let h='';for(const t of tr){h+=`<div class="activity-item"><div class="activity-top"><span class="activity-type" style="color:${t.status==='armed'?'var(--green)':'var(--text3)'}">${esc(t.name)}</span><span class="activity-time">${esc(t.status)}</span></div><div class="activity-detail">fires: ${new Date(t.fire_at).toLocaleString()}</div></div>`}
   document.getElementById('trigger-list').innerHTML=h}}catch{}}
 
 // Store field toggling based on type
@@ -1245,12 +1444,13 @@ async function storeSecret(){
     document.getElementById('s-labels').value='';
     document.getElementById('s-rotate-days').value='';
     // Apply non-default security depth after the secret exists.
+    let depthErr='';
     if (depth && depth !== 'standard') {
-      try { await api('POST','/api/demipass/gate-policy',{ name:n, security_depth:depth }); } catch(_) {}
+      try { await api('POST','/api/demipass/gate-policy',{ name:n, security_depth:depth }); } catch(e) { if(sessionEnded(e)) return; depthErr=e.message; }
     }
-    m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'');
-    m.className='modal-msg ok';
-    loadVault();setTimeout(closeModal,1200);
+    m.textContent='Stored'+(r.ref?' — ref: '+r.ref:'')+(r.provider?' ('+r.provider+')':'')+(depthErr?' — kept at Standard: '+depthErr:'');
+    m.className=depthErr?'modal-msg err':'modal-msg ok';
+    loadVault(); if(!depthErr) setTimeout(()=>closeSheet('store'),1200);
   }catch(e){
     // PURGE on failure too — don't leave the secret in memory after an error
     body.value='';document.getElementById('s-value').value='';
@@ -1259,7 +1459,7 @@ async function storeSecret(){
   }}
 
 // Satisfy one security gate interactively. Returns true on success.
-async function satisfyGate(gate){
+async function satisfyGate(gate, what, intent){
   try {
     if(gate==='twofa'){
       await api('POST','/api/identity/request-2fa',{did});
@@ -1280,42 +1480,53 @@ async function satisfyGate(gate){
       const r=prompt('Enter your genesis refraction:');
       if(!r) return false;
       await api('POST','/api/identity/gate/verify',{gate:'genesis',refraction:r});
+    } else if(gate==='pin'){
+      return await unlockWithPin(what, intent);
     } else if(gate==='fingerprint'){
-      // A fingerprint gate needs a fingerprint-authed token; re-auth with password.
-      const pw=prompt('Confirm your password to satisfy the biometric gate:');
+      // Legacy server: a fingerprint gate needs a fingerprint-authed token; re-auth with password.
+      const pw=prompt('Confirm your password to continue:');
       if(!pw) return false;
       const r=await api('POST','/api/identity/auth-fingerprint',{username:user,password:pw,scope:'transact'});
       if(r&&r.token){ tk=r.token; localStorage.setItem('dp_token',tk); localStorage.setItem('dp_token_at',Date.now()); }
       await api('POST','/api/identity/gate/verify',{gate:'fingerprint'});
     } else { return false; }
     return true;
-  } catch(e){ alert(esc(gate)+' verification failed: '+e.message); return false; }
+  } catch(e){ if(!sessionEnded(e)) alert(gateName(gate)+' verification failed: '+e.message); return false; }
 }
 
 // Call a gated endpoint. On a 403 listing missing gates, walk the user through
 // each factor and retry once. Returns the parsed JSON on success.
-async function apiGated(method, path, body){
+async function apiGated(method, path, body, what){
+  if(autoLogoutIfExpired()) throw new Error('session expired');
+  const epoch=sessionEpoch;
   const call = async () => {
+    if(epoch!==sessionEpoch) throw new Error('session ended');
     const o={method,headers:{'Content-Type':'application/json','Authorization':'Bearer '+tk}};
     if(body)o.body=JSON.stringify(body);
     const r=await fetch(API+path,o); const d=await r.json().catch(()=>({}));
+    if(epoch!==sessionEpoch) throw new Error('session ended');
+    if(r.status===401){ logout(); document.getElementById('auth-err').textContent='Session expired — please sign in again'; throw new Error('session expired'); }
     return {status:r.status,d};
   };
   let {status,d}=await call();
   if(status===403 && Array.isArray(d.missing) && d.missing.length){
-    for(const g of d.missing){ if(!await satisfyGate(g)) throw new Error('cancelled — '+g+' not verified'); }
+    // Codes first, the PIN last: its proof opens only this action (d.intent), once, so it is typed right
+    // before the retry — never ahead of a code step that might still be cancelled.
+    const order=[...d.missing.filter(g=>g!=='pin'), ...d.missing.filter(g=>g==='pin')];
+    for(const g of order){ if(!await satisfyGate(g, what, d.intent)) throw new Error('cancelled — '+g+' not verified'); }
     ({status,d}=await call());
   }
   if(status>=400) throw new Error(d.error||'failed');
   return d;
 }
 
-// Change a credential's security depth from the detail view.
+// Change a credential's security depth from the detail view. Raising it is free; lowering it first
+// asks for every factor currently protecting the credential (the server answers 403 + missing).
 async function setDepth(name, depth){
   try {
-    await api('POST','/api/demipass/gate-policy',{name,security_depth:depth});
+    await apiGated('POST','/api/demipass/gate-policy',{name,security_depth:depth},'Lowering the protection on '+name+' needs your PIN first.');
     showDetail(name);
-  } catch(e){ alert('Could not set depth: '+e.message); }
+  } catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert('Could not set depth: '+e.message); }
 }
 
 async function revealSecret(name) {
@@ -1325,14 +1536,15 @@ async function revealSecret(name) {
   btn.disabled = true;
   try {
     // apiGated walks whatever factors this credential's policy demands
-    // (fingerprint, +email, +SMS) and only then reveals.
+    // (PIN, +email, +SMS) and only then reveals.
     const data = await apiGated('POST','/api/blindkey/reveal',{ name });
     valEl.textContent = data.value;
     valEl.style.display = 'block';
     btn.textContent = 'Revealed — auto-hides in 30s';
     btn.style.borderColor = 'var(--red)';
     btn.style.color = 'var(--red)';
-    setTimeout(() => {
+    revealTimer = setTimeout(() => {
+      revealTimer = null;
       valEl.textContent = '';
       valEl.style.display = 'none';
       btn.textContent = 'Reveal';
@@ -1343,26 +1555,27 @@ async function revealSecret(name) {
   } catch (e) {
     btn.textContent = 'Reveal';
     btn.disabled = false;
-    if(!/cancelled/.test(e.message)) alert(e.message);
+    if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message);
   }
 }
 
-async function revokeSecret(name){if(!confirm('Delete '+name+'? This retires the credential.'))return;try{await apiGated('DELETE','/api/demipass/delete',{name});closeDetail()}catch(e){if(!/cancelled/.test(e.message))alert(e.message)}}
+async function revokeSecret(name){if(!confirm('Delete '+name+'? This retires the credential.'))return;try{await apiGated('DELETE','/api/demipass/delete',{name},'Deleting '+name+' needs your PIN first.');closeDetail()}catch(e){if(!/cancelled/.test(e.message)&&!sessionEnded(e))alert(e.message)}}
 
-function confirmPanic(){if(!confirm('TRIP ALL BREAKERS? This revokes every active secret.'))return;(async()=>{for(const s of secrets.filter(x=>x.status==='active')){try{await api('DELETE','/api/demipass/revoke',{name:s.name})}catch{}}panic=true;document.getElementById('panic').style.display='block';loadVault()})()}
+// Bound to the session that tripped it: a sign-out mid-loop stops it (the next account's token never revokes anything).
+function confirmPanic(){if(!confirm('TRIP ALL BREAKERS? This revokes every active secret.'))return;const epoch=sessionEpoch;(async()=>{for(const s of secrets.filter(x=>x.status==='active')){if(epoch!==sessionEpoch)return;try{await api('DELETE','/api/demipass/revoke',{name:s.name})}catch{}}if(epoch!==sessionEpoch)return;panic=true;document.getElementById('panic').style.display='block';loadVault()})()}
 function resetPanic(){panic=false;document.getElementById('panic').style.display='none';loadVault()}
 
 async function dropTick(){const t=document.getElementById('t-type').value,n=document.getElementById('t-note').value.trim(),m=document.getElementById('t-msg');
   if(!n){m.textContent='Note required';m.className='modal-msg err';return}
-  try{const r=await api('POST','/api/tick',{type:t,note:n});m.textContent='Tick #'+r.tick_id;m.className='modal-msg ok';loadBuoy();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+  try{const r=await api('POST','/api/tick',{type:t,note:n});m.textContent='Tick #'+r.tick_id;m.className='modal-msg ok';loadBuoy();setTimeout(()=>closeSheet('tick'),800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
 
 async function armTrigger(){const n=document.getElementById('c-name').value.trim(),f=document.getElementById('c-fire').value.trim(),a=document.getElementById('c-action').value,t=document.getElementById('c-target').value.trim(),m=document.getElementById('c-msg');
   if(!n||!f){m.textContent='Name and fire time required';m.className='modal-msg err';return}
-  try{const r=await api('POST','/api/chrono/create',{name:n,fire_in:f,action:a,target:t||'self'});m.textContent='Armed';m.className='modal-msg ok';loadBuoy();setTimeout(closeModal,800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
+  try{const r=await api('POST','/api/chrono/create',{name:n,fire_in:f,action:a,target:t||'self'});m.textContent='Armed';m.className='modal-msg ok';loadBuoy();setTimeout(()=>closeSheet('chrono'),800)}catch(e){m.textContent=e.message;m.className='modal-msg err'}}
 
 async function verifyChain(){const o=document.getElementById('settings-output');try{const r=await api('POST','/api/tick/chain/verify',{did});o.innerHTML=r.valid?'<span style="color:var(--green)">Chain valid — '+r.ticks_checked+' ticks verified</span>':'<span style="color:var(--red)">Chain broken at tick #'+r.broken_at_tick_id+'</span>'}catch(e){o.textContent=e.message}}
 
-async function loadLedgerSummary(){const o=document.getElementById('settings-output');try{const r=await api('GET','/api/ledger/summary');o.innerHTML='Entries: '+r.total_entries+'<br>First: '+(r.first_entry||'—')+'<br>Last: '+(r.last_entry||'—')}catch(e){o.textContent=e.message}}
+async function loadLedgerSummary(){const o=document.getElementById('settings-output');try{const r=await api('GET','/api/ledger/summary');o.innerHTML='Entries: '+r.total_entries+'<br>First: '+esc(r.first_entry||'—')+'<br>Last: '+esc(r.last_entry||'—')}catch(e){o.textContent=e.message}}
 
 async function completeOnboarding(){
   const email=document.getElementById('wizard-recovery-email').value.trim();
@@ -1373,8 +1586,7 @@ async function completeOnboarding(){
     const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email});
     if(r.ok){
       document.getElementById('onboarding-wizard').style.display='none';
-      document.getElementById('app').style.display='block';
-      await loadVault();
+      await showApp();   // continues with the mandatory PIN check, then opens the vault
     }else{msg.textContent=r.error||'failed';msg.style.color='var(--red)'}
   }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}
 }
@@ -1405,7 +1617,7 @@ async function runDoctor(){
     h+='<div style="color:var(--green);font-weight:600;margin-bottom:0.5rem">System Diagnostics</div>';
     h+='<div>Identity: <strong>'+esc(user)+'</strong></div>';
     h+='<div>DID: <span style="font-family:monospace;font-size:0.65rem">'+esc(did).slice(0,30)+'...</span></div>';
-    h+='<div>Trust band: <strong>'+(d.band||d.trust_band||'—')+'</strong></div>';
+    h+='<div>Trust band: <strong>'+esc(d.band||d.trust_band||'—')+'</strong></div>';
     h+='<div>Recovery email: '+(d.recovery_email?'<span style="color:var(--green)">set</span>':'<span style="color:var(--red)">NOT SET</span>')+'</div>';
     h+='<div>Secrets: <strong>'+(dashboardData?.total||'?')+'</strong></div>';
     h+='<div>Balance: <strong>'+(dashboardData?.balance_dd||'?')+' DD</strong></div>';
@@ -1430,20 +1642,26 @@ async function loadSiliconAgents(){
       if(permList) h+='<div style="font-size:0.65rem;color:var(--text3);padding:0.1rem 0 0.3rem">'+esc(permList)+'</div>';
     }
     el.innerHTML=h;
-  }catch(e){document.getElementById('silicon-agents').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+  }catch(e){if(!sessionEnded(e))document.getElementById('silicon-agents').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 
 function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
-function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
-function esc(s){const d=document.createElement('div');d.textContent=s||'';return d.innerHTML}
+function closeSheet(id){document.getElementById('modal-'+id).classList.remove('show')}
+// Cancel / Escape / backdrop. The blocking PIN sheets (setup, status error) stay: only their own buttons or
+// sign-out end them. An open PIN unlock counts as cancelled, so the action waiting on it settles too.
+function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error')m.classList.remove('show')});settleUnlock(false)}
+function closeAllSheets(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
+// HTML-escape for text AND attribute values (quotes included).
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+// A string argument for an inline handler: a JSON string literal, escaped for the attribute it sits in.
+function jsArg(v){return esc(JSON.stringify(String(v??'')))}
+function gateName(g){return ({pin:'PIN',fingerprint:'PIN',twofa:'email code',sms:'SMS code',password:'password',genesis:'genesis'})[g]||esc(g)}
 
 document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeModal()}});
-setInterval(()=>{if(tk)loadVault()},30000);
+setInterval(()=>{if(tk&&vaultOpen)loadVault()},30000);   // never behind a closed PIN gate
 
 // ── QR Scanner ──
-let scanStream = null;
-let scanInterval = null;
 
 async function startScan() {
   openModal('scan');
@@ -1495,7 +1713,7 @@ async function handleScannedData(raw) {
     data.v = ''; data.n = '';
     msg.textContent = 'Deposited! Secret is in your vault.'; msg.className = 'modal-msg ok';
     loadVault();
-    setTimeout(() => closeModal(), 1500);
+    setTimeout(() => closeSheet('scan'), 1500);
   } catch (e) {
     msg.textContent = e.message; msg.className = 'modal-msg err';
   }
