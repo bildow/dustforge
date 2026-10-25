@@ -38,7 +38,8 @@ For a website login use `secret_type: 'password'`; for a pasted key, `api_key` o
 `oauth_token` (`token` is not a type — it silently becomes `api_key`). A secret
 stored with origins gets no default `/use` context: it is for browser fill only.
 `/store` needs a `write`-scoped token or better. Storing again under the same
-name replaces the value; `origins`/`login` left out keep what was there.
+name replaces the value; `origins`/`login` left out keep what was there. A deleted, retired or revoked entry
+under that name is moved aside (renamed `<name>~<id>`), so the store makes a new live entry.
 
 ### `POST /api/blindkey/origins` — carbon only
 `{ ref | name, origins: [...], mode: 'add' | 'set' }` → `{ ok, ref, origins }`.
@@ -75,6 +76,11 @@ refresh happens anyway, ask again. A silicon's session is its agent identity.
 - 403 `{ error: 'denied' }`, 410 `{ error: 'expired' | 'already_redeemed' }`.
 - 200 `{ ok, value, username, origin, name, ref }` — once. The request is then
   spent. Logged as a `secret_filled` security event, not a reveal.
+
+### `POST /api/blindkey/fill/withdraw`
+`{ request_id }` — only the session that asked (404 for any other). A pending or approved request becomes
+`withdrawn`: it leaves the wallet, and a later redeem answers 410 `{ error: 'withdrawn' }`. Use it when the page
+left or the person cancelled.
 
 ### Wallet side — carbon only, never the requesting session
 - `GET /api/blindkey/fill/pending` → `{ ok, requests: [{ id, intent, name, ref,

@@ -3038,6 +3038,9 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     const resolvedOwnership = ['sole', 'shared', 'delegated'].includes(ownership) ? ownership : 'sole';
     const resolvedRotatable = rotatable === false || rotatable === 0 ? 0 : 1;
 
+    // A deleted, retired or revoked entry under this name moves aside: the upsert below would otherwise write the
+    // new value into that dead row, which nothing lists, uses or fills. Its history stays under its id.
+    db.prepare("UPDATE blindkey_secrets SET name = name || '~' || id WHERE did = ? AND name = ? AND status IN ('deleted', 'retired', 'revoked')").run(req.identity.did, name);
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -3302,6 +3305,18 @@ app.post('/api/blindkey/fill/redeem', rateLimitFill, (req, res) => {
       .run(auth.did, `secret filled: ${secret.name} → ${row.origin}`, req.ip || '', 'UTC', 'tick', JSON.stringify(['demipass:fill', `secret:${secret.name}`]));
   } catch (_) { /* the fill stands without its tick */ }
   res.json({ ok: true, value, username: secret.fill_username || '', origin: row.origin, name: secret.name, ref: secret.ref_code });
+});
+
+// POST /api/blindkey/fill/withdraw — the asking session gives up its own request (the page left, the person
+// cancelled). A pending card leaves the wallet; an approved one can no longer be redeemed. { request_id }
+app.post('/api/blindkey/fill/withdraw', rateLimitFill, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  const { request_id } = req.body || {};
+  if (typeof request_id !== 'string' || !request_id) return res.status(400).json({ error: 'request_id required' });
+  const row = db.prepare('SELECT * FROM blindkey_fill_requests WHERE request_code = ?').get(request_id);
+  if (!row || row.did !== auth.did || row.requester_session !== gateSession(auth)) return res.status(404).json({ error: 'fill request not found' });
+  const changed = db.prepare("UPDATE blindkey_fill_requests SET status = 'withdrawn', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending', 'approved')").run(row.id).changes;
+  res.json({ ok: true, status: changed ? 'withdrawn' : row.status });
 });
 
 // GET /api/blindkey/fill/pending — the wallet's list of fills waiting for this person (carbon only).

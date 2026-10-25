@@ -223,6 +223,20 @@ call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'
 for i in $(seq 1 505); do curl -s -o /dev/null "$API/api/blindkey/fill/pending" -H "Authorization: Bearer $Wt"; done
 call GET /api/blindkey/list "$E"; [ "$CODE" = 200 ] && ok "500+ fill polls do not exhaust the standard limit (/list still 200)" || fail "rate limit shared: $CODE"
 
+# ── withdraw by the asking session; re-saving a deleted name (extension re-audit 2026-10-25) ──
+call GET /api/blindkey/fill/pending "$Wt"   # the cap check above left 20 waiting: clear them first
+for f in $(python3 -c 'import json,sys; print(" ".join(str(r["id"]) for r in json.load(sys.stdin)["requests"]))' <<<"$BODY"); do call POST /api/blindkey/fill/$f/deny "$Wt"; done
+call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'; WR=$(echo "$BODY" | J request_id)
+call POST /api/blindkey/fill/withdraw "$Wt" '{"request_id":"'$WR'"}'; [ "$CODE" = 404 ] && ok "another session cannot withdraw the request" || fail "withdraw other session: $CODE $BODY"
+call POST /api/blindkey/fill/withdraw "$E" '{"request_id":"'$WR'"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J status)" = withdrawn ] && ok "the asking session withdraws its request" || fail "withdraw: $CODE $BODY"
+call GET /api/blindkey/fill/pending "$Wt"; [ "$(echo "$BODY" | J requests)" = "[]" ] && ok "a withdrawn request leaves the wallet" || fail "withdrawn still listed: $BODY"
+call POST /api/blindkey/fill/redeem "$E" '{"request_id":"'$WR'"}'; [ "$CODE" = 410 ] && [ "$(echo "$BODY" | J error)" = withdrawn ] && ok "a withdrawn request cannot be redeemed" || fail "redeem withdrawn: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"gone-login","value":"first-1","secret_type":"password","origins":["'$ORIG'"]}'
+call DELETE /api/blindkey/delete "$E" '{"name":"gone-login"}'; [ "$CODE" = 200 ] || fail "delete: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"gone-login","value":"second-2","secret_type":"password","origins":["'$ORIG'"]}'
+call GET "/api/blindkey/fill/candidates?origin=$ORIG" "$E"
+python3 -c 'import json,sys; sys.exit(0 if any(c["name"]=="gone-login" for c in json.load(sys.stdin)["candidates"]) else 1)' <<<"$BODY" && ok "re-saving a deleted login's name makes a live, fillable entry" || fail "dead-name store: $BODY"
+
 # ── where the value appeared ──
 AFTER=$(grep -c -- "$VAL" "$ALL")
 [ "$BEFORE" = 0 ] && [ "$AFTER" = 2 ] && ok "the value appears in exactly the two redeem replies, nowhere else" || fail "value appeared before=$BEFORE after=$AFTER"
