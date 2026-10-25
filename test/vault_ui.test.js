@@ -806,3 +806,107 @@ test('a check that timed out is cancelled once a later attempt in the same flow 
   assert.equal(pg.el('reveal-value').textContent, 'the-value');
   assert.deepEqual(discards.map(d => d.attempt), [verifies[0].attempt], 'only the timed-out attempt is cancelled, never the winner');
 });
+
+// ── browser fill approvals ─────────────────────────────────────────────────────────────────────────────
+// The extension asks; the wallet shows the request and approves it with the PIN for intent fill:<id>.
+function fillRoutes(state) {
+  return async (p, body) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/fill/pending') return { json: { ok: true, requests: state.requests, grants: state.grants || [] } };
+    if (p === '/api/blindkey/silicon/grants/5/approve') {
+      if (!state.pinFresh) return { status: 403, json: { error: 'needs pin', missing: ['pin'], required: ['pin'], intent: 'grant:5' } };
+      state.pinFresh = false; state.grants = []; return { json: { ok: true, status: 'approved' } };
+    }
+    if (p === '/api/blindkey/silicon/grants/5/deny') { state.grants = []; return { json: { ok: true, status: 'denied' } }; }
+    if (p === '/api/blindkey/fill/12/approve') {
+      if (!state.pinFresh) return { status: 403, json: { error: 'needs pin', missing: ['pin'], required: ['pin'], intent: 'fill:12' } };
+      state.pinFresh = false; state.requests = state.requests.filter(q => q.id !== 12); return { json: { ok: true, status: 'approved' } };
+    }
+    if (p === '/api/blindkey/fill/12/deny') { state.requests = state.requests.filter(q => q.id !== 12); return { json: { ok: true, status: 'denied' } }; }
+    if (p === '/api/identity/gate/verify') { assert.equal(body.intent, state.intent || 'fill:12', 'the PIN opens this one action'); state.pinFresh = body.pin === '2468'; return state.pinFresh ? { json: { ok: true } } : { status: 403, json: { error: 'incorrect PIN' } }; }
+    throw new Error('unexpected ' + p);
+  };
+}
+const fillReq = (over = {}) => ({ id: 12, intent: 'fill:12', name: 'example-login', ref: 'DP-PWD-x', username: 'me@example.com', origin: 'https://login.example.com', client_label: 'Chrome on flimflam', own_session: false, ...over });
+
+test('a pending browser fill shows its origin and is approved with the PIN for fill:<id>', async () => {
+  const state = { requests: [fillReq(), fillReq({ id: 13, own_session: true })] };
+  const pg = page({ storage: signedIn, routes: fillRoutes(state) });
+  await settle();
+  const card = pg.el('fill-requests').innerHTML;
+  assert.match(card, /https:\/\/login\.example\.com/);
+  assert.match(card, /me@example\.com/);
+  assert.equal((card.match(/class="fill-req"/g) || []).length, 1, 'the wallet\'s own request is not offered for approval');
+  const done = pg.ctx.decideFill(12, true);
+  await settle();
+  assert.equal(pg.shown('modal-pin'), true, 'PIN sheet opened by the 403');
+  assert.match(pg.el('pin-unlock-what').textContent, /login\.example\.com/);
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();
+  await done;
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/fill/12/approve').length, 2, 'refused once, approved after the PIN');
+  assert.doesNotMatch(pg.el('fill-requests').innerHTML, /fill-req/, 'card gone once approved');
+});
+
+test('deny needs no PIN; cancelling the PIN sheet approves nothing', async () => {
+  const state = { requests: [fillReq()] };
+  const pg = page({ storage: signedIn, routes: fillRoutes(state) });
+  await settle();
+  const done = pg.ctx.decideFill(12, true);
+  await settle();
+  pg.ctx.cancelPin();
+  await done;
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/fill/12/approve').length, 1, 'no retry after Cancel');
+  await pg.ctx.decideFill(12, false);
+  assert.equal(pg.calls.filter(c => c.path === '/api/identity/gate/verify').length, 0, 'deny asked for no PIN');
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/fill/12/deny').length, 1);
+});
+
+test('fill requests: hostile fields stay inert, polling stops at sign-out and the cards are cleared', async () => {
+  const evil = `x');alert(1);//"><img src=x onerror=alert(2)>`;
+  const state = { requests: [fillReq({ name: evil, username: evil, origin: 'https://a.example', client_label: evil })] };
+  const pg = page({ storage: signedIn, routes: fillRoutes(state) });
+  await settle();
+  const html = pg.el('fill-requests').innerHTML;
+  assert.doesNotMatch(html, /<img/);
+  for (const m of html.matchAll(/\son\w+="([^"]*)"/g)) assert.match(m[1], /^decideFill\(12,(true|false)\)$/, 'handlers carry only the numeric id');
+  const polls = () => pg.calls.filter(c => c.path === '/api/blindkey/fill/pending').length;
+  const before = polls();
+  for (const f of pg.intervals) f();
+  await settle();
+  assert.ok(polls() > before, 'polls while open');
+  pg.ctx.logout();
+  assert.equal(pg.el('fill-requests').innerHTML, '', 'cards cleared at sign-out');
+  const atLogout = polls();
+  for (const f of pg.intervals) f();
+  await settle();
+  assert.equal(polls(), atLogout, 'no polling after sign-out');
+});
+
+const grantReq = (over = {}) => ({ id: 5, intent: 'grant:5', agent_name: 'fleet-a1', permission: 'action:browser_fill', resource: 'DP-PWD-x', label: 'example-login (bot@example.com) on https://login.example.com', ...over });
+
+test('an agent fill grant shows the agent and the login, is allowed with the PIN for grant:<id>, and denied without one', async () => {
+  const evil = `x');alert(1);//"><img src=x onerror=alert(2)>`;
+  const state = { requests: [], grants: [grantReq({ agent_name: evil })], intent: 'grant:5' };
+  const pg = page({ storage: signedIn, routes: fillRoutes(state) });
+  await settle();
+  const html = pg.el('fill-requests').innerHTML;
+  assert.match(html, /bot@example\.com/);
+  assert.doesNotMatch(html, /<img/);
+  for (const m of html.matchAll(/\son\w+="([^"]*)"/g)) assert.match(m[1], /^decideGrant\(5,(true|false)\)$/, 'handlers carry only the numeric id');
+  const done = pg.ctx.decideGrant(5, true);
+  await settle();
+  assert.equal(pg.shown('modal-pin'), true, 'PIN sheet opened by the 403');
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();
+  await done;
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/silicon/grants/5/approve').length, 2, 'refused once, approved after the PIN');
+  assert.doesNotMatch(pg.el('fill-requests').innerHTML, /fill-req/, 'card gone once allowed');
+  state.grants = [grantReq()];
+  for (const f of pg.intervals) f();
+  await settle();
+  await pg.ctx.decideGrant(5, false);
+  assert.equal(pg.calls.filter(c => c.path === '/api/identity/gate/verify').length, 1, 'deny asked for no PIN');
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/silicon/grants/5/deny').length, 1);
+});
