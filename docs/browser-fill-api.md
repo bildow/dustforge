@@ -12,7 +12,9 @@ Base URL: `https://api.dustforge.com`. Every call carries `Authorization: Bearer
 |---|---|---|
 | Extension (a person's browser) | carbon JWT, scope `transact` | device flow: `POST /api/identity/device/code {agent_label, scope:'transact'}` → approve at `https://demipass.com/device` → poll `POST /api/identity/device/token {device_code}` (428 `authorization_pending` while waiting). Refresh with `POST /api/identity/refresh {refresh_token}` — the pair rotates, store both again. |
 | Phone wallet (`vault-mobile.html`) | carbon JWT | existing vault sign-in |
-| Agent fill tool | silicon token (`silicon:…`) | existing silicon registration |
+| Agent fill tool | silicon token (`silicon:…`) | existing silicon registration (by the owner; a silicon or worker token cannot register agents or grant permissions) |
+
+Worker tokens (`wrk`) are refused on every fill route.
 
 ## Origins
 
@@ -42,10 +44,16 @@ name replaces the value; `origins`/`login` left out keep what was there.
 `{ ref | name, origins: [...], mode: 'add' | 'set' }` → `{ ok, ref, origins }`.
 `set` with `[]` unbinds every origin.
 
+**Limit:** the origin binding stops a page from receiving a login through the real extension. It does not stop
+someone holding a stolen extension token from binding their own origin (`/store` or `/origins`); what stops that
+fill is the PIN on the wallet card, which shows the origin. Read the origin before approving.
+
 ### `GET /api/blindkey/fill/candidates?origin=<origin>`
 → `{ ok, origin, candidates: [{ ref, name, username, secret_type }] }`.
 Never a value. Carbon: the owner's secrets bound to that origin. Silicon: only
 secrets it holds `action:browser_fill` for (resource `<ref>`, `<name>` or `*`).
+Only the active version of a login is a candidate: after a rotation, the new version (it keeps the origins and
+login) is filled, the superseded one is not, even during its grace period.
 
 ### `POST /api/blindkey/fill/request`
 `{ ref, origin, client_label? }`.
@@ -76,6 +84,21 @@ refresh happens anyway, ask again. A silicon's session is its agent identity.
   The PIN proof is spent by the approval. The session that made the request
   cannot approve it (409).
 - Deny: `POST /api/blindkey/fill/<id>/deny`.
+
+### Granting an agent `action:browser_fill` — owner only, approved with the PIN
+- `POST /api/blindkey/silicon/permissions {agent_name, permission_type:'action:browser_fill', resource:<ref|name|'*'>}`
+  → 202 `{ status:'pending', grant_request_id, expires_in: 600 }`. Nothing is granted yet. `/silicon/register`
+  refuses `action:browser_fill` in its `permissions` list (400); grant it per login after registering.
+- The wallet lists it under `grants` in `GET /api/blindkey/fill/pending` (`{ id, intent:'grant:<id>', agent_name,
+  resource, label }`). Approve: PIN for `intent` → `POST /api/blindkey/silicon/grants/<id>/approve`. Deny:
+  `POST /api/blindkey/silicon/grants/<id>/deny`.
+- The admin key cannot grant it. Prefer one grant per login; `*` covers every website login the owner has.
+
+### Limits
+- At most 20 fill requests (and 20 grants) wait per person; the 21st is 429.
+- Fill routes have their own rate limit (3000 per 15 min per IP), separate from `/use`'s.
+- "Another session" means another access token (its `jti`), not another device: a second sign-in on the same
+  computer could approve with the PIN. The PIN is the factor.
 
 ## What this does and does not protect
 

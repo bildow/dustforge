@@ -137,6 +137,60 @@ call POST /api/blindkey/fill/redeem "$SIL" '{"request_id":"'$SR2'"}'; [ "$CODE" 
 call POST /api/blindkey/origins "$SIL" '{"ref":"'$REF'","origins":["https://attacker.example"],"mode":"add"}'; [ "$CODE" = 403 ] && ok "silicon cannot bind origins" || fail "sil origins: $CODE $BODY"
 call GET /api/blindkey/fill/pending "$SIL"; [ "$CODE" = 403 ] && ok "silicon cannot list or approve fills" || fail "sil pending: $CODE $BODY"
 
+# ── grants: action:browser_fill only from the owner, approved with the PIN (review 2026-10-25, blockers 1+2) ──
+VAL2='grant-only-value-77'
+call POST /api/blindkey/store "$E" '{"name":"agent-login","value":"'$VAL2'","secret_type":"password","origins":["'$ORIG'"],"login":"bot@example.com"}'; REF2=$(echo "$BODY" | J ref)
+call POST /api/blindkey/silicon/register "$E" '{"agent_name":"stolen1","permissions":["action:browser_fill"]}'
+[ "$CODE" = 400 ] && ok "register refuses action:browser_fill (granted per login, with the PIN)" || fail "register with browser_fill: $CODE $BODY"
+call POST /api/blindkey/silicon/register "$SIL" '{"agent_name":"child1"}'
+[ "$CODE" = 403 ] && ok "a silicon cannot register agents" || fail "silicon register: $CODE $BODY"
+call POST /api/blindkey/silicon/permissions "$SIL" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"*"}'
+[ "$CODE" = 403 ] && ok "a silicon cannot grant itself browser_fill" || fail "silicon self-grant: $CODE $BODY"
+call POST /api/blindkey/silicon/permissions "$SIL" '{"agent_name":"fleet-a1","permission_type":"admin:full"}'
+[ "$CODE" = 403 ] && ok "a silicon cannot grant itself anything" || fail "silicon self-grant admin: $CODE $BODY"
+call POST /api/blindkey/silicon/permissions "$E" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"'$REF2'"}'
+[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = pending ] && ok "owner's browser_fill grant waits for the wallet" || fail "grant request: $CODE $BODY"
+GID=$(echo "$BODY" | J grant_request_id)
+call POST /api/blindkey/fill/request "$SIL" '{"ref":"'$REF2'","origin":"'$ORIG'"}'; [ "$CODE" = 403 ] && ok "pending grant gives the agent nothing" || fail "pending grant fill: $CODE $BODY"
+call GET /api/blindkey/fill/pending "$Wt"
+[ "$(echo "$BODY" | J grants.0.intent)" = "grant:$GID" ] && [ "$(echo "$BODY" | J grants.0.agent_name)" = fleet-a1 ] && ok "wallet lists the grant with intent grant:$GID" || fail "wallet grants: $BODY"
+call POST /api/blindkey/silicon/grants/$GID/approve "$Wt"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "grant:$GID" ] && ok "approving a grant without the PIN → 403 + intent" || fail "grant no pin: $CODE $BODY"
+call POST /api/identity/gate/verify "$Wt" '{"gate":"pin","pin":"4321","intent":"fill:'$GID'"}'
+call POST /api/blindkey/silicon/grants/$GID/approve "$Wt"; [ "$CODE" = 403 ] && ok "a PIN proof for another intent does not approve a grant" || fail "grant wrong intent: $CODE $BODY"
+call POST /api/identity/gate/verify "$Wt" '{"gate":"pin","pin":"4321","intent":"grant:'$GID'"}'; [ "$CODE" = 200 ] || fail "grant verify: $CODE $BODY"
+call POST /api/blindkey/silicon/grants/$GID/approve "$Wt"; [ "$CODE" = 200 ] && ok "grant approved with the PIN" || fail "grant approve: $CODE $BODY"
+call POST /api/blindkey/silicon/grants/$GID/approve "$Wt"; [ "$CODE" = 409 ] && ok "a decided grant cannot be approved again" || fail "grant re-approve: $CODE $BODY"
+call POST /api/blindkey/fill/request "$SIL" '{"ref":"'$REF2'","origin":"'$ORIG'"}'; GR=$(echo "$BODY" | J request_id)
+call POST /api/blindkey/fill/redeem "$SIL" '{"request_id":"'$GR'"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J value)" = "$VAL2" ] && ok "approved grant: the agent fills that login" || fail "granted fill: $CODE $BODY"
+call POST /api/blindkey/fill/request "$SIL" '{"ref":"'$REF'","origin":"'$ORIG'"}'; [ "$CODE" = 403 ] && ok "the grant covers only the login it names" || fail "grant scope: $CODE $BODY"
+call POST /api/blindkey/silicon/permissions "$E" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"*"}'; GID2=$(echo "$BODY" | J grant_request_id)
+call POST /api/blindkey/silicon/grants/$GID2/deny "$Wt"; [ "$CODE" = 200 ] && ok "deny a grant (no PIN needed)" || fail "grant deny: $CODE $BODY"
+call POST /api/blindkey/fill/request "$SIL" '{"ref":"'$REF'","origin":"'$ORIG'"}'; [ "$CODE" = 403 ] && ok "denied grant gives nothing" || fail "denied grant: $CODE $BODY"
+call POST /api/blindkey/silicon/grants/$GID2/approve "$SIL"; [ "$CODE" = 403 ] && ok "a silicon cannot decide grants" || fail "silicon decides grant: $CODE $BODY"
+
+# ── website logins keep their binding (review should-fix 3+4) ──
+CTX(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM blindkey_contexts x JOIN blindkey_secrets s ON s.id=x.secret_id WHERE s.name=?', (sys.argv[2],)).fetchone()[0])" "$DB_PATH" "$1"; }
+call POST /api/blindkey/store "$E" '{"name":"agent-login","value":"changed-pass-1","secret_type":"password"}'
+[ "$CODE" = 200 ] && [ "$(CTX agent-login)" = 0 ] && ok "re-storing a website login without origins adds no default context" || fail "re-store context: $CODE ctx=$(CTX agent-login)"
+call POST /api/blindkey/store "$E" '{"name":"rot","value":"old-pass-1","secret_type":"password","origins":["'$ORIG'"],"login":"r@example.com"}'
+call POST /api/blindkey/rotate "$E" '{"name":"rot","new_value":"new-pass-1"}'; [ "$CODE" = 200 ] || fail "rotate: $CODE $BODY"
+call GET "/api/blindkey/fill/candidates?origin=$ORIG" "$E"
+python3 -c 'import json,sys; c=json.load(sys.stdin)["candidates"]; r=[x for x in c if x["name"].startswith("rot")]; sys.exit(0 if len(r)==1 and r[0]["ref"] and r[0]["username"]=="r@example.com" else 1)' <<<"$BODY" && ok "after rotate: one candidate, the new version, origins and login carried" || fail "rotate candidates: $BODY"
+RREF=$(python3 -c 'import json,sys; print([x["ref"] for x in json.load(sys.stdin)["candidates"] if x["name"].startswith("rot")][0])' <<<"$BODY")
+call POST /api/blindkey/fill/request "$E" '{"ref":"'$RREF'","origin":"'$ORIG'"}'; [ "$CODE" = 201 ] && ok "the rotated login is fillable by its ref" || fail "rotated request: $CODE $BODY"
+call POST /api/blindkey/fill/request "$E" '{"name":"rot","origin":"'$ORIG'"}'; [ "$CODE" = 404 ] && ok "the superseded version is not fillable during the grace period" || fail "old version fill: $CODE $BODY"
+
+# ── labels, pending cap, rate limit (review should-fix 5, nits) ──
+call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'","client_label":"Chrome‮​moorhsalf"}'
+call GET /api/blindkey/fill/pending "$Wt"
+python3 -c 'import json,sys; ls=[r["client_label"] for r in json.load(sys.stdin)["requests"]]; sys.exit(0 if "Chromemoorhsalf" in ls and not any(ch in "".join(ls) for ch in "‮​") else 1)' <<<"$BODY" && ok "client_label loses bidi and zero-width characters" || fail "label: $BODY"
+for i in $(seq 1 25); do call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'; [ "$CODE" = 429 ] && break; done
+call GET /api/blindkey/fill/pending "$Wt"; NP=$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)["requests"]))' <<<"$BODY")
+call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'
+[ "$CODE" = 429 ] && [ "$NP" = 20 ] && ok "at most 20 fill requests wait at once" || fail "pending cap: $CODE pending=$NP"
+for i in $(seq 1 505); do curl -s -o /dev/null "$API/api/blindkey/fill/pending" -H "Authorization: Bearer $Wt"; done
+call GET /api/blindkey/list "$E"; [ "$CODE" = 200 ] && ok "500+ fill polls do not exhaust the standard limit (/list still 200)" || fail "rate limit shared: $CODE"
+
 # ── where the value appeared ──
 AFTER=$(grep -c -- "$VAL" "$ALL")
 [ "$BEFORE" = 0 ] && [ "$AFTER" = 2 ] && ok "the value appears in exactly the two redeem replies, nowhere else" || fail "value appeared before=$BEFORE after=$AFTER"

@@ -525,6 +525,7 @@ let secrets=[],panic=false;
 let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
 let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
+let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
 let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
@@ -564,7 +565,7 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];fillBusy.clear();
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -941,8 +942,8 @@ async function showApp(){
 // (its intent is fill:<id>, so the proof opens that one fill) or denied. Polled every 4 s while the vault is open.
 async function loadFillRequests(){
   const epoch=sessionEpoch;
-  try{ const r=await api('GET','/api/blindkey/fill/pending'); if(epoch!==sessionEpoch||!vaultOpen) return; fillReqs=(r.requests||[]).filter(q=>!q.own_session); }
-  catch(e){ if(sessionEnded(e)) return; fillReqs=[]; }
+  try{ const r=await api('GET','/api/blindkey/fill/pending'); if(epoch!==sessionEpoch||!vaultOpen) return; fillReqs=(r.requests||[]).filter(q=>!q.own_session); grantReqs=r.grants||[]; }
+  catch(e){ if(sessionEnded(e)) return; if(e.status===429) return; fillReqs=[]; grantReqs=[]; }   // rate-limited: keep the cards, retry next poll
   renderFillRequests();
 }
 function renderFillRequests(){
@@ -951,7 +952,22 @@ function renderFillRequests(){
     +'<div class="fr-origin">'+esc(q.origin)+'</div>'
     +(q.client_label?'<div style="color:var(--text3);margin-top:0.25rem">asked by '+esc(q.client_label)+'</div>':'')
     +'<div class="fr-row"><button class="btn-primary" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',true)">Approve</button>'
-    +'<button class="btn-ghost" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',false)">Deny</button></div></div>').join('');
+    +'<button class="btn-ghost" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',false)">Deny</button></div></div>').join('')
+    +grantReqs.map(g=>'<div class="fill-req"><div>Let agent <b>'+esc(g.agent_name)+'</b> fill</div>'
+    +'<div class="fr-origin">'+esc(g.label)+'</div>'
+    +'<div style="color:var(--text3);margin-top:0.25rem">without asking you each time — it receives the password itself</div>'
+    +'<div class="fr-row"><button class="btn-primary" '+(fillBusy.has('g'+g.id)?'disabled ':'')+'onclick="decideGrant('+Number(g.id)+',true)">Allow</button>'
+    +'<button class="btn-ghost" '+(fillBusy.has('g'+g.id)?'disabled ':'')+'onclick="decideGrant('+Number(g.id)+',false)">Deny</button></div></div>').join('');
+}
+async function decideGrant(id, approve){
+  const g=grantReqs.find(x=>x.id===id), key='g'+id; if(!g||fillBusy.has(key)) return;
+  fillBusy.add(key); renderFillRequests();
+  try{
+    if(approve) await apiGated('POST','/api/blindkey/silicon/grants/'+id+'/approve',null,'Let agent '+g.agent_name+' fill '+g.label+'? Your PIN approves this grant.');
+    else await api('POST','/api/blindkey/silicon/grants/'+id+'/deny');
+    grantReqs=grantReqs.filter(x=>x.id!==id);
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ fillBusy.delete(key); renderFillRequests(); }
 }
 async function decideFill(id, approve){
   const q=fillReqs.find(x=>x.id===id); if(!q||fillBusy.has(id)) return;
