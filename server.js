@@ -48,6 +48,7 @@ const BLINDKEY_SSH_HOSTS = new Set([
 ]);
 
 const pinGate = require('./pin_gate');   // vault PIN: hash/verify/lockout helpers for the 'pin' gate
+const browserFill = require('./browser_fill');   // which page may receive a stored login (docs/browser-fill-api.md)
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 50, message: { error: 'Too many requests' } });
@@ -2412,6 +2413,29 @@ function detectProvider(value) {
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN ref_code TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN rotatable INTEGER DEFAULT 1"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN ownership TEXT DEFAULT 'sole'"); } catch(_) {}
+// Browser fill: the origins a login may be filled into (JSON array, exact origins) and the account it belongs to.
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN fill_origins TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN fill_username TEXT DEFAULT NULL"); } catch(_) {}
+// One fill: asked by a session (the extension or an agent's fill tool), approved on another (the phone wallet,
+// with the PIN) or by a silicon permission, redeemed once by the asking session.
+try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_fill_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_code TEXT NOT NULL UNIQUE,
+  did TEXT NOT NULL,
+  secret_id INTEGER NOT NULL,
+  origin TEXT NOT NULL,
+  requester_session TEXT NOT NULL,
+  requester_kind TEXT NOT NULL,
+  agent_name TEXT DEFAULT NULL,
+  client_label TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  expires_at TEXT NOT NULL,
+  decided_at TEXT DEFAULT NULL,
+  decided_session TEXT DEFAULT NULL,
+  redeemed_at TEXT DEFAULT NULL
+)`); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_fill_req_did ON blindkey_fill_requests(did, status)"); } catch(_) {}
 // ownership: 'sole' = you own the target, safe to rotate
 //            'shared' = shared credential, do NOT rotate without all parties agreeing
 //            'delegated' = someone delegated this to you, you cannot rotate the source
@@ -2916,8 +2940,18 @@ function authorizeSecretMediation({ requestorDid, secretName, contextName, actio
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
-  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days } = req.body || {};
+  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days, origins, login } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
+  // Browser fill fields. Left out (undefined/null) = keep what a re-store had; [] / '' clear them.
+  let resolvedOrigins = null;
+  if (origins !== undefined && origins !== null) {
+    const parsed = browserFill.parseOrigins(origins);
+    if (parsed.error) return res.status(400).json({ error: `origins: ${parsed.error}` });
+    resolvedOrigins = JSON.stringify(parsed.origins);
+  }
+  if (login !== undefined && login !== null && !browserFill.validLogin(login)) {
+    return res.status(400).json({ error: `login: a string of at most ${browserFill.MAX_LOGIN} characters, no control characters` });
+  }
   if (name.length > 64) return res.status(400).json({ error: 'name must be 64 chars or less' });
   if (value.length > 10000) return res.status(400).json({ error: 'value must be 10000 chars or less' });
   if (description && description.length > 256) return res.status(400).json({ error: 'description must be 256 chars or less' });
@@ -3026,6 +3060,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       refCode = generateRefCode(resolvedType, name);
       db.prepare("UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?").run(refCode, stored.id);
     }
+    if (resolvedOrigins !== null) db.prepare('UPDATE blindkey_secrets SET fill_origins = ? WHERE id = ?').run(resolvedOrigins, stored.id);
+    if (login !== undefined && login !== null) db.prepare('UPDATE blindkey_secrets SET fill_username = ? WHERE id = ?').run(login, stored.id);
 
     // Auto-create a default context so the secret is immediately usable.
     // Without this, secrets stored via the app have no context and can't get tokens.
@@ -3052,6 +3088,7 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       provider: providerInfo.provider || null,
       expires_at: expiresAt,
       buoy_tick: buoyTickId,
+      ...(resolvedOrigins !== null ? { origins: JSON.parse(resolvedOrigins) } : {}),
       note: 'Secret stored. It will never be returned in any API response.',
     });
   } catch (e) {
@@ -3115,6 +3152,190 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
 
   res.json({ ok: true, name: secret.name, value: decrypted, revealed_at: new Date().toISOString(),
     warning: 'This value was shown once. It is logged as a CRITICAL security event.' });
+});
+
+// ── Browser fill (docs/browser-fill-api.md) ──────────────────────────────────────────────────────────────────
+// A stored login is filled into a page only when the page's origin is bound to it, and only through a request
+// that one session asks for and another approves: a person's request is approved on the phone wallet with the
+// vault PIN (the same factors as reveal, since a filled field is readable by the page); an agent's fill tool is
+// approved by an explicit `action:browser_fill` grant — never by admin:full or a wildcard, because a fill hands
+// the value to the silicon's process. The asking session redeems the value once, within REQUEST_TTL_SEC.
+
+// The secret a fill names, owned by this caller's DID. Ref preferred; name for the extension's own entries.
+function fillSecret(did, { ref, name }) {
+  if (typeof ref === 'string' && ref) return db.prepare(`SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND ${REDEEMABLE_STATUS_SQL}`).get(did, ref);
+  if (typeof name === 'string' && name) return db.prepare(`SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND ${REDEEMABLE_STATUS_SQL}`).get(did, name);
+  return null;
+}
+// Explicit grant only: exact permission type, resource = this secret's ref or name, or '*'.
+function siliconMayFill(agentName, secret) {
+  return Boolean(db.prepare(
+    "SELECT 1 FROM silicon_permissions WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active' AND (expires_at = '' OR expires_at IS NULL OR expires_at > datetime('now')) AND resource IN ('*', ?, ?)"
+  ).get(agentName, secret.ref_code || '', secret.name));
+}
+function fillExpired(row) { return new Date(row.expires_at).getTime() <= Date.now(); }
+function fillAuth(req, res) {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+  if (!gateSession(auth)) { res.status(403).json({ error: 'this token cannot hold a fill request — sign in again' }); return null; }
+  return auth;
+}
+
+// POST /api/blindkey/origins — bind or unbind the origins a login may be filled into (owner, carbon only).
+//   { ref | name, origins: [...], mode: 'add' | 'set' }
+app.post('/api/blindkey/origins', rateLimitStandard, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  if (auth.silicon) return res.status(403).json({ error: 'silicon agents cannot change where a login may be filled' });
+  const { mode = 'add' } = req.body || {};
+  if (mode !== 'add' && mode !== 'set') return res.status(400).json({ error: "mode must be 'add' or 'set'" });
+  const parsed = browserFill.parseOrigins((req.body || {}).origins);
+  if (parsed.error) return res.status(400).json({ error: `origins: ${parsed.error}` });
+  const secret = fillSecret(auth.did, req.body || {});
+  if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
+  let next = parsed.origins;
+  if (mode === 'add') next = [...new Set([...browserFill.storedOrigins(secret.fill_origins), ...parsed.origins])];
+  if (next.length > browserFill.MAX_ORIGINS) return res.status(400).json({ error: `origins: at most ${browserFill.MAX_ORIGINS} origins per secret` });
+  db.prepare('UPDATE blindkey_secrets SET fill_origins = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(JSON.stringify(next), secret.id);
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+    .run('fill_origins_set', auth.did, secret.id, null, JSON.stringify({ origins: next }));
+  res.json({ ok: true, ref: secret.ref_code, name: secret.name, origins: next });
+});
+
+// GET /api/blindkey/fill/candidates?origin= — the logins this caller could fill on that origin. Never a value.
+app.get('/api/blindkey/fill/candidates', rateLimitStandard, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  const origin = browserFill.normalizeOrigin(String(req.query.origin || ''));
+  if (!origin) return res.status(400).json({ error: 'origin must be an https URL (http only for localhost)' });
+  const rows = db.prepare(`SELECT * FROM blindkey_secrets WHERE did = ? AND ${REDEEMABLE_STATUS_SQL} AND fill_origins IS NOT NULL AND fill_origins != '[]' ORDER BY name`).all(auth.did);
+  const candidates = rows
+    .filter(s => browserFill.storedOrigins(s.fill_origins).includes(origin))
+    .filter(s => !auth.silicon || siliconMayFill(auth.agent_name, s))
+    .map(s => ({ ref: s.ref_code, name: s.name, username: s.fill_username || '', secret_type: s.secret_type, frozen: Boolean(s.frozen) }));
+  res.json({ ok: true, origin, candidates });
+});
+
+// POST /api/blindkey/fill/request — ask to fill a login into a page. { ref | name, origin, client_label? }
+app.post('/api/blindkey/fill/request', rateLimitStandard, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  const { client_label = '' } = req.body || {};
+  const origin = browserFill.normalizeOrigin((req.body || {}).origin);
+  if (!origin) return res.status(400).json({ error: 'origin must be an https URL (http only for localhost)' });
+  const secret = fillSecret(auth.did, req.body || {});
+  if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
+  if (secret.frozen) return res.status(423).json({ error: 'secret is frozen — unfreeze before use', frozen: true });
+  const bound = browserFill.storedOrigins(secret.fill_origins);
+  if (!bound.includes(origin)) {
+    logSecurityEvent('fill_origin_refused', 'warn', { caller_did: auth.did, agent_name: auth.agent_name, capability: 'browser_fill', target: secret.name, ip: req.ip, context: { origin, bound } });
+    return res.status(403).json({ error: `this login is not bound to ${origin}`, bound_origins: bound });
+  }
+  let status = 'pending';
+  if (auth.silicon) {
+    if (!siliconMayFill(auth.agent_name, secret)) {
+      logSecurityEvent('fill_blocked_silicon', 'warn', { caller_did: auth.did, agent_name: auth.agent_name, capability: 'browser_fill', target: secret.name, ip: req.ip, context: { origin } });
+      return res.status(403).json({ error: `silicon '${auth.agent_name}' holds no action:browser_fill grant for this secret` });
+    }
+    status = 'approved';
+  }
+  const code = browserFill.newRequestCode();
+  const expiresAt = new Date(Date.now() + browserFill.REQUEST_TTL_SEC * 1000).toISOString();
+  db.prepare(`INSERT INTO blindkey_fill_requests (request_code, did, secret_id, origin, requester_session, requester_kind, agent_name, client_label, status, expires_at, decided_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(code, auth.did, secret.id, origin, gateSession(auth), auth.silicon ? 'silicon' : 'carbon', auth.agent_name || null,
+         String(client_label || '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 80), status, expiresAt, status === 'approved' ? new Date().toISOString() : null);
+  res.status(201).json({ ok: true, request_id: code, status, expires_in: browserFill.REQUEST_TTL_SEC,
+    ...(status === 'pending' ? { approve_in: 'the DemiPass wallet on your phone, with your vault PIN' } : {}) });
+});
+
+// POST /api/blindkey/fill/redeem — the asking session collects the value of an approved request, once.
+app.post('/api/blindkey/fill/redeem', rateLimitStandard, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  const { request_id } = req.body || {};
+  if (typeof request_id !== 'string' || !request_id) return res.status(400).json({ error: 'request_id required' });
+  const row = db.prepare('SELECT * FROM blindkey_fill_requests WHERE request_code = ?').get(request_id);
+  // Another session's request is indistinguishable from a missing one.
+  if (!row || row.did !== auth.did || row.requester_session !== gateSession(auth)) return res.status(404).json({ error: 'fill request not found' });
+  if (row.status === 'redeemed') return res.status(410).json({ error: 'already_redeemed' });
+  if (row.status === 'denied') return res.status(403).json({ error: 'denied' });
+  if (fillExpired(row)) {
+    if (row.status !== 'expired') db.prepare("UPDATE blindkey_fill_requests SET status = 'expired' WHERE id = ? AND status IN ('pending', 'approved')").run(row.id);
+    return res.status(410).json({ error: 'expired' });
+  }
+  if (row.status === 'pending') return res.status(428).json({ error: 'approval_pending', expires_at: row.expires_at });
+  if (row.status !== 'approved') return res.status(410).json({ error: row.status });
+  const secret = db.prepare(`SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(row.secret_id, auth.did);
+  if (!secret) return res.status(404).json({ error: 'the login was deleted or revoked since the request' });
+  if (secret.frozen) return res.status(423).json({ error: 'secret is frozen — unfreeze before use', frozen: true });
+  // Re-checked at redeem: an origin unbound, or an agent grant revoked, after approval stops the fill.
+  if (!browserFill.storedOrigins(secret.fill_origins).includes(row.origin)) return res.status(403).json({ error: `this login is no longer bound to ${row.origin}` });
+  if (auth.silicon && !siliconMayFill(auth.agent_name, secret)) return res.status(403).json({ error: `silicon '${auth.agent_name}' no longer holds action:browser_fill for this secret` });
+  let value;
+  try { value = blindkeyDecrypt(secret.encrypted_value); } catch (e) { return res.status(500).json({ error: 'decryption failed' }); }
+  // Spend first: of two concurrent redeems exactly one changes the row, and only that one answers with the value.
+  const spent = db.prepare("UPDATE blindkey_fill_requests SET status = 'redeemed', redeemed_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'approved'").run(row.id).changes;
+  if (spent !== 1) return res.status(410).json({ error: 'already_redeemed' });
+  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+  logSecurityEvent('secret_filled', 'warn', { caller_did: auth.did, agent_name: auth.agent_name, capability: 'browser_fill', target: secret.name, ip: req.ip, context: { ref: secret.ref_code, origin: row.origin, kind: row.requester_kind } });
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(auth.did, `secret filled: ${secret.name} → ${row.origin}`, req.ip || '', 'UTC', 'tick', JSON.stringify(['demipass:fill', `secret:${secret.name}`]));
+  } catch (_) { /* the fill stands without its tick */ }
+  res.json({ ok: true, value, username: secret.fill_username || '', origin: row.origin, name: secret.name, ref: secret.ref_code });
+});
+
+// GET /api/blindkey/fill/pending — the wallet's list of fills waiting for this person (carbon only).
+app.get('/api/blindkey/fill/pending', rateLimitStandard, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  if (auth.silicon) return res.status(403).json({ error: 'only the owner approves fills' });
+  const rows = db.prepare(`SELECT r.*, s.name, s.ref_code, s.fill_username FROM blindkey_fill_requests r JOIN blindkey_secrets s ON s.id = r.secret_id
+                           WHERE r.did = ? AND r.status = 'pending' ORDER BY r.id`).all(auth.did);
+  const session = gateSession(auth);
+  const requests = rows.filter(r => !fillExpired(r)).map(r => ({
+    id: r.id, intent: `fill:${r.id}`, name: r.name, ref: r.ref_code, username: r.fill_username || '', origin: r.origin,
+    client_label: r.client_label || '', created_at: r.created_at, expires_at: r.expires_at,
+    own_session: r.requester_session === session,   // the wallet cannot approve a request it made itself
+  }));
+  res.json({ ok: true, requests });
+});
+
+// The pending request a wallet decides on, or a refusal already sent.
+function fillDecision(req, res, auth) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) { res.status(400).json({ error: 'invalid request id' }); return null; }
+  const row = db.prepare('SELECT * FROM blindkey_fill_requests WHERE id = ? AND did = ?').get(id, auth.did);
+  if (!row) { res.status(404).json({ error: 'fill request not found' }); return null; }
+  if (row.status !== 'pending') { res.status(409).json({ error: `this fill request is already ${row.status}` }); return null; }
+  if (fillExpired(row)) { res.status(410).json({ error: 'expired' }); return null; }
+  return row;
+}
+
+// POST /api/blindkey/fill/:id/approve — approve on the wallet. Needs the reveal factors of the secret (the vault
+// PIN at least), proven with intent `fill:<id>`; the PIN proof is spent here. Never from the asking session.
+app.post('/api/blindkey/fill/:id/approve', rateLimitStandard, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  if (auth.silicon) return res.status(403).json({ error: 'only the owner approves fills' });
+  const row = fillDecision(req, res, auth); if (!row) return;
+  const session = gateSession(auth);
+  if (row.requester_session === session) return res.status(409).json({ error: 'approve this fill from your phone wallet, not from the session that asked for it' });
+  const secret = db.prepare(`SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(row.secret_id, auth.did);
+  if (!secret) return res.status(404).json({ error: 'the login was deleted or revoked since the request' });
+  const required = resolveGatePolicy(secret).reveal;   // a filled field is readable by the page: reveal's factors
+  const intent = `fill:${row.id}`;
+  const missing = required.filter(g => !gateFresh(auth.did, g, auth, intent));
+  if (missing.length) return res.status(403).json(gateMissing('fill', required, missing, intent));
+  const refused = spendSingleUse(auth.did, 'fill', required, auth, intent);
+  if (refused) return res.status(refused.status || 403).json(refused);
+  const changed = db.prepare("UPDATE blindkey_fill_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP, decided_session = ? WHERE id = ? AND status = 'pending'").run(session, row.id).changes;
+  if (changed !== 1) return res.status(409).json({ error: 'this fill request was decided meanwhile' });
+  res.json({ ok: true, id: row.id, status: 'approved', origin: row.origin });
+});
+
+// POST /api/blindkey/fill/:id/deny
+app.post('/api/blindkey/fill/:id/deny', rateLimitStandard, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  if (auth.silicon) return res.status(403).json({ error: 'only the owner decides fills' });
+  const row = fillDecision(req, res, auth); if (!row) return;
+  db.prepare("UPDATE blindkey_fill_requests SET status = 'denied', decided_at = CURRENT_TIMESTAMP, decided_session = ? WHERE id = ? AND status = 'pending'").run(gateSession(auth), row.id);
+  res.json({ ok: true, id: row.id, status: 'denied' });
 });
 
 // GET /api/blindkey/list — list secret names and metadata (never values)
@@ -11486,6 +11707,7 @@ const SILICON_PERMISSION_TYPES = [
   'action:http_header', // HTTP header injection
   'action:http_body', // HTTP body injection
   'action:document',  // document retrieval
+  'action:browser_fill', // the agent fill tool may receive this login for a bound origin (never via admin:full)
   'admin:full',       // full access (carbon equivalent)
 ];
 
@@ -11822,7 +12044,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy):\d{1,12}$/;
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill):\d{1,12}$/;   // fill:<fill request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

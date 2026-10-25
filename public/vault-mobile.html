@@ -47,7 +47,11 @@
 
   /* Panic button */
   .panic-strip { display:none; padding:0.6rem 1rem; background:rgba(224,108,117,0.1); border-bottom:1px solid rgba(224,108,117,0.3); text-align:center; }
-  .panic-strip span { color:var(--red); font-weight:600; font-size:0.8rem; }
+.panic-strip span { color:var(--red); font-weight:600; font-size:0.8rem; }
+  .fill-req { margin:0.6rem 1rem 0; padding:0.75rem; border:1px solid var(--accent); border-radius:10px; font-size:0.8rem; }
+  .fill-req .fr-origin { font-weight:700; word-break:break-all; }
+  .fill-req .fr-row { display:flex; gap:0.5rem; margin-top:0.6rem; }
+  .fill-req .fr-row button { flex:1; padding:0.55rem; border-radius:8px; }
 
   /* Sections */
   .section { padding:0 1rem 1rem; }
@@ -161,6 +165,9 @@
     <span>ALL BREAKERS TRIPPED</span>
     <button class="btn-ghost" style="margin-left:0.5rem;font-size:0.7rem" onclick="resetPanic()">Reset</button>
   </div>
+
+  <!-- Browser fill requests waiting for this person: the extension asked, the phone approves with the PIN -->
+  <div id="fill-requests"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
   <div id="page-vault" class="page active">
@@ -517,6 +524,7 @@ let tk=localStorage.getItem('dp_token')||'',did=localStorage.getItem('dp_did')||
 let secrets=[],panic=false;
 let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
+let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
 let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
@@ -556,7 +564,7 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status']){const e=document.getElementById(i);if(e)e.innerHTML=''}
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];fillBusy.clear();
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -925,7 +933,36 @@ async function showApp(){
   vaultOpen=true;
   document.getElementById('ns-id').textContent=user;
   await loadVault();
-  loadSiliconAgents()}
+  loadSiliconAgents();
+  loadFillRequests()}
+
+// ── Browser fill approvals ─────────────────────────────────────────────────
+// The browser extension asks to fill a login into a page; the request waits here until approved with the PIN
+// (its intent is fill:<id>, so the proof opens that one fill) or denied. Polled every 4 s while the vault is open.
+async function loadFillRequests(){
+  const epoch=sessionEpoch;
+  try{ const r=await api('GET','/api/blindkey/fill/pending'); if(epoch!==sessionEpoch||!vaultOpen) return; fillReqs=(r.requests||[]).filter(q=>!q.own_session); }
+  catch(e){ if(sessionEnded(e)) return; fillReqs=[]; }
+  renderFillRequests();
+}
+function renderFillRequests(){
+  const el=document.getElementById('fill-requests');
+  el.innerHTML=fillReqs.map(q=>'<div class="fill-req"><div>Fill <b>'+esc(q.name)+'</b>'+(q.username?' ('+esc(q.username)+')':'')+' into</div>'
+    +'<div class="fr-origin">'+esc(q.origin)+'</div>'
+    +(q.client_label?'<div style="color:var(--text3);margin-top:0.25rem">asked by '+esc(q.client_label)+'</div>':'')
+    +'<div class="fr-row"><button class="btn-primary" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',true)">Approve</button>'
+    +'<button class="btn-ghost" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',false)">Deny</button></div></div>').join('');
+}
+async function decideFill(id, approve){
+  const q=fillReqs.find(x=>x.id===id); if(!q||fillBusy.has(id)) return;
+  fillBusy.add(id); renderFillRequests();
+  try{
+    if(approve) await apiGated('POST','/api/blindkey/fill/'+id+'/approve',null,'Fill '+q.name+' into '+q.origin+'? Your PIN approves this one fill.');
+    else await api('POST','/api/blindkey/fill/'+id+'/deny');
+    fillReqs=fillReqs.filter(x=>x.id!==id);
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ fillBusy.delete(id); renderFillRequests(); }
+}
 // Could not learn whether a PIN exists: stay closed, offer retry or sign out.
 function showPinCheckError(why){
   vaultOpen=false;
@@ -1660,6 +1697,7 @@ function gateName(g){return ({pin:'PIN',fingerprint:'PIN',twofa:'email code',sms
 document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeModal()}});
 setInterval(()=>{if(tk&&vaultOpen)loadVault()},30000);   // never behind a closed PIN gate
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadFillRequests()},4000);
 
 // ── QR Scanner ──
 
