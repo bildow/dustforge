@@ -267,7 +267,9 @@ call POST /api/blindkey/store "$E" '{"name":"z","value":"z-1","secret_type":"api
 call POST /api/blindkey/rotate "$E" '{"name":"z","new_value":"z-2"}'
 call POST /api/blindkey/store "$E" '{"name":"z_v3","value":"user-named","secret_type":"api_key"}'
 call POST /api/blindkey/rotate "$E" '{"name":"z","new_value":"z-3"}'
-[ "$CODE" = 200 ] && python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); n={r[0]:r[1] for r in c.execute(\"SELECT name,status FROM blindkey_secrets WHERE name LIKE 'z%'\")}; sys.exit(0 if n.get('z_v3')=='active' and n.get('z_v4')=='active' else 1)" "$DB_PATH" && ok "rotation steps over a live secret named like its next version" || fail "z rotate: $CODE $BODY"
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "z_v3" && ok "rotation refuses (409) when its next _vN name is another live secret" || fail "z rotate: $CODE $BODY"
+call POST /api/blindkey/rotate "$E" '{"name":"z_v3","new_value":"user-2"}'
+[ "$CODE" = 409 ] && ok "rotating the user-named z_v3 rotates that exact secret (and refuses its taken next name), not the z chain" || fail "z_v3 rotate: $CODE $BODY"
 
 # ── where the value appeared ──
 AFTER=$(grep -c -- "$VAL" "$ALL")
