@@ -223,6 +223,54 @@ call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'
 for i in $(seq 1 505); do curl -s -o /dev/null "$API/api/blindkey/fill/pending" -H "Authorization: Bearer $Wt"; done
 call GET /api/blindkey/list "$E"; [ "$CODE" = 200 ] && ok "500+ fill polls do not exhaust the standard limit (/list still 200)" || fail "rate limit shared: $CODE"
 
+# ── withdraw by the asking session; re-saving a deleted name (extension re-audit 2026-10-25) ──
+call GET /api/blindkey/fill/pending "$Wt"   # the cap check above left 20 waiting: clear them first
+for f in $(python3 -c 'import json,sys; print(" ".join(str(r["id"]) for r in json.load(sys.stdin)["requests"]))' <<<"$BODY"); do call POST /api/blindkey/fill/$f/deny "$Wt"; done
+call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'; WR=$(echo "$BODY" | J request_id)
+call POST /api/blindkey/fill/withdraw "$Wt" '{"request_id":"'$WR'"}'; [ "$CODE" = 404 ] && ok "another session cannot withdraw the request" || fail "withdraw other session: $CODE $BODY"
+call POST /api/blindkey/fill/withdraw "$E" '{"request_id":"'$WR'"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J status)" = withdrawn ] && ok "the asking session withdraws its request" || fail "withdraw: $CODE $BODY"
+call GET /api/blindkey/fill/pending "$Wt"; [ "$(echo "$BODY" | J requests)" = "[]" ] && ok "a withdrawn request leaves the wallet" || fail "withdrawn still listed: $BODY"
+call POST /api/blindkey/fill/redeem "$E" '{"request_id":"'$WR'"}'; [ "$CODE" = 410 ] && [ "$(echo "$BODY" | J error)" = withdrawn ] && ok "a withdrawn request cannot be redeemed" || fail "redeem withdrawn: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"gone-login","value":"first-1","secret_type":"password","origins":["'$ORIG'"]}'
+call DELETE /api/blindkey/delete "$E" '{"name":"gone-login"}'; [ "$CODE" = 200 ] || fail "delete: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"gone-login","value":"second-2","secret_type":"password","origins":["'$ORIG'"]}'
+call GET "/api/blindkey/fill/candidates?origin=$ORIG" "$E"
+python3 -c 'import json,sys; sys.exit(0 if any(c["name"]=="gone-login" for c in json.load(sys.stdin)["candidates"]) else 1)' <<<"$BODY" && ok "re-saving a deleted login's name makes a live, fillable entry" || fail "dead-name store: $BODY"
+
+# ── dead and rotated names (PR #18 review) ──
+call POST /api/blindkey/store "$E" '{"name":"tw","value":"tw-1","secret_type":"password"}'
+TWID=$(python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"SELECT id FROM blindkey_secrets WHERE name='tw'\").fetchone()[0])" "$DB_PATH")
+call DELETE /api/blindkey/delete "$E" '{"name":"tw"}'
+call POST /api/blindkey/store "$E" '{"name":"tw~'$TWID'","value":"squatter","secret_type":"password"}'
+call POST /api/blindkey/store "$E" '{"name":"tw","value":"tw-2","secret_type":"password"}'; [ "$CODE" = 200 ] && ok "a live row named <name>~<id> cannot block re-storing <name>" || fail "squat: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"aws","value":"aws-1","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"aws","new_value":"aws-2"}'
+call POST /api/blindkey/store "$E" '{"name":"aws","value":"aws-x","secret_type":"api_key"}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q aws_v2 && ok "storing a name in its rotation grace → 409 naming the current version" || fail "rotating store: $CODE $BODY"
+SQL "UPDATE blindkey_secrets SET status = 'retired' WHERE name = 'aws'"
+call POST /api/blindkey/store "$E" '{"name":"aws","value":"aws-y","secret_type":"api_key"}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q aws_v2 && ok "storing a rotated-away name → 409 naming the current version (no unreachable twin)" || fail "retired store: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"aws_v2","value":"aws-z","secret_type":"api_key"}'; [ "$CODE" = 200 ] && ok "storing under the current version works" || fail "current version store: $CODE $BODY"
+
+# ── rotation link, not name patterns (PR #18 re-review) ──
+call POST /api/blindkey/store "$E" '{"name":"stripe","value":"s-1","secret_type":"api_key"}'
+call POST /api/blindkey/store "$E" '{"name":"stripe_v2","value":"s2-1","secret_type":"api_key"}'
+call DELETE /api/blindkey/delete "$E" '{"name":"stripe_v2"}'
+call POST /api/blindkey/store "$E" '{"name":"stripe_v2","value":"s2-2","secret_type":"api_key"}'; [ "$CODE" = 200 ] && ok "an unrelated deleted <name>_v2 can be stored again" || fail "stripe_v2: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"k","value":"k-1","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"k","new_value":"k-2"}'; call POST /api/blindkey/rotate "$E" '{"name":"k","new_value":"k-3"}'
+SQL "UPDATE blindkey_secrets SET status = 'retired' WHERE name IN ('k', 'k_v2')"
+call DELETE /api/blindkey/delete "$E" '{"name":"k_v3"}'
+call POST /api/blindkey/store "$E" '{"name":"k","value":"k-new","secret_type":"api_key"}'; [ "$CODE" = 200 ] && ok "a name whose whole lineage is dead can be stored again" || fail "k store: $CODE $BODY"
+call POST /api/blindkey/rotate "$E" '{"name":"k","new_value":"k-new-2"}'; [ "$CODE" = 200 ] && ok "…and rotated (dead k_v2 moved aside, no UNIQUE 500)" || fail "k rotate: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"z","value":"z-1","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"z","new_value":"z-2"}'
+call POST /api/blindkey/store "$E" '{"name":"z_v3","value":"user-named","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"z","new_value":"z-3"}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "z_v3" && ok "rotation refuses (409) when its next _vN name is another live secret" || fail "z rotate: $CODE $BODY"
+call POST /api/blindkey/rotate "$E" '{"name":"z_v3","new_value":"user-2"}'
+[ "$CODE" = 409 ] && ok "rotating the user-named z_v3 rotates that exact secret (and refuses its taken next name), not the z chain" || fail "z_v3 rotate: $CODE $BODY"
+
 # ── where the value appeared ──
 AFTER=$(grep -c -- "$VAL" "$ALL")
 [ "$BEFORE" = 0 ] && [ "$AFTER" = 2 ] && ok "the value appears in exactly the two redeem replies, nowhere else" || fail "value appeared before=$BEFORE after=$AFTER"

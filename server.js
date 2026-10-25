@@ -2443,6 +2443,42 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_fill_req_did ON blindkey_fill_requ
 //            'delegated' = someone delegated this to you, you cannot rotate the source
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_ref ON blindkey_secrets(ref_code) WHERE ref_code != ''"); } catch(_) {}
 
+// Before an upsert by (did, name), which would otherwise write into whatever row holds the name:
+// - a name whose rotation moved on (followed through replaced_by, which /rotate and /rotate-blind set) is refused,
+//   naming the live version: the value would land in a row on its way out, or beside a lineage /rotate never reaches;
+// - a deleted, retired or revoked row otherwise moves aside (renamed <name>~<id>~<random>, history stays under its
+//   id), so the value lands in a fresh live entry.
+// Returns null, or the refusal message (409).
+const DEAD_SECRET_STATUSES = new Set(['deleted', 'retired', 'revoked']);
+function moveSecretAside(row, name) {
+  db.prepare('UPDATE blindkey_secrets SET name = ? WHERE id = ?').run(`${name}~${row.id}~${crypto.randomBytes(4).toString('hex')}`, row.id);
+}
+function clearNameForStore(did, name) {
+  const row = db.prepare('SELECT id, status, replaced_by FROM blindkey_secrets WHERE did = ? AND name = ?').get(did, name);
+  if (!row || row.status === 'active') return null;
+  const seen = new Set();
+  for (let next = row.replaced_by; next && !seen.has(next); ) {
+    seen.add(next);
+    const r = db.prepare('SELECT name, status, replaced_by FROM blindkey_secrets WHERE id = ? AND did = ?').get(next, did);
+    if (!r) break;
+    if (r.status === 'active' || r.status === 'rotating') return `'${name}' was rotated; the current version is '${r.name}' — store under that name`;
+    next = r.replaced_by;
+  }
+  if (row.status === 'rotating') return `'${name}' is being rotated; store under its new version`;
+  if (DEAD_SECRET_STATUSES.has(row.status)) moveSecretAside(row, name);
+  return null;
+}
+// The name a rotation writes its new version under: <base>_v<version+1>. A dead row on that name moves aside; a
+// live one (a secret someone named that way) is a conflict the caller refuses before changing anything.
+function nextVersionName(did, baseName, version) {
+  const v = (version || 1) + 1;
+  const name = `${baseName}_v${v}`;
+  const row = db.prepare('SELECT id, status FROM blindkey_secrets WHERE did = ? AND name = ?').get(did, name);
+  if (row && DEAD_SECRET_STATUSES.has(row.status)) moveSecretAside(row, name);
+  else if (row) return { conflict: `cannot rotate: '${name}' is already another live secret — rename or delete it first` };
+  return { name, version: v };
+}
+
 function generateRefCode(secretType, name) {
   const prefix = { api_key: 'API', password: 'PWD', token: 'TKN', ssh_key: 'SSH', cert: 'CRT', other: 'SEC' }[secretType] || 'SEC';
   const slug = name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toLowerCase();
@@ -3038,6 +3074,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     const resolvedOwnership = ['sole', 'shared', 'delegated'].includes(ownership) ? ownership : 'sole';
     const resolvedRotatable = rotatable === false || rotatable === 0 ? 0 : 1;
 
+    const nameRefused = clearNameForStore(req.identity.did, name);
+    if (nameRefused) return res.status(409).json({ error: nameRefused });
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -3302,6 +3340,18 @@ app.post('/api/blindkey/fill/redeem', rateLimitFill, (req, res) => {
       .run(auth.did, `secret filled: ${secret.name} → ${row.origin}`, req.ip || '', 'UTC', 'tick', JSON.stringify(['demipass:fill', `secret:${secret.name}`]));
   } catch (_) { /* the fill stands without its tick */ }
   res.json({ ok: true, value, username: secret.fill_username || '', origin: row.origin, name: secret.name, ref: secret.ref_code });
+});
+
+// POST /api/blindkey/fill/withdraw — the asking session gives up its own request (the page left, the person
+// cancelled). A pending card leaves the wallet; an approved one can no longer be redeemed. { request_id }
+app.post('/api/blindkey/fill/withdraw', rateLimitFill, (req, res) => {
+  const auth = fillAuth(req, res); if (!auth) return;
+  const { request_id } = req.body || {};
+  if (typeof request_id !== 'string' || !request_id) return res.status(400).json({ error: 'request_id required' });
+  const row = db.prepare('SELECT * FROM blindkey_fill_requests WHERE request_code = ?').get(request_id);
+  if (!row || row.did !== auth.did || row.requester_session !== gateSession(auth)) return res.status(404).json({ error: 'fill request not found' });
+  const changed = db.prepare("UPDATE blindkey_fill_requests SET status = 'withdrawn', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status IN ('pending', 'approved')").run(row.id).changes;
+  res.json({ ok: true, status: changed ? 'withdrawn' : row.status });
 });
 
 // GET /api/blindkey/fill/pending — the wallet's list of fills waiting for this person (carbon only).
@@ -4622,7 +4672,8 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
   // Find the existing active secret with the highest version for this base name
   // Strip any existing _v{N} suffix to get the base name
   const baseName = name.replace(/_v\d+$/, '');
-  const existing = db.prepare(
+  // An active secret with exactly this name first; otherwise the newest active version of the base name's chain.
+  const existing = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = 'active'").get(ownerDid, name) || db.prepare(
     "SELECT * FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'active' ORDER BY version DESC LIMIT 1"
   ).get(ownerDid, baseName, baseName + '_v%');
 
@@ -4634,8 +4685,9 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     if (!g.ok) return res.status(g.status || 403).json(g);
   }
 
-  const newVersion = (existing.version || 1) + 1;
-  const newName = baseName + '_v' + newVersion;
+  const target = nextVersionName(ownerDid, existing.name.replace(/_v\d+$/, ''), existing.version);
+  if (target.conflict) return res.status(409).json({ error: target.conflict });
+  const { name: newName, version: newVersion } = target;
 
   try {
     const encrypted = blindkeyEncrypt(new_value);
@@ -4754,6 +4806,8 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
 
   try {
     const encrypted = blindkeyEncrypt(value);
+    const nameRefused = clearNameForStore(resolvedTargetDid, name);
+    if (nameRefused) return res.status(409).json({ error: nameRefused });
     const metaJson = metadata ? JSON.stringify(metadata) : '{}';
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
@@ -4820,6 +4874,8 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
       try {
         const encrypted = blindkeyEncrypt(s.value);
         const metaJson = s.metadata ? JSON.stringify(s.metadata) : '{}';
+        const nameRefused = clearNameForStore(s.target_did, s.name);
+        if (nameRefused) { errors.push({ index: i, error: nameRefused }); continue; }
         insertStmt.run(s.target_did, s.name, s.description || '', resolvedType, encrypted, metaJson);
         const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
         results.push({ ok: true, secret_id: inserted.id, name: s.name, secret_type: resolvedType, target_did: s.target_did });
@@ -5026,6 +5082,8 @@ function handleRowenIngest(req, res) {
 
   try {
     const encrypted = blindkeyEncrypt(value);
+    const nameRefused = clearNameForStore(target_did, name);
+    if (nameRefused) return res.status(409).json({ error: nameRefused });
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
       VALUES (?, ?, ?, ?, ?, ?)
@@ -10864,6 +10922,11 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   catch (e) { return res.status(500).json({ error: 'failed to decrypt current secret' }); }
 
   const newPassword = crypto.randomBytes(24).toString('base64url');
+  // The new version's name is settled before the host password changes: a conflict found after would leave the
+  // host on a password the vault could not record.
+  const baseName = secret.name.replace(/_v\d+$/, '');
+  const target = nextVersionName(ownerDid, baseName, secret.version);
+  if (target.conflict) return res.status(409).json({ error: target.conflict });
   const sshUser = target_user || 'root';
   const { execSync } = require('child_process');
 
@@ -10914,9 +10977,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
       });
     }
 
-    const baseName = secret.name.replace(/_v\d+$/, '');
-    const newVersion = (secret.version || 1) + 1;
-    const newName = baseName + '_v' + newVersion;
+    const { name: newName, version: newVersion } = target;
     const encrypted = blindkeyEncrypt(newPassword);
 
     const newRefCode = generateRefCode('password', newName);
@@ -10942,7 +11003,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
         .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
     }
 
-    db.prepare("UPDATE blindkey_secrets SET status = 'revoked', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(secret.id);
+    db.prepare("UPDATE blindkey_secrets SET status = 'revoked', replaced_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(newSecret.id, secret.id);
 
     try {
       db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
@@ -12120,6 +12181,21 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS secret_rotations (
   rotated_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 try { db.exec('CREATE INDEX IF NOT EXISTS idx_sr_secret ON secret_rotations(secret_id)'); } catch(e) {}
+// One-time link: /rotate-blind did not set replaced_by on the row it revoked before 2026-10-25. Link each such row
+// to the successor its own rotation recorded (secret_rotations, method rotate_blind), so clearNameForStore sees the
+// rotation. Only NULL links, only recorded rotations: idempotent and never a guess from names alone.
+try {
+  const linked = db.prepare(`UPDATE blindkey_secrets AS old SET replaced_by = (
+      SELECT n.id FROM secret_rotations r JOIN blindkey_secrets n ON n.id = r.secret_id
+      WHERE r.method = 'rotate_blind' AND r.did = old.did AND n.did = old.did AND r.old_version = COALESCE(old.version, 1)
+        AND n.name = (CASE WHEN old.name GLOB '*_v[0-9]*' THEN rtrim(old.name, '0123456789') ELSE old.name || '_v' END) || r.new_version
+      ORDER BY r.id DESC LIMIT 1)
+    WHERE old.status = 'revoked' AND old.replaced_by IS NULL AND EXISTS (
+      SELECT 1 FROM secret_rotations r JOIN blindkey_secrets n ON n.id = r.secret_id
+      WHERE r.method = 'rotate_blind' AND r.did = old.did AND n.did = old.did AND r.old_version = COALESCE(old.version, 1)
+        AND n.name = (CASE WHEN old.name GLOB '*_v[0-9]*' THEN rtrim(old.name, '0123456789') ELSE old.name || '_v' END) || r.new_version)`).run().changes;
+  if (linked) console.log(`[rotate] linked ${linked} blind-rotated row(s) to their successors`);
+} catch (e) { console.error('[rotate] replaced_by backfill skipped:', e.message); }
 
 // ══════════════════════════════════════════════════════════════════════════
 // Per-credential gate policy (shakedown item 4) + SMS gate (item 5)
