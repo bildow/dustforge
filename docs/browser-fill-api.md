@@ -40,8 +40,8 @@ stored with origins gets no default `/use` context: it is for browser fill only.
 `/store` needs a `write`-scoped token or better. Storing again under the same
 name replaces the value; `origins`/`login` left out keep what was there. A deleted, retired or revoked entry
 under that name is moved aside (renamed `<name>~<id>~<random>`), so the store makes a new live entry. A name
-whose rotation moved on (it is rotating, or retired with an active `<name>_vN`) answers 409 naming the current
-version: store under that name.
+whose rotation moved on (its row links, through rotation, to a live version) answers 409 naming that version:
+store under that name. A rotation steps over a live secret that already holds its next `_vN` name.
 
 ### `POST /api/blindkey/origins` — carbon only
 `{ ref | name, origins: [...], mode: 'add' | 'set' }` → `{ ok, ref, origins }`.

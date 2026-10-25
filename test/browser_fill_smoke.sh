@@ -252,6 +252,23 @@ call POST /api/blindkey/store "$E" '{"name":"aws","value":"aws-y","secret_type":
 [ "$CODE" = 409 ] && echo "$BODY" | grep -q aws_v2 && ok "storing a rotated-away name → 409 naming the current version (no unreachable twin)" || fail "retired store: $CODE $BODY"
 call POST /api/blindkey/store "$E" '{"name":"aws_v2","value":"aws-z","secret_type":"api_key"}'; [ "$CODE" = 200 ] && ok "storing under the current version works" || fail "current version store: $CODE $BODY"
 
+# ── rotation link, not name patterns (PR #18 re-review) ──
+call POST /api/blindkey/store "$E" '{"name":"stripe","value":"s-1","secret_type":"api_key"}'
+call POST /api/blindkey/store "$E" '{"name":"stripe_v2","value":"s2-1","secret_type":"api_key"}'
+call DELETE /api/blindkey/delete "$E" '{"name":"stripe_v2"}'
+call POST /api/blindkey/store "$E" '{"name":"stripe_v2","value":"s2-2","secret_type":"api_key"}'; [ "$CODE" = 200 ] && ok "an unrelated deleted <name>_v2 can be stored again" || fail "stripe_v2: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"k","value":"k-1","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"k","new_value":"k-2"}'; call POST /api/blindkey/rotate "$E" '{"name":"k","new_value":"k-3"}'
+SQL "UPDATE blindkey_secrets SET status = 'retired' WHERE name IN ('k', 'k_v2')"
+call DELETE /api/blindkey/delete "$E" '{"name":"k_v3"}'
+call POST /api/blindkey/store "$E" '{"name":"k","value":"k-new","secret_type":"api_key"}'; [ "$CODE" = 200 ] && ok "a name whose whole lineage is dead can be stored again" || fail "k store: $CODE $BODY"
+call POST /api/blindkey/rotate "$E" '{"name":"k","new_value":"k-new-2"}'; [ "$CODE" = 200 ] && ok "…and rotated (dead k_v2 moved aside, no UNIQUE 500)" || fail "k rotate: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"z","value":"z-1","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"z","new_value":"z-2"}'
+call POST /api/blindkey/store "$E" '{"name":"z_v3","value":"user-named","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"z","new_value":"z-3"}'
+[ "$CODE" = 200 ] && python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); n={r[0]:r[1] for r in c.execute(\"SELECT name,status FROM blindkey_secrets WHERE name LIKE 'z%'\")}; sys.exit(0 if n.get('z_v3')=='active' and n.get('z_v4')=='active' else 1)" "$DB_PATH" && ok "rotation steps over a live secret named like its next version" || fail "z rotate: $CODE $BODY"
+
 # ── where the value appeared ──
 AFTER=$(grep -c -- "$VAL" "$ALL")
 [ "$BEFORE" = 0 ] && [ "$AFTER" = 2 ] && ok "the value appears in exactly the two redeem replies, nowhere else" || fail "value appeared before=$BEFORE after=$AFTER"
