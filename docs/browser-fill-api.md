@@ -51,7 +51,7 @@ fill is the PIN on the wallet card, which shows the origin. Read the origin befo
 ### `GET /api/blindkey/fill/candidates?origin=<origin>`
 → `{ ok, origin, candidates: [{ ref, name, username, secret_type }] }`.
 Never a value. Carbon: the owner's secrets bound to that origin. Silicon: only
-secrets it holds `action:browser_fill` for (resource `<ref>`, `<name>` or `*`).
+secrets it holds `action:browser_fill` for (resource = the login's ref, or `*`).
 Only the active version of a login is a candidate: after a rotation, the new version (it keeps the origins and
 login) is filled, the superseded one is not, even during its grace period.
 
@@ -96,10 +96,13 @@ refresh happens anyway, ask again. A silicon's session is its agent identity.
   every website login the owner has at standard depth.
 - Agents fill only logins whose reveal needs the PIN alone (standard depth): a grant is approved with the PIN, so
   it never stands in for more factors. A login raised above standard is refused to agents, even under `*`.
-- Resetting an agent's token revokes its `action:browser_fill` grants; grant them again for the new token.
+- Resetting an agent's token revokes its `action:browser_fill` grants and denies its waiting grant requests; a
+  grant request is bound to the agent's token when asked, so one approved after a re-key is refused (409).
 
 ### Limits
 - At most 20 fill requests (and 20 grants) wait per person; the 21st is 429.
+- A carbon fill's factors are checked when it is approved; raising the login's depth in the ≤120 s between
+  approval and redeem does not cancel that one fill.
 - Fill routes have their own rate limit (3000 per 15 min per IP), separate from `/use`'s.
 - "Another session" means another access token (its `jti`), not another device: a second sign-in on the same
   computer could approve with the PIN. The PIN is the factor.

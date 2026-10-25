@@ -3174,14 +3174,15 @@ function fillSecret(did, { ref, name }) {
 // Explicit grant only: exact permission type, resource = this secret's ref or name, or '*'.
 // A grant is approved with the PIN alone, so it never covers a login whose reveal needs more (it may be raised later).
 function agentFillable(secret) {
+  if (secret.gate_policy) { try { JSON.parse(secret.gate_policy); } catch (_) { return false; } }   // unreadable policy: no agent fill
   const r = resolveGatePolicy(secret).reveal;
   return r.length === 1 && r[0] === 'pin';
 }
 function siliconMayFill(agentName, secret) {
   if (!agentFillable(secret)) return false;
   return Boolean(db.prepare(
-    "SELECT 1 FROM silicon_permissions WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active' AND (expires_at = '' OR expires_at IS NULL OR expires_at > datetime('now')) AND resource IN ('*', ?, ?)"
-  ).get(agentName, secret.ref_code || '', secret.name));
+    "SELECT 1 FROM silicon_permissions WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active' AND (expires_at = '' OR expires_at IS NULL OR expires_at > datetime('now')) AND resource IN ('*', ?)"
+  ).get(agentName, secret.ref_code || secret.name));   // grants name the ref (the name only for a login without one)
 }
 function fillExpired(row) { return new Date(row.expires_at).getTime() <= Date.now(); }
 function fillAuth(req, res) {
@@ -11837,6 +11838,7 @@ app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
   db.prepare('UPDATE silicon_agents SET token_hash = ? WHERE id = ?').run(tokenHash, agent.id);
   // A fill grant was approved with the PIN for the agent as it was keyed then; a new token must be approved again.
   const dropped = db.prepare("UPDATE silicon_permissions SET status = 'revoked' WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active'").run(agent_name).changes;
+  db.prepare("UPDATE silicon_grant_requests SET status = 'denied', decided_at = CURRENT_TIMESTAMP WHERE agent_name = ? AND did = ? AND status = 'pending'").run(agent_name, actor.did);
 
   res.json({ ok: true, agent_name, token: rawToken, note: 'Previous token is immediately invalidated. SAVE THIS TOKEN.',
     ...(dropped ? { browser_fill_grants_revoked: dropped, browser_fill_note: 'grant action:browser_fill again; the wallet approves it with your PIN' } : {}) });
@@ -11901,11 +11903,13 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS silicon_grant_requests (
   permission_type TEXT NOT NULL,
   resource TEXT NOT NULL,
   label TEXT DEFAULT '',
+  agent_token_hash TEXT DEFAULT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   expires_at TEXT NOT NULL,
   decided_at TEXT DEFAULT NULL
 )`); } catch(_) {}
+try { db.exec("ALTER TABLE silicon_grant_requests ADD COLUMN agent_token_hash TEXT DEFAULT NULL"); } catch(_) {}
 const GRANT_REQUEST_TTL_SEC = 600;
 function requestFillGrant(req, res, actor, agent, resource) {
   if (actor.mode === 'admin') return res.status(403).json({ error: 'action:browser_fill is approved by the account owner in the wallet, not by the admin key' });
@@ -11923,8 +11927,9 @@ function requestFillGrant(req, res, actor, agent, resource) {
   const pending = db.prepare("SELECT COUNT(*) AS n FROM silicon_grant_requests WHERE did = ? AND status = 'pending' AND expires_at > ?").get(actor.did, new Date().toISOString()).n;
   if (pending >= FILL_MAX_PENDING) return res.status(429).json({ error: 'too many grants waiting for approval — approve or deny some first' });
   const expiresAt = new Date(Date.now() + GRANT_REQUEST_TTL_SEC * 1000).toISOString();
-  const id = db.prepare('INSERT INTO silicon_grant_requests (did, agent_name, permission_type, resource, label, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
-    .run(actor.did, agent.agent_name, 'action:browser_fill', resource, cleanLabel(label, 300), expiresAt).lastInsertRowid;
+  // Bound to the agent's token as it is now: a grant approved after a re-key would go to whoever re-keyed it.
+  const id = db.prepare('INSERT INTO silicon_grant_requests (did, agent_name, permission_type, resource, label, agent_token_hash, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(actor.did, agent.agent_name, 'action:browser_fill', resource, cleanLabel(label, 300), agent.token_hash, expiresAt).lastInsertRowid;
   res.status(202).json({ ok: true, status: 'pending', grant_request_id: Number(id), agent_name: agent.agent_name, permission: 'action:browser_fill', resource,
     expires_in: GRANT_REQUEST_TTL_SEC, approve_in: 'the DemiPass wallet on your phone, with your vault PIN' });
 }
@@ -11952,8 +11957,12 @@ app.post('/api/blindkey/silicon/grants/:id/approve', rateLimitFill, (req, res) =
   if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('grant', ['pin'], ['pin'], intent));
   const refused = spendSingleUse(auth.did, 'grant', ['pin'], auth, intent);
   if (refused) return res.status(refused.status || 403).json(refused);
-  const agent = db.prepare("SELECT 1 FROM silicon_agents WHERE agent_name = ? AND carbon_did = ? AND status = 'active'").get(row.agent_name, auth.did);
+  const agent = db.prepare("SELECT token_hash FROM silicon_agents WHERE agent_name = ? AND carbon_did = ? AND status = 'active'").get(row.agent_name, auth.did);
   if (!agent) return res.status(404).json({ error: 'the agent was removed since the request' });
+  if (!row.agent_token_hash || agent.token_hash !== row.agent_token_hash) {
+    db.prepare("UPDATE silicon_grant_requests SET status = 'denied', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(row.id);
+    return res.status(409).json({ error: "the agent's token was reset since this grant was asked for; ask again" });
+  }
   const changed = db.prepare("UPDATE silicon_grant_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(row.id).changes;
   if (changed !== 1) return res.status(409).json({ error: 'this grant request was decided meanwhile' });
   if (!db.prepare("SELECT 1 FROM silicon_permissions WHERE agent_name = ? AND permission_type = ? AND resource = ? AND status = 'active'").get(row.agent_name, row.permission_type, row.resource)) {

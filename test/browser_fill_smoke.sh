@@ -185,6 +185,21 @@ call POST /api/blindkey/silicon/permissions "$E" '{"agent_name":"fleet-a1","perm
 [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J resource)" = "$REF2" ] && ok "a grant asked by name is stored by ref" || fail "grant by name: $CODE $BODY"
 call POST /api/blindkey/silicon/grants/$(echo "$BODY" | J grant_request_id)/deny "$Wt"
 
+# ── re-audit cf93dd9: a waiting grant does not survive a re-key ──
+call POST /api/blindkey/silicon/permissions "$E" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"'$REF2'"}'; PG=$(echo "$BODY" | J grant_request_id)
+call POST /api/blindkey/silicon/token/reset "$E" '{"agent_name":"fleet-a1"}'; SIL=$(echo "$BODY" | J token)
+call POST /api/identity/gate/verify "$Wt" '{"gate":"pin","pin":"4321","intent":"grant:'$PG'"}'
+call POST /api/blindkey/silicon/grants/$PG/approve "$Wt"; [ "$CODE" = 409 ] && ok "a grant asked before a token reset cannot be approved after it" || fail "pending grant after reset: $CODE $BODY"
+call POST /api/blindkey/fill/request "$SIL" '{"ref":"'$REF2'","origin":"'$ORIG'"}'; [ "$CODE" = 403 ] && ok "…and the re-keyed agent gets nothing" || fail "re-key fill: $CODE $BODY"
+call POST /api/blindkey/silicon/permissions "$E" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"'$REF2'"}'; PG=$(echo "$BODY" | J grant_request_id)
+SQL "UPDATE silicon_agents SET token_hash = 'rekeyed-elsewhere' WHERE agent_name = 'fleet-a1'"
+call POST /api/identity/gate/verify "$Wt" '{"gate":"pin","pin":"4321","intent":"grant:'$PG'"}'
+call POST /api/blindkey/silicon/grants/$PG/approve "$Wt"; [ "$CODE" = 409 ] && ok "approval checks the agent's token, whatever re-keyed it" || fail "token-bound grant: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"'$REF2'","value":"decoy-1","secret_type":"password","origins":["https://evil.example.net"]}'
+call POST /api/blindkey/silicon/token/reset "$E" '{"agent_name":"fleet-a1"}'; SIL=$(echo "$BODY" | J token)
+SQL "INSERT INTO silicon_permissions (agent_name, permission_type, resource) VALUES ('fleet-a1', 'action:browser_fill', '$REF2')"
+call GET "/api/blindkey/fill/candidates?origin=https://evil.example.net" "$SIL"; [ "$(echo "$BODY" | J candidates)" = "[]" ] && ok "a grant by ref does not match a login named like that ref" || fail "ref/name collision: $BODY"
+
 # ── website logins keep their binding (review should-fix 3+4) ──
 CTX(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM blindkey_contexts x JOIN blindkey_secrets s ON s.id=x.secret_id WHERE s.name=?', (sys.argv[2],)).fetchone()[0])" "$DB_PATH" "$1"; }
 call POST /api/blindkey/store "$E" '{"name":"agent-login","value":"changed-pass-1","secret_type":"password"}'
