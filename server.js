@@ -3172,7 +3172,13 @@ function fillSecret(did, { ref, name }) {
   return null;
 }
 // Explicit grant only: exact permission type, resource = this secret's ref or name, or '*'.
+// A grant is approved with the PIN alone, so it never covers a login whose reveal needs more (it may be raised later).
+function agentFillable(secret) {
+  const r = resolveGatePolicy(secret).reveal;
+  return r.length === 1 && r[0] === 'pin';
+}
 function siliconMayFill(agentName, secret) {
+  if (!agentFillable(secret)) return false;
   return Boolean(db.prepare(
     "SELECT 1 FROM silicon_permissions WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active' AND (expires_at = '' OR expires_at IS NULL OR expires_at > datetime('now')) AND resource IN ('*', ?, ?)"
   ).get(agentName, secret.ref_code || '', secret.name));
@@ -3241,6 +3247,7 @@ app.post('/api/blindkey/fill/request', rateLimitFill, (req, res) => {
   }
   let status = 'pending';
   if (auth.silicon) {
+    if (!agentFillable(secret)) return res.status(403).json({ error: 'this login needs more than the PIN to reveal, so agents cannot fill it' });
     if (!siliconMayFill(auth.agent_name, secret)) {
       logSecurityEvent('fill_blocked_silicon', 'warn', { caller_did: auth.did, agent_name: auth.agent_name, capability: 'browser_fill', target: secret.name, ip: req.ip, context: { origin } });
       return res.status(403).json({ error: `silicon '${auth.agent_name}' holds no action:browser_fill grant for this secret` });
@@ -11818,6 +11825,7 @@ app.post('/api/blindkey/silicon/register', rateLimitStandard, (req, res) => {
 app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
+  if (!personActor(req, res)) return;
   const { agent_name } = req.body || {};
   if (!agent_name) return res.status(400).json({ error: 'agent_name required' });
 
@@ -11827,8 +11835,11 @@ app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
   const rawToken = 'silicon:' + crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
   db.prepare('UPDATE silicon_agents SET token_hash = ? WHERE id = ?').run(tokenHash, agent.id);
+  // A fill grant was approved with the PIN for the agent as it was keyed then; a new token must be approved again.
+  const dropped = db.prepare("UPDATE silicon_permissions SET status = 'revoked' WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active'").run(agent_name).changes;
 
-  res.json({ ok: true, agent_name, token: rawToken, note: 'Previous token is immediately invalidated. SAVE THIS TOKEN.' });
+  res.json({ ok: true, agent_name, token: rawToken, note: 'Previous token is immediately invalidated. SAVE THIS TOKEN.',
+    ...(dropped ? { browser_fill_grants_revoked: dropped, browser_fill_note: 'grant action:browser_fill again; the wallet approves it with your PIN' } : {}) });
 });
 
 // GET /api/silicon/agents — list silicon agents under a carbon
@@ -11900,8 +11911,10 @@ function requestFillGrant(req, res, actor, agent, resource) {
   if (actor.mode === 'admin') return res.status(403).json({ error: 'action:browser_fill is approved by the account owner in the wallet, not by the admin key' });
   let label = 'every website login';
   if (resource !== '*') {
-    const s = db.prepare("SELECT name, ref_code, fill_username, fill_origins FROM blindkey_secrets WHERE did = ? AND status = 'active' AND (ref_code = ? OR name = ?)").get(actor.did, resource, resource);
+    const s = db.prepare("SELECT name, ref_code, fill_username, fill_origins, security_depth, gate_policy FROM blindkey_secrets WHERE did = ? AND status = 'active' AND (ref_code = ? OR name = ?)").get(actor.did, resource, resource);
     if (!s) return res.status(404).json({ error: 'resource: no active login with that ref or name' });
+    if (!agentFillable(s)) return res.status(403).json({ error: 'this login needs more than the PIN to reveal; an agent fill would skip those factors — lower its security depth to standard first' });
+    resource = s.ref_code || s.name;   // a grant names this login, not whatever later takes its name
     label = s.name + (s.fill_username ? ` (${s.fill_username})` : '') + ' on ' + (browserFill.storedOrigins(s.fill_origins).join(', ') || 'no origin yet');
   }
   if (db.prepare("SELECT 1 FROM silicon_permissions WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND resource = ? AND status = 'active'").get(agent.agent_name, resource)) {
@@ -11961,6 +11974,7 @@ app.post('/api/blindkey/silicon/grants/:id/deny', rateLimitFill, (req, res) => {
 app.delete('/api/blindkey/silicon/permissions', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
+  if (!personActor(req, res)) return;
   const { agent_name, permission_type, resource } = req.body || {};
   if (!agent_name || !permission_type) return res.status(400).json({ error: 'agent_name and permission_type required' });
   const agent = db.prepare('SELECT * FROM silicon_agents WHERE agent_name = ? AND carbon_did = ?').get(agent_name, actor.did);

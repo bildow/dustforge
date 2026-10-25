@@ -92,7 +92,11 @@ refresh happens anyway, ask again. A silicon's session is its agent identity.
 - The wallet lists it under `grants` in `GET /api/blindkey/fill/pending` (`{ id, intent:'grant:<id>', agent_name,
   resource, label }`). Approve: PIN for `intent` → `POST /api/blindkey/silicon/grants/<id>/approve`. Deny:
   `POST /api/blindkey/silicon/grants/<id>/deny`.
-- The admin key cannot grant it. Prefer one grant per login; `*` covers every website login the owner has.
+- The admin key cannot grant it. A grant is stored by the login's ref. Prefer one grant per login; `*` covers
+  every website login the owner has at standard depth.
+- Agents fill only logins whose reveal needs the PIN alone (standard depth): a grant is approved with the PIN, so
+  it never stands in for more factors. A login raised above standard is refused to agents, even under `*`.
+- Resetting an agent's token revokes its `action:browser_fill` grants; grant them again for the new token.
 
 ### Limits
 - At most 20 fill requests (and 20 grants) wait per person; the 21st is 429.

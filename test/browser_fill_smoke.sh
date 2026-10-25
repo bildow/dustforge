@@ -168,6 +168,23 @@ call POST /api/blindkey/silicon/grants/$GID2/deny "$Wt"; [ "$CODE" = 200 ] && ok
 call POST /api/blindkey/fill/request "$SIL" '{"ref":"'$REF'","origin":"'$ORIG'"}'; [ "$CODE" = 403 ] && ok "denied grant gives nothing" || fail "denied grant: $CODE $BODY"
 call POST /api/blindkey/silicon/grants/$GID2/approve "$SIL"; [ "$CODE" = 403 ] && ok "a silicon cannot decide grants" || fail "silicon decides grant: $CODE $BODY"
 
+# ── re-audit 771caab: token reset drops fill grants; agents fill standard-depth logins only ──
+call POST /api/blindkey/silicon/token/reset "$SIL" '{"agent_name":"fleet-a1"}'; [ "$CODE" = 403 ] && ok "a silicon cannot reset an agent's token" || fail "silicon reset: $CODE $BODY"
+call DELETE /api/blindkey/silicon/permissions "$SIL" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"'$REF2'"}'; [ "$CODE" = 403 ] && ok "a silicon cannot revoke grants" || fail "silicon revoke: $CODE $BODY"
+call POST /api/blindkey/silicon/token/reset "$E" '{"agent_name":"fleet-a1"}'
+NSIL=$(echo "$BODY" | J token); [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J browser_fill_grants_revoked)" = 1 ] && ok "token reset revokes the agent's fill grants" || fail "reset: $CODE $(echo "$BODY" | J browser_fill_grants_revoked)"
+call POST /api/blindkey/fill/request "$NSIL" '{"ref":"'$REF2'","origin":"'$ORIG'"}'; [ "$CODE" = 403 ] && ok "the re-keyed agent cannot fill until granted again" || fail "re-keyed fill: $CODE $BODY"
+SIL=$NSIL
+call POST /api/blindkey/store "$E" '{"name":"deep-login","value":"deep-value-1","secret_type":"password","origins":["'$ORIG'"]}'; DREF=$(echo "$BODY" | J ref)
+SQL "UPDATE blindkey_secrets SET security_depth = 'elevated' WHERE ref_code = '$DREF'"
+call POST /api/blindkey/silicon/permissions "$E" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"'$DREF'"}'; [ "$CODE" = 403 ] && ok "no grant request for a login that needs more than the PIN" || fail "deep grant: $CODE $BODY"
+SQL "INSERT INTO silicon_permissions (agent_name, permission_type, resource) VALUES ('fleet-a1', 'action:browser_fill', '*')"
+call POST /api/blindkey/fill/request "$SIL" '{"ref":"'$DREF'","origin":"'$ORIG'"}'; [ "$CODE" = 403 ] && ok "a * grant does not cover a login raised above standard depth" || fail "deep fill: $CODE $BODY"
+SQL "UPDATE silicon_permissions SET status = 'revoked' WHERE agent_name = 'fleet-a1' AND resource = '*'"
+call POST /api/blindkey/silicon/permissions "$E" '{"agent_name":"fleet-a1","permission_type":"action:browser_fill","resource":"agent-login"}'
+[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J resource)" = "$REF2" ] && ok "a grant asked by name is stored by ref" || fail "grant by name: $CODE $BODY"
+call POST /api/blindkey/silicon/grants/$(echo "$BODY" | J grant_request_id)/deny "$Wt"
+
 # ── website logins keep their binding (review should-fix 3+4) ──
 CTX(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT COUNT(*) FROM blindkey_contexts x JOIN blindkey_secrets s ON s.id=x.secret_id WHERE s.name=?', (sys.argv[2],)).fetchone()[0])" "$DB_PATH" "$1"; }
 call POST /api/blindkey/store "$E" '{"name":"agent-login","value":"changed-pass-1","secret_type":"password"}'
