@@ -17,7 +17,8 @@ Base URL: `https://api.dustforge.com`. Every call carries `Authorization: Bearer
 ## Origins
 
 A secret is filled only into a page whose origin is bound to it. An origin is
-`new URL(x).origin`: `https://host[:port]`. Plain `http:` is accepted only for
+`new URL(x).origin`: `https://host[:port]`. Opaque origins (`about:blank`,
+`data:`, sandboxed frames — origin `null`) are refused. Plain `http:` is accepted only for
 `localhost` and `127.0.0.1`. Matching is exact — `https://login.example.com` and
 `https://example.com` are different origins; bind both if both are used. At most
 10 origins per secret.
@@ -31,7 +32,10 @@ A secret is filled only into a page whose origin is bound to it. An origin is
   `candidates` and `redeem`. It is a separate field from the SSH `username`
   binding (dustforge PR #10), which only accepts SSH account names.
 
-For a website login use `secret_type: 'password'`. Storing again under the same
+For a website login use `secret_type: 'password'`; for a pasted key, `api_key` or
+`oauth_token` (`token` is not a type — it silently becomes `api_key`). A secret
+stored with origins gets no default `/use` context: it is for browser fill only.
+`/store` needs a `write`-scoped token or better. Storing again under the same
 name replaces the value; `origins`/`login` left out keep what was there.
 
 ### `POST /api/blindkey/origins` — carbon only
@@ -54,7 +58,11 @@ secrets it holds `action:browser_fill` for (resource `<ref>`, `<name>` or `*`).
 `request_id` is an opaque string (`dpf_…`). `client_label` is display-only.
 
 ### `POST /api/blindkey/fill/redeem`
-`{ request_id }` — only the session that made the request can redeem it.
+`{ request_id }` — only the session that made the request can redeem it. A
+carbon session is one access token (its `jti`): a token refreshed while the
+request waits gets a new session, and the old request answers 404. So refresh
+*before* asking when the access token expires within 5 minutes, and if a
+refresh happens anyway, ask again. A silicon's session is its agent identity.
 - 428 `{ error: 'approval_pending' }` — poll again (every 2 s is fine).
 - 403 `{ error: 'denied' }`, 410 `{ error: 'expired' | 'already_redeemed' }`.
 - 200 `{ ok, value, username, origin, name, ref }` — once. The request is then

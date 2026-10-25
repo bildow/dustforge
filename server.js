@@ -3065,8 +3065,10 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
 
     // Auto-create a default context so the secret is immediately usable.
     // Without this, secrets stored via the app have no context and can't get tokens.
+    // A website login (stored with origins) is for browser fill only: no default ssh_exec/http context to any host.
     const existingCtx = db.prepare('SELECT id FROM blindkey_contexts WHERE secret_id = ?').get(stored.id);
-    if (!existingCtx) {
+    const websiteLogin = resolvedOrigins !== null && JSON.parse(resolvedOrigins).length > 0;
+    if (!existingCtx && !websiteLogin) {
       const typeToAction = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
       const defaultAction = typeToAction[resolvedType] || 'http_header';
       db.prepare(

@@ -54,6 +54,9 @@ call POST /api/blindkey/store "$E" '{"name":"example-login","value":"'$VAL'","se
 call POST /api/blindkey/store "$E" '{"name":"example-login","value":"'$VAL'","secret_type":"password","origins":["https://login.example.com/signin?x=1","http://localhost:8080/a"],"login":"me@example.com"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J origins.0)" = "$ORIG" ] && [ "$(echo "$BODY" | J origins.1)" = http://localhost:8080 ] && ok "store binds normalized origins (path and query dropped, localhost http kept)" || fail "store: $CODE $BODY"
 REF=$(echo "$BODY" | J ref)
+python3 - "$DB_PATH" "$REF" <<'PY2' && ok "a website login gets no default context (no ssh_exec/http use to any host)" || fail "website login got a default context"
+import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); n=c.execute("SELECT COUNT(*) FROM blindkey_contexts x JOIN blindkey_secrets s ON s.id=x.secret_id WHERE s.ref_code=?", (sys.argv[2],)).fetchone()[0]; sys.exit(0 if n==0 else 1)
+PY2
 call POST /api/blindkey/store "$E" '{"name":"example-login","value":"'$VAL'","secret_type":"password"}'
 call GET "/api/blindkey/fill/candidates?origin=$ORIG" "$E"
 [ "$(echo "$BODY" | J candidates.0.ref)" = "$REF" ] && [ "$(echo "$BODY" | J candidates.0.username)" = me@example.com ] && ok "re-store without origins/login keeps both; candidates list it with its login" || fail "keep on re-store: $BODY"
