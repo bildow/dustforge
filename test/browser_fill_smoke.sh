@@ -237,6 +237,21 @@ call POST /api/blindkey/store "$E" '{"name":"gone-login","value":"second-2","sec
 call GET "/api/blindkey/fill/candidates?origin=$ORIG" "$E"
 python3 -c 'import json,sys; sys.exit(0 if any(c["name"]=="gone-login" for c in json.load(sys.stdin)["candidates"]) else 1)' <<<"$BODY" && ok "re-saving a deleted login's name makes a live, fillable entry" || fail "dead-name store: $BODY"
 
+# ── dead and rotated names (PR #18 review) ──
+call POST /api/blindkey/store "$E" '{"name":"tw","value":"tw-1","secret_type":"password"}'
+TWID=$(python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"SELECT id FROM blindkey_secrets WHERE name='tw'\").fetchone()[0])" "$DB_PATH")
+call DELETE /api/blindkey/delete "$E" '{"name":"tw"}'
+call POST /api/blindkey/store "$E" '{"name":"tw~'$TWID'","value":"squatter","secret_type":"password"}'
+call POST /api/blindkey/store "$E" '{"name":"tw","value":"tw-2","secret_type":"password"}'; [ "$CODE" = 200 ] && ok "a live row named <name>~<id> cannot block re-storing <name>" || fail "squat: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"aws","value":"aws-1","secret_type":"api_key"}'
+call POST /api/blindkey/rotate "$E" '{"name":"aws","new_value":"aws-2"}'
+call POST /api/blindkey/store "$E" '{"name":"aws","value":"aws-x","secret_type":"api_key"}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q aws_v2 && ok "storing a name in its rotation grace → 409 naming the current version" || fail "rotating store: $CODE $BODY"
+SQL "UPDATE blindkey_secrets SET status = 'retired' WHERE name = 'aws'"
+call POST /api/blindkey/store "$E" '{"name":"aws","value":"aws-y","secret_type":"api_key"}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q aws_v2 && ok "storing a rotated-away name → 409 naming the current version (no unreachable twin)" || fail "retired store: $CODE $BODY"
+call POST /api/blindkey/store "$E" '{"name":"aws_v2","value":"aws-z","secret_type":"api_key"}'; [ "$CODE" = 200 ] && ok "storing under the current version works" || fail "current version store: $CODE $BODY"
+
 # ── where the value appeared ──
 AFTER=$(grep -c -- "$VAL" "$ALL")
 [ "$BEFORE" = 0 ] && [ "$AFTER" = 2 ] && ok "the value appears in exactly the two redeem replies, nowhere else" || fail "value appeared before=$BEFORE after=$AFTER"

@@ -2443,6 +2443,27 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_fill_req_did ON blindkey_fill_requ
 //            'delegated' = someone delegated this to you, you cannot rotate the source
 try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_ref ON blindkey_secrets(ref_code) WHERE ref_code != ''"); } catch(_) {}
 
+// Before an upsert by (did, name), which would otherwise write into whatever row holds the name:
+// - a deleted, retired or revoked row moves aside (renamed <name>~<id>~<random>, history stays under its id), so
+//   the value lands in a fresh live entry;
+// - a name whose rotation moved on is refused, naming the current version: the value would land in a row on its
+//   way out, or beside a lineage /rotate never reaches.
+// Returns null, or the refusal message (409).
+const DEAD_SECRET_STATUSES = new Set(['deleted', 'retired', 'revoked']);
+function clearNameForStore(did, name) {
+  const row = db.prepare('SELECT id, status FROM blindkey_secrets WHERE did = ? AND name = ?').get(did, name);
+  if (!row || row.status === 'active') return null;
+  const base = String(name).replace(/_v\d+$/, '');
+  const current = db.prepare("SELECT name FROM blindkey_secrets WHERE did = ? AND status = 'active' AND (name = ? OR substr(name, 1, ?) = ?) ORDER BY version DESC")
+    .all(did, base, base.length + 2, base + '_v').find(r => r.name !== name && (r.name === base || /^_v\d+$/.test(r.name.slice(base.length))));
+  if (current) return `'${name}' was rotated; the current version is '${current.name}' — store under that name`;
+  if (row.status === 'rotating') return `'${name}' is being rotated; store under its new version`;
+  if (DEAD_SECRET_STATUSES.has(row.status)) {
+    db.prepare('UPDATE blindkey_secrets SET name = ? WHERE id = ?').run(`${name}~${row.id}~${crypto.randomBytes(4).toString('hex')}`, row.id);
+  }
+  return null;
+}
+
 function generateRefCode(secretType, name) {
   const prefix = { api_key: 'API', password: 'PWD', token: 'TKN', ssh_key: 'SSH', cert: 'CRT', other: 'SEC' }[secretType] || 'SEC';
   const slug = name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toLowerCase();
@@ -3038,9 +3059,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     const resolvedOwnership = ['sole', 'shared', 'delegated'].includes(ownership) ? ownership : 'sole';
     const resolvedRotatable = rotatable === false || rotatable === 0 ? 0 : 1;
 
-    // A deleted, retired or revoked entry under this name moves aside: the upsert below would otherwise write the
-    // new value into that dead row, which nothing lists, uses or fills. Its history stays under its id.
-    db.prepare("UPDATE blindkey_secrets SET name = name || '~' || id WHERE did = ? AND name = ? AND status IN ('deleted', 'retired', 'revoked')").run(req.identity.did, name);
+    const nameRefused = clearNameForStore(req.identity.did, name);
+    if (nameRefused) return res.status(409).json({ error: nameRefused });
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, expires_at, provider, ownership, rotatable, category, labels, rotation_interval_days)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -4769,6 +4789,8 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
 
   try {
     const encrypted = blindkeyEncrypt(value);
+    const nameRefused = clearNameForStore(resolvedTargetDid, name);
+    if (nameRefused) return res.status(409).json({ error: nameRefused });
     const metaJson = metadata ? JSON.stringify(metadata) : '{}';
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
@@ -4835,6 +4857,8 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
       try {
         const encrypted = blindkeyEncrypt(s.value);
         const metaJson = s.metadata ? JSON.stringify(s.metadata) : '{}';
+        const nameRefused = clearNameForStore(s.target_did, s.name);
+        if (nameRefused) { errors.push({ index: i, error: nameRefused }); continue; }
         insertStmt.run(s.target_did, s.name, s.description || '', resolvedType, encrypted, metaJson);
         const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
         results.push({ ok: true, secret_id: inserted.id, name: s.name, secret_type: resolvedType, target_did: s.target_did });
@@ -5041,6 +5065,8 @@ function handleRowenIngest(req, res) {
 
   try {
     const encrypted = blindkeyEncrypt(value);
+    const nameRefused = clearNameForStore(target_did, name);
+    if (nameRefused) return res.status(409).json({ error: nameRefused });
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
       VALUES (?, ?, ?, ?, ?, ?)

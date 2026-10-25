@@ -39,7 +39,9 @@ For a website login use `secret_type: 'password'`; for a pasted key, `api_key` o
 stored with origins gets no default `/use` context: it is for browser fill only.
 `/store` needs a `write`-scoped token or better. Storing again under the same
 name replaces the value; `origins`/`login` left out keep what was there. A deleted, retired or revoked entry
-under that name is moved aside (renamed `<name>~<id>`), so the store makes a new live entry.
+under that name is moved aside (renamed `<name>~<id>~<random>`), so the store makes a new live entry. A name
+whose rotation moved on (it is rotating, or retired with an active `<name>_vN`) answers 409 naming the current
+version: store under that name.
 
 ### `POST /api/blindkey/origins` — carbon only
 `{ ref | name, origins: [...], mode: 'add' | 'set' }` → `{ ok, ref, origins }`.
