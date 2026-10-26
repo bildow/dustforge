@@ -43,6 +43,9 @@ module.exports = function registerFleetRoutes(deps) {
     const role = m ? m.role : (fleet.owner_did === who.did ? 'owner' : null);
     if (!role) { res.status(403).json({ error: 'fleet membership required' }); return null; }
     if (roles && !roles.includes(role)) { res.status(403).json({ error: `${roles.join(' or ')} role required` }); return null; }
+    // A token some fleet owner minted for this wallet acts as the wallet, but never runs the wallet's own fleet:
+    // otherwise an owner reaches, through a member, the member's agents.
+    if (roles && who.decoded.auth_method === 'fleet_owner_mint') { res.status(403).json({ error: 'a fleet-minted token cannot manage a fleet; sign in as this wallet' }); return null; }
     return { ...who, fleet, role };
   }
   function sendMail({ to, subject, text }) {
@@ -61,9 +64,12 @@ module.exports = function registerFleetRoutes(deps) {
     const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did);
     return w ? w.username : null;
   }
-  function siliconOr404(res, fleet, handle) {
+  // Only an active silicon (it consented) is managed: one waiting on its claim link is listed, and can be edited
+  // or removed (allowPending), but never gets a token, DD, secrets, workers or a detail view.
+  function siliconOr404(res, fleet, handle, { allowPending = false } = {}) {
     const s = fb.getSilicon(db, fleet.id, handle);
     if (!s || s.status === 'removed') { res.status(404).json({ error: 'silicon not found in this fleet' }); return null; }
+    if (s.status !== 'active' && !(allowPending && s.status === 'pending_claim')) { res.status(409).json({ error: `@${s.handle} has not confirmed joining the fleet yet` }); return null; }
     return s;
   }
   function projectRows(fleet) {
@@ -127,7 +133,12 @@ module.exports = function registerFleetRoutes(deps) {
     if (contactEmail && !EMAIL_RE.test(contactEmail)) return res.status(400).json({ error: 'contact_email: invalid' });
     const prior = fb.getSilicon(db, fleet.id, handle);
     if (prior && prior.status !== 'removed') return res.status(409).json({ error: 'handle already used in this fleet' });
-    if (prior) db.prepare('DELETE FROM fleet_silicons WHERE id = ?').run(prior.id);   // a removed silicon can be re-added
+    // The wallet's own row in this fleet, under any handle: an active or invited one is not added twice, and one that
+    // joined through the network comes back through the network (it keeps its key), never through a claim link.
+    const memberOf = did => db.prepare('SELECT * FROM fleet_silicons WHERE fleet_id = ? AND member_did = ?').get(fleet.id, did);
+    // A removed silicon's handle can be reused: its row is renamed out of the way (kept, with how it joined), only
+    // once every check below has passed, in the same transaction as the new row.
+    const freePrior = (memberDid) => { if (prior && prior.member_did !== memberDid) db.prepare("UPDATE fleet_silicons SET handle = handle || '~' || id WHERE id = ?").run(prior.id); };
     const refill = b.refill && typeof b.refill === 'object' ? b.refill : {};
 
     // Existing identity? by did, else by contact email.
@@ -144,24 +155,50 @@ module.exports = function registerFleetRoutes(deps) {
     try {
       if (wallet) {
         if (wallet.did === fleet.owner_did) return res.status(400).json({ error: 'the fleet owner is not a silicon of their own fleet' });
-        const other = db.prepare("SELECT f.slug FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.member_did = ? AND s.fleet_id != ? AND s.status = 'active'").get(wallet.did, fleet.id);
-        if (other) return res.status(409).json({ error: `identity is already a silicon of fleet '${other.slug}'` });
+        const own = memberOf(wallet.did);
+        if (own && own.status !== 'removed') return res.status(409).json({ error: `that wallet is already in this fleet as @${own.handle}` });
+        // The marker is history, not the row (rows elsewhere are cleared when a wallet joins another fleet): a wallet
+        // that ever joined this owner's fleet through the network comes back only through the network.
+        let viaNetwork = Boolean(own && own.joined_via === 'network');
+        try {
+          viaNetwork = viaNetwork || Boolean(db.prepare(`SELECT 1 FROM network_requests WHERE status = 'accepted' AND
+            ((kind = 'agent' AND requester_did = ? AND target_did = ?) OR (kind = 'join' AND requester_did = ? AND target_did = ?)) LIMIT 1`)
+            .get(fleet.owner_did, wallet.did, wallet.did, fleet.owner_did));
+        } catch (_) { /* no network table yet: nothing joined through it */ }
+        if (viaNetwork && !isAdminReq(req)) return res.status(409).json({ error: 'that wallet joined through the network; invite it again there (it keeps its own key)' });
+        const why = fb.joinBlocker(db, fleet, wallet.did);
+        if (why) return res.status(409).json({ error: why });
+        if (db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status = 'pending_claim'").get(wallet.did, fleet.id)) {
+          return res.status(409).json({ error: 'that wallet has an open invitation from another fleet' });
+        }
         // consent: member token, admin key, or mailbox claim
         let proof = null;
         if (b.member_token) {
           const v = identity.verifyTokenStandalone(String(b.member_token));
-          if (v.valid && v.decoded.sub === wallet.did) proof = 'member_token';
-          else return res.status(403).json({ error: 'member_token does not belong to that identity' });
+          if (!v.valid || v.decoded.sub !== wallet.did) return res.status(403).json({ error: 'member_token does not belong to that identity' });
+          if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(403).json({ error: 'member_token is revoked' });
+          // Consent comes from the wallet itself, not from a token some fleet owner minted for it.
+          if (v.decoded.auth_method === 'fleet_owner_mint' || v.decoded.auth_method === 'worker' || v.decoded.wrk) {
+            return res.status(403).json({ error: 'member_token must be the wallet\'s own sign-in token, not a fleet-minted or worker one' });
+          }
+          proof = 'member_token';
         } else if (isAdminReq(req)) proof = 'admin';
-        const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill });
+        // Every check passed: free the handle, clear the wallet's removed rows elsewhere (its silicon id is unique),
+        // write its row (its own removed row here, under any handle, is updated in place) — together or not at all.
+        let s, claim = null;
+        db.transaction(() => {
+          freePrior(wallet.did);
+          fb.clearStaleSiliconRows(db, wallet.did, fleet.id);
+          s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill });
+          if (proof) db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, wallet.did);
+          else claim = fb.issueClaim(db, s);
+        })();
         if (proof) {
-          db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, wallet.did);
           const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet, apiBase });
           sendMail({ to: s.contact_email, subject: `DemiPass: ${handle} joined fleet ${fleet.slug} — your DID record`, text });
           log(`linked ${handle} (${wallet.did}) into ${fleet.slug} via ${proof}`);
           return res.json({ ok: true, mode: 'linked', proof, silicon: fb.siliconView(db, billing, s, { fleet }) });
         }
-        const claim = fb.issueClaim(db, s);
         const claimUrl = `${apiBase}/api/fleet/claim/${claim.code}`;
         const sent = await sendMail({ to: wallet.email, subject: `DemiPass: confirm joining fleet ${fleet.slug} as ${handle}`, text: fb.claimEmail({ silicon: s, fleet, claimUrl }) });
         log(`claim issued for ${handle} (${wallet.did}) in ${fleet.slug}; mail ${sent ? 'sent' : 'NOT sent'} to ${wallet.email}`);
@@ -170,6 +207,7 @@ module.exports = function registerFleetRoutes(deps) {
       }
 
       // Create a brand-new identity (mailbox + wallet), charged like /provision.
+      if (fb.activeFleetOf(db, fleet.owner_did)) return res.status(409).json({ error: 'the fleet owner is an agent in a fleet, so it cannot take agents' });
       const create = b.create && typeof b.create === 'object' ? b.create : {};
       const username = String(create.username || handle).toLowerCase();
       if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'username must be 3-31 chars, lowercase alphanumeric' });
@@ -196,6 +234,7 @@ module.exports = function registerFleetRoutes(deps) {
         db.prepare("INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, id.did);
       });
       txn();
+      freePrior(id.did);
       const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
       const walletRow = { username, email: emailResult.email };
       const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet: walletRow, apiBase });
@@ -208,10 +247,19 @@ module.exports = function registerFleetRoutes(deps) {
     } catch (e) { return fail(res, e); }
   });
 
-  // One-time mailbox claim link (no auth; the code is the proof).
+  // One-time mailbox claim link (no auth; the code is the proof). Opening it only shows what joining means; the
+  // button POSTs — a mail scanner or an agent that fetches links does not consent by fetching.
+  const escHtml = v => String(v == null ? '' : v).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
   app.get('/api/fleet/claim/:code', rateLimitStandard, (req, res) => {
+    const row = db.prepare("SELECT s.handle, f.name FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.claim_code = ? AND s.status = 'pending_claim'").get(fb.hashToken(req.params.code || ''));
+    if (!row) return res.status(400).send('<html><body style="font-family:sans-serif;padding:2rem"><h2>DemiPass fleet</h2><p>unknown or already used claim.</p></body></html>');
+    res.set('Cache-Control', 'no-store').send(`<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"></head><body style="font-family:sans-serif;padding:2rem;max-width:36rem">
+<h2>DemiPass fleet</h2><p>The fleet <strong>${escHtml(row.name)}</strong> wants to add this wallet as <strong>@${escHtml(row.handle)}</strong>. Its owner could then mint tokens for this wallet (acting as it), refill it, and give it secrets.</p>
+<form method="post"><button type="submit" style="padding:0.7rem 1.4rem;font-size:1rem">Join the fleet</button></form><p style="color:#666">Not expected? Close this page; nothing happens.</p></body></html>`);
+  });
+  app.post('/api/fleet/claim/:code', rateLimitStandard, (req, res) => {
     const r = fb.redeemClaim(db, req.params.code);
-    if (!r.ok) return res.status(400).send(`<html><body style="font-family:sans-serif;padding:2rem"><h2>DemiPass fleet</h2><p>${r.error}.</p></body></html>`);
+    if (!r.ok) return res.status(400).send(`<html><body style="font-family:sans-serif;padding:2rem"><h2>DemiPass fleet</h2><p>${String(r.error).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)}.</p></body></html>`);
     const fleet = db.prepare('SELECT * FROM fleets WHERE id = ?').get(r.silicon.fleet_id);
     const wallet = db.prepare('SELECT username, email FROM identity_wallets WHERE did = ?').get(r.silicon.member_did) || {};
     sendMail({ to: r.silicon.contact_email || wallet.email, subject: `DemiPass: ${r.silicon.handle} joined fleet ${fleet.slug} — your DID record`,
@@ -225,24 +273,30 @@ module.exports = function registerFleetRoutes(deps) {
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
     const ownerView = ['owner', 'admin'].includes(a.role) || s.member_did === a.did;
     if (!ownerView) return res.status(403).json({ error: 'owner, admin, or the silicon itself' });
-    const delegations = db.prepare(`SELECT d.id, d.status, d.max_uses, d.use_count, d.granted_at, d.expires_at, b.name AS secret_name, b.ref_code, b.secret_type
+    // A wallet that joined through the network shows its owner only what is between them: its balance and spend,
+    // the owner's delegations to it, their work links. Its own secrets, workers and other links stay its own.
+    const narrow = s.joined_via === 'network' && s.member_did !== a.did;
+    const mine = row => !narrow || row.owner_did === a.fleet.owner_did;
+    const delegations = db.prepare(`SELECT d.id, d.status, d.max_uses, d.use_count, d.granted_at, d.expires_at, d.owner_did, b.name AS secret_name, b.ref_code, b.secret_type
                                     FROM demipass_delegations d JOIN blindkey_secrets b ON b.id = d.secret_id
-                                    WHERE d.delegate_did = ? ORDER BY d.granted_at DESC LIMIT 50`).all(s.member_did);
+                                    WHERE d.delegate_did = ? ORDER BY d.granted_at DESC LIMIT 50`).all(s.member_did).filter(mine);
+    const secrets = fb.siliconSecrets(db, s.member_did);
     res.json({
       ok: true,
       silicon: fb.siliconView(db, billing, s, { fleet: a.fleet }),
       recent: fb.recentSpend(db, s.member_did, 30),
       attribution: fb.attributionReport(db, { actorDids: [s.member_did], sinceDays: 30 }),
-      delegations, secrets: fb.siliconSecrets(db, s.member_did),
-      workers: fb.listWorkers(db, s.member_did).map(fb.workerView),
-      work_links: fb.listWorkLinks(db, s.member_did),
+      delegations, secrets: narrow ? { own: [], delegated: secrets.delegated.filter(mine) } : secrets,
+      workers: narrow ? [] : fb.listWorkers(db, s.member_did).map(fb.workerView),
+      work_links: fb.listWorkLinks(db, s.member_did).filter(l => !narrow || l.requester_did === a.fleet.owner_did || l.provider_did === a.fleet.owner_did),
       current_tick: fb.currentTick(db),
     });
   });
 
   app.patch('/api/fleet/:slug/silicons/:handle', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
-    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
+    if (s.joined_via === 'network' && (req.body || {}).contact_email !== undefined) return res.status(403).json({ error: `@${s.handle} joined through the network: its contact email is its own` });
     try {
       const updated = fb.updateSiliconSettings(db, s, req.body || {});
       res.json({ ok: true, silicon: fb.siliconView(db, billing, updated, { fleet: a.fleet }) });
@@ -251,9 +305,13 @@ module.exports = function registerFleetRoutes(deps) {
 
   app.delete('/api/fleet/:slug/silicons/:handle', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
-    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
-    db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
-    db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(a.fleet.id, s.member_did);
+    const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
+    db.transaction(() => {
+      db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, claim_code = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
+      db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(a.fleet.id, s.member_did);
+      fb.cutFleetTokens(db, s.member_did, a.fleet.slug);   // tokens this fleet minted for it stop working
+      fb.revokeOwnerWorkers(db, s.member_did, a.fleet.owner_did);   // and workers its owner made for it
+    })();
     log(`removed ${s.handle} from ${a.fleet.slug} by ${a.did}`);
     res.json({ ok: true });
   });
@@ -273,6 +331,7 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/token', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network and keeps its own key: it signs in itself` });
     const { scope = TOKEN_SCOPE_CAP, expires_in = '30d' } = req.body || {};
     if (!identity.ISSUABLE_SCOPES.includes(scope) || identity.scopeAtLeast(scope, 'admin')) return res.status(400).json({ error: `scope must be read, write or ${TOKEN_SCOPE_CAP}` });
     if (typeof expires_in !== 'string' || !/^\d+[smhd]$/.test(expires_in)) return res.status(400).json({ error: 'expires_in: e.g. 24h, 7d, 30d' });
@@ -368,6 +427,7 @@ module.exports = function registerFleetRoutes(deps) {
   function workerManager(req, res) {
     const who = bearer(req, res); if (!who) return null;
     if (who.decoded.wrk) { res.status(403).json({ error: 'a worker token cannot manage workers' }); return null; }
+    if (who.decoded.auth_method === 'fleet_owner_mint') { res.status(403).json({ error: 'a fleet-minted token cannot manage workers; sign in as this wallet' }); return null; }
     if (!identity.scopeAtLeast(who.scope, 'transact')) { res.status(403).json({ error: 'transact scope required' }); return null; }
     return who;
   }
@@ -422,17 +482,20 @@ module.exports = function registerFleetRoutes(deps) {
   app.get('/api/fleet/:slug/silicons/:handle/workers', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'] }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
-    res.json({ ok: true, workers: fb.listWorkers(db, s.member_did).map(fb.workerView) });
+    const ws = fb.listWorkers(db, s.member_did).filter(w => s.joined_via !== 'network' || w.created_by === a.fleet.owner_did);
+    res.json({ ok: true, workers: ws.map(fb.workerView) });
   });
   app.post('/api/fleet/:slug/silicons/:handle/workers', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network: it makes its own workers` });
     const r = createWorkerFrom(res, s.member_did, req.body || {}, a.did); if (!r) return;
     res.json({ ok: true, ...r });
   });
   app.post('/api/fleet/:slug/silicons/:handle/workers/:wid/token', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network: it mints its own worker tokens` });
     const w = fb.getWorker(db, req.params.wid);
     if (!w || w.parent_did !== s.member_did) return res.status(404).json({ error: 'worker not found' });
     if (w.status !== 'active') return res.status(409).json({ error: `worker is ${w.status}` });
@@ -443,7 +506,7 @@ module.exports = function registerFleetRoutes(deps) {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
     const w = fb.getWorker(db, req.params.wid);
-    if (!w || w.parent_did !== s.member_did) return res.status(404).json({ error: 'worker not found' });
+    if (!w || w.parent_did !== s.member_did || (s.joined_via === 'network' && w.created_by !== a.fleet.owner_did)) return res.status(404).json({ error: 'worker not found' });
     res.json({ ok: true, worker: fb.workerView(fb.revokeWorker(db, { wid: w.worker_id, byDid: a.did })) });
   });
   // Owner revokes one of their delegations to the silicon.

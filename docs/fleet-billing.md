@@ -63,7 +63,8 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
 | PATCH | `/api/fleet/:slug/projects/:project` | `{bill_mode: owner|project_wallet}` |
 | GET | `/api/fleet/:slug/attribution?days=30` | who paid for what |
 | POST | `/api/fleet/:slug/refills/run` | run the scheduler now |
-| GET | `/api/fleet/claim/:code` | one-time mailbox claim link (no auth) |
+| GET | `/api/fleet/claim/:code` | one-time mailbox claim link (no auth): shows what joining means |
+| POST | `/api/fleet/claim/:code` | the page's Join button: redeems the claim (a GET never does) |
 | GET | `/api/silicons/me` | a silicon's own view (any token) |
 | GET | `/api/silicons/resolve/:sid` | hashed id → handle/fleet (+DID for same-fleet) |
 | POST/GET | `/api/work-links` | create (`provider` = sil_ id, DID, username or `handle@fleet`; `ttl_ticks`, `ttl_seconds?`, `project?`, `note?`, `max_spend_cents?`) / list mine |

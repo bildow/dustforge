@@ -279,6 +279,14 @@ function checkTokenRevocation(db, decoded) {
     if (cut && decoded.iat && decoded.iat < cut.revoke_before) {
       return { revoked: true, reason: 'token revoked by revoke-all' };
     }
+    // A token a fleet owner minted for a member dies when the member leaves or is removed from that fleet.
+    if (decoded.auth_method === 'fleet_owner_mint') {
+      // A minted token without a fleet claim is checked against every cut of its wallet.
+      const fc = decoded.fleet
+        ? db.prepare('SELECT revoke_before FROM fleet_token_cuts WHERE did = ? AND fleet = ?').get(decoded.sub, String(decoded.fleet))
+        : db.prepare('SELECT MAX(revoke_before) AS revoke_before FROM fleet_token_cuts WHERE did = ?').get(decoded.sub);
+      if (fc && fc.revoke_before && (!decoded.iat || decoded.iat < fc.revoke_before)) return { revoked: true, reason: 'token revoked: the wallet left that fleet' };
+    }
   } catch (_) {}
   return { revoked: false };
 }

@@ -910,3 +910,100 @@ test('an agent fill grant shows the agent and the login, is allowed with the PIN
   assert.equal(pg.calls.filter(c => c.path === '/api/identity/gate/verify').length, 1, 'deny asked for no PIN');
   assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/silicon/grants/5/deny').length, 1);
 });
+
+// ── network: requests, agents joining a fleet, sending DD ─────────────────────────────────────────────
+function netRoutes(state) {
+  return async (p, body) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/fill/pending') return { json: { ok: true, requests: [], grants: [] } };
+    if (p === '/api/fleets/mine') return { json: { ok: true, fleets: [] } };
+    if (p === '/api/network') return { json: { ok: true, me: { did: 'did:key:zFixture', username: 'fixture', pin_set: true, balance_cents: 900 }, fleet: null, member_of: null,
+                                               people: state.people || [], agents: [], incoming: state.incoming || [], outgoing: [] } };
+    if (p === '/api/network/requests/4/accept') {
+      if (!state.pinFresh) return { status: 403, json: { error: 'joining a fleet needs your PIN', missing: ['pin'], required: ['pin'], intent: 'join:4' } };
+      state.pinFresh = false; state.incoming = []; return { json: { ok: true, kind: 'agent' } };
+    }
+    if (p === '/api/network/requests/4/decline') { state.incoming = []; return { json: { ok: true } }; }
+    if (p === '/api/network/transfers') { state.created = body; return { status: 201, json: { ok: true, transfer: { id: 7, intent: 'send:7', to: body.to, amount_cents: body.amount_cents, needs_pin: true } } }; }
+    if (p === '/api/network/transfers/7/confirm') {
+      if (!state.pinFresh) return { status: 403, json: { error: 'sending needs your PIN', missing: ['pin'], required: ['pin'], intent: 'send:7' } };
+      state.pinFresh = false; return { json: { ok: true, status: 'sent', to: 'kylemayor', amount_cents: state.created.amount_cents } };
+    }
+    if (p === '/api/network/transfers/7/cancel') { state.cancelled = (state.cancelled || 0) + 1; return { json: { ok: true } }; }
+    if (p === '/api/identity/gate/verify') { assert.equal(body.intent, state.intent, 'the PIN opens this one action'); state.pinFresh = body.pin === '2468'; return state.pinFresh ? { json: { ok: true } } : { status: 403, json: { error: 'incorrect PIN' } }; }
+    throw new Error('unexpected ' + p);
+  };
+}
+const netReq = (over = {}) => ({ id: 4, kind: 'agent', direction: 'incoming', other: 'aaron', other_did: 'did:key:zAaron', note: '', needs_pin: true, intent: 'join:4',
+                                 effect: "You join aaron's fleet as an agent. aaron can then mint tokens for your wallet, refill it, and give it secrets.", ...over });
+
+test('an incoming fleet invite shows on the vault home with a badge; accepting walks the PIN for join:<id>', async () => {
+  const evil = `x');alert(1);//"><img src=x onerror=alert(2)>`;
+  const state = { incoming: [netReq({ other: evil, note: evil })], intent: 'join:4' };
+  const pg = page({ storage: signedIn, routes: netRoutes(state) });
+  await settle();
+  const html = pg.el('net-requests').innerHTML;
+  assert.match(html, /mint tokens for your wallet/);
+  assert.doesNotMatch(html, /<img/);
+  for (const m of html.matchAll(/\son\w+="([^"]*)"/g)) assert.match(m[1], /^decideNet\(4,(true|false)\)$/, 'handlers carry only the numeric id');
+  assert.equal(pg.el('net-badge').textContent, 'Fleet · 1 request ›');
+  const done = pg.ctx.decideNet(4, true);
+  await settle();
+  assert.equal(pg.shown('modal-pin'), true, 'PIN sheet opened by the 403');
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();
+  await done; await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/network/requests/4/accept').length, 2, 'refused once, accepted after the PIN');
+  assert.equal(pg.el('net-requests').innerHTML, '', 'card gone once accepted');
+  assert.equal(pg.el('net-badge').textContent, 'Fleet ›');
+});
+
+test('declining an invite asks for no PIN; sign-out clears the cards and the badge', async () => {
+  const state = { incoming: [netReq({ kind: 'person', needs_pin: false })], intent: 'none' };
+  const pg = page({ storage: signedIn, routes: netRoutes(state) });
+  await settle();
+  state.incoming = [netReq()];
+  await pg.ctx.loadNetwork();
+  pg.ctx.logout();
+  assert.equal(pg.el('net-requests').innerHTML, '');
+  assert.equal(pg.el('net-badge').textContent, 'Fleet ›');
+  const pg2 = page({ storage: signedIn, routes: netRoutes(state) });
+  await settle();
+  await pg2.ctx.decideNet(4, false);
+  assert.equal(pg2.calls.filter(c => c.path === '/api/identity/gate/verify').length, 0, 'decline asked for no PIN');
+  assert.equal(pg2.calls.filter(c => c.path === '/api/network/requests/4/decline').length, 1);
+});
+
+test('Send DD: the transfer is created, then confirmed with the PIN for send:<id>; a cancelled PIN cancels the transfer', async () => {
+  const state = { people: [{ kind: 'person', did: 'did:key:zKyle', username: 'kylemayor' }], intent: 'send:7' };
+  const pg = page({ storage: signedIn, routes: netRoutes(state) });
+  await settle();
+  await pg.ctx.loadFleet();
+  assert.match(pg.el('fleet-content').innerHTML, /kylemayor/);
+  assert.match(pg.el('fleet-content').innerHTML, /No agents yet/);
+  pg.ctx.openSend('kylemayor');
+  assert.equal(pg.el('send-to-name').textContent, 'kylemayor');
+  assert.equal(pg.el('send-balance').textContent, '900');
+  pg.el('send-amount').value = '2.5';
+  await pg.ctx.sendDD();
+  assert.equal(state.created, undefined, 'a fractional amount is refused before anything is sent');
+  pg.el('send-amount').value = '150'; pg.el('send-note').value = 'for the box';
+  const done = pg.ctx.sendDD();
+  await settle();
+  assert.deepEqual({ ...state.created }, { to: 'kylemayor', amount_cents: 150, note: 'for the box' });
+  assert.equal(pg.shown('modal-pin'), true);
+  assert.match(pg.el('pin-unlock-what').textContent, /150 DD to kylemayor/);
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();
+  await done; await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/network/transfers/7/confirm').length, 2, 'refused once, sent after the PIN');
+  assert.equal(state.cancelled || 0, 0, 'a sent transfer is not cancelled');
+  pg.ctx.openSend('kylemayor'); pg.el('send-amount').value = '5';
+  const second = pg.ctx.sendDD();
+  await settle();
+  pg.ctx.cancelPin();
+  await second; await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/network/transfers/7/confirm').length, 3, 'no retry after Cancel');
+  assert.equal(state.cancelled, 1, 'the waiting transfer is cancelled on the server');
+});

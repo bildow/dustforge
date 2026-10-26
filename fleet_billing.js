@@ -139,6 +139,71 @@ function initSchema(db) {
   // the platform admin key, or a one-time claim link sent to its mailbox.
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN claim_code TEXT DEFAULT ''`); } catch (_) {}
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN claim_expires_at TEXT DEFAULT ''`); } catch (_) {}
+  // Tokens a fleet owner minted for a member (auth_method fleet_owner_mint, claim `fleet`) die when the member
+  // leaves or is removed: billing.checkTokenRevocation refuses any minted before revoke_before (unix seconds).
+  // How a silicon joined: 'owner' (the owner created it, or linked it with its token / the admin key / a claim
+  // link: the owner holds its key and may mint its tokens and workers) or 'network' (the wallet accepted a network
+  // request: it keeps its own key; the owner refills it, delegates to it and sees its spend, and mints nothing).
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN joined_via TEXT DEFAULT 'owner'`); } catch (_) {}
+  db.exec(`CREATE TABLE IF NOT EXISTS fleet_token_cuts (
+    did TEXT NOT NULL,
+    fleet TEXT NOT NULL,
+    revoke_before INTEGER NOT NULL,
+    PRIMARY KEY (did, fleet)
+  )`);
+}
+
+// ── Fleet membership rules ──────────────────────────────────────────────────
+// A wallet is an agent of at most one fleet; an agent owns no fleet with agents (else a fleet owner could reach,
+// through a member's minted token, the agents of the member's own fleet). pending_claim rows count: a claim link
+// may still be opened.
+function activeFleetOf(db, did) {
+  return db.prepare(`SELECT f.*, s.handle FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+                     WHERE s.member_did = ? AND s.status = 'active' AND f.status = 'active'`).get(did) || null;
+}
+function ownsFleetWithAgents(db, did) {
+  return Boolean(db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+                             WHERE f.owner_did = ? AND f.status = 'active' AND s.status IN ('active', 'pending_claim') LIMIT 1`).get(did));
+}
+// Why `memberDid` cannot become an agent of fleet `fleet` now, or null.
+function joinBlocker(db, fleet, memberDid) {
+  if (memberDid === fleet.owner_did) return 'the fleet owner is not an agent of their own fleet';
+  const mf = activeFleetOf(db, memberDid);
+  if (mf && mf.id !== fleet.id) return 'that wallet is already an agent in another fleet; it has to leave it first';
+  if (ownsFleetWithAgents(db, memberDid)) return 'that wallet runs its own fleet of agents, so it cannot join one';
+  const of = activeFleetOf(db, fleet.owner_did);
+  if (of) return 'the fleet owner is an agent in a fleet, so it cannot take agents';
+  return null;
+}
+// Before a wallet joins a fleet: rows it left in other fleets give way — its silicon id is unique across fleets.
+// Removed rows always; claims never opened only when the wallet itself consents here (withPending), never when
+// some owner merely names it.
+function clearStaleSiliconRows(db, memberDid, fleetId, { withPending = false } = {}) {
+  db.prepare(`DELETE FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status ${withPending ? "!= 'active'" : "= 'removed'"}`).run(memberDid, fleetId);
+}
+// "Change the locks": every token of this wallet issued so far dies — its own, owner-minted ones, worker tokens,
+// device-flow tokens — and so do its refresh tokens and workers. Used when a wallet leaves a fleet: whatever the
+// owner obtained while it held the key stops working.
+function signOutEverywhere(db, did) {
+  // iat has whole seconds: the cut is this second (a sign-in right after still works), and every token issued so far
+  // — the same second included — is also revoked by its jti (all tokens are recorded in issued_tokens).
+  const cut = Math.floor(Date.now() / 1000);
+  db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(did, cut);
+  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(did);
+  try { db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(did); } catch (_) {}
+  try { db.prepare("UPDATE fleet_workers SET status = 'revoked', revoked_at = datetime('now'), revoked_by = ? WHERE parent_did = ? AND status = 'active'").run(did, did); } catch (_) {}
+  try { db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active'").run(did); } catch (_) {}
+}
+// The owner's workers for a member (created through the owner route) end with the membership.
+function revokeOwnerWorkers(db, memberDid, ownerDid) {
+  const rows = db.prepare("SELECT worker_id FROM fleet_workers WHERE parent_did = ? AND created_by = ? AND status = 'active'").all(memberDid, ownerDid);
+  for (const r of rows) revokeWorker(db, { wid: r.worker_id, byDid: ownerDid });
+  return rows.length;
+}
+// Kill every token the owner of `slug` minted for `did` so far.
+function cutFleetTokens(db, did, slug) {
+  db.prepare(`INSERT INTO fleet_token_cuts (did, fleet, revoke_before) VALUES (?, ?, ?)
+              ON CONFLICT(did, fleet) DO UPDATE SET revoke_before = excluded.revoke_before`).run(did, slug, Math.floor(Date.now() / 1000) + 1);
 }
 
 // ── Hashed silicon id ────────────────────────────────────────────────────────
@@ -340,6 +405,13 @@ function tokenStatus(db, did, now = Date.now()) {
 }
 
 function siliconView(db, billing, s, { fleet } = {}) {
+  // Not confirmed yet: the owner named a wallet, the wallet has not agreed. Show nothing of it.
+  if (s.status !== 'active') {
+    return { handle: s.handle, display_name: s.display_name, did: null, silicon_id: null, username: null, email: null, wallet_status: null,
+             balance_cents: null, last_active: null,
+             refill: { enabled: !!s.refill_enabled, threshold_cents: s.refill_threshold_cents, amount_cents: s.refill_amount_cents, source: s.refill_source, last_refill_at: null, last_error: '' },
+             token: { status: 'none' }, fleet: fleet ? { slug: fleet.slug, name: fleet.name } : undefined, status: s.status, created_at: s.created_at };
+  }
   const w = db.prepare('SELECT username, email, status, balance_cents, updated_at FROM identity_wallets WHERE did = ?').get(s.member_did) || {};
   const balance = billing.getDerivedBalance(db, s.member_did);
   const lastTx = db.prepare('SELECT created_at FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT 1').get(s.member_did);
@@ -351,7 +423,7 @@ function siliconView(db, billing, s, { fleet } = {}) {
               source: s.refill_source, last_refill_at: s.last_refill_at, last_error: s.last_refill_error || '' },
     token: tokenStatus(db, s.member_did),
     fleet: fleet ? { slug: fleet.slug, name: fleet.name } : undefined,
-    status: s.status, created_at: s.created_at,
+    status: s.status, created_at: s.created_at, joined_via: s.joined_via || 'owner',
   };
 }
 
@@ -481,7 +553,8 @@ function runSiliconRefills(db, billing, { now = Date.now(), ledger = null } = {}
 // Email the silicon's contact when its newest token is within TOKEN_WARN_DAYS of
 // expiry (or there is none). Once per 24h per silicon. `mailer({to, subject, text})`.
 function runTokenWarnings(db, { now = Date.now(), mailer = null } = {}) {
-  const rows = db.prepare("SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.status = 'active' AND s.contact_email != ''").all();
+  // Network agents sign in themselves: the fleet mints nothing for them, so it does not warn about its tokens.
+  const rows = db.prepare("SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.status = 'active' AND s.contact_email != '' AND COALESCE(s.joined_via, 'owner') != 'network'").all();
   const out = [];
   for (const s of rows) {
     const t = tokenStatus(db, s.member_did, now);
@@ -740,6 +813,9 @@ function redeemClaim(db, code) {
   const row = db.prepare("SELECT * FROM fleet_silicons WHERE claim_code = ? AND status = 'pending_claim'").get(hashToken(code || ''));
   if (!row) return { ok: false, error: 'unknown or already used claim' };
   if (row.claim_expires_at && new Date(row.claim_expires_at).getTime() < Date.now()) return { ok: false, error: 'claim expired' };
+  const fleet = db.prepare('SELECT * FROM fleets WHERE id = ?').get(row.fleet_id);
+  const why = fleet ? joinBlocker(db, fleet, row.member_did) : 'fleet not found';
+  if (why) return { ok: false, error: why };
   const txn = db.transaction(() => {
     db.prepare("UPDATE fleet_silicons SET status = 'active', claim_code = '', claim_expires_at = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(row.id);
     db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(row.fleet_id, row.member_did);
@@ -754,7 +830,8 @@ function claimEmail({ silicon, fleet, claimUrl }) {
     ``,
     `DID: ${silicon.member_did}`,
     ``,
-    `Joining lets the fleet owner see this wallet's balance and spend, refill it, and delegate secrets to it.`,
+    `Joining lets the fleet owner mint tokens for this wallet (acting as it, up to 30 days each), see its balance`,
+    `and spend, refill it, and delegate secrets to it.`,
     `If that is expected, confirm with this one-time link (valid 72 hours):`,
     ``,
     `  ${claimUrl}`,
@@ -817,6 +894,7 @@ module.exports = {
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
   issueClaim, redeemClaim, claimEmail, hashToken,
+  activeFleetOf, ownsFleetWithAgents, joinBlocker, clearStaleSiliconRows, cutFleetTokens, signOutEverywhere, revokeOwnerWorkers,
   workerId, createWorker, getWorker, listWorkers, revokeWorker, workerTokenClaims, recordWorkerToken, resolveWorker, workerMayUseSecret, workerView, siliconSecrets,
   didRecordEmail, tokenWarningEmail,
   HANDLE_RE, PROJECT_RE, INITIATORS, TOKEN_WARN_DAYS, REFILL_COOLDOWN_MS,

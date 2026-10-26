@@ -1251,6 +1251,7 @@ app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(auth.did, now);
   db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(auth.did);
+  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(auth.did);   // else a refresh mints a live token again
   res.json({ ok: true, revoke_before: now, warning: 'ALL tokens for this DID issued before now are dead, including the one that made this call. Re-mint via request-2fa + verify.' });
 });
 
@@ -6048,6 +6049,11 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
   if (_deadApprover.revoked) return res.status(401).json({ error: _deadApprover.reason });
   const approverDid = v.decoded && v.decoded.sub;
   if (!approverDid) return res.status(401).json({ error: 'operator token has no DID' });
+  // A device login is a new session of the approver's wallet: only the wallet's own session may open one, not a
+  // token a fleet owner minted for it or a worker's token.
+  if (v.decoded.auth_method === 'fleet_owner_mint' || v.decoded.auth_method === 'worker' || v.decoded.wrk) {
+    return res.status(403).json({ error: 'approve device logins from your own sign-in, not a fleet-minted or worker token' });
+  }
   const uc = user_code.toString().toUpperCase().trim();
   const row = db.prepare("SELECT * FROM device_auth WHERE user_code = ? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(uc);
   if (!row) return res.status(404).json({ error: 'no pending request for that code' });
@@ -6139,6 +6145,7 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required' });
 
@@ -6148,7 +6155,7 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   if (sender.status !== 'active') return res.status(403).json({ error: 'account suspended' });
 
   try {
-    const debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Transfer to ' + receiver.username);
+    const debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Transfer to ' + receiver.username, 'Transfer from ' + sender.username);
     res.json({ ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents });
   } catch (e) {
     const status = e.statusCode || 500;
@@ -6527,29 +6534,36 @@ function computeBarrelTier(did) {
   return { tier, inner_count, middle_count, outer_count, wallet_bound, last_auth_age_seconds };
 }
 
+// The refusal (an Error with statusCode/body) a transfer of this size from this wallet meets, or null.
+function transferBarrelRefusal(fromDid, amountCents) {
+  if (!(amountCents > 100)) return null;
+  const barrel = computeBarrelTier(fromDid);
+  if (BARREL_TIERS.indexOf(barrel.tier) >= BARREL_TIERS.indexOf('double')) return null;
+  const upgrade_hint = !barrel.wallet_bound
+    ? 'fund your wallet to unlock double barrel'
+    : 'accumulate more fingerprint ring signals via repeated auth';
+  return Object.assign(new Error('double barrel required for transfers > 100 DD'), {
+    statusCode: 403,
+    body: { error: 'double barrel required for transfers > 100 DD', required_tier: 'double', current_tier: barrel.tier, upgrade_hint },
+  });
+}
+
 // ── Ledger-level barrel invariant ──
 // This is the ONLY function that should be used for transfers.
 // It enforces barrel tier checks at the ledger level, not just route level.
-function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, description) {
-  if (amountCents > 100 && type.includes('transfer')) {
-    const barrel = computeBarrelTier(fromDid);
-    const barrelIndex = BARREL_TIERS.indexOf(barrel.tier);
-    if (barrelIndex < BARREL_TIERS.indexOf('double')) {
-      const upgrade_hint = !barrel.wallet_bound
-        ? 'fund your wallet to unlock double barrel'
-        : 'accumulate more fingerprint ring signals via repeated auth';
-      throw Object.assign(new Error('double barrel required for transfers > 100 DD'), {
-        statusCode: 403,
-        body: { error: 'double barrel required for transfers > 100 DD', required_tier: 'double', current_tier: barrel.tier, upgrade_hint },
-      });
-    }
+// creditDescription: what the receiver's ledger says (default: description with 'to' swapped for 'from', which names
+// the receiver itself when description is 'Transfer to <receiver>' — pass the sender's name instead).
+function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, description, creditDescription = null) {
+  if (type.includes('transfer')) {
+    const refusal = transferBarrelRefusal(fromDid, amountCents);
+    if (refusal) throw refusal;
   }
 
   const txn = db.transaction(() => {
     const debit = billing.deductBalance(db, fromDid, amountCents, 'transfer_out', description);
     if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: debit });
     // Build credit description: swap "to" for "from" in the description
-    const creditDesc = description.replace(/\bto\b/, 'from');
+    const creditDesc = creditDescription || description.replace(/\bto\b/, 'from');
     billing.creditBalance(db, toDid, amountCents, 'transfer_in', creditDesc);
     return debit;
   });
@@ -7355,6 +7369,11 @@ const fleetRoutes = require('./fleet_routes')({
   app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
   rateLimitStandard, adminKey: ADMIN_API_KEY, crypto,
 });
+// Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
+require('./network_routes')({
+  app, db, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
+  barrelGuardedTransfer, transferRefusal: transferBarrelRefusal, sendMail: fleetRoutes.sendMail,
+});
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
   try {
@@ -7379,6 +7398,9 @@ app.post('/api/fleet/create', (req, res) => {
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
   const owner_did = v.decoded.sub;
+  if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required' });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  if (v.decoded.auth_method === 'fleet_owner_mint') return res.status(403).json({ error: 'a fleet-minted token cannot create a fleet; sign in as this wallet' });
 
   const { name, slug, description } = req.body || {};
   if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name required' });
@@ -7451,6 +7473,7 @@ app.post('/api/fleet/:slug/invite', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { did } = req.body || {};
@@ -7520,6 +7543,7 @@ app.post('/api/fleet/:slug/upgrade', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { tier } = req.body || {};
@@ -7559,6 +7583,7 @@ app.post('/api/fleet/:slug/fund', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
@@ -7619,6 +7644,7 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { username, password } = req.body || {};
@@ -7695,6 +7721,7 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { prefix, count, password } = req.body || {};
@@ -7781,6 +7808,7 @@ app.post('/api/fleet/:slug/fund/qr', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
@@ -8208,6 +8236,7 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   // Progressive Barrel: require transact-or-above scope for secure transfers (double barrel tier)
   if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required (double barrel)' });
@@ -8218,7 +8247,8 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   // DF-177: Atomic transfer via barrelGuardedTransfer (ledger-level barrel invariant)
   let debit;
   try {
-    debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''));
+    debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''),
+      'Secure transfer from ' + sender.username + (description ? ': ' + description : ''));
   } catch (e) {
     const status = e.statusCode || 402;
     return res.status(status).json(e.body || { ok: false, error: e.message, balance_cents: sender.balance_cents });
@@ -11949,7 +11979,7 @@ app.post('/api/blindkey/silicon/permissions', rateLimitStandard, (req, res) => {
 function personActor(req, res) {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return true;   // admin-key path: getDemiPassActor already accepted it
-  if (auth.silicon || (auth.decoded && auth.decoded.wrk)) {
+  if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) {
     res.status(403).json({ error: 'only the account owner registers agents or grants them permissions' });
     return false;
   }
@@ -12255,7 +12285,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
