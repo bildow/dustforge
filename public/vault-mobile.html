@@ -158,7 +158,7 @@
       <div style="width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green)"></div>
       <span style="font-weight:700;font-size:0.9rem" id="ns-id">—</span>
     </div>
-    <span style="color:var(--text3);font-size:0.7rem">Fleet ›</span>
+    <span id="net-badge" style="color:var(--text3);font-size:0.7rem">Fleet ›</span>
   </div>
 
   <div id="panic" class="panic-strip">
@@ -168,6 +168,7 @@
 
   <!-- Browser fill requests waiting for this person: the extension asked, the phone approves with the PIN -->
   <div id="fill-requests"></div>
+  <div id="net-requests"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
   <div id="page-vault" class="page active">
@@ -287,7 +288,8 @@
         <span class="section-title" id="fleet-title">Fleet</span>
         <div style="display:flex;gap:0.4rem">
           <button class="btn-ghost" onclick="loadFleet()" style="font-size:0.7rem">Refresh</button>
-          <button class="btn-primary" onclick="openAddSilicon()">+ Silicon</button>
+          <button class="btn-ghost" onclick="openAddSilicon()" style="font-size:0.7rem">+ Silicon</button>
+          <button class="btn-primary" onclick="openAddWallet()">+ Wallet</button>
         </div>
       </div>
       <div id="fleet-content"><div class="empty">Loading…</div></div>
@@ -434,6 +436,39 @@
   </div>
 </div>
 
+<!-- Add a wallet to your network: a person (contact) or an agent (joins your fleet) -->
+<div id="modal-netadd" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Add a wallet</h3>
+    <label>Their username, email or DID</label><input type="text" id="net-to" placeholder="e.g. kylemayor or felixbaakmk@dustforge.com" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <label>Who is it?</label>
+    <select id="net-as" onchange="updateNetFields()">
+      <option value="person">A person: a contact you can send DD to</option>
+      <option value="agent">An agent: it joins your fleet</option>
+    </select>
+    <div id="net-agent-fields" style="display:none">
+      <div style="font-size:0.72rem;color:var(--text3);margin:0.25rem 0 0.5rem">Once the agent accepts, you can refill its wallet, give it secrets and mint its tokens. An agent can be in one fleet at a time.</div>
+      <label>Handle in your fleet (optional)</label><input type="text" id="net-handle" placeholder="defaults to its username" autocapitalize="off">
+    </div>
+    <label>Note (optional)</label><input type="text" id="net-note" maxlength="200" placeholder="e.g. it's Aaron">
+    <div style="font-size:0.72rem;color:var(--text3);margin-top:0.25rem">They get a request in their wallet and by email. Nothing is shared until they accept.</div>
+    <div id="net-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="addWallet()">Send request</button></div>
+  </div>
+</div>
+
+<!-- Send DD to a connection -->
+<div id="modal-send" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Send DD to <span id="send-to-name"></span></h3>
+    <label>Amount (DD)</label><input type="number" id="send-amount" min="1" step="1" inputmode="numeric" placeholder="e.g. 100">
+    <label>Note (optional)</label><input type="text" id="send-note" maxlength="140" placeholder="shows in both ledgers">
+    <div style="font-size:0.72rem;color:var(--text3);margin-top:0.25rem">Your PIN approves the transfer. Your balance: <span id="send-balance">—</span> DD</div>
+    <div id="send-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" id="send-go" onclick="sendDD()">Send</button></div>
+  </div>
+</div>
+
 <!-- Vault PIN: unlock (asked by a gate), first-time setup (mandatory), change (settings) -->
 <div id="modal-pin" class="modal-bg" onclick="if(event.target===this)cancelPin()">
   <div class="modal-sheet">
@@ -526,6 +561,7 @@ let loginPw='';   // the password just typed at sign-in; consumed by the mandato
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
 let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
 let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
+let netData=null, netBusy=new Set(), sendTo=null, sendBusy=false;   // network: GET /api/network, requests being decided, the open send
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
 let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
@@ -565,12 +601,12 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;document.getElementById('net-badge').textContent='Fleet ›';
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
-                  's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why']){const e=document.getElementById(i);if(e)e.textContent=''}
+                  's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why','net-msg','send-msg','send-to-name','send-balance']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
   for(const i of ['df-fwd-banner','security-banner','panic','onboarding-wizard']){const e=document.getElementById(i);if(e)e.style.display='none'}
-  updateStoreFields(); updateSiliconFields();   // the sheets' field sets follow their reset dropdowns
+  updateStoreFields(); updateSiliconFields(); updateNetFields();   // the sheets' field sets follow their reset dropdowns
   secrets=[]; dashboardData=null; fleetSlug=null; fleetData=null; siliconHandle=null; panic=false;
   goPage('vault');
   document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
@@ -594,13 +630,17 @@ async function pickFleet(){
 async function loadFleet(){
   const el=document.getElementById('fleet-content');
   try{
+    const epoch=sessionEpoch;
+    const n=await loadNetwork();
+    if(epoch!==sessionEpoch)return;
+    const net=networkSection(n);
     const slug=await pickFleet();
-    if(!slug){el.innerHTML='<div class="empty">You have no fleet yet. Create one via the API (POST /api/fleet/create) — silicons live under a fleet.</div>';return}
+    if(!slug){el.innerHTML=net+(n&&n.member_of?'':'<div class="empty">No agents yet. Tap + Wallet to add an agent or a person.</div>');return}
     const d=await api('GET','/api/fleet/'+encodeURIComponent(slug)+'/overview');
     fleetData=d;
     document.getElementById('fleet-title').textContent=d.fleet.name;
     const owner=d.owner, rule=owner&&owner.refill_rule;
-    let h='';
+    let h=net;
     // Owner wallet + weekly refill
     if(owner){
       h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
@@ -935,7 +975,135 @@ async function showApp(){
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
-  loadFillRequests()}
+  loadFillRequests();
+  loadNetwork()}
+
+// ── Network: people, agents joining a fleet, sending DD ───────────────────
+// GET /api/network lists this wallet's contacts, its agents and the requests waiting either way. Incoming requests
+// also show as cards on the vault home. Accepting an invite to join someone's fleet needs the PIN (join:<id>); a
+// send is created first (amount + recipient fixed) and confirmed with the PIN (send:<id>).
+async function loadNetwork(){
+  const epoch=sessionEpoch;
+  try{ const r=await api('GET','/api/network'); if(epoch!==sessionEpoch) return null; netData=r; }
+  catch(e){ if(sessionEnded(e)||epoch!==sessionEpoch) return null; if(e.status!==429) netData=null; }
+  renderNetRequests();
+  return netData;
+}
+function netWho(r){ return esc(r.other||String(r.other_did||'').slice(8,20)+'…'); }
+function netAsk(r){
+  if(r.kind==='person') return r.direction==='incoming'?'<b>'+netWho(r)+'</b> wants to connect':'You asked <b>'+netWho(r)+'</b> to connect';
+  if(r.kind==='agent') return r.direction==='incoming'?'<b>'+netWho(r)+'</b> invites your wallet into their fleet as an agent':'You invited <b>'+netWho(r)+'</b> into your fleet as an agent';
+  return r.direction==='incoming'?'Agent <b>'+netWho(r)+'</b> asks to join your fleet':'You asked to join <b>'+netWho(r)+'</b>\'s fleet';
+}
+function netCard(r){
+  const busy=netBusy.has(r.id)?'disabled ':'';
+  let h='<div class="fill-req"><div>'+netAsk(r)+'</div>';
+  if(r.note) h+='<div style="margin-top:0.25rem">“'+esc(r.note)+'”</div>';
+  if(r.direction==='incoming'){
+    h+='<div style="color:var(--text3);margin-top:0.25rem">'+esc(r.effect)+(r.needs_pin?' Your PIN approves it.':'')+'</div>';
+    h+='<div class="fr-row"><button class="btn-primary" '+busy+'onclick="decideNet('+Number(r.id)+',true)">Accept</button><button class="btn-ghost" '+busy+'onclick="decideNet('+Number(r.id)+',false)">Decline</button></div>';
+  } else {
+    h+='<div class="fr-row"><button class="btn-ghost" '+busy+'onclick="withdrawNet('+Number(r.id)+')">Withdraw</button></div>';
+  }
+  return h+'</div>';
+}
+function renderNetRequests(){
+  const inc=(netData&&netData.incoming)||[];
+  document.getElementById('net-requests').innerHTML=inc.map(netCard).join('');
+  document.getElementById('net-badge').textContent=inc.length?('Fleet · '+inc.length+' request'+(inc.length===1?'':'s')+' ›'):'Fleet ›';
+}
+function networkSection(n){
+  if(!n) return '';
+  let h='';
+  const reqs=[...(n.incoming||[]),...(n.outgoing||[])];
+  if(reqs.length){
+    h+='<div class="section-head" style="padding:0.25rem 0 0"><span class="section-title">Requests</span></div>';
+    h+='<div style="margin:0 -1rem 0.75rem">'+reqs.map(netCard).join('')+'</div>';
+  }
+  if(n.member_of){
+    const m=n.member_of;
+    h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:1rem;font-size:0.8rem">';
+    h+='This wallet is agent <b>@'+esc(m.handle)+'</b> in <b>'+esc(m.owner)+'</b>\'s fleet.';
+    h+='<div class="fr-row" style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-primary" style="flex:1" onclick="openSend('+jsArg(m.owner)+')">Send DD</button><button class="btn-ghost" style="flex:1" onclick="leaveFleet()">Leave fleet</button></div></div>';
+  }
+  h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">People</span><span style="font-size:0.7rem;color:var(--text3)">'+dd(n.me&&n.me.balance_cents)+' DD in your wallet</span></div>';
+  if(!(n.people||[]).length) h+='<div class="empty" style="font-size:0.75rem">No contacts yet. Tap + Wallet and pick “A person”.</div>';
+  for(const p of n.people||[]){
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.5rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.82rem">';
+    h+='<strong>'+esc(p.username||String(p.did).slice(8,20)+'…')+'</strong><span style="display:flex;gap:0.4rem"><button class="btn-primary" style="font-size:0.7rem;padding:0.35rem 0.6rem" onclick="openSend('+jsArg(p.username)+')">Send DD</button><button class="btn-ghost" style="font-size:0.7rem" onclick="removePerson('+jsArg(p.username)+')">Remove</button></span></div>';
+  }
+  if((n.agents||[]).length){
+    h+='<div style="font-size:0.7rem;color:var(--text3);margin:0.6rem 0 1rem">Your agents are under Silicons below. To send one DD: <span>';
+    h+=(n.agents||[]).map(a=>'<a href="#" style="color:var(--accent)" onclick="openSend('+jsArg(a.username)+');return false">@'+esc(a.handle)+'</a>').join(' · ')+'</span></div>';
+  } else h+='<div style="height:1rem"></div>';
+  return h;
+}
+async function decideNet(id, accept){
+  const r=netData&&(netData.incoming||[]).find(x=>x.id===id); if(!r||netBusy.has(id)) return;
+  netBusy.add(id); renderNetRequests();
+  try{
+    if(accept) await apiGated('POST','/api/network/requests/'+id+'/accept',null,'Join '+(r.other||'their')+'\'s fleet as an agent? Your PIN approves it.');
+    else await api('POST','/api/network/requests/'+id+'/decline');
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ netBusy.delete(id); fleetSlug=null; if(document.getElementById('page-fleet').classList.contains('active')) loadFleet(); else loadNetwork(); }
+}
+async function withdrawNet(id){
+  if(netBusy.has(id)) return; netBusy.add(id);
+  try{ await api('POST','/api/network/requests/'+id+'/withdraw'); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  finally{ netBusy.delete(id); loadFleet(); }
+}
+function updateNetFields(){ document.getElementById('net-agent-fields').style.display=document.getElementById('net-as').value==='agent'?'block':'none'; }
+function openAddWallet(){ const m=document.getElementById('net-msg'); m.textContent=''; m.className='modal-msg'; updateNetFields(); openModal('netadd'); setTimeout(()=>document.getElementById('net-to').focus(),80); }
+async function addWallet(){
+  const m=document.getElementById('net-msg'), to=document.getElementById('net-to').value.trim(), as=document.getElementById('net-as').value;
+  if(!to){ m.textContent='Enter their username, email or DID'; m.className='modal-msg err'; return; }
+  const body={to,as,note:document.getElementById('net-note').value.trim()};
+  const handle=document.getElementById('net-handle').value.trim().toLowerCase(); if(as==='agent'&&handle) body.handle=handle;
+  try{
+    m.textContent='Sending…'; m.className='modal-msg';
+    await api('POST','/api/network/requests',body);
+    for(const i of ['net-to','net-note','net-handle']) document.getElementById(i).value='';
+    closeSheet('netadd'); loadFleet();
+  }catch(e){ if(!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
+}
+function openSend(username){
+  if(!username) return;
+  sendTo=username; sendBusy=false;
+  document.getElementById('send-to-name').textContent=username;
+  document.getElementById('send-balance').textContent=dd(netData&&netData.me&&netData.me.balance_cents);
+  for(const i of ['send-amount','send-note']) document.getElementById(i).value='';
+  const m=document.getElementById('send-msg'); m.textContent=''; m.className='modal-msg';
+  openModal('send'); setTimeout(()=>document.getElementById('send-amount').focus(),80);
+}
+async function sendDD(){
+  const m=document.getElementById('send-msg'), to=sendTo, a=Number(document.getElementById('send-amount').value);
+  if(!to||sendBusy) return;
+  if(!Number.isInteger(a)||a<1){ m.textContent='A whole number of DD, 1 or more'; m.className='modal-msg err'; return; }
+  sendBusy=true; m.textContent='Working…'; m.className='modal-msg';
+  let t=null;
+  try{
+    t=(await api('POST','/api/network/transfers',{to,amount_cents:a,note:document.getElementById('send-note').value.trim()})).transfer;
+    closeSheet('send');   // the PIN sheet takes over; it says what it approves
+    const r=await apiGated('POST','/api/network/transfers/'+t.id+'/confirm',null,'Send '+dd(a)+' DD to '+to+'? Your PIN approves this one transfer.');
+    t=null; alert('Sent '+dd(r.amount_cents)+' DD to '+r.to+'.');
+  }catch(e){
+    if(!sessionEnded(e)&&!/cancelled/.test(e.message)) alert(e.message);
+  }finally{
+    if(t&&tk) api('POST','/api/network/transfers/'+t.id+'/cancel').catch(()=>{});   // not sent: nothing stays waiting
+    sendBusy=false; sendTo=null; loadFleet();
+  }
+}
+async function removePerson(username){
+  if(!confirm('Remove '+username+' from your contacts? You can no longer send each other DD until one of you adds the other again.')) return;
+  try{ await api('POST','/api/network/people/remove',{username}); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  loadFleet();
+}
+async function leaveFleet(){
+  const m=netData&&netData.member_of; if(!m) return;
+  if(!confirm('Leave '+m.owner+'\'s fleet? '+m.owner+' can then no longer mint tokens for this wallet, refill it, or give it secrets through the fleet.')) return;
+  try{ await api('POST','/api/network/leave-fleet'); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  fleetSlug=null; loadFleet();
+}
 
 // ── Browser fill approvals ─────────────────────────────────────────────────
 // The browser extension asks to fill a login into a page; the request waits here until approved with the PIN
@@ -1712,7 +1880,8 @@ function gateName(g){return ({pin:'PIN',fingerprint:'PIN',twofa:'email code',sms
 
 document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeModal()}});
-setInterval(()=>{if(tk&&vaultOpen)loadVault()},30000);   // never behind a closed PIN gate
+setInterval(()=>{if(tk&&vaultOpen)loadVault()},30000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadFillRequests()},4000);
 
 // ── QR Scanner ──

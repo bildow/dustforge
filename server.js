@@ -6148,7 +6148,7 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   if (sender.status !== 'active') return res.status(403).json({ error: 'account suspended' });
 
   try {
-    const debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Transfer to ' + receiver.username);
+    const debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Transfer to ' + receiver.username, 'Transfer from ' + sender.username);
     res.json({ ok: true, from: { did: from_did, balance_after: debit.balance_after }, to: { did: to_did }, amount_cents });
   } catch (e) {
     const status = e.statusCode || 500;
@@ -6530,7 +6530,9 @@ function computeBarrelTier(did) {
 // ── Ledger-level barrel invariant ──
 // This is the ONLY function that should be used for transfers.
 // It enforces barrel tier checks at the ledger level, not just route level.
-function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, description) {
+// creditDescription: what the receiver's ledger says (default: description with 'to' swapped for 'from', which names
+// the receiver itself when description is 'Transfer to <receiver>' — pass the sender's name instead).
+function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, description, creditDescription = null) {
   if (amountCents > 100 && type.includes('transfer')) {
     const barrel = computeBarrelTier(fromDid);
     const barrelIndex = BARREL_TIERS.indexOf(barrel.tier);
@@ -6549,7 +6551,7 @@ function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, descriptio
     const debit = billing.deductBalance(db, fromDid, amountCents, 'transfer_out', description);
     if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: debit });
     // Build credit description: swap "to" for "from" in the description
-    const creditDesc = description.replace(/\bto\b/, 'from');
+    const creditDesc = creditDescription || description.replace(/\bto\b/, 'from');
     billing.creditBalance(db, toDid, amountCents, 'transfer_in', creditDesc);
     return debit;
   });
@@ -7354,6 +7356,11 @@ billing.setAttribution(fleetBilling, require('./dd_ledger'));
 const fleetRoutes = require('./fleet_routes')({
   app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
   rateLimitStandard, adminKey: ADMIN_API_KEY, crypto,
+});
+// Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
+require('./network_routes')({
+  app, db, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
+  barrelGuardedTransfer, sendMail: fleetRoutes.sendMail,
 });
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
@@ -8218,7 +8225,8 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   // DF-177: Atomic transfer via barrelGuardedTransfer (ledger-level barrel invariant)
   let debit;
   try {
-    debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''));
+    debit = barrelGuardedTransfer(db, from_did, to_did, amount_cents, 'transfer_out', 'Secure transfer to ' + receiver.username + (description ? ': ' + description : ''),
+      'Secure transfer from ' + sender.username + (description ? ': ' + description : ''));
   } catch (e) {
     const status = e.statusCode || 402;
     return res.status(status).json(e.body || { ok: false, error: e.message, balance_cents: sender.balance_cents });
@@ -12255,7 +12263,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
