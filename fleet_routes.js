@@ -136,8 +136,9 @@ module.exports = function registerFleetRoutes(deps) {
     // The wallet's own row in this fleet, under any handle: an active or invited one is not added twice, and one that
     // joined through the network comes back through the network (it keeps its key), never through a claim link.
     const memberOf = did => db.prepare('SELECT * FROM fleet_silicons WHERE fleet_id = ? AND member_did = ?').get(fleet.id, did);
-    // A removed silicon's handle can be reused (its row goes once the new one is known to be allowed, below).
-    const dropPrior = () => { if (prior) db.prepare('DELETE FROM fleet_silicons WHERE id = ?').run(prior.id); };
+    // A removed silicon's handle can be reused: its row is renamed out of the way (kept, with how it joined), only
+    // once every check below has passed, in the same transaction as the new row.
+    const freePrior = (memberDid) => { if (prior && prior.member_did !== memberDid) db.prepare("UPDATE fleet_silicons SET handle = handle || '~' || id WHERE id = ?").run(prior.id); };
     const refill = b.refill && typeof b.refill === 'object' ? b.refill : {};
 
     // Existing identity? by did, else by contact email.
@@ -157,11 +158,8 @@ module.exports = function registerFleetRoutes(deps) {
         const own = memberOf(wallet.did);
         if (own && own.status !== 'removed') return res.status(409).json({ error: `that wallet is already in this fleet as @${own.handle}` });
         if (own && own.joined_via === 'network' && !isAdminReq(req)) return res.status(409).json({ error: 'that wallet joined through the network; invite it again there (it keeps its own key)' });
-        dropPrior();
-        if (own && own.id !== (prior && prior.id)) db.prepare('DELETE FROM fleet_silicons WHERE id = ?').run(own.id);   // its own removed row under another handle
         const why = fb.joinBlocker(db, fleet, wallet.did);
         if (why) return res.status(409).json({ error: why });
-        fb.clearStaleSiliconRows(db, wallet.did, fleet.id);
         if (db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status = 'pending_claim'").get(wallet.did, fleet.id)) {
           return res.status(409).json({ error: 'that wallet has an open invitation from another fleet' });
         }
@@ -177,15 +175,22 @@ module.exports = function registerFleetRoutes(deps) {
           }
           proof = 'member_token';
         } else if (isAdminReq(req)) proof = 'admin';
-        const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill });
+        // Every check passed: free the handle, clear the wallet's removed rows elsewhere (its silicon id is unique),
+        // write its row (its own removed row here, under any handle, is updated in place) — together or not at all.
+        let s, claim = null;
+        db.transaction(() => {
+          freePrior(wallet.did);
+          fb.clearStaleSiliconRows(db, wallet.did, fleet.id);
+          s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill });
+          if (proof) db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, wallet.did);
+          else claim = fb.issueClaim(db, s);
+        })();
         if (proof) {
-          db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, wallet.did);
           const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet, apiBase });
           sendMail({ to: s.contact_email, subject: `DemiPass: ${handle} joined fleet ${fleet.slug} — your DID record`, text });
           log(`linked ${handle} (${wallet.did}) into ${fleet.slug} via ${proof}`);
           return res.json({ ok: true, mode: 'linked', proof, silicon: fb.siliconView(db, billing, s, { fleet }) });
         }
-        const claim = fb.issueClaim(db, s);
         const claimUrl = `${apiBase}/api/fleet/claim/${claim.code}`;
         const sent = await sendMail({ to: wallet.email, subject: `DemiPass: confirm joining fleet ${fleet.slug} as ${handle}`, text: fb.claimEmail({ silicon: s, fleet, claimUrl }) });
         log(`claim issued for ${handle} (${wallet.did}) in ${fleet.slug}; mail ${sent ? 'sent' : 'NOT sent'} to ${wallet.email}`);
@@ -195,7 +200,6 @@ module.exports = function registerFleetRoutes(deps) {
 
       // Create a brand-new identity (mailbox + wallet), charged like /provision.
       if (fb.activeFleetOf(db, fleet.owner_did)) return res.status(409).json({ error: 'the fleet owner is an agent in a fleet, so it cannot take agents' });
-      dropPrior();
       const create = b.create && typeof b.create === 'object' ? b.create : {};
       const username = String(create.username || handle).toLowerCase();
       if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'username must be 3-31 chars, lowercase alphanumeric' });
@@ -222,6 +226,7 @@ module.exports = function registerFleetRoutes(deps) {
         db.prepare("INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, id.did);
       });
       txn();
+      freePrior(id.did);
       const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
       const walletRow = { username, email: emailResult.email };
       const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet: walletRow, apiBase });

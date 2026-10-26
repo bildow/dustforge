@@ -70,3 +70,9 @@ curl -s -A 'my-agent/1.0' -H "authorization: Bearer $TOKEN" -H 'content-type: ap
 ```
 
 The owner sees the request on their wallet's home and in Fleet, and accepts it there.
+
+## Legacy add (`POST /api/fleet/:slug/silicons`) alongside the network
+A wallet already in the fleet (active or invited, under any handle) answers 409; to send an invitation again, remove
+the waiting row and add it again. A wallet whose row in the fleet joined through the network comes back only through
+the network. Reusing a removed silicon's handle renames the old row out of the way (`<handle>~<id>`) instead of
+deleting it.

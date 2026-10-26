@@ -214,7 +214,17 @@ call DELETE /api/fleet/$SLUG/silicons/s-net "$A"
 call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-net","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'"}'; [ "$CODE" = 409 ] && ok "a removed network agent cannot be re-added through a claim link (flip to owner-held refused)" || fail "flip: $CODE $BODY"
 # claim links: GET shows, POST joins
 call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"claimer","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='person-k'")'"}'
-[ "$(echo "$BODY" | J mode)" = pending_claim ] || ok "(K runs a fleet: legacy add refused, as it should: $CODE)"
+[ "$CODE" = 409 ] && ok "legacy add of a wallet that runs a fleet → 409" || fail "K legacy add: $CODE $BODY"
+# a refused add under a removed network agent's handle must not erase its marker
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-net","did":"'$LDID'","member_token":"'$K'"}'
+[ "$CODE" = 403 ] && ok "add of L under s-net's handle with someone else's member_token → 403, after every other check passed" || fail "bad token add: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-back","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'"}'
+[ "$CODE" = 409 ] && ok "after that refusal, the removed network agent still cannot be re-added by claim" || fail "marker erased: $CODE $BODY"
+# end to end: the legacy route issues a claim (L, removed owner-held row), the POST redeems it
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"l-claim","did":"'$LDID'"}'; [ "$(echo "$BODY" | J mode)" = pending_claim ] && ok "legacy add without proof → claim issued" || fail "claim issue: $CODE $BODY"
+CL=e2eclaimcode456; HL=$(node -e "console.log(require('./fleet_billing').hashToken(process.argv[1]))" "$CL")
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET claim_code=? WHERE handle='l-claim'\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$HL"
+curl -s -o /dev/null -X POST "$API/api/fleet/claim/$CL"; [ "$(Q "SELECT status FROM fleet_silicons WHERE handle='l-claim'")" = active ] && ok "that claim redeemed by POST → active" || fail "e2e claim"
 CODE_K=claimtestcode123; H=$(node -e "console.log(require('./fleet_billing').hashToken(process.argv[1]))" "$CODE_K")
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET handle='g-claim', status='pending_claim', joined_via='owner', claim_code=?, claim_expires_at='2999-01-01T00:00:00Z' WHERE member_did=(SELECT did FROM identity_wallets WHERE username='agent-g') AND fleet_id=(SELECT id FROM fleets WHERE slug=?)\", (sys.argv[2], sys.argv[3])); c.commit()" "$DB_PATH" "$H" "$SLUG"
 curl -s -o /dev/null "$API/api/fleet/claim/$CODE_K"; [ "$(Q "SELECT status FROM fleet_silicons WHERE handle='g-claim'")" = pending_claim ] && ok "opening a claim link (GET) does not join" || fail "GET joined"
