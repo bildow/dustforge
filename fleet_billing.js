@@ -553,7 +553,8 @@ function runSiliconRefills(db, billing, { now = Date.now(), ledger = null } = {}
 // Email the silicon's contact when its newest token is within TOKEN_WARN_DAYS of
 // expiry (or there is none). Once per 24h per silicon. `mailer({to, subject, text})`.
 function runTokenWarnings(db, { now = Date.now(), mailer = null } = {}) {
-  const rows = db.prepare("SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.status = 'active' AND s.contact_email != ''").all();
+  // Network agents sign in themselves: the fleet mints nothing for them, so it does not warn about its tokens.
+  const rows = db.prepare("SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.status = 'active' AND s.contact_email != '' AND COALESCE(s.joined_via, 'owner') != 'network'").all();
   const out = [];
   for (const s of rows) {
     const t = tokenStatus(db, s.member_did, now);

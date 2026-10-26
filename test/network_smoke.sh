@@ -196,6 +196,29 @@ call POST /api/wallet/transfer "$LM" '{"from_did":"'$LDID'","to_did":"'$(Q "SELE
 [ "$CODE" = 401 ] && ok "the dead minted token cannot move DD through /api/wallet/transfer" || fail "legacy transfer with cut token: $CODE $BODY"
 call POST /api/fleet/$SLUG/fund "$LM" '{"amount_cents":1}'; [ "$CODE" = 401 ] && ok "nor through /api/fleet/:slug/fund" || fail "fund with cut token: $CODE $BODY"
 L=$(login legacy-l); call GET /api/network "$L"; [ "$CODE" = 200 ] && ok "L signs in again" || fail "L relogin: $CODE"
+# owner removal revokes the workers the owner made: re-link L, make a worker, remove L
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"legacy-l2","did":"'$LDID'","member_token":"'$L'"}'; [ "$(echo "$BODY" | J mode)" = linked ] || fail "re-link L: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons/legacy-l2/workers "$A" '{"name":"lw2"}'; WID2=$(echo "$BODY" | J worker.worker_id)
+call POST /api/fleet/$SLUG/silicons/legacy-l2/workers/$WID2/token "$A" '{"scope":"transact","expires_in":"1h"}'; LW2=$(echo "$BODY" | J token)
+call DELETE /api/fleet/$SLUG/silicons/legacy-l2 "$A"; [ "$CODE" = 200 ] || fail "remove L: $CODE"
+call GET /api/network "$LW2"; [ "$CODE" = 401 ] && ok "owner removal revokes the workers the owner made" || fail "removal worker: $CODE $BODY"
+# a network member: the owner sees only what is between them, cannot touch its own workers or contact email
+call POST /api/network/requests "$A" '{"to":"stranger-s","as":"agent","handle":"s-net"}'; RN=$(echo "$BODY" | J request.id)
+X=$(login stranger-s); call POST /api/network/requests/$RN/accept "$X"; [ "$CODE" = 200 ] || fail "S joins: $CODE $BODY"
+call POST /api/silicons/workers "$X" '{"name":"sown"}'; SWID=$(echo "$BODY" | J worker.worker_id)
+call GET /api/fleet/$SLUG/silicons/s-net "$A"; [ "$(echo "$BODY" | J workers)" = "[]" ] && [ "$(echo "$BODY" | J secrets.own)" = "[]" ] && ok "owner's view of a network agent: no own secrets, no own workers" || fail "narrow view: $BODY"
+call POST /api/fleet/$SLUG/silicons/s-net/workers/$SWID/revoke "$A"; [ "$CODE" = 404 ] && ok "owner cannot revoke the agent's own worker" || fail "revoke own worker: $CODE $BODY"
+call PATCH /api/fleet/$SLUG/silicons/s-net "$A" '{"contact_email":"owner@evil.example"}'; [ "$CODE" = 403 ] && ok "owner cannot redirect the agent's contact email" || fail "patch email: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-other","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'"}'; [ "$CODE" = 409 ] && ok "legacy re-add of an active member under another handle → 409 (no limbo)" || fail "limbo: $CODE $BODY"
+call DELETE /api/fleet/$SLUG/silicons/s-net "$A"
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-net","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'"}'; [ "$CODE" = 409 ] && ok "a removed network agent cannot be re-added through a claim link (flip to owner-held refused)" || fail "flip: $CODE $BODY"
+# claim links: GET shows, POST joins
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"claimer","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='person-k'")'"}'
+[ "$(echo "$BODY" | J mode)" = pending_claim ] || ok "(K runs a fleet: legacy add refused, as it should: $CODE)"
+CODE_K=claimtestcode123; H=$(node -e "console.log(require('./fleet_billing').hashToken(process.argv[1]))" "$CODE_K")
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET handle='g-claim', status='pending_claim', joined_via='owner', claim_code=?, claim_expires_at='2999-01-01T00:00:00Z' WHERE member_did=(SELECT did FROM identity_wallets WHERE username='agent-g') AND fleet_id=(SELECT id FROM fleets WHERE slug=?)\", (sys.argv[2], sys.argv[3])); c.commit()" "$DB_PATH" "$H" "$SLUG"
+curl -s -o /dev/null "$API/api/fleet/claim/$CODE_K"; [ "$(Q "SELECT status FROM fleet_silicons WHERE handle='g-claim'")" = pending_claim ] && ok "opening a claim link (GET) does not join" || fail "GET joined"
+curl -s -o /dev/null -X POST "$API/api/fleet/claim/$CODE_K"; [ "$(Q "SELECT status FROM fleet_silicons WHERE handle='g-claim'")" = active ] && ok "the confirm button (POST) joins" || fail "POST claim: $(Q "SELECT status FROM fleet_silicons WHERE handle='g-claim'")"
 # an owner with agents (K owns a fleet with F) cannot join, even via a second empty fleet trick
 call POST /api/network/requests "$A" '{"to":"person-k","as":"agent"}'; [ "$CODE" = 409 ] && ok "K runs a fleet with an agent → cannot be invited (any owned fleet counts)" || fail "owner join: $CODE $BODY"
 # barrel before the PIN: stranger-s has no inner-ring signals and a balance → 403 barrel without a PIN prompt
