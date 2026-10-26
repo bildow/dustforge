@@ -220,6 +220,12 @@ call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-net","did":"'$LDID'","mem
 [ "$CODE" = 403 ] && ok "add of L under s-net's handle with someone else's member_token → 403, after every other check passed" || fail "bad token add: $CODE $BODY"
 call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-back","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'"}'
 [ "$CODE" = 409 ] && ok "after that refusal, the removed network agent still cannot be re-added by claim" || fail "marker erased: $CODE $BODY"
+# the marker survives the wallet joining (and leaving) another fleet: S joins K's fleet, leaves, A still cannot claim it
+call POST /api/network/requests "$X" '{"to":"person-k","as":"join","handle":"s-k"}'; RSK=$(echo "$BODY" | J request.id)
+call POST /api/network/requests/$RSK/accept "$K"; [ "$CODE" = 200 ] || fail "S joins K: $CODE $BODY"
+call POST /api/network/leave-fleet "$X"; [ "$CODE" = 200 ] || fail "S leaves K: $CODE"
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"s-back2","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'"}'
+[ "$CODE" = 409 ] && ok "after S joined and left another fleet, A still cannot re-add it by claim (marker is history)" || fail "marker via other fleet: $CODE $BODY"
 # end to end: the legacy route issues a claim (L, removed owner-held row), the POST redeems it
 call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"l-claim","did":"'$LDID'"}'; [ "$(echo "$BODY" | J mode)" = pending_claim ] && ok "legacy add without proof → claim issued" || fail "claim issue: $CODE $BODY"
 CL=e2eclaimcode456; HL=$(node -e "console.log(require('./fleet_billing').hashToken(process.argv[1]))" "$CL")

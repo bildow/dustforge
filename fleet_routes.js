@@ -157,7 +157,15 @@ module.exports = function registerFleetRoutes(deps) {
         if (wallet.did === fleet.owner_did) return res.status(400).json({ error: 'the fleet owner is not a silicon of their own fleet' });
         const own = memberOf(wallet.did);
         if (own && own.status !== 'removed') return res.status(409).json({ error: `that wallet is already in this fleet as @${own.handle}` });
-        if (own && own.joined_via === 'network' && !isAdminReq(req)) return res.status(409).json({ error: 'that wallet joined through the network; invite it again there (it keeps its own key)' });
+        // The marker is history, not the row (rows elsewhere are cleared when a wallet joins another fleet): a wallet
+        // that ever joined this owner's fleet through the network comes back only through the network.
+        let viaNetwork = Boolean(own && own.joined_via === 'network');
+        try {
+          viaNetwork = viaNetwork || Boolean(db.prepare(`SELECT 1 FROM network_requests WHERE status = 'accepted' AND
+            ((kind = 'agent' AND requester_did = ? AND target_did = ?) OR (kind = 'join' AND requester_did = ? AND target_did = ?)) LIMIT 1`)
+            .get(fleet.owner_did, wallet.did, wallet.did, fleet.owner_did));
+        } catch (_) { /* no network table yet: nothing joined through it */ }
+        if (viaNetwork && !isAdminReq(req)) return res.status(409).json({ error: 'that wallet joined through the network; invite it again there (it keeps its own key)' });
         const why = fb.joinBlocker(db, fleet, wallet.did);
         if (why) return res.status(409).json({ error: why });
         if (db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status = 'pending_claim'").get(wallet.did, fleet.id)) {
