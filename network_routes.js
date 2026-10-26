@@ -19,10 +19,11 @@ const MAX_PENDING_TRANSFERS = 10;
 const MAX_TRANSFER = 1000000;     // same cap as /api/wallet/transfer
 const NEW_FLEET_MAX_AGENTS = 25;
 const KINDS = new Set(['person', 'agent', 'join']);
+const REASK_COOLDOWN_HOURS = 24;  // after a decline or withdraw, the same wallet asks the same wallet again only after this
 
 module.exports = function registerNetworkRoutes(deps) {
   const { app, db, billing, fleetBilling: fb, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing,
-          spendSingleUse, barrelGuardedTransfer, sendMail } = deps;
+          spendSingleUse, barrelGuardedTransfer, transferRefusal, sendMail } = deps;
   const log = deps.log || ((...a) => console.log('[network]', ...a));
 
   db.exec(`CREATE TABLE IF NOT EXISTS network_requests (
@@ -81,7 +82,9 @@ module.exports = function registerNetworkRoutes(deps) {
     const wallet = db.prepare('SELECT did, username, email, status, pin_hash FROM identity_wallets WHERE did = ?').get(auth.did);
     if (!wallet) { res.status(404).json({ error: 'no wallet for this token' }); return null; }
     if (wallet.status !== 'active') { res.status(403).json({ error: 'account suspended' }); return null; }
-    return { auth, wallet };
+    // A token a fleet owner minted for this wallet acts as the wallet, but does not decide fleet membership for it.
+    const minted = Boolean(auth.decoded && auth.decoded.auth_method === 'fleet_owner_mint');
+    return { auth, wallet, minted };
   }
   function findWallet(q) {
     const s = String(q || '').trim();
@@ -158,12 +161,9 @@ module.exports = function registerNetworkRoutes(deps) {
     const { owner, member } = fleetSides({ kind, requester_did: requesterDid, target_did: targetDid });
     const mf = memberFleet(member);
     if (mf && mf.owner_did === owner) return 'already in that fleet';
-    if (mf) return `${walletName(member) || 'that wallet'} is already an agent in another fleet (${mf.slug}); it has to leave it first`;
-    if (memberFleet(owner)) return `${walletName(owner) || 'that wallet'} is an agent in a fleet, so it cannot own one`;
-    const f = ownedFleet(member);
-    if (f && db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND status = 'active'").get(f.id)) {
-      return `${walletName(member) || 'that wallet'} runs its own fleet of agents, so it cannot join one`;
-    }
+    if (mf) return 'that wallet is already an agent in another fleet; it has to leave it first';
+    if (memberFleet(owner)) return 'a wallet that is an agent in a fleet cannot take agents';
+    if (fb.ownsFleetWithAgents(db, member)) return 'a wallet that runs its own fleet of agents cannot join one';
     return null;
   }
   function requestView(r, me) {
@@ -227,6 +227,12 @@ module.exports = function registerNetworkRoutes(deps) {
     const target = findWallet(b.to);
     if (!target || target.status !== 'active') return res.status(404).json({ error: 'no wallet by that name' });
     if (target.did === me) return res.status(400).json({ error: 'that is your own wallet' });
+    if (kind !== 'person' && w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot change fleet membership; sign in as this wallet' });
+    // A `join` request hands the asker to the target's fleet with no step on the asker's side after this one, so
+    // it is for wallets with no PIN (agents). A wallet with a PIN asks the owner to invite it and accepts with the PIN.
+    if (kind === 'join' && w.wallet.pin_hash) {
+      return res.status(403).json({ error: 'this wallet has a PIN: ask the fleet owner to add you as an agent, then accept with your PIN' });
+    }
     const note = cleanText(b.note, 200);
     let handle = '';
     if (kind !== 'person') {
@@ -244,6 +250,9 @@ module.exports = function registerNetworkRoutes(deps) {
       return res.status(409).json({ error: open.requester_did === me ? 'you already asked; it is waiting for them' : `${target.username} already asked you; accept their request instead`,
                                     request: requestView(open, me) });
     }
+    const recent = db.prepare(`SELECT decided_at FROM network_requests WHERE requester_did = ? AND target_did = ? AND status IN ('declined', 'withdrawn')
+                               AND decided_at > datetime('now', ?) ORDER BY id DESC LIMIT 1`).get(me, target.did, `-${REASK_COOLDOWN_HOURS} hours`);
+    if (recent) return res.status(429).json({ error: `you asked this wallet recently; ask again after ${REASK_COOLDOWN_HOURS} hours` });
     if (db.prepare("SELECT COUNT(*) AS n FROM network_requests WHERE requester_did = ? AND status = 'pending'").get(me).n >= MAX_OUTGOING) {
       return res.status(429).json({ error: `at most ${MAX_OUTGOING} requests can wait at once; withdraw one first` });
     }
@@ -255,11 +264,13 @@ module.exports = function registerNetworkRoutes(deps) {
     const row = db.prepare('SELECT * FROM network_requests WHERE id = ?').get(id);
     const ask = kind === 'person' ? 'wants to connect with you'
       : kind === 'agent' ? 'invites your wallet to join their fleet as an agent' : 'asks to join your fleet as an agent';
+    // The mail only says a request waits; the note and the decision stay in the wallet (no free text from strangers
+    // in a mail from DemiPass, and no ready-made accept command for an agent that reads its mailbox).
     if (sendMail) {
       sendMail({ to: target.email, subject: `DemiPass: ${w.wallet.username} ${ask}`,
-        text: `${w.wallet.username} ${ask}.${note ? `\n\nTheir note: ${note}` : ''}\n\n${requestView(row, target.did).effect}\n\n`
-          + `Open your wallet at https://demipass.com/vault-mobile.html, tab Fleet, to accept or decline.\n`
-          + `Agents: POST https://api.dustforge.com/api/network/requests/${id}/accept with your wallet token.\n\nThe request expires in ${REQUEST_TTL_DAYS} days.` });
+        text: `${w.wallet.username} ${ask}.\n\n${requestView(row, target.did).effect}\n\n`
+          + `Open your wallet at https://demipass.com/vault-mobile.html, tab Fleet, to see it and decide. If you do not know `
+          + `${w.wallet.username}, decline it or let it expire (${REQUEST_TTL_DAYS} days).` });
     }
     log(`request ${id}: ${w.wallet.username} → ${target.username} (${kind})`);
     res.status(201).json({ ok: true, request: requestView(row, me) });
@@ -284,6 +295,7 @@ module.exports = function registerNetworkRoutes(deps) {
     const me = w.wallet.did;
     const r = requestFor(req, res, me); if (!r) return;
     if (r.target_did !== me) return res.status(403).json({ error: 'only the wallet that was asked can accept' });
+    if (r.kind !== 'person' && w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot change fleet membership; sign in as this wallet' });
     const requester = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(r.requester_did);
     if (!requester || requester.status !== 'active') return res.status(409).json({ error: 'the wallet that asked is no longer active' });
     const why = blocker(r.kind, r.requester_did, r.target_did);
@@ -320,7 +332,9 @@ module.exports = function registerNetworkRoutes(deps) {
         const member = db.prepare('SELECT username, email FROM identity_wallets WHERE did = ?').get(sides.member);
         // The silicon id is one per wallet: rows it left behind in other fleets (removed, or a mailbox claim never
         // opened) give way. An active row elsewhere was refused above.
-        db.prepare("DELETE FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status != 'active'").run(sides.member, fleet.id);
+        const why2 = fb.joinBlocker(db, fleet, sides.member);
+        if (why2) throw Object.assign(new Error(why2), { statusCode: 409 });
+        fb.clearStaleSiliconRows(db, sides.member, fleet.id);
         const handle = freeHandle(fleet.id, r.handle || defaultHandle(member.username), sides.member);
         const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: sides.member, handle, displayName: member.username, contactEmail: member.email });
         db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, sides.member);
@@ -361,11 +375,13 @@ module.exports = function registerNetworkRoutes(deps) {
   // An agent leaves the fleet it is in (its owner removes it with DELETE /api/fleet/:slug/silicons/:handle).
   app.post('/api/network/leave-fleet', rateLimitStandard, (req, res) => {
     const w = walletAuth(req, res); if (!w) return;
+    if (w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot change fleet membership; sign in as this wallet' });
     const mf = memberFleet(w.wallet.did);
     if (!mf) return res.status(404).json({ error: 'this wallet is not an agent in a fleet' });
     db.transaction(() => {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE fleet_id = ? AND member_did = ?").run(mf.id, w.wallet.did);
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(mf.id, w.wallet.did);
+      fb.cutFleetTokens(db, w.wallet.did, mf.slug);   // the owner's minted tokens for this wallet stop working
     })();
     log(`${w.wallet.username} left fleet ${mf.slug}`);
     res.json({ ok: true, left: mf.slug });
@@ -412,6 +428,8 @@ module.exports = function registerNetworkRoutes(deps) {
     const to = db.prepare('SELECT username, status FROM identity_wallets WHERE did = ?').get(t.to_did);
     if (!to || to.status !== 'active') return res.status(409).json({ error: 'that wallet is no longer active' });
     const intent = `send:${t.id}`;
+    const barrel = transferRefusal ? transferRefusal(me, t.amount_cents) : null;   // say so before asking for a PIN
+    if (barrel) return res.status(barrel.statusCode || 403).json(barrel.body || { error: barrel.message });
     const required = w.wallet.pin_hash ? ['pin'] : [];
     if (required.length && !gateFresh(me, 'pin', w.auth, intent)) {
       return res.status(403).json({ ...gateMissing('send', required, required, intent), error: `sending ${t.amount_cents} DD to ${to.username} needs your PIN` });

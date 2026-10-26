@@ -6527,24 +6527,29 @@ function computeBarrelTier(did) {
   return { tier, inner_count, middle_count, outer_count, wallet_bound, last_auth_age_seconds };
 }
 
+// The refusal (an Error with statusCode/body) a transfer of this size from this wallet meets, or null.
+function transferBarrelRefusal(fromDid, amountCents) {
+  if (!(amountCents > 100)) return null;
+  const barrel = computeBarrelTier(fromDid);
+  if (BARREL_TIERS.indexOf(barrel.tier) >= BARREL_TIERS.indexOf('double')) return null;
+  const upgrade_hint = !barrel.wallet_bound
+    ? 'fund your wallet to unlock double barrel'
+    : 'accumulate more fingerprint ring signals via repeated auth';
+  return Object.assign(new Error('double barrel required for transfers > 100 DD'), {
+    statusCode: 403,
+    body: { error: 'double barrel required for transfers > 100 DD', required_tier: 'double', current_tier: barrel.tier, upgrade_hint },
+  });
+}
+
 // ── Ledger-level barrel invariant ──
 // This is the ONLY function that should be used for transfers.
 // It enforces barrel tier checks at the ledger level, not just route level.
 // creditDescription: what the receiver's ledger says (default: description with 'to' swapped for 'from', which names
 // the receiver itself when description is 'Transfer to <receiver>' — pass the sender's name instead).
 function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, description, creditDescription = null) {
-  if (amountCents > 100 && type.includes('transfer')) {
-    const barrel = computeBarrelTier(fromDid);
-    const barrelIndex = BARREL_TIERS.indexOf(barrel.tier);
-    if (barrelIndex < BARREL_TIERS.indexOf('double')) {
-      const upgrade_hint = !barrel.wallet_bound
-        ? 'fund your wallet to unlock double barrel'
-        : 'accumulate more fingerprint ring signals via repeated auth';
-      throw Object.assign(new Error('double barrel required for transfers > 100 DD'), {
-        statusCode: 403,
-        body: { error: 'double barrel required for transfers > 100 DD', required_tier: 'double', current_tier: barrel.tier, upgrade_hint },
-      });
-    }
+  if (type.includes('transfer')) {
+    const refusal = transferBarrelRefusal(fromDid, amountCents);
+    if (refusal) throw refusal;
   }
 
   const txn = db.transaction(() => {
@@ -7360,7 +7365,7 @@ const fleetRoutes = require('./fleet_routes')({
 // Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
 require('./network_routes')({
   app, db, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-  barrelGuardedTransfer, sendMail: fleetRoutes.sendMail,
+  barrelGuardedTransfer, transferRefusal: transferBarrelRefusal, sendMail: fleetRoutes.sendMail,
 });
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
@@ -7386,6 +7391,9 @@ app.post('/api/fleet/create', (req, res) => {
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
   const owner_did = v.decoded.sub;
+  if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required' });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  if (v.decoded.auth_method === 'fleet_owner_mint') return res.status(403).json({ error: 'a fleet-minted token cannot create a fleet; sign in as this wallet' });
 
   const { name, slug, description } = req.body || {};
   if (!name || typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name required' });

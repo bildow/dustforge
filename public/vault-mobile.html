@@ -463,7 +463,7 @@
     <h3>Send DD to <span id="send-to-name"></span></h3>
     <label>Amount (DD)</label><input type="number" id="send-amount" min="1" step="1" inputmode="numeric" placeholder="e.g. 100">
     <label>Note (optional)</label><input type="text" id="send-note" maxlength="140" placeholder="shows in both ledgers">
-    <div style="font-size:0.72rem;color:var(--text3);margin-top:0.25rem">Your PIN approves the transfer. Your balance: <span id="send-balance">—</span> DD</div>
+    <div style="font-size:0.72rem;color:var(--text3);margin-top:0.25rem"><span id="send-pin-note">Your PIN approves the transfer.</span> Your balance: <span id="send-balance">—</span> DD</div>
     <div id="send-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" id="send-go" onclick="sendDD()">Send</button></div>
   </div>
@@ -623,7 +623,8 @@ async function pickFleet(){
   if(fleetSlug)return fleetSlug;
   const r=await api('GET','/api/fleets/mine');
   const mine=(r.fleets||[]);
-  const owned=mine.find(f=>f.role==='owner')||mine[0];
+  const inFleet=netData&&netData.member_of&&mine.find(f=>f.slug===netData.member_of.slug);   // the fleet this wallet is an agent of
+  const owned=mine.find(f=>f.role==='owner')||inFleet||mine[0];
   fleetSlug=owned?owned.slug:null;
   return fleetSlug;
 }
@@ -1071,6 +1072,7 @@ function openSend(username){
   sendTo=username; sendBusy=false;
   document.getElementById('send-to-name').textContent=username;
   document.getElementById('send-balance').textContent=dd(netData&&netData.me&&netData.me.balance_cents);
+  document.getElementById('send-pin-note').textContent=(netData&&netData.me&&netData.me.pin_set===false)?'This wallet has no PIN: Send sends at once.':'Your PIN approves the transfer.';
   for(const i of ['send-amount','send-note']) document.getElementById(i).value='';
   const m=document.getElementById('send-msg'); m.textContent=''; m.className='modal-msg';
   openModal('send'); setTimeout(()=>document.getElementById('send-amount').focus(),80);

@@ -43,6 +43,9 @@ module.exports = function registerFleetRoutes(deps) {
     const role = m ? m.role : (fleet.owner_did === who.did ? 'owner' : null);
     if (!role) { res.status(403).json({ error: 'fleet membership required' }); return null; }
     if (roles && !roles.includes(role)) { res.status(403).json({ error: `${roles.join(' or ')} role required` }); return null; }
+    // A token some fleet owner minted for this wallet acts as the wallet, but never runs the wallet's own fleet:
+    // otherwise an owner reaches, through a member, the member's agents.
+    if (roles && who.decoded.auth_method === 'fleet_owner_mint') { res.status(403).json({ error: 'a fleet-minted token cannot manage a fleet; sign in as this wallet' }); return null; }
     return { ...who, fleet, role };
   }
   function sendMail({ to, subject, text }) {
@@ -61,9 +64,12 @@ module.exports = function registerFleetRoutes(deps) {
     const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did);
     return w ? w.username : null;
   }
-  function siliconOr404(res, fleet, handle) {
+  // Only an active silicon (it consented) is managed: one waiting on its claim link is listed, and can be edited
+  // or removed (allowPending), but never gets a token, DD, secrets, workers or a detail view.
+  function siliconOr404(res, fleet, handle, { allowPending = false } = {}) {
     const s = fb.getSilicon(db, fleet.id, handle);
     if (!s || s.status === 'removed') { res.status(404).json({ error: 'silicon not found in this fleet' }); return null; }
+    if (s.status !== 'active' && !(allowPending && s.status === 'pending_claim')) { res.status(409).json({ error: `@${s.handle} has not confirmed joining the fleet yet` }); return null; }
     return s;
   }
   function projectRows(fleet) {
@@ -144,14 +150,18 @@ module.exports = function registerFleetRoutes(deps) {
     try {
       if (wallet) {
         if (wallet.did === fleet.owner_did) return res.status(400).json({ error: 'the fleet owner is not a silicon of their own fleet' });
-        const other = db.prepare("SELECT f.slug FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.member_did = ? AND s.fleet_id != ? AND s.status = 'active'").get(wallet.did, fleet.id);
-        if (other) return res.status(409).json({ error: `identity is already a silicon of fleet '${other.slug}'` });
+        const why = fb.joinBlocker(db, fleet, wallet.did);
+        if (why) return res.status(409).json({ error: why });
+        fb.clearStaleSiliconRows(db, wallet.did, fleet.id);
         // consent: member token, admin key, or mailbox claim
         let proof = null;
         if (b.member_token) {
           const v = identity.verifyTokenStandalone(String(b.member_token));
-          if (v.valid && v.decoded.sub === wallet.did) proof = 'member_token';
-          else return res.status(403).json({ error: 'member_token does not belong to that identity' });
+          if (!v.valid || v.decoded.sub !== wallet.did) return res.status(403).json({ error: 'member_token does not belong to that identity' });
+          if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(403).json({ error: 'member_token is revoked' });
+          // Consent comes from the wallet itself, not from a token some fleet owner minted for it.
+          if (v.decoded.auth_method === 'fleet_owner_mint') return res.status(403).json({ error: 'member_token must be the wallet\'s own sign-in token, not a fleet-minted one' });
+          proof = 'member_token';
         } else if (isAdminReq(req)) proof = 'admin';
         const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill });
         if (proof) {
@@ -242,7 +252,7 @@ module.exports = function registerFleetRoutes(deps) {
 
   app.patch('/api/fleet/:slug/silicons/:handle', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
-    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
     try {
       const updated = fb.updateSiliconSettings(db, s, req.body || {});
       res.json({ ok: true, silicon: fb.siliconView(db, billing, updated, { fleet: a.fleet }) });
@@ -251,9 +261,12 @@ module.exports = function registerFleetRoutes(deps) {
 
   app.delete('/api/fleet/:slug/silicons/:handle', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
-    const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
-    db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
-    db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(a.fleet.id, s.member_did);
+    const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
+    db.transaction(() => {
+      db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, claim_code = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
+      db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(a.fleet.id, s.member_did);
+      fb.cutFleetTokens(db, s.member_did, a.fleet.slug);   // tokens this fleet minted for it stop working
+    })();
     log(`removed ${s.handle} from ${a.fleet.slug} by ${a.did}`);
     res.json({ ok: true });
   });

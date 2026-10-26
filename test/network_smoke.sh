@@ -76,10 +76,10 @@ call POST /api/network/requests "$A" '{"to":"person-k","as":"person"}'; [ "$CODE
 call POST /api/network/requests "$X" '{"to":"owner-a","as":"person"}'; RX=$(echo "$BODY" | J request.id)
 call POST /api/network/requests/$RX/decline "$X"; [ "$CODE" = 403 ] && ok "the asker cannot decline (it withdraws)" || fail "decl own: $CODE $BODY"
 call POST /api/network/requests/$RX/decline "$A"; [ "$CODE" = 200 ] && ok "A declines S" || fail "decline: $CODE $BODY"
-call POST /api/network/requests "$X" '{"to":"owner-a","as":"person"}'; RX=$(echo "$BODY" | J request.id)
-call POST /api/network/requests/$RX/withdraw "$A"; [ "$CODE" = 403 ] && ok "the target cannot withdraw" || fail "wd target: $CODE $BODY"
-call POST /api/network/requests/$RX/withdraw "$X"; [ "$CODE" = 200 ] && ok "S withdraws its request" || fail "withdraw: $CODE $BODY"
-call POST /api/network/requests/$RX/accept "$A"; [ "$CODE" = 409 ] && ok "a withdrawn request cannot be accepted" || fail "accept withdrawn: $CODE $BODY"
+call POST /api/network/requests "$F" '{"to":"stranger-s","as":"person"}'; RX=$(echo "$BODY" | J request.id)
+call POST /api/network/requests/$RX/withdraw "$X"; [ "$CODE" = 403 ] && ok "the target cannot withdraw" || fail "wd target: $CODE $BODY"
+call POST /api/network/requests/$RX/withdraw "$F"; [ "$CODE" = 200 ] && ok "F withdraws its request" || fail "withdraw: $CODE $BODY"
+call POST /api/network/requests/$RX/accept "$X"; [ "$CODE" = 409 ] && ok "a withdrawn request cannot be accepted" || fail "accept withdrawn: $CODE $BODY"
 
 # ── send DD to a person ──
 call POST /api/network/transfers "$A" '{"to":"stranger-s","amount_cents":5}'; [ "$CODE" = 403 ] && ok "sending to a wallet you are not connected to → 403" || fail "unconnected: $CODE $BODY"
@@ -154,5 +154,44 @@ call POST /api/network/requests/$RK2/accept "$F"; [ "$CODE" = 200 ] && [ "$(echo
 call GET /api/fleets/mine "$K"; [ "$(echo "$BODY" | J fleets.0.role)" = owner ] && ok "K now owns a fleet (Fleet tab works for K)" || fail "K fleets: $BODY"
 call POST /api/network/people/remove "$K" '{"username":"owner-a"}'; [ "$CODE" = 200 ] && ok "K removes A as a contact" || fail "remove: $CODE"
 call POST /api/network/transfers "$A" '{"to":"person-k","amount_cents":1}'; [ "$CODE" = 403 ] && ok "after removal, A cannot send K DD" || fail "post-remove: $CODE"
+# ── review round 1 regressions ──
+call POST /api/network/requests "$G" '{"to":"stranger-s","as":"join"}'; [ "$CODE" = 403 ] && ok "a wallet with a PIN cannot send 'join' (stolen-token takeover closed)" || fail "join with pin: $CODE $BODY"
+call POST /api/network/requests "$X" '{"to":"owner-a","as":"person"}'; RC=$(echo "$BODY" | J request.id)
+call POST /api/network/requests/$RC/decline "$A"
+call POST /api/network/requests "$X" '{"to":"owner-a","as":"person"}'; [ "$CODE" = 429 ] && ok "asking again right after a decline → 429 (cooldown)" || fail "cooldown: $CODE $BODY"
+call POST /api/network/requests "$K" '{"to":"stranger-s","as":"person"}'; RW=$(echo "$BODY" | J request.id)
+call POST /api/network/requests/$RW/withdraw "$K"
+call POST /api/network/requests "$K" '{"to":"stranger-s","as":"person"}'; [ "$CODE" = 429 ] && ok "request → withdraw → request again → 429 (no mail loop)" || fail "withdraw loop: $CODE $BODY"
+# legacy route: a silicon added without consent stays pending and gets nothing
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"stranger","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'"}'
+[ "$(echo "$BODY" | J mode)" = pending_claim ] && ok "legacy add without proof → pending_claim" || fail "legacy add: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons/stranger/token "$A" '{"scope":"transact","expires_in":"1h"}'; [ "$CODE" = 409 ] && ok "no token minted for a silicon that has not confirmed (was: any wallet's token)" || fail "pending mint: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons/stranger/refill "$A" '{"amount_cents":5}'; [ "$CODE" = 409 ] && ok "no refill to an unconfirmed silicon" || fail "pending refill: $CODE"
+call GET /api/fleet/$SLUG/silicons/stranger "$A"; [ "$CODE" = 409 ] && ok "no detail view of an unconfirmed silicon" || fail "pending detail: $CODE"
+call DELETE /api/fleet/$SLUG/silicons/stranger "$A"; [ "$CODE" = 200 ] && ok "an unconfirmed silicon can be removed" || fail "pending delete: $CODE $BODY"
+call POST /api/fleet/create "$(curl -s -X POST $API/api/identity/auth-fingerprint -H 'Content-Type: application/json' -d '{"username":"stranger-s","password":"hunter22","scope":"read","expires_in":"1h"}' | J token)" '{"name":"x","slug":"read-fleet"}'
+[ "$CODE" = 403 ] && ok "/api/fleet/create refuses a read-scope token" || fail "fleet create read: $CODE $BODY"
+# minted tokens: G is @agent-f-2 in A's fleet. A mints G's token.
+call POST /api/fleet/$SLUG/silicons/agent-f-2/token "$A" '{"scope":"transact","expires_in":"1h"}'; GM=$(echo "$BODY" | J token)
+[ "$CODE" = 200 ] && ok "A mints a token for its agent G" || fail "mint G: $CODE $BODY"
+call GET /api/network "$GM"; [ "$CODE" = 200 ] && ok "the minted token works as G" || fail "minted works: $CODE"
+call POST /api/network/requests "$GM" '{"to":"person-k","as":"join"}'; [ "$CODE" = 403 ] && ok "a minted token cannot send fleet requests for G" || fail "minted join: $CODE $BODY"
+call POST /api/network/leave-fleet "$GM"; [ "$CODE" = 403 ] && ok "a minted token cannot make G leave" || fail "minted leave: $CODE"
+call POST /api/fleet/create "$GM" '{"name":"x","slug":"minted-fleet"}'; [ "$CODE" = 403 ] && ok "a minted token cannot create a fleet for G" || fail "minted create: $CODE $BODY"
+call POST /api/network/leave-fleet "$G"; [ "$CODE" = 200 ] && ok "G leaves A's fleet with its own token" || fail "G leave: $CODE"
+call GET /api/network "$GM"; [ "$CODE" = 401 ] && ok "A's minted token for G died when G left" || fail "cut: $CODE $BODY"
+call GET /api/network "$G"; [ "$CODE" = 200 ] && ok "G's own token still works" || fail "own after cut: $CODE"
+# an owner with agents (K owns a fleet with F) cannot join, even via a second empty fleet trick
+call POST /api/network/requests "$A" '{"to":"person-k","as":"agent"}'; [ "$CODE" = 409 ] && ok "K runs a fleet with an agent → cannot be invited (any owned fleet counts)" || fail "owner join: $CODE $BODY"
+# barrel before the PIN: stranger-s has no inner-ring signals and a balance → 403 barrel without a PIN prompt
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE identity_wallets SET balance_cents=500 WHERE username='stranger-s'\"); c.commit()" "$DB_PATH"
+call POST /api/network/requests "$X" '{"to":"agent-g","as":"person"}'; RS=$(echo "$BODY" | J request.id); call POST /api/network/requests/$RS/accept "$G"
+call POST /api/network/transfers "$G" '{"to":"stranger-s","amount_cents":150}'; TG=$(echo "$BODY" | J transfer.id)
+call POST /api/network/transfers/$TG/confirm "$G"
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J required_tier)" = double ] && [ "$(echo "$BODY" | J missing)" = None ] && ok "over 100 DD below the double barrel → refused before any PIN prompt" || fail "barrel first: $CODE $BODY"
+# F is an agent in K's fleet: a fleet F creates cannot take agents through the legacy route either
+call POST /api/fleet/create "$F" '{"name":"f-own","slug":"f-own"}'; [ "$CODE" = 200 ] || fail "F create: $CODE $BODY"
+call POST /api/fleet/f-own/silicons "$F" '{"handle":"s1","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'","member_token":"'$X'"}'
+[ "$CODE" = 409 ] && ok "an agent's own fleet cannot take agents (legacy route, even with the member's token)" || fail "agent owner legacy: $CODE $BODY"
 grep -qiE 'pin.*(4321|8765)|"pin":"' "$S/server.log" && fail "a PIN reached the server log" || ok "no PIN in the server log"
 echo "$fails failure(s)"; [ "$fails" = 0 ]
