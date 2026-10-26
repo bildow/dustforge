@@ -1251,6 +1251,7 @@ app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
   const now = Math.floor(Date.now() / 1000);
   db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(auth.did, now);
   db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(auth.did);
+  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(auth.did);   // else a refresh mints a live token again
   res.json({ ok: true, revoke_before: now, warning: 'ALL tokens for this DID issued before now are dead, including the one that made this call. Re-mint via request-2fa + verify.' });
 });
 
@@ -6048,6 +6049,11 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
   if (_deadApprover.revoked) return res.status(401).json({ error: _deadApprover.reason });
   const approverDid = v.decoded && v.decoded.sub;
   if (!approverDid) return res.status(401).json({ error: 'operator token has no DID' });
+  // A device login is a new session of the approver's wallet: only the wallet's own session may open one, not a
+  // token a fleet owner minted for it or a worker's token.
+  if (v.decoded.auth_method === 'fleet_owner_mint' || v.decoded.auth_method === 'worker' || v.decoded.wrk) {
+    return res.status(403).json({ error: 'approve device logins from your own sign-in, not a fleet-minted or worker token' });
+  }
   const uc = user_code.toString().toUpperCase().trim();
   const row = db.prepare("SELECT * FROM device_auth WHERE user_code = ? AND status='pending' ORDER BY created_at DESC LIMIT 1").get(uc);
   if (!row) return res.status(404).json({ error: 'no pending request for that code' });
@@ -6139,6 +6145,7 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required' });
 
@@ -8223,6 +8230,7 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   // Progressive Barrel: require transact-or-above scope for secure transfers (double barrel tier)
   if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required (double barrel)' });

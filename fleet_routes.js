@@ -153,6 +153,9 @@ module.exports = function registerFleetRoutes(deps) {
         const why = fb.joinBlocker(db, fleet, wallet.did);
         if (why) return res.status(409).json({ error: why });
         fb.clearStaleSiliconRows(db, wallet.did, fleet.id);
+        if (db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status = 'pending_claim'").get(wallet.did, fleet.id)) {
+          return res.status(409).json({ error: 'that wallet has an open invitation from another fleet' });
+        }
         // consent: member token, admin key, or mailbox claim
         let proof = null;
         if (b.member_token) {
@@ -160,7 +163,9 @@ module.exports = function registerFleetRoutes(deps) {
           if (!v.valid || v.decoded.sub !== wallet.did) return res.status(403).json({ error: 'member_token does not belong to that identity' });
           if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(403).json({ error: 'member_token is revoked' });
           // Consent comes from the wallet itself, not from a token some fleet owner minted for it.
-          if (v.decoded.auth_method === 'fleet_owner_mint') return res.status(403).json({ error: 'member_token must be the wallet\'s own sign-in token, not a fleet-minted one' });
+          if (v.decoded.auth_method === 'fleet_owner_mint' || v.decoded.auth_method === 'worker' || v.decoded.wrk) {
+            return res.status(403).json({ error: 'member_token must be the wallet\'s own sign-in token, not a fleet-minted or worker one' });
+          }
           proof = 'member_token';
         } else if (isAdminReq(req)) proof = 'admin';
         const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill });
@@ -180,6 +185,7 @@ module.exports = function registerFleetRoutes(deps) {
       }
 
       // Create a brand-new identity (mailbox + wallet), charged like /provision.
+      if (fb.activeFleetOf(db, fleet.owner_did)) return res.status(409).json({ error: 'the fleet owner is an agent in a fleet, so it cannot take agents' });
       const create = b.create && typeof b.create === 'object' ? b.create : {};
       const username = String(create.username || handle).toLowerCase();
       if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'username must be 3-31 chars, lowercase alphanumeric' });
@@ -221,7 +227,7 @@ module.exports = function registerFleetRoutes(deps) {
   // One-time mailbox claim link (no auth; the code is the proof).
   app.get('/api/fleet/claim/:code', rateLimitStandard, (req, res) => {
     const r = fb.redeemClaim(db, req.params.code);
-    if (!r.ok) return res.status(400).send(`<html><body style="font-family:sans-serif;padding:2rem"><h2>DemiPass fleet</h2><p>${r.error}.</p></body></html>`);
+    if (!r.ok) return res.status(400).send(`<html><body style="font-family:sans-serif;padding:2rem"><h2>DemiPass fleet</h2><p>${String(r.error).replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)}.</p></body></html>`);
     const fleet = db.prepare('SELECT * FROM fleets WHERE id = ?').get(r.silicon.fleet_id);
     const wallet = db.prepare('SELECT username, email FROM identity_wallets WHERE did = ?').get(r.silicon.member_did) || {};
     sendMail({ to: r.silicon.contact_email || wallet.email, subject: `DemiPass: ${r.silicon.handle} joined fleet ${fleet.slug} — your DID record`,
@@ -381,6 +387,7 @@ module.exports = function registerFleetRoutes(deps) {
   function workerManager(req, res) {
     const who = bearer(req, res); if (!who) return null;
     if (who.decoded.wrk) { res.status(403).json({ error: 'a worker token cannot manage workers' }); return null; }
+    if (who.decoded.auth_method === 'fleet_owner_mint') { res.status(403).json({ error: 'a fleet-minted token cannot manage workers; sign in as this wallet' }); return null; }
     if (!identity.scopeAtLeast(who.scope, 'transact')) { res.status(403).json({ error: 'transact scope required' }); return null; }
     return who;
   }

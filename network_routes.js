@@ -334,7 +334,7 @@ module.exports = function registerNetworkRoutes(deps) {
         // opened) give way. An active row elsewhere was refused above.
         const why2 = fb.joinBlocker(db, fleet, sides.member);
         if (why2) throw Object.assign(new Error(why2), { statusCode: 409 });
-        fb.clearStaleSiliconRows(db, sides.member, fleet.id);
+        fb.clearStaleSiliconRows(db, sides.member, fleet.id, { withPending: true });
         const handle = freeHandle(fleet.id, r.handle || defaultHandle(member.username), sides.member);
         const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: sides.member, handle, displayName: member.username, contactEmail: member.email });
         db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, sides.member);
@@ -381,10 +381,13 @@ module.exports = function registerNetworkRoutes(deps) {
     db.transaction(() => {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE fleet_id = ? AND member_did = ?").run(mf.id, w.wallet.did);
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(mf.id, w.wallet.did);
-      fb.cutFleetTokens(db, w.wallet.did, mf.slug);   // the owner's minted tokens for this wallet stop working
+      fb.cutFleetTokens(db, w.wallet.did, mf.slug);
+      // Whatever the owner obtained while it held the key — minted tokens, device logins it approved with them,
+      // refresh tokens, workers — stops working. So does this session: sign in again.
+      fb.signOutEverywhere(db, w.wallet.did);
     })();
     log(`${w.wallet.username} left fleet ${mf.slug}`);
-    res.json({ ok: true, left: mf.slug });
+    res.json({ ok: true, left: mf.slug, signed_out: true, note: 'every token of this wallet was revoked, this one too: sign in again' });
   });
 
   // ── Send DD to a connection ───────────────────────────────────────────────

@@ -659,7 +659,8 @@ async function loadFleet(){
     h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">Silicons</span><span style="font-size:0.7rem;color:var(--text3)">'+d.silicons.length+' / '+d.fleet.max_agents+'</span></div>';
     if(!d.silicons.length)h+='<div class="empty">No silicons yet. Tap + Silicon to add one.</div>';
     for(const s of d.silicons){
-      h+='<div onclick="openSilicon('+jsArg(s.handle)+')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
+      const live=s.status==='active';   // one still waiting on its claim link has no subpage yet
+      h+='<div '+(live?'onclick="openSilicon('+jsArg(s.handle)+')" ':'')+'style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:'+(live?'pointer':'default')+(live?'':';opacity:0.7')+'">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong style="color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700">'+dd(s.balance_cents)+' DD</div></div>';
       h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.35rem;font-size:0.68rem;color:var(--text3)"><span>'+(s.refill.enabled?('refill +'+dd(s.refill.amount_cents)+' below '+dd(s.refill.threshold_cents)):'no auto-refill')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</span>'+tokenChip(s.token)+'</div>';
       h+='</div>';
@@ -1102,7 +1103,7 @@ async function removePerson(username){
 }
 async function leaveFleet(){
   const m=netData&&netData.member_of; if(!m) return;
-  if(!confirm('Leave '+m.owner+'\'s fleet? '+m.owner+' can then no longer mint tokens for this wallet, refill it, or give it secrets through the fleet.')) return;
+  if(!confirm('Leave '+m.owner+'\'s fleet? '+m.owner+' can then no longer mint tokens for this wallet, refill it, or give it secrets through the fleet. Every session of this wallet is signed out, this one too: sign in again after.')) return;
   try{ await api('POST','/api/network/leave-fleet'); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
   fleetSlug=null; loadFleet();
 }

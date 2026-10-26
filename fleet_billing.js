@@ -171,10 +171,23 @@ function joinBlocker(db, fleet, memberDid) {
   if (of) return 'the fleet owner is an agent in a fleet, so it cannot take agents';
   return null;
 }
-// Before a wallet joins a fleet: rows it left in other fleets (removed, or a claim never opened) give way — its
-// silicon id is unique across fleets.
-function clearStaleSiliconRows(db, memberDid, fleetId) {
-  db.prepare("DELETE FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status != 'active'").run(memberDid, fleetId);
+// Before a wallet joins a fleet: rows it left in other fleets give way — its silicon id is unique across fleets.
+// Removed rows always; claims never opened only when the wallet itself consents here (withPending), never when
+// some owner merely names it.
+function clearStaleSiliconRows(db, memberDid, fleetId, { withPending = false } = {}) {
+  db.prepare(`DELETE FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status ${withPending ? "!= 'active'" : "= 'removed'"}`).run(memberDid, fleetId);
+}
+// "Change the locks": every token of this wallet issued so far dies — its own, owner-minted ones, worker tokens,
+// device-flow tokens — and so do its refresh tokens and workers. Used when a wallet leaves a fleet: whatever the
+// owner obtained while it held the key stops working.
+function signOutEverywhere(db, did) {
+  // iat has whole seconds: the cut is this second (a sign-in right after still works), and every token issued so far
+  // — the same second included — is also revoked by its jti (all tokens are recorded in issued_tokens).
+  const cut = Math.floor(Date.now() / 1000);
+  db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(did, cut);
+  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(did);
+  try { db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(did); } catch (_) {}
+  try { db.prepare("UPDATE fleet_workers SET status = 'revoked', revoked_at = datetime('now'), revoked_by = ? WHERE parent_did = ? AND status = 'active'").run(did, did); } catch (_) {}
 }
 // Kill every token the owner of `slug` minted for `did` so far.
 function cutFleetTokens(db, did, slug) {
@@ -381,6 +394,13 @@ function tokenStatus(db, did, now = Date.now()) {
 }
 
 function siliconView(db, billing, s, { fleet } = {}) {
+  // Not confirmed yet: the owner named a wallet, the wallet has not agreed. Show nothing of it.
+  if (s.status !== 'active') {
+    return { handle: s.handle, display_name: s.display_name, did: null, silicon_id: null, username: null, email: null, wallet_status: null,
+             balance_cents: null, last_active: null,
+             refill: { enabled: !!s.refill_enabled, threshold_cents: s.refill_threshold_cents, amount_cents: s.refill_amount_cents, source: s.refill_source, last_refill_at: null, last_error: '' },
+             token: { status: 'none' }, fleet: fleet ? { slug: fleet.slug, name: fleet.name } : undefined, status: s.status, created_at: s.created_at };
+  }
   const w = db.prepare('SELECT username, email, status, balance_cents, updated_at FROM identity_wallets WHERE did = ?').get(s.member_did) || {};
   const balance = billing.getDerivedBalance(db, s.member_did);
   const lastTx = db.prepare('SELECT created_at FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT 1').get(s.member_did);
@@ -862,7 +882,7 @@ module.exports = {
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
   issueClaim, redeemClaim, claimEmail, hashToken,
-  activeFleetOf, ownsFleetWithAgents, joinBlocker, clearStaleSiliconRows, cutFleetTokens,
+  activeFleetOf, ownsFleetWithAgents, joinBlocker, clearStaleSiliconRows, cutFleetTokens, signOutEverywhere,
   workerId, createWorker, getWorker, listWorkers, revokeWorker, workerTokenClaims, recordWorkerToken, resolveWorker, workerMayUseSecret, workerView, siliconSecrets,
   didRecordEmail, tokenWarningEmail,
   HANDLE_RE, PROJECT_RE, INITIATORS, TOKEN_WARN_DAYS, REFILL_COOLDOWN_MS,
