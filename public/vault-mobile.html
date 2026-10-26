@@ -749,7 +749,8 @@ async function openSilicon(handle){
     h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
     h+='<div style="display:flex;justify-content:space-between;align-items:center"><div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">Access token</div>'+tokenChip(s.token)+'</div>';
     h+='<div style="font-size:0.72rem;margin-top:0.3rem">'+(s.token.expires_at?('scope '+esc(s.token.scope)+' · expires '+new Date(s.token.expires_at).toLocaleString()):'none on record')+'</div>';
-    h+='<div style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-ghost" onclick="mintSiliconToken()" style="font-size:0.72rem">Mint a 30-day token</button></div><div id="sil-token-out" style="display:none;margin-top:0.5rem"><div style="font-size:0.65rem;color:var(--red)">Shown once. Hand it to the silicon now.</div><textarea id="sil-token-text" readonly style="width:100%;height:4.5rem;font-family:monospace;font-size:0.6rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px"></textarea></div>';
+    if(s.joined_via==='network')h+='<div style="font-size:0.7rem;color:var(--text3);margin-top:0.6rem">Joined through the network: it keeps its own key and signs in itself.</div>';
+    else h+='<div style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-ghost" onclick="mintSiliconToken()" style="font-size:0.72rem">Mint a 30-day token</button></div><div id="sil-token-out" style="display:none;margin-top:0.5rem"><div style="font-size:0.65rem;color:var(--red)">Shown once. Hand it to the silicon now.</div><textarea id="sil-token-text" readonly style="width:100%;height:4.5rem;font-family:monospace;font-size:0.6rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px"></textarea></div>';
     h+='</div>';
     // secrets this silicon uses: its own + the ones delegated to it
     const own=(d.secrets&&d.secrets.own)||[], del=(d.secrets&&d.secrets.delegated)||d.delegations||[];
@@ -770,11 +771,13 @@ async function openSilicon(handle){
       if(w.status==='active')h+='<div style="display:flex;gap:0.4rem;margin-top:0.4rem"><button class="btn-ghost" onclick="mintWorkerToken('+jsArg(w.worker_id)+')" style="font-size:0.65rem">Mint token</button><button class="btn-ghost" onclick="revokeWorker('+jsArg(w.worker_id)+')" style="font-size:0.65rem;color:var(--red)">Revoke</button></div>';
       h+='</div>';
     }
+    if(s.joined_via!=='network'){   // the owner makes workers only for a silicon whose key it holds
     h+='<div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:0.7rem;margin-top:0.5rem"><div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem">New worker</div>';
     h+='<div style="display:flex;gap:0.4rem;flex-wrap:wrap"><input type="text" id="wk-name" placeholder="name, e.g. brain2" style="flex:1;min-width:7rem;margin:0;padding:0.4rem"><input type="text" id="wk-purpose" placeholder="purpose" style="flex:1;min-width:7rem;margin:0;padding:0.4rem"></div>';
     h+='<input type="text" id="wk-secrets" placeholder="allowed secrets: DP- refs or names, comma-separated (blank = all)" style="width:100%;margin:0.4rem 0 0;padding:0.4rem">';
     h+='<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;margin-top:0.4rem;font-size:0.72rem"><span>spend cap</span><input type="number" id="wk-cap" value="100" min="0" style="width:5rem;margin:0;padding:0.3rem"><span>DD · token</span><select id="wk-ttl" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.72rem;margin:0"><option value="1h">1 hour</option><option value="24h" selected>24 hours</option><option value="7d">7 days</option><option value="30d">30 days</option></select><button class="btn-primary" onclick="createWorker()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Create + mint</button></div>';
     h+='<div id="wk-token-out" style="display:none;margin-top:0.5rem"><div style="font-size:0.65rem;color:var(--red)">Worker token, shown once. Put it in the worker\'s environment.</div><textarea id="wk-token-text" readonly style="width:100%;height:4rem;font-family:monospace;font-size:0.6rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px"></textarea></div></div>';
+    }
     // recent spend
     h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Recent activity</span></div>';
     if(!d.recent.length)h+='<div class="empty" style="font-size:0.75rem">No transactions.</div>';
@@ -1103,8 +1106,10 @@ async function removePerson(username){
 }
 async function leaveFleet(){
   const m=netData&&netData.member_of; if(!m) return;
-  if(!confirm('Leave '+m.owner+'\'s fleet? '+m.owner+' can then no longer mint tokens for this wallet, refill it, or give it secrets through the fleet. Every session of this wallet is signed out, this one too: sign in again after.')) return;
-  try{ await api('POST','/api/network/leave-fleet'); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  if(!confirm('Leave '+m.owner+'\'s fleet? '+m.owner+' can then no longer mint tokens for this wallet, refill it, or give it secrets through the fleet. If '+m.owner+' held this wallet\'s key, every session of it is signed out too.')) return;
+  let r=null;
+  try{ r=await api('POST','/api/network/leave-fleet'); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  if(r&&r.signed_out){ logout(); document.getElementById('auth-err').textContent='You left the fleet and every session of this wallet was signed out. Sign in again.'; return; }
   fleetSlug=null; loadFleet();
 }
 

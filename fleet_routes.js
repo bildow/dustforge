@@ -272,6 +272,7 @@ module.exports = function registerFleetRoutes(deps) {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, claim_code = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(a.fleet.id, s.member_did);
       fb.cutFleetTokens(db, s.member_did, a.fleet.slug);   // tokens this fleet minted for it stop working
+      fb.revokeOwnerWorkers(db, s.member_did, a.fleet.owner_did);   // and workers its owner made for it
     })();
     log(`removed ${s.handle} from ${a.fleet.slug} by ${a.did}`);
     res.json({ ok: true });
@@ -292,6 +293,7 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/token', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network and keeps its own key: it signs in itself` });
     const { scope = TOKEN_SCOPE_CAP, expires_in = '30d' } = req.body || {};
     if (!identity.ISSUABLE_SCOPES.includes(scope) || identity.scopeAtLeast(scope, 'admin')) return res.status(400).json({ error: `scope must be read, write or ${TOKEN_SCOPE_CAP}` });
     if (typeof expires_in !== 'string' || !/^\d+[smhd]$/.test(expires_in)) return res.status(400).json({ error: 'expires_in: e.g. 24h, 7d, 30d' });
@@ -447,12 +449,14 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/workers', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network: it makes its own workers` });
     const r = createWorkerFrom(res, s.member_did, req.body || {}, a.did); if (!r) return;
     res.json({ ok: true, ...r });
   });
   app.post('/api/fleet/:slug/silicons/:handle/workers/:wid/token', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network: it mints its own worker tokens` });
     const w = fb.getWorker(db, req.params.wid);
     if (!w || w.parent_did !== s.member_did) return res.status(404).json({ error: 'worker not found' });
     if (w.status !== 'active') return res.status(409).json({ error: `worker is ${w.status}` });

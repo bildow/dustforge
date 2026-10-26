@@ -176,8 +176,8 @@ module.exports = function registerNetworkRoutes(deps) {
       // What accepting means for the one who decides, in plain words.
       effect: r.kind === 'person' ? 'You become contacts and can send each other DD.'
         : (sides.member === me
-          ? `You join ${walletName(sides.owner)}'s fleet as an agent. ${walletName(sides.owner)} can then mint tokens for your wallet, refill it, and give it secrets.`
-          : `${walletName(sides.member)} joins your fleet as an agent. You can then mint its tokens, refill it, and give it secrets.`),
+          ? `You join ${walletName(sides.owner)}'s fleet as an agent. ${walletName(sides.owner)} can then see this wallet's balance and spend, refill it, give it secrets to use, and you can send each other DD. Your wallet keeps its own key.`
+          : `${walletName(sides.member)} joins your fleet as an agent. You can then see its balance and spend, refill it, give it secrets to use, and send each other DD. It keeps its own key: it signs in itself.`),
       needs_pin: r.kind !== 'person' && sides.member === r.target_did && r.target_did === me && Boolean(db.prepare('SELECT pin_hash FROM identity_wallets WHERE did = ?').get(me)?.pin_hash),
       intent: `join:${r.id}`,
       handle: r.handle || '', note: r.note || '', status: r.status, created_at: r.created_at, expires_at: r.expires_at,
@@ -338,6 +338,7 @@ module.exports = function registerNetworkRoutes(deps) {
         const handle = freeHandle(fleet.id, r.handle || defaultHandle(member.username), sides.member);
         const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: sides.member, handle, displayName: member.username, contactEmail: member.email });
         db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, sides.member);
+        db.prepare("UPDATE fleet_silicons SET joined_via = 'network' WHERE id = ?").run(s.id);   // keeps its own key
         result = { kind: 'agent', fleet: fleet.slug, handle: s.handle, member: member.username, owner: walletName(sides.owner) };
       }).immediate();
       log(`request ${r.id} accepted: ${JSON.stringify(result)}`);
@@ -378,16 +379,20 @@ module.exports = function registerNetworkRoutes(deps) {
     if (w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot change fleet membership; sign in as this wallet' });
     const mf = memberFleet(w.wallet.did);
     if (!mf) return res.status(404).json({ error: 'this wallet is not an agent in a fleet' });
+    const ownerHeldKey = (db.prepare('SELECT joined_via FROM fleet_silicons WHERE fleet_id = ? AND member_did = ?').get(mf.id, w.wallet.did) || {}).joined_via !== 'network';
     db.transaction(() => {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE fleet_id = ? AND member_did = ?").run(mf.id, w.wallet.did);
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(mf.id, w.wallet.did);
       fb.cutFleetTokens(db, w.wallet.did, mf.slug);
-      // Whatever the owner obtained while it held the key — minted tokens, device logins it approved with them,
-      // refresh tokens, workers — stops working. So does this session: sign in again.
-      fb.signOutEverywhere(db, w.wallet.did);
+      fb.revokeOwnerWorkers(db, w.wallet.did, mf.owner_did);
+      // An owner that held this wallet's key (it created or linked it) could act as it: its sessions, refresh
+      // tokens, workers and registered agents end, this session too. A wallet that joined through the network
+      // kept its key; only the membership ends.
+      if (ownerHeldKey) fb.signOutEverywhere(db, w.wallet.did);
     })();
-    log(`${w.wallet.username} left fleet ${mf.slug}`);
-    res.json({ ok: true, left: mf.slug, signed_out: true, note: 'every token of this wallet was revoked, this one too: sign in again' });
+    log(`${w.wallet.username} left fleet ${mf.slug}${ownerHeldKey ? ' (signed out everywhere)' : ''}`);
+    res.json({ ok: true, left: mf.slug, signed_out: ownerHeldKey,
+               note: ownerHeldKey ? 'the fleet owner held this wallet\'s key: every token of it was revoked, this one too — sign in again, and check the recovery email and registered agents' : undefined });
   });
 
   // ── Send DD to a connection ───────────────────────────────────────────────

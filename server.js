@@ -7473,6 +7473,7 @@ app.post('/api/fleet/:slug/invite', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { did } = req.body || {};
@@ -7542,6 +7543,7 @@ app.post('/api/fleet/:slug/upgrade', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { tier } = req.body || {};
@@ -7581,6 +7583,7 @@ app.post('/api/fleet/:slug/fund', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
@@ -7641,6 +7644,7 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { username, password } = req.body || {};
@@ -7717,6 +7721,7 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { prefix, count, password } = req.body || {};
@@ -7803,6 +7808,7 @@ app.post('/api/fleet/:slug/fund/qr', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
+  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
@@ -11973,7 +11979,7 @@ app.post('/api/blindkey/silicon/permissions', rateLimitStandard, (req, res) => {
 function personActor(req, res) {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return true;   // admin-key path: getDemiPassActor already accepted it
-  if (auth.silicon || (auth.decoded && auth.decoded.wrk)) {
+  if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) {
     res.status(403).json({ error: 'only the account owner registers agents or grants them permissions' });
     return false;
   }

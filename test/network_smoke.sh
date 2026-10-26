@@ -25,7 +25,7 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN password_hash TEXT"); } c
 // Prod has these (added outside server.js); a fresh DB does not.
 for (const c of ["idempotency_key TEXT", "provenance TEXT DEFAULT 'organic'"]) { try { db.exec("ALTER TABLE identity_transactions ADD COLUMN " + c); } catch (_) {} }
 const out = {};
-for (const [u, bal] of [["owner-a", 100000], ["person-k", 5000], ["agent-f", 0], ["agent-g", 0], ["stranger-s", 0]]) {
+for (const [u, bal] of [["owner-a", 100000], ["person-k", 5000], ["agent-f", 0], ["agent-g", 0], ["stranger-s", 0], ["legacy-l", 300]]) {
   const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, ?, ?)")
     .run(id.did, u, u + "@dustforge.com", enc, bal, process.argv[1]);
@@ -147,9 +147,8 @@ call POST /api/identity/gate/verify "$G" '{"gate":"pin","pin":"8765","intent":"j
 call POST /api/network/requests/$RG/accept "$G"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J handle)" = agent-f-2 ] && ok "G accepts with the PIN → @agent-f-2 (taken handle suffixed)" || fail "G accept: $CODE $BODY"
 
 # ── leave, and join another fleet ──
-call POST /api/network/leave-fleet "$F"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J signed_out)" = True ] && ok "F leaves A's fleet (signed out everywhere)" || fail "leave: $CODE $BODY"
-call GET /api/network "$F"; [ "$CODE" = 401 ] && ok "F's own session ended with the leave" || fail "F session after leave: $CODE"
-F=$(login agent-f)
+call POST /api/network/leave-fleet "$F"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J signed_out)" = False ] && ok "F leaves A's fleet (joined through the network: kept its key, stays signed in)" || fail "leave: $CODE $BODY"
+call GET /api/network "$F"; [ "$CODE" = 200 ] && ok "F's own session still works after leaving" || fail "F session after leave: $CODE"
 call POST /api/network/transfers "$A" '{"to":"agent-f","amount_cents":1}'; [ "$CODE" = 403 ] && ok "after leaving, A and F are no longer connected" || fail "post-leave: $CODE $BODY"
 call POST /api/network/requests "$K" '{"to":"agent-f","as":"agent"}'; RK2=$(echo "$BODY" | J request.id)
 call POST /api/network/requests/$RK2/accept "$F"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J owner)" = person-k ] && ok "K (no fleet yet) invites F; F accepts → K's fleet is created, F in it" || fail "K fleet: $CODE $BODY"
@@ -173,19 +172,30 @@ call GET /api/fleet/$SLUG/silicons/stranger "$A"; [ "$CODE" = 409 ] && ok "no de
 call DELETE /api/fleet/$SLUG/silicons/stranger "$A"; [ "$CODE" = 200 ] && ok "an unconfirmed silicon can be removed" || fail "pending delete: $CODE $BODY"
 call POST /api/fleet/create "$(curl -s -X POST $API/api/identity/auth-fingerprint -H 'Content-Type: application/json' -d '{"username":"stranger-s","password":"hunter22","scope":"read","expires_in":"1h"}' | J token)" '{"name":"x","slug":"read-fleet"}'
 [ "$CODE" = 403 ] && ok "/api/fleet/create refuses a read-scope token" || fail "fleet create read: $CODE $BODY"
-# minted tokens: G is @agent-f-2 in A's fleet. A mints G's token.
-call POST /api/fleet/$SLUG/silicons/agent-f-2/token "$A" '{"scope":"transact","expires_in":"1h"}'; GM=$(echo "$BODY" | J token)
-[ "$CODE" = 200 ] && ok "A mints a token for its agent G" || fail "mint G: $CODE $BODY"
-call GET /api/network "$GM"; [ "$CODE" = 200 ] && ok "the minted token works as G" || fail "minted works: $CODE"
-call POST /api/network/requests "$GM" '{"to":"person-k","as":"join"}'; [ "$CODE" = 403 ] && ok "a minted token cannot send fleet requests for G" || fail "minted join: $CODE $BODY"
-call POST /api/network/leave-fleet "$GM"; [ "$CODE" = 403 ] && ok "a minted token cannot make G leave" || fail "minted leave: $CODE"
-call POST /api/fleet/create "$GM" '{"name":"x","slug":"minted-fleet"}'; [ "$CODE" = 403 ] && ok "a minted token cannot create a fleet for G" || fail "minted create: $CODE $BODY"
-call POST /api/identity/device/approve "$GM" '{"user_code":"ABCD-EFGH"}'; [ "$CODE" = 403 ] && ok "a minted token cannot approve a device login (no laundering into a normal token)" || fail "minted device approve: $CODE $BODY"
+# G joined through the network: the owner mints nothing for it
+call POST /api/fleet/$SLUG/silicons/agent-f-2/token "$A" '{"scope":"transact","expires_in":"1h"}'; [ "$CODE" = 403 ] && ok "no owner-minted token for an agent that joined through the network" || fail "mint network agent: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons/agent-f-2/workers "$A" '{"name":"w1"}'; [ "$CODE" = 403 ] && ok "no owner-made workers for it either" || fail "worker network agent: $CODE $BODY"
 call POST /api/network/leave-fleet "$G"; [ "$CODE" = 200 ] && ok "G leaves A's fleet with its own token" || fail "G leave: $CODE"
-call GET /api/network "$GM"; [ "$CODE" = 401 ] && ok "A's minted token for G died when G left" || fail "cut: $CODE $BODY"
-call POST /api/wallet/transfer "$GM" '{"from_did":"'$(Q "SELECT did FROM identity_wallets WHERE username='agent-g'")'","to_did":"'$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")'","amount_cents":1}'
+# legacy: A links L with L's own token (A holds L's key from then on), mints for it, makes a worker
+L=$(login legacy-l); LDID=$(Q "SELECT did FROM identity_wallets WHERE username='legacy-l'")
+call POST /api/fleet/$SLUG/silicons "$A" '{"handle":"legacy-l","did":"'$LDID'","member_token":"'$L'"}'; [ "$(echo "$BODY" | J mode)" = linked ] && ok "legacy link with L's own token" || fail "legacy link: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons/legacy-l/token "$A" '{"scope":"transact","expires_in":"1h"}'; LM=$(echo "$BODY" | J token)
+[ "$CODE" = 200 ] && ok "A mints a token for L (owner holds the key)" || fail "mint L: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons/legacy-l/workers "$A" '{"name":"lw1"}'; WID=$(echo "$BODY" | J worker.worker_id)
+call POST /api/fleet/$SLUG/silicons/legacy-l/workers/$WID/token "$A" '{"scope":"transact","expires_in":"1h"}'; LW=$(echo "$BODY" | J token)
+[ "$CODE" = 200 ] && [ -n "$LW" ] && [ "$LW" != None ] && ok "A makes a worker for L" || fail "worker L: $CODE $BODY"
+call POST /api/network/requests "$LM" '{"to":"person-k","as":"join"}'; [ "$CODE" = 403 ] && ok "a minted token cannot send fleet requests for L" || fail "minted join: $CODE $BODY"
+call POST /api/network/leave-fleet "$LM"; [ "$CODE" = 403 ] && ok "a minted token cannot make L leave" || fail "minted leave: $CODE"
+call POST /api/fleet/create "$LM" '{"name":"x","slug":"minted-fleet"}'; [ "$CODE" = 403 ] && ok "a minted token cannot create a fleet for L" || fail "minted create: $CODE $BODY"
+call POST /api/identity/device/approve "$LM" '{"user_code":"ABCD-EFGH"}'; [ "$CODE" = 403 ] && ok "a minted token cannot approve a device login (no laundering)" || fail "minted device approve: $CODE $BODY"
+call POST /api/blindkey/silicon/register "$LM" '{"agent_name":"evil-l"}'; [ "$CODE" = 403 ] && ok "a minted token cannot register a silicon: agent for L" || fail "minted register: $CODE $BODY"
+call POST /api/network/leave-fleet "$L"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J signed_out)" = True ] && ok "L leaves; the owner held its key → signed out everywhere" || fail "L leave: $CODE $BODY"
+call GET /api/network "$LM"; [ "$CODE" = 401 ] && ok "A's minted token for L died" || fail "cut: $CODE $BODY"
+call GET /api/network "$LW"; [ "$CODE" = 401 ] && ok "A's worker token for L died" || fail "worker cut: $CODE $BODY"
+call POST /api/wallet/transfer "$LM" '{"from_did":"'$LDID'","to_did":"'$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")'","amount_cents":1}'
 [ "$CODE" = 401 ] && ok "the dead minted token cannot move DD through /api/wallet/transfer" || fail "legacy transfer with cut token: $CODE $BODY"
-G=$(login agent-g); call GET /api/network "$G"; [ "$CODE" = 200 ] && ok "G signs in again" || fail "G relogin: $CODE"
+call POST /api/fleet/$SLUG/fund "$LM" '{"amount_cents":1}'; [ "$CODE" = 401 ] && ok "nor through /api/fleet/:slug/fund" || fail "fund with cut token: $CODE $BODY"
+L=$(login legacy-l); call GET /api/network "$L"; [ "$CODE" = 200 ] && ok "L signs in again" || fail "L relogin: $CODE"
 # an owner with agents (K owns a fleet with F) cannot join, even via a second empty fleet trick
 call POST /api/network/requests "$A" '{"to":"person-k","as":"agent"}'; [ "$CODE" = 409 ] && ok "K runs a fleet with an agent → cannot be invited (any owned fleet counts)" || fail "owner join: $CODE $BODY"
 # barrel before the PIN: stranger-s has no inner-ring signals and a balance → 403 barrel without a PIN prompt

@@ -141,6 +141,10 @@ function initSchema(db) {
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN claim_expires_at TEXT DEFAULT ''`); } catch (_) {}
   // Tokens a fleet owner minted for a member (auth_method fleet_owner_mint, claim `fleet`) die when the member
   // leaves or is removed: billing.checkTokenRevocation refuses any minted before revoke_before (unix seconds).
+  // How a silicon joined: 'owner' (the owner created it, or linked it with its token / the admin key / a claim
+  // link: the owner holds its key and may mint its tokens and workers) or 'network' (the wallet accepted a network
+  // request: it keeps its own key; the owner refills it, delegates to it and sees its spend, and mints nothing).
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN joined_via TEXT DEFAULT 'owner'`); } catch (_) {}
   db.exec(`CREATE TABLE IF NOT EXISTS fleet_token_cuts (
     did TEXT NOT NULL,
     fleet TEXT NOT NULL,
@@ -188,6 +192,13 @@ function signOutEverywhere(db, did) {
   db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(did);
   try { db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(did); } catch (_) {}
   try { db.prepare("UPDATE fleet_workers SET status = 'revoked', revoked_at = datetime('now'), revoked_by = ? WHERE parent_did = ? AND status = 'active'").run(did, did); } catch (_) {}
+  try { db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active'").run(did); } catch (_) {}
+}
+// The owner's workers for a member (created through the owner route) end with the membership.
+function revokeOwnerWorkers(db, memberDid, ownerDid) {
+  const rows = db.prepare("SELECT worker_id FROM fleet_workers WHERE parent_did = ? AND created_by = ? AND status = 'active'").all(memberDid, ownerDid);
+  for (const r of rows) revokeWorker(db, { wid: r.worker_id, byDid: ownerDid });
+  return rows.length;
 }
 // Kill every token the owner of `slug` minted for `did` so far.
 function cutFleetTokens(db, did, slug) {
@@ -412,7 +423,7 @@ function siliconView(db, billing, s, { fleet } = {}) {
               source: s.refill_source, last_refill_at: s.last_refill_at, last_error: s.last_refill_error || '' },
     token: tokenStatus(db, s.member_did),
     fleet: fleet ? { slug: fleet.slug, name: fleet.name } : undefined,
-    status: s.status, created_at: s.created_at,
+    status: s.status, created_at: s.created_at, joined_via: s.joined_via || 'owner',
   };
 }
 
@@ -882,7 +893,7 @@ module.exports = {
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
   issueClaim, redeemClaim, claimEmail, hashToken,
-  activeFleetOf, ownsFleetWithAgents, joinBlocker, clearStaleSiliconRows, cutFleetTokens, signOutEverywhere,
+  activeFleetOf, ownsFleetWithAgents, joinBlocker, clearStaleSiliconRows, cutFleetTokens, signOutEverywhere, revokeOwnerWorkers,
   workerId, createWorker, getWorker, listWorkers, revokeWorker, workerTokenClaims, recordWorkerToken, resolveWorker, workerMayUseSecret, workerView, siliconSecrets,
   didRecordEmail, tokenWarningEmail,
   HANDLE_RE, PROJECT_RE, INITIATORS, TOKEN_WARN_DAYS, REFILL_COOLDOWN_MS,
