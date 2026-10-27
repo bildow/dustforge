@@ -42,6 +42,7 @@ net.createServer(sock => {
 http.createServer((req, res) => {
   let b = ""; req.on("data", c => b += c);
   req.on("end", () => {
+    if (req.method === "PATCH" && req.url.includes("reset-hang")) return;   // a hung Stalwart
     if (req.method === "PATCH") fs.appendFileSync(dir + "/stalwart.log", "PATCH " + decodeURIComponent(req.url.split("/").pop()) + " " + b + "\n");
     res.writeHead(req.method === "PATCH" ? 200 : 404, { "content-type": "application/json" });
     res.end(req.method === "PATCH" ? "{\"data\":null}" : "{}");
@@ -60,6 +61,14 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN password_hash TEXT"); } c
 const id = identity.createIdentity();
 db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 0, ?)")
   .run(id.did, "reset-old", "reset-old@dustforge.com", id.encrypted_private_key || id.encryptedPrivateKey, process.argv[1]);
+// silicon: agents of reset-old: one registered today, one 60 days ago.
+const sqlTime = daysAgo => new Date(Date.now() - daysAgo * 864e5).toISOString().replace("T", " ").slice(0, 19);
+const addAgent = db.prepare("INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash, created_at) VALUES (?, ?, ?, ?, ?)");
+addAgent.run("fresh-agent", "did:silicon:fresh", id.did, "h1", sqlTime(0));
+addAgent.run("old-agent", "did:silicon:old", id.did, "h2", sqlTime(60));
+const hang = identity.createIdentity();
+db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 0, ?)")
+  .run(hang.did, "reset-hang", "reset-hang@dustforge.com", hang.encrypted_private_key || hang.encryptedPrivateKey, process.argv[1]);
 ' "$H"
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 Q(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute(sys.argv[2]).fetchone(); print(r[0] if r else '')" "$DB_PATH" "$1"; }
@@ -92,6 +101,10 @@ TOKB=$(Q "select token from password_reset_tokens where username='reset-old' ord
 SESS=$(signin reset-old "$OLD")
 [ -n "$SESS" ] && ok "signed in with the old password" || fail "could not sign in"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"update identity_wallets set username='reset-new', email='reset-new@dustforge.com' where username='reset-old'\"); c.commit()" "$DB_PATH"
+# A device login approved with the old session but not claimed yet must not survive the reset.
+DC=$(curl -s -X POST "$API/api/identity/device/code" -H 'Content-Type: application/json' -d '{"agent_label":"intruder","scope":"transact"}')
+DCODE=$(echo "$DC" | python3 -c 'import json,sys; print(json.load(sys.stdin)["device_code"])'); UCODE=$(echo "$DC" | python3 -c 'import json,sys; print(json.load(sys.stdin)["user_code"])')
+[ "$(authpost /api/identity/device/approve "$SESS" "{\"user_code\":\"$UCODE\"}")" = 200 ] && ok "device login approved (unclaimed)" || fail "device approve failed"
 V=$(curl -s "$API/api/identity/reset-password/verify?token=$TOKB")
 echo "$V" | grep -q '"username":"reset-new"' && ok "verify shows the current username" || fail "verify says: $V"
 sleep 1   # the sign-out cut is whole seconds
@@ -105,6 +118,9 @@ NH=$(printf '%s' newpass22 | sha256sum | cut -d' ' -f1)
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/network" -H "Authorization: Bearer $SESS")" = 401 ] && ok "pre-reset session signed out" || fail "pre-reset session still works"
 [ -z "$(signin reset-new "$OLD")" ] && ok "old password refused" || fail "old password still signs in"
 NEWSESS=$(signin reset-new newpass22); [ -n "$NEWSESS" ] && ok "new password signs in" || fail "new password refused"
+[ "$(post /api/identity/device/token "{\"device_code\":\"$DCODE\"}")" = 403 ] && ok "pre-reset device approval can't be claimed" || fail "device login claimed after the reset"
+[ "$(Q "select status from silicon_agents where agent_name='fresh-agent'")" = revoked ] && ok "agent registered in the last 30 days revoked" || fail "recent agent still active"
+[ "$(Q "select status from silicon_agents where agent_name='old-agent'")" = active ] && ok "older agent kept" || fail "older agent revoked"
 wait_for "$S/server.log" "password-reset-done reset-new\] emailed to reset-new@dustforge.com" && ok "account address told of the reset" || fail "no reset notice"
 
 # 4. The recovery email takes the password, not just a token, and the old addresses are told.
@@ -118,7 +134,13 @@ age; post /api/identity/forgot-password '{"username":"reset-new"}' >/dev/null
 TOK2=$(Q "select token from password_reset_tokens where username='reset-new' order by id desc limit 1")
 wait_for "$S/mail.log" "$TOK2" && grep -B12 "$TOK2" "$S/mail.log" | grep -qi '^To: other@example.com' && ok "sent to the recovery email" || fail "recovery email not used"
 
-# 5. SMTP down: still 200, the failure is logged, the link is not.
+# 5. Stalwart hangs: the reset gives up after 10 s and the link is live again.
+post /api/identity/forgot-password '{"username":"reset-hang"}' >/dev/null
+TOKH=$(Q "select token from password_reset_tokens where username='reset-hang' order by id desc limit 1")
+[ "$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X POST "$API/api/identity/reset-password" -H 'Content-Type: application/json' -d "{\"token\":\"$TOKH\",\"new_password\":\"hangpass1\"}")" = 500 ] && ok "hung Stalwart: 500 within the timeout" || fail "hung Stalwart: no answer"
+[ "$(Q "select used from password_reset_tokens where token='$TOKH'")" = 0 ] && ok "link live again for a retry" || fail "link stuck as used"
+
+# 6. SMTP down: still 200, the failure is logged, the link is not.
 kill $FAKE 2>/dev/null; wait $FAKE 2>/dev/null
 age; [ "$(post /api/identity/forgot-password '{"username":"reset-new"}')" = 200 ] && ok "forgot-password 200 with SMTP down" || fail "not 200 with SMTP down"
 TOK3=$(Q "select token from password_reset_tokens where username='reset-new' order by id desc limit 1")

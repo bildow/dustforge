@@ -1245,13 +1245,23 @@ app.post('/api/identity/tokens/revoke', rateLimitStandard, (req, res) => {
   res.json({ ok: true, jti, revoked: true });
 });
 
+// End every session of a wallet: tokens issued so far (this second included, by
+// jti), refresh tokens (else a refresh mints a live token again) and device
+// logins approved but not yet claimed (else a claim mints fresh ones).
+// silicon: agent tokens and worker rows are the caller's call.
+function cutSessions(did) {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(did, now);
+  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(did);
+  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(did);
+  db.prepare("UPDATE device_auth SET status = 'denied' WHERE approved_did = ? AND status = 'approved'").run(did);
+  return now;
+}
+
 app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(auth.did, now);
-  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(auth.did);
-  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(auth.did);   // else a refresh mints a live token again
+  const now = cutSessions(auth.did);
   res.json({ ok: true, revoke_before: now, warning: 'ALL tokens for this DID issued before now are dead, including the one that made this call. Re-mint via request-2fa + verify.' });
 });
 
@@ -11508,8 +11518,11 @@ app.post('/api/identity/set-recovery-email', rateLimitStrict, async (req, res) =
 });
 
 // POST /api/identity/reset-password — use a reset token to set new password
-// Success voids every reset link of the account and signs it out everywhere
-// (access and refresh tokens), then tells the account's addresses.
+// Success voids every reset link of the account, signs it out everywhere
+// (cutSessions) and revokes silicon: agents registered in the last 30 days (the
+// life of the tokens just killed: an intruder's way back in). Older agents and
+// workers keep running, so a forgotten password doesn't stop a fleet; the
+// "Password changed" mail names them all so the owner can check.
 app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
   const { token, new_password } = req.body || {};
   if (!token || !new_password) return res.status(400).json({ error: 'token and new_password required' });
@@ -11531,7 +11544,12 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
   if (db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ? AND used = 0').run(resetRow.id).changes !== 1) {
     return res.status(400).json({ error: 'invalid or expired reset token' });
   }
-  const release = () => { try { db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ?').run(resetRow.id); } catch (_) {} };
+  // On failure the link goes back to live, unless a newer one has replaced it.
+  const release = () => { try {
+    db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM password_reset_tokens WHERE did = ? AND id > ?)')
+      .run(resetRow.id, resetRow.did, resetRow.id);
+  } catch (_) {} };
+  const fail = (status, error) => { release(); if (!res.headersSent) res.status(status).json({ error }); };
 
   // Change password via Stalwart
   try {
@@ -11556,11 +11574,10 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
       let body = '';
       pRes.on('data', c => body += c);
       pRes.on('end', () => {
-        if (pRes.statusCode >= 300) {
-          release();
-          return res.status(500).json({ error: 'failed to update password. Try again or contact support.' });
-        }
+        if (res.headersSent) return;   // timed out: the link was released, the caller told to retry
+        if (pRes.statusCode >= 300) return fail(500, 'failed to update password. Try again or contact support.');
         // The password has changed: everything below must happen too.
+        let dropped = [], agents = [], workers = [];
         try {
           db.transaction(() => {
             db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0').run(resetRow.did);
@@ -11568,11 +11585,11 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
             // signs in whenever Stalwart is unreachable.
             db.prepare('UPDATE identity_wallets SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?')
               .run(crypto.createHash('sha256').update(new_password).digest('hex'), resetRow.did);
-            // Sign out everywhere: tokens issued so far (this second included) and refresh tokens.
-            db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before')
-              .run(resetRow.did, Math.floor(Date.now() / 1000));
-            db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(resetRow.did);
-            db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(resetRow.did);
+            cutSessions(resetRow.did);
+            dropped = db.prepare("SELECT agent_name, created_at FROM silicon_agents WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").all(resetRow.did);
+            db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").run(resetRow.did);
+            agents = db.prepare("SELECT agent_name, created_at FROM silicon_agents WHERE carbon_did = ? AND status = 'active' ORDER BY created_at").all(resetRow.did);
+            workers = db.prepare("SELECT name, created_at FROM fleet_workers WHERE parent_did = ? AND status = 'active' ORDER BY created_at").all(resetRow.did);
           })();
         } catch (e) {
           console.error(`[password-reset] ${resetWallet.username}: password changed but sign-out failed: ${e.message}`);
@@ -11585,21 +11602,27 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
             .run(resetRow.did, `Password reset completed for ${resetWallet.username}`, req.ip || '', 'UTC', 'decision',
               JSON.stringify(['auth:password-reset-complete', `user:${resetWallet.username}`]));
         } catch(_) {}
+        const list = rows => rows.map(r => `  - ${r.agent_name || r.name} (since ${String(r.created_at).slice(0, 10)})`).join('\n');
+        const access = [
+          dropped.length ? `Agents registered in the last 30 days were signed out; register them again if they are yours:\n${list(dropped)}` : '',
+          agents.length ? `These agents still have access; revoke any you don't recognise:\n${list(agents)}` : '',
+          workers.length ? `These workers still have access; revoke any you don't recognise:\n${list(workers)}` : '',
+        ].filter(Boolean).join('\n\n');
         for (const to of accountAddresses(resetWallet.email, resetWallet.recovery_email)) {
           sendSecurityMail(to, 'Password changed — DemiPass',
-            `The password of the DemiPass account ${resetWallet.username} was reset, and every session was signed out.\n\nIf this wasn't you, reset it again now and check the account's recovery email.\n\n— DemiPass`,
+            `The password of the DemiPass account ${resetWallet.username} was reset, and every session was signed out.${access ? '\n\n' + access : ''}\n\nIf this wasn't you, reset it again now and check the account's recovery email.\n\n— DemiPass`,
             `password-reset-done ${resetWallet.username}`);
         }
 
         res.json({ ok: true, message: 'Password reset successfully. You can now log in with your new password.' });
       });
     });
-    pReq.on('error', () => { release(); res.status(500).json({ error: 'password service unavailable' }); });
+    pReq.setTimeout(10000, () => pReq.destroy(new Error('stalwart timeout')));
+    pReq.on('error', () => fail(500, 'password service unavailable'));
     pReq.write(postData);
     pReq.end();
   } catch (e) {
-    release();
-    res.status(500).json({ error: 'reset failed: ' + e.message });
+    fail(500, 'reset failed: ' + e.message);
   }
 });
 
