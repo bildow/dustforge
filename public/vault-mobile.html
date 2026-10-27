@@ -134,6 +134,7 @@
       <div style="font-weight:700;font-size:0.9rem;margin-bottom:0.5rem">Recovery Email</div>
       <p style="font-size:0.8rem;color:var(--text3);margin-bottom:1rem">If you ever forget your password, we'll send a reset link to this email. It must be different from your @dustforge.com address.</p>
       <input type="email" id="wizard-recovery-email" placeholder="your.email@gmail.com" style="width:100%;padding:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.9rem;margin-bottom:0.5rem">
+      <div id="wizard-pw-row" style="display:none"><input type="password" id="wizard-pw" placeholder="Account password" autocomplete="current-password" style="width:100%;padding:0.6rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.9rem;margin-bottom:0.5rem"></div>
       <div id="wizard-msg" style="font-size:0.75rem;min-height:1.2rem;margin-bottom:0.75rem"></div>
       <button onclick="completeOnboarding()" style="width:100%;padding:0.7rem;background:var(--accent);border:none;border-radius:8px;color:var(--bg);font-weight:700;font-size:0.9rem;cursor:pointer">Continue to Vault</button>
     </div>
@@ -316,6 +317,7 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Recovery Email</div>
         <div style="display:flex;gap:0.5rem;align-items:center">
           <input type="email" id="recovery-email" placeholder="external email (gmail, etc.)" style="flex:1;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem">
+          <input type="password" id="recovery-pw" placeholder="Password" autocomplete="current-password" style="width:6.5rem;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem">
           <button onclick="setRecoveryEmail()" style="padding:0.5rem 0.75rem;background:var(--accent);border:none;border-radius:6px;color:var(--bg);font-weight:600;font-size:0.75rem;cursor:pointer;white-space:nowrap">Save</button>
         </div>
         <div id="recovery-msg" style="font-size:0.7rem;margin-top:0.25rem;margin-bottom:0.75rem"></div>
@@ -596,7 +598,7 @@ function logout(){
   sessionEpoch++; tk='';did='';user='';loginPw='';vaultOpen=false;
   for(const k of ['dp_token','dp_did','dp_user','dp_token_at']) localStorage.removeItem(k);
   closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
-  for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass']){const e=document.getElementById(i);if(e)e.value=''}
+  for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass','wizard-pw','recovery-pw']){const e=document.getElementById(i);if(e)e.value=''}
   const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; pinSentFor=null; pinOpenAttempts=[]; if(s)s(false); if(u)u(false);
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
@@ -960,6 +962,7 @@ async function showApp(){
     const profile = await api('GET','/api/identity/trust?did='+encodeURIComponent(did));
     if (!live()) return;
     if (!profile.recovery_email) {
+      document.getElementById('wizard-pw-row').style.display=loginPw?'none':'block';
       document.getElementById('onboarding-wizard').style.display='flex';
       return;
     }
@@ -1811,21 +1814,30 @@ async function completeOnboarding(){
   const msg=document.getElementById('wizard-msg');
   if(!email){msg.textContent='Recovery email is required';msg.style.color='var(--red)';return}
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){msg.textContent='Enter a valid email';msg.style.color='var(--red)';return}
+  const pw=loginPw||document.getElementById('wizard-pw').value;   // changing it takes the password, not just the session
+  if(!pw){document.getElementById('wizard-pw-row').style.display='block';msg.textContent='Enter your account password';msg.style.color='var(--red)';return}
   try{
-    const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email});
+    const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email,password:pw});
     if(r.ok){
+      document.getElementById('wizard-pw').value='';
       document.getElementById('onboarding-wizard').style.display='none';
       await showApp();   // continues with the mandatory PIN check, then opens the vault
     }else{msg.textContent=r.error||'failed';msg.style.color='var(--red)'}
-  }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}
+  }catch(e){
+    // Password refused (403) — even the one typed at sign-in: stop resending it and ask for it here.
+    if(e.status===403){loginPw='';document.getElementById('wizard-pw').value='';document.getElementById('wizard-pw-row').style.display='block'}
+    msg.textContent=e.message;msg.style.color='var(--red)'}
 }
 
 async function setRecoveryEmail(){
   const email=document.getElementById('recovery-email').value.trim();
+  const pwEl=document.getElementById('recovery-pw');
   const msg=document.getElementById('recovery-msg');
   if(!email){msg.textContent='Enter an email';msg.style.color='var(--red)';return}
+  if(!pwEl.value){msg.textContent='Enter your account password';msg.style.color='var(--red)';return}
   try{
-    const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email});
+    const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email,password:pwEl.value});
+    pwEl.value='';
     msg.textContent=r.ok?'Recovery email saved':(r.error||'failed');
     msg.style.color=r.ok?'var(--green)':'var(--red)';
   }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}

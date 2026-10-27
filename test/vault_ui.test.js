@@ -1007,3 +1007,56 @@ test('Send DD: the transfer is created, then confirmed with the PIN for send:<id
   assert.equal(pg.calls.filter(c => c.path === '/api/network/transfers/7/confirm').length, 3, 'no retry after Cancel');
   assert.equal(state.cancelled, 1, 'the waiting transfer is cancelled on the server');
 });
+
+// Changing the recovery email takes the account password (the server refuses a token alone).
+test('recovery wizard sends the password typed at sign-in; a refused one is asked for on the wizard', async () => {
+  let recovery = null, refuse = true;
+  const pg = page({ routes: async (p, body) => {
+    const l = loginRoute(p); if (l) return l;
+    if (p.startsWith('/api/identity/trust')) return { json: { recovery_email: recovery } };
+    if (p === '/api/identity/set-recovery-email') {
+      if (refuse) { refuse = false; return { status: 403, json: { error: 'invalid password' } }; }
+      recovery = body.recovery_email; return { json: { ok: true } };
+    }
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    throw new Error('unexpected ' + p);
+  } });
+  await signIn(pg);
+  assert.equal(pg.el('onboarding-wizard').style.display, 'flex', 'wizard shown');
+  assert.equal(pg.el('wizard-pw-row').style.display, 'none', 'no password field while the sign-in password is held');
+  pg.el('wizard-recovery-email').value = 'me@example.com';
+  await pg.ctx.completeOnboarding(); await settle();
+  let sent = pg.calls.filter(c => c.path === '/api/identity/set-recovery-email');
+  assert.deepEqual(sent[0].body, { recovery_email: 'me@example.com', password: 'pw-typed-at-login' });
+  assert.equal(pg.el('wizard-pw-row').style.display, 'block', 'refused: the wizard asks for the password');
+  await pg.ctx.completeOnboarding(); await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/identity/set-recovery-email').length, 1, 'refused password not resent');
+  assert.match(pg.el('wizard-msg').textContent, /password/i);
+  pg.el('wizard-pw').value = 'pw-typed-again';
+  await pg.ctx.completeOnboarding(); await settle();
+  sent = pg.calls.filter(c => c.path === '/api/identity/set-recovery-email');
+  assert.deepEqual(sent[1].body, { recovery_email: 'me@example.com', password: 'pw-typed-again' });
+  assert.equal(pg.el('wizard-pw').value, '', 'password field cleared');
+  assert.equal(pg.el('onboarding-wizard').style.display, 'none');
+  assert.equal(pg.appOpen(), true);
+});
+
+test('settings: saving a recovery email needs the password, sends it once and clears it', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/set-recovery-email') return { json: { ok: true } };
+    throw new Error('unexpected ' + p);
+  } });
+  await settle();
+  pg.el('recovery-email').value = 'new@example.com';
+  await pg.ctx.setRecoveryEmail();
+  assert.equal(pg.calls.filter(c => c.path === '/api/identity/set-recovery-email').length, 0, 'nothing sent without the password');
+  assert.match(pg.el('recovery-msg').textContent, /password/i);
+  pg.el('recovery-pw').value = 'acct-pw';
+  await pg.ctx.setRecoveryEmail();
+  const sent = pg.calls.filter(c => c.path === '/api/identity/set-recovery-email');
+  assert.deepEqual(sent.map(c => c.body), [{ recovery_email: 'new@example.com', password: 'acct-pw' }]);
+  assert.equal(pg.el('recovery-pw').value, '');
+  assert.equal(pg.el('recovery-msg').textContent, 'Recovery email saved');
+});

@@ -191,6 +191,7 @@ function signOutEverywhere(db, did) {
   db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(did, cut);
   db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(did);
   try { db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(did); } catch (_) {}
+  try { db.prepare("UPDATE device_auth SET status = 'denied' WHERE approved_did = ? AND status = 'approved'").run(did); } catch (_) {}
   try { db.prepare("UPDATE fleet_workers SET status = 'revoked', revoked_at = datetime('now'), revoked_by = ? WHERE parent_did = ? AND status = 'active'").run(did, did); } catch (_) {}
   try { db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active'").run(did); } catch (_) {}
 }

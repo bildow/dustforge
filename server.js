@@ -1245,13 +1245,23 @@ app.post('/api/identity/tokens/revoke', rateLimitStandard, (req, res) => {
   res.json({ ok: true, jti, revoked: true });
 });
 
+// End every session of a wallet: tokens issued so far (this second included, by
+// jti), refresh tokens (else a refresh mints a live token again) and device
+// logins approved but not yet claimed (else a claim mints fresh ones).
+// silicon: agent tokens and worker rows are the caller's call.
+function cutSessions(did) {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(did, now);
+  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(did);
+  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(did);
+  db.prepare("UPDATE device_auth SET status = 'denied' WHERE approved_did = ? AND status = 'approved'").run(did);
+  return now;
+}
+
 app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-  const now = Math.floor(Date.now() / 1000);
-  db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(auth.did, now);
-  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0").run(auth.did);
-  db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE did = ? AND revoked = 0').run(auth.did);   // else a refresh mints a live token again
+  const now = cutSessions(auth.did);
   res.json({ ok: true, revoke_before: now, warning: 'ALL tokens for this DID issued before now are dead, including the one that made this call. Re-mint via request-2fa + verify.' });
 });
 
@@ -11409,69 +11419,114 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
 
+// Account-security mail (reset links, change notices). Logs where it went,
+// never the body: a reset link is a credential.
+function sendSecurityMail(to, subject, text, tag) {
+  if (!to) return;
+  try {
+    createEmailTransport().sendMail({ from: 'noreply@dustforge.com', to, subject, text })
+      .then(() => console.log(`[${tag}] emailed to ${to}`))
+      .catch(e => console.error(`[${tag}] email to ${to} failed: ${e.message}`));
+  } catch (e) {
+    console.error(`[${tag}] email to ${to} failed: ${e.message}`);
+  }
+}
+// Every address that should hear about a change to the account: the
+// @dustforge.com mailbox and the recovery email(s), once each.
+function accountAddresses(...addrs) {
+  const seen = new Set();
+  return addrs.filter(a => a && !seen.has(a.toLowerCase()) && seen.add(a.toLowerCase()));
+}
+
 // POST /api/identity/forgot-password — request a reset token
+// Per account: one live link at a time (a new one voids the old), at most one
+// mail per 5 minutes and 5 per day. The reply never says whether one was sent.
 app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   const { username } = req.body || {};
   if (!username) return res.status(400).json({ error: 'username required' });
+  const reply = () => res.json({ ok: true, message: 'If that account exists, a reset link has been sent to the associated email.' });
 
   const wallet = db.prepare('SELECT did, username, email, recovery_email FROM identity_wallets WHERE username = ?').get(username);
-  if (!wallet) {
-    // Don't reveal whether account exists
-    return res.json({ ok: true, message: 'If that account exists, a reset link has been sent to the associated email.' });
+  if (!wallet) return reply();   // Don't reveal whether account exists
+
+  const recent = db.prepare(`SELECT
+      SUM(created_at > datetime('now', '-5 minutes')) AS last5m,
+      COUNT(*) AS last24h
+    FROM password_reset_tokens WHERE did = ? AND created_at > datetime('now', '-1 day')`).get(wallet.did);
+  if ((recent.last5m || 0) > 0 || recent.last24h >= 5) {
+    console.log(`[password-reset] ${wallet.username}: not sent (per-account limit)`);
+    return reply();
   }
 
   const resetToken = crypto.randomBytes(32).toString('hex');
   const expiresAt = new Date(Date.now() + 3600000).toISOString(); // 1 hour
-
-  db.prepare('INSERT INTO password_reset_tokens (did, username, token, expires_at) VALUES (?, ?, ?, ?)')
-    .run(wallet.did, wallet.username, resetToken, expiresAt);
+  db.transaction(() => {
+    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0').run(wallet.did);
+    db.prepare('INSERT INTO password_reset_tokens (did, username, token, expires_at) VALUES (?, ?, ?, ?)')
+      .run(wallet.did, wallet.username, resetToken, expiresAt);
+  })();
 
   // Send reset email — prefer recovery_email (external), fall back to @dustforge.com
   const resetUrl = `https://demipass.com/reset-password.html?token=${resetToken}`;
-  const sendTo = wallet.recovery_email || wallet.email;
-  try {
-    const dustforge = require('./dustforge-mail');
-    if (dustforge && dustforge.sendMail) {
-      dustforge.sendMail(sendTo, 'Password Reset — DemiPass',
-        `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`);
-    }
-  } catch(_) {
-    console.log(`[password-reset] ${wallet.username} → ${sendTo}: ${resetUrl}`);
-  }
+  sendSecurityMail(wallet.recovery_email || wallet.email, 'Password Reset — DemiPass',
+    `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`,
+    `password-reset ${wallet.username}`);
 
-  // Also store reset URL in a tick so admin can find it
+  // Also record the request in a tick so admin can see it
   try {
     db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
       .run('system', `Password reset requested for ${wallet.username}`, req.ip || '', 'UTC', 'alert',
         JSON.stringify(['auth:password-reset', `user:${wallet.username}`]));
   } catch(_) {}
 
-  res.json({ ok: true, message: 'If that account exists, a reset link has been sent to the associated email.' });
+  reply();
 });
 
 // POST /api/identity/set-recovery-email — set an external recovery email
-app.post('/api/identity/set-recovery-email', rateLimitStandard, (req, res) => {
+// The recovery email can reset the password, so changing it takes the password
+// itself (a token alone is not enough), and the old addresses are told.
+app.post('/api/identity/set-recovery-email', rateLimitStrict, async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (auth.silicon) return res.status(403).json({ error: 'silicon agents cannot change the owner recovery email' });
 
-  const { recovery_email } = req.body || {};
-  if (!recovery_email) return res.status(400).json({ error: 'recovery_email required' });
+  const { recovery_email, password } = req.body || {};
+  if (!recovery_email || typeof recovery_email !== 'string') return res.status(400).json({ error: 'recovery_email required' });
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recovery_email)) return res.status(400).json({ error: 'invalid email format' });
+  if (!password || typeof password !== 'string') return res.status(400).json({ error: 'password required to change the recovery email' });
 
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
   // Circular guard: recovery email cannot be your own @dustforge.com account email
-  const wallet = db.prepare('SELECT email FROM identity_wallets WHERE did = ?').get(auth.did);
-  if (wallet && recovery_email.toLowerCase() === wallet.email.toLowerCase()) {
+  if (recovery_email.toLowerCase() === String(wallet.email || '').toLowerCase()) {
     return res.status(400).json({ error: 'Recovery email cannot be the same as your account email. Use an external email (gmail, etc.) so you can still receive reset links if you lose access to your @dustforge.com inbox.' });
   }
+  const okPw = await verifyWalletPassword(wallet, password);
+  if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  if (!okPw) return res.status(403).json({ error: 'invalid password' });
 
-  db.prepare('UPDATE identity_wallets SET recovery_email = ? WHERE did = ?').run(recovery_email, auth.did);
+  db.prepare('UPDATE identity_wallets SET recovery_email = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(recovery_email, auth.did);
+  logSecurityEvent('recovery_email_changed', 'warn', { caller_did: auth.did, ip: req.ip });
+  if (String(wallet.recovery_email || '').toLowerCase() !== recovery_email.toLowerCase()) {
+    for (const to of accountAddresses(wallet.email, wallet.recovery_email)) {
+      sendSecurityMail(to, 'Recovery email changed — DemiPass',
+        `The recovery email of the DemiPass account ${wallet.username} was changed to ${recovery_email}. Password reset links now go there.\n\nIf this wasn't you, sign in and change your password now.\n\n— DemiPass`,
+        `recovery-email ${wallet.username}`);
+    }
+  }
   res.json({ ok: true, recovery_email, note: 'Password reset links will be sent to this email.' });
 });
 
 // POST /api/identity/reset-password — use a reset token to set new password
+// Success voids every reset link of the account, signs it out everywhere
+// (cutSessions) and revokes silicon: agents registered in the last 30 days (the
+// life of the tokens just killed: an intruder's way back in). Older agents and
+// workers keep running, so a forgotten password doesn't stop a fleet; the
+// "Password changed" mail names them all so the owner can check.
 app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
   const { token, new_password } = req.body || {};
   if (!token || !new_password) return res.status(400).json({ error: 'token and new_password required' });
+  if (typeof token !== 'string' || typeof new_password !== 'string') return res.status(400).json({ error: 'token and new_password must be strings' });
   if (new_password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
   if (new_password.length > 128) return res.status(400).json({ error: 'password too long' });
 
@@ -11481,12 +11536,26 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
     db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
     return res.status(400).json({ error: 'reset token has expired. Request a new one.' });
   }
+  // The mailbox is named after the wallet's current username, which may have
+  // changed since the link was sent.
+  const resetWallet = db.prepare('SELECT username, email, recovery_email FROM identity_wallets WHERE did = ?').get(resetRow.did);
+  if (!resetWallet) return res.status(400).json({ error: 'invalid or expired reset token' });
+  // Claim the link before the async password change, so two requests can't both spend it.
+  if (db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ? AND used = 0').run(resetRow.id).changes !== 1) {
+    return res.status(400).json({ error: 'invalid or expired reset token' });
+  }
+  // On failure the link goes back to live, unless a newer one has replaced it.
+  const release = () => { try {
+    db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM password_reset_tokens WHERE did = ? AND id > ?)')
+      .run(resetRow.id, resetRow.did, resetRow.id);
+  } catch (_) {} };
+  const fail = (status, error) => { release(); if (!res.headersSent) res.status(status).json({ error }); };
 
   // Change password via Stalwart
   try {
     const http = require('http');
     const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
-    const stalwartPort = Number(process.env.STALWART_PORT || 8090);
+    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
     const stalwartPass = process.env.STALWART_PASS || '';
     const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
 
@@ -11498,45 +11567,75 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
 
     const pReq = http.request({
       hostname: stalwartHost, port: stalwartPort,
-      path: '/api/principal/' + encodeURIComponent(resetRow.username),
+      path: '/api/principal/' + encodeURIComponent(resetWallet.username),
       method: 'PATCH',
       headers: { 'Authorization': 'Basic ' + adminAuth, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) },
     }, (pRes) => {
       let body = '';
       pRes.on('data', c => body += c);
       pRes.on('end', () => {
-        if (pRes.statusCode < 300) {
-          // Only burn token after confirmed password change
-          db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
-          // Buoy tick
-          try {
-            db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
-              .run(resetRow.did, `Password reset completed for ${resetRow.username}`, req.ip || '', 'UTC', 'decision',
-                JSON.stringify(['auth:password-reset-complete', `user:${resetRow.username}`]));
-          } catch(_) {}
-
-          res.json({ ok: true, message: 'Password reset successfully. You can now log in with your new password.' });
-        } else {
-          res.status(500).json({ error: 'failed to update password. Try again or contact support.' });
+        if (res.headersSent) return;   // timed out: the link was released, the caller told to retry
+        if (pRes.statusCode >= 300) return fail(500, 'failed to update password. Try again or contact support.');
+        // The password has changed: everything below must happen too.
+        let dropped = [], agents = [], workers = [];
+        try {
+          db.transaction(() => {
+            db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0').run(resetRow.did);
+            // Keep the local fallback hash in step, or the old password still
+            // signs in whenever Stalwart is unreachable.
+            db.prepare('UPDATE identity_wallets SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?')
+              .run(crypto.createHash('sha256').update(new_password).digest('hex'), resetRow.did);
+            cutSessions(resetRow.did);
+            dropped = db.prepare("SELECT agent_name, created_at FROM silicon_agents WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").all(resetRow.did);
+            db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").run(resetRow.did);
+            agents = db.prepare("SELECT agent_name, created_at FROM silicon_agents WHERE carbon_did = ? AND status = 'active' ORDER BY created_at").all(resetRow.did);
+            workers = db.prepare("SELECT name, created_at FROM fleet_workers WHERE parent_did = ? AND status = 'active' ORDER BY created_at").all(resetRow.did);
+          })();
+        } catch (e) {
+          console.error(`[password-reset] ${resetWallet.username}: password changed but sign-out failed: ${e.message}`);
+          return res.status(500).json({ error: 'password changed, but signing out other sessions failed. Reset again or contact support.' });
         }
+        logSecurityEvent('password_reset', 'warn', { caller_did: resetRow.did, ip: req.ip });
+        // Buoy tick
+        try {
+          db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(resetRow.did, `Password reset completed for ${resetWallet.username}`, req.ip || '', 'UTC', 'decision',
+              JSON.stringify(['auth:password-reset-complete', `user:${resetWallet.username}`]));
+        } catch(_) {}
+        const list = rows => rows.map(r => `  - ${r.agent_name || r.name} (since ${String(r.created_at).slice(0, 10)})`).join('\n');
+        const access = [
+          dropped.length ? `Agents registered in the last 30 days were signed out. If they are yours, give each a new token to bring it back (POST /api/blindkey/silicon/token/reset {agent_name}):\n${list(dropped)}` : '',
+          agents.length ? `These agents still have access; revoke any you don't recognise:\n${list(agents)}` : '',
+          workers.length ? `These workers still have access; revoke any you don't recognise:\n${list(workers)}` : '',
+        ].filter(Boolean).join('\n\n');
+        for (const to of accountAddresses(resetWallet.email, resetWallet.recovery_email)) {
+          sendSecurityMail(to, 'Password changed — DemiPass',
+            `The password of the DemiPass account ${resetWallet.username} was reset, and every session was signed out.${access ? '\n\n' + access : ''}\n\nIf this wasn't you, reset it again now and check the account's recovery email.\n\n— DemiPass`,
+            `password-reset-done ${resetWallet.username}`);
+        }
+
+        res.json({ ok: true, message: 'Password reset successfully. You can now log in with your new password.' });
       });
     });
-    pReq.on('error', () => res.status(500).json({ error: 'password service unavailable' }));
+    pReq.setTimeout(10000, () => pReq.destroy(new Error('stalwart timeout')));
+    pReq.on('error', () => fail(500, 'password service unavailable'));
     pReq.write(postData);
     pReq.end();
   } catch (e) {
-    res.status(500).json({ error: 'reset failed: ' + e.message });
+    fail(500, 'reset failed: ' + e.message);
   }
 });
 
 // GET /api/identity/reset-password/verify — check if a reset token is valid
 app.get('/api/identity/reset-password/verify', (req, res) => {
   const { token } = req.query;
-  if (!token) return res.status(400).json({ error: 'token required' });
-  const row = db.prepare('SELECT username, expires_at, used FROM password_reset_tokens WHERE token = ?').get(token);
+  if (!token || typeof token !== 'string') return res.status(400).json({ error: 'token required' });
+  const row = db.prepare('SELECT did, expires_at, used FROM password_reset_tokens WHERE token = ?').get(token);
   if (!row || row.used) return res.json({ valid: false });
   if (new Date(row.expires_at) < new Date()) return res.json({ valid: false, reason: 'expired' });
-  res.json({ valid: true, username: row.username });
+  const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(row.did);   // the name it signs in with now
+  if (!wallet) return res.json({ valid: false });
+  res.json({ valid: true, username: wallet.username });
 });
 
 // ============================================================
@@ -11914,6 +12013,8 @@ app.post('/api/blindkey/silicon/register', rateLimitStandard, (req, res) => {
 });
 
 // POST /api/silicon/token/reset — carbon resets a silicon's token
+// Also brings back an agent that was signed out (a password reset revokes the
+// recent ones): the owner's new token is the only way in.
 app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
@@ -11926,12 +12027,13 @@ app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
 
   const rawToken = 'silicon:' + crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-  db.prepare('UPDATE silicon_agents SET token_hash = ? WHERE id = ?').run(tokenHash, agent.id);
+  db.prepare("UPDATE silicon_agents SET token_hash = ?, status = 'active' WHERE id = ?").run(tokenHash, agent.id);
   // A fill grant was approved with the PIN for the agent as it was keyed then; a new token must be approved again.
   const dropped = db.prepare("UPDATE silicon_permissions SET status = 'revoked' WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active'").run(agent_name).changes;
   db.prepare("UPDATE silicon_grant_requests SET status = 'denied', decided_at = CURRENT_TIMESTAMP WHERE agent_name = ? AND did = ? AND status = 'pending'").run(agent_name, actor.did);
 
   res.json({ ok: true, agent_name, token: rawToken, note: 'Previous token is immediately invalidated. SAVE THIS TOKEN.',
+    ...(agent.status !== 'active' ? { reactivated: true } : {}),
     ...(dropped ? { browser_fill_grants_revoked: dropped, browser_fill_note: 'grant action:browser_fill again; the wallet approves it with your PIN' } : {}) });
 });
 
