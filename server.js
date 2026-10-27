@@ -11604,7 +11604,7 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
         } catch(_) {}
         const list = rows => rows.map(r => `  - ${r.agent_name || r.name} (since ${String(r.created_at).slice(0, 10)})`).join('\n');
         const access = [
-          dropped.length ? `Agents registered in the last 30 days were signed out; register them again if they are yours:\n${list(dropped)}` : '',
+          dropped.length ? `Agents registered in the last 30 days were signed out. If they are yours, give each a new token to bring it back (POST /api/blindkey/silicon/token/reset {agent_name}):\n${list(dropped)}` : '',
           agents.length ? `These agents still have access; revoke any you don't recognise:\n${list(agents)}` : '',
           workers.length ? `These workers still have access; revoke any you don't recognise:\n${list(workers)}` : '',
         ].filter(Boolean).join('\n\n');
@@ -12013,6 +12013,8 @@ app.post('/api/blindkey/silicon/register', rateLimitStandard, (req, res) => {
 });
 
 // POST /api/silicon/token/reset — carbon resets a silicon's token
+// Also brings back an agent that was signed out (a password reset revokes the
+// recent ones): the owner's new token is the only way in.
 app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
@@ -12025,12 +12027,13 @@ app.post('/api/blindkey/silicon/token/reset', rateLimitStandard, (req, res) => {
 
   const rawToken = 'silicon:' + crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
-  db.prepare('UPDATE silicon_agents SET token_hash = ? WHERE id = ?').run(tokenHash, agent.id);
+  db.prepare("UPDATE silicon_agents SET token_hash = ?, status = 'active' WHERE id = ?").run(tokenHash, agent.id);
   // A fill grant was approved with the PIN for the agent as it was keyed then; a new token must be approved again.
   const dropped = db.prepare("UPDATE silicon_permissions SET status = 'revoked' WHERE agent_name = ? AND permission_type = 'action:browser_fill' AND status = 'active'").run(agent_name).changes;
   db.prepare("UPDATE silicon_grant_requests SET status = 'denied', decided_at = CURRENT_TIMESTAMP WHERE agent_name = ? AND did = ? AND status = 'pending'").run(agent_name, actor.did);
 
   res.json({ ok: true, agent_name, token: rawToken, note: 'Previous token is immediately invalidated. SAVE THIS TOKEN.',
+    ...(agent.status !== 'active' ? { reactivated: true } : {}),
     ...(dropped ? { browser_fill_grants_revoked: dropped, browser_fill_note: 'grant action:browser_fill again; the wallet approves it with your PIN' } : {}) });
 });
 

@@ -121,6 +121,12 @@ NEWSESS=$(signin reset-new newpass22); [ -n "$NEWSESS" ] && ok "new password sig
 [ "$(post /api/identity/device/token "{\"device_code\":\"$DCODE\"}")" = 403 ] && ok "pre-reset device approval can't be claimed" || fail "device login claimed after the reset"
 [ "$(Q "select status from silicon_agents where agent_name='fresh-agent'")" = revoked ] && ok "agent registered in the last 30 days revoked" || fail "recent agent still active"
 [ "$(Q "select status from silicon_agents where agent_name='old-agent'")" = active ] && ok "older agent kept" || fail "older agent revoked"
+# The owner brings the revoked agent back with a new token, as the mail says.
+RT=$(curl -s -X POST "$API/api/blindkey/silicon/token/reset" -H 'Content-Type: application/json' -H "Authorization: Bearer $NEWSESS" -d '{"agent_name":"fresh-agent"}')
+SILTOK=$(echo "$RT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("token") or "") if d.get("reactivated") else print("")')
+[ -n "$SILTOK" ] && [ "$(Q "select status from silicon_agents where agent_name='fresh-agent'")" = active ] && ok "token reset brings the agent back" || fail "token reset: $RT"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/blindkey/silicon/agents" -H "Authorization: Bearer $SILTOK")" = 200 ] && ok "its new token works" || fail "new agent token refused"
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/blindkey/silicon/agents" -H "Authorization: Bearer silicon:not-a-real-token")" = 401 ] && ok "a made-up agent token is refused there" || fail "endpoint accepts any agent token"
 wait_for "$S/server.log" "password-reset-done reset-new\] emailed to reset-new@dustforge.com" && ok "account address told of the reset" || fail "no reset notice"
 
 # 4. The recovery email takes the password, not just a token, and the old addresses are told.
