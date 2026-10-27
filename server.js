@@ -11429,17 +11429,20 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   // Send reset email — prefer recovery_email (external), fall back to @dustforge.com
   const resetUrl = `https://demipass.com/reset-password.html?token=${resetToken}`;
   const sendTo = wallet.recovery_email || wallet.email;
+  // The link is a credential: log where it went, never the link itself.
   try {
-    const dustforge = require('./dustforge-mail');
-    if (dustforge && dustforge.sendMail) {
-      dustforge.sendMail(sendTo, 'Password Reset — DemiPass',
-        `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`);
-    }
-  } catch(_) {
-    console.log(`[password-reset] ${wallet.username} → ${sendTo}: ${resetUrl}`);
+    createEmailTransport().sendMail({
+      from: 'noreply@dustforge.com',
+      to: sendTo,
+      subject: 'Password Reset — DemiPass',
+      text: `Reset your password: ${resetUrl}\n\nThis link expires in 1 hour.\n\nIf you didn't request this, ignore this email.\n\n— DemiPass`,
+    }).then(() => console.log(`[password-reset] ${wallet.username}: link emailed to ${sendTo}`))
+      .catch(e => console.error(`[password-reset] ${wallet.username}: email to ${sendTo} failed: ${e.message}`));
+  } catch (e) {
+    console.error(`[password-reset] ${wallet.username}: email to ${sendTo} failed: ${e.message}`);
   }
 
-  // Also store reset URL in a tick so admin can find it
+  // Also record the request in a tick so admin can see it
   try {
     db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
       .run('system', `Password reset requested for ${wallet.username}`, req.ip || '', 'UTC', 'alert',
@@ -11481,6 +11484,10 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
     db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
     return res.status(400).json({ error: 'reset token has expired. Request a new one.' });
   }
+  // The mailbox is named after the wallet's current username, which may have
+  // changed since the link was sent.
+  const resetWallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(resetRow.did);
+  if (!resetWallet) return res.status(400).json({ error: 'invalid or expired reset token' });
 
   // Change password via Stalwart
   try {
@@ -11498,7 +11505,7 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
 
     const pReq = http.request({
       hostname: stalwartHost, port: stalwartPort,
-      path: '/api/principal/' + encodeURIComponent(resetRow.username),
+      path: '/api/principal/' + encodeURIComponent(resetWallet.username),
       method: 'PATCH',
       headers: { 'Authorization': 'Basic ' + adminAuth, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(postData) },
     }, (pRes) => {
@@ -11508,11 +11515,15 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
         if (pRes.statusCode < 300) {
           // Only burn token after confirmed password change
           db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
+          // Keep the local fallback hash in step, or the old password still
+          // signs in whenever Stalwart is unreachable.
+          db.prepare('UPDATE identity_wallets SET password_hash = ? WHERE did = ?')
+            .run(crypto.createHash('sha256').update(new_password).digest('hex'), resetRow.did);
           // Buoy tick
           try {
             db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
-              .run(resetRow.did, `Password reset completed for ${resetRow.username}`, req.ip || '', 'UTC', 'decision',
-                JSON.stringify(['auth:password-reset-complete', `user:${resetRow.username}`]));
+              .run(resetRow.did, `Password reset completed for ${resetWallet.username}`, req.ip || '', 'UTC', 'decision',
+                JSON.stringify(['auth:password-reset-complete', `user:${resetWallet.username}`]));
           } catch(_) {}
 
           res.json({ ok: true, message: 'Password reset successfully. You can now log in with your new password.' });
