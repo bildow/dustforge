@@ -35,7 +35,7 @@ case "$remote" in
     printf -- '---journal---\nflight log for unit %s\n' "$u"; exit 0;;
   "sudo -n systemctl stop dp-hostop-"*) u=${remote#*stop dp-hostop-}; echo stopped > "$F/job-$u"; exit 0;;
   *"'exit-3'"*) echo "failing as asked" >&2; exit 3;;
-  *) echo "ran: $remote"; echo "credential seen by the host: $SSHPASS"; exit 0;;
+  *) echo "ran: $remote"; echo "credential seen by the host: [$SSHPASS]"; exit 0;;
 esac
 EOF
 cat > "$F/bin/ssh-keyscan" <<EOF
@@ -167,6 +167,23 @@ call POST /api/demipass/hostops/requests/$(echo "$BODY" | J request_id)/deny "$O
 call POST /api/blindkey/store "$OWN" '{"name":"api-key","value":"sk-fixture-0001","secret_type":"api_key"}'
 APIREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='api-key'")
 call POST /api/demipass/hostops/run "$OWN" "{\"ref\":\"$APIREF\",\"host\":\"10.0.0.5\",\"user\":\"apple\",\"argv\":[\"incus\",\"list\"]}"; [ "$CODE" = 400 ] && ok "only password credentials drive host operations" || fail "api key cred: $CODE $BODY"
+# a stored password ending in a line break: ssh types it without the break, and output is redacted in that form too
+printf 'fixture-host-key-ed25519-again' | base64 -w0 > "$F/key.b64"; SQL "UPDATE hostops_hosts SET known_hosts = '10.0.0.5 ssh-ed25519 '||'$(cat "$F/key.b64")'||char(10)"
+call POST /api/blindkey/store "$OWN" '{"name":"host-ssh-nl","value":"Fixture-Pass-91\n","secret_type":"password"}'
+NLREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='host-ssh-nl'")
+call POST /api/blindkey/delegate "$OWN" "{\"secret_name\":\"host-ssh-nl\",\"delegate_did\":\"$AGDID\"}"
+NLRUN="{\"ref\":\"$NLREF\",\"host\":\"10.0.0.5\",\"user\":\"apple\",\"argv\":[\"incus\",\"list\"]}"
+call POST /api/demipass/hostops/run "$AG" "$NLRUN"; RNL=$(echo "$BODY" | J request_id)
+call POST /api/identity/gate/verify "$OWN" "{\"gate\":\"pin\",\"pin\":\"2468\",\"intent\":\"hostop:$RNL\"}"
+call POST /api/demipass/hostops/requests/$RNL/approve "$OWN" '{}'
+call POST /api/demipass/hostops/run "$AG" "$NLRUN"
+echo "$BODY" | grep -q 'Fixture-Pass-91' && fail "newline-terminated password leaked: $BODY" || { [ "$CODE" = 200 ] && echo "$BODY" | J run.stdout | grep -q REDACTED && ok "a password stored with a trailing line break is redacted too" || fail "newline pw run: $CODE $BODY"; }
+# a command too long to render is refused before anything is charged or recorded
+B2=$(BAL agent-b); RUNS=$(Q "SELECT COUNT(*) FROM hostops_runs")
+LONGP="source=/srv/agent-ssd/$(python3 -c 'print("a"*500)')"
+call POST /api/demipass/hostops/run "$AG" "$(RUN "[\"incus\",\"storage\",\"create\",\"agent-ssd\",\"dir\",\"$LONGP\"]")"
+[ "$(BAL agent-b)" = "$B2" ] && [ "$(Q "SELECT COUNT(*) FROM hostops_runs")" = "$RUNS" ] && ok "an unrenderable command costs nothing and leaves no run ($CODE)" || fail "long cmd: $CODE $BODY"
+call POST /api/demipass/hostops/run "$AG" '{"ref":"'"$REF"'","host":"127.0.0.1","user":"apple","argv":["incus","list"]}'; [ "$CODE" = 400 ] && ok "loopback is never a host" || fail "loopback: $CODE $BODY"
 grep -q 'Fixture-Pass-91' "$S/server.log" && fail "the credential appears in the server log" || ok "the credential never appears in the server log"
 python3 - "$DB_PATH" <<'PY' && ok "no stored receipt contains the credential" || fail "credential stored in a receipt"
 import sqlite3,sys; c=sqlite3.connect(sys.argv[1])

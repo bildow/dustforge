@@ -24,6 +24,7 @@ module.exports = function registerHostopsRoutes(deps) {
   const REQUEST_TTL_HOURS = 24;
   const ONCE_HOURS = 1;
   const POLL_CACHE_MS = 5000;
+  const scanFailures = new Map();   // requester DID → times of failed host-key scans (an hour's worth)
 
   // ── schema ───────────────────────────────────────────────────────────────────────────────────────
   db.exec(`CREATE TABLE IF NOT EXISTS hostops_hosts (
@@ -114,6 +115,9 @@ module.exports = function registerHostopsRoutes(deps) {
     const auth = getBearerIdentity(req);
     if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
     if (auth.decoded && auth.decoded.wrk) { res.status(403).json({ error: 'worker tokens cannot use host operations' }); return null; }
+    // Silicon agent tokens are not supported yet: billing and window grants are per identity, and a silicon token
+    // acts as its owner's identity. Agents use their own DID (a delegation), as Brain does.
+    if (auth.silicon) { res.status(403).json({ error: 'silicon agent tokens cannot use host operations yet; use an identity token with a delegation' }); return null; }
     if (!gateSession(auth)) { res.status(403).json({ error: 'this token cannot hold host operations — sign in again' }); return null; }
     return auth;
   }
@@ -151,11 +155,13 @@ module.exports = function registerHostopsRoutes(deps) {
 
   // Run one remote command on a pinned host with the stored password. Never a local shell; the password travels
   // in the environment only. Resolves { code, stdout, stderr, timedOut }.
+  // The password as ssh will type it (sshpass sends one line): what runs, and what must be redacted.
+  function usablePassword(p) { return typeof p === 'string' ? p.replace(/\r?\n$/, '') : p; }
   function ssh(host, password, remote, timeoutMs) {
     return new Promise(resolve => {
-      if (typeof password === 'string') password = password.replace(/\r?\n$/, '');
+      password = usablePassword(password);
       if (typeof password !== 'string' || /[\0\r\n]/.test(password)) return resolve({ code: 255, stdout: '', stderr: 'this stored password cannot be used for ssh', timedOut: false });
-      const args = ['-e', 'ssh', '-p', String(host.port),
+      const args = ['-e', 'ssh', '-F', '/dev/null', '-p', String(host.port),
         '-o', 'StrictHostKeyChecking=yes', '-o', `UserKnownHostsFile=${knownHostsFile(host)}`, '-o', 'GlobalKnownHostsFile=/dev/null',
         '-o', 'ConnectTimeout=10', '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1',
         '--', `${host.ssh_user}@${host.address}`, remote];
@@ -189,6 +195,8 @@ module.exports = function registerHostopsRoutes(deps) {
     if (!s) return null;
     try { return blindkeyDecrypt(s.encrypted_value); } catch (_) { return null; }
   }
+  // Redact every form the password can take in output (as stored, and as typed).
+  const redactor = password => s => hostops.tail(hostops.redact(s, [password, usablePassword(password)]));
 
   function openWindows(owner, grantee, secretId, hostId) {
     return db.prepare(`SELECT * FROM hostops_windows WHERE owner_did = ? AND grantee_did = ? AND secret_id = ? AND host_id = ? AND status = 'open'
@@ -238,9 +246,12 @@ module.exports = function registerHostopsRoutes(deps) {
     if (pendingCount(cred.owner_did) >= MAX_PENDING) return { status: 429, error: `the owner already has ${MAX_PENDING} host-operation requests waiting` };
     let scan = null;
     if (!t.host) {
+      const recent = (scanFailures.get(auth.did) || []).filter(ts => Date.now() - ts < 3600e3);
+      if (recent.length >= 10) return { status: 429, error: 'too many hosts that could not be reached in the last hour' };
       scan = await keyscan(t.address, t.port);
-      if (!scan) return { status: 502, error: `could not read ${t.address}'s SSH host key` };
+      if (!scan) { scanFailures.set(auth.did, [...recent, Date.now()]); return { status: 502, error: `could not read ${t.address}'s SSH host key` }; }
     }
+    if (pendingCount(cred.owner_did) >= MAX_PENDING) return { status: 429, error: `the owner already has ${MAX_PENDING} host-operation requests waiting` };
     const id = db.prepare(`INSERT INTO hostops_requests (owner_did, requester_did, requester_session, secret_id, address, port, ssh_user, host_id,
         scanned_known_hosts, scanned_fingerprint, kind, argv, shapes, label, reason, duration_hours, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(cred.owner_did, auth.did, gateSession(auth), cred.secret.id, t.address, t.port, t.user,
@@ -285,6 +296,8 @@ module.exports = function registerHostopsRoutes(deps) {
     }
     const password = decryptFor(cred.secret.id);
     if (password === null) return res.status(500).json({ error: 'could not open the stored credential' });
+    // Render first: a command that cannot be rendered costs nothing and leaves no run behind.
+    try { hostops.renderRemote(shape, body.argv, { unit: 'dp-hostop-999999999999' }); } catch (e) { return res.status(400).json({ error: e.message }); }
     if (!(await charge(req, res))) return;
     // Take one run from the window, or refuse if it closed, expired or ran out meanwhile.
     const took = db.prepare(`UPDATE hostops_windows SET run_count = run_count + 1 WHERE id = ? AND status = 'open' AND closes_at > ?
@@ -297,11 +310,12 @@ module.exports = function registerHostopsRoutes(deps) {
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run('hostop_run', auth.did, cred.secret.id, null,
       JSON.stringify({ run_id: runId, window_id: cover.window.id, shape: shape.name, host: t.address, argv: body.argv }));
 
-    const clean = s => hostops.tail(hostops.redact(s, [password]));
+    const clean = redactor(password);
     if (shape.mode === 'job') {
       const unit = `dp-hostop-${runId}`;
       const r = await ssh(t.host, password, hostops.renderRemote(shape, body.argv, { unit }), 30000);
-      if (r.code === 0) db.prepare('UPDATE hostops_runs SET unit = ?, stdout = ?, polled_at = ? WHERE id = ?').run(unit, clean(r.stdout), Date.now(), runId);
+      // Started, or no answer in time (it may have started): keep the unit and let the next poll find out.
+      if (r.code === 0 || r.timedOut) db.prepare('UPDATE hostops_runs SET unit = ?, stdout = ?, polled_at = ? WHERE id = ?').run(unit, clean(r.stdout || (r.timedOut ? 'no answer while starting; checking on the next poll' : '')), r.timedOut ? 0 : Date.now(), runId);
       else db.prepare("UPDATE hostops_runs SET status = 'error', exit_code = ?, stdout = ?, stderr = ?, finished_at = CURRENT_TIMESTAMP WHERE id = ?")
         .run(r.code, clean(r.stdout), clean(r.stderr || (r.timedOut ? 'the job did not start within 30 s' : '')), runId);
     } else {
@@ -331,7 +345,7 @@ module.exports = function registerHostopsRoutes(deps) {
     const probe = await ssh(host, password, hostops.jobProbe(r.unit), 30000);
     if (probe.code !== 0 && !probe.stdout) return db.prepare('SELECT * FROM hostops_runs WHERE id = ?').get(r.id);
     const st = hostops.parseJobProbe(probe.stdout);
-    const log = hostops.tail(hostops.redact(st.journal, [password]));
+    const log = redactor(password)(st.journal);
     if (st.status === 'running') {
       db.prepare("UPDATE hostops_runs SET stdout = ? WHERE id = ? AND status = 'running'").run(log, r.id);
     } else {
@@ -356,7 +370,7 @@ module.exports = function registerHostopsRoutes(deps) {
     const password = host ? decryptFor(r.secret_id) : null;
     if (!host || password === null) return res.status(500).json({ error: 'could not reach the job' });
     const stop = await ssh(host, password, hostops.jobStop(r.unit), 30000);
-    if (stop.code !== 0) return res.status(502).json({ error: 'the host did not stop the job', detail: hostops.redact(stop.stderr, [password]).slice(0, 500) });
+    if (stop.code !== 0) return res.status(502).json({ error: 'the host did not stop the job', detail: redactor(password)(stop.stderr).slice(0, 500) });
     db.prepare("UPDATE hostops_runs SET status = 'cancelled', finished_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running'").run(r.id);
     res.json({ ok: true, run: publicRun(db.prepare('SELECT * FROM hostops_runs WHERE id = ?').get(r.id)) });
   });

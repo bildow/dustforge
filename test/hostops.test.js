@@ -150,3 +150,16 @@ test('hosts and output helpers', () => {
   assert.equal(h.normalPath('/srv/agent-ssd/incus'), '/srv/agent-ssd/incus');
   for (const p of ['/srv//x', '/srv/./x', '/srv/../etc', 'srv/x', '/srv/x y']) assert.equal(h.normalPath(p), null, p);
 });
+
+test('server-audit fixes: memoised matching, blocked addresses, no backslash words, longest rendering capped', () => {
+  const many = shape({ name: 'opt', argv: ['tool', ...Array.from({ length: 30 }, (_, i) => ({ literal: 'o' + (i % 2), optional: true }))] });
+  const t0 = Date.now();
+  assert.equal(h.matchShape(many, ['tool', ...Array(30).fill('o0'), 'nope']).ok, false);
+  assert.ok(Date.now() - t0 < 200, 'a non-matching argv against many optionals stays fast');
+  for (const a of ['localhost', '127.0.0.1', '127.1.2.3', '169.254.169.254', '0.0.0.0', 'metadata.google.internal', '2130706433', '0x7f000001']) assert.equal(h.validAddress(a), false, a);
+  assert.equal(h.validAddress('100.83.112.88'), true);
+  assert.match(h.validateArgv(['echo', 'a\\b']), /argv\[1\]/, 'no backslash in argv words');
+  assert.equal(h.validateShape({ name: 'x', argv: ['echo', 'a\\b'] }).ok, false, 'no backslash in literals');
+  const wide = h.validateShape({ name: 'wide', mode: 'job', sudo: true, argv: ['/bin/x', ...Array.from({ length: 9 }, (_, i) => ({ slot: 'p' + i, type: 'path', under: ['/srv/'] }))] });
+  assert.equal(wide.ok, false); assert.match(wide.error, /renders past 4096/);
+});

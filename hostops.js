@@ -7,7 +7,7 @@
 const crypto = require('crypto');
 
 const SAFE_VALUE = /^[A-Za-z0-9._:@=+,/-]+$/;      // slot values: no spaces, quotes or shell characters
-const SAFE_WORD = /^[\x21-\x7e]+$/;                 // a literal word / an argv element: printable ASCII, no spaces
+const SAFE_WORD = /^[\x21-\x5b\x5d-\x7e]+$/;       // a literal word / an argv element: printable ASCII, no spaces, no backslash
 const COMMAND = /^(\/[A-Za-z0-9._/-]+|[A-Za-z0-9._-]+)$/;
 const SHAPE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SLOT_NAME = /^[a-z][a-z0-9_]{0,31}$/;
@@ -101,6 +101,10 @@ function validateShape(input) {
   if (argv[0].optional || argv[0].literal === undefined || !COMMAND.test(argv[0].literal)) {
     return { ok: false, error: `shape ${s.name}: argv[0] must be a required literal command name or absolute path` };
   }
+  // The longest line this shape can render (every slot at its longest, every optional present) must fit.
+  const longest = 160 + argv.reduce((n, e) => n + 4 + (e.literal !== undefined ? e.literal.length * 4 :
+    (e.prefix ? e.prefix.length * 4 : 0) + (e.enum ? Math.max(...e.enum.map(v => v.length)) : e.type === 'path' ? 512 : e.type === 'int' ? 12 : 128)), 0);
+  if (longest > MAX_RENDERED) return { ok: false, error: `shape ${s.name}: at its longest it renders past ${MAX_RENDERED} characters; use fewer or tighter slots` };
   return { ok: true, shape: { name: s.name, mode, sudo, max_seconds, argv } };
 }
 
@@ -167,7 +171,15 @@ function slotRefusal(el, v) {
 function matchShape(shape, argv) {
   let best = { ok: false, index: -1, reason: 'no match' };
   const note = (i, reason) => { if (i > best.index) best = { ok: false, index: i, reason }; };
+  const failed = new Set();   // (template position, argv position) pairs already known not to lead to a match
   const walk = (t, a, values) => {
+    const key = t * 64 + a;
+    if (failed.has(key)) return null;
+    const r = step(t, a, values);
+    if (!r) failed.add(key);
+    return r;
+  };
+  const step = (t, a, values) => {
     if (t === shape.argv.length) {
       if (a === argv.length) return values;
       note(a, `argument ${a + 1} ${JSON.stringify(argv[a])} is one too many`);
@@ -269,7 +281,9 @@ function parseJobProbe(text) {
 
 const ADDRESS = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 const LOGIN = /^[a-z_][a-z0-9_.-]{0,31}$/;
-function validAddress(a) { return typeof a === 'string' && ADDRESS.test(a); }
+// Loopback, unspecified, link-local and cloud-metadata targets are never hosts: DemiPass would be scanning itself.
+const BLOCKED_HOST = /^(localhost|localhost\.localdomain|metadata(\.google\.internal)?|0(\.0){0,3}|127(\.\d{1,3}){3}|169\.254(\.\d{1,3}){2}|0x[0-9a-f]+|\d+)$/i;
+function validAddress(a) { return typeof a === 'string' && ADDRESS.test(a) && !BLOCKED_HOST.test(a); }
 function validLogin(u) { return typeof u === 'string' && LOGIN.test(u); }
 function validPort(p) { return Number.isInteger(p) && p >= 1 && p <= 65535; }
 
