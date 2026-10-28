@@ -575,7 +575,7 @@ let loginPw='';   // the password just typed at sign-in; consumed by the mandato
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
 let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
 let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
-let netData=null, netBusy=new Set(), sendTo=null, sendBusy=false;   // network: GET /api/network, requests being decided, the open send
+let netData=null, netBusy=new Set(), sendTo=null, sendBusy=false, topupBusy=false;   // network: GET /api/network, requests being decided, the open send
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
 let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
@@ -615,7 +615,7 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;document.getElementById('net-badge').textContent='Fleet ›';
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why','net-msg','send-msg','send-to-name','send-balance']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -1141,12 +1141,15 @@ function openTopup(){
 }
 async function askTopup(){
   const m=document.getElementById('topup-msg'), a=Number(document.getElementById('topup-amount').value);
+  if(topupBusy) return;
   if(!Number.isInteger(a)||a<1){ m.textContent='A whole number of DD, 1 or more'; m.className='modal-msg err'; return; }
+  topupBusy=true;
   try{
     m.textContent='Asking…'; m.className='modal-msg';
     await api('POST','/api/network/topups',{amount_cents:a,note:document.getElementById('topup-note').value.trim()});
     closeSheet('topup'); loadFleet();
   }catch(e){ if(!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
+  finally{ topupBusy=false; }
 }
 async function topupAct(id, act){
   const key='t'+id; if(netBusy.has(key)) return; netBusy.add(key); renderNetRequests();

@@ -167,14 +167,27 @@ call POST /api/network/transfers/$TT/confirm "$A"; [ "$CODE" = 403 ] && ok "answ
 [ "$(Q "SELECT status FROM network_topups WHERE id=$TU2")" = pending ] && ok "a refused send leaves the ask open" || fail "refused closed ask"
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"send:'$TT'"}'
 call POST /api/network/transfers/$TT/confirm "$A"
-[ "$CODE" = 200 ] && [ "$(bal agent-f)" = $((FB+30)) ] && [ "$(Q "SELECT status||':'||sent_cents||':'||transfer_id FROM network_topups WHERE id=$TU2")" = "sent:30:$TT" ] \
+[ "$CODE" = 200 ] && [ "$(bal agent-f)" = $((FB+30)) ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TU2")" = "sent:30" ] \
   && ok "A sends 30 (asked 40): F gets 30, the ask closes as sent 30" || fail "topup answered: $CODE $BODY $(Q "SELECT status, sent_cents FROM network_topups WHERE id=$TU2")"
 call GET /api/network "$A"; [ "$(echo "$BODY" | J topups.incoming)" = "[]" ] && ok "the answered ask leaves A's list" || fail "A list after: $BODY"
+call POST /api/network/topups "$F" '{"amount_cents":15}'; TUR=$(echo "$BODY" | J topup.id)
+call POST /api/network/transfers "$F" '{"to":"owner-a","amount_cents":1}'; call POST /api/network/transfers/$(echo "$BODY" | J transfer.id)/confirm "$F"
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status FROM network_topups WHERE id=$TUR")" = pending ] && ok "DD from the agent to its owner does not close its ask" || fail "agent→owner closed: $CODE $(Q "SELECT status FROM network_topups WHERE id=$TUR")"
+call POST /api/fleet/$SLUG/silicons/agent-f/refill "$A" '{"amount_cents":15}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUR")" = "sent:15" ] && ok "a fleet refill answers the ask too" || fail "refill close: $CODE $BODY $(Q "SELECT status FROM network_topups WHERE id=$TUR")"
+call POST /api/network/topups "$F" '{"amount_cents":6}'; TUW=$(echo "$BODY" | J topup.id)
+FDID=$(Q "SELECT did FROM identity_wallets WHERE username='agent-f'"); ADID=$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")
+call POST /api/wallet/transfer "$A" '{"from_did":"'$ADID'","to_did":"'$FDID'","amount_cents":6}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUW")" = "sent:6" ] && ok "/api/wallet/transfer from the owner answers the ask too" || fail "wallet transfer close: $CODE $BODY"
+call POST /api/network/transfers "$K" '{"to":"owner-a","amount_cents":999999}'; call POST /api/network/transfers/$(echo "$BODY" | J transfer.id)/confirm "$K"
+echo "$BODY" | grep -q '"topup"' && fail "a person (not an agent) got the top-up hint: $CODE" || ok "a person short of DD gets no top-up hint ($CODE)"
+call POST /api/identity/create "" '{"username":"nokey-x"}'; [ "$CODE" = 402 ] && ! echo "$BODY" | grep -q '"topup"' && ok "an anonymous 402 (account needs payment) carries no top-up hint" || fail "anon 402: $CODE $BODY"
+setq "UPDATE network_topups SET created_at=datetime('now','-2 days')"
 call POST /api/network/topups "$F" '{"amount_cents":10}'; TU3=$(echo "$BODY" | J topup.id)
 call POST /api/network/topups/$TU3/decline "$A"; [ "$CODE" = 200 ] && ok "A declines an ask" || fail "A decline: $CODE $BODY"
 call POST /api/network/topups "$F" '{"amount_cents":10}'; [ "$CODE" = 429 ] && ok "asking again right after a decline → 429" || fail "after decline: $CODE $BODY"
 setq "UPDATE network_topups SET decided_at=datetime('now','-2 hours') WHERE id=$TU3"
-for i in 4 5; do call POST /api/network/topups "$F" '{"amount_cents":1}'; call POST /api/network/topups/$(echo "$BODY" | J topup.id)/withdraw "$F"; done
+for i in 1 2 3 4; do call POST /api/network/topups "$F" '{"amount_cents":1}'; call POST /api/network/topups/$(echo "$BODY" | J topup.id)/withdraw "$F"; done
 call POST /api/network/topups "$F" '{"amount_cents":1}'; [ "$CODE" = 429 ] && ok "a sixth ask in a day → 429" || fail "daily cap: $CODE $BODY"
 setq "UPDATE network_topups SET created_at=datetime('now','-2 days')"
 call POST /api/network/topups "$F" '{"amount_cents":2}'; TU7=$(echo "$BODY" | J topup.id)

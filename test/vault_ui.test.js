@@ -1052,7 +1052,9 @@ test('an agent wallet asks its fleet owner for DD with a note, and can withdraw 
   await pg.ctx.askTopup();
   assert.equal(state.asked, undefined, 'a zero amount is refused before anything is sent');
   pg.el('topup-amount').value = '120'; pg.el('topup-note').value = ' out of DD mid-task ';
-  await pg.ctx.askTopup(); await settle();
+  const t1 = pg.ctx.askTopup(), t2 = pg.ctx.askTopup();
+  await t1; await t2; await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/network/topups').length, 1, 'a double tap asks once');
   assert.deepEqual({ ...state.asked }, { amount_cents: 120, note: 'out of DD mid-task' });
   assert.equal(pg.shown('modal-topup'), false, 'sheet closes once asked');
   assert.match(pg.el('fleet-content').innerHTML, /You asked <b>aaron<\/b> for <b>120 DD<\/b>/);
@@ -1060,6 +1062,10 @@ test('an agent wallet asks its fleet owner for DD with a note, and can withdraw 
   assert.equal(pg.calls.filter(c => c.path === '/api/network/topups/9/withdraw').length, 1);
   await pg.ctx.loadFleet();   // the fleet tab is not the active page in this harness
   assert.doesNotMatch(pg.el('fleet-content').innerHTML, /You asked/);
+  pg.ctx.openTopup(); pg.el('topup-amount').value = '7'; pg.el('topup-note').value = 'draft';
+  pg.ctx.logout();
+  for (const i of ['topup-owner', 'topup-msg']) assert.equal(pg.el(i).textContent, '', i + ' cleared on sign-out');
+  for (const i of ['topup-amount', 'topup-note']) assert.equal(pg.el(i).value, '', i + ' cleared on sign-out');
 });
 
 // Changing the recovery email takes the account password (the server refuses a token alone).

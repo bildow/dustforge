@@ -11,7 +11,7 @@
 // Sending DD is two steps: create the transfer (amount + recipient fixed), then confirm it with the PIN
 // (intent send:<id>). A wallet with no PIN (an agent) confirms without one, like /api/wallet/transfer.
 // An agent short of DD asks its fleet owner for a top-up (amount + why). The owner answers by sending DD (any
-// confirmed send from the owner to the agent closes the ask) or declines it.
+// send from its fleet to the agent closes the ask: a network send, /api/wallet/transfer or a refill) or declines it.
 
 const REQUEST_TTL_DAYS = 14;
 const TRANSFER_TTL_SEC = 300;
@@ -78,13 +78,14 @@ module.exports = function registerNetworkRoutes(deps) {
     note TEXT DEFAULT '',
     status TEXT NOT NULL DEFAULT 'pending',
     sent_cents INTEGER DEFAULT NULL,
-    transfer_id INTEGER DEFAULT NULL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     expires_at TEXT NOT NULL,
     decided_at TEXT DEFAULT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_ntu_owner ON network_topups(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ntu_agent ON network_topups(agent_did, status)');
+  // expireOld walks the open asks on every overview; closed ones pile up, so it reads only these.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_ntu_pending ON network_topups(status, expires_at) WHERE status = 'pending'");
 
   // ── helpers ───────────────────────────────────────────────────────────────
   const nowIso = () => new Date().toISOString();
@@ -489,10 +490,8 @@ module.exports = function registerNetworkRoutes(deps) {
         const changed = db.prepare("UPDATE network_transfers SET status = 'sent', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(t.id).changes;
         if (changed !== 1) throw Object.assign(new Error('this transfer was decided meanwhile'), { statusCode: 409 });
         const note = t.note ? ': ' + t.note : '';
+        // A send from the owner to its agent also answers the agent's open top-up ask (in barrelGuardedTransfer).
         debit = barrelGuardedTransfer(db, me, t.to_did, t.amount_cents, 'transfer_out', 'Transfer to ' + to.username + note, 'Transfer from ' + w.wallet.username + note);
-        // A send from the owner to its agent answers the agent's open top-up ask, whatever the amount.
-        db.prepare(`UPDATE network_topups SET status = 'sent', sent_cents = ?, transfer_id = ?, decided_at = CURRENT_TIMESTAMP
-                    WHERE agent_did = ? AND owner_did = ? AND status = 'pending'`).run(t.amount_cents, t.id, t.to_did, me);
       }).immediate();
       log(`transfer ${t.id}: ${w.wallet.username} → ${to.username} ${t.amount_cents} DD`);
       res.json({ ok: true, id: t.id, status: 'sent', to: to.username, amount_cents: t.amount_cents, balance_after: debit.balance_after });

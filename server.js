@@ -293,11 +293,20 @@ const _jsonParser = express.json();
 const _urlencodedParser = express.urlencoded({ extended: false });
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, next)));
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, next)));
-// Every "not enough DD" (402) answer tells an agent how to ask its fleet owner for a top-up (network_routes.js).
+// A "not enough DD" (402) answer to an agent paying for itself tells it how to ask its fleet owner for a top-up
+// (network_routes.js). Not for people, worker/silicon tokens, or a charge someone else pays.
+function topupHintFor(req, body) {
+  try {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok || auth.silicon || (auth.decoded && auth.decoded.wrk)) return false;
+    if (body.payer_did && body.payer_did !== auth.did) return false;
+    return Boolean(fleetBilling.agentFleetOwner(db, auth.did));
+  } catch (_) { return false; }
+}
 app.use((req, res, next) => {
   const json = res.json.bind(res);
   res.json = (body) => {
-    if (res.statusCode === 402 && body && typeof body === 'object' && !Array.isArray(body) && !body.topup) {
+    if (res.statusCode === 402 && body && typeof body === 'object' && !Array.isArray(body) && !body.topup && topupHintFor(req, body)) {
       body = { ...body, topup: { how: 'POST /api/network/topups', body: { amount_cents: '<whole DD>', note: '<why you need it>' },
         note: 'An agent in a fleet asks its owner for DD this way; the owner sees the ask and the note in their wallet.' } };
     }
@@ -6587,6 +6596,8 @@ function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, descriptio
     // Build credit description: swap "to" for "from" in the description
     const creditDesc = creditDescription || description.replace(/\bto\b/, 'from');
     billing.creditBalance(db, toDid, amountCents, 'transfer_in', creditDesc);
+    // DD from the agent's own fleet owner answers its open top-up ask (network_routes.js), whichever route sent it.
+    if (fleetBilling.fromItsFleet(db, fromDid, toDid)) fleetBilling.answerTopups(db, toDid, amountCents);
     return debit;
   });
 

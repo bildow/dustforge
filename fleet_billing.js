@@ -451,6 +451,30 @@ function transferRefill(db, billing, { fromDid, toDid, amount, description, ledg
   return out;
 }
 
+// ── Top-up asks (network_routes.js) ─────────────────────────────────────────
+// The fleet owner a wallet is an active agent of, or null.
+function agentFleetOwner(db, did) {
+  const r = db.prepare(`SELECT f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+                        WHERE s.member_did = ? AND s.status = 'active' AND f.status = 'active'`).get(did);
+  return r ? r.owner_did : null;
+}
+// DD reaching an agent from its fleet (the owner, or the fleet wallet on a refill) answers the agent's open top-up
+// ask, whatever the route: a network send, /api/wallet/transfer, a manual or threshold refill. Returns rows closed.
+const _hasTopups = new WeakSet();
+function answerTopups(db, agentDid, sentCents) {
+  if (!_hasTopups.has(db)) {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'network_topups'").get()) return 0;
+    _hasTopups.add(db);
+  }
+  return db.prepare(`UPDATE network_topups SET status = 'sent', sent_cents = ?, decided_at = CURRENT_TIMESTAMP
+                     WHERE agent_did = ? AND status = 'pending'`).run(sentCents, agentDid).changes;
+}
+function fromItsFleet(db, fromDid, agentDid) {
+  const r = db.prepare(`SELECT f.owner_did, f.wallet_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+                        WHERE s.member_did = ? AND s.status = 'active' AND f.status = 'active'`).get(agentDid);
+  return Boolean(r && (r.owner_did === fromDid || (r.wallet_did && r.wallet_did === fromDid)));
+}
+
 function thresholdRefill(db, billing, s, { force = false, amount = null, now = Date.now(), ledger = null } = {}) {
   const amt = Number(amount != null ? amount : s.refill_amount_cents);
   if (!force) {
@@ -468,6 +492,7 @@ function thresholdRefill(db, billing, s, { force = false, amount = null, now = D
     const r = transferRefill(db, billing, { fromDid: from, toDid: s.member_did, amount: amt,
       description: `Refill ${amt} DD to ${s.handle} (fleet ${fleet.slug})`, ledger });
     db.prepare("UPDATE fleet_silicons SET last_refill_at = datetime('now'), last_refill_error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
+    if (fromItsFleet(db, from, s.member_did)) answerTopups(db, s.member_did, amt);
     return { ok: true, ...r, from_did: from };
   } catch (e) {
     const msg = (e.body && e.body.error) || e.message;
@@ -890,7 +915,7 @@ function tokenWarningEmail({ silicon, token }) {
 module.exports = {
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
-  thresholdRefill, maybeThresholdRefill, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
+  thresholdRefill, maybeThresholdRefill, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
   runOwnerRefills, runSiliconRefills, runTokenWarnings, runRefills,
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
