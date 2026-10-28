@@ -32,6 +32,7 @@ node -e '
 const http = require("http"), fs = require("fs"); const [port, dir] = process.argv.slice(1);
 const load = () => JSON.parse(fs.readFileSync(dir + "/stw.json", "utf8")), save = (s) => fs.writeFileSync(dir + "/stw.json", JSON.stringify(s));
 http.createServer((req, res) => { let b = ""; req.on("data", c => b += c); req.on("end", () => {
+  if (fs.existsSync(dir + "/down")) { res.writeHead(503); return res.end("down"); }
   const u = new URL(req.url, "http://x"), st = load(), send = (code, j) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(j)); };
   if (u.pathname === "/api/principal") { fs.appendFileSync(dir + "/stalwart.log", "LIST\n"); const items = Object.entries(st).map(([name, p]) => ({ name, ...p })); return send(200, { data: { items, total: items.length } }); }
   const name = decodeURIComponent(u.pathname.split("/").pop()); fs.appendFileSync(dir + "/stalwart.log", req.method + " " + name + "\n");
@@ -59,9 +60,11 @@ const db = new Database(process.env.DB_PATH), sha = (s) => crypto.createHash("sh
   add("plain", null); add("hashed", null);
   add("current", await pw.hashPassword("currentpass1"));
   add("m1", sha("stale-old-pass")); add("m2", null); add("m3", sha("m3localpass"));
+  add("stale", sha("old-stale-pass")); add("m4", await pw.hashPassword("m4-local-old")); add("m5", null);
   const st = { plain: { type: "individual", secrets: ["plainpass1"] }, hashed: { type: "individual", secrets: [await pw.hashPassword("hashedpass1")] },
     current: { type: "individual", secrets: ["not-the-password"] }, m1: { type: "individual", secrets: ["m1stalwartpass"] },
-    m2: { type: "individual", secrets: ["m2pass1", "$app$phone$keepme"] }, "dustforge.com": { type: "domain", secrets: [] } };
+    m2: { type: "individual", secrets: ["m2pass1", "$app$phone$keepme", "otpauth://totp/m2?secret=ABC"] }, "dustforge.com": { type: "domain", secrets: [] },
+    stale: { type: "individual", secrets: ["new-real-pass"] }, m4: { type: "individual", secrets: ["m4-stalwart-pass"] }, m5: { type: "individual", secrets: ["{PLAIN}m5pass"] } };
   fs.writeFileSync(process.argv[1] + "/stw.json", JSON.stringify(st));
   const iso = (min) => new Date(Date.now() + min * 60000).toISOString();
   const sec = db.prepare("INSERT INTO blindkey_secrets (did, name, encrypted_value, status, rotate_expires_at) VALUES (?, ?, ?, ?, ?)");
@@ -98,6 +101,15 @@ G0=$(grep -c '^GET plain$' "$S/stalwart.log")
 CR=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/identity/auth-critical" -H 'Content-Type: application/json' -d '{"username":"legacy","password":"legacypass1","scope":"critical"}')
 [ "$CR" != 503 ] && [ "$CR" != 401 ] && ok "auth-critical verifies from the local hash ($CR)" || fail "auth-critical: $CR"
 
+# 1b. A stale local password used while Stalwart is down signs in (as before) but never becomes the account's
+#     password: the local form is only salted, and once Stalwart answers, its password decides again.
+touch "$S/down"
+[ "$(code stale old-stale-pass)" = 200 ] && ok "Stalwart down: the local hash still answers" || fail "Stalwart down: local fallback failed"
+case "$(Q "select password_hash from identity_wallets where username='stale'")" in sha256+*) ok "Stalwart down: the stale hash is salted, not promoted";; *) fail "stale hash promoted: $(Q "select substr(password_hash,1,12) from identity_wallets where username='stale'")";; esac
+rm -f "$S/down"
+[ "$(code stale new-real-pass)" = 200 ] && [ "$(code stale old-stale-pass)" = 401 ] && ok "Stalwart back: its password decides, the stale one is refused" || fail "stale password still wins"
+[ "$(code m4 m4-local-old)" = 200 ] && ok "m4: before the migration, a current local hash decides" || fail "m4 local sign-in"
+
 # 2. Migration.
 cp "$S/stw.json" "$S/stw.before"
 OUT=$(node scripts/migrate-password-hashes.js 2>&1)
@@ -107,12 +119,18 @@ OUT=$(node scripts/migrate-password-hashes.js --execute 2>&1); echo "$OUT" | tai
 grep -q '"stalwart_failed":0' "$S/migrate.json" && grep -q '"unsalted_left":0' "$S/migrate.json" && ok "migration: no failures, no unsalted hash left" || fail "migration: $OUT"
 J 'const s = require(process.argv[1] + "/stw.json"), pw = require("./passwords"); const bad = Object.entries(s).filter(([n, p]) => (p.secrets || []).some(pw.isPlaintextSecret)).map(([n]) => n); console.log(bad.join(",") || "none")' "$S" | grep -qx none \
   && ok "no readable password left in Stalwart" || fail "readable passwords left in Stalwart"
-J 'const s = require(process.argv[1] + "/stw.json"); process.exit(s.m2.secrets[1] === "$app$phone$keepme" && s.m2.secrets.length === 2 ? 0 : 1)' "$S" && ok "app password kept as it was" || fail "app password changed"
+J 'const s = require(process.argv[1] + "/stw.json"), pw = require("./passwords"); const [main, app, otp] = s.m2.secrets;
+  (async () => { const inner = app.startsWith("$app$phone$") ? app.slice("$app$phone$".length) : "";
+    process.exit(s.m2.secrets.length === 3 && otp === "otpauth://totp/m2?secret=ABC" && (await pw.verifyPassword("keepme", inner)).ok && pw.isCurrent(main) ? 0 : 1); })()' "$S" \
+  && ok "app password hashed inside and still verifies; TOTP seed kept" || fail "m2 secrets wrong after migration"
+[ "$(code m5 m5pass)" = 200 ] && ok "m5: a {PLAIN} Stalwart password is hashed and still signs in" || fail "m5 sign-in failed"
+[ "$(code m4 m4-stalwart-pass)" = 200 ] && [ "$(code m4 m4-local-old)" = 401 ] && ok "m4: Stalwart's password wins over a disagreeing current local hash" || fail "m4 after migration"
+grep -q '"local_disagreed":2' "$S/migrate.json" && ok "migration reports both disagreements (m4, current)" || fail "migration tally: $(cat "$S/migrate.json")"
 J 'const s = require(process.argv[1] + "/stw.json"), pw = require("./passwords"); pw.verifyPassword("hashedpass1", s.hashed.secrets[0]).then(r => process.exit(r.ok ? 0 : 1))' "$S" && ok "already-hashed Stalwart entry kept" || fail "hashed entry broken"
 [ "$(code m1 m1stalwartpass)" = 200 ] && [ "$(code m1 stale-old-pass)" = 401 ] && ok "m1: Stalwart's password wins over the stale local sha256" || fail "m1 sign-in wrong after migration"
 [ "$(code m3 m3localpass)" = 200 ] && [ "$(current m3 m3localpass)" = yes ] && ok "m3: wrapped sha256 signs in and upgrades" || fail "m3 sign-in wrong after migration"
 [ "$(code m2 m2pass1)" = 200 ] && ok "m2 signs in after migration" || fail "m2 sign-in failed"
-[ "$(code current currentpass1)" = 200 ] && ok "current kept its local hash" || fail "current broken by migration"
+[ "$(code current not-the-password)" = 200 ] && [ "$(code current currentpass1)" = 401 ] && ok "current: Stalwart's password replaced the disagreeing local hash" || fail "current after migration"
 
 # 3. Secret values.
 TOKEN=$(signin legacy legacypass1 | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
