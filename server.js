@@ -48,15 +48,19 @@ const BLINDKEY_SSH_HOSTS = new Set([
 // ssh with a password, and no shell on this server: sshpass gets user@host and the remote command as separate
 // arguments, and the password in SSHPASS. The remote command still runs in the remote user's shell, as each
 // caller intends. User and host are checked here as well, so nothing a caller passes reaches a local shell.
+// `--` ends ssh's options: ssh keeps parsing options after the destination, so a command like
+// "-oProxyCommand=…" would otherwise run on this server (and could read SSHPASS). A command starting with "-"
+// is refused too. A password ssh could not take (NUL, CR, LF) is refused before Node quotes it in an error.
 // Errors look like execSync's (stdout, stderr, status).
 const SSH_USER_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$/;
 const SSH_HOST_RE = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
 function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } = {}) {
-  if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) {
-    throw Object.assign(new Error('invalid ssh user or host'), { stdout: '', stderr: 'invalid ssh user or host', status: 2 });
-  }
+  const refuse = (why) => { throw Object.assign(new Error(why), { stdout: '', stderr: why, status: 2 }); };
+  if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) refuse('invalid ssh user or host');
+  if (typeof remoteCommand !== 'string' || /^\s*-/.test(remoteCommand) || remoteCommand.includes('\0')) refuse('invalid ssh command');
+  if (typeof password !== 'string' || /[\0\r\n]/.test(password)) refuse('this stored password cannot be used for ssh (it holds a NUL or a line break)');
   return require('child_process').execFileSync('sshpass',
-    ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', `${user}@${host}`, remoteCommand],
+    ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '--', `${user}@${host}`, remoteCommand],
     { timeout, encoding: 'utf8', maxBuffer: 1024 * 1024, env: { ...process.env, SSHPASS: password }, input });
 }
 
@@ -4235,6 +4239,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           if (!/^[a-zA-Z0-9\s\/_\-.:=,@+*?[\]{}()#<>|&;'"%!\\\n]+$/.test(command)) {
             return res.status(400).json({ error: 'command contains disallowed characters' });
           }
+          // ssh would read a leading "-" as its own option (-oProxyCommand runs on this server): see sshRun.
+          if (/^\s*-/.test(command)) return res.status(400).json({ error: 'command must not start with "-"' });
           if (!/^[a-zA-Z0-9._-]+$/.test(effectiveUser)) {
             return res.status(400).json({ error: 'invalid target_user' });
           }
@@ -4591,7 +4597,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         // Host whitelist check
         if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
           return res.status(403).json({
-            error: `host ${target_host} not in SSH whitelist. Allowed: ${[...BLINDKEY_SSH_HOSTS].join(', ')}`,
+            error: 'host not in SSH whitelist',
           });
         }
 
@@ -4616,6 +4622,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         if (!/^[a-zA-Z0-9\s\/_\-.:=,@+*?[\]{}()#<>|&;'"%!\\\n]+$/.test(command)) {
           return res.status(400).json({ error: 'command contains disallowed characters' });
         }
+        // ssh would read a leading "-" as its own option (-oProxyCommand runs on this server): see sshRun.
+        if (/^\s*-/.test(command)) return res.status(400).json({ error: 'command must not start with "-"' });
 
         // Optionally load a second secret (e.g. an SSH key) by key_name
         let password = decryptedValue;
@@ -5359,6 +5367,8 @@ async function handleRowenDeliver(req, res) {
         if (!/^[a-zA-Z0-9\s\/_\-.:=,@+*?[\]{}()#<>|&;'"%!\\\n]+$/.test(command)) {
           return res.status(400).json({ error: 'command contains disallowed characters' });
         }
+        // ssh would read a leading "-" as its own option (-oProxyCommand runs on this server): see sshRun.
+        if (/^\s*-/.test(command)) return res.status(400).json({ error: 'command must not start with "-"' });
         try {
           // No local shell: see sshRun.
           const output = sshRun(target_user, target_host, decryptedValue, command);
@@ -10947,7 +10957,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   // command on this server unchecked, which let any account run commands here.
   if (typeof target_host !== 'string' || !BLINDKEY_SSH_HOSTS.has(target_host)) {
     logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), error: 'host not in SSH whitelist', ip: req.ip });
-    return res.status(403).json({ error: `host not in SSH whitelist. Allowed: ${[...BLINDKEY_SSH_HOSTS].join(', ')}` });
+    return res.status(403).json({ error: 'host not in SSH whitelist' });
   }
   if (typeof sshUser !== 'string' || !SSH_USER_RE.test(sshUser)) return res.status(400).json({ error: 'invalid target_user' });
   // The chpasswd script goes to `bash -s` on the host over stdin: no file on this server, and every value is
