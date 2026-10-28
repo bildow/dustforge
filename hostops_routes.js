@@ -311,6 +311,9 @@ module.exports = function registerHostopsRoutes(deps) {
     try { hostops.renderRemote(shape, body.argv, { unit: 'dp-hostop-999999999999' }); } catch (e) { return res.status(400).json({ error: e.message }); }
     const where = await reachable(t.host.address);
     if (!where.ok) return res.status(400).json({ error: where.error });
+    if (shape.mode === 'job' && db.prepare("SELECT COUNT(*) AS n FROM hostops_runs WHERE host_id = ? AND mode = 'job' AND status = 'running'").get(t.host.id).n >= MAX_JOBS_PER_HOST) {
+      return res.status(429).json({ error: `${MAX_JOBS_PER_HOST} jobs are already running on this host` });   // re-checked after the lookup await
+    }
     if (!(await charge(req, res))) return;
     // Take one run from the window, or refuse if it closed, expired or ran out meanwhile.
     const took = db.prepare(`UPDATE hostops_windows SET run_count = run_count + 1 WHERE id = ? AND status = 'open' AND closes_at > ?
@@ -354,6 +357,7 @@ module.exports = function registerHostopsRoutes(deps) {
     const host = db.prepare('SELECT * FROM hostops_hosts WHERE id = ?').get(r.host_id);
     const password = host ? decryptFor(r.secret_id) : null;
     if (!host || password === null) return r;
+    if (!(await reachable(host.address)).ok) return r;   // never log in to wherever a repointed name now goes
     db.prepare('UPDATE hostops_runs SET polled_at = ? WHERE id = ?').run(Date.now(), r.id);
     const probe = await ssh(host, password, hostops.jobProbe(r.unit), 30000);
     if (probe.code !== 0 && !probe.stdout) return db.prepare('SELECT * FROM hostops_runs WHERE id = ?').get(r.id);
@@ -382,6 +386,8 @@ module.exports = function registerHostopsRoutes(deps) {
     const host = db.prepare('SELECT * FROM hostops_hosts WHERE id = ?').get(r.host_id);
     const password = host ? decryptFor(r.secret_id) : null;
     if (!host || password === null) return res.status(500).json({ error: 'could not reach the job' });
+    const where = await reachable(host.address);
+    if (!where.ok) return res.status(400).json({ error: where.error });
     const stop = await ssh(host, password, hostops.jobStop(r.unit), 30000);
     if (stop.code !== 0) return res.status(502).json({ error: 'the host did not stop the job', detail: redactor(password)(stop.stderr).slice(0, 500) });
     db.prepare("UPDATE hostops_runs SET status = 'cancelled', finished_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'running'").run(r.id);
