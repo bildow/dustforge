@@ -58,6 +58,9 @@ function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } 
   const refuse = (why) => { throw Object.assign(new Error(why), { stdout: '', stderr: why, status: 2 }); };
   if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) refuse('invalid ssh user or host');
   if (typeof remoteCommand !== 'string' || /^\s*-/.test(remoteCommand) || remoteCommand.includes('\0')) refuse('invalid ssh command');
+  // sshpass types the password and a newline, and ssh stops at the first one: a stored password ending in one line
+  // break has always logged in without it. A NUL or a line break inside is refused.
+  if (typeof password === 'string') password = password.replace(/\r?\n$/, '');
   if (typeof password !== 'string' || /[\0\r\n]/.test(password)) refuse('this stored password cannot be used for ssh (it holds a NUL or a line break)');
   return require('child_process').execFileSync('sshpass',
     ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '--', `${user}@${host}`, remoteCommand],
@@ -11604,10 +11607,12 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
     pReq.setTimeout(10000, () => pReq.destroy(new Error('stalwart timeout')));
     // Timed out or failed once connected: Stalwart may have taken the new password or not. Clearing the local hash
     // lets Stalwart decide, so neither password can win on DemiPass while the other works for mail.
-    // Errors that mean the PATCH never reached Stalwart (no connection) leave both sides on the old password.
-    pReq.on('error', (err) => {
-      const neverSent = ['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN'].includes(err && err.code);
-      if (!neverSent) try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(resetRow.did); } catch (_) {}
+    // A failure before the connection was made (refused, unresolvable, or a host that drops packets until the
+    // timeout) means the PATCH never reached Stalwart: both sides stay on the old password.
+    let connected = false;
+    pReq.on('socket', (sock) => { if (!sock.connecting) connected = true; else sock.once('connect', () => { connected = true; }); });
+    pReq.on('error', () => {
+      if (connected) try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(resetRow.did); } catch (_) {}
       fail(500, 'password service unavailable');
     });
     pReq.write(postData);
