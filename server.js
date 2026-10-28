@@ -6597,7 +6597,9 @@ function barrelGuardedTransfer(db, fromDid, toDid, amountCents, type, descriptio
     const creditDesc = creditDescription || description.replace(/\bto\b/, 'from');
     billing.creditBalance(db, toDid, amountCents, 'transfer_in', creditDesc);
     // DD from the agent's own fleet owner answers its open top-up ask (network_routes.js), whichever route sent it.
-    if (fleetBilling.fromItsFleet(db, fromDid, toDid)) fleetBilling.answerTopups(db, toDid, amountCents);
+    // Bookkeeping only: it never fails the transfer.
+    try { if (fleetBilling.fromItsFleet(db, fromDid, toDid)) fleetBilling.answerTopups(db, toDid, amountCents); }
+    catch (e) { console.error('[topups] closing an ask failed:', e.message); }
     return debit;
   });
 

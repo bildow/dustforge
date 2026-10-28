@@ -492,7 +492,9 @@ function thresholdRefill(db, billing, s, { force = false, amount = null, now = D
     const r = transferRefill(db, billing, { fromDid: from, toDid: s.member_did, amount: amt,
       description: `Refill ${amt} DD to ${s.handle} (fleet ${fleet.slug})`, ledger });
     db.prepare("UPDATE fleet_silicons SET last_refill_at = datetime('now'), last_refill_error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
-    if (fromItsFleet(db, from, s.member_did)) answerTopups(db, s.member_did, amt);
+    // The DD already moved: closing the ask is bookkeeping and never turns the refill into a failure.
+    try { if (fromItsFleet(db, from, s.member_did)) answerTopups(db, s.member_did, amt); }
+    catch (e) { console.error('[topups] closing an ask failed:', e.message); }
     return { ok: true, ...r, from_did: from };
   } catch (e) {
     const msg = (e.body && e.body.error) || e.message;
