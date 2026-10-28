@@ -5,7 +5,6 @@ const fs = require('fs');
 const crypto = require('crypto');
 const Database = require('better-sqlite3');
 
-const { execSync } = require('child_process');
 const identity = require('./identity');
 const dustforge = require('./dustforge');
 const billing = require('./billing');
@@ -46,6 +45,20 @@ const BLINDKEY_SSH_HOSTS = new Set([
   '100.103.90.79',     // flimflam
   '100.73.92.12',      // skypie (Aaron's laptop, tailnet)
 ]);
+// ssh with a password, and no shell on this server: sshpass gets user@host and the remote command as separate
+// arguments, and the password in SSHPASS. The remote command still runs in the remote user's shell, as each
+// caller intends. User and host are checked here as well, so nothing a caller passes reaches a local shell.
+// Errors look like execSync's (stdout, stderr, status).
+const SSH_USER_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$/;
+const SSH_HOST_RE = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
+function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } = {}) {
+  if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) {
+    throw Object.assign(new Error('invalid ssh user or host'), { stdout: '', stderr: 'invalid ssh user or host', status: 2 });
+  }
+  return require('child_process').execFileSync('sshpass',
+    ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', `${user}@${host}`, remoteCommand],
+    { timeout, encoding: 'utf8', maxBuffer: 1024 * 1024, env: { ...process.env, SSHPASS: password }, input });
+}
 
 const pinGate = require('./pin_gate');   // vault PIN: hash/verify/lockout helpers for the 'pin' gate
 const passwords = require('./passwords');   // account password hashing: salted scrypt, the form Stalwart also verifies
@@ -4239,14 +4252,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
 
           try {
-            // SECURITY: pass password via SSHPASS env var, never on command line.
-            // This prevents shell injection via crafted secret values.
-            const escapedCommand = command.replace(/'/g, "'\"'\"'");
-            const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${effectiveUser}@${target_host} '${escapedCommand}'`;
-            const output = execSync(sshCmd, {
-              timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
-              env: { ...process.env, SSHPASS: password },
-            });
+            // No local shell: see sshRun.
+            const output = sshRun(effectiveUser, target_host, password, command);
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
@@ -4630,13 +4637,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         try {
-          // SECURITY: pass password via SSHPASS env var, never on command line
-          const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
-          const output = execSync(sshCmd, {
-            timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
-            env: { ...process.env, SSHPASS: password },
-          });
+          // No local shell: see sshRun.
+          const output = sshRun(target_user, target_host, password, command);
 
           // Redact any echo of credentials in the output
           const redactedOutput = output
@@ -5349,6 +5351,7 @@ async function handleRowenDeliver(req, res) {
         if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
           return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
         }
+        if (!SSH_USER_RE.test(target_user)) return res.status(400).json({ error: 'invalid target_user' });
         const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[;&]|&&|\|\|)\s*exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
         for (const pat of dangerousPatterns) {
           if (pat.test(command)) return res.status(400).json({ error: 'command contains disallowed pattern' });
@@ -5357,13 +5360,8 @@ async function handleRowenDeliver(req, res) {
           return res.status(400).json({ error: 'command contains disallowed characters' });
         }
         try {
-          // SECURITY: pass password via SSHPASS env var, never on command line
-          const escapedCommand = command.replace(/'/g, "'\"'\"'");
-          const sshCmd = `sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ${target_user}@${target_host} '${escapedCommand}'`;
-          const output = execSync(sshCmd, {
-            timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024,
-            env: { ...process.env, SSHPASS: decryptedValue },
-          });
+          // No local shell: see sshRun.
+          const output = sshRun(target_user, target_host, decryptedValue, command);
           const redactedOutput = output.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
           result = { stdout: redactedOutput, exit_code: 0 };
         } catch (sshErr) {
@@ -10945,19 +10943,22 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const target = nextVersionName(ownerDid, baseName, secret.version);
   if (target.conflict) return res.status(409).json({ error: target.conflict });
   const sshUser = target_user || 'root';
-  const { execSync } = require('child_process');
+  // Same hosts as every other SSH action. Before 2026-10-28 target_host and target_user went into a shell
+  // command on this server unchecked, which let any account run commands here.
+  if (typeof target_host !== 'string' || !BLINDKEY_SSH_HOSTS.has(target_host)) {
+    logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), error: 'host not in SSH whitelist', ip: req.ip });
+    return res.status(403).json({ error: `host not in SSH whitelist. Allowed: ${[...BLINDKEY_SSH_HOSTS].join(', ')}` });
+  }
+  if (typeof sshUser !== 'string' || !SSH_USER_RE.test(sshUser)) return res.status(400).json({ error: 'invalid target_user' });
+  // The chpasswd script goes to `bash -s` on the host over stdin: no file on this server, and every value is
+  // single-quoted for the remote shell (a stored password may hold $, ` or ").
+  const sq = (v) => "'" + String(v).replace(/'/g, "'\\''") + "'";
+  const chpasswdScript = (sudoPassword, password, done) => '#!/bin/bash\n'
+    + 'echo ' + sq(sudoPassword) + ' | sudo -S bash -c ' + sq('echo ' + sq(sshUser + ':' + password) + ' | chpasswd') + ' 2>/dev/null\n'
+    + 'echo ' + done + '\n';
 
   try {
-    const scriptPath = `/tmp/.dp_rotate_${crypto.randomBytes(4).toString('hex')}.sh`;
-    const scriptContent = '#!/bin/bash\necho ' + JSON.stringify(currentPassword) + ' | sudo -S bash -c "echo ' + sshUser + ':' + newPassword + ' | chpasswd" 2>/dev/null\necho ROTATED\n';
-    fs.writeFileSync(scriptPath, scriptContent, { mode: 0o700 });
-
-    const result = execSync(
-      'SSHPASS=' + JSON.stringify(currentPassword) + ' sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ' + sshUser + '@' + target_host + ' "bash -s" < ' + scriptPath,
-      { timeout: 30000, encoding: 'utf8' }
-    );
-
-    try { fs.unlinkSync(scriptPath); } catch(_) {}
+    const result = sshRun(sshUser, target_host, currentPassword, 'bash -s', { input: chpasswdScript(currentPassword, newPassword, 'ROTATED') });
 
     if (!result.includes('ROTATED')) {
       return res.status(500).json({ error: 'password change did not confirm success. Old password is still active.' });
@@ -10966,25 +10967,15 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     // VERIFICATION: SSH in with the NEW password to confirm it actually works
     let verified = false;
     try {
-      const verifyResult = execSync(
-        'SSHPASS=' + JSON.stringify(newPassword) + ' sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ' + sshUser + '@' + target_host + ' "echo VERIFIED"',
-        { timeout: 15000, encoding: 'utf8' }
-      );
+      const verifyResult = sshRun(sshUser, target_host, newPassword, 'echo VERIFIED', { timeout: 15000 });
       verified = verifyResult.includes('VERIFIED');
     } catch(_) {}
 
     if (!verified) {
       // ROLLBACK: new password didn't work. Revert to old password.
       try {
-        const rollbackScript = `/tmp/.dp_rollback_${crypto.randomBytes(4).toString('hex')}.sh`;
         // Try with new password first (in case chpasswd partially worked)
-        const rollbackContent = '#!/bin/bash\necho ' + JSON.stringify(newPassword) + ' | sudo -S bash -c "echo ' + sshUser + ':' + JSON.stringify(currentPassword) + ' | chpasswd" 2>/dev/null\necho ROLLED_BACK\n';
-        fs.writeFileSync(rollbackScript, rollbackContent, { mode: 0o700 });
-        execSync(
-          'SSHPASS=' + JSON.stringify(newPassword) + ' sshpass -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 ' + sshUser + '@' + target_host + ' "bash -s" < ' + rollbackScript,
-          { timeout: 15000, encoding: 'utf8' }
-        );
-        try { fs.unlinkSync(rollbackScript); } catch(_) {}
+        sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 });
       } catch(_) {}
 
       return res.status(500).json({
@@ -11033,8 +11024,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
       note: 'Password rotated. New password generated server-side and never entered any agent context.',
     });
   } catch (e) {
-    try { execSync('rm -f /tmp/.dp_rotate_*', { timeout: 5000 }); } catch(_) {}
-    res.status(500).json({ error: 'rotation failed: ' + e.message });
+    res.status(500).json({ error: 'rotation failed: ' + String(e.message || e).split('\n')[0] });
   }
 });
 
