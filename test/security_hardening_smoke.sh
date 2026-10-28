@@ -39,7 +39,7 @@ http.createServer((req, res) => { let b = ""; req.on("data", c => b += c); req.o
   const u = new URL(req.url, "http://x"), st = load(), send = (code, j) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(j)); };
   if (u.pathname === "/api/principal") { fs.appendFileSync(dir + "/stalwart.log", "LIST\n"); const items = Object.entries(st).map(([name, p]) => ({ name, ...p })); return send(200, { data: { items, total: items.length } }); }
   const name = decodeURIComponent(u.pathname.split("/").pop()); fs.appendFileSync(dir + "/stalwart.log", req.method + " " + name + "\n");
-  if (!st[name]) return send(404, { error: "notFound" });
+  if (!st[name]) return send(200, { error: "notFound", item: name });   // as real Stalwart answers a missing principal
   if (req.method === "GET") return send(200, { data: { name, ...st[name] } });
   if (req.method === "PATCH") { for (const op of JSON.parse(b)) if (op.action === "set" && op.field === "secrets") st[name].secrets = op.value; save(st); return send(200, { data: null }); }
   send(405, {});
@@ -118,7 +118,12 @@ cp "$S/stw.json" "$S/stw.before"
 OUT=$(node scripts/migrate-password-hashes.js 2>&1)
 cmp -s "$S/stw.json" "$S/stw.before" && ok "dry run leaves Stalwart alone" || fail "dry run wrote to Stalwart"
 echo "$OUT" | grep -q '"mode":"dry-run"' && ok "dry run reports" || fail "dry run output: $OUT"
+cp "$S/stw.json" "$S/stw.before"
+node scripts/migrate-password-hashes.js --execute >/dev/null 2>&1; RC=$?
+[ "$RC" = 2 ] && cmp -s "$S/stw.json" "$S/stw.before" && ok "--execute refused while the API answers, nothing written" || fail "--execute ran with the API up (rc $RC)"
+stop
 OUT=$(node scripts/migrate-password-hashes.js --execute 2>&1); echo "$OUT" | tail -1 >"$S/migrate.json"
+start
 grep -q '"stalwart_failed":0' "$S/migrate.json" && grep -q '"unsalted_left":0' "$S/migrate.json" && ok "migration: no failures, no unsalted hash left" || fail "migration: $OUT"
 J 'const s = require(process.argv[1] + "/stw.json"), pw = require("./passwords"); const bad = Object.entries(s).filter(([n, p]) => (p.secrets || []).some(pw.isPlaintextSecret)).map(([n]) => n); console.log(bad.join(",") || "none")' "$S" | grep -qx none \
   && ok "no readable password left in Stalwart" || fail "readable passwords left in Stalwart"

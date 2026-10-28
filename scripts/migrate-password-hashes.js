@@ -13,8 +13,8 @@
 //      that does not match it;
 //   3. wraps every remaining unsalted sha256 in scrypt (passwords.wrapLegacySha256), so no unsalted hash is left;
 //      the next sign-in replaces it with a plain scrypt hash.
-// Run it after the server that reads these forms is deployed, at a quiet moment: a password reset in the same
-// instant as an account's write is detected and reported (reset again), not prevented. Dry run by default; --execute writes. Prints counts
+// Run --execute after the server that reads these forms is deployed, with that server stopped (the script checks):
+// a reset is the only other writer of these passwords. A local hash that moved since the start is still skipped. Dry run by default; --execute writes. Prints counts
 // and usernames only, never a password or a hash.
 //
 //   set -a; . /opt/dustforge/.env; set +a; node scripts/migrate-password-hashes.js [--execute]
@@ -56,7 +56,20 @@ async function principals() {
   return out;
 }
 
+// --execute only with the API stopped: a password reset is a Stalwart write and then a local one, and no check
+// here can see one landing between this script's read and its write.
+function apiAnswers() {
+  return new Promise((resolve) => {
+    const r = http.get({ hostname: '127.0.0.1', port: Number(process.env.PORT || 3001), path: '/api/health', timeout: 2000 }, (res) => { res.resume(); resolve(true); });
+    r.on('error', () => resolve(false)); r.on('timeout', () => { r.destroy(); resolve(false); });
+  });
+}
+
 (async () => {
+  if (EXECUTE && !process.argv.includes('--api-stopped-elsewhere') && await apiAnswers()) {
+    console.error(`the dustforge API answers on 127.0.0.1:${process.env.PORT || 3001}: stop it first (systemctl stop dustforge), so no password reset can run while accounts are rewritten`);
+    process.exit(2);
+  }
   const db = new Database(DB_PATH);
   db.pragma('secure_delete = ON');   // the replaced unsalted hashes are zeroed, not left in free pages
   const wallets = new Map(db.prepare('SELECT did, username, password_hash FROM identity_wallets').all().map((w) => [w.username, w]));
@@ -81,6 +94,9 @@ async function principals() {
     // The local verifier follows Stalwart's account password, which is what sign-in trusted until now.
     const readable = passwords.readableSecret(secrets[0]);
     const before = w ? localNow(w.did) : '';
+    if (w && before !== (w.password_hash || '')) {
+      tally.raced_by_reset++; console.error(`  skipped ${name}: its password changed while this ran; run the script again`); continue;
+    }
     let local = null, note = '';
     if (w && readable !== null) {
       if (!passwords.isCurrent(before)) local = hashed[0];

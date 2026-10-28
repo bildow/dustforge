@@ -25,6 +25,7 @@ const HASH_SCHEME = /^(\$(scrypt|argon2(id|i|d)?|pbkdf2(-sha\d+)?|2[abxy]?|[1567
 const PLAIN_PREFIX = /^\{(PLAIN|CLEAR)\}/i;
 const APP = /^\$app\$([^$]*)\$(.*)$/s;
 const OTP = /^otpauth:/i;
+const BSDI = /^_[./0-9A-Za-z]{19}$/;   // BSDi extended DES crypt
 
 function scrypt(pw, salt, keylen, ln, r, p) {
   return new Promise((resolve, reject) =>
@@ -82,7 +83,7 @@ function isCurrent(stored) {
 function readableSecret(secret) {
   if (typeof secret !== 'string' || !secret) return null;
   if (PLAIN_PREFIX.test(secret)) return secret.replace(PLAIN_PREFIX, '') || null;
-  if (HASH_SCHEME.test(secret) || APP.test(secret) || OTP.test(secret)) return null;
+  if (HASH_SCHEME.test(secret) || BSDI.test(secret) || APP.test(secret) || OTP.test(secret)) return null;
   return secret;
 }
 

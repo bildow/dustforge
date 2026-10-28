@@ -146,6 +146,7 @@ wait_for "$S/mail.log" "$TOK2" && grep -B12 "$TOK2" "$S/mail.log" | grep -qi '^T
 post /api/identity/forgot-password '{"username":"reset-hang"}' >/dev/null
 TOKH=$(Q "select token from password_reset_tokens where username='reset-hang' order by id desc limit 1")
 [ "$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X POST "$API/api/identity/reset-password" -H 'Content-Type: application/json' -d "{\"token\":\"$TOKH\",\"new_password\":\"hangpass1\"}")" = 500 ] && ok "hung Stalwart: 500 within the timeout" || fail "hung Stalwart: no answer"
+[ "$(Q "select coalesce(password_hash, 'NULL') from identity_wallets where username='reset-hang'")" = NULL ] && ok "hung Stalwart: local hash cleared, so Stalwart decides" || fail "hung Stalwart: local hash kept"
 [ "$(Q "select used from password_reset_tokens where token='$TOKH'")" = 0 ] && ok "link live again for a retry" || fail "link stuck as used"
 
 # 6. SMTP down: still 200, the failure is logged, the link is not.

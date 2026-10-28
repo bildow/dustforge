@@ -11592,7 +11592,12 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
       });
     });
     pReq.setTimeout(10000, () => pReq.destroy(new Error('stalwart timeout')));
-    pReq.on('error', () => fail(500, 'password service unavailable'));
+    // Timed out or failed after the PATCH went out: Stalwart may have taken the new password or not. Clearing the
+    // local hash lets Stalwart decide, so neither password can win on DemiPass while the other works for mail.
+    pReq.on('error', () => {
+      try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(resetRow.did); } catch (_) {}
+      fail(500, 'password service unavailable');
+    });
     pReq.write(postData);
     pReq.end();
   } catch (e) {
@@ -12578,7 +12583,7 @@ function gateMissing(action, required, missing, intent) {
 }
 
 // The account's Stalwart secret (first entry): { state: 'ok', secret }, { state: 'absent' } when Stalwart answers
-// that no such principal exists, or { state: 'unreachable' } for anything else.
+// that no such principal exists, or { state: 'unreachable' } for anything else (including any 404).
 function fetchStalwartSecret(username) {
   return new Promise((resolve) => {
     const http = require('http');
@@ -12588,9 +12593,14 @@ function fetchStalwartSecret(username) {
       headers: { 'Authorization': 'Basic ' + adminAuth } }, (rs) => {
       let data = ''; rs.on('data', c => data += c);
       rs.on('end', () => {
-        if (rs.statusCode === 404) return resolve({ state: 'absent' });
-        try { const _s = JSON.parse(data).data.secrets; const v = Array.isArray(_s) ? _s[0] : _s; resolve(typeof v === 'string' ? { state: 'ok', secret: v } : { state: 'unreachable' }); }
-        catch (_) { resolve({ state: 'unreachable' }); }
+        try {
+          const j = JSON.parse(data);
+          // Stalwart answers a missing principal with HTTP 200 {"error":"notFound","item":"<name>"}; a 404 means a
+          // wrong route or host, which must not pass for "this account has no mailbox".
+          if (rs.statusCode === 200 && j && j.error === 'notFound' && j.item === username) return resolve({ state: 'absent' });
+          const _s = j.data.secrets; const v = Array.isArray(_s) ? _s[0] : _s;
+          resolve(rs.statusCode === 200 && typeof v === 'string' ? { state: 'ok', secret: v } : { state: 'unreachable' });
+        } catch (_) { resolve({ state: 'unreachable' }); }
       });
     });
     r.on('error', () => resolve({ state: 'unreachable' }));

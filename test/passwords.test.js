@@ -51,7 +51,7 @@ test('Stalwart secrets: readable ones verify only in stalwart mode; other scheme
 test('which Stalwart secrets the migration hashes, and how', async () => {
   for (const readable of ['hunter2', '$weird{pw', '{PLAIN}pw', '{CLEAR}pw', '$app$phone$plainapp']) assert.ok(pw.isPlaintextSecret(readable), readable);
   const h = await pw.hashPassword('a');
-  for (const kept of [h, '$app$phone$' + h, 'otpauth://totp/a?secret=B', '{SSHA}x', '$2b$10$abc', '']) assert.ok(!pw.isPlaintextSecret(kept), kept);
+  for (const kept of [h, '$app$phone$' + h, 'otpauth://totp/a?secret=B', '{SSHA}x', '$2b$10$abc', '_J9..CCCCXBrJUJV154M', '']) assert.ok(!pw.isPlaintextSecret(kept), kept);
   const plain = await pw.hashStalwartSecret('{PLAIN}pw');
   assert.ok(pw.isCurrent(plain) && (await pw.verifyPassword('pw', plain)).ok);
   const app = await pw.hashStalwartSecret('$app$phone$plainapp');
