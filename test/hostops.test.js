@@ -163,3 +163,10 @@ test('server-audit fixes: memoised matching, blocked addresses, no backslash wor
   const wide = h.validateShape({ name: 'wide', mode: 'job', sudo: true, argv: ['/bin/x', ...Array.from({ length: 9 }, (_, i) => ({ slot: 'p' + i, type: 'path', under: ['/srv/'] }))] });
   assert.equal(wide.ok, false); assert.match(wide.error, /renders past 4096/);
 });
+
+test('addresses: odd IPv4 spellings are refused; resolved loopback/link-local/metadata IPs are blocked', () => {
+  for (const a of ['127.1', '0x7f.1', '0177.0.0.1', '0251.0376.0251.0376', '10.1', '1.2.3']) assert.equal(h.validAddress(a), false, a);
+  for (const a of ['100.83.112.88', '10.0.0.5', 'phasewhip', 'host-0x7f.example', 'deadbeef.example']) assert.equal(h.validAddress(a), true, a);
+  for (const ip of ['127.0.0.1', '127.9.9.9', '0.0.0.0', '169.254.169.254', '::1', '::', 'fe80::1', '::ffff:127.0.0.1', 'fd00:ec2::254']) assert.equal(h.blockedIp(ip), true, ip);
+  for (const ip of ['100.83.112.88', '10.0.0.5', '192.168.0.161', '2001:db8::1']) assert.equal(h.blockedIp(ip), false, ip);
+});

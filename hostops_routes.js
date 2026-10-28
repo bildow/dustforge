@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
+const dns = require('dns').promises;
 const hostops = require('./hostops');
 
 module.exports = function registerHostopsRoutes(deps) {
@@ -174,6 +175,14 @@ module.exports = function registerHostopsRoutes(deps) {
     });
   }
 
+  // Resolve a host name and refuse it when any address it resolves to is loopback, link-local or metadata.
+  // Checked before a scan and before every connection (a name can be repointed after it was approved).
+  async function reachable(address) {
+    let ips;
+    try { ips = await dns.lookup(address, { all: true }); } catch (_) { return { ok: false, error: `${address} does not resolve` }; }
+    if (!ips.length || ips.some(r => hostops.blockedIp(r.address))) return { ok: false, error: `${address} points at a local or metadata address; it cannot be a host` };
+    return { ok: true };
+  }
   function keyscan(address, port) {
     return new Promise(resolve => {
       execFile(keyscanBin, ['-T', '5', '-p', String(port), '-t', 'ed25519,ecdsa,rsa', address], { timeout: 15000, encoding: 'utf8', env: { PATH: process.env.PATH } },
@@ -246,6 +255,8 @@ module.exports = function registerHostopsRoutes(deps) {
     if (pendingCount(cred.owner_did) >= MAX_PENDING) return { status: 429, error: `the owner already has ${MAX_PENDING} host-operation requests waiting` };
     let scan = null;
     if (!t.host) {
+      const where = await reachable(t.address);
+      if (!where.ok) return { status: 400, error: where.error };
       const recent = (scanFailures.get(auth.did) || []).filter(ts => Date.now() - ts < 3600e3);
       if (recent.length >= 10) return { status: 429, error: 'too many hosts that could not be reached in the last hour' };
       scan = await keyscan(t.address, t.port);
@@ -298,6 +309,8 @@ module.exports = function registerHostopsRoutes(deps) {
     if (password === null) return res.status(500).json({ error: 'could not open the stored credential' });
     // Render first: a command that cannot be rendered costs nothing and leaves no run behind.
     try { hostops.renderRemote(shape, body.argv, { unit: 'dp-hostop-999999999999' }); } catch (e) { return res.status(400).json({ error: e.message }); }
+    const where = await reachable(t.host.address);
+    if (!where.ok) return res.status(400).json({ error: where.error });
     if (!(await charge(req, res))) return;
     // Take one run from the window, or refuse if it closed, expired or ran out meanwhile.
     const took = db.prepare(`UPDATE hostops_windows SET run_count = run_count + 1 WHERE id = ? AND status = 'open' AND closes_at > ?

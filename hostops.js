@@ -283,7 +283,16 @@ const ADDRESS = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\
 const LOGIN = /^[a-z_][a-z0-9_.-]{0,31}$/;
 // Loopback, unspecified, link-local and cloud-metadata targets are never hosts: DemiPass would be scanning itself.
 const BLOCKED_HOST = /^(localhost|localhost\.localdomain|metadata(\.google\.internal)?|0(\.0){0,3}|127(\.\d{1,3}){3}|169\.254(\.\d{1,3}){2}|0x[0-9a-f]+|\d+)$/i;
-function validAddress(a) { return typeof a === 'string' && ADDRESS.test(a) && !BLOCKED_HOST.test(a); }
+// An IPv4-looking address must be four plain decimal octets (no 127.1, hex or octal spellings).
+const IPV4ISH = /^[0-9a-fx.]+$/i;
+const DOTTED_QUAD = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+function validAddress(a) { return typeof a === 'string' && ADDRESS.test(a) && !BLOCKED_HOST.test(a) && (!IPV4ISH.test(a) || /[g-wyz]/i.test(a) || DOTTED_QUAD.test(a)); }
+// Where a name really goes: a resolved IP that is loopback, unspecified, link-local or a metadata address is never a host.
+function blockedIp(ip) {
+  const v = String(ip).toLowerCase().replace(/^::ffff:/, '');
+  if (DOTTED_QUAD.test(v)) { const [a, b] = v.split('.').map(Number); return a === 127 || a === 0 || (a === 169 && b === 254); }
+  return v === '::1' || v === '::' || /^fe[89ab][0-9a-f]:/.test(v) || v.startsWith('fd00:ec2:');
+}
 function validLogin(u) { return typeof u === 'string' && LOGIN.test(u); }
 function validPort(p) { return Number.isInteger(p) && p >= 1 && p <= 65535; }
 
@@ -318,5 +327,5 @@ module.exports = {
   SAFE_VALUE, MAX_ELEMENTS, MAX_RUN_SECONDS, MAX_JOB_SECONDS, MAX_SHAPES,
   validateShape, validateShapes, validateArgv, literalShape, matchShape, findCover, explainRefusal, describe,
   quote, renderRemote, jobProbe, jobStop, parseJobProbe,
-  normalPath, validAddress, validLogin, validPort, parseKeyscan, redact, tail,
+  normalPath, validAddress, blockedIp, validLogin, validPort, parseKeyscan, redact, tail,
 };
