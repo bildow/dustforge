@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — DemiPass</title>
+<meta name="description" content="What DemiPass, its Android app and its browser extension collect, where your secrets live, who can read them, and how to remove them.">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg: #08111a;
+    --surface: #0e1824;
+    --card: #122030;
+    --border: #1e3448;
+    --text: #e7f1fb;
+    --text2: #9cb4c9;
+    --text3: #6d8397;
+    --accent: #5fb3ff;
+    --green: #69c7b1;
+    --yellow: #c8a84b;
+  }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif; line-height:1.7; }
+  .header { padding:1.5rem 2rem; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid var(--border); }
+  .logo { font-size:1.5rem; font-weight:800; text-decoration:none; color:var(--text); }
+  .logo span { color:var(--accent); }
+  .nav { display:flex; gap:1.5rem; font-size:0.9rem; }
+  .nav a { color:var(--text2); text-decoration:none; }
+  .nav a:hover { color:var(--accent); }
+  main { max-width:760px; margin:0 auto; padding:3rem 1rem 4rem; }
+  h1 { font-size:2rem; font-weight:800; margin-bottom:0.25rem; }
+  .updated { color:var(--text3); font-size:0.85rem; margin-bottom:2rem; }
+  h2 { font-size:1.15rem; color:var(--accent); margin:2.25rem 0 0.75rem; }
+  h3 { font-size:0.95rem; color:var(--text); margin:1.25rem 0 0.4rem; }
+  p, li { color:var(--text2); font-size:0.95rem; }
+  p { margin-bottom:0.75rem; }
+  ul { padding-left:1.4rem; margin-bottom:0.75rem; }
+  li { margin-bottom:0.35rem; }
+  strong { color:var(--text); }
+  a { color:var(--accent); }
+  code { background:var(--card); padding:0.1rem 0.4rem; border-radius:4px; font-size:0.85rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:1.25rem 1.5rem; margin:1rem 0 1.5rem; }
+  .card p:last-child, .card ul:last-child { margin-bottom:0; }
+  .card.warn { border-color:var(--yellow); }
+  footer { text-align:center; padding:2rem; color:var(--text3); font-size:0.8rem; border-top:1px solid var(--border); }
+  footer a { color:var(--text3); }
+  @media (max-width:600px) {
+    .header { flex-direction:column; gap:0.5rem; padding:1rem; }
+    main { padding:2rem 1rem 3rem; }
+    h1 { font-size:1.6rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <a href="/" class="logo">Demi<span>Pass</span></a>
+  <div class="nav">
+    <a href="/vault-mobile.html">Vault</a>
+    <a href="/#get-started">Get started</a>
+    <a href="https://github.com/bildow/demipass">GitHub</a>
+  </div>
+</div>
+
+<main>
+  <h1>Privacy Policy</h1>
+  <p class="updated">DemiPass &middot; Effective October 28, 2026 &middot; AKStrapped LLC</p>
+
+  <p>DemiPass holds passwords, API keys and other secrets for you and for the AI agents you run. A product like that should tell you exactly where your secrets are, who can read them and how to get rid of them. This page does that in plain terms, including the places where the design involves trust in us.</p>
+  <p>DemiPass is operated by AKStrapped LLC ("we", "us") and runs on a <a href="https://dustforge.com">Dustforge</a> identity. This policy covers the DemiPass service at demipass.com and api.dustforge.com, the DemiPass Android app, the DemiPass browser extension and the <code>demipass</code> npm package. The general <a href="https://dustforge.com/privacy.html">AKStrapped privacy policy</a> covers our other services.</p>
+
+  <h2>The short version</h2>
+  <div class="card">
+    <ul>
+      <li>We store your secrets <strong>encrypted</strong>, and we use them only when you or an agent you've authorized asks.</li>
+      <li>Your agents get a short-lived token to <strong>use</strong> a secret. DemiPass puts the secret into the request on the server, so the agent never sees it.</li>
+      <li>Filling a password into a website needs <strong>your approval and PIN on your phone</strong>, every time.</li>
+      <li>We keep a record of every use, fill, reveal and refused attempt, so <strong>you can audit your vault</strong>.</li>
+      <li>No ads, no analytics or tracking scripts, no selling data, no training AI models on your data. Your secrets are never sent to AI model providers.</li>
+    </ul>
+  </div>
+
+  <h2>Who can read your secrets</h2>
+  <div class="card warn">
+    <p><strong>DemiPass is not zero-knowledge.</strong> Your secrets are encrypted at rest with AES-256-GCM, using a key held by our server. Keeping the key on the server is what lets DemiPass put a secret into an agent's request without the agent ever seeing it. It also means that someone in control of our server could decrypt your secrets. We protect that key and that server accordingly, and we never decrypt a secret except to carry out a request from you or an agent you have authorized.</p>
+  </div>
+  <ul>
+    <li><strong>Your agents</strong> can use a secret only through a token you allowed, for the action it was issued for, and only on the hosts DemiPass permits. Agents enrolled as agents can never reveal a secret's value, and revealing one always takes your PIN.</li>
+    <li><strong>You</strong> can reveal your own secrets. Every reveal is recorded as an alert in your activity log.</li>
+    <li><strong>A website</strong> receives a saved password only when you approve a fill on your phone (see the browser extension section below).</li>
+    <li><strong>We</strong> do not look at your secrets. Our admin tools do not show secret values.</li>
+  </ul>
+
+  <h2>What we collect</h2>
+  <h3>Your account</h3>
+  <ul>
+    <li>Your username, your DID (a public cryptographic identifier) and your private key, which is stored encrypted.</li>
+    <li>Your @dustforge.com mail address and its mail, plus a forwarding or recovery address and a phone number if you give us one.</li>
+    <li>Your account password and PIN, stored only as hashes, never in readable form.</li>
+    <li>Sign-in sessions and approved devices, including agents and browsers you have paired.</li>
+  </ul>
+  <h3>Your vault</h3>
+  <ul>
+    <li>Each secret's encrypted value, plus its name, type, description, the websites it is allowed to fill on, expiry dates, and when and how often it has been used.</li>
+    <li>Your grants, meaning which agents may use which secrets and for what.</li>
+  </ul>
+  <h3>Your activity log</h3>
+  <ul>
+    <li>Storing, using, filling, revealing, rotating and deleting a secret, with the time, the agent or device involved and the IP address the request came from.</li>
+    <li>Refused attempts, such as a wrong PIN, an agent without permission, or a host that isn't allowed, with the same details. This is how you and we spot misuse.</li>
+  </ul>
+  <h3>Your wallet</h3>
+  <ul>
+    <li>Your Diamond Dust balance and transfers, including transfers between you and your agents.</li>
+    <li>Payments are handled by Stripe. We receive a record of the charge, not your card number.</li>
+  </ul>
+
+  <h2>The browser extension</h2>
+  <p>The extension finds login forms on the pages you visit so it can offer to fill or save a login. Here is what that means in practice:</p>
+  <ul>
+    <li><strong>Page contents stay in your browser.</strong> The extension looks at form fields on the page to find logins. It does not send page contents, your browsing history or the sites you visit to us.</li>
+    <li><strong>A site's address is sent only when you act.</strong> That happens when you open the extension's popup on a site (to list the logins saved for it), when you ask to fill a login there, and when you save a login there.</li>
+    <li><strong>Passwords you type are sent only if you click Save.</strong> When you sign in with a password you typed, the extension offers to save it. Until you click Save it stays in the extension's memory. If you dismiss the offer or leave the page, it is discarded.</li>
+    <li><strong>A fill needs your phone.</strong> You approve each fill and enter your PIN in the DemiPass app. Only then is the password sent to that browser and typed into the page's field. From that moment the site has it, just as if you had typed it.</li>
+    <li><strong>The extension stores no passwords.</strong> It keeps only its own sign-in tokens. The long-lived one is encrypted with a key the browser will not export. The short-lived one is kept only for the browser session.</li>
+    <li>Access to every website is an <strong>optional</strong> permission that you grant yourself. Without it, the extension works only on a page when you click it.</li>
+  </ul>
+
+  <h2>The Android app</h2>
+  <p>The app is your vault on your phone, and it is where you approve sign-ins, fills and transfers with your PIN. It uses the account, vault and activity data described above.</p>
+
+  <h2>Who else processes data</h2>
+  <ul>
+    <li><strong>Cloudflare</strong> sits in front of demipass.com and api.dustforge.com and protects them from attacks. Encrypted connections end at Cloudflare and continue encrypted to our server, which means traffic, including secrets you store or fill, passes through Cloudflare's network unencrypted for a moment.</li>
+    <li><strong>RackNerd</strong> hosts the server that runs DemiPass.</li>
+    <li><strong>Stripe</strong> processes payments.</li>
+    <li><strong>Backblaze B2</strong> holds our off-site backups. They are encrypted before they leave our servers, so Backblaze sees only encrypted data.</li>
+  </ul>
+  <p>Mail for @dustforge.com addresses runs on our own mail servers. We do not use advertising, analytics or tracking services.</p>
+  <p>When you tell an agent to use one of your secrets with an outside service, such as an AI provider's API, DemiPass puts the secret into that request and sends it to that service on your instruction. What that service does with it is covered by its own terms.</p>
+
+  <h2>Keeping and deleting data</h2>
+  <ul>
+    <li><strong>Deleting a secret</strong> stops it working at once: it can no longer be used, filled or revealed. Its encrypted record stays in our database marked as deleted. To have deleted secrets erased completely, email us and we will remove them.</li>
+    <li><strong>Your activity log</strong> is kept while your account exists, so you can always audit it.</li>
+    <li><strong>Backups</strong> of the database are made twice a day, and the copies are replaced on a rolling schedule. Data you delete can stay in older backups until those copies expire.</li>
+    <li><strong>To delete your account</strong>, email us. We will delete your account, vault and mailbox, keeping only what the law requires us to keep, such as payment records.</li>
+  </ul>
+
+  <h2>If something goes wrong</h2>
+  <p>If we find that your secrets or account data have been exposed, we will email you promptly with what happened and what to rotate. DemiPass can rotate many secrets for you.</p>
+  <p>We share data with authorities only when the law requires it. Unless the law forbids it, we will tell you first.</p>
+
+  <h2>Other things</h2>
+  <ul>
+    <li>DemiPass is not intended for children under 13.</li>
+    <li>When this policy changes, we will post the new version here with a new effective date. If a change affects how your secrets are handled, we will also email you.</li>
+  </ul>
+
+  <h2>Contact</h2>
+  <p>Privacy questions, deletion requests and security reports: <a href="mailto:support@dustforge.com">support@dustforge.com</a>.</p>
+</main>
+
+<footer>
+  <p>DemiPass &mdash; a <a href="https://dustforge.com">Dustforge</a> product &middot; <a href="https://dustforge.com/terms.html">Terms</a> &middot; <a href="/privacy">Privacy</a></p>
+</footer>
+
+</body>
+</html>
