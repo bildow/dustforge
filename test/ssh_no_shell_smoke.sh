@@ -4,7 +4,9 @@
 # host locally (fake sudo + chpasswd). Checks: a target_host carrying a shell command is refused and runs nothing;
 # a host off the SSH whitelist and a bad target_user are refused; a rotation hands chpasswd exactly
 # "<user>:<new password>" even when the current password is full of shell metacharacters; no password appears in
-# sshpass's arguments (SSHPASS carries it); nothing is written under /tmp. No network.
+# sshpass's arguments (SSHPASS carries it); nothing is written under /tmp; a command starting with "-" is refused
+# and ssh always gets "--" before user@host (ssh parses options after the destination: -oProxyCommand would run
+# here); a stored password with a NUL is refused without being echoed; a 403 doesn't list the whitelist. No network.
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-ssh-smoke.XXXXXX)
@@ -45,7 +47,9 @@ db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_privat
 const key = Buffer.from(process.env.IDENTITY_MASTER_KEY, "hex").slice(0, 32);
 const seal = (v) => { const iv = crypto.randomBytes(16), c = crypto.createCipheriv("aes-256-gcm", key, iv); const e = Buffer.concat([c.update(v, "utf8"), c.final()]); return Buffer.concat([iv, c.getAuthTag(), e]).toString("base64"); };
 const add = db.prepare("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, status, ref_code) VALUES (?, ?, ?, ?, ?, ?)");
-add.run(id.did, "box", "password", seal(process.env.CUR), "active", "DP-PWD-box-0001");'
+add.run(id.did, "box", "password", seal(process.env.CUR), "active", "DP-PWD-box-0001");
+add.run(id.did, "nul", "password", seal("nulpw\u0000tail"), "active", "DP-PWD-nul-0001");
+db.prepare("INSERT INTO identity_transactions (did, amount_cents, type) VALUES (?, 1000, ?)").run(id.did, "credit");'
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 TOK=$(curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'Content-Type: application/json' -d '{"username":"owner","password":"ownerpass1","scope":"transact"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("token",""))')
 rot(){ curl -s -o "$S/last.json" -w '%{http_code}' -X POST "$API/api/blindkey/rotate-blind" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$1"; }
@@ -71,5 +75,16 @@ const x = crypto.createDecipheriv("aes-256-gcm", k, d.slice(0, 16)); x.setAuthTa
 [ -n "$NEW" ] && ! grep -qF -- "$NEW" "$S/ssh.log" && ! grep -qF -- "$CUR" "$S/ssh.log" && ok "no password in sshpass's arguments" || fail "a password in sshpass's arguments"
 [ "$(grep -c 'SSHPASS_SET yes' "$S/ssh.log")" = 2 ] && ok "SSHPASS carried the password (change + verify)" || fail "SSHPASS: $(grep SSHPASS "$S/ssh.log")"
 [ "$(ls /tmp | grep -c '^\.dp_')" = "$before" ] && ok "nothing written under /tmp" || fail "new /tmp/.dp_ files"
+
+# ssh reads options after the destination: a command starting with "-" (e.g. -oProxyCommand=…) must never reach it.
+use(){ curl -s -o "$S/use.json" -w '%{http_code}' -X POST "$API/api/blindkey/use" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$1"; }
+: >"$S/ssh.log"
+C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"target_user\":\"deploy\",\"command\":\"-oProxyCommand=sh -c 'touch $MARK'\"}")
+[ "$C" = 400 ] && [ ! -e "$MARK" ] && [ ! -s "$S/ssh.log" ] && ok "command starting with - refused (400), ssh never ran" || fail "leading-dash command: $C $(cat "$S/use.json")"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo hi"}')
+grep -q '^ARGV -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -- deploy@100.83.112.88 echo hi$' "$S/ssh.log" && ok "ssh gets -- before user@host" || fail "ssh argv: $(cat "$S/ssh.log") ($C)"
+C=$(rot '{"ref":"DP-PWD-nul-0001","target_host":"100.83.112.88","target_user":"deploy"}')
+grep -q 'tail' "$S/last.json" && fail "a stored password leaked into the error: $(cat "$S/last.json")" || ok "a password ssh can't take is refused without echoing it ($C)"
+C=$(rot '{"ref":"DP-PWD-box-0001","target_host":"10.9.9.9"}'); grep -q '100\.' "$S/last.json" && fail "403 lists whitelisted hosts" || ok "a refused host doesn't learn the whitelist"
 
 echo; [ $fails = 0 ] && echo "ssh no-shell smoke: all ok" || { echo "ssh no-shell smoke: $fails failed"; exit 1; }
