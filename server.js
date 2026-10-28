@@ -2143,6 +2143,8 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         const pending = db.prepare('SELECT * FROM identity_pending_checkouts WHERE session_id = ?').get(session.id);
         if (!pending) { console.warn('[stripe-webhook] no pending checkout for session', session.id); }
         else if (pending.status === 'completed') { console.log('[stripe-webhook] already fulfilled:', pending.username); }
+        // eraseDeadValues clears the sealed password of a checkout older than 7 days (Stripe stops retrying after 3).
+        else if (!pending.encrypted_password) { console.error('[stripe-webhook] paid checkout past its 7 days, password already erased; account not created:', pending.username, session.id); }
         else {
           const password = identity.decryptPrivateKey(pending.encrypted_password).toString('utf8');
           const id = identity.createIdentity();
@@ -4795,8 +4797,9 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
       "UPDATE blindkey_secrets SET status = 'rotating', replaced_by = ?, rotate_expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
     ).run(newSecret.id, rotateExpiresAt, existing.id);
 
-    // Schedule retirement of old secret after grace period
-    setTimeout(() => {
+    // Schedule retirement of old secret after grace period. A grace past setTimeout's 24.8-day limit would fire at
+    // once and erase the old value early; eraseDeadValues retires those when the grace really ends.
+    if (graceMins * 60 * 1000 <= 2 ** 31 - 1) setTimeout(() => {
       try {
         db.prepare(
           `UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'`
@@ -11555,13 +11558,17 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
         if (pRes.statusCode >= 300) return fail(500, 'failed to update password. Try again or contact support.');
         // The password has changed: everything below must happen too.
         let dropped = [], agents = [], workers = [];
+        // The local verifier follows Stalwart at once and on its own: if it kept the old hash, the old password
+        // would still sign in. Should even that write fail, clearing it hands the decision back to Stalwart.
+        try {
+          db.prepare('UPDATE identity_wallets SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(newHash, resetRow.did);
+        } catch (e) {
+          console.error(`[password-reset] ${resetWallet.username}: could not store the new hash: ${e.message}`);
+          try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(resetRow.did); } catch (_) {}
+        }
         try {
           db.transaction(() => {
             db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0').run(resetRow.did);
-            // Keep the local fallback hash in step, or the old password still
-            // signs in whenever Stalwart is unreachable.
-            db.prepare('UPDATE identity_wallets SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?')
-              .run(newHash, resetRow.did);
             cutSessions(resetRow.did);
             dropped = db.prepare("SELECT agent_name, created_at FROM silicon_agents WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").all(resetRow.did);
             db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").run(resetRow.did);
@@ -12580,7 +12587,8 @@ function gateMissing(action, required, missing, intent) {
   };
 }
 
-// The account's Stalwart secret (first entry), or null when Stalwart is unreachable or has no such principal.
+// The account's Stalwart secret (first entry): { state: 'ok', secret }, { state: 'absent' } when Stalwart answers
+// that no such principal exists, or { state: 'unreachable' } for anything else.
 function fetchStalwartSecret(username) {
   return new Promise((resolve) => {
     const http = require('http');
@@ -12589,31 +12597,46 @@ function fetchStalwartSecret(username) {
       path: '/api/principal/' + encodeURIComponent(username), method: 'GET',
       headers: { 'Authorization': 'Basic ' + adminAuth } }, (rs) => {
       let data = ''; rs.on('data', c => data += c);
-      rs.on('end', () => { try { const _s = JSON.parse(data).data.secrets; const v = Array.isArray(_s) ? _s[0] : _s; resolve(typeof v === 'string' ? v : null); } catch (_) { resolve(null); } });
+      rs.on('end', () => {
+        if (rs.statusCode === 404) return resolve({ state: 'absent' });
+        try { const _s = JSON.parse(data).data.secrets; const v = Array.isArray(_s) ? _s[0] : _s; resolve(typeof v === 'string' ? { state: 'ok', secret: v } : { state: 'unreachable' }); }
+        catch (_) { resolve({ state: 'unreachable' }); }
+      });
     });
-    r.on('error', () => resolve(null));
-    r.setTimeout(5000, () => { r.destroy(); resolve(null); });
+    r.on('error', () => resolve({ state: 'unreachable' }));
+    r.setTimeout(5000, () => { r.destroy(); resolve({ state: 'unreachable' }); });
     r.end();
   });
 }
 
-// Verify a wallet password. The verifier is the salted hash in identity_wallets.password_hash (passwords.js);
-// Stalwart is asked only while an account has no current one. Stalwart then holds the same salted hash, or,
-// until scripts/migrate-password-hashes.js has run, the readable password. A match on any older form stores a
-// current hash locally (never in Stalwart: a write there could race a reset and bring the old password back;
-// the migration hashes Stalwart's copies). Returns true/false, or null when no verifier is available.
+// Verify a wallet password. The verifier is the salted hash in identity_wallets.password_hash (passwords.js) once
+// it is current. Until then Stalwart's secret decides, as it always has (scripts/migrate-password-hashes.js leaves
+// it hashed, never readable), and the older local forms (sha256, sha256+ wrapped) answer only when Stalwart gives
+// no verdict. A match stores a current hash only when the verdict came from the account's own password: Stalwart's,
+// or the local form of an account Stalwart has no principal for. A match on an older local form while Stalwart is
+// unreachable could be a password the account has since changed, so it only salts that form (sha256 → sha256+)
+// and Stalwart still decides the next time. Never writes to Stalwart: that could race a reset. Returns true/false,
+// or null when no verifier is available.
 async function verifyWalletPassword(wallet, password) {
   if (typeof password !== 'string' || !password) return false;
   if (passwords.isCurrent(wallet.password_hash)) return (await passwords.verifyPassword(password, wallet.password_hash)).ok === true;
-  let verdict = null;
-  const secret = wallet.username ? await fetchStalwartSecret(wallet.username) : null;
-  if (secret !== null) verdict = (await passwords.verifyPassword(password, secret, { allowPlaintext: true })).ok;
-  if (verdict === null && wallet.password_hash) verdict = (await passwords.verifyPassword(password, wallet.password_hash)).ok;
+  const st = wallet.username ? await fetchStalwartSecret(wallet.username) : { state: 'absent' };
+  let verdict = null, authoritative = false;
+  if (st.state === 'ok') {
+    verdict = (await passwords.verifyPassword(password, st.secret, { stalwart: true })).ok;
+    authoritative = verdict !== null;
+  }
+  if (verdict === null && wallet.password_hash) {
+    verdict = (await passwords.verifyPassword(password, wallet.password_hash)).ok;
+    authoritative = st.state === 'absent';
+  }
   if (verdict === true) {
     try {
-      const h = await passwords.hashPassword(password);
+      const legacyHex = /^[0-9a-f]{64}$/.test(wallet.password_hash || '');
+      const h = authoritative ? await passwords.hashPassword(password)
+        : legacyHex ? await passwords.wrapLegacySha256(wallet.password_hash) : null;
       // Only over the hash this check read: a reset in between keeps its new hash.
-      db.prepare("UPDATE identity_wallets SET password_hash = ? WHERE did = ? AND COALESCE(password_hash, '') = ?")
+      if (h) db.prepare("UPDATE identity_wallets SET password_hash = ? WHERE did = ? AND COALESCE(password_hash, '') = ?")
         .run(h, wallet.did, wallet.password_hash || '');
     } catch (e) { console.error(`[password] ${wallet.username}: could not store the upgraded hash: ${e.message}`); }
   }
