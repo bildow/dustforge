@@ -48,6 +48,7 @@ const BLINDKEY_SSH_HOSTS = new Set([
 ]);
 
 const pinGate = require('./pin_gate');   // vault PIN: hash/verify/lockout helpers for the 'pin' gate
+const passwords = require('./passwords');   // account password hashing: salted scrypt, the form Stalwart also verifies
 const browserFill = require('./browser_fill');   // which page may receive a stored login (docs/browser-fill-api.md)
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
@@ -242,6 +243,7 @@ function getDemiPassActor(req, res, options = {}) {
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+db.pragma('secure_delete = ON');   // overwritten secret values are zeroed in the file, not left in free space
 
 // DD provenance ledger — lineage for chargeback clawback, keyed-hash identity.
 try { require('./dd_ledger').initSchema(db); } catch (e) { console.error('dd_ledger schema:', e.message); }
@@ -420,6 +422,8 @@ try { db.exec("ALTER TABLE identity_wallets ADD COLUMN trust_score INTEGER DEFAU
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN email_storage_mode TEXT DEFAULT 'auto_delete'"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_hash TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN recovery_email TEXT DEFAULT ''"); } catch(_) {}
+// The local password verifier (passwords.js). Production has the column already; nothing here created it.
+try { db.exec("ALTER TABLE identity_wallets ADD COLUMN password_hash TEXT"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN origination_narrative TEXT DEFAULT ''"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN silicon_ssn TEXT DEFAULT ''"); } catch(_) {}
 
@@ -670,7 +674,7 @@ app.post('/api/identity/create', async (req, res) => {
     // admin API and only falls back to this column, so an account created
     // without it cannot authenticate at all whenever Stalwart is unreachable.
     // 59 of 61 accounts were in that state before 2026-07-30.
-    const pwHashAtCreate = require('crypto').createHash('sha256').update(effectivePassword).digest('hex');
+    const pwHashAtCreate = emailResult.password_hash || await passwords.hashPassword(effectivePassword);
     db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)`)
       .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, referredBy, emailResult.stalwart_id, pwHashAtCreate);
     db.prepare(`INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Account created', 0)`).run(id.did);
@@ -2155,7 +2159,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
               const r = db.prepare('SELECT did FROM identity_wallets WHERE referral_code = ?').get(_refToken);
               referredBy = r ? r.did : (require('./onboarding').resolveInviteToAccount(db, _refToken) || '');
             }
-            db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id);
+            db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id, emailResult.password_hash || null);
             db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe webhook', 0)").run(id.did);
             // Onboarding grant: $1 buys 100 DD. If REFERRED, a 10 DD creation fee goes
             // to the referrer and the new user nets 90 DD. If NOT referred, the fee is
@@ -2184,7 +2188,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
                 if (_dep > 0) console.log(`[referral] auto-deposited ${_dep} DD to ${pending.username} on mint`);
               } catch (_) {}
             }
-            db.prepare('UPDATE identity_pending_checkouts SET status = ?, completed_at = CURRENT_TIMESTAMP WHERE session_id = ?').run('completed', session.id);
+            db.prepare("UPDATE identity_pending_checkouts SET status = ?, encrypted_password = '', completed_at = CURRENT_TIMESTAMP WHERE session_id = ?").run('completed', session.id);
             console.log('[stripe-webhook] fulfilled:', pending.username, '->', id.did);
           }
         }
@@ -2482,6 +2486,28 @@ try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_ref ON blindkey_secrets(
 //   id), so the value lands in a fresh live entry.
 // Returns null, or the refusal message (409).
 const DEAD_SECRET_STATUSES = new Set(['deleted', 'retired', 'revoked']);
+// A secret that can never be served again loses its encrypted value at once: deleted, revoked, and retired (a
+// rotated-out version once its grace period ends). The row stays as history; nothing decrypts a dead row.
+const ERASE_VALUE_SQL = "encrypted_value = ''";
+// Catches what the inline erasures can miss: values from before this existed, a rotation grace that ended while
+// the process was down (its setTimeout never fired), and a paid signup's sealed password once the checkout is
+// done or abandoned (Stripe retries a webhook for 3 days). Runs at start and every 10 minutes.
+function eraseDeadValues() {
+  let n = 0;
+  try {
+    n += db.prepare(`UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP
+      WHERE status = 'rotating' AND rotate_expires_at != '' AND datetime(rotate_expires_at) <= datetime('now')`).run().changes;
+    n += db.prepare(`UPDATE blindkey_secrets SET ${ERASE_VALUE_SQL} WHERE encrypted_value != '' AND status IN ('deleted', 'retired', 'revoked')`).run().changes;
+    n += db.prepare(`UPDATE identity_pending_checkouts SET encrypted_password = '' WHERE encrypted_password != ''
+      AND (status != 'pending' OR datetime(created_at) < datetime('now', '-7 days'))`).run().changes;
+    // secure_delete zeroes overwritten bytes in the page images; the checkpoint writes those over the old pages in
+    // the database file and empties the WAL. Every run, so an inline erasure leaves the file within 10 minutes.
+    try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (_) {}
+  } catch (e) { console.error(`[erase] ${e.message}`); }
+  return n;
+}
+setTimeout(eraseDeadValues, 0);   // after every table exists
+setInterval(eraseDeadValues, 10 * 60 * 1000).unref();
 function moveSecretAside(row, name) {
   db.prepare('UPDATE blindkey_secrets SET name = ? WHERE id = ?').run(`${name}~${row.id}~${crypto.randomBytes(4).toString('hex')}`, row.id);
 }
@@ -2835,7 +2861,8 @@ function isSecretRedeemable(secret) {
 }
 
 // SQL clause for redeemable secrets (active OR rotating within grace)
-const REDEEMABLE_STATUS_SQL = "(status = 'active' OR (status = 'rotating' AND rotate_expires_at > datetime('now')))";
+// datetime(): rotate_expires_at is ISO ("…T…Z"), and as text it sorts after datetime('now') all day long.
+const REDEEMABLE_STATUS_SQL = "(status = 'active' OR (status = 'rotating' AND datetime(rotate_expires_at) > datetime('now')))";
 
 // Simple glob matcher for context target patterns (supports * and prefix*)
 function blindkeyPatternMatch(pattern, value) {
@@ -4648,7 +4675,7 @@ app.delete('/api/blindkey/revoke', rateLimitStandard, (req, res) => {
     ownerDid = did || (username ? db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username)?.did : null);
     if (!ownerDid) return res.status(400).json({ error: 'did or username required when using admin access' });
   }
-  const result = db.prepare('UPDATE blindkey_secrets SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?')
+  const result = db.prepare(`UPDATE blindkey_secrets SET status = ?, ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?`)
     .run('revoked', ownerDid, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
   res.json({ ok: true, name, did: ownerDid, status: 'revoked' });
@@ -4677,8 +4704,8 @@ app.delete('/api/blindkey/delete', rateLimitStandard, (req, res) => {
     if (!g.ok) return res.status(g.status || 403).json(g);
   }
   const result = ref
-    ? db.prepare("UPDATE blindkey_secrets SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE did = ? AND ref_code = ? AND status != 'deleted'").run(ownerDid, ref)
-    : db.prepare("UPDATE blindkey_secrets SET status = 'deleted', updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ? AND status != 'deleted'").run(ownerDid, name);
+    ? db.prepare(`UPDATE blindkey_secrets SET status = 'deleted', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND ref_code = ? AND status != 'deleted'`).run(ownerDid, ref)
+    : db.prepare(`UPDATE blindkey_secrets SET status = 'deleted', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ? AND status != 'deleted'`).run(ownerDid, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
   res.json({ ok: true, ...(ref ? { ref } : { name }), did: ownerDid, status: 'deleted' });
 });
@@ -4772,7 +4799,7 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     setTimeout(() => {
       try {
         db.prepare(
-          "UPDATE blindkey_secrets SET status = 'retired', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'"
+          `UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'`
         ).run(existing.id);
       } catch (_) {}
     }, graceMins * 60 * 1000);
@@ -5750,8 +5777,8 @@ app.post('/api/prepaid/redeem', rateLimitStrict, async (req, res) => {
 
     const myReferralCode = crypto.randomBytes(6).toString('hex');
 
-    db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)').run(
-      id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id
+    db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?)').run(
+      id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id, emailResult.password_hash || null
     );
     db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via prepaid key', 0)").run(id.did);
 
@@ -5929,39 +5956,9 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
     : db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
 
-  // Verify password via Stalwart admin API
-  try {
-    const http = require('http');
-    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
-    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
-    const stalwartPass = process.env.STALWART_PASS || '';
-    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
-    const storedPassword = await new Promise((resolve) => {
-      const req = http.request({ hostname: stalwartHost, port: stalwartPort,
-        path: '/api/principal/' + encodeURIComponent(wallet.username),
-        method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
-        let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
-      req.end();
-    });
-    if (storedPassword === null) {
-      if (wallet.password_hash) {
-        const inputHash = require('crypto').createHash('sha256').update(password).digest('hex');
-        if (inputHash !== wallet.password_hash) {
-          return res.status(401).json({ error: 'invalid password' });
-        }
-      } else {
-        return res.status(503).json({ error: 'password verification temporarily unavailable' });
-      }
-    } else if (storedPassword !== password) {
-      return res.status(401).json({ error: 'invalid password' });
-    }
-  } catch(e) {
-    return res.status(503).json({ error: 'password verification temporarily unavailable' });
-  }
+  const okPw = await verifyWalletPassword(wallet, password);
+  if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  if (!okPw) return res.status(401).json({ error: 'invalid password' });
 
   // Capture fingerprint profile on every auth
   const headers = req.headers || {};
@@ -7047,8 +7044,8 @@ app.post('/api/identity/bulk-create', rateLimitStrict, async (req, res) => {
         continue;
       }
       const referralCode = crypto.randomBytes(6).toString('hex');
-      db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, referral_code, stalwart_id, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'active')`).run(id.did, username, emailResult.email, id.encrypted_private_key, referralCode, emailResult.stalwart_id || 0);
+      db.prepare(`INSERT INTO identity_wallets (did, username, email, encrypted_private_key, referral_code, stalwart_id, status, password_hash)
+        VALUES (?, ?, ?, ?, ?, ?, 'active', ?)`).run(id.did, username, emailResult.email, id.encrypted_private_key, referralCode, emailResult.stalwart_id || 0, emailResult.password_hash || null);
       db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, 'account_created', 'Bulk provisioned', 0, 'fleet_provisioned')").run(id.did);
       created.push({ username, did: id.did, email: emailResult.email, referral_code: referralCode });
     } catch (e) {
@@ -7726,8 +7723,8 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
       const debit = billing.deductBalance(db, fleet.wallet_did, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
       if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: { error: 'insufficient fleet wallet balance', detail: debit.error, balance_cents: debit.balance_cents, required: PROVISION_COST } });
 
-      db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
-        .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id);
+      db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
+        .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id, emailResult.password_hash || null);
       db.prepare('INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, ?, ?, 0, ?)')
         .run(id.did, 'account_created', `Fleet-provisioned by ${fleet.slug}`, 'fleet_provisioned');
 
@@ -7811,8 +7808,8 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
       const myReferralCode = crypto.randomBytes(6).toString('hex');
       // Atomic per-agent DB writes: wallet insert + transaction log + fleet member
       const insertAgentAtomic = db.transaction(() => {
-        db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id) VALUES (?, ?, ?, ?, 0, ?, ?)')
-          .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id || 0);
+        db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
+          .run(id.did, username, emailResult.email, id.encrypted_private_key, myReferralCode, emailResult.stalwart_id || 0, emailResult.password_hash || null);
         db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, 'account_created', ?, 0, 'fleet_provisioned')")
           .run(id.did, `Fleet bulk-provisioned by ${fleet.slug}`);
         db.prepare('INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)')
@@ -8094,33 +8091,9 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, fingerprint
     : db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
 
-  // Verify password via Stalwart admin API
-  try {
-    const http = require('http');
-    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
-    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
-    const stalwartPass = process.env.STALWART_PASS || '';
-    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
-    const storedPassword = await new Promise((resolve) => {
-      const req = http.request({ hostname: stalwartHost, port: stalwartPort,
-        path: '/api/principal/' + encodeURIComponent(wallet.username),
-        method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
-        let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
-      req.end();
-    });
-    if (storedPassword === null) {
-      return res.status(503).json({ error: 'password verification temporarily unavailable' });
-    }
-    if (storedPassword !== password) {
-      return res.status(401).json({ error: 'invalid password' });
-    }
-  } catch(e) {
-    return res.status(503).json({ error: 'password verification temporarily unavailable' });
-  }
+  const okPw = await verifyWalletPassword(wallet, password);
+  if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  if (!okPw) return res.status(401).json({ error: 'invalid password' });
 
   // Capture fingerprint profile on every auth
   const headers = req.headers || {};
@@ -8192,33 +8165,9 @@ app.post('/api/identity/auth-critical', rateLimitStandard, async (req, res) => {
   const wallet = db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
 
-  // Verify password via Stalwart admin API
-  try {
-    const http = require('http');
-    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
-    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
-    const stalwartPass = process.env.STALWART_PASS || '';
-    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
-    const storedPassword = await new Promise((resolve) => {
-      const req = http.request({ hostname: stalwartHost, port: stalwartPort,
-        path: '/api/principal/' + encodeURIComponent(wallet.username),
-        method: 'GET', headers: { 'Authorization': 'Basic ' + adminAuth } }, (res) => {
-        let data = ''; res.on('data', chunk => data += chunk);
-        res.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch(_) { resolve(null); } });
-      });
-      req.on('error', () => resolve(null));
-      req.setTimeout(5000, () => { req.destroy(); resolve(null); });
-      req.end();
-    });
-    if (storedPassword === null) {
-      return res.status(503).json({ error: 'password verification temporarily unavailable' });
-    }
-    if (storedPassword !== password) {
-      return res.status(401).json({ error: 'invalid password' });
-    }
-  } catch(e) {
-    return res.status(503).json({ error: 'password verification temporarily unavailable' });
-  }
+  const okPw = await verifyWalletPassword(wallet, password);
+  if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
+  if (!okPw) return res.status(401).json({ error: 'invalid password' });
 
   // Must already be at 'double' tier minimum
   const barrel = computeBarrelTier(wallet.did);
@@ -11068,7 +11017,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
         .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
     }
 
-    db.prepare("UPDATE blindkey_secrets SET status = 'revoked', replaced_by = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(newSecret.id, secret.id);
+    db.prepare(`UPDATE blindkey_secrets SET status = 'revoked', replaced_by = ?, ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(newSecret.id, secret.id);
 
     try {
       db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
@@ -11548,7 +11497,7 @@ app.post('/api/identity/set-recovery-email', rateLimitStrict, async (req, res) =
 // life of the tokens just killed: an intruder's way back in). Older agents and
 // workers keep running, so a forgotten password doesn't stop a fleet; the
 // "Password changed" mail names them all so the owner can check.
-app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
+app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
   const { token, new_password } = req.body || {};
   if (!token || !new_password) return res.status(400).json({ error: 'token and new_password required' });
   if (typeof token !== 'string' || typeof new_password !== 'string') return res.status(400).json({ error: 'token and new_password must be strings' });
@@ -11575,6 +11524,9 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
       .run(resetRow.id, resetRow.did, resetRow.id);
   } catch (_) {} };
   const fail = (status, error) => { release(); if (!res.headersSent) res.status(status).json({ error }); };
+  // Stalwart and the local verifier get the same salted hash; the password itself is stored nowhere.
+  let newHash;
+  try { newHash = await passwords.hashPassword(new_password); } catch (_) { return fail(500, 'failed to update password. Try again or contact support.'); }
 
   // Change password via Stalwart
   try {
@@ -11587,7 +11539,7 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
     const postData = JSON.stringify([{
       action: 'set',
       field: 'secrets',
-      value: [new_password],
+      value: [newHash],
     }]);
 
     const pReq = http.request({
@@ -11609,7 +11561,7 @@ app.post('/api/identity/reset-password', rateLimitStrict, (req, res) => {
             // Keep the local fallback hash in step, or the old password still
             // signs in whenever Stalwart is unreachable.
             db.prepare('UPDATE identity_wallets SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?')
-              .run(crypto.createHash('sha256').update(new_password).digest('hex'), resetRow.did);
+              .run(newHash, resetRow.did);
             cutSessions(resetRow.did);
             dropped = db.prepare("SELECT agent_name, created_at FROM silicon_agents WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").all(resetRow.did);
             db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").run(resetRow.did);
@@ -12628,33 +12580,44 @@ function gateMissing(action, required, missing, intent) {
   };
 }
 
-// Verify a wallet password against Stalwart (authoritative) with local-hash
-// fallback. Returns true/false, or null when the verifier is unreachable.
-async function verifyWalletPassword(wallet, password) {
-  try {
+// The account's Stalwart secret (first entry), or null when Stalwart is unreachable or has no such principal.
+function fetchStalwartSecret(username) {
+  return new Promise((resolve) => {
     const http = require('http');
-    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
-    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
-    const stalwartPass = process.env.STALWART_PASS || '';
-    const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
-    const stored = await new Promise((resolve) => {
-      const r = http.request({ hostname: stalwartHost, port: stalwartPort,
-        path: '/api/principal/' + encodeURIComponent(wallet.username), method: 'GET',
-        headers: { 'Authorization': 'Basic ' + adminAuth } }, (rs) => {
-        let data = ''; rs.on('data', c => data += c);
-        rs.on('end', () => { try { const _s = JSON.parse(data).data.secrets; resolve(Array.isArray(_s) ? _s[0] : _s); } catch (_) { resolve(null); } });
-      });
-      r.on('error', () => resolve(null));
-      r.setTimeout(5000, () => { r.destroy(); resolve(null); });
-      r.end();
+    const adminAuth = Buffer.from('admin:' + (process.env.STALWART_PASS || '')).toString('base64');
+    const r = http.request({ hostname: process.env.STALWART_HOST || '100.83.112.88', port: Number(process.env.STALWART_PORT || 8080),
+      path: '/api/principal/' + encodeURIComponent(username), method: 'GET',
+      headers: { 'Authorization': 'Basic ' + adminAuth } }, (rs) => {
+      let data = ''; rs.on('data', c => data += c);
+      rs.on('end', () => { try { const _s = JSON.parse(data).data.secrets; const v = Array.isArray(_s) ? _s[0] : _s; resolve(typeof v === 'string' ? v : null); } catch (_) { resolve(null); } });
     });
-    if (stored !== null) return stored === password;
-  } catch (_) { /* fall through to local hash */ }
-  if (wallet.password_hash) {
-    const inputHash = crypto.createHash('sha256').update(password).digest('hex');
-    return inputHash === wallet.password_hash;
+    r.on('error', () => resolve(null));
+    r.setTimeout(5000, () => { r.destroy(); resolve(null); });
+    r.end();
+  });
+}
+
+// Verify a wallet password. The verifier is the salted hash in identity_wallets.password_hash (passwords.js);
+// Stalwart is asked only while an account has no current one. Stalwart then holds the same salted hash, or,
+// until scripts/migrate-password-hashes.js has run, the readable password. A match on any older form stores a
+// current hash locally (never in Stalwart: a write there could race a reset and bring the old password back;
+// the migration hashes Stalwart's copies). Returns true/false, or null when no verifier is available.
+async function verifyWalletPassword(wallet, password) {
+  if (typeof password !== 'string' || !password) return false;
+  if (passwords.isCurrent(wallet.password_hash)) return (await passwords.verifyPassword(password, wallet.password_hash)).ok === true;
+  let verdict = null;
+  const secret = wallet.username ? await fetchStalwartSecret(wallet.username) : null;
+  if (secret !== null) verdict = (await passwords.verifyPassword(password, secret, { allowPlaintext: true })).ok;
+  if (verdict === null && wallet.password_hash) verdict = (await passwords.verifyPassword(password, wallet.password_hash)).ok;
+  if (verdict === true) {
+    try {
+      const h = await passwords.hashPassword(password);
+      // Only over the hash this check read: a reset in between keeps its new hash.
+      db.prepare("UPDATE identity_wallets SET password_hash = ? WHERE did = ? AND COALESCE(password_hash, '') = ?")
+        .run(h, wallet.did, wallet.password_hash || '');
+    } catch (e) { console.error(`[password] ${wallet.username}: could not store the upgraded hash: ${e.message}`); }
   }
-  return null; // no verifier available
+  return verdict;
 }
 
 // Send an SMS via SignalWire's Twilio-compatible LaML REST API. Zero SDK

@@ -7,6 +7,7 @@
 const PROVISION_COST = 100;   // DD, same as /api/fleet/:slug/provision
 const TOKEN_SCOPE_CAP = 'transact';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const passwords = require('./passwords');   // salted scrypt for the local password verifier
 
 module.exports = function registerFleetRoutes(deps) {
   const { app, db, identity, billing, fleetBilling: fb, ledger, dustforge, createEmailTransport, rateLimitStandard, adminKey, crypto } = deps;
@@ -223,7 +224,7 @@ module.exports = function registerFleetRoutes(deps) {
       const emailResult = await dustforge.createAccount(username, password);
       if (!emailResult.ok) return res.status(500).json({ error: `email creation failed: ${emailResult.error}` });
       const referral = crypto.randomBytes(6).toString('hex');
-      const pwHash = crypto.createHash('sha256').update(password).digest('hex');
+      const pwHash = emailResult.password_hash || await passwords.hashPassword(password);
       const txn = db.transaction(() => {
         const debit = billing.deductBalance(db, payer, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
         if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: { error: 'insufficient balance to provision', detail: debit.error, payer_did: payer } });
