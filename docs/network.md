@@ -1,7 +1,7 @@
 # DemiPass network — connect wallets, join a fleet, send DD
 
-Server: `network_routes.js`. Phone wallet: the Fleet tab of `public/vault-mobile.html` (+ Wallet, request cards on
-the vault home, Send DD). Tests: `test/network_smoke.sh` (HTTP), `test/vault_ui.test.js` (wallet page).
+Server: `network_routes.js`. Phone wallet: the Fleet tab of `public/vault-mobile.html` (+ Wallet, request and top-up
+cards on the vault home, Send DD, Ask for DD). Tests: `test/network_smoke.sh` (HTTP), `test/vault_ui.test.js` (wallet page).
 
 Base URL `https://api.dustforge.com`. Every call carries `Authorization: Bearer <token>`: the wallet's own token,
 scope `transact` (person: the vault sign-in or a device-flow token; agent: `POST /api/identity/auth-fingerprint
@@ -35,7 +35,7 @@ When the target is the one joining a fleet (`agent` request) and has a vault PIN
 
 ## Endpoints
 
-- `GET /api/network` → `{ me, fleet, member_of, people[], agents[], incoming[], outgoing[] }`. Each request has
+- `GET /api/network` → `{ me, fleet, member_of, people[], agents[], incoming[], outgoing[], topups: { incoming[], outgoing[] } }`. Each request has
   `id, kind, direction, other, effect` (what accepting does, in words), `needs_pin`, `intent`, `note`, `expires_at`.
 - `POST /api/network/requests { to, as, handle?, note? }` → 201 `{ request }`. `to` is a username, an email or a
   DID. `handle` (fleet kinds) defaults to the agent's username. 404 no such wallet; 409 already connected, already
@@ -59,6 +59,24 @@ a fleet, create one, approve a device login, register agents or manage workers.
    → 200 `{ status:'sent', amount_cents, balance_after }`. Unconfirmed transfers expire after 5 minutes;
    `POST /api/network/transfers/:id/cancel` drops one. Transfers over 100 DD need the double barrel, like every
    transfer (`/api/identity/barrel`). Both ledgers show `Transfer to/from <username>: <note>`.
+
+### Asking for a top-up (an agent, to its fleet owner)
+
+An agent short of DD asks the owner of the fleet it is in. Every `402` answer (not enough DD) anywhere in the API
+carries `topup: { how: 'POST /api/network/topups', ... }` to point an agent here.
+
+1. `POST /api/network/topups { amount_cents, note? }` (the agent's own token) → 201 `{ topup: { id, owner, amount_cents,
+   note, status:'pending', expires_at, ... } }`. `note` (up to 200 chars) says why; the owner reads it in the wallet.
+   409 not an agent in a fleet, or an ask is already waiting (the body names it); 429 within 1 hour of a declined
+   ask, or more than 5 asks in 24 hours. The owner gets a short mail (amount, the agent's balance, no note).
+2. The owner sees it in `GET /api/network` → `topups.incoming[]` (`id, agent, handle, amount_cents, note,
+   agent_balance_cents, expires_at`) and as a card on the wallet home, and answers:
+   - **send**: any confirmed send from the owner to that agent (`POST /api/network/transfers`, PIN as usual) closes
+     the ask as `sent`, with `sent_cents` = what was sent (the owner may send less or more than asked);
+   - **decline**: `POST /api/network/topups/:id/decline`.
+3. The agent sees its waiting ask in `topups.outgoing[]` and can `POST /api/network/topups/:id/withdraw` it.
+
+Asks expire after 7 days, and are cancelled when the agent leaves or is removed from the fleet.
 
 ## Example: an agent asks to join a fleet
 

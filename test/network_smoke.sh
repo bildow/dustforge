@@ -4,7 +4,8 @@
 # (PIN) — and drives the real HTTP routes: person requests (dedupe, accept, decline, withdraw, who may decide), an
 # agent asking to join A's fleet, A inviting G (accept needs G's PIN, intent join:<id>), one fleet per agent, leaving,
 # a fleet created on first join, and DD sends: only to connections, two steps, PIN for intent send:<id> when the
-# sender has one, bound to the session that started it, spent once. Silicon tokens are refused. No network.
+# sender has one, bound to the session that started it, spent once; top-up asks from an agent to its fleet owner (one at
+# a time, closed by a send, declined, withdrawn, capped, cancelled on leaving). Silicon tokens are refused. No network.
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-network-smoke.XXXXXX)
@@ -131,12 +132,68 @@ call POST /api/network/requests "$F" '{"to":"person-k","as":"join"}'; [ "$CODE" 
 call POST /api/network/requests "$F" '{"to":"person-k","as":"agent"}'; [ "$CODE" = 409 ] && ok "an agent in a fleet cannot own one → 409" || fail "agent owns: $CODE $BODY"
 call POST /api/network/requests "$K" '{"to":"owner-a","as":"agent"}'; [ "$CODE" = 409 ] && ok "a wallet running a fleet cannot be invited as an agent → 409" || fail "owner as agent: $CODE $BODY"
 F0=$(bal agent-f)
+call GET /api/ledger "$F"; [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J topup.how)" = "POST /api/network/topups" ] && ok "F at 0 DD: a 402 tells it how to ask for a top-up" || fail "402 hint: $CODE $BODY"
 call POST /api/network/transfers "$A" '{"to":"agent-f","amount_cents":25}'; TF=$(echo "$BODY" | J transfer.id)
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"send:'$TF'"}'
 call POST /api/network/transfers/$TF/confirm "$A"; [ "$CODE" = 200 ] && [ "$(bal agent-f)" = $((F0+25)) ] && ok "A sends its agent F 25 DD" || fail "A→F: $CODE $BODY"
 call POST /api/network/transfers "$F" '{"to":"owner-a","amount_cents":5}'; TF2=$(echo "$BODY" | J transfer.id)
 call POST /api/network/transfers/$TF2/confirm "$F"; [ "$CODE" = 200 ] && ok "F (no PIN) sends its fleet owner 5 DD" || fail "F→A: $CODE $BODY"
 call POST /api/network/transfers "$F" '{"to":"person-k","amount_cents":1}'; [ "$CODE" = 403 ] && ok "F cannot send to A's contact K (not F's connection)" || fail "F→K: $CODE $BODY"
+
+# ── top-up asks: F asks its fleet owner A for DD ──
+setq(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
+call POST /api/network/topups "$K" '{"amount_cents":10}'; [ "$CODE" = 409 ] && ok "a wallet that is not an agent cannot ask for a top-up → 409" || fail "K topup: $CODE $BODY"
+call POST /api/network/topups "$F" '{"amount_cents":0}'; [ "$CODE" = 400 ] && ok "top-up amount 0 → 400" || fail "topup 0: $CODE"
+call POST /api/network/topups "$F" '{"amount_cents":2.5}'; [ "$CODE" = 400 ] && ok "fractional top-up amount → 400" || fail "topup frac: $CODE"
+call POST /api/network/topups "$SIL" '{"amount_cents":50}'; [ "$CODE" = 403 ] && ok "a silicon: token cannot ask" || fail "topup sil: $CODE"
+call POST /api/network/topups "$F" '{"amount_cents":50,"note":"out of DD mid-task‮"}'
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J topup.note)" = "out of DD mid-task" ] && [ "$(echo "$BODY" | J topup.owner)" = owner-a ] && ok "F asks A for 50 DD with a note → 201" || fail "topup: $CODE $BODY"
+TU1=$(echo "$BODY" | J topup.id)
+call POST /api/network/topups "$F" '{"amount_cents":60}'; [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J topup.id)" = "$TU1" ] && ok "a second ask while one waits → 409 pointing at it" || fail "topup dup: $CODE $BODY"
+call GET /api/network "$A"
+[ "$(echo "$BODY" | J topups.incoming.0.id)" = "$TU1" ] && [ "$(echo "$BODY" | J topups.incoming.0.agent)" = agent-f ] && [ "$(echo "$BODY" | J topups.incoming.0.amount_cents)" = 50 ] \
+  && [ "$(echo "$BODY" | J topups.incoming.0.agent_balance_cents)" = "$(bal agent-f)" ] && [ "$(echo "$BODY" | J topups.incoming.0.handle)" = agent-f ] && ok "A sees the ask: agent, amount, note, its balance" || fail "A topups: $BODY"
+call GET /api/network "$F"; [ "$(echo "$BODY" | J topups.outgoing.0.id)" = "$TU1" ] && ok "F sees its own ask" || fail "F topups: $BODY"
+call GET /api/network "$K"; [ "$(echo "$BODY" | J topups.incoming)" = "[]" ] && ok "another wallet does not see it" || fail "K sees: $BODY"
+call POST /api/network/topups/$TU1/decline "$X"; [ "$CODE" = 404 ] && ok "a stranger cannot decline it (404)" || fail "X decline: $CODE"
+call POST /api/network/topups/$TU1/decline "$F"; [ "$CODE" = 403 ] && ok "the agent cannot decline its own ask" || fail "F decline: $CODE"
+call POST /api/network/topups/$TU1/withdraw "$A"; [ "$CODE" = 403 ] && ok "the owner cannot withdraw it" || fail "A withdraw: $CODE"
+call POST /api/network/topups/$TU1/withdraw "$F"; [ "$CODE" = 200 ] && ok "F withdraws its ask" || fail "F withdraw: $CODE $BODY"
+call POST /api/network/topups/$TU1/withdraw "$F"; [ "$CODE" = 409 ] && ok "withdrawing twice → 409" || fail "withdraw twice: $CODE"
+call POST /api/network/topups "$F" '{"amount_cents":40,"note":"tick costs"}'; TU2=$(echo "$BODY" | J topup.id)
+FB=$(bal agent-f)
+call POST /api/network/transfers "$A" '{"to":"agent-f","amount_cents":30,"note":"Top-up"}'; TT=$(echo "$BODY" | J transfer.id)
+call POST /api/network/transfers/$TT/confirm "$A"; [ "$CODE" = 403 ] && ok "answering the ask still needs A's PIN" || fail "topup send no pin: $CODE"
+[ "$(Q "SELECT status FROM network_topups WHERE id=$TU2")" = pending ] && ok "a refused send leaves the ask open" || fail "refused closed ask"
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"send:'$TT'"}'
+call POST /api/network/transfers/$TT/confirm "$A"
+[ "$CODE" = 200 ] && [ "$(bal agent-f)" = $((FB+30)) ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TU2")" = "sent:30" ] \
+  && ok "A sends 30 (asked 40): F gets 30, the ask closes as sent 30" || fail "topup answered: $CODE $BODY $(Q "SELECT status, sent_cents FROM network_topups WHERE id=$TU2")"
+call GET /api/network "$A"; [ "$(echo "$BODY" | J topups.incoming)" = "[]" ] && ok "the answered ask leaves A's list" || fail "A list after: $BODY"
+call POST /api/network/topups "$F" '{"amount_cents":15}'; TUR=$(echo "$BODY" | J topup.id)
+call POST /api/network/transfers "$F" '{"to":"owner-a","amount_cents":1}'; call POST /api/network/transfers/$(echo "$BODY" | J transfer.id)/confirm "$F"
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status FROM network_topups WHERE id=$TUR")" = pending ] && ok "DD from the agent to its owner does not close its ask" || fail "agent→owner closed: $CODE $(Q "SELECT status FROM network_topups WHERE id=$TUR")"
+call POST /api/fleet/$SLUG/silicons/agent-f/refill "$A" '{"amount_cents":15}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUR")" = "sent:15" ] && ok "a fleet refill answers the ask too" || fail "refill close: $CODE $BODY $(Q "SELECT status FROM network_topups WHERE id=$TUR")"
+call POST /api/network/topups "$F" '{"amount_cents":6}'; TUW=$(echo "$BODY" | J topup.id)
+FDID=$(Q "SELECT did FROM identity_wallets WHERE username='agent-f'"); ADID=$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")
+call POST /api/wallet/transfer "$A" '{"from_did":"'$ADID'","to_did":"'$FDID'","amount_cents":6}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUW")" = "sent:6" ] && ok "/api/wallet/transfer from the owner answers the ask too" || fail "wallet transfer close: $CODE $BODY"
+call POST /api/network/transfers "$K" '{"to":"owner-a","amount_cents":999999}'; call POST /api/network/transfers/$(echo "$BODY" | J transfer.id)/confirm "$K"
+echo "$BODY" | grep -q '"topup"' && fail "a person (not an agent) got the top-up hint: $CODE" || ok "a person short of DD gets no top-up hint ($CODE)"
+call POST /api/identity/create "" '{"username":"nokey-x"}'; [ "$CODE" = 402 ] && ! echo "$BODY" | grep -q '"topup"' && ok "an anonymous 402 (account needs payment) carries no top-up hint" || fail "anon 402: $CODE $BODY"
+setq "UPDATE network_topups SET created_at=datetime('now','-2 days')"
+call POST /api/network/topups "$F" '{"amount_cents":10}'; TU3=$(echo "$BODY" | J topup.id)
+call POST /api/network/topups/$TU3/decline "$A"; [ "$CODE" = 200 ] && ok "A declines an ask" || fail "A decline: $CODE $BODY"
+call POST /api/network/topups "$F" '{"amount_cents":10}'; [ "$CODE" = 429 ] && ok "asking again right after a decline → 429" || fail "after decline: $CODE $BODY"
+setq "UPDATE network_topups SET decided_at=datetime('now','-2 hours') WHERE id=$TU3"
+for i in 1 2 3 4; do call POST /api/network/topups "$F" '{"amount_cents":1}'; call POST /api/network/topups/$(echo "$BODY" | J topup.id)/withdraw "$F"; done
+call POST /api/network/topups "$F" '{"amount_cents":1}'; [ "$CODE" = 429 ] && ok "a sixth ask in a day → 429" || fail "daily cap: $CODE $BODY"
+setq "UPDATE network_topups SET created_at=datetime('now','-2 days')"
+call POST /api/network/topups "$F" '{"amount_cents":2}'; TU7=$(echo "$BODY" | J topup.id)
+setq "UPDATE network_topups SET expires_at='2000-01-01T00:00:00Z' WHERE id=$TU7"
+call POST /api/network/topups/$TU7/decline "$A"; [ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM network_topups WHERE id=$TU7")" = expired ] && ok "an expired ask cannot be declined (409, marked expired)" || fail "expired: $CODE $BODY"
+call POST /api/network/topups "$F" '{"amount_cents":3}'; TU8=$(echo "$BODY" | J topup.id)
 
 # ── A invites G as an agent: G has a PIN, so accepting needs it ──
 call POST /api/network/requests "$A" '{"to":"agent-g","as":"agent","handle":"agent-f"}'; RG=$(echo "$BODY" | J request.id)
@@ -149,6 +206,8 @@ call POST /api/network/requests/$RG/accept "$G"; [ "$CODE" = 200 ] && [ "$(echo 
 # ── leave, and join another fleet ──
 call POST /api/network/leave-fleet "$F"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J signed_out)" = False ] && ok "F leaves A's fleet (joined through the network: kept its key, stays signed in)" || fail "leave: $CODE $BODY"
 call GET /api/network "$F"; [ "$CODE" = 200 ] && ok "F's own session still works after leaving" || fail "F session after leave: $CODE"
+[ "$(Q "SELECT status FROM network_topups WHERE id=$TU8")" = cancelled ] && [ "$(echo "$BODY" | J topups.outgoing)" = "[]" ] && ok "leaving the fleet cancels F's open ask" || fail "leave cancel: $(Q "SELECT status FROM network_topups WHERE id=$TU8")"
+call POST /api/network/topups "$F" '{"amount_cents":3}'; [ "$CODE" = 409 ] && ok "out of a fleet, F cannot ask" || fail "ask after leave: $CODE"
 call POST /api/network/transfers "$A" '{"to":"agent-f","amount_cents":1}'; [ "$CODE" = 403 ] && ok "after leaving, A and F are no longer connected" || fail "post-leave: $CODE $BODY"
 call POST /api/network/requests "$K" '{"to":"agent-f","as":"agent"}'; RK2=$(echo "$BODY" | J request.id)
 call POST /api/network/requests/$RK2/accept "$F"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J owner)" = person-k ] && ok "K (no fleet yet) invites F; F accepts → K's fleet is created, F in it" || fail "K fleet: $CODE $BODY"

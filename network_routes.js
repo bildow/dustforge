@@ -10,6 +10,8 @@
 // refill it, delegate secrets to it), so a member who has a vault PIN accepts an `agent` request with the PIN.
 // Sending DD is two steps: create the transfer (amount + recipient fixed), then confirm it with the PIN
 // (intent send:<id>). A wallet with no PIN (an agent) confirms without one, like /api/wallet/transfer.
+// An agent short of DD asks its fleet owner for a top-up (amount + why). The owner answers by sending DD (any
+// send from its fleet to the agent closes the ask: a network send, /api/wallet/transfer or a refill) or declines it.
 
 const REQUEST_TTL_DAYS = 14;
 const TRANSFER_TTL_SEC = 300;
@@ -20,6 +22,9 @@ const MAX_TRANSFER = 1000000;     // same cap as /api/wallet/transfer
 const NEW_FLEET_MAX_AGENTS = 25;
 const KINDS = new Set(['person', 'agent', 'join']);
 const REASK_COOLDOWN_HOURS = 24;  // after a decline or withdraw, the same wallet asks the same wallet again only after this
+const TOPUP_TTL_DAYS = 7;
+const TOPUP_DECLINE_COOLDOWN_HOURS = 1;  // after the owner declines, the agent asks again only after this
+const TOPUP_MAX_PER_DAY = 5;             // asks per agent per 24 h (each one mails the owner)
 
 module.exports = function registerNetworkRoutes(deps) {
   const { app, db, billing, fleetBilling: fb, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing,
@@ -65,6 +70,22 @@ module.exports = function registerNetworkRoutes(deps) {
     error TEXT DEFAULT ''
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_nt_from ON network_transfers(from_did, status)');
+  db.exec(`CREATE TABLE IF NOT EXISTS network_topups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_did TEXT NOT NULL,
+    owner_did TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    note TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    sent_cents INTEGER DEFAULT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT NOT NULL,
+    decided_at TEXT DEFAULT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ntu_owner ON network_topups(owner_did, status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ntu_agent ON network_topups(agent_did, status)');
+  // expireOld walks the open asks on every overview; closed ones pile up, so it reads only these.
+  db.exec("CREATE INDEX IF NOT EXISTS idx_ntu_pending ON network_topups(status, expires_at) WHERE status = 'pending'");
 
   // ── helpers ───────────────────────────────────────────────────────────────
   const nowIso = () => new Date().toISOString();
@@ -186,6 +207,18 @@ module.exports = function registerNetworkRoutes(deps) {
   function expireOld() {
     db.prepare("UPDATE network_requests SET status = 'expired', decided_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND expires_at <= ?").run(nowIso());
     db.prepare("UPDATE network_transfers SET status = 'expired', decided_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND expires_at <= ?").run(nowIso());
+    db.prepare("UPDATE network_topups SET status = 'expired', decided_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND expires_at <= ?").run(nowIso());
+    // An ask outlives no membership: the agent left or was removed, or the fleet closed.
+    db.prepare(`UPDATE network_topups SET status = 'cancelled', decided_at = CURRENT_TIMESTAMP WHERE status = 'pending' AND NOT EXISTS
+                (SELECT 1 FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.member_did = network_topups.agent_did
+                 AND s.status = 'active' AND f.status = 'active' AND f.owner_did = network_topups.owner_did)`).run();
+  }
+  function topupView(t, me) {
+    return { id: t.id, direction: t.agent_did === me ? 'outgoing' : 'incoming',
+             agent: walletName(t.agent_did), agent_did: t.agent_did, owner: walletName(t.owner_did), owner_did: t.owner_did,
+             handle: (db.prepare("SELECT handle FROM fleet_silicons WHERE member_did = ? AND status = 'active'").get(t.agent_did) || {}).handle || null,
+             amount_cents: t.amount_cents, note: t.note || '', status: t.status, sent_cents: t.sent_cents,
+             agent_balance_cents: billing.getDerivedBalance(db, t.agent_did), created_at: t.created_at, expires_at: t.expires_at };
   }
   function fail(res, e) {
     return res.status(e.statusCode || 500).json(e.body || { error: e.message });
@@ -213,6 +246,11 @@ module.exports = function registerNetworkRoutes(deps) {
       people: peers, agents,
       incoming: requests.filter(r => r.direction === 'incoming'),
       outgoing: requests.filter(r => r.direction === 'outgoing'),
+      // Top-up asks: from my agents (incoming), and mine to my fleet owner (outgoing).
+      topups: {
+        incoming: db.prepare("SELECT * FROM network_topups WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC").all(me).map(t => topupView(t, me)),
+        outgoing: db.prepare("SELECT * FROM network_topups WHERE agent_did = ? AND status = 'pending' ORDER BY id DESC").all(me).map(t => topupView(t, me)),
+      },
     });
   });
 
@@ -452,6 +490,7 @@ module.exports = function registerNetworkRoutes(deps) {
         const changed = db.prepare("UPDATE network_transfers SET status = 'sent', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(t.id).changes;
         if (changed !== 1) throw Object.assign(new Error('this transfer was decided meanwhile'), { statusCode: 409 });
         const note = t.note ? ': ' + t.note : '';
+        // A send from the owner to its agent also answers the agent's open top-up ask (in barrelGuardedTransfer).
         debit = barrelGuardedTransfer(db, me, t.to_did, t.amount_cents, 'transfer_out', 'Transfer to ' + to.username + note, 'Transfer from ' + w.wallet.username + note);
       }).immediate();
       log(`transfer ${t.id}: ${w.wallet.username} → ${to.username} ${t.amount_cents} DD`);
@@ -468,6 +507,64 @@ module.exports = function registerNetworkRoutes(deps) {
     const n = Number.isInteger(id) ? db.prepare("UPDATE network_transfers SET status = 'cancelled', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND from_did = ? AND status = 'pending'").run(id, w.wallet.did).changes : 0;
     if (!n) return res.status(404).json({ error: 'no pending transfer by that id' });
     res.json({ ok: true, id, status: 'cancelled' });
+  });
+
+  // ── Top-up asks: an agent asks its fleet owner for DD ─────────────────────
+  // body: { amount_cents, note? }. One open ask per agent; the owner sees it in its wallet (and gets a short mail) and
+  // answers by sending DD (POST /api/network/transfers, confirmed with its PIN) or declining it.
+  app.post('/api/network/topups', rateLimitStandard, (req, res) => {
+    const w = walletAuth(req, res); if (!w) return;
+    const me = w.wallet.did;
+    const b = req.body || {};
+    const amount = Number(b.amount_cents);
+    if (!Number.isInteger(amount) || amount < 1 || amount > MAX_TRANSFER) return res.status(400).json({ error: `amount_cents: a whole number of DD, 1 to ${MAX_TRANSFER}` });
+    expireOld();
+    const mf = memberFleet(me);
+    if (!mf) return res.status(409).json({ error: 'this wallet is not an agent in a fleet; only an agent asks its fleet owner for a top-up' });
+    const owner = db.prepare('SELECT username, email, status FROM identity_wallets WHERE did = ?').get(mf.owner_did);
+    if (!owner || owner.status !== 'active') return res.status(409).json({ error: 'the fleet owner\'s wallet is not active' });
+    const open = db.prepare("SELECT * FROM network_topups WHERE agent_did = ? AND status = 'pending'").get(me);
+    if (open) return res.status(409).json({ error: 'you already asked; it is waiting for your fleet owner (withdraw it to ask again)', topup: topupView(open, me) });
+    const declined = db.prepare(`SELECT 1 FROM network_topups WHERE agent_did = ? AND status = 'declined' AND decided_at > datetime('now', ?)`)
+      .get(me, `-${TOPUP_DECLINE_COOLDOWN_HOURS} hours`);
+    if (declined) return res.status(429).json({ error: `your last ask was declined; ask again after ${TOPUP_DECLINE_COOLDOWN_HOURS} hour` });
+    if (db.prepare("SELECT COUNT(*) AS n FROM network_topups WHERE agent_did = ? AND created_at > datetime('now', '-1 day')").get(me).n >= TOPUP_MAX_PER_DAY) {
+      return res.status(429).json({ error: `at most ${TOPUP_MAX_PER_DAY} top-up asks a day` });
+    }
+    const id = db.prepare('INSERT INTO network_topups (agent_did, owner_did, amount_cents, note, expires_at) VALUES (?, ?, ?, ?, ?)')
+      .run(me, mf.owner_did, amount, cleanText(b.note, 200), later(TOPUP_TTL_DAYS * 86400)).lastInsertRowid;
+    const row = db.prepare('SELECT * FROM network_topups WHERE id = ?').get(id);
+    // Like a connection request, the mail carries no free text: the note is read in the wallet.
+    if (sendMail) {
+      sendMail({ to: owner.email, subject: `DemiPass: your agent ${w.wallet.username} asks for ${amount} DD`,
+        text: `Your agent ${w.wallet.username} (@${mf.handle}) asks for a top-up of ${amount} DD. It has ${billing.getDerivedBalance(db, me)} DD.\n\n`
+          + `Open your wallet at https://demipass.com/vault-mobile.html to see why and send it DD, or decline. The ask expires in ${TOPUP_TTL_DAYS} days.` });
+    }
+    log(`topup ${id}: ${w.wallet.username} asks ${owner.username} for ${amount} DD`);
+    res.status(201).json({ ok: true, topup: topupView(row, me) });
+  });
+  function topupFor(req, res, me) {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) { res.status(400).json({ error: 'invalid top-up id' }); return null; }
+    expireOld();
+    const t = db.prepare('SELECT * FROM network_topups WHERE id = ? AND (agent_did = ? OR owner_did = ?)').get(id, me, me);
+    if (!t) { res.status(404).json({ error: 'top-up ask not found' }); return null; }
+    if (t.status !== 'pending') { res.status(409).json({ error: `this ask is already ${t.status}` }); return null; }
+    return t;
+  }
+  app.post('/api/network/topups/:id/decline', rateLimitStandard, (req, res) => {
+    const w = walletAuth(req, res); if (!w) return;
+    const t = topupFor(req, res, w.wallet.did); if (!t) return;
+    if (t.owner_did !== w.wallet.did) return res.status(403).json({ error: 'only the fleet owner can decline; withdraw your own ask instead' });
+    db.prepare("UPDATE network_topups SET status = 'declined', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(t.id);
+    res.json({ ok: true, id: t.id, status: 'declined' });
+  });
+  app.post('/api/network/topups/:id/withdraw', rateLimitStandard, (req, res) => {
+    const w = walletAuth(req, res); if (!w) return;
+    const t = topupFor(req, res, w.wallet.did); if (!t) return;
+    if (t.agent_did !== w.wallet.did) return res.status(403).json({ error: 'only the agent that asked can withdraw' });
+    db.prepare("UPDATE network_topups SET status = 'withdrawn', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(t.id);
+    res.json({ ok: true, id: t.id, status: 'withdrawn' });
   });
 
   return { connected };
