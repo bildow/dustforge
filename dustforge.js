@@ -6,6 +6,7 @@
  */
 
 const http = require('http');
+const passwords = require('./passwords');   // Stalwart gets the salted hash, never the password
 
 const STALWART_HOST = process.env.STALWART_HOST || '10.225.75.76';
 const STALWART_PORT = Number(process.env.STALWART_PORT || 8080);
@@ -49,18 +50,19 @@ async function createAccount(username, password, options = {}) {
   } = options;
   const email = `${username}@dustforge.com`;
 
+  const passwordHash = await passwords.hashPassword(password);
   const result = await stalwartRequest('POST', '/api/principal', {
     type: 'individual',
     name: username,
     emails: [email],
-    secrets: [password],
+    secrets: [passwordHash],
     quota,
     roles: ['user'],
     description: displayName,
   });
 
   if (result.data) {
-    return { ok: true, stalwart_id: result.data, email, username };
+    return { ok: true, stalwart_id: result.data, email, username, password_hash: passwordHash };
   }
   return { ok: false, error: result.detail || result.title || 'account creation failed' };
 }
@@ -92,7 +94,7 @@ async function listAccounts(limit = 50) {
 
 async function changePassword(username, newPassword) {
   const result = await stalwartRequest('PATCH', `/api/principal/${encodeURIComponent(username)}`, {
-    secrets: [newPassword],
+    secrets: [await passwords.hashPassword(newPassword)],
   });
   return { ok: !result.status || result.status < 400 };
 }

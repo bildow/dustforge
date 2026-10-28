@@ -109,10 +109,12 @@ V=$(curl -s "$API/api/identity/reset-password/verify?token=$TOKB")
 echo "$V" | grep -q '"username":"reset-new"' && ok "verify shows the current username" || fail "verify says: $V"
 sleep 1   # the sign-out cut is whole seconds
 [ "$(post /api/identity/reset-password "{\"token\":\"$TOKB\",\"new_password\":\"newpass22\"}")" = 200 ] && ok "reset-password 200" || fail "reset-password not 200"
-grep -q '^PATCH reset-new .*newpass22' "$S/stalwart.log" && ok "mailbox of the current username updated" || fail "stalwart saw: $(cat "$S/stalwart.log" 2>/dev/null)"
+grep -q '^PATCH reset-new .*\$scrypt\$ln=' "$S/stalwart.log" && ok "mailbox of the current username updated with a salted hash" || fail "stalwart saw: $(cat "$S/stalwart.log" 2>/dev/null)"
+grep -q 'newpass22' "$S/stalwart.log" && fail "Stalwart was sent the readable password" || ok "Stalwart never sees the readable password"
 grep -q '^PATCH reset-old' "$S/stalwart.log" && fail "old username patched" || ok "old username not touched"
-NH=$(printf '%s' newpass22 | sha256sum | cut -d' ' -f1)
-[ "$(Q "select password_hash from identity_wallets where username='reset-new'")" = "$NH" ] && ok "local password hash updated" || fail "local hash still old"
+NHASH=$(Q "select password_hash from identity_wallets where username='reset-new'")
+[ "$(node -e 'require("./passwords").verifyPassword("newpass22", process.argv[1]).then(r => console.log(r.ok && !r.upgrade ? "yes" : "no"))' "$NHASH")" = yes ] \
+  && ok "local password hash updated (salted scrypt)" || fail "local hash not a current hash of the new password"
 [ "$(Q "select used from password_reset_tokens where token='$TOKB'")" = 1 ] && ok "token spent" || fail "token not spent"
 [ "$(post /api/identity/reset-password "{\"token\":\"$TOKB\",\"new_password\":\"again333\"}")" = 400 ] && ok "spent token refused" || fail "spent token reused"
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/network" -H "Authorization: Bearer $SESS")" = 401 ] && ok "pre-reset session signed out" || fail "pre-reset session still works"
@@ -144,6 +146,7 @@ wait_for "$S/mail.log" "$TOK2" && grep -B12 "$TOK2" "$S/mail.log" | grep -qi '^T
 post /api/identity/forgot-password '{"username":"reset-hang"}' >/dev/null
 TOKH=$(Q "select token from password_reset_tokens where username='reset-hang' order by id desc limit 1")
 [ "$(curl -s -o /dev/null -w '%{http_code}' -m 20 -X POST "$API/api/identity/reset-password" -H 'Content-Type: application/json' -d "{\"token\":\"$TOKH\",\"new_password\":\"hangpass1\"}")" = 500 ] && ok "hung Stalwart: 500 within the timeout" || fail "hung Stalwart: no answer"
+[ "$(Q "select coalesce(password_hash, 'NULL') from identity_wallets where username='reset-hang'")" = NULL ] && ok "hung Stalwart: local hash cleared, so Stalwart decides" || fail "hung Stalwart: local hash kept"
 [ "$(Q "select used from password_reset_tokens where token='$TOKH'")" = 0 ] && ok "link live again for a retry" || fail "link stuck as used"
 
 # 6. SMTP down: still 200, the failure is logged, the link is not.
