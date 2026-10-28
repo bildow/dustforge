@@ -1120,3 +1120,82 @@ test('settings: saving a recovery email needs the password, sends it once and cl
   assert.equal(pg.el('recovery-pw').value, '');
   assert.equal(pg.el('recovery-msg').textContent, 'Recovery email saved');
 });
+
+// ── host operations ────────────────────────────────────────────────────────────────────────────────────
+// An agent asks to run commands on a host; the wallet approves with the PIN for intent hostop:<id>.
+function hostopRoutes(state) {
+  return async (p, body) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/fill/pending') return { json: { ok: true, requests: [], grants: [] } };
+    if (p === '/api/blindkey/hostops/pending') return { json: { ok: true, requests: state.requests, windows: state.windows || [], runs: state.runs || [] } };
+    if (p === '/api/blindkey/hostops/requests/21/approve') {
+      if (!state.pinFresh) return { status: 403, json: { error: 'needs pin', missing: ['pin'], required: ['pin'], intent: 'hostop:21' } };
+      state.pinFresh = false; state.requests = []; return { json: { ok: true, status: 'approved' } };
+    }
+    if (p === '/api/blindkey/hostops/requests/21/deny') { state.requests = []; return { json: { ok: true, status: 'denied' } }; }
+    if (p === '/api/blindkey/hostops/windows/9/close') { state.windows = []; return { json: { ok: true } }; }
+    if (p === '/api/identity/gate/verify') { assert.equal(body.intent, 'hostop:21', 'the PIN opens this one request'); state.pinFresh = body.pin === '2468'; return state.pinFresh ? { json: { ok: true } } : { status: 403, json: { error: 'incorrect PIN' } }; }
+    throw new Error('unexpected ' + p);
+  };
+}
+const flightShape = { name: 'flight', mode: 'job', sudo: true, max_seconds: 10800, argv: [{ literal: '/usr/local/sbin/agent-ssd-flight.sh' }, { slot: 'container', enum: ['brain2', 'soul2', 'triadic2'], optional: false }, { literal: 'precopy', optional: true }] };
+const hostopReq = (over = {}) => ({ id: 21, intent: 'hostop:21', kind: 'window', requester: 'brain', host: '100.83.112.88', user: 'apple', fingerprint: 'SHA256:abc', host_is_new: true, label: 'SSD migration', reason: 'finish the move', duration_hours: 72, shapes: [flightShape], own_session: false, ...over });
+
+test('a host-operation window request shows who, where, the key and every shape; approved with the PIN for hostop:<id>', async () => {
+  const state = { requests: [hostopReq(), hostopReq({ id: 22, own_session: true })] };
+  const pg = page({ storage: signedIn, routes: hostopRoutes(state) });
+  await settle();
+  const card = pg.el('hostop-requests').innerHTML;
+  for (const want of [/brain/, /apple@100\.83\.112\.88/, /SHA256:abc/, /72 h/, /SSD migration/, /agent-ssd-flight\.sh/, /brain2 \| soul2 \| triadic2/, /background, up to 3 h/, /sudo/, /finish the move/]) assert.match(card, want);
+  assert.equal((card.match(/onclick="decideHostop\(/g) || []).length, 2, 'only the request from another session is offered (approve + deny)');
+  const done = pg.ctx.decideHostop(21, true);
+  await settle();
+  assert.equal(pg.shown('modal-pin'), true, 'PIN sheet opened by the 403');
+  assert.match(pg.el('pin-unlock-what').textContent, /72 h window for brain on 100\.83\.112\.88/);
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();
+  await done; await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/hostops/requests/21/approve').length, 2, 'refused once, approved after the PIN');
+  assert.doesNotMatch(pg.el('hostop-requests').innerHTML, /decideHostop\(21/, 'card gone once approved');
+});
+
+test('host operations: Cancel approves nothing, deny needs no PIN, a window closes after confirming', async () => {
+  const state = { requests: [hostopReq({ kind: 'run', argv: ['incus', 'list'], shapes: null })], windows: [{ id: 9, label: 'SSD migration', grantee: 'brain', host: '100.83.112.88', user: 'apple', closes_at: new Date(Date.now() + 5 * 3600e3).toISOString(), max_runs: 0, run_count: 3, status: 'open' }], runs: [{ id: 4, status: 'succeeded', exit_code: 0, argv: ['incus', 'list'] }] };
+  const pg = page({ storage: signedIn, routes: hostopRoutes(state) });
+  await settle();
+  const html = pg.el('hostop-requests').innerHTML;
+  assert.match(html, /run, once/); assert.match(html, /incus list/); assert.match(html, /5 h left/); assert.match(html, /3 runs/); assert.match(html, /succeeded 0/);
+  const done = pg.ctx.decideHostop(21, true);
+  await settle();
+  pg.ctx.cancelPin();
+  await done;
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/hostops/requests/21/approve').length, 1, 'no retry after Cancel');
+  await pg.ctx.decideHostop(21, false);
+  assert.equal(pg.calls.filter(c => c.path === '/api/identity/gate/verify').length, 0, 'deny asked for no PIN');
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/hostops/requests/21/deny').length, 1);
+  await pg.ctx.closeHostopWindow(9);
+  assert.equal(pg.calls.filter(c => c.path === '/api/blindkey/hostops/windows/9/close').length, 1, 'closed after the confirm');
+});
+
+test('host operations: hostile fields stay inert, polling stops at sign-out and the cards are cleared', async () => {
+  const evil = `x');alert(1);//"><img src=x onerror=alert(2)>`;
+  const state = { requests: [hostopReq({ requester: evil, label: evil, reason: evil, host: 'h.example', user: 'apple', fingerprint: evil, shapes: [{ ...flightShape, name: 'n', argv: [{ literal: evil }, { slot: 's', enum: [evil] }] }] })],
+    windows: [{ id: 9, label: evil, grantee: evil, host: evil, user: evil, closes_at: new Date(Date.now() + 3600e3).toISOString(), max_runs: 1, run_count: 0 }], runs: [{ id: 1, status: evil, exit_code: null, argv: [evil] }] };
+  const pg = page({ storage: signedIn, routes: hostopRoutes(state) });
+  await settle();
+  const html = pg.el('hostop-requests').innerHTML;
+  assert.doesNotMatch(html, /<img/);
+  for (const m of html.matchAll(/\son\w+="([^"]*)"/g)) assert.match(m[1], /^(decideHostop\(21,(true|false)\)|closeHostopWindow\(9\))$/, 'handlers carry only numeric ids');
+  const polls = () => pg.calls.filter(c => c.path === '/api/blindkey/hostops/pending').length;
+  const before = polls();
+  for (const f of pg.intervals) f();
+  await settle();
+  assert.ok(polls() > before, 'polls while open');
+  pg.ctx.logout();
+  assert.equal(pg.el('hostop-requests').innerHTML, '', 'cards cleared at sign-out');
+  const atLogout = polls();
+  for (const f of pg.intervals) f();
+  await settle();
+  assert.equal(polls(), atLogout, 'no polling after sign-out');
+});
