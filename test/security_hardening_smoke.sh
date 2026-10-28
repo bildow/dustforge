@@ -4,9 +4,12 @@
 # admin API (a JSON file of principals; every request is logged to stalwart.log). Checks:
 #   - sign-in for each stored form: unsalted sha256, sha256 wrapped in scrypt, readable Stalwart password,
 #     hashed Stalwart password, current local hash (Stalwart never asked); a match upgrades the local hash and a
-#     sign-in never writes to Stalwart; wrong passwords fail; auth-critical works from the local hash alone;
+#     sign-in never writes to Stalwart; wrong passwords fail; auth-critical works from the local hash alone; a stale
+#     local password used while Stalwart is down signs in but is only salted, never promoted, so Stalwart decides
+#     again once it answers;
 #   - scripts/migrate-password-hashes.js: the dry run writes nothing; --execute hashes every readable Stalwart
-#     password (app passwords and hashed entries kept), Stalwart's password wins over a stale local sha256, and no
+#     password ({PLAIN} ones and an app password's readable inner part too; hashed entries and TOTP seeds kept),
+#     Stalwart's password wins over a stale local sha256 and over a disagreeing current local hash, and no
 #     unsalted hash is left;
 #   - deleting or revoking a secret empties its value; at start the sweep empties values of deleted rows, retires a
 #     rotation whose grace ended earlier today (an ISO time) and drops abandoned or finished checkouts' sealed
