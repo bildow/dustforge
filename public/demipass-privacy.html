@@ -75,6 +75,9 @@
       <li>Your agents get a short-lived token to <strong>use</strong> a secret. DemiPass puts the secret into the request on the server, so the agent never sees it.</li>
       <li>Filling a password into a website needs <strong>your approval and PIN on your phone</strong>, every time.</li>
       <li>We keep a record of every use, fill, reveal and refused attempt, so <strong>you can audit your vault</strong>.</li>
+      <li>Your account password and PIN are kept only as <strong>salted hashes</strong>, never readable, by us or by our mail server.</li>
+      <li>Your secrets travel <strong>straight to our server</strong>, encrypted the whole way. No proxy or CDN sees them.</li>
+      <li>Deleting a secret <strong>erases</strong> it. It isn't just hidden.</li>
       <li>No ads, no analytics or tracking scripts, no selling data, no training AI models on your data. Your secrets are never sent to AI model providers.</li>
     </ul>
   </div>
@@ -95,7 +98,7 @@
   <ul>
     <li>Your username, your DID (a public cryptographic identifier) and your private key, which is stored encrypted.</li>
     <li>Your @dustforge.com mail address and its mail, plus a forwarding or recovery address and a phone number if you give us one.</li>
-    <li>Your account password and PIN, stored only as hashes, never in readable form.</li>
+    <li>Your account password and PIN, stored only as salted scrypt hashes, never in readable form. That includes our mail server, which checks your mail login against the same hash.</li>
     <li>Sign-in sessions and approved devices, including agents and browsers you have paired.</li>
   </ul>
   <h3>Your vault</h3>
@@ -130,7 +133,7 @@
 
   <h2>Who else processes data</h2>
   <ul>
-    <li><strong>Cloudflare</strong> sits in front of demipass.com and api.dustforge.com and protects them from attacks. Encrypted connections end at Cloudflare and continue encrypted to our server, which means traffic, including secrets you store or fill, passes through Cloudflare's network unencrypted for a moment.</li>
+    <li><strong>Cloudflare</strong> delivers the demipass.com website. It does not carry the DemiPass API: the app, the browser extension, your agents and the web vault connect to api.dustforge.com directly, encrypted from your device to our server, so your secrets never pass through Cloudflare. Because Cloudflare delivers the website's pages, including the web vault page, the Android app and the browser extension are the most direct way to handle your secrets.</li>
     <li><strong>RackNerd</strong> hosts the server that runs DemiPass.</li>
     <li><strong>Stripe</strong> processes payments.</li>
     <li><strong>Backblaze B2</strong> holds our off-site backups. They are encrypted before they leave our servers, so Backblaze sees only encrypted data.</li>
@@ -140,9 +143,9 @@
 
   <h2>Keeping and deleting data</h2>
   <ul>
-    <li><strong>Deleting a secret</strong> stops it working at once: it can no longer be used, filled or revealed. Its encrypted record stays in our database marked as deleted. To have deleted secrets erased completely, email us and we will remove them.</li>
+    <li><strong>Deleting a secret</strong> erases its encrypted value at once, and within minutes the old bytes are overwritten in the database file too. The same happens when you revoke a secret, and to an old version once a rotation's grace period ends. Only the secret's name and its activity history stay, so you can still audit what happened.</li>
     <li><strong>Your activity log</strong> is kept while your account exists, so you can always audit it.</li>
-    <li><strong>Backups</strong> of the database are made twice a day, and the copies are replaced on a rolling schedule. Data you delete can stay in older backups until those copies expire.</li>
+    <li><strong>Backups</strong> of the database are made twice a day. Copies on our own servers are kept for a week. Encrypted off-site copies are kept daily for a week, weekly for a month and monthly for six months. Data you delete can stay in those copies for up to six months, until they expire.</li>
     <li><strong>To delete your account</strong>, email us. We will delete your account, vault and mailbox, keeping only what the law requires us to keep, such as payment records.</li>
   </ul>
 
