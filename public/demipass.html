@@ -89,6 +89,7 @@
     <a href="/vault-mobile.html">Vault</a>
     <a href="/qr-deposit.html">QR Deposit</a>
     <a href="https://www.npmjs.com/package/demipass">npm</a>
+    <a href="/#extension">Extension</a>
     <a href="https://github.com/bildow/demipass">GitHub</a>
   </div>
 </div>
@@ -117,12 +118,12 @@
 </div>
 
 <!-- Onboarding Journey -->
-<div style="background:var(--surface);padding:4rem 2rem">
+<div id="get-started" style="background:var(--surface);padding:4rem 2rem">
   <div style="max-width:700px;margin:0 auto">
     <h2 style="text-align:center;font-size:2rem;margin-bottom:0.5rem">Get started</h2>
-    <p style="text-align:center;color:var(--text2);margin-bottom:2.5rem">Three paths to your first deposit. Pick the one that fits.</p>
+    <p style="text-align:center;color:var(--text2);margin-bottom:2.5rem">Four paths to your first deposit. Pick the one that fits.</p>
 
-    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1.5rem">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:1.5rem">
       <!-- Path 1: Phone app -->
       <div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
         <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x1f4f1;</div>
@@ -159,6 +160,19 @@
           <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> <code style="background:var(--bg);padding:0.1rem 0.3rem;border-radius:3px">demipass.store({name, value})</code></p>
           <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Use ref code to access anywhere</p>
           <a href="https://www.npmjs.com/package/demipass" style="display:inline-block;padding:0.5rem 1rem;border:1px solid var(--border);color:var(--text2);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">View on npm</a>
+        </div>
+      </div>
+
+      <!-- Path 4: Browser extension -->
+      <div id="extension" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1.5rem">
+        <div style="font-size:1.5rem;margin-bottom:0.5rem">&#x1f310;</div>
+        <h3 style="font-size:0.95rem;margin-bottom:0.75rem;color:var(--green)">Browser Extension</h3>
+        <div style="font-size:0.8rem;color:var(--text2);line-height:1.6">
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">1.</strong> Install the app first &mdash; your phone approves everything</p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">2.</strong> Add the extension and pair it from the app</p>
+          <p style="margin-bottom:0.5rem"><strong style="color:var(--text)">3.</strong> Sign in somewhere &mdash; tap <em>Save</em> to vault it</p>
+          <p style="margin-bottom:0.75rem"><strong style="color:var(--text)">4.</strong> Fill later with a PIN on your phone</p>
+          <a href="https://github.com/bildow/demipass/tree/main/extension#install" style="display:inline-block;padding:0.5rem 1rem;border:1px solid var(--border);color:var(--text2);border-radius:6px;font-weight:700;font-size:0.8rem;text-decoration:none">Chrome &amp; Firefox</a>
         </div>
       </div>
     </div>
@@ -357,7 +371,7 @@
 </div>
 
 <footer>
-  <p>DemiPass &mdash; a <a href="https://dustforge.com">Dustforge</a> product &middot; <a href="https://dustforge.com/terms.html">Terms</a> &middot; <a href="https://dustforge.com/privacy.html">Privacy</a></p>
+  <p>DemiPass &mdash; a <a href="https://dustforge.com">Dustforge</a> product &middot; <a href="https://dustforge.com/terms.html">Terms</a> &middot; <a href="/privacy">Privacy</a></p>
   <p style="margin-top:0.5rem">Secrets management for the agentic era.</p>
 </footer>
 
