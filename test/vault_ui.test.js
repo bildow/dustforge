@@ -1199,3 +1199,36 @@ test('host operations: hostile fields stay inert, polling stops at sign-out and 
   await settle();
   assert.equal(polls(), atLogout, 'no polling after sign-out');
 });
+
+test('host operations: a one-time card says it runs as root / in the background; receipts show with no window open', async () => {
+  const once = hostopReq({ kind: 'run', argv: ['/usr/local/sbin/fix.sh', 'x'], shapes: [{ name: 'once', mode: 'job', sudo: true, max_seconds: 900, argv: [{ literal: '/usr/local/sbin/fix.sh' }, { literal: 'x' }] }], port: 2222 });
+  const state = { requests: [once], windows: [], runs: [{ id: 4, status: 'failed', exit_code: 3, argv: ['incus', 'list'], caller: 'brain', started_at: '2026-10-28 10:00:00', finished_at: '2026-10-28 10:02:00', stderr: 'boom: no such pool' }] };
+  const pg = page({ storage: signedIn, routes: hostopRoutes(state) });
+  await settle();
+  const html = pg.el('hostop-requests').innerHTML;
+  assert.match(html, /run, once <span class="ho-tag">as root \(sudo\)<\/span> <span class="ho-tag">in the background, up to 15 min<\/span>/, 'sudo and background on the one-time card');
+  assert.match(html, /apple@100\.83\.112\.88:2222/, 'a non-default port is shown');
+  assert.match(html, /Recent host runs/); assert.match(html, /failed 3/); assert.match(html, /2 min/); assert.match(html, /boom: no such pool/);
+  const done = pg.ctx.decideHostop(21, true);
+  await settle();
+  assert.match(pg.el('pin-unlock-what').textContent, /run one command as root in the background on 100\.83\.112\.88/);
+  pg.ctx.cancelPin(); await done;
+});
+
+test('host operations: a late failed poll from an ended session leaves the next account\'s cards alone', async () => {
+  let release; const state = { requests: [hostopReq()] };
+  const routes = hostopRoutes(state);
+  const pg = page({ routes: async (p, body) => {
+    if (loginFor(p, body)) return loginFor(p, body);
+    if (p === '/api/blindkey/hostops/pending' && state.hang) return new Promise((_, rej) => { release = () => rej(new TypeError('Failed to fetch')); });
+    return routes(p, body);
+  } });
+  await signInAs(pg, 'accountA');
+  state.hang = true; pg.ctx.loadHostops(); await settle();
+  pg.ctx.logout(); state.hang = false;
+  await signInAs(pg, 'accountB');
+  assert.match(pg.el('hostop-requests').innerHTML, /decideHostop\(21/, 'B sees its card');
+  release(); await settle();
+  assert.match(pg.el('hostop-requests').innerHTML, /decideHostop\(21/, 'A\'s late failure did not wipe B\'s card');
+  pg.ctx.logout();
+});
