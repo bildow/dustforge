@@ -11602,10 +11602,12 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
       });
     });
     pReq.setTimeout(10000, () => pReq.destroy(new Error('stalwart timeout')));
-    // Timed out or failed after the PATCH went out: Stalwart may have taken the new password or not. Clearing the
-    // local hash lets Stalwart decide, so neither password can win on DemiPass while the other works for mail.
-    pReq.on('error', () => {
-      try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(resetRow.did); } catch (_) {}
+    // Timed out or failed once connected: Stalwart may have taken the new password or not. Clearing the local hash
+    // lets Stalwart decide, so neither password can win on DemiPass while the other works for mail.
+    // Errors that mean the PATCH never reached Stalwart (no connection) leave both sides on the old password.
+    pReq.on('error', (err) => {
+      const neverSent = ['ECONNREFUSED', 'ENOTFOUND', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN'].includes(err && err.code);
+      if (!neverSent) try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(resetRow.did); } catch (_) {}
       fail(500, 'password service unavailable');
     });
     pReq.write(postData);
@@ -12870,4 +12872,7 @@ app.post('/api/blindkey/outcome', rateLimitStandard, (req, res) => {
 
 module.exports = { app, db, buoyNotifyConduit };
 
-app.listen(PORT, () => console.log(`Dustforge running on port ${PORT}`));
+// Loopback only: nginx is the front door (TLS, real client IP). Listening on every interface left the API
+// reachable as plain HTTP on the public IP, where a caller also chose its own X-Forwarded-For. HOST overrides.
+const HOST = process.env.HOST || '127.0.0.1';
+app.listen(PORT, HOST, () => console.log(`Dustforge running on ${HOST}:${PORT}`));

@@ -60,14 +60,14 @@ async function principals() {
 // here can see one landing between this script's read and its write.
 function apiAnswers() {
   return new Promise((resolve) => {
-    const r = http.get({ hostname: '127.0.0.1', port: Number(process.env.PORT || 3001), path: '/api/health', timeout: 2000 }, (res) => { res.resume(); resolve(true); });
+    const r = http.get({ hostname: '127.0.0.1', port: Number(process.env.PORT || 3000), path: '/api/health', timeout: 2000 }, (res) => { res.resume(); resolve(true); });
     r.on('error', () => resolve(false)); r.on('timeout', () => { r.destroy(); resolve(false); });
   });
 }
 
 (async () => {
   if (EXECUTE && !process.argv.includes('--api-stopped-elsewhere') && await apiAnswers()) {
-    console.error(`the dustforge API answers on 127.0.0.1:${process.env.PORT || 3001}: stop it first (systemctl stop dustforge), so no password reset can run while accounts are rewritten`);
+    console.error(`the dustforge API answers on 127.0.0.1:${process.env.PORT || 3000}: stop it first (systemctl stop dustforge), so no password reset can run while accounts are rewritten`);
     process.exit(2);
   }
   const db = new Database(DB_PATH);
