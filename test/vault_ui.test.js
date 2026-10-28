@@ -918,8 +918,12 @@ function netRoutes(state) {
     if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
     if (p === '/api/blindkey/fill/pending') return { json: { ok: true, requests: [], grants: [] } };
     if (p === '/api/fleets/mine') return { json: { ok: true, fleets: [] } };
-    if (p === '/api/network') return { json: { ok: true, me: { did: 'did:key:zFixture', username: 'fixture', pin_set: true, balance_cents: 900 }, fleet: null, member_of: null,
-                                               people: state.people || [], agents: [], incoming: state.incoming || [], outgoing: [] } };
+    if (p === '/api/network') return { json: { ok: true, me: { did: 'did:key:zFixture', username: 'fixture', pin_set: true, balance_cents: 900 }, fleet: null, member_of: state.member_of || null,
+                                               people: state.people || [], agents: [], incoming: state.incoming || [], outgoing: [],
+                                               topups: { incoming: state.topupsIn || [], outgoing: state.topupsOut || [] } } };
+    if (p === '/api/network/topups') { state.asked = body; state.topupsOut = [{ id: 9, direction: 'outgoing', owner: 'aaron', amount_cents: body.amount_cents, note: body.note }]; return { status: 201, json: { ok: true } }; }
+    if (p === '/api/network/topups/9/decline') { state.topupsIn = []; return { json: { ok: true } }; }
+    if (p === '/api/network/topups/9/withdraw') { state.topupsOut = []; return { json: { ok: true } }; }
     if (p === '/api/network/requests/4/accept') {
       if (!state.pinFresh) return { status: 403, json: { error: 'joining a fleet needs your PIN', missing: ['pin'], required: ['pin'], intent: 'join:4' } };
       state.pinFresh = false; state.incoming = []; return { json: { ok: true, kind: 'agent' } };
@@ -1006,6 +1010,56 @@ test('Send DD: the transfer is created, then confirmed with the PIN for send:<id
   await second; await settle();
   assert.equal(pg.calls.filter(c => c.path === '/api/network/transfers/7/confirm').length, 3, 'no retry after Cancel');
   assert.equal(state.cancelled, 1, 'the waiting transfer is cancelled on the server');
+});
+
+// ── top-up asks: an agent asks its fleet owner for DD ─────────────────────────────────────────────────
+test('an agent\'s top-up ask shows on the owner\'s home; Send DD opens prefilled, Decline posts once', async () => {
+  const evil = `x');alert(1);//"><img src=x onerror=alert(2)>`;
+  const state = { topupsIn: [{ id: 9, direction: 'incoming', agent: 'felixbaakmk', amount_cents: 200, note: evil, agent_balance_cents: 0 }],
+                  incoming: [netReq()], intent: 'send:7' };
+  const pg = page({ storage: signedIn, routes: netRoutes(state) });
+  await settle();
+  const html = pg.el('net-requests').innerHTML;
+  assert.match(html, /<b>felixbaakmk<\/b> asks for <b>200 DD<\/b>/);
+  assert.match(html, /It has 0 DD/);
+  assert.doesNotMatch(html, /<img/);
+  assert.equal(pg.el('net-badge').textContent, 'Fleet · 2 requests ›', 'asks count with connection requests');
+  pg.ctx.openSend('felixbaakmk', 200);
+  assert.equal(pg.el('send-to-name').textContent, 'felixbaakmk');
+  assert.equal(pg.el('send-amount').value, '200');
+  assert.equal(pg.el('send-note').value, 'Top-up');
+  pg.ctx.closeModal();
+  pg.ctx.openSend('kylemayor');
+  assert.equal(pg.el('send-amount').value, '', 'a plain Send DD is not prefilled');
+  pg.ctx.closeModal();
+  const d1 = pg.ctx.declineTopup(9), d2 = pg.ctx.declineTopup(9);
+  await d1; await d2; await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/network/topups/9/decline').length, 1, 'a double tap declines once');
+  assert.equal(pg.calls.filter(c => c.path === '/api/identity/gate/verify').length, 0, 'decline asks for no PIN');
+  assert.equal(pg.el('net-badge').textContent, 'Fleet · 1 request ›');
+});
+
+test('an agent wallet asks its fleet owner for DD with a note, and can withdraw the ask', async () => {
+  const state = { member_of: { slug: 'aaron', name: "aaron's fleet", owner: 'aaron', owner_did: 'did:key:zAaron', handle: 'felixbaakmk' }, intent: 'none' };
+  const pg = page({ storage: signedIn, routes: netRoutes(state) });
+  await settle();
+  await pg.ctx.loadFleet();
+  assert.match(pg.el('fleet-content').innerHTML, /Ask for DD/);
+  pg.ctx.openTopup();
+  assert.equal(pg.el('topup-owner').textContent, 'aaron');
+  assert.equal(pg.shown('modal-topup'), true);
+  pg.el('topup-amount').value = '0';
+  await pg.ctx.askTopup();
+  assert.equal(state.asked, undefined, 'a zero amount is refused before anything is sent');
+  pg.el('topup-amount').value = '120'; pg.el('topup-note').value = ' out of DD mid-task ';
+  await pg.ctx.askTopup(); await settle();
+  assert.deepEqual({ ...state.asked }, { amount_cents: 120, note: 'out of DD mid-task' });
+  assert.equal(pg.shown('modal-topup'), false, 'sheet closes once asked');
+  assert.match(pg.el('fleet-content').innerHTML, /You asked <b>aaron<\/b> for <b>120 DD<\/b>/);
+  await pg.ctx.withdrawTopup(9); await settle();
+  assert.equal(pg.calls.filter(c => c.path === '/api/network/topups/9/withdraw').length, 1);
+  await pg.ctx.loadFleet();   // the fleet tab is not the active page in this harness
+  assert.doesNotMatch(pg.el('fleet-content').innerHTML, /You asked/);
 });
 
 // Changing the recovery email takes the account password (the server refuses a token alone).

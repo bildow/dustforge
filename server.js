@@ -293,6 +293,18 @@ const _jsonParser = express.json();
 const _urlencodedParser = express.urlencoded({ extended: false });
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, next)));
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, next)));
+// Every "not enough DD" (402) answer tells an agent how to ask its fleet owner for a top-up (network_routes.js).
+app.use((req, res, next) => {
+  const json = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode === 402 && body && typeof body === 'object' && !Array.isArray(body) && !body.topup) {
+      body = { ...body, topup: { how: 'POST /api/network/topups', body: { amount_cents: '<whole DD>', note: '<why you need it>' },
+        note: 'An agent in a fleet asks its owner for DD this way; the owner sees the ask and the note in their wallet.' } };
+    }
+    return json(body);
+  };
+  next();
+});
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 
 // DemiPass public surface — rewrite /api/demipass/* to /api/blindkey/* at the raw URL level

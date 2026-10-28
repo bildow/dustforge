@@ -471,6 +471,18 @@
   </div>
 </div>
 
+<!-- An agent asks its fleet owner for DD -->
+<div id="modal-topup" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Ask <span id="topup-owner"></span> for DD</h3>
+    <label>Amount (DD)</label><input type="number" id="topup-amount" min="1" step="1" inputmode="numeric" placeholder="e.g. 100">
+    <label>Why (optional)</label><input type="text" id="topup-note" maxlength="200" placeholder="e.g. out of DD mid-task">
+    <div style="font-size:0.72rem;color:var(--text3);margin-top:0.25rem">They see your ask and your note in their wallet and decide. Nothing moves until they send.</div>
+    <div id="topup-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="askTopup()">Ask</button></div>
+  </div>
+</div>
+
 <!-- Vault PIN: unlock (asked by a gate), first-time setup (mandatory), change (settings) -->
 <div id="modal-pin" class="modal-bg" onclick="if(event.target===this)cancelPin()">
   <div class="modal-sheet">
@@ -1015,24 +1027,41 @@ function netCard(r){
   }
   return h+'</div>';
 }
+// Top-up asks: an agent short of DD asks its fleet owner; the owner answers with Send DD (any send to that agent
+// closes the ask) or declines.
+function topupCard(t){
+  const key='t'+t.id, busy=netBusy.has(key)?'disabled ':'';
+  let h='<div class="fill-req"><div>';
+  h+=t.direction==='incoming'?'Agent <b>'+esc(t.agent||'')+'</b> asks for <b>'+dd(t.amount_cents)+' DD</b>':'You asked <b>'+esc(t.owner||'')+'</b> for <b>'+dd(t.amount_cents)+' DD</b>';
+  h+='</div>';
+  if(t.note) h+='<div style="margin-top:0.25rem">“'+esc(t.note)+'”</div>';
+  if(t.direction==='incoming'){
+    h+='<div style="color:var(--text3);margin-top:0.25rem">It has '+dd(t.agent_balance_cents)+' DD. Send DD answers the ask; you can change the amount.</div>';
+    h+='<div class="fr-row"><button class="btn-primary" '+busy+'onclick="openSend('+jsArg(t.agent)+','+Number(t.amount_cents)+')">Send DD</button><button class="btn-ghost" '+busy+'onclick="declineTopup('+Number(t.id)+')">Decline</button></div>';
+  } else {
+    h+='<div class="fr-row"><button class="btn-ghost" '+busy+'onclick="withdrawTopup('+Number(t.id)+')">Withdraw</button></div>';
+  }
+  return h+'</div>';
+}
+function netTopups(dir){ return (netData&&netData.topups&&netData.topups[dir])||[]; }
 function renderNetRequests(){
-  const inc=(netData&&netData.incoming)||[];
-  document.getElementById('net-requests').innerHTML=inc.map(netCard).join('');
-  document.getElementById('net-badge').textContent=inc.length?('Fleet · '+inc.length+' request'+(inc.length===1?'':'s')+' ›'):'Fleet ›';
+  const inc=(netData&&netData.incoming)||[], tin=netTopups('incoming'), n=inc.length+tin.length;
+  document.getElementById('net-requests').innerHTML=tin.map(topupCard).join('')+inc.map(netCard).join('');
+  document.getElementById('net-badge').textContent=n?('Fleet · '+n+' request'+(n===1?'':'s')+' ›'):'Fleet ›';
 }
 function networkSection(n){
   if(!n) return '';
   let h='';
-  const reqs=[...(n.incoming||[]),...(n.outgoing||[])];
-  if(reqs.length){
+  const reqs=[...(n.incoming||[]),...(n.outgoing||[])], tops=[...((n.topups&&n.topups.incoming)||[]),...((n.topups&&n.topups.outgoing)||[])];
+  if(reqs.length||tops.length){
     h+='<div class="section-head" style="padding:0.25rem 0 0"><span class="section-title">Requests</span></div>';
-    h+='<div style="margin:0 -1rem 0.75rem">'+reqs.map(netCard).join('')+'</div>';
+    h+='<div style="margin:0 -1rem 0.75rem">'+tops.map(topupCard).join('')+reqs.map(netCard).join('')+'</div>';
   }
   if(n.member_of){
     const m=n.member_of;
     h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:1rem;font-size:0.8rem">';
     h+='This wallet is agent <b>@'+esc(m.handle)+'</b> in <b>'+esc(m.owner)+'</b>\'s fleet.';
-    h+='<div class="fr-row" style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-primary" style="flex:1" onclick="openSend('+jsArg(m.owner)+')">Send DD</button><button class="btn-ghost" style="flex:1" onclick="leaveFleet()">Leave fleet</button></div></div>';
+    h+='<div class="fr-row" style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-primary" style="flex:1" onclick="openTopup()">Ask for DD</button><button class="btn-ghost" style="flex:1" onclick="openSend('+jsArg(m.owner)+')">Send DD</button><button class="btn-ghost" style="flex:1" onclick="leaveFleet()">Leave fleet</button></div></div>';
   }
   h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">People</span><span style="font-size:0.7rem;color:var(--text3)">'+dd(n.me&&n.me.balance_cents)+' DD in your wallet</span></div>';
   if(!(n.people||[]).length) h+='<div class="empty" style="font-size:0.75rem">No contacts yet. Tap + Wallet and pick “A person”.</div>';
@@ -1074,13 +1103,14 @@ async function addWallet(){
     closeSheet('netadd'); loadFleet();
   }catch(e){ if(!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
 }
-function openSend(username){
+function openSend(username, amount){
   if(!username) return;
   sendTo=username; sendBusy=false;
   document.getElementById('send-to-name').textContent=username;
   document.getElementById('send-balance').textContent=dd(netData&&netData.me&&netData.me.balance_cents);
   document.getElementById('send-pin-note').textContent=(netData&&netData.me&&netData.me.pin_set===false)?'This wallet has no PIN: Send sends at once.':'Your PIN approves the transfer.';
   for(const i of ['send-amount','send-note']) document.getElementById(i).value='';
+  if(amount){ document.getElementById('send-amount').value=String(amount); document.getElementById('send-note').value='Top-up'; }
   const m=document.getElementById('send-msg'); m.textContent=''; m.className='modal-msg';
   openModal('send'); setTimeout(()=>document.getElementById('send-amount').focus(),80);
 }
@@ -1102,6 +1132,29 @@ async function sendDD(){
     sendBusy=false; sendTo=null; loadFleet();
   }
 }
+function openTopup(){
+  const m=netData&&netData.member_of; if(!m) return;
+  document.getElementById('topup-owner').textContent=m.owner;
+  for(const i of ['topup-amount','topup-note']) document.getElementById(i).value='';
+  const el=document.getElementById('topup-msg'); el.textContent=''; el.className='modal-msg';
+  openModal('topup'); setTimeout(()=>document.getElementById('topup-amount').focus(),80);
+}
+async function askTopup(){
+  const m=document.getElementById('topup-msg'), a=Number(document.getElementById('topup-amount').value);
+  if(!Number.isInteger(a)||a<1){ m.textContent='A whole number of DD, 1 or more'; m.className='modal-msg err'; return; }
+  try{
+    m.textContent='Asking…'; m.className='modal-msg';
+    await api('POST','/api/network/topups',{amount_cents:a,note:document.getElementById('topup-note').value.trim()});
+    closeSheet('topup'); loadFleet();
+  }catch(e){ if(!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
+}
+async function topupAct(id, act){
+  const key='t'+id; if(netBusy.has(key)) return; netBusy.add(key); renderNetRequests();
+  try{ await api('POST','/api/network/topups/'+id+'/'+act); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  finally{ netBusy.delete(key); if(document.getElementById('page-fleet').classList.contains('active')) loadFleet(); else loadNetwork(); }
+}
+function declineTopup(id){ topupAct(id,'decline'); }
+function withdrawTopup(id){ topupAct(id,'withdraw'); }
 async function removePerson(username){
   if(!confirm('Remove '+username+' from your contacts? You can no longer send each other DD until one of you adds the other again.')) return;
   try{ await api('POST','/api/network/people/remove',{username}); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
