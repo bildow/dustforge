@@ -7420,6 +7420,12 @@ require('./network_routes')({
   app, db, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   barrelGuardedTransfer, transferRefusal: transferBarrelRefusal, sendMail: fleetRoutes.sendMail,
 });
+// Host operations: typed argv on owner-registered, key-pinned hosts, inside PIN-approved windows. docs/host-operations.md.
+require('./hostops_routes')({
+  app, db, billing, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse, logSecurityEvent, blindkeyDecrypt,
+  siliconHasPermission, cleanLabel, REDEEMABLE_STATUS_SQL, rateLimitStandard, rateLimitPoll: rateLimitFill,
+  dataDir: require('path').dirname(DB_PATH),
+});
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
   try {
@@ -12383,7 +12389,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|hostop):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, hostop:<host-operation request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

@@ -52,6 +52,12 @@
   .fill-req .fr-origin { font-weight:700; word-break:break-all; }
   .fill-req .fr-row { display:flex; gap:0.5rem; margin-top:0.6rem; }
   .fill-req .fr-row button { flex:1; padding:0.55rem; border-radius:8px; }
+  .ho-argv { font-family:monospace; font-size:0.72rem; word-break:break-all; margin-top:0.2rem; }
+  .ho-shape { margin-top:0.45rem; padding-top:0.35rem; border-top:1px solid var(--border); }
+  .ho-tag { font-size:0.6rem; border:1px solid var(--border); border-radius:6px; padding:0 0.3rem; color:var(--text3); }
+  .ho-run { font-family:monospace; font-size:0.66rem; word-break:break-all; margin-top:0.3rem; }
+  .ho-out { color:var(--text3); white-space:pre-wrap; }
+  .ho-st { font-family:inherit; font-weight:700; } .ho-succeeded { color:var(--green); } .ho-failed, .ho-timed_out, .ho-error, .ho-lost { color:var(--red); } .ho-running { color:var(--yellow); }
 
   /* Sections */
   .section { padding:0 1rem 1rem; }
@@ -169,6 +175,7 @@
 
   <!-- Browser fill requests waiting for this person: the extension asked, the phone approves with the PIN -->
   <div id="fill-requests"></div>
+  <div id="hostop-requests"></div>
   <div id="net-requests"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
@@ -574,6 +581,7 @@ let secrets=[],panic=false;
 let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
 let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
+let hostopReqs=[], hostopWindows=[], hostopRuns=[], hostopBusy=new Set();   // host operations waiting on this wallet (docs/host-operations.md)
 let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
 let netData=null, netBusy=new Set(), sendTo=null, sendBusy=false, topupBusy=false;   // network: GET /api/network, requests being decided, the open send
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
@@ -615,7 +623,7 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests','hostop-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();hostopReqs=[];hostopWindows=[];hostopRuns=[];hostopBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why','net-msg','send-msg','send-to-name','send-balance']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -995,7 +1003,7 @@ async function showApp(){
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
-  loadFillRequests();
+  loadFillRequests(); loadHostops();
   loadNetwork()}
 
 // ── Network: people, agents joining a fleet, sending DD ───────────────────
@@ -1170,6 +1178,79 @@ async function leaveFleet(){
   try{ r=await api('POST','/api/network/leave-fleet'); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
   if(r&&r.signed_out){ logout(); document.getElementById('auth-err').textContent='You left the fleet and every session of this wallet was signed out. Sign in again.'; return; }
   fleetSlug=null; loadFleet();
+}
+
+// ── Host operations ────────────────────────────────────────────────────────
+// An agent asks to run commands on a host with a stored SSH password: either one exact command, or a window of
+// command shapes for some hours. Approve with the PIN (intent hostop:<id>) or deny; open windows can be closed here.
+async function loadHostops(){
+  const epoch=sessionEpoch;
+  try{ const r=await api('GET','/api/blindkey/hostops/pending'); if(epoch!==sessionEpoch||!vaultOpen) return;
+    hostopReqs=(r.requests||[]).filter(q=>!q.own_session); hostopWindows=r.windows||[]; hostopRuns=r.runs||[]; }
+  catch(e){ if(sessionEnded(e)||epoch!==sessionEpoch) return; if(e.status===429) return; hostopReqs=[]; hostopWindows=[]; hostopRuns=[]; }
+  renderHostops();
+}
+// One shape as words: literals as typed, slots as ‹name: allowed values›.
+function hostopShapeText(s){
+  const word=e=>{
+    if(e.literal!==undefined) return esc(e.literal)+(e.optional?'?':'');
+    const allowed=e.enum?e.enum.join(' | '):e.match?e.match:e.type==='path'?'path under '+(e.under||[]).join(', '):e.type;
+    return (e.prefix?esc(e.prefix):'')+'<i>‹'+esc(e.slot)+': '+esc(allowed)+'›</i>'+(e.optional?'?':'');
+  };
+  const tags=hostopTags(s);
+  return '<div class="ho-shape"><b>'+esc(s.name)+'</b>'+tags+'<div class="ho-argv">'+(s.argv||[]).map(word).join(' ')+'</div></div>';
+}
+function hostopSpan(sec){ sec=Number(sec)||0; return sec<3600?Math.max(1,Math.round(sec/60))+' min':sec<172800?Math.round(sec/360)/10+' h':Math.round(sec/8640)/10+' days'; }
+// What a shape is allowed to do beyond its words: as root, in the background (and for how long at most).
+function hostopTags(s){ return (s&&s.sudo?' <span class="ho-tag">as root (sudo)</span>':'')+(s&&s.mode==='job'?' <span class="ho-tag">in the background, up to '+hostopSpan(s.max_seconds)+'</span>':''); }
+function hostopWhen(iso){ const sec=(Date.parse(iso)-Date.now())/1000; return sec<=0?'closed':hostopSpan(sec)+' left'; }
+function hostopAt(q){ return esc(q.user)+'@'+esc(q.host)+(q.port&&Number(q.port)!==22?':'+Number(q.port):''); }
+function renderHostops(){
+  const el=document.getElementById('hostop-requests'); if(!el) return;
+  let h=hostopReqs.map(q=>{
+    const busy=hostopBusy.has(q.id)?'disabled ':'';
+    const what=q.kind==='run'
+      ?'<div>Let <b>'+esc(q.requester)+'</b> run, once'+hostopTags((q.shapes||[])[0])+':</div><div class="ho-argv">'+(q.argv||[]).map(esc).join(' ')+'</div>'
+      :'<div>Let <b>'+esc(q.requester)+'</b> run these for <b>'+Number(q.duration_hours)+' h</b> — '+esc(q.label)+'</div>'+(q.shapes||[]).map(hostopShapeText).join('');
+    return '<div class="fill-req">'+what
+      +'<div style="color:var(--text3);margin-top:0.35rem">on <b>'+hostopAt(q)+'</b>'+(q.host_is_new?' — new host, key '+esc(q.fingerprint):'')+'</div>'
+      +(q.reason?'<div style="color:var(--text3);margin-top:0.25rem">why: '+esc(q.reason)+'</div>':'')
+      +'<div class="fr-row"><button class="btn-primary" '+busy+'onclick="decideHostop('+Number(q.id)+',true)">Approve</button>'
+      +'<button class="btn-ghost" '+busy+'onclick="decideHostop('+Number(q.id)+',false)">Deny</button></div></div>';
+  }).join('');
+  if(hostopWindows.length){
+    h+='<div class="fill-req"><div><b>Open host windows</b></div>'+hostopWindows.map(w=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;margin-top:0.45rem"><div style="min-width:0">'+esc(w.label||'window')
+      +'<div style="color:var(--text3);font-size:0.7rem">'+esc(w.grantee)+' · '+esc(w.user)+'@'+esc(w.host)+' · '+hostopWhen(w.closes_at)+' · '+Number(w.run_count)+(Number(w.max_runs)?'/'+Number(w.max_runs):'')+' runs</div></div>'
+      +'<button class="btn-ghost" '+(hostopBusy.has('w'+w.id)?'disabled ':'')+'onclick="closeHostopWindow('+Number(w.id)+')">Close</button></div>').join('')+'</div>';
+  }
+  if(hostopRuns.length){
+    const took=r=>{ const a=Date.parse((r.started_at||'').replace(' ','T')+'Z'), b=Date.parse((r.finished_at||'').replace(' ','T')+'Z'); return a&&b&&b>=a?' · '+hostopSpan((b-a)/1000):''; };
+    const last=r=>{ const t=String(r.stderr||r.stdout||'').trim().split('\n').pop()||''; return t?'<div class="ho-out">'+esc(t.slice(-160))+'</div>':''; };
+    h+='<div class="fill-req"><div><b>Recent host runs</b></div>'+hostopRuns.slice(0,5).map(r=>
+      '<div class="ho-run"><span class="ho-st ho-'+esc(r.status)+'">'+esc(r.status)+(r.exit_code!==null&&r.exit_code!==undefined?' '+Number(r.exit_code):'')+'</span> '
+      +(r.argv||[]).map(esc).join(' ')+'<span style="color:var(--text3)"> · '+esc(r.caller)+took(r)+'</span>'+last(r)+'</div>').join('')+'</div>';
+  }
+  el.innerHTML=h;
+}
+async function decideHostop(id, approve){
+  const q=hostopReqs.find(x=>x.id===id); if(!q||hostopBusy.has(id)) return;
+  hostopBusy.add(id); renderHostops();
+  try{
+    if(approve) await apiGated('POST','/api/blindkey/hostops/requests/'+id+'/approve',{},
+      (q.kind==='run'?'Let '+q.requester+' run one command'+((q.shapes||[])[0]&&q.shapes[0].sudo?' as root':'')+((q.shapes||[])[0]&&q.shapes[0].mode==='job'?' in the background':''):'Open a '+q.duration_hours+' h window for '+q.requester)+' on '+q.host+'? Your PIN approves it.');
+    else await api('POST','/api/blindkey/hostops/requests/'+id+'/deny');
+    hostopReqs=hostopReqs.filter(x=>x.id!==id);
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ hostopBusy.delete(id); loadHostops(); }
+}
+async function closeHostopWindow(id){
+  const w=hostopWindows.find(x=>x.id===id), key='w'+id; if(!w||hostopBusy.has(key)) return;
+  if(!confirm('Close "'+(w.label||'window')+'"? '+w.grantee+' can no longer run its commands on '+w.host+'.')) return;
+  hostopBusy.add(key); renderHostops();
+  try{ await api('POST','/api/blindkey/hostops/windows/'+id+'/close'); }
+  catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  finally{ hostopBusy.delete(key); loadHostops(); }
 }
 
 // ── Browser fill approvals ─────────────────────────────────────────────────
@@ -1959,6 +2040,7 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeMod
 setInterval(()=>{if(tk&&vaultOpen)loadVault()},30000);
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadFillRequests()},4000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadHostops()},10000);
 
 // ── QR Scanner ──
 
