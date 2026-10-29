@@ -106,6 +106,7 @@ function createEmailTransport() {
 // daily slot before billing, and return it on any failed response. Security
 // mail and internal alerts use the same relay but are exempt from this cap.
 function emailWarmupGuard(req, res, next) {
+  if (require('./brain_mail_quota').brainMailQuota(db, req, res, next)) return;
   const start = process.env.MAIL_WARMUP_START_UTC;
   if (!start) return next();
   const startMs = Date.parse(start);
@@ -1739,7 +1740,7 @@ app.post('/api/billing/topup', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/email/send', emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+app.post('/api/email/send', billing.billingMiddleware(db, 'email_send', { cost: 0 }), emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject, and body required' });
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
