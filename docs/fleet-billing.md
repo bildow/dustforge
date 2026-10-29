@@ -26,7 +26,10 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
 7. **Refills.** Per silicon: `refill_enabled`, `refill_threshold_cents`, `refill_amount_cents` — when the
    silicon's balance drops below the threshold, the owner's wallet (or the fleet wallet) transfers the amount
    (lineage-preserving transfer, not a mint). Checked inline right after every attributed charge and by the
-   5-minute scheduler; one refill per silicon per 10 minutes. Per owner: `wallet_refill_rules` — a
+   5-minute scheduler; one refill per silicon per 10 minutes. Optional `refill_daily_cap_cents` (0 = none)
+   caps what the automatic refills move in any rolling 24 h (the last one is cut to what's left; manual
+   refills don't count). A silicon below its threshold whose refill can't run (cap reached, or the source
+   is short) mails `refill_alert_email` from the scheduler pass, at most once per 24 h. Per owner: `wallet_refill_rules` — a
    daily/weekly/monthly operator-grant credit with an idempotency key per period. Operator grants are only
    honoured for DIDs listed in `OPERATOR_GRANT_DIDS` (env, comma-separated). Stripe-funded refills are
    declared but not implemented (the rule records the error).

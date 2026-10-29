@@ -233,6 +233,60 @@ test('token status and expiry warnings', () => {
   assert.equal(fb.tokenStatus(db, BRAIN, now).status, 'valid');
 });
 
+test('threshold refill daily cap: rolling 24 h of automatic refills, manual refills not counted, alert once', () => {
+  const db = mkdb();
+  fund(db, OWNER, 2000);
+  const s = fb.upsertSilicon(db, { fleetId: 1, memberDid: BRAIN, handle: 'brain', displayName: 'Brain',
+    refill: { enabled: true, threshold_cents: 20, amount_cents: 30 } });
+  fb.updateSiliconSettings(db, s, { refill_daily_cap_cents: 50, refill_alert_email: 'brain@dustforge.com' });
+  assert.throws(() => fb.updateSiliconSettings(db, s, { refill_daily_cap_cents: -1 }), /refill_daily_cap_cents/);
+  assert.throws(() => fb.updateSiliconSettings(db, s, { refill_alert_email: 'not an address' }), /refill_alert_email/);
+  const mails = [];
+  const mailer = m => mails.push(m);
+  const later = n => Date.now() + n * 11 * 60 * 1000;            // step past the 10-min cooldown
+  // 0 DD → first automatic refill: the full 30
+  let out = fb.runSiliconRefills(db, billing, { now: later(0), mailer });
+  assert.equal(out[0].ok, true); assert.equal(bal(db, BRAIN), 30);
+  // a manual refill does not count against the cap
+  assert.equal(fb.thresholdRefill(db, billing, fb.getSilicon(db, 1, 'brain'), { force: true, amount: 100 }).ok, true);
+  assert.equal(fb.autoRefilledLast24h(db, BRAIN), 30);
+  billing.deductBalance(db, BRAIN, 120, 'api_call_compute', 'burn');   // 10 DD, below threshold
+  // second automatic refill is cut to the 20 left under the cap
+  out = fb.runSiliconRefills(db, billing, { now: later(1), mailer });
+  assert.equal(out[0].ok, true); assert.equal(out[0].amount, 20); assert.equal(bal(db, BRAIN), 30);
+  assert.equal(fb.autoRefilledLast24h(db, BRAIN), 50);
+  billing.deductBalance(db, BRAIN, 25, 'api_call_compute', 'burn');    // 5 DD
+  // cap reached: nothing moves, Brain is told once
+  out = fb.runSiliconRefills(db, billing, { now: later(2), mailer });
+  assert.equal(out[0].skipped, 'daily cap reached'); assert.equal(out[0].alerted, 'brain@dustforge.com');
+  assert.equal(bal(db, BRAIN), 5);
+  assert.equal(mails.length, 1); assert.equal(mails[0].to, 'brain@dustforge.com');
+  assert.match(mails[0].subject, /brain is low on DD \(5 DD\)/); assert.match(mails[0].text, /daily cap of 50 DD/);
+  out = fb.runSiliconRefills(db, billing, { now: later(3), mailer });
+  assert.equal(out[0].skipped, 'daily cap reached'); assert.equal(out[0].alerted, undefined);
+  assert.equal(mails.length, 1, 'once per 24 h');
+  // the view reports cap, use and alert address
+  const v = fb.siliconView(db, billing, fb.getSilicon(db, 1, 'brain'));
+  assert.deepEqual([v.refill.daily_cap_cents, v.refill.auto_last_24h_cents, v.refill.alert_email], [50, 50, 'brain@dustforge.com']);
+  // 24 h later the window has moved: the automatic refills are older than a day
+  db.prepare("UPDATE identity_transactions SET created_at = datetime('now', '-25 hours') WHERE did = ? AND description LIKE 'Auto refill %'").run(BRAIN);
+  db.prepare("UPDATE fleet_silicons SET last_refill_at = datetime('now', '-25 hours') WHERE member_did = ?").run(BRAIN);
+  out = fb.runSiliconRefills(db, billing, { now: Date.now(), mailer });
+  assert.equal(out[0].ok, true); assert.equal(out[0].amount, 30); assert.equal(bal(db, BRAIN), 35);
+});
+
+test('threshold refill without a cap is unchanged (cap 0)', () => {
+  const db = mkdb();
+  fund(db, OWNER, 2000);
+  fb.upsertSilicon(db, { fleetId: 1, memberDid: BRAIN, handle: 'brain', refill: { enabled: true, threshold_cents: 20, amount_cents: 300 } });
+  const t0 = Date.now();
+  for (let i = 0; i < 3; i++) {
+    const out = fb.runSiliconRefills(db, billing, { now: t0 + i * 11 * 60 * 1000 });
+    assert.equal(out[0].ok, true); assert.equal(out[0].amount, 300);
+    billing.deductBalance(db, BRAIN, 300, 'api_call_compute', 'burn');
+  }
+});
+
 test('runRefills runs every engine and attributionReport/recentSpend read back', () => {
   const db = mkdb();
   fund(db, OWNER, 1000);
