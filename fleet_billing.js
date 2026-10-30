@@ -145,6 +145,11 @@ function initSchema(db) {
   // link: the owner holds its key and may mint its tokens and workers) or 'network' (the wallet accepted a network
   // request: it keeps its own key; the owner refills it, delegates to it and sees its spend, and mints nothing).
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN joined_via TEXT DEFAULT 'owner'`); } catch (_) {}
+  // Threshold refills may be capped per rolling 24 h (0 = no cap). When a silicon is below its threshold and the
+  // refill can't run (cap reached, or the source is short), refill_alert_email is told, once per 24 h.
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_daily_cap_cents INTEGER DEFAULT 0`); } catch (_) {}
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_alert_email TEXT DEFAULT ''`); } catch (_) {}
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_alerted_at TEXT`); } catch (_) {}
   db.exec(`CREATE TABLE IF NOT EXISTS fleet_token_cuts (
     did TEXT NOT NULL,
     fleet TEXT NOT NULL,
@@ -378,6 +383,16 @@ function updateSiliconSettings(db, siliconRow, patch) {
     if (!Number.isInteger(n) || n < 0 || n > 1000000) throw Object.assign(new Error('refill_amount_cents: integer 0-1000000'), { statusCode: 400 });
     fields.push('refill_amount_cents = ?'); vals.push(n);
   }
+  if (patch.refill_daily_cap_cents !== undefined) {
+    const n = Number(patch.refill_daily_cap_cents);
+    if (!Number.isInteger(n) || n < 0 || n > 1000000) throw Object.assign(new Error('refill_daily_cap_cents: integer 0-1000000'), { statusCode: 400 });
+    fields.push('refill_daily_cap_cents = ?'); vals.push(n);
+  }
+  if (patch.refill_alert_email !== undefined) {
+    const e = String(patch.refill_alert_email || '').trim();
+    if (e && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) throw Object.assign(new Error('refill_alert_email: an email address, or empty'), { statusCode: 400 });
+    fields.push('refill_alert_email = ?'); vals.push(e.slice(0, 200));
+  }
   if (patch.refill_source !== undefined) {
     if (!['owner', 'fleet'].includes(patch.refill_source)) throw Object.assign(new Error("refill_source: 'owner' or 'fleet'"), { statusCode: 400 });
     fields.push('refill_source = ?'); vals.push(patch.refill_source);
@@ -421,7 +436,9 @@ function siliconView(db, billing, s, { fleet } = {}) {
     did: s.member_did, silicon_id: s.silicon_id, username: w.username || null, email: w.email || null,
     wallet_status: w.status || null, balance_cents: balance, last_active: lastTx ? lastTx.created_at : null,
     refill: { enabled: !!s.refill_enabled, threshold_cents: s.refill_threshold_cents, amount_cents: s.refill_amount_cents,
-              source: s.refill_source, last_refill_at: s.last_refill_at, last_error: s.last_refill_error || '' },
+              source: s.refill_source, last_refill_at: s.last_refill_at, last_error: s.last_refill_error || '',
+              daily_cap_cents: s.refill_daily_cap_cents || 0, auto_last_24h_cents: autoRefilledLast24h(db, s.member_did),
+              alert_email: s.refill_alert_email || '' },
     token: tokenStatus(db, s.member_did),
     fleet: fleet ? { slug: fleet.slug, name: fleet.name } : undefined,
     status: s.status, created_at: s.created_at, joined_via: s.joined_via || 'owner',
@@ -475,13 +492,28 @@ function fromItsFleet(db, fromDid, agentDid) {
   return Boolean(r && (r.owner_did === fromDid || (r.wallet_did && r.wallet_did === fromDid)));
 }
 
+// Automatic (threshold) refills are told apart from manual ones by their description, so the daily cap
+// counts only what the rule moved, never what the owner sent by hand.
+const AUTO_REFILL_PREFIX = 'Auto refill ';
+function autoRefilledLast24h(db, did, now = Date.now()) {
+  const r = db.prepare(`SELECT COALESCE(SUM(amount_cents), 0) AS c FROM identity_transactions
+                        WHERE did = ? AND type = 'fleet_transfer_refill_in' AND description LIKE ? AND created_at >= ?`)
+    .get(did, AUTO_REFILL_PREFIX + '%', sqlNow(new Date(now - 86400000)));
+  return r ? r.c : 0;
+}
+
 function thresholdRefill(db, billing, s, { force = false, amount = null, now = Date.now(), ledger = null } = {}) {
-  const amt = Number(amount != null ? amount : s.refill_amount_cents);
+  let amt = Number(amount != null ? amount : s.refill_amount_cents);
   if (!force) {
     if (!s.refill_enabled || !(s.refill_threshold_cents > 0) || !(amt > 0)) return { ok: false, skipped: 'rule disabled' };
     const bal = billing.getDerivedBalance(db, s.member_did);
     if (bal >= s.refill_threshold_cents) return { ok: false, skipped: 'above threshold', balance_cents: bal };
     if (s.last_refill_at && now - new Date(s.last_refill_at + 'Z').getTime() < REFILL_COOLDOWN_MS) return { ok: false, skipped: 'cooldown' };
+    if (s.refill_daily_cap_cents > 0) {
+      const room = s.refill_daily_cap_cents - autoRefilledLast24h(db, s.member_did, now);
+      if (room <= 0) return { ok: false, skipped: 'daily cap reached', balance_cents: bal, daily_cap_cents: s.refill_daily_cap_cents };
+      amt = Math.min(amt, room);
+    }
   }
   if (!(amt > 0)) return { ok: false, error: 'amount required' };
   const from = refillSourceDid(db, s);
@@ -490,7 +522,7 @@ function thresholdRefill(db, billing, s, { force = false, amount = null, now = D
   const fleet = db.prepare('SELECT slug FROM fleets WHERE id = ?').get(s.fleet_id) || { slug: '?' };
   try {
     const r = transferRefill(db, billing, { fromDid: from, toDid: s.member_did, amount: amt,
-      description: `Refill ${amt} DD to ${s.handle} (fleet ${fleet.slug})`, ledger });
+      description: `${force ? 'Refill ' : AUTO_REFILL_PREFIX}${amt} DD to ${s.handle} (fleet ${fleet.slug})`, ledger });
     db.prepare("UPDATE fleet_silicons SET last_refill_at = datetime('now'), last_refill_error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
     // The DD already moved: closing the ask is bookkeeping and never turns the refill into a failure.
     try { if (fromItsFleet(db, from, s.member_did)) answerTopups(db, s.member_did, amt); }
@@ -573,9 +605,32 @@ function runOwnerRefills(db, billing, { now = Date.now(), grantDids } = {}) {
   return out;
 }
 
-function runSiliconRefills(db, billing, { now = Date.now(), ledger = null } = {}) {
+function runSiliconRefills(db, billing, { now = Date.now(), ledger = null, mailer = null } = {}) {
   const rows = db.prepare("SELECT * FROM fleet_silicons WHERE refill_enabled = 1 AND status = 'active' AND refill_threshold_cents > 0 AND refill_amount_cents > 0").all();
-  return rows.map(s => ({ handle: s.handle, did: s.member_did, ...thresholdRefill(db, billing, s, { now, ledger }) }));
+  return rows.map(s => {
+    const r = thresholdRefill(db, billing, s, { now, ledger });
+    const alerted = (r.skipped === 'daily cap reached' || (!r.ok && r.error)) ? refillAlert(db, billing, s, r, { now, mailer }) : false;
+    return { handle: s.handle, did: s.member_did, ...r, ...(alerted ? { alerted: s.refill_alert_email } : {}) };
+  });
+}
+
+// A silicon below its threshold whose refill can't run: tell refill_alert_email, once per 24 h.
+function refillAlert(db, billing, s, r, { now = Date.now(), mailer = null } = {}) {
+  if (!s.refill_alert_email || !mailer) return false;
+  if (s.refill_alerted_at && now - new Date(s.refill_alerted_at + 'Z').getTime() < 86400000) return false;
+  const bal = billing.getDerivedBalance(db, s.member_did);
+  const why = r.skipped === 'daily cap reached'
+    ? `its automatic refills reached the daily cap of ${s.refill_daily_cap_cents} DD in the last 24 hours`
+    : `the refill failed: ${r.error}`;
+  const text = [
+    `@${s.handle} is low on DD: ${bal} DD, below its refill threshold of ${s.refill_threshold_cents} DD.`,
+    `It was not refilled because ${why}.`,
+    `Each DemiPass /use costs 1 DD; at 0 DD its calls return 402 payment required.`,
+    `The fleet owner can refill it by hand from the Fleet tab, or raise the cap.`,
+  ].join('\n');
+  try { mailer({ to: s.refill_alert_email, subject: `DemiPass: ${s.handle} is low on DD (${bal} DD)`, text }); } catch (_) {}
+  db.prepare("UPDATE fleet_silicons SET refill_alerted_at = datetime('now') WHERE id = ?").run(s.id);
+  return true;
 }
 
 // Email the silicon's contact when its newest token is within TOKEN_WARN_DAYS of
@@ -600,7 +655,7 @@ function runRefills(db, billing, opts = {}) {
   const now = opts.now || Date.now();
   return {
     owner: runOwnerRefills(db, billing, { now, grantDids: opts.grantDids }),
-    silicons: runSiliconRefills(db, billing, { now, ledger: opts.ledger }),
+    silicons: runSiliconRefills(db, billing, { now, ledger: opts.ledger, mailer: opts.mailer }),
     token_warnings: runTokenWarnings(db, { now, mailer: opts.mailer }),
     work_links_expired: expireWorkLinks(db, { now }),
   };
@@ -917,7 +972,7 @@ function tokenWarningEmail({ silicon, token }) {
 module.exports = {
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
-  thresholdRefill, maybeThresholdRefill, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
+  thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
   runOwnerRefills, runSiliconRefills, runTokenWarnings, runRefills,
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
