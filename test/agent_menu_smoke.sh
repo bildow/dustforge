@@ -179,8 +179,12 @@ call POST /api/demipass/request-token "$SIL" '{"ref":"DP-none-1"}'
 echo "$BODY" | grep -q 'svc-token' && fail "silicon error menu leaked svc-token" || ok "a silicon token's error menu leaks nothing else"
 
 SID=$(SQ "SELECT id FROM blindkey_secrets WHERE ref_code='$REF'")
-SQ "INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, allowed_by, status) VALUES ($SID, 'second', 'http_header', '*', 'smoke', 'active')" >/dev/null
+SQ "INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, allowed_by, status) VALUES ($SID, 'billing', 'http_header', 'https://billing.example/*', 'smoke', 'active')" >/dev/null
 call POST /api/demipass/request-token "$O" '{"ref":"'$REF'"}'
-[ "$CODE" = 400 ] && [ "$(echo "$BODY" | J contexts.1)" != None ] && ok "a ref with two contexts asks which one instead of picking" || fail "ref contexts: $CODE $BODY"
+[ "$CODE" = 400 ] && [ "$(echo "$BODY" | J contexts.1)" != None ] && ok "a ref with two contexts and no target asks which one instead of picking" || fail "ref contexts: $CODE $BODY"
+call POST /api/demipass/request-token "$O" '{"ref":"'$REF'","target_url":"https://other.example/x"}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J context)" = default ] && ok "…but a target only one context fits picks that one" || fail "fit by url: $CODE $BODY"
+call POST /api/demipass/request-token "$O" '{"ref":"'$REF'","target_url":"https://billing.example/x"}'
+[ "$CODE" = 400 ] && ok "…and a target both fit still asks" || fail "both fit: $CODE $BODY"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || { echo "$fails FAILED"; exit 1; }

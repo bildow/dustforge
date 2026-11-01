@@ -1228,4 +1228,8 @@ test('another window signed in as a different account: this one signs out, never
   assert.ok(!after.includes('/api/x'), 'no call is made with the other account');
   assert.equal(pg.authOpen(), true);
   assert.match(pg.el('auth-err').textContent, /another account/);
+  assert.ok(!after.includes('/api/identity/refresh/revoke'), 'the other account\'s refresh token is not revoked');
+  assert.equal(pg.store.get('dp_refresh'), 'dpr_other');
+  assert.equal(pg.store.get('dp_token'), 'other.token.z');
+  assert.equal(pg.store.get('dp_did'), 'did:key:zOther');
 });

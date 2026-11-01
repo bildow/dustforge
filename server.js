@@ -3946,11 +3946,19 @@ function sharedSecretsNamed(did, name) {
     WHERE d.delegate_did = ? AND d.status = 'active' AND s.name = ? AND ${REDEEMABLE_STATUS_SQL.replace(/\bstatus\b/g, 's.status')}
     GROUP BY d.owner_did`).all(did, name);
 }
-// The context to use when the caller names none: the secret's only active one.
-function soleContext(secret) {
-  const ctxs = db.prepare("SELECT context_name FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id).map(c => c.context_name);
-  if (ctxs.length === 1) return { context: ctxs[0] };
-  return { error: ctxs.length ? `context required — '${secret.name}' has ${ctxs.length} contexts; pick one` : `'${secret.name}' has no usage context yet; its owner must add one`, contexts: ctxs };
+// The context to use when the caller names none: the secret's only active one, or else the only one that fits
+// the action and target the caller gave (the same action/pattern rules enforceBlindkeyContext applies).
+function soleContext(secret, { action = null, targetUrl = null, targetHost = null } = {}) {
+  const all = db.prepare("SELECT context_name, action_type, target_url_pattern, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
+  if (all.length === 1) return { context: all[0].context_name };
+  if (action || targetUrl || targetHost) {
+    const fit = all.filter(c => (!action || c.action_type === action)
+      && (!targetUrl || !['http_header', 'http_body'].includes(c.action_type) || blindkeyPatternMatch(c.target_url_pattern, targetUrl))
+      && (!targetHost || c.action_type !== 'ssh_exec' || blindkeyPatternMatch(c.target_host_pattern, targetHost)));
+    if (fit.length === 1) return { context: fit[0].context_name };
+  }
+  const names = all.map(c => c.context_name);
+  return { error: names.length ? `context required — '${secret.name}' has ${names.length} contexts; pick one` : `'${secret.name}' has no usage context yet; its owner must add one`, contexts: names };
 }
 // Runs a synchronous route handler against a stand-in response and returns what it answered.
 function captureJson(handler, req) {
@@ -4022,7 +4030,7 @@ function requestUseTokenHandler(req, res) {
     // Auto-resolve context — use the first active context if not provided
     // Do NOT fabricate 'default' if no contexts exist — that causes enforceBlindkeyContext to reject
     if (!contextName) {
-      const picked = soleContext(refSecret);
+      const picked = soleContext(refSecret, { action, targetUrl: target_url, targetHost: target_host });
       if (picked.context) contextName = picked.context;
       else if (picked.contexts.length) return res.status(400).json(picked);
       // If no contexts exist at all, contextName stays null and the request is refused below
@@ -4072,7 +4080,7 @@ function requestUseTokenHandler(req, res) {
       return res.status(403).json({ error: 'no active delegation for this secret and context' });
     }
     if (!contextName) {
-      const picked = soleContext(secret);
+      const picked = soleContext(secret, { action, targetUrl: target_url, targetHost: target_host });
       if (picked.error) return res.status(400).json(picked);
       contextName = picked.context;
     }
@@ -4120,7 +4128,7 @@ function requestUseTokenHandler(req, res) {
     return res.status(404).json({ error: `no secret named '${name}' is yours or shared with you` });
   }
   if (!contextName) {
-    const picked = soleContext(secret);
+    const picked = soleContext(secret, { action, targetUrl: target_url, targetHost: target_host });
     if (picked.error) return res.status(400).json(picked);
     contextName = picked.context;
   }
@@ -4600,7 +4608,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
   // Enforce context rules
   const targetUrl = (params && params.url) || (req.body && req.body.target_url) || null;
   const targetHost = (req.body && req.body.target_host) || (params && params.target_host) || null;
-  const ctxCheck = enforceBlindkeyContext(secret, contextName || soleContext(secret).context, action, targetUrl, targetHost);
+  const ctxCheck = enforceBlindkeyContext(secret, contextName || soleContext(secret, { action, targetUrl, targetHost }).context, action, targetUrl, targetHost);
   if (!ctxCheck.allowed) {
     return res.status(403).json({ error: ctxCheck.error });
   }

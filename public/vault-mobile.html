@@ -646,10 +646,14 @@ async function login(){
 function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
 function logout(){
-  const rf=localStorage.getItem('dp_refresh');
-  if(rf) fetch(API+'/api/identity/refresh/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:rf})}).catch(()=>{});
+  // Shared storage (and its refresh token) is revoked and cleared only while it is still this window's session:
+  // if another window has since signed in as another account, that session is theirs and stays untouched.
+  if(storedIsMine()){
+    const rf=localStorage.getItem('dp_refresh');
+    if(rf) fetch(API+'/api/identity/refresh/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:rf})}).catch(()=>{});
+    for(const k of ['dp_token','dp_did','dp_user','dp_token_at','dp_refresh']) localStorage.removeItem(k);
+  }
   sessionEpoch++; tk='';did='';user='';loginPw='';vaultOpen=false; renewing=null;
-  for(const k of ['dp_token','dp_did','dp_user','dp_token_at','dp_refresh']) localStorage.removeItem(k);
   closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
   for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass','wizard-pw','recovery-pw']){const e=document.getElementById(i);if(e)e.value=''}
   const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; pinSentFor=null; pinOpenAttempts=[]; if(s)s(false); if(u)u(false);
