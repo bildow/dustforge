@@ -1120,3 +1120,116 @@ test('settings: saving a recovery email needs the password, sends it once and cl
   assert.equal(pg.el('recovery-pw').value, '');
   assert.equal(pg.el('recovery-msg').textContent, 'Recovery email saved');
 });
+
+// ── Session renewal: the vault no longer signs out every 24 h ──
+const DAY = 24 * 3600 * 1000;
+const renewRoutes = (extra) => async (p, body) => {
+  if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+  if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+  const r = extra && await extra(p, body); if (r) return r;
+  throw new Error('unexpected ' + p);
+};
+
+test('an expired access token is renewed with the refresh token at start: vault opens, new token used and kept', async () => {
+  const pg = page({ storage: { ...signedIn, dp_token_at: String(Date.now() - DAY - 1000), dp_refresh: 'dpr_old' },
+    routes: renewRoutes(p => p === '/api/identity/refresh' ? { json: { token: 'fixture.token.b', refresh_token: 'dpr_new' } } : null) });
+  await settle(10);
+  assert.equal(pg.appOpen(), true);
+  const ref = pg.calls.find(c => c.path === '/api/identity/refresh');
+  assert.equal(ref.body.refresh_token, 'dpr_old');
+  assert.equal(pg.store.get('dp_token'), 'fixture.token.b');
+  assert.equal(pg.store.get('dp_refresh'), 'dpr_new');
+  assert.ok(pg.calls.filter(c => c.path === '/api/identity/gate/status').every(c => c.auth === 'Bearer fixture.token.b'));
+});
+
+test('a token in its last hour is renewed before the next call; concurrent calls share one refresh', async () => {
+  let refreshes = 0;
+  const pg = page({ storage: { ...signedIn, dp_token_at: String(Date.now() - DAY + 30 * 60 * 1000), dp_refresh: 'dpr_old' },
+    routes: renewRoutes(p => {
+      if (p === '/api/identity/refresh') { refreshes++; return { json: { token: 'fixture.token.b', refresh_token: 'dpr_new' } }; }
+      if (p === '/api/x') return { json: { ok: true } };
+    }) });
+  await settle(10);
+  await Promise.all([pg.ctx.api('GET', '/api/x'), pg.ctx.api('GET', '/api/x')]);
+  assert.equal(refreshes, 1);
+  assert.ok(pg.calls.filter(c => c.path === '/api/x').every(c => c.auth === 'Bearer fixture.token.b'));
+});
+
+test('a 401 is retried once after renewing; a second 401 signs out', async () => {
+  let n = 0;
+  const pg = page({ storage: { ...signedIn, dp_refresh: 'dpr_old' }, routes: renewRoutes(p => {
+    if (p === '/api/identity/refresh') return { json: { token: 'fixture.token.b', refresh_token: 'dpr_new' } };
+    if (p === '/api/x') { n++; return n === 1 ? { status: 401, json: { error: 'expired' } } : { json: { ok: true } }; }
+    if (p === '/api/y') return { status: 401, json: { error: 'revoked' } };
+  }) });
+  await settle(10);
+  assert.deepEqual(await pg.ctx.api('GET', '/api/x'), { ok: true });
+  assert.equal(pg.calls.filter(c => c.path === '/api/x')[1].auth, 'Bearer fixture.token.b');
+  await assert.rejects(pg.ctx.api('GET', '/api/y'), /session expired/);
+  assert.equal(pg.authOpen(), true);
+});
+
+test('a refused refresh token ends the session; sign-out revokes the refresh token and forgets it', async () => {
+  const pg = page({ storage: { ...signedIn, dp_token_at: String(Date.now() - DAY - 1000), dp_refresh: 'dpr_dead' },
+    routes: renewRoutes(p => p === '/api/identity/refresh' ? { status: 401, json: { error: 'invalid' } } : (p === '/api/identity/refresh/revoke' ? { json: { ok: true } } : null)) });
+  await settle(10);
+  assert.equal(pg.appOpen(), false);
+  assert.equal(pg.authOpen(), true);
+  assert.equal(pg.store.get('dp_refresh'), undefined);
+  assert.equal(pg.calls.find(c => c.path === '/api/identity/refresh/revoke').body.refresh_token, 'dpr_dead');
+});
+
+test('sign-in keeps the refresh token the server returns', async () => {
+  const pg = page({ routes: renewRoutes(p => p === '/api/identity/auth-fingerprint' ? { json: { token: 'fixture.token.a', did: 'did:key:zFixture', refresh_token: 'dpr_login' } } : null) });
+  await signIn(pg);
+  assert.equal(pg.store.get('dp_refresh'), 'dpr_login');
+});
+
+// ── Access requests: an agent in your fleet asks for a secret ──
+test('access request card: hostile names stay inert, the owner picks a secret, Share walks the PIN gate', async () => {
+  const req = { id: 7, intent: 'access:7', requester: '<img src=x onerror=alert(1)>', secret_hint: 'x"><b>', reason: '</div><script>1</script>', match: null };
+  let approveBody = null, approves = 0;
+  const pg = page({ storage: signedIn, routes: renewRoutes((p, body) => {
+    if (p === '/api/blindkey/fill/pending') return { json: { ok: true, requests: [], grants: [], access_requests: [req] } };
+    if (p === '/api/blindkey/access-requests/7/approve') { approves++; approveBody = body; return approves === 1 ? { status: 403, json: { error: 'pin', missing: ['pin'], required: ['pin'], intent: 'access:7' } } : { json: { ok: true } }; }
+    if (p === '/api/identity/gate/verify') return { json: { ok: true } };
+  }) });
+  await settle();
+  vm.runInContext("secrets = [{ name: 'felix-stringline', ref: 'DP-API-felixstr-1', status: 'active' }]; vaultOpen = true;", pg.ctx);
+  await pg.ctx.loadFillRequests();
+  const html = pg.el('fill-requests').innerHTML;
+  assert.ok(!html.includes('<img') && !html.includes('<script>') && !html.includes('"><b>'), html);
+  assert.match(html, /decideAccess\(7,true\)/);
+  vm.runInContext("accessPick[7] = 'DP-API-felixstr-1'", pg.ctx);
+  pg.el('ar-secret-7').value = 'DP-API-felixstr-1';
+  const done = pg.ctx.decideAccess(7, true);
+  await settle(10);
+  pg.el('pin-unlock').value = '4321';
+  await pg.ctx.submitPin();
+  await settle(10);
+  await done;
+  assert.equal(approveBody.secret, 'DP-API-felixstr-1');
+  assert.equal(pg.calls.find(c => c.path === '/api/identity/gate/verify').body.intent, 'access:7');
+});
+
+test('another window signed in as a different account: this one signs out, never renews or adopts that session', async () => {
+  const pg = page({ storage: { ...signedIn, dp_refresh: 'dpr_mine' }, routes: renewRoutes(p => {
+    if (p === '/api/x') return { status: 401, json: { error: 'expired' } };
+    if (p === '/api/identity/refresh' || p === '/api/identity/refresh/revoke') return { json: { token: 'fixture.token.other', refresh_token: 'dpr_x' } };
+  }) });
+  await settle(10);
+  assert.equal(pg.appOpen(), true);
+  // the other window: signs out (revoking ours) and signs in as user2
+  pg.store.set('dp_did', 'did:key:zOther'); pg.store.set('dp_user', 'other'); pg.store.set('dp_token', 'other.token.z'); pg.store.set('dp_refresh', 'dpr_other');
+  const before = pg.calls.length;
+  await assert.rejects(pg.ctx.api('GET', '/api/x'), /session expired/);
+  const after = pg.calls.slice(before).map(c => c.path);
+  assert.ok(!after.includes('/api/identity/refresh'), JSON.stringify(after));
+  assert.ok(!after.includes('/api/x'), 'no call is made with the other account');
+  assert.equal(pg.authOpen(), true);
+  assert.match(pg.el('auth-err').textContent, /another account/);
+  assert.ok(!after.includes('/api/identity/refresh/revoke'), 'the other account\'s refresh token is not revoked');
+  assert.equal(pg.store.get('dp_refresh'), 'dpr_other');
+  assert.equal(pg.store.get('dp_token'), 'other.token.z');
+  assert.equal(pg.store.get('dp_did'), 'did:key:zOther');
+});

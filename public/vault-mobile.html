@@ -575,6 +575,7 @@ let loginPw='';   // the password just typed at sign-in; consumed by the mandato
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
 let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
 let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
+let accessReqs=[], accessPick={};  // agents in your fleets asking for a secret (ids share fillBusy as 'a'+id), and the secret picked per card
 let netData=null, netBusy=new Set(), sendTo=null, sendBusy=false, topupBusy=false;   // network: GET /api/network, requests being decided, the open send
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
@@ -585,10 +586,48 @@ let vaultOpen=false;        // true only once the vault is past the PIN gate; th
 let dashboardData=null, fleetSlug=null, fleetData=null, siliconHandle=null;   // per-account state (sign-out clears it)
 let scanStream=null, scanInterval=null, revealTimer=null;
 
+// Sessions renew themselves: sign-in also returns a 90-day refresh token (rotated on every use). The 24 h access
+// token is renewed in its last hour, or at once when it has expired or the server answers 401, so the vault no
+// longer signs out every day. Sign-out revokes the refresh token.
+const RENEW_BEFORE = 60 * 60 * 1000;   // renew in the access token's last hour
+let renewing=null;   // the renewal in flight; concurrent calls share it (a refresh token is spent on use)
+// localStorage is shared by every tab: it still holds this tab's account only if no tab signed in as another.
+function storedIsMine(){return localStorage.getItem('dp_did')===did&&localStorage.getItem('dp_user')===user}
+// When this tab's access token expires, read from the token itself (exp), not from storage another tab may own.
+function tokenExpiresAt(){try{const p=JSON.parse(atob(tk.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));if(p&&p.exp)return p.exp*1000}catch(_){}return Number(localStorage.getItem('dp_token_at')||0)+TOKEN_TTL}
+function renewSession(){
+  if(renewing) return renewing;
+  const rf=localStorage.getItem('dp_refresh'); if(!rf||!storedIsMine()) return Promise.resolve('rejected');
+  const epoch=sessionEpoch;
+  renewing=(async()=>{
+    try{
+      const r=await fetch(API+'/api/identity/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:rf,expires_in:'24h'})});
+      const d=await r.json().catch(()=>({}));
+      if(epoch!==sessionEpoch) return 'rejected';
+      if(!storedIsMine()) return 'rejected';
+      if(r.status<300&&d.token&&d.refresh_token){tk=d.token;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_token_at',String(Date.now()));localStorage.setItem('dp_refresh',d.refresh_token);return 'ok'}
+      // Another tab (or device.html) may have renewed first and spent this refresh token: adopt its session.
+      if(localStorage.getItem('dp_refresh')!==rf&&localStorage.getItem('dp_token')){tk=localStorage.getItem('dp_token');return 'ok'}
+      return r.status>=500?'offline':'rejected';
+    }catch(_){return 'offline'}
+    finally{renewing=null}
+  })();
+  return renewing;
+}
+// True when there is a usable access token (renewing it if needed); false when the session is over (signed out).
+async function ensureSession(){
+  if(!tk) return false;
+  if(!storedIsMine()){ logout(); document.getElementById('auth-err').textContent='Signed in as another account in another window — please sign in again'; return false; }
+  const left=tokenExpiresAt()-Date.now();
+  if(left>RENEW_BEFORE) return true;
+  const r=await renewSession();
+  if(r==='ok') return true;
+  if(r==='offline'){ if(left>0) return true; throw new Error('connection error — try again'); }
+  logout(); document.getElementById('auth-err').textContent='Session expired — please sign in again'; return false;
+}
 if(tk&&!isTokenExpired())showApp();
-else if(tk){logout();document.getElementById('auth-err').textContent='Please sign in'}
-function autoLogoutIfExpired(){if(tk&&isTokenExpired()){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again';return true}return false}
-async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&autoLogoutIfExpired())throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
+else if(tk){ensureSession().then(ok=>{if(ok)showApp()},()=>{document.getElementById('auth-err').textContent='No connection — reopen to continue'})}
+async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&hadToken&&!(await ensureSession()))throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){if(hadToken&&!(opt&&opt.renewed)&&epoch===sessionEpoch&&await renewSession()==='ok')return api(m,p,b,{...(opt||{}),renewed:true});if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>({}));if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
 // A reply from a session that has since ended (signed out, or replaced by another sign-in): handlers stop here.
 function sessionEnded(e){return !!e&&/^session (ended|expired)$/.test(e.message||'')}
 
@@ -599,7 +638,7 @@ async function login(){
     e.textContent='Signing in...';e.style.color='var(--text3)';
     const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
     if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
-    tk=a.token;did=a.did||'';user=u;loginPw=p;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
+    tk=a.token;did=a.did||'';user=u;loginPw=p;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);if(a.refresh_token)localStorage.setItem('dp_refresh',a.refresh_token);else localStorage.removeItem('dp_refresh');localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
 
 // Device login approval: hand off to /device.html on this same origin, which reuses this
@@ -607,15 +646,21 @@ async function login(){
 function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
 function logout(){
-  sessionEpoch++; tk='';did='';user='';loginPw='';vaultOpen=false;
-  for(const k of ['dp_token','dp_did','dp_user','dp_token_at']) localStorage.removeItem(k);
+  // Shared storage (and its refresh token) is revoked and cleared only while it is still this window's session:
+  // if another window has since signed in as another account, that session is theirs and stays untouched.
+  if(storedIsMine()){
+    const rf=localStorage.getItem('dp_refresh');
+    if(rf) fetch(API+'/api/identity/refresh/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:rf})}).catch(()=>{});
+    for(const k of ['dp_token','dp_did','dp_user','dp_token_at','dp_refresh']) localStorage.removeItem(k);
+  }
+  sessionEpoch++; tk='';did='';user='';loginPw='';vaultOpen=false; renewing=null;
   closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
   for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass','wizard-pw','recovery-pw']){const e=document.getElementById(i);if(e)e.value=''}
   const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; pinSentFor=null; pinOpenAttempts=[]; if(s)s(false); if(u)u(false);
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];fillBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];accessReqs=[];accessPick={};fillBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why','net-msg','send-msg','send-to-name','send-balance']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -1177,8 +1222,8 @@ async function leaveFleet(){
 // (its intent is fill:<id>, so the proof opens that one fill) or denied. Polled every 4 s while the vault is open.
 async function loadFillRequests(){
   const epoch=sessionEpoch;
-  try{ const r=await api('GET','/api/blindkey/fill/pending'); if(epoch!==sessionEpoch||!vaultOpen) return; fillReqs=(r.requests||[]).filter(q=>!q.own_session); grantReqs=r.grants||[]; }
-  catch(e){ if(sessionEnded(e)) return; if(e.status===429) return; fillReqs=[]; grantReqs=[]; }   // rate-limited: keep the cards, retry next poll
+  try{ const r=await api('GET','/api/blindkey/fill/pending'); if(epoch!==sessionEpoch||!vaultOpen) return; fillReqs=(r.requests||[]).filter(q=>!q.own_session); grantReqs=r.grants||[]; accessReqs=r.access_requests||[]; }
+  catch(e){ if(sessionEnded(e)) return; if(e.status===429) return; fillReqs=[]; grantReqs=[]; accessReqs=[]; }   // rate-limited: keep the cards, retry next poll
   renderFillRequests();
 }
 function renderFillRequests(){
@@ -1192,7 +1237,30 @@ function renderFillRequests(){
     +'<div class="fr-origin">'+esc(g.label)+'</div>'
     +'<div style="color:var(--text3);margin-top:0.25rem">without asking you each time — it receives the password itself</div>'
     +'<div class="fr-row"><button class="btn-primary" '+(fillBusy.has('g'+g.id)?'disabled ':'')+'onclick="decideGrant('+Number(g.id)+',true)">Allow</button>'
-    +'<button class="btn-ghost" '+(fillBusy.has('g'+g.id)?'disabled ':'')+'onclick="decideGrant('+Number(g.id)+',false)">Deny</button></div></div>').join('');
+    +'<button class="btn-ghost" '+(fillBusy.has('g'+g.id)?'disabled ':'')+'onclick="decideGrant('+Number(g.id)+',false)">Deny</button></div></div>').join('')
+    +accessReqs.map(a=>{
+      // The owner picks which secret to share; the one the agent named is preselected when it exists.
+      const want=accessPick[a.id]!==undefined?accessPick[a.id]:(a.match?a.match.ref:'');
+      const opts=secrets.filter(x=>x.status==='active').map(x=>'<option value="'+esc(x.ref||x.name)+'"'+((x.ref||x.name)===want?' selected':'')+'>'+esc(x.name)+'</option>').join('');
+      return '<div class="fill-req"><div><b>@'+esc(a.requester)+'</b> asks to use '+(a.secret_hint?'<b>'+esc(a.secret_hint)+'</b>':'one of your secrets')+'</div>'
+      +(a.reason?'<div style="margin-top:0.25rem">“'+esc(a.reason)+'”</div>':'')
+      +'<div style="color:var(--text3);margin-top:0.25rem">They can use it through DemiPass without ever seeing it. You can revoke it any time.</div>'
+      +'<select id="ar-secret-'+Number(a.id)+'" onchange="accessPick['+Number(a.id)+']=this.value" style="margin:0.4rem 0 0;width:100%"><option value="">choose a secret…</option>'+opts+'</select>'
+      +'<div class="fr-row"><button class="btn-primary" '+(fillBusy.has('a'+a.id)?'disabled ':'')+'onclick="decideAccess('+Number(a.id)+',true)">Share</button>'
+      +'<button class="btn-ghost" '+(fillBusy.has('a'+a.id)?'disabled ':'')+'onclick="decideAccess('+Number(a.id)+',false)">Deny</button></div></div>';
+    }).join('');
+}
+async function decideAccess(id, approve){
+  const a=accessReqs.find(x=>x.id===id), key='a'+id; if(!a||fillBusy.has(key)) return;
+  const pick=(document.getElementById('ar-secret-'+id)||{}).value||'';
+  if(approve&&!pick){ alert('Choose which secret to share first.'); return; }
+  fillBusy.add(key); renderFillRequests();
+  try{
+    if(approve) await apiGated('POST','/api/blindkey/access-requests/'+id+'/approve',{secret:pick},'Share '+pick+' with @'+a.requester+'? Your PIN approves this.');
+    else await api('POST','/api/blindkey/access-requests/'+id+'/deny');
+    accessReqs=accessReqs.filter(x=>x.id!==id);
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ fillBusy.delete(key); renderFillRequests(); }
 }
 async function decideGrant(id, approve){
   const g=grantReqs.find(x=>x.id===id), key='g'+id; if(!g||fillBusy.has(key)) return;
@@ -1785,7 +1853,7 @@ async function satisfyGate(gate, what, intent){
 // Call a gated endpoint. On a 403 listing missing gates, walk the user through
 // each factor and retry once. Returns the parsed JSON on success.
 async function apiGated(method, path, body, what){
-  if(autoLogoutIfExpired()) throw new Error('session expired');
+  if(!(await ensureSession())) throw new Error('session expired');
   const epoch=sessionEpoch;
   const call = async () => {
     if(epoch!==sessionEpoch) throw new Error('session ended');

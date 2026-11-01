@@ -10,7 +10,7 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const passwords = require('./passwords');   // salted scrypt for the local password verifier
 
 module.exports = function registerFleetRoutes(deps) {
-  const { app, db, identity, billing, fleetBilling: fb, ledger, dustforge, createEmailTransport, rateLimitStandard, adminKey, crypto } = deps;
+  const { app, db, identity, billing, fleetBilling: fb, ledger, dustforge, createEmailTransport, rateLimitStandard, adminKey, crypto, grantAllContextsDelegation } = deps;
   const log = deps.log || ((...a) => console.log('[fleet]', ...a));
   const apiBase = deps.apiBase || 'https://api.dustforge.com';
   const vaultBase = deps.vaultBase || 'https://demipass.com';
@@ -360,12 +360,7 @@ module.exports = function registerFleetRoutes(deps) {
     if (!secret) return res.status(404).json({ error: 'secret not found among the owner\'s active secrets' });
     const expiresAt = (typeof expires_in === 'number' && expires_in > 0) ? new Date(Date.now() + expires_in * 1000).toISOString() : null;
     try {
-      db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
-                  VALUES (?, ?, ?, NULL, ?, ?, ?)
-                  ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
-                    status = 'active', max_uses = excluded.max_uses, use_count = 0, granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at`)
-        .run(a.did, s.member_did, secret.id, Number(max_uses) || 0, a.did, expiresAt);
-      const d = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL').get(a.did, s.member_did, secret.id);
+      const d = { id: grantAllContextsDelegation(a.did, s.member_did, secret.id, a.did, { maxUses: Number(max_uses) || 0, expiresAt }) };
       try {
         db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
           .run('delegation_granted', a.did, secret.id, '*', JSON.stringify({ delegation_id: d && d.id, owner_did: a.did, delegate_did: s.member_did, via: 'fleet', max_uses: Number(max_uses) || 0, expires_at: expiresAt }));
