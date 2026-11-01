@@ -1211,3 +1211,21 @@ test('access request card: hostile names stay inert, the owner picks a secret, S
   assert.equal(approveBody.secret, 'DP-API-felixstr-1');
   assert.equal(pg.calls.find(c => c.path === '/api/identity/gate/verify').body.intent, 'access:7');
 });
+
+test('another window signed in as a different account: this one signs out, never renews or adopts that session', async () => {
+  const pg = page({ storage: { ...signedIn, dp_refresh: 'dpr_mine' }, routes: renewRoutes(p => {
+    if (p === '/api/x') return { status: 401, json: { error: 'expired' } };
+    if (p === '/api/identity/refresh' || p === '/api/identity/refresh/revoke') return { json: { token: 'fixture.token.other', refresh_token: 'dpr_x' } };
+  }) });
+  await settle(10);
+  assert.equal(pg.appOpen(), true);
+  // the other window: signs out (revoking ours) and signs in as user2
+  pg.store.set('dp_did', 'did:key:zOther'); pg.store.set('dp_user', 'other'); pg.store.set('dp_token', 'other.token.z'); pg.store.set('dp_refresh', 'dpr_other');
+  const before = pg.calls.length;
+  await assert.rejects(pg.ctx.api('GET', '/api/x'), /session expired/);
+  const after = pg.calls.slice(before).map(c => c.path);
+  assert.ok(!after.includes('/api/identity/refresh'), JSON.stringify(after));
+  assert.ok(!after.includes('/api/x'), 'no call is made with the other account');
+  assert.equal(pg.authOpen(), true);
+  assert.match(pg.el('auth-err').textContent, /another account/);
+});

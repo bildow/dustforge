@@ -591,15 +591,20 @@ let scanStream=null, scanInterval=null, revealTimer=null;
 // longer signs out every day. Sign-out revokes the refresh token.
 const RENEW_BEFORE = 60 * 60 * 1000;   // renew in the access token's last hour
 let renewing=null;   // the renewal in flight; concurrent calls share it (a refresh token is spent on use)
+// localStorage is shared by every tab: it still holds this tab's account only if no tab signed in as another.
+function storedIsMine(){return localStorage.getItem('dp_did')===did&&localStorage.getItem('dp_user')===user}
+// When this tab's access token expires, read from the token itself (exp), not from storage another tab may own.
+function tokenExpiresAt(){try{const p=JSON.parse(atob(tk.split('.')[1].replace(/-/g,'+').replace(/_/g,'/')));if(p&&p.exp)return p.exp*1000}catch(_){}return Number(localStorage.getItem('dp_token_at')||0)+TOKEN_TTL}
 function renewSession(){
   if(renewing) return renewing;
-  const rf=localStorage.getItem('dp_refresh'); if(!rf) return Promise.resolve('rejected');
+  const rf=localStorage.getItem('dp_refresh'); if(!rf||!storedIsMine()) return Promise.resolve('rejected');
   const epoch=sessionEpoch;
   renewing=(async()=>{
     try{
       const r=await fetch(API+'/api/identity/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:rf,expires_in:'24h'})});
       const d=await r.json().catch(()=>({}));
       if(epoch!==sessionEpoch) return 'rejected';
+      if(!storedIsMine()) return 'rejected';
       if(r.status<300&&d.token&&d.refresh_token){tk=d.token;localStorage.setItem('dp_token',tk);localStorage.setItem('dp_token_at',String(Date.now()));localStorage.setItem('dp_refresh',d.refresh_token);return 'ok'}
       // Another tab (or device.html) may have renewed first and spent this refresh token: adopt its session.
       if(localStorage.getItem('dp_refresh')!==rf&&localStorage.getItem('dp_token')){tk=localStorage.getItem('dp_token');return 'ok'}
@@ -612,11 +617,12 @@ function renewSession(){
 // True when there is a usable access token (renewing it if needed); false when the session is over (signed out).
 async function ensureSession(){
   if(!tk) return false;
-  const age=Date.now()-Number(localStorage.getItem('dp_token_at')||0);
-  if(age<TOKEN_TTL-RENEW_BEFORE) return true;
+  if(!storedIsMine()){ logout(); document.getElementById('auth-err').textContent='Signed in as another account in another window — please sign in again'; return false; }
+  const left=tokenExpiresAt()-Date.now();
+  if(left>RENEW_BEFORE) return true;
   const r=await renewSession();
   if(r==='ok') return true;
-  if(r==='offline'){ if(age<TOKEN_TTL) return true; throw new Error('connection error — try again'); }
+  if(r==='offline'){ if(left>0) return true; throw new Error('connection error — try again'); }
   logout(); document.getElementById('auth-err').textContent='Session expired — please sign in again'; return false;
 }
 if(tk&&!isTokenExpired())showApp();

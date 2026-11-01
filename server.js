@@ -355,10 +355,12 @@ app.use((req, res, next) => {
   res.setHeader('X-DemiPass-Menu', 'GET /api/demipass/menu');
   const json = res.json.bind(res);
   res.json = (body) => {
-    if (res.statusCode >= 400 && body && typeof body === 'object' && !Array.isArray(body) && body.menu === undefined) {
+    const code = res.statusCode;
+    // Not on 429 (a flood must stay cheap) or 5xx (nothing the caller can choose differently).
+    if (code >= 400 && code < 500 && code !== 429 && body && typeof body === 'object' && !Array.isArray(body) && body.menu === undefined) {
       try {
         const auth = getBearerIdentity(req);
-        body = { ...body, menu: auth.ok ? buildAgentMenu(auth.did, { compact: true }) : MENU_SIGNED_OUT };
+        body = { ...body, menu: auth.ok ? buildAgentMenu(auth.did, { compact: true, auth }) : MENU_SIGNED_OUT };
       } catch (_) {}
     }
     return json(body);
@@ -3920,6 +3922,21 @@ setInterval(() => {
 // The silicon never sees the secret — it only gets a nonce that proves its intent was validated.
 // Supports delegated access: if the caller doesn't own the secret, check demipass_delegations.
 // The delegate passes { owner_did } to indicate whose secret they want to use via delegation.
+// Grants or re-activates the all-contexts delegation owner → delegate for a secret and returns its id.
+// context_id is NULL here, and SQLite's UNIQUE treats NULLs as distinct, so ON CONFLICT never fires for it: the
+// newest row is updated in place and older duplicates are revoked, so one revoke always ends the access.
+function grantAllContextsDelegation(ownerDid, delegateDid, secretId, grantedBy, { maxUses = 0, expiresAt = null } = {}) {
+  const rows = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL ORDER BY id DESC')
+    .all(ownerDid, delegateDid, secretId);
+  if (!rows.length) {
+    return Number(db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
+                              VALUES (?, ?, ?, NULL, ?, ?, ?)`).run(ownerDid, delegateDid, secretId, maxUses, grantedBy, expiresAt).lastInsertRowid);
+  }
+  db.prepare(`UPDATE demipass_delegations SET status = 'active', max_uses = ?, use_count = 0, granted_by = ?, granted_at = CURRENT_TIMESTAMP,
+              revoked_at = NULL, expires_at = ? WHERE id = ?`).run(maxUses, grantedBy, expiresAt, rows[0].id);
+  for (const r of rows.slice(1)) db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ? AND status = 'active'").run(r.id);
+  return rows[0].id;
+}
 // The action a secret type is used with when the caller names none.
 const DEFAULT_ACTION_BY_TYPE = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
 // Active secrets other owners share with `did` under `name` (latest version per owner).
@@ -4005,11 +4022,10 @@ function requestUseTokenHandler(req, res) {
     // Auto-resolve context — use the first active context if not provided
     // Do NOT fabricate 'default' if no contexts exist — that causes enforceBlindkeyContext to reject
     if (!contextName) {
-      const firstCtx = db.prepare("SELECT context_name FROM blindkey_contexts WHERE secret_id = ? AND status = 'active' LIMIT 1").get(refSecret.id);
-      if (firstCtx) {
-        contextName = firstCtx.context_name;
-      }
-      // If no contexts exist at all, contextName stays null — enforceBlindkeyContext will handle it
+      const picked = soleContext(refSecret);
+      if (picked.context) contextName = picked.context;
+      else if (picked.contexts.length) return res.status(400).json(picked);
+      // If no contexts exist at all, contextName stays null and the request is refused below
     }
 
     // Auto-resolve target_host from context if not provided
@@ -4051,7 +4067,10 @@ function requestUseTokenHandler(req, res) {
   // If caller doesn't own the secret, check for a delegation
   if (!secret && owner_did) {
     secret = resolveLatestBlindkeySecret(owner_did, name);
-    if (!secret) return res.status(404).json({ error: 'secret not found' });
+    // The same refusal whether the secret is missing or not shared: nothing about another owner's vault leaks.
+    if (!secret || !db.prepare("SELECT 1 FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND status = 'active'").get(owner_did, callerDid, secret.id)) {
+      return res.status(403).json({ error: 'no active delegation for this secret and context' });
+    }
     if (!contextName) {
       const picked = soleContext(secret);
       if (picked.error) return res.status(400).json(picked);
@@ -7489,7 +7508,7 @@ try { fleetBilling.initSchema(db); } catch (e) { console.error('[fleet] schema i
 billing.setAttribution(fleetBilling, require('./dd_ledger'));
 const fleetRoutes = require('./fleet_routes')({
   app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
-  rateLimitStandard, adminKey: ADMIN_API_KEY, crypto,
+  rateLimitStandard, adminKey: ADMIN_API_KEY, crypto, grantAllContextsDelegation,
 });
 // Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
 require('./network_routes')({
@@ -8925,17 +8944,20 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
   }
 
   try {
-    const result = db.prepare(`
-      INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
-        status = 'active', max_uses = excluded.max_uses, use_count = 0,
-        granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
-    `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
-
-    const delegation = db.prepare(`
-      SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND (context_id IS ? OR context_id = ?)
-    `).get(ownerDid, delegate_did, secret.id, contextId, contextId);
+    let delegation;
+    if (contextId === null) {
+      delegation = { id: grantAllContextsDelegation(ownerDid, delegate_did, secret.id, actor.actor, { maxUses: max_uses || 0, expiresAt }) };
+    } else {
+      db.prepare(`
+        INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
+          status = 'active', max_uses = excluded.max_uses, use_count = 0,
+          granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
+      `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
+      delegation = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?')
+        .get(ownerDid, delegate_did, secret.id, contextId);
+    }
 
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
       'delegation_granted', actor.actor, secret.id, context_name || '*',
@@ -8975,8 +8997,18 @@ app.post('/api/blindkey/delegate/revoke', rateLimitStandard, (req, res) => {
   } else {
     const secret = resolveLatestBlindkeySecret(ownerDid, secret_name);
     if (!secret) return res.status(404).json({ error: 'secret not found' });
-    delegation = db.prepare('SELECT * FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND status = ?')
-      .get(ownerDid, delegate_did, secret.id, 'active');
+    // Every active row for this owner, delegate and secret: a revoke by name ends the access, duplicates included.
+    const rows = db.prepare('SELECT * FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND status = ? ORDER BY id')
+      .all(ownerDid, delegate_did, secret.id, 'active');
+    if (rows.length > 1) {
+      for (const r of rows) {
+        db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(r.id);
+        db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+          'delegation_revoked', actor.actor, r.secret_id, null, JSON.stringify({ delegation_id: r.id, owner_did: r.owner_did, delegate_did: r.delegate_did }));
+      }
+      return res.json({ ok: true, revoked: true, delegation_ids: rows.map(r => r.id) });
+    }
+    delegation = rows[0];
   }
 
   if (!delegation) return res.status(404).json({ error: 'delegation not found' });
@@ -9167,12 +9199,7 @@ app.post('/api/blindkey/access-requests/:id/approve', rateLimitFill, (req, res) 
     db.transaction(() => {
       const claimed = db.prepare("UPDATE demipass_access_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP, secret_id = ? WHERE id = ? AND status = 'pending'").run(secret.id, row.id).changes;
       if (claimed !== 1) throw Object.assign(new Error('this access request was decided meanwhile'), { status: 409 });
-      db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
-                  VALUES (?, ?, ?, NULL, 0, ?, NULL)
-                  ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
-                    status = 'active', max_uses = 0, use_count = 0, granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = NULL`)
-        .run(auth.did, row.requester_did, secret.id, auth.did);
-      delegationId = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL').get(auth.did, row.requester_did, secret.id).id;
+      delegationId = grantAllContextsDelegation(auth.did, row.requester_did, secret.id, auth.did);
       db.prepare('UPDATE demipass_access_requests SET delegation_id = ? WHERE id = ?').run(delegationId, row.id);
       db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
         .run('delegation_granted', auth.did, secret.id, '*', JSON.stringify({ delegation_id: delegationId, owner_did: auth.did, delegate_did: row.requester_did, via: 'access_request', request_id: row.id }));
@@ -9206,8 +9233,15 @@ const MENU_CALLS = {
   ask_for_access: 'POST /api/demipass/access-requests {"owner":"<username>","secret":"<name or ref>","reason":"…"} — the owner approves it in the DemiPass app with their PIN; check GET /api/demipass/access-requests',
   store: 'POST /api/demipass/store {"name","value","secret_type"}',
 };
-function buildAgentMenu(did, { compact = false } = {}) {
+function buildAgentMenu(did, { compact = false, auth = null } = {}) {
   const cap = compact ? 15 : 200;
+  // A silicon agent acts with its owner's DID but may use only the secrets it holds secret:use for; a worker token
+  // only its allow-list. The menu lists exactly those (never the rest of the owner's vault).
+  const usable = (s) => {
+    if (auth && auth.silicon && !siliconHasPermission(auth.agent_name, 'secret:use', s.name)) return false;
+    if (auth && auth.decoded && auth.decoded.wrk && !fleetBilling.workerMayUseSecret(db, auth.decoded, s).ok) return false;
+    return true;
+  };
   const sql = REDEEMABLE_STATUS_SQL.replace(/\bstatus\b/g, 's.status');
   const ctxOf = db.prepare("SELECT context_name, action_type, target_url_pattern, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'");
   const describe = (s, extra) => {
@@ -9216,14 +9250,16 @@ function buildAgentMenu(did, { compact = false } = {}) {
     if (!compact) item.contexts = ctx.map(c => ({ name: c.context_name, action: c.action_type, url: c.target_url_pattern || undefined, host: c.target_host_pattern || undefined }));
     return item;
   };
+  const restricted = !!(auth && (auth.silicon || (auth.decoded && auth.decoded.wrk)));
   const own = db.prepare(`SELECT s.* FROM blindkey_secrets s WHERE s.did = ? AND ${sql}
-                          AND s.version = (SELECT MAX(x.version) FROM blindkey_secrets x WHERE x.did = s.did AND x.name = s.name) ORDER BY s.name LIMIT ?`).all(did, cap + 1);
+                          AND s.version = (SELECT MAX(x.version) FROM blindkey_secrets x WHERE x.did = s.did AND x.name = s.name) ORDER BY s.name LIMIT ?`)
+    .all(did, restricted ? 100000 : cap + 1).filter(usable).slice(0, cap + 1);
   const shared = db.prepare(`SELECT s.*, w.username AS owner_username, d.max_uses AS d_max, d.use_count AS d_used, d.expires_at AS d_expires
                              FROM demipass_delegations d JOIN blindkey_secrets s ON s.id = d.secret_id JOIN identity_wallets w ON w.did = d.owner_did
                              WHERE d.delegate_did = ? AND d.status = 'active' AND (d.expires_at IS NULL OR d.expires_at > ?) AND ${sql}
-                             ORDER BY s.name LIMIT ?`).all(did, new Date().toISOString(), cap + 1);
+                             ORDER BY s.name LIMIT ?`).all(did, new Date().toISOString(), restricted ? 100000 : cap + 1).filter(usable).slice(0, cap + 1);
   let askable = [], waiting = [];
-  try {
+  if (!restricted) try {
     askable = fleetOwnersOf(did).map(o => o.username);
     waiting = db.prepare(`SELECT r.id, w.username AS owner, r.secret_hint FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.owner_did
                           WHERE r.requester_did = ? AND r.status = 'pending' ORDER BY r.id DESC LIMIT 10`).all(did);
@@ -9247,7 +9283,7 @@ app.get('/api/blindkey/menu', rateLimitStandard, (req, res) => {
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, menu: MENU_SIGNED_OUT });
   const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(auth.did) || {};
   try {
-    res.json({ ok: true, you: { username: wallet.username || null, did: auth.did, scope: auth.scope || null, agent: auth.agent_name || null }, ...buildAgentMenu(auth.did) });
+    res.json({ ok: true, you: { username: wallet.username || null, did: auth.did, scope: auth.scope || null, agent: auth.agent_name || null }, ...buildAgentMenu(auth.did, { auth }) });
   } catch (e) {
     res.status(500).json({ error: 'could not build the menu', calls: MENU_CALLS });
   }

@@ -142,4 +142,45 @@ call POST /api/demipass/request-token "$A" '{"name":"svc-token"}'
 call POST /api/demipass/request-token "$A" '{"ref":"'$PREF'"}'
 [ "$CODE" = 200 ] && ok "the ref picks one" || fail "ref pick: $CODE $BODY"
 
+# ── review findings (PR #32 round 1) ──
+SQ(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute(sys.argv[2]).fetchall(); c.commit(); print(r[0][0] if r and r[0] else '')" "$DB_PATH" "$1"; }
+call POST /api/demipass/access-requests "$A" '{"owner":"owner","secret":"'$REF'","reason":"same secret, other wording"}'
+RQ2=$(echo "$BODY" | J request_id)
+call POST /api/identity/gate/verify "$O" '{"gate":"pin","pin":"4321","intent":"access:'$RQ2'"}'
+call POST /api/demipass/access-requests/$RQ2/approve "$O"; D2=$(echo "$BODY" | J delegation_id)
+ACT=$(SQ "SELECT COUNT(*) FROM demipass_delegations d JOIN blindkey_secrets s ON s.id=d.secret_id JOIN identity_wallets w ON w.did=d.delegate_did WHERE w.username='agent' AND s.ref_code='$REF' AND d.status='active'")
+[ "$CODE" = 200 ] && [ "$ACT" = 1 ] && ok "approving the same secret twice keeps ONE active delegation (id $D2)" || fail "dup delegation: $CODE active=$ACT $BODY"
+call POST /api/demipass/delegate/revoke "$O" '{"delegate_did":"'$AD'","secret_name":"svc-token"}'
+call POST /api/demipass/request-token "$A" '{"ref":"'$REF'"}'
+[ "$CODE" = 403 ] && ok "one revoke by name ends the access" || fail "after revoke: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); s=c.execute(\"SELECT id FROM blindkey_secrets WHERE ref_code=?\",(sys.argv[2],)).fetchone()[0]; o=c.execute(\"SELECT did FROM identity_wallets WHERE username='owner'\").fetchone()[0]; [c.execute(\"INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, status) VALUES (?,?,?,NULL,'active')\",(o,sys.argv[3],s)) for _ in range(2)]; c.commit()" "$DB_PATH" "$REF" "$AD"
+call POST /api/demipass/delegate/revoke "$O" '{"delegate_did":"'$AD'","secret_name":"svc-token"}'
+call POST /api/demipass/request-token "$A" '{"ref":"'$REF'"}'
+[ "$CODE" = 403 ] && ok "legacy duplicate rows: a revoke by name ends them all" || fail "legacy dups: $CODE $BODY"
+call POST /api/demipass/access-requests "$A" '{"owner":"owner","secret":"svc-token","reason":"third time"}'
+RQ3=$(echo "$BODY" | J request_id)
+call POST /api/identity/gate/verify "$O" '{"gate":"pin","pin":"4321","intent":"access:'$RQ3'"}'
+call POST /api/demipass/access-requests/$RQ3/approve "$O"; D3=$(echo "$BODY" | J delegation_id)
+call POST /api/demipass/delegate/revoke "$O" '{"delegation_id":'$D3'}'
+call POST /api/demipass/request-token "$A" '{"ref":"'$REF'"}'
+[ "$CODE" = 403 ] && ok "the delegation id approve reports is the one that, revoked, ends the access" || fail "reported id: $D3 $CODE $BODY"
+
+OD=$(SQ "SELECT did FROM identity_wallets WHERE username='owner'")
+call POST /api/demipass/request-token "$X" '{"name":"svc-token","owner_did":"'$OD'"}'; C1=$CODE; B1=$(echo "$BODY" | J error)
+call POST /api/demipass/request-token "$X" '{"name":"no-such-secret","owner_did":"'$OD'"}'
+[ "$C1" = 403 ] && [ "$CODE" = 403 ] && [ "$B1" = "$(echo "$BODY" | J error)" ] && ! echo "$BODY" | grep -q '"contexts"' \
+  && ok "an outsider naming owner_did gets the same 403 for a real and a missing secret, no context names" || fail "owner_did oracle: $C1 / $CODE $BODY"
+
+SQ "INSERT INTO silicon_permissions (agent_name, permission_type, resource, granted_by) VALUES ('owner-bot', 'secret:use', 'other-token', 'smoke')" >/dev/null
+call GET /api/demipass/menu "$SIL"
+NAMES=$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(",".join(s["name"] for s in d["your_secrets"]))')
+[ "$CODE" = 200 ] && [ "$NAMES" = other-token ] && [ "$(echo "$BODY" | J can_ask)" = "[]" ] && ok "a silicon token's menu lists only the secret it may use" || fail "silicon menu: $NAMES $BODY"
+call POST /api/demipass/request-token "$SIL" '{"ref":"DP-none-1"}'
+echo "$BODY" | grep -q 'svc-token' && fail "silicon error menu leaked svc-token" || ok "a silicon token's error menu leaks nothing else"
+
+SID=$(SQ "SELECT id FROM blindkey_secrets WHERE ref_code='$REF'")
+SQ "INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, allowed_by, status) VALUES ($SID, 'second', 'http_header', '*', 'smoke', 'active')" >/dev/null
+call POST /api/demipass/request-token "$O" '{"ref":"'$REF'"}'
+[ "$CODE" = 400 ] && [ "$(echo "$BODY" | J contexts.1)" != None ] && ok "a ref with two contexts asks which one instead of picking" || fail "ref contexts: $CODE $BODY"
+
 echo; [ $fails = 0 ] && echo "ALL OK" || { echo "$fails FAILED"; exit 1; }
