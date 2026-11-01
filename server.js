@@ -348,6 +348,24 @@ app.use((req, _res, next) => {
   next();
 });
 
+// Every DemiPass reply points at the caller's menu; an error carries the compact menu itself (buildAgentMenu),
+// so an agent that hits a wall is told what it can use and how, instead of hunting for it.
+app.use((req, res, next) => {
+  if (!req.url.startsWith('/api/blindkey/') && req.url !== '/api/blindkey') return next();
+  res.setHeader('X-DemiPass-Menu', 'GET /api/demipass/menu');
+  const json = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode >= 400 && body && typeof body === 'object' && !Array.isArray(body) && body.menu === undefined) {
+      try {
+        const auth = getBearerIdentity(req);
+        body = { ...body, menu: auth.ok ? buildAgentMenu(auth.did, { compact: true }) : MENU_SIGNED_OUT };
+      } catch (_) {}
+    }
+    return json(body);
+  };
+  next();
+});
+
 // Silicon discovery headers — every API response whispers "identity available here"
 app.use((req, res, next) => {
   // Only add for non-browser requests (API clients, agents, scripts)
@@ -3448,7 +3466,7 @@ app.get('/api/blindkey/fill/pending', rateLimitFill, (req, res) => {
     client_label: r.client_label || '', created_at: r.created_at, expires_at: r.expires_at,
     own_session: r.requester_session === session,   // the wallet cannot approve a request it made itself
   }));
-  res.json({ ok: true, requests, grants: pendingGrants(auth.did) });
+  res.json({ ok: true, requests, grants: pendingGrants(auth.did), access_requests: pendingAccessRequests(auth.did) });
 });
 
 // The pending request a wallet decides on, or a refusal already sent.
@@ -3902,7 +3920,30 @@ setInterval(() => {
 // The silicon never sees the secret — it only gets a nonce that proves its intent was validated.
 // Supports delegated access: if the caller doesn't own the secret, check demipass_delegations.
 // The delegate passes { owner_did } to indicate whose secret they want to use via delegation.
-app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), (req, res) => {
+// The action a secret type is used with when the caller names none.
+const DEFAULT_ACTION_BY_TYPE = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
+// Active secrets other owners share with `did` under `name` (latest version per owner).
+function sharedSecretsNamed(did, name) {
+  return db.prepare(`SELECT d.owner_did, w.username AS owner_username, MAX(s.ref_code) AS ref_code
+    FROM demipass_delegations d JOIN blindkey_secrets s ON s.id = d.secret_id JOIN identity_wallets w ON w.did = d.owner_did
+    WHERE d.delegate_did = ? AND d.status = 'active' AND s.name = ? AND ${REDEEMABLE_STATUS_SQL.replace(/\bstatus\b/g, 's.status')}
+    GROUP BY d.owner_did`).all(did, name);
+}
+// The context to use when the caller names none: the secret's only active one.
+function soleContext(secret) {
+  const ctxs = db.prepare("SELECT context_name FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id).map(c => c.context_name);
+  if (ctxs.length === 1) return { context: ctxs[0] };
+  return { error: ctxs.length ? `context required — '${secret.name}' has ${ctxs.length} contexts; pick one` : `'${secret.name}' has no usage context yet; its owner must add one`, contexts: ctxs };
+}
+// Runs a synchronous route handler against a stand-in response and returns what it answered.
+function captureJson(handler, req) {
+  const out = { status: 200, body: null };
+  const res = { status(code) { out.status = code; return res; }, json(body) { out.body = body; return res; } };
+  handler(req, res);
+  return out;
+}
+// Also called by /api/blindkey/use (one-call mode for shared secrets and refs), so it must stay synchronous.
+function requestUseTokenHandler(req, res) {
   let { name, ref, context: contextName, action, target_host, target_url, owner_did } = req.body || {};
 
   // Per-DID rate limit + suspension check
@@ -3958,8 +3999,7 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
 
     // Auto-resolve action from secret_type if not provided
     if (!action) {
-      const typeToAction = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
-      action = typeToAction[refSecret.secret_type] || 'http_header';
+      action = DEFAULT_ACTION_BY_TYPE[refSecret.secret_type] || 'http_header';
     }
 
     // Auto-resolve context — use the first active context if not provided
@@ -3981,14 +4021,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
     }
   }
 
-  if (!name || !action) return res.status(400).json({ error: 'name and action required (or use ref: "DP-...")' });
+  if (!name) return res.status(400).json({ error: 'name or ref required (ref: "DP-...")' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
-  if (typeof action !== 'string') return res.status(400).json({ error: 'action: must be a string' });
+  if (action != null && typeof action !== 'string') return res.status(400).json({ error: 'action: must be a string' });
   if (name.length > 100) return res.status(400).json({ error: 'name: max 100 characters' });
-  if (action.length > 100) return res.status(400).json({ error: 'action: max 100 characters' });
-  if (!contextName) return res.status(400).json({ error: 'context required — use-tokens always require a context' });
-  if (typeof contextName !== 'string') return res.status(400).json({ error: 'context: must be a string' });
-  if (contextName.length > 100) return res.status(400).json({ error: 'context: max 100 characters' });
+  if (action && action.length > 100) return res.status(400).json({ error: 'action: max 100 characters' });
+  if (contextName != null && typeof contextName !== 'string') return res.status(400).json({ error: 'context: must be a string' });
+  if (contextName && contextName.length > 100) return res.status(400).json({ error: 'context: max 100 characters' });
+  if (owner_did != null && typeof owner_did !== 'string') return res.status(400).json({ error: 'owner_did: must be a string' });
   if (target_host && typeof target_host !== 'string') return res.status(400).json({ error: 'target_host: must be a string' });
   if (target_url && typeof target_url !== 'string') return res.status(400).json({ error: 'target_url: must be a string' });
 
@@ -3998,10 +4038,25 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   let secret = resolveLatestBlindkeySecret(callerDid, name);
   let delegation = null;
 
+  // Not owned and no owner given: a secret someone shared with the caller under this name.
+  if (!secret && !owner_did) {
+    const shared = sharedSecretsNamed(callerDid, name);
+    if (shared.length > 1) {
+      return res.status(409).json({ error: `more than one owner shares a secret named '${name}' with you — send its ref instead`,
+        candidates: shared.map(s => ({ ref: s.ref_code, owner: s.owner_username })) });
+    }
+    if (shared.length === 1) owner_did = shared[0].owner_did;
+  }
+
   // If caller doesn't own the secret, check for a delegation
   if (!secret && owner_did) {
     secret = resolveLatestBlindkeySecret(owner_did, name);
     if (!secret) return res.status(404).json({ error: 'secret not found' });
+    if (!contextName) {
+      const picked = soleContext(secret);
+      if (picked.error) return res.status(400).json(picked);
+      contextName = picked.context;
+    }
 
     // Look up the context_id for the delegation check
     const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, contextName);
@@ -4043,8 +4098,14 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
       return res.status(403).json({ error: `delegation has reached its max usage limit (${delegation.max_uses})` });
     }
   } else if (!secret) {
-    return res.status(404).json({ error: 'secret not found' });
+    return res.status(404).json({ error: `no secret named '${name}' is yours or shared with you` });
   }
+  if (!contextName) {
+    const picked = soleContext(secret);
+    if (picked.error) return res.status(400).json(picked);
+    contextName = picked.context;
+  }
+  if (!action) action = DEFAULT_ACTION_BY_TYPE[secret.secret_type] || 'http_header';
 
   // Validate context using existing enforceBlindkeyContext
   const ctxCheck = enforceBlindkeyContext(secret, contextName, action, target_url || null, target_host || null);
@@ -4143,14 +4204,28 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+}
+app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), requestUseTokenHandler);
 
 // POST /api/blindkey/use — use a secret without seeing it (delegated execution)
 // Supports two modes:
 //   1. use-token mode: { use_token, command } — uses pre-validated context from token
 //   2. direct mode: { name, action, params, context } — validates context inline (backward compatible)
+//   3. one-call mode: { ref | name of a shared secret, action, params, context? } — issues a use-token through
+//      request-token (same delegation, context, gate, velocity and worker checks) and redeems it at once
 app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
-  const { use_token } = req.body || {};
+  let { use_token } = req.body || {};
+
+  const b = req.body || {};
+  if (!use_token && (b.ref || (b.name && typeof b.name === 'string' && !resolveLatestBlindkeySecret(req.identity.did, b.name)))) {
+    const p = (b.params && typeof b.params === 'object') ? b.params : {};
+    const issueReq = Object.create(req);
+    issueReq.body = { ref: b.ref, name: b.name, action: b.action, context: b.context, owner_did: b.owner_did,
+                      target_url: p.url || b.target_url, target_host: p.target_host || b.target_host };
+    const issued = captureJson(requestUseTokenHandler, issueReq);
+    if (!issued.body || !issued.body.use_token) return res.status(issued.status >= 400 ? issued.status : 500).json(issued.body || { error: 'could not issue a use-token' });
+    use_token = issued.body.use_token;
+  }
 
   // ── Use-token mode ──
   if (use_token) {
@@ -4506,7 +4581,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
   // Enforce context rules
   const targetUrl = (params && params.url) || (req.body && req.body.target_url) || null;
   const targetHost = (req.body && req.body.target_host) || (params && params.target_host) || null;
-  const ctxCheck = enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost);
+  const ctxCheck = enforceBlindkeyContext(secret, contextName || soleContext(secret).context, action, targetUrl, targetHost);
   if (!ctxCheck.allowed) {
     return res.status(403).json({ error: ctxCheck.error });
   }
@@ -8971,6 +9046,213 @@ app.get('/api/blindkey/delegations', rateLimitStandard, (req, res) => {
   res.json({ delegations: results, total: results.length });
 });
 
+// ── Access requests: an agent asks an owner for a secret ──
+// Only a member of one of the owner's fleets may ask. The request waits in the owner's DemiPass app; approving
+// it needs the vault PIN (intent access:<id>) and creates an ordinary delegation, revocable like any other.
+try { db.exec(`CREATE TABLE IF NOT EXISTS demipass_access_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  requester_did TEXT NOT NULL,
+  owner_did TEXT NOT NULL,
+  secret_hint TEXT DEFAULT '',
+  reason TEXT DEFAULT '',
+  status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'denied', 'expired')),
+  secret_id INTEGER,
+  delegation_id INTEGER,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  decided_at TEXT,
+  expires_at TEXT NOT NULL
+)`); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dar_owner ON demipass_access_requests(owner_did, status)"); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_dar_requester ON demipass_access_requests(requester_did, status)"); } catch(_) {}
+const ACCESS_REQUEST_TTL_DAYS = 7;
+const ACCESS_REQUEST_MAX_PENDING_PER_PAIR = 5;
+const ACCESS_REQUEST_MAX_PENDING_PER_OWNER = 50;
+
+// Owners of the active fleets `did` belongs to: the people it may ask for a secret.
+function fleetOwnersOf(did) {
+  return db.prepare(`SELECT DISTINCT f.owner_did, w.username FROM fleets f JOIN identity_wallets w ON w.did = f.owner_did
+    WHERE f.status = 'active' AND f.owner_did != ? AND (
+      EXISTS (SELECT 1 FROM fleet_silicons fs WHERE fs.fleet_id = f.id AND fs.member_did = ? AND fs.status = 'active')
+      OR EXISTS (SELECT 1 FROM fleet_members fm WHERE fm.fleet_id = f.id AND fm.member_did = ?))`).all(did, did, did);
+}
+function expireAccessRequests() {
+  db.prepare("UPDATE demipass_access_requests SET status = 'expired' WHERE status = 'pending' AND expires_at <= ?").run(new Date().toISOString());
+}
+// The owner's active secret a request (or the owner's choice) names, by ref or by name.
+function ownSecretFor(did, pick) {
+  if (!pick || typeof pick !== 'string') return null;
+  if (pick.startsWith('DP-')) return db.prepare(`SELECT * FROM blindkey_secrets WHERE ref_code = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(pick, did) || null;
+  return resolveLatestBlindkeySecret(did, pick) || null;
+}
+// Pending requests waiting on an owner, for the app's approval cards (sent with GET /fill/pending).
+function pendingAccessRequests(ownerDid) {
+  expireAccessRequests();
+  return db.prepare(`SELECT r.*, w.username AS requester FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.requester_did
+                     WHERE r.owner_did = ? AND r.status = 'pending' ORDER BY r.id`).all(ownerDid).map(r => {
+    const match = ownSecretFor(ownerDid, r.secret_hint);
+    return { id: r.id, intent: `access:${r.id}`, requester: r.requester, secret_hint: r.secret_hint, reason: r.reason,
+             match: match ? { name: match.name, ref: match.ref_code } : null, created_at: r.created_at, expires_at: r.expires_at };
+  });
+}
+
+// POST /api/blindkey/access-requests — { owner: username or DID, secret: name or ref you need, reason }
+app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (auth.silicon) return res.status(403).json({ error: "a silicon agent already acts with its owner's secrets; ask the owner for a grant instead" });
+  const { owner, secret = '', reason = '' } = req.body || {};
+  if (!owner || typeof owner !== 'string' || owner.length > 200) return res.status(400).json({ error: "owner required: the username of the secret's owner" });
+  if (typeof secret !== 'string' || secret.length > 100) return res.status(400).json({ error: 'secret: the name or ref you need, max 100 characters' });
+  if (typeof reason !== 'string' || reason.length > 500) return res.status(400).json({ error: 'reason: max 500 characters' });
+  const ownerRow = db.prepare('SELECT did, username FROM identity_wallets WHERE username = ? OR did = ?').get(owner, owner);
+  const askable = fleetOwnersOf(auth.did);
+  if (!ownerRow || !askable.some(o => o.owner_did === ownerRow.did)) {
+    return res.status(403).json({ error: 'you can ask only the owner of a fleet you belong to', you_can_ask: askable.map(o => o.username) });
+  }
+  expireAccessRequests();
+  const hint = cleanLabel(secret, 100).trim(), why = cleanLabel(reason, 500).trim();
+  const same = db.prepare("SELECT id FROM demipass_access_requests WHERE requester_did = ? AND owner_did = ? AND secret_hint = ? AND status = 'pending'").get(auth.did, ownerRow.did, hint);
+  if (same) return res.json({ ok: true, request_id: same.id, status: 'pending', owner: ownerRow.username, already_pending: true });
+  const pair = db.prepare("SELECT COUNT(*) AS n FROM demipass_access_requests WHERE requester_did = ? AND owner_did = ? AND status = 'pending'").get(auth.did, ownerRow.did).n;
+  if (pair >= ACCESS_REQUEST_MAX_PENDING_PER_PAIR) return res.status(429).json({ error: `you already have ${pair} requests waiting on ${ownerRow.username}` });
+  const all = db.prepare("SELECT COUNT(*) AS n FROM demipass_access_requests WHERE owner_did = ? AND status = 'pending'").get(ownerRow.did).n;
+  if (all >= ACCESS_REQUEST_MAX_PENDING_PER_OWNER) return res.status(429).json({ error: `${ownerRow.username} has too many requests waiting; try again later` });
+  const expiresAt = new Date(Date.now() + ACCESS_REQUEST_TTL_DAYS * 86400000).toISOString();
+  const id = db.prepare('INSERT INTO demipass_access_requests (requester_did, owner_did, secret_hint, reason, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .run(auth.did, ownerRow.did, hint, why, expiresAt).lastInsertRowid;
+  logSecurityEvent('access_requested', 'info', { caller_did: auth.did, agent_name: auth.agent_name, capability: 'access_request', target: hint, ip: req.ip, context: { owner: ownerRow.username, request_id: id } });
+  res.status(201).json({ ok: true, request_id: id, status: 'pending', owner: ownerRow.username, expires_at: expiresAt,
+    next: `${ownerRow.username} approves it in the DemiPass app with their PIN. Check GET /api/demipass/access-requests; once approved the secret is listed in GET /api/demipass/menu` });
+});
+
+// GET /api/blindkey/access-requests — { incoming: waiting on you (owners only), outgoing: the ones you sent }
+app.get('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  expireAccessRequests();
+  const outgoing = db.prepare(`SELECT r.id, w.username AS owner, r.secret_hint, r.status, s.name AS secret_name, s.ref_code AS ref, r.created_at, r.decided_at, r.expires_at
+                               FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.owner_did LEFT JOIN blindkey_secrets s ON s.id = r.secret_id
+                               WHERE r.requester_did = ? ORDER BY r.id DESC LIMIT 20`).all(auth.did);
+  res.json({ ok: true, incoming: auth.silicon ? [] : pendingAccessRequests(auth.did), outgoing });
+});
+
+// The pending request an owner decides on, or a refusal already sent.
+function accessDecision(req, res) {
+  const auth = fillAuth(req, res); if (!auth) return null;
+  if (auth.silicon) { res.status(403).json({ error: 'only the owner decides access requests' }); return null; }
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) { res.status(400).json({ error: 'invalid access request id' }); return null; }
+  expireAccessRequests();
+  const row = db.prepare('SELECT * FROM demipass_access_requests WHERE id = ? AND owner_did = ?').get(id, auth.did);
+  if (!row) { res.status(404).json({ error: 'access request not found' }); return null; }
+  if (row.status !== 'pending') { res.status(409).json({ error: `this access request is already ${row.status}` }); return null; }
+  return { auth, row };
+}
+
+// POST /api/blindkey/access-requests/:id/approve — { secret?: name or ref to share; defaults to the one asked for }.
+// Needs the PIN, proven for intent access:<id>.
+app.post('/api/blindkey/access-requests/:id/approve', rateLimitFill, (req, res) => {
+  const d = accessDecision(req, res); if (!d) return;
+  const { auth, row } = d;
+  const pick = (req.body && req.body.secret) || row.secret_hint;
+  if (!pick) return res.status(400).json({ error: 'choose the secret to share: {"secret":"<name or ref>"}' });
+  const secret = ownSecretFor(auth.did, pick);
+  if (!secret) return res.status(404).json({ error: `you have no active secret '${pick}'; send {"secret":"<name or ref>"} to share another` });
+  const intent = `access:${row.id}`;
+  if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('access', ['pin'], ['pin'], intent));
+  const refused = spendSingleUse(auth.did, 'access', ['pin'], auth, intent);
+  if (refused) return res.status(refused.status || 403).json(refused);
+  let delegationId;
+  try {
+    db.transaction(() => {
+      const claimed = db.prepare("UPDATE demipass_access_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP, secret_id = ? WHERE id = ? AND status = 'pending'").run(secret.id, row.id).changes;
+      if (claimed !== 1) throw Object.assign(new Error('this access request was decided meanwhile'), { status: 409 });
+      db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
+                  VALUES (?, ?, ?, NULL, 0, ?, NULL)
+                  ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
+                    status = 'active', max_uses = 0, use_count = 0, granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = NULL`)
+        .run(auth.did, row.requester_did, secret.id, auth.did);
+      delegationId = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL').get(auth.did, row.requester_did, secret.id).id;
+      db.prepare('UPDATE demipass_access_requests SET delegation_id = ? WHERE id = ?').run(delegationId, row.id);
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+        .run('delegation_granted', auth.did, secret.id, '*', JSON.stringify({ delegation_id: delegationId, owner_did: auth.did, delegate_did: row.requester_did, via: 'access_request', request_id: row.id }));
+    })();
+  } catch (e) {
+    return res.status(e.status || 500).json({ error: e.status ? e.message : 'could not approve the request; try again' });
+  }
+  logSecurityEvent('access_request_approved', 'warn', { caller_did: auth.did, capability: 'delegation', target: secret.name, ip: req.ip, context: { request_id: row.id, delegate_did: row.requester_did, delegation_id: delegationId } });
+  res.json({ ok: true, id: row.id, status: 'approved', secret_name: secret.name, ref: secret.ref_code, delegation_id: delegationId });
+});
+
+// POST /api/blindkey/access-requests/:id/deny
+app.post('/api/blindkey/access-requests/:id/deny', rateLimitFill, (req, res) => {
+  const d = accessDecision(req, res); if (!d) return;
+  db.prepare("UPDATE demipass_access_requests SET status = 'denied', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(d.row.id);
+  res.json({ ok: true, id: d.row.id, status: 'denied' });
+});
+
+// ── Agent menu: what this identity can do in DemiPass, and the exact calls ──
+// GET /api/blindkey/menu answers in full; every DemiPass error carries the compact form (see the middleware near
+// the /api/demipass rewrite), so an agent that hits a wall is told its options instead of hunting for them.
+const MENU_SIGNED_OUT = {
+  sign_in: 'POST /api/identity/auth-fingerprint {"username","password","scope":"transact"} → {"token"}; send it as Authorization: Bearer <token>',
+  device_login: 'POST /api/identity/device/code {"agent_label","scope":"transact"} → the owner approves the code at https://demipass.com/device, then poll POST /api/identity/device/token',
+  then: 'GET /api/demipass/menu lists your secrets and how to use them',
+};
+const MENU_CALLS = {
+  use: 'POST /api/demipass/use {"ref":"DP-…","params":{"url":"https://…","method":"GET","body":{}}} — one call; DemiPass injects the secret and returns the response, you never see the value. SSH: {"ref","action":"ssh_exec","command":"…"}',
+  use_two_step: 'POST /api/demipass/request-token {"ref"} → {"use_token"} (single use, 30 s), then POST /api/demipass/use {"use_token","params":{…}}',
+  names: "a name works in place of a ref, for your own secrets and for ones shared with you; context and action are filled in when there is only one choice",
+  ask_for_access: 'POST /api/demipass/access-requests {"owner":"<username>","secret":"<name or ref>","reason":"…"} — the owner approves it in the DemiPass app with their PIN; check GET /api/demipass/access-requests',
+  store: 'POST /api/demipass/store {"name","value","secret_type"}',
+};
+function buildAgentMenu(did, { compact = false } = {}) {
+  const cap = compact ? 15 : 200;
+  const sql = REDEEMABLE_STATUS_SQL.replace(/\bstatus\b/g, 's.status');
+  const ctxOf = db.prepare("SELECT context_name, action_type, target_url_pattern, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'");
+  const describe = (s, extra) => {
+    const ctx = ctxOf.all(s.id);
+    const item = { name: s.name, ref: s.ref_code, type: s.secret_type, actions: [...new Set(ctx.map(c => c.action_type))], ...extra };
+    if (!compact) item.contexts = ctx.map(c => ({ name: c.context_name, action: c.action_type, url: c.target_url_pattern || undefined, host: c.target_host_pattern || undefined }));
+    return item;
+  };
+  const own = db.prepare(`SELECT s.* FROM blindkey_secrets s WHERE s.did = ? AND ${sql}
+                          AND s.version = (SELECT MAX(x.version) FROM blindkey_secrets x WHERE x.did = s.did AND x.name = s.name) ORDER BY s.name LIMIT ?`).all(did, cap + 1);
+  const shared = db.prepare(`SELECT s.*, w.username AS owner_username, d.max_uses AS d_max, d.use_count AS d_used, d.expires_at AS d_expires
+                             FROM demipass_delegations d JOIN blindkey_secrets s ON s.id = d.secret_id JOIN identity_wallets w ON w.did = d.owner_did
+                             WHERE d.delegate_did = ? AND d.status = 'active' AND (d.expires_at IS NULL OR d.expires_at > ?) AND ${sql}
+                             ORDER BY s.name LIMIT ?`).all(did, new Date().toISOString(), cap + 1);
+  let askable = [], waiting = [];
+  try {
+    askable = fleetOwnersOf(did).map(o => o.username);
+    waiting = db.prepare(`SELECT r.id, w.username AS owner, r.secret_hint FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.owner_did
+                          WHERE r.requester_did = ? AND r.status = 'pending' ORDER BY r.id DESC LIMIT 10`).all(did);
+  } catch (_) {}
+  const menu = {
+    your_secrets: own.slice(0, cap).map(s => describe(s)),
+    shared_with_you: shared.slice(0, cap).map(s => describe(s, { owner: s.owner_username, ...(s.d_max ? { uses_left: Math.max(0, s.d_max - s.d_used) } : {}), ...(s.d_expires ? { expires_at: s.d_expires } : {}) })),
+    can_ask: askable,
+    waiting_on: waiting,
+    calls: MENU_CALLS,
+    http_hosts: BLINDKEY_HTTP_HOSTS,
+  };
+  if (own.length > cap || shared.length > cap) menu.more = 'GET /api/demipass/menu lists everything';
+  if (compact) menu.full_menu = 'GET /api/demipass/menu';
+  return menu;
+}
+
+// GET /api/blindkey/menu — the full menu for the caller
+app.get('/api/blindkey/menu', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, menu: MENU_SIGNED_OUT });
+  const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(auth.did) || {};
+  try {
+    res.json({ ok: true, you: { username: wallet.username || null, did: auth.did, scope: auth.scope || null, agent: auth.agent_name || null }, ...buildAgentMenu(auth.did) });
+  } catch (e) {
+    res.status(500).json({ error: 'could not build the menu', calls: MENU_CALLS });
+  }
+});
+
 // GET /api/blindkey/delegate/chain — show the delegation chain for a secret (owner only)
 app.get('/api/blindkey/delegate/chain', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
@@ -12384,7 +12666,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
