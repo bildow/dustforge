@@ -314,8 +314,21 @@ app.use((req, res, next) => {
 // MTA hook above.
 const _jsonParser = express.json();
 const _urlencodedParser = express.urlencoded({ extended: false });
-app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, next)));
-app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, next)));
+// A body the parser refuses is answered in JSON with what to fix (and the DemiPass menu), never Express's HTML page,
+// which also printed a stack trace with server paths. The body itself is not echoed.
+function badBody(req, res, err) {
+  const tooLarge = err && err.type === 'entity.too.large';
+  const body = tooLarge
+    ? { error: 'request body too large', hint: 'Keep a JSON body under 100 kB.' }
+    : { error: 'request body is not valid JSON', hint: 'Send one JSON object with Content-Type: application/json. Every string is quoted: "pane_id": "%30".' };
+  if (req.url.startsWith('/api/demipass') || req.url.startsWith('/api/blindkey')) {
+    res.setHeader('X-DemiPass-Menu', 'GET /api/demipass/menu');
+    try { const auth = getBearerIdentity(req); body.menu = auth.ok ? buildAgentMenu(auth.did, { compact: true, auth }) : MENU_SIGNED_OUT; } catch (_) {}
+  }
+  return res.status(tooLarge ? 413 : 400).json(body);
+}
+app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, (err) => (err ? badBody(req, res, err) : next()))));
+app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 // A "not enough DD" (402) answer to an agent paying for itself tells it how to ask its fleet owner for a top-up
 // (network_routes.js). Not for people, worker/silicon tokens, or a charge someone else pays.
 function topupHintFor(req, body) {
@@ -13200,6 +13213,14 @@ app.post('/api/blindkey/outcome', rateLimitStandard, (req, res) => {
   db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
     .run(secret_id, auth.did, action_type || '', outcome, error_summary || '', auth.agent_name || '');
   res.json({ ok: true });
+});
+
+// Last resort for an error a route threw: JSON, logged here, and no stack trace to the caller.
+app.use((err, req, res, _next) => {
+  console.error('[error]', req.method, req.path, err && err.stack || err);
+  if (res.headersSent) return;
+  const status = err && err.status >= 400 && err.status < 500 ? err.status : 500;
+  res.status(status).json({ error: status === 500 ? 'internal error' : (err.expose && err.message) || 'bad request' });
 });
 
 module.exports = { app, db, buoyNotifyConduit };

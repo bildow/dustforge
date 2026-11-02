@@ -187,4 +187,14 @@ call POST /api/demipass/request-token "$O" '{"ref":"'$REF'","target_url":"https:
 call POST /api/demipass/request-token "$O" '{"ref":"'$REF'","target_url":"https://billing.example/x"}'
 [ "$CODE" = 400 ] && ok "…and a target both fit still asks" || fail "both fit: $CODE $BODY"
 
+# A body that is not JSON: JSON answer with a hint (and the menu on DemiPass routes), no HTML, no stack trace.
+R=$(curl -s -o "$S/bad" -w '%{http_code} %{content_type}' -X POST "$API/api/demipass/use" -H "Authorization: Bearer $A" -H 'Content-Type: application/json' -d '{"ref":"x","body":%2530}')
+B=$(cat "$S/bad")
+[[ "$R" == "400 application/json"* ]] && [ "$(echo "$B" | J menu.calls)" != None ] && [ "$(echo "$B" | J hint)" != None ] && ! grep -q "node_modules\|SyntaxError" "$S/bad" && ok "bad JSON on /use → 400 JSON with hint + menu, no stack" || fail "bad json: $R $B"
+R=$(curl -s -o "$S/bad" -w '%{http_code} %{content_type}' -X POST "$API/api/identity/refresh" -H 'Content-Type: application/json' -d '{oops')
+[[ "$R" == "400 application/json"* ]] && [ "$(J menu < "$S/bad")" = None ] && ok "bad JSON elsewhere → 400 JSON, no menu" || fail "bad json elsewhere: $R $(cat "$S/bad")"
+python3 -c 'print("{\"x\":\"" + "a"*200000 + "\"}")' > "$S/big"
+R=$(curl -s -o "$S/bad" -w '%{http_code} %{content_type}' -X POST "$API/api/demipass/use" -H 'Content-Type: application/json' --data-binary @"$S/big")
+[[ "$R" == "413 application/json"* ]] && ok "oversized body → 413 JSON" || fail "big: $R $(head -c 200 "$S/bad")"
+
 echo; [ $fails = 0 ] && echo "ALL OK" || { echo "$fails FAILED"; exit 1; }
