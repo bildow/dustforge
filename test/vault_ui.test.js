@@ -55,7 +55,8 @@ function page({ storage = {}, routes, abortable = false } = {}) {
         if (o.signal.aborted) abort(); else o.signal.addEventListener('abort', abort);
         Promise.resolve(routed).then(resolve, reject);
       }) : await routed;
-      return { status: r.status || 200, json: async () => (r.json === undefined ? {} : r.json) };
+      // cut: the connection dropped mid-reply, so the body is not JSON (a phone switching Wi-Fi ↔ mobile data)
+      return { status: r.status || 200, json: async () => { if (r.cut) throw new SyntaxError('Unexpected end of JSON input'); return r.json === undefined ? {} : r.json; } };
     },
   };
   if (abortable) ctx.AbortController = AbortController;   // an older WebView: AbortController, no AbortSignal.timeout
@@ -1232,4 +1233,59 @@ test('another window signed in as a different account: this one signs out, never
   assert.equal(pg.store.get('dp_refresh'), 'dpr_other');
   assert.equal(pg.store.get('dp_token'), 'other.token.z');
   assert.equal(pg.store.get('dp_did'), 'did:key:zOther');
+});
+
+// ── A reply cut off by a network change is a dropped connection, never an empty vault or a sign-out ──
+const dash = { balance_dd: 42, secrets: [{ name: 'fixture-secret', type: 'api_key', status: 'active', health: 'green', labels: [], contexts: [], silicons: [] }], health_summary: { green: 1 } };
+
+test('a cut-off dashboard reply keeps the last vault and balance on screen and says it is offline', async () => {
+  let cut = false;
+  const pg = page({ storage: signedIn, routes: renewRoutes(p => p === '/api/demipass/dashboard' ? (cut ? { cut: true } : { json: dash }) : null) });
+  await settle(10);
+  pg.ctx.loadVault = pg.ctx.__realLoadVault;
+  await pg.ctx.loadVault();
+  assert.equal(pg.el('bal').textContent, 42);
+  const list = pg.el('secret-list').innerHTML;
+  assert.match(list, /fixture-secret/);
+  cut = true;
+  await pg.ctx.loadVault();
+  assert.equal(pg.el('bal').textContent, 42, 'balance not zeroed');
+  assert.equal(pg.el('secret-list').innerHTML, list, 'secrets not wiped');
+  assert.match(pg.el('vault-note').textContent, /^Offline/);
+  assert.equal(pg.authOpen(), false);
+  cut = false;
+  await pg.ctx.loadVault();
+  assert.equal(pg.el('vault-note').textContent, '');
+});
+
+test('a cut-off first dashboard reply is an error, not "0 DD, no secrets"', async () => {
+  const pg = page({ storage: signedIn, routes: renewRoutes(p => p === '/api/demipass/dashboard' ? { cut: true } : null) });
+  await settle(10);
+  pg.ctx.loadVault = pg.ctx.__realLoadVault;
+  await pg.ctx.loadVault();
+  assert.notEqual(pg.el('bal').textContent, 0);
+  assert.doesNotMatch(pg.el('secret-list').innerHTML, /No secrets/);
+  assert.match(pg.el('secret-list').innerHTML, /Connection dropped/);
+});
+
+test('a cut-off renewal reply keeps the session: no sign-out, the refresh token is kept', async () => {
+  const pg = page({ storage: { ...signedIn, dp_token_at: String(Date.now() - DAY + 30 * 60 * 1000), dp_refresh: 'dpr_old' },
+    routes: renewRoutes(p => p === '/api/identity/refresh' ? { cut: true } : (p === '/api/x' ? { json: { ok: true } } : null)) });
+  await settle(10);
+  assert.deepEqual(await pg.ctx.api('GET', '/api/x'), { ok: true });
+  assert.equal(pg.authOpen(), false);
+  assert.equal(pg.store.get('dp_refresh'), 'dpr_old');
+  assert.equal(pg.store.get('dp_token'), 'fixture.token.a');
+});
+
+test('a PIN-gated action renews once on 401 instead of signing out', async () => {
+  let n = 0;
+  const pg = page({ storage: { ...signedIn, dp_refresh: 'dpr_old' }, routes: renewRoutes(p => {
+    if (p === '/api/identity/refresh') return { json: { token: 'fixture.token.b', refresh_token: 'dpr_new' } };
+    if (p === '/api/g') { n++; return n === 1 ? { status: 401, json: { error: 'expired' } } : { json: { ok: true } }; }
+  }) });
+  await settle(10);
+  assert.deepEqual(await pg.ctx.apiGated('POST', '/api/g', {}, 'x'), { ok: true });
+  assert.equal(pg.calls.filter(c => c.path === '/api/g')[1].auth, 'Bearer fixture.token.b');
+  assert.equal(pg.authOpen(), false);
 });
