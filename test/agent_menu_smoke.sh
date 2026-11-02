@@ -197,4 +197,16 @@ python3 -c 'print("{\"x\":\"" + "a"*200000 + "\"}")' > "$S/big"
 R=$(curl -s -o "$S/bad" -w '%{http_code} %{content_type}' -X POST "$API/api/demipass/use" -H 'Content-Type: application/json' --data-binary @"$S/big")
 [[ "$R" == "413 application/json"* ]] && ok "oversized body → 413 JSON" || fail "big: $R $(head -c 200 "$S/bad")"
 
+# Refresh grace: a renewal whose reply was lost (the client still holds the old token) works once within 60 s;
+# the unused successor dies, so one token stays live. A signed-out token never gets grace.
+call POST /api/identity/auth-fingerprint "" '{"username":"other","password":"hunter22","scope":"transact","expires_in":"1h"}'; R0=$(echo "$BODY" | J refresh_token)
+call POST /api/identity/refresh "" '{"refresh_token":"'$R0'"}'; R1=$(echo "$BODY" | J refresh_token)
+call POST /api/identity/refresh "" '{"refresh_token":"'$R0'"}'; R2=$(echo "$BODY" | J refresh_token)
+[ "$CODE" = 200 ] && [ "$R2" != None ] && [ "$R2" != "$R1" ] && ok "a just-rotated refresh token is accepted again (lost reply)" || fail "grace: $CODE $BODY"
+call POST /api/identity/refresh "" '{"refresh_token":"'$R1'"}'; [ "$CODE" = 401 ] && ok "…and the successor whose reply was lost is dead" || fail "lost successor: $CODE $BODY"
+call POST /api/identity/refresh "" '{"refresh_token":"'$R2'"}'; R3=$(echo "$BODY" | J refresh_token); [ "$CODE" = 200 ] && ok "…the newest token renews normally" || fail "newest: $CODE $BODY"
+call POST /api/identity/refresh "" '{"refresh_token":"'$R0'"}'; [ "$CODE" = 401 ] && ok "…once the successor was used, the old token has no grace" || fail "used successor: $CODE $BODY"
+call POST /api/identity/refresh/revoke "" '{"refresh_token":"'$R3'"}'
+call POST /api/identity/refresh "" '{"refresh_token":"'$R3'"}'; [ "$CODE" = 401 ] && ok "a signed-out refresh token gets no grace" || fail "revoked grace: $CODE $BODY"
+
 echo; [ $fails = 0 ] && echo "ALL OK" || { echo "$fails FAILED"; exit 1; }

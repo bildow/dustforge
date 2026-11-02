@@ -1289,3 +1289,36 @@ test('a PIN-gated action renews once on 401 instead of signing out', async () =>
   assert.equal(pg.calls.filter(c => c.path === '/api/g')[1].auth, 'Bearer fixture.token.b');
   assert.equal(pg.authOpen(), false);
 });
+
+test('a rate-limited renewal (429) and a 401 whose renewal is offline keep the session', async () => {
+  let refresh = { status: 429, json: { error: 'Rate limit exceeded' } };
+  const pg = page({ storage: { ...signedIn, dp_token_at: String(Date.now() - DAY + 30 * 60 * 1000), dp_refresh: 'dpr_old' },
+    routes: renewRoutes(p => p === '/api/identity/refresh' ? refresh : (p === '/api/x' ? { json: { ok: true } } : (p === '/api/y' ? { status: 401, json: { error: 'expired' } } : null))) });
+  await settle(10);
+  assert.deepEqual(await pg.ctx.api('GET', '/api/x'), { ok: true });
+  assert.equal(pg.authOpen(), false, '429 is not a sign-out');
+  refresh = { cut: true };
+  await assert.rejects(pg.ctx.api('POST', '/api/y', {}), /check whether it went through/);
+  assert.equal(pg.authOpen(), false, 'a 401 with an offline renewal is not a sign-out');
+  assert.equal(pg.store.get('dp_refresh'), 'dpr_old');
+});
+
+test('a cut-off reply to a change says to check it went through; to a read, that it retries', async () => {
+  const pg = page({ storage: signedIn, routes: renewRoutes(p => (p === '/api/x' ? { cut: true } : null)) });
+  await settle(10);
+  await assert.rejects(pg.ctx.api('GET', '/api/x'), /retrying/);
+  await assert.rejects(pg.ctx.api('POST', '/api/x', {}), /check whether it went through/);
+  await assert.rejects(pg.ctx.apiGated('DELETE', '/api/x', {}, 'x'), /check whether it went through/);
+});
+
+test('only the newest dashboard load writes the screen', async () => {
+  const replies = [];
+  const pg = page({ storage: signedIn, routes: renewRoutes(p => p === '/api/demipass/dashboard' ? new Promise(r => replies.push(r)) : null) });
+  await settle(10);
+  pg.ctx.loadVault = pg.ctx.__realLoadVault;
+  const first = pg.ctx.loadVault(); await settle(); const second = pg.ctx.loadVault(); await settle();
+  replies[1]({ json: dash }); await second;
+  replies[0]({ cut: true }); await first;
+  assert.equal(pg.el('bal').textContent, 42);
+  assert.equal(pg.el('vault-note').textContent, '', 'an older cut-off load leaves no false Offline note');
+});

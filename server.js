@@ -325,7 +325,7 @@ function badBody(req, res, err) {
     res.setHeader('X-DemiPass-Menu', 'GET /api/demipass/menu');
     try { const auth = getBearerIdentity(req); body.menu = auth.ok ? buildAgentMenu(auth.did, { compact: true, auth }) : MENU_SIGNED_OUT; } catch (_) {}
   }
-  return res.status(tooLarge ? 413 : 400).json(body);
+  return res.status(err && err.status >= 400 && err.status < 500 ? err.status : 400).json(body);
 }
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, (err) => (err ? badBody(req, res, err) : next()))));
@@ -642,13 +642,20 @@ function issueRefreshToken(did, scope) {
   return { refresh_token: raw, refresh_expires_at: exp };
 }
 // Validate + single-use rotate: returns {did, scope} or null. Old token is revoked + linked to new.
+// Grace: a token rotated in the last REFRESH_GRACE_SEC whose successor is still unused is accepted once more.
+// A phone that loses the reply to its renewal (Wi-Fi <-> mobile data) still holds only the old token; without
+// this it was signed out on its next call. The caller then retires that unused successor (successorId).
+const REFRESH_GRACE_SEC = 60;
 function consumeRefreshToken(raw) {
   if (!raw || typeof raw !== 'string') return null;
   const row = db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?').get(_refreshHash(raw));
   if (!row) return null;
-  if (row.revoked) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) return null;
-  return { id: row.id, did: row.did, scope: row.scope };
+  if (!row.revoked) return { id: row.id, did: row.did, scope: row.scope };
+  if (!row.rotated_to) return null;   // revoked by sign-out, not by rotation
+  const next = db.prepare(`SELECT id FROM refresh_tokens WHERE token_hash = ? AND revoked = 0 AND did = ?
+    AND ? >= datetime('now', '-${REFRESH_GRACE_SEC} seconds')`).get(row.rotated_to, row.did, row.last_used_at || '');
+  return next ? { id: row.id, did: row.did, scope: row.scope, successorId: next.id } : null;
 }
 function revokeRefreshToken(id, rotatedToRaw) {
   db.prepare('UPDATE refresh_tokens SET revoked = 1, last_used_at = datetime(\'now\'), rotated_to = ? WHERE id = ?')
@@ -6249,7 +6256,11 @@ app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
   } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
   // Rotate: issue new refresh token, revoke the consumed one (linked for audit)
   const nrf = issueRefreshToken(wallet.did, rec.scope);
-  revokeRefreshToken(rec.id, nrf.refresh_token);
+  if (rec.successorId) {
+    // Its reply was lost: retire that successor, and keep the old token's rotation time so the grace never extends.
+    revokeRefreshToken(rec.successorId, null);   // retired, not rotated: it gets no grace of its own
+    db.prepare('UPDATE refresh_tokens SET rotated_to = ? WHERE id = ?').run(_refreshHash(nrf.refresh_token), rec.id);
+  } else revokeRefreshToken(rec.id, nrf.refresh_token);
   res.json({ ok: true, token, refresh_token: nrf.refresh_token, refresh_expires_at: nrf.refresh_expires_at, did: wallet.did, scope: rec.scope, email: wallet.email, auth_method: 'refresh' });
 });
 
@@ -6259,6 +6270,7 @@ app.post('/api/identity/refresh/revoke', rateLimitStandard, (req, res) => {
   if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
   const rec = consumeRefreshToken(refresh_token);
   if (!rec) return res.json({ ok: true, revoked: false, note: 'token already invalid' });
+  if (rec.successorId) revokeRefreshToken(rec.successorId, null);
   revokeRefreshToken(rec.id, null);
   res.json({ ok: true, revoked: true });
 });
@@ -13218,8 +13230,9 @@ app.post('/api/blindkey/outcome', rateLimitStandard, (req, res) => {
 // Last resort for an error a route threw: JSON, logged here, and no stack trace to the caller.
 app.use((err, req, res, _next) => {
   console.error('[error]', req.method, req.path, err && err.stack || err);
-  if (res.headersSent) return;
-  const status = err && err.status >= 400 && err.status < 500 ? err.status : 500;
+  if (res.headersSent) return _next(err);
+  const code = err && (err.status || err.statusCode);
+  const status = code >= 400 && code < 500 ? code : 500;
   res.status(status).json({ error: status === 500 ? 'internal error' : (err.expose && err.message) || 'bad request' });
 });
 
