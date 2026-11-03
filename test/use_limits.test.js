@@ -94,3 +94,17 @@ test('no body (HEAD, 204, 304) is never refused for its Content-Length', async (
     assert.equal(await L.readCapped(new Response(null, { status, headers: { 'content-length': String(LIMIT * 4) } })), '');
   }
 });
+
+test('a numeric secret echoed in another number form is redacted (1e3 for 1000)', () => {
+  assert.deepEqual(L.redactedBody('{"pin":1e3,"n":[1000.0, 7]}', '1000'), { pin: '[REDACTED]', n: ['[REDACTED]', 7] });
+  assert.equal(L.redactedBody('1e3', '1000'), '[REDACTED]');
+  assert.deepEqual(L.redactedBody('{"pin":42}', '1000'), { pin: 42 });
+});
+
+test('review gaps of #35: escaped forms the raw pass would break, a secret split across key and value', () => {
+  const leaks = (o, s) => (typeof o === 'string' ? o : JSON.stringify(o)).includes(s);
+  for (const [secret, upstream] of [['tok"', '{"tok":1,"b":"tok\\u0022"}'], ['ab":"cd', '{"a\\u0062":"cd"}'], ['1000', '{"n":1000.0}']]) {
+    const out = L.redactedBody(upstream, secret);
+    assert.ok(!leaks(out, secret), `${secret} leaked from ${upstream}: ${JSON.stringify(out)}`);
+  }
+});
