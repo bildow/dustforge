@@ -193,9 +193,9 @@ B=$(cat "$S/bad")
 [[ "$R" == "400 application/json"* ]] && [ "$(echo "$B" | J menu.calls)" != None ] && [ "$(echo "$B" | J hint)" != None ] && ! grep -q "node_modules\|SyntaxError" "$S/bad" && ok "bad JSON on /use → 400 JSON with hint + menu, no stack" || fail "bad json: $R $B"
 R=$(curl -s -o "$S/bad" -w '%{http_code} %{content_type}' -X POST "$API/api/identity/refresh" -H 'Content-Type: application/json' -d '{oops')
 [[ "$R" == "400 application/json"* ]] && [ "$(J menu < "$S/bad")" = None ] && ok "bad JSON elsewhere → 400 JSON, no menu" || fail "bad json elsewhere: $R $(cat "$S/bad")"
-python3 -c 'print("{\"x\":\"" + "a"*200000 + "\"}")' > "$S/big"
+python3 -c 'print("{\"x\":\"" + "a"*1100000 + "\"}")' > "$S/big"   # over the 1 MiB /use limit
 R=$(curl -s -o "$S/bad" -w '%{http_code} %{content_type}' -X POST "$API/api/demipass/use" -H 'Content-Type: application/json' --data-binary @"$S/big")
-[[ "$R" == "413 application/json"* ]] && ok "oversized body → 413 JSON" || fail "big: $R $(head -c 200 "$S/bad")"
+[[ "$R" == "413 application/json"* ]] && ok "oversized body (over 1 MiB) → 413 JSON" || fail "big: $R $(head -c 200 "$S/bad")"
 
 # Refresh grace: a renewal whose reply was lost (the client still holds the old token) works once within 60 s;
 # the unused successor dies, so one token stays live. A signed-out token never gets grace.

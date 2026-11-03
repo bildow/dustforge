@@ -13,6 +13,7 @@ const conversion = require('./conversion');
 const referral = require('./referral');
 const stripeService = require('./stripe-service');
 const ddUnits = require('./dd_units');
+const useLimits = require('./use_limits');
 
 const app = express();
 app.set("trust proxy", 1);
@@ -314,13 +315,17 @@ app.use((req, res, next) => {
 // (account creation, founders, prepaid). Skip the webhook path here, same as the
 // MTA hook above.
 const _jsonParser = express.json();
+const _useJsonParser = express.json({ limit: useLimits.USE_MAX_REQUEST_BYTES }); // POST /use: see use_limits.js
+const isUsePath = (p) => p === '/api/demipass/use' || p === '/api/blindkey/use';
 const _urlencodedParser = express.urlencoded({ extended: false });
 // A body the parser refuses is answered in JSON with what to fix (and the DemiPass menu), never Express's HTML page,
 // which also printed a stack trace with server paths. The body itself is not echoed.
 function badBody(req, res, err) {
   const tooLarge = err && err.type === 'entity.too.large';
+  const limit = isUsePath(req.path) ? useLimits.USE_MAX_REQUEST_BYTES : 100 * 1024;
   const body = tooLarge
-    ? { error: 'request body too large', hint: 'Keep a JSON body under 100 kB.' }
+    ? { error: `request body too large: the limit for ${req.path} is ${limit} bytes (${isUsePath(req.path) ? useLimits.mib(limit) : '100 kB'})`, limit_bytes: limit,
+        hint: isUsePath(req.path) ? 'Send less in one call: split the body, or post a link to the content instead of the content.' : 'Keep a JSON body under 100 kB.', charged: false }
     : { error: 'request body is not valid JSON', hint: 'Send one JSON object with Content-Type: application/json. Every string is quoted: "pane_id": "%30".' };
   if (req.url.startsWith('/api/demipass') || req.url.startsWith('/api/blindkey')) {
     res.setHeader('X-DemiPass-Menu', 'GET /api/demipass/menu');
@@ -328,7 +333,7 @@ function badBody(req, res, err) {
   }
   return res.status(err && err.status >= 400 && err.status < 500 ? err.status : 400).json(body);
 }
-app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _jsonParser(req, res, (err) => (err ? badBody(req, res, err) : next()))));
+app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : (isUsePath(req.path) ? _useJsonParser : _jsonParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 // A "not enough DD" (402) answer to an agent paying for itself tells it how to ask its fleet owner for a top-up
 // (network_routes.js). Not for people, worker/silicon tokens, or a charge someone else pays.
@@ -4342,12 +4347,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             body: reqBody ? JSON.stringify(reqBody) : undefined,
             signal: AbortSignal.timeout(30000),
           });
-          const responseBody = await response.text();
-          let parsed;
-          try { parsed = JSON.parse(responseBody); } catch (_) { parsed = responseBody; }
-          const secretRedacted = typeof parsed === 'string'
-            ? parsed.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
-            : JSON.parse(JSON.stringify(parsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+          const secretRedacted = useLimits.redactedBody(await useLimits.readCapped(response), decryptedValue);
           result = { status: response.status, body: secretRedacted };
           break;
         }
@@ -4433,10 +4433,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             body: bodyStr,
             signal: AbortSignal.timeout(30000),
           });
-          const bodyText = await bodyResponse.text();
-          let bodyParsed;
-          try { bodyParsed = JSON.parse(bodyText); } catch (_) { bodyParsed = bodyText; }
-          const bodyRedacted = JSON.parse(JSON.stringify(bodyParsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+          const bodyRedacted = useLimits.redactedBody(await useLimits.readCapped(bodyResponse), decryptedValue);
           result = { status: bodyResponse.status, body: bodyRedacted };
           break;
         }
@@ -4556,10 +4553,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             body: JSON.stringify({ query }),
             signal: AbortSignal.timeout(30000),
           });
-          const dbText = await dbResponse.text();
-          let dbParsed;
-          try { dbParsed = JSON.parse(dbText); } catch (_) { dbParsed = dbText; }
-          const dbRedacted = JSON.parse(JSON.stringify(dbParsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+          const dbRedacted = useLimits.redactedBody(await useLimits.readCapped(dbResponse), decryptedValue);
           result = { status: dbResponse.status, body: dbRedacted };
           break;
         }
@@ -4618,6 +4612,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           .run(secret.id, req.identity.did, action, 'failure', e.message.slice(0, 200), req.identity?.agent_name || '');
       } catch(_) {}
 
+      if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
       return res.status(500).json({ error: `action failed: ${e.message}` });
     }
   }
@@ -4681,14 +4676,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           body: reqBody ? JSON.stringify(reqBody) : undefined,
           signal: AbortSignal.timeout(30000),
         });
-        const responseBody = await response.text();
-        let parsed;
-        try { parsed = JSON.parse(responseBody); } catch (_) { parsed = responseBody; }
-
         // Redact any echo of the secret in the response
-        const secretRedacted = typeof parsed === 'string'
-          ? parsed.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
-          : JSON.parse(JSON.stringify(parsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+        const secretRedacted = useLimits.redactedBody(await useLimits.readCapped(response), decryptedValue);
 
         result = { status: response.status, body: secretRedacted };
         break;
@@ -4802,6 +4791,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
     res.json({ ok: true, action, secret_name: name, result });
   } catch (e) {
+    if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 });
@@ -5471,12 +5461,7 @@ async function handleRowenDeliver(req, res) {
           body: reqBody ? JSON.stringify(reqBody) : undefined,
           signal: AbortSignal.timeout(30000),
         });
-        const responseBody = await response.text();
-        let parsed;
-        try { parsed = JSON.parse(responseBody); } catch (_) { parsed = responseBody; }
-        const secretRedacted = typeof parsed === 'string'
-          ? parsed.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
-          : JSON.parse(JSON.stringify(parsed).replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]'));
+        const secretRedacted = useLimits.redactedBody(await useLimits.readCapped(response), decryptedValue);
         result = { status: response.status, body: secretRedacted };
         break;
       }
@@ -5561,6 +5546,7 @@ async function handleRowenDeliver(req, res) {
       result,
     });
   } catch (e) {
+    if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 }
