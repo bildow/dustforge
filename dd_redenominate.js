@@ -9,8 +9,9 @@
  * Not multiplied, on purpose:
  *   - prepaid_keys.amount_cents: the US cents a key was bought for.
  *   - tick_billing.pending: a count of ticks, not DD.
- *   - referral_accumulators.accumulated: one unit was 0.1 old DD = 1 new DD,
- *     and the new code pays one unit as 1 DD.
+ *
+ * referral_accumulators.accumulated changes unit too: one old unit was 0.1 old DD
+ * (= 1 new DD); one new unit is 0.01 DD, so it is multiplied by 100.
  */
 const { REDENOMINATION_FACTOR } = require('./dd_units');
 
@@ -32,6 +33,10 @@ const DD_COLUMNS = {
   fleet_workers: ['max_spend_cents', 'spent_cents'],
   network_transfers: ['amount_cents'],
   network_topups: ['amount_cents', 'sent_cents'],
+};
+// table → { column: factor } where the factor is not REDENOMINATION_FACTOR
+const OTHER_FACTORS = {
+  referral_accumulators: { accumulated: 100 },
 };
 
 function columnsOf(db, table) {
@@ -71,6 +76,12 @@ function migrate(db, { dryRun = false, log = () => {} } = {}) {
         const set = present.map(c => `${c} = ${c} * ${f}`).join(', ');
         const where = present.map(c => `${c} != 0`).join(' OR ');
         changed[table] = db.prepare(`UPDATE ${table} SET ${set} WHERE ${where}`).run().changes;
+      }
+      for (const [table, cols] of Object.entries(OTHER_FACTORS)) {
+        const have = columnsOf(db, table);
+        for (const [c, k] of Object.entries(cols)) {
+          if (have.has(c)) changed[`${table}.${c}`] = db.prepare(`UPDATE ${table} SET ${c} = ${c} * ${k} WHERE ${c} != 0`).run().changes;
+        }
       }
       const after = walletTotals(db);
       if (after.wallets.s !== before.wallets.s * f || after.ledger.s !== before.ledger.s * f) {

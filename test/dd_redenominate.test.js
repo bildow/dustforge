@@ -49,7 +49,7 @@ function legacyDb() {
   return db;
 }
 
-test('redenomination multiplies stored DD by 10 and leaves dollars, ticks and accumulators alone', () => {
+test('redenomination multiplies stored DD by 10, the referral accumulator by 100, and leaves dollars and ticks alone', () => {
   const db = legacyDb();
   const r = migrate(db);
   assert.equal(r.applied, true);
@@ -67,10 +67,10 @@ test('redenomination multiplies stored DD by 10 and leaves dollars, ticks and ac
   assert.deepEqual(db.prepare('SELECT refill_threshold_cents t, refill_amount_cents a, refill_daily_cap_cents c FROM fleet_silicons').get(), { t: 200, a: 500, c: 500 });
   assert.equal(db.prepare('SELECT amount_cents FROM wallet_refill_rules').get().amount_cents, 10000);
   assert.equal(db.prepare('SELECT collateral_cents FROM escrow_contracts').get().collateral_cents, 10);
-  // US cents, ticks and the per-tick referral counter keep their values.
+  // US cents and tick counts keep their values; the accumulator moves to hundredths of a DD.
   assert.equal(db.prepare('SELECT amount_cents FROM prepaid_keys').get().amount_cents, 100);
   assert.equal(db.prepare('SELECT pending FROM tick_billing').get().pending, 42);
-  assert.equal(db.prepare('SELECT accumulated FROM referral_accumulators').get().accumulated, 7);
+  assert.equal(db.prepare('SELECT accumulated FROM referral_accumulators').get().accumulated, 700);
 });
 
 test('redenomination runs once: a second start changes nothing', () => {

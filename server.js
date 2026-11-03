@@ -526,6 +526,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS identity_transactions (
 
 // Provenance column (additive migration) — tracks origin of transactions for reputation scoring
 try { db.exec("ALTER TABLE identity_transactions ADD COLUMN provenance TEXT DEFAULT 'organic'"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_transactions ADD COLUMN idempotency_key TEXT"); } catch(_) {} // vault-server.js used to add it; a fresh database needs it for idempotent credits
 
 // ── Invite Keys ──
 db.exec(`CREATE TABLE IF NOT EXISTS invite_keys (
@@ -8527,12 +8528,12 @@ app.post('/api/barrel/cosign/request', rateLimitStrict, async (req, res) => {
       from: 'cosign@dustforge.com',
       to: carbon_email,
       subject: `Dustforge Cosign Request: ${operation}`,
-      text: `A silicon identity (${siliconName}) is requesting your co-approval for a high-value operation.\n\nOperation: ${operation}\nAmount: ${amountCents > 0 ? '$' + (amountCents / 100).toFixed(2) : 'N/A'}\n\nApproval Code: ${approvalCode}\n\nThis code expires in 10 minutes.\n\nIf you did not expect this request, ignore this email.\n\n— Dustforge Barrel Cosign`,
+      text: `A silicon identity (${siliconName}) is requesting your co-approval for a high-value operation.\n\nOperation: ${operation}\nAmount: ${amountCents > 0 ? `${amountCents} DD (${ddUnits.usdLabel(amountCents)})` : 'N/A'}\n\nApproval Code: ${approvalCode}\n\nThis code expires in 10 minutes.\n\nIf you did not expect this request, ignore this email.\n\n— Dustforge Barrel Cosign`,
       html: `<div style="font-family:monospace;background:#08111a;color:#e7f1fb;padding:2rem;max-width:480px;margin:auto;border-radius:8px;text-align:center">
         <h2 style="color:#5fb3ff;margin-top:0">Barrel Cosign Request</h2>
         <p style="color:#9cb4c9">A silicon identity (<strong>${siliconName}</strong>) needs your co-approval.</p>
         <p style="color:#9cb4c9"><strong>Operation:</strong> ${operation}</p>
-        ${amountCents > 0 ? `<p style="color:#9cb4c9"><strong>Amount:</strong> $${(amountCents / 100).toFixed(2)}</p>` : ''}
+        ${amountCents > 0 ? `<p style="color:#9cb4c9"><strong>Amount:</strong> ${amountCents} DD (${ddUnits.usdLabel(amountCents)})</p>` : ''}
         <div style="font-size:2.5rem;font-weight:800;color:#c8a84b;letter-spacing:0.3em;margin:1rem 0">${approvalCode}</div>
         <p style="font-size:0.8rem;color:#6d8397">Expires in 10 minutes.</p>
       </div>`,
@@ -8620,7 +8621,7 @@ app.post('/api/escrow/create', rateLimitStandard, (req, res) => {
   if (!title || typeof title !== 'string') return res.status(400).json({ error: 'title required' });
   if (title.length > 160) return res.status(400).json({ error: 'title: max 160 characters' });
   if (collateralCents <= 0) return res.status(400).json({ error: 'collateral_cents must be > 0' });
-  if (collateralCents > 5000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
+  if (collateralCents > 50000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
 
   const resolvedCounterpartyDid = String(counterparty_did || '').trim();
   const resolvedBeneficiaryDid = String(beneficiary_did || resolvedCounterpartyDid || actor.did).trim();
@@ -9425,7 +9426,9 @@ try { db.exec("ALTER TABLE ticks ADD COLUMN ref_tick INTEGER DEFAULT NULL"); } c
 try { db.exec("ALTER TABLE ticks ADD COLUMN tags TEXT DEFAULT '[]'"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_type ON ticks(tick_type)"); } catch(e) {}
 
-// Referral share accumulator — counts ticks (1 unit = 1 DD) until the 10-unit payout threshold
+// Referral share accumulator — the referrer's 10% of the tick fees, in hundredths of a DD;
+// paid out in whole DD (REFERRAL_SHARE_UNITS_PER_DD units), the remainder carried.
+const REFERRAL_SHARE_UNITS_PER_DD = 100;
 try { db.exec(`CREATE TABLE IF NOT EXISTS referral_accumulators (
   referrer_did TEXT NOT NULL,
   source_did TEXT NOT NULL,
@@ -9465,10 +9468,12 @@ app.post('/api/tick', (req, res) => {
   // Bill member tick at 0.1 DD — free lanes: soul-integrity ticks + first-party infra (Kodiak).
   // The ledger is integer-DD, so we accumulate a per-DID counter and charge 10 DD
   // every 100 ticks (= 0.1 DD/tick). A heartbeat can tick 100x on 10 DD.
+  let tickFeeBilled = false;  // only a tick that carries a fee earns the referrer a share
   if (isMember) {
     const isSoulTick = (tickType === 'soul') && ((siliconDid && SOUL_DIDS.has(siliconDid)) || SOUL_DIDS.has(did));
     const isFirstPartyComp = FIRSTPARTY_DIDS.has(did) && /^kodiak:/i.test(noteClean);
     if (!isSoulTick && !isFirstPartyComp) {
+      tickFeeBilled = true;
       const TICK_BATCH = 100; // 10 DD per 100 ticks
       const cur = db.prepare('SELECT pending FROM tick_billing WHERE did = ?').get(did);
       let pending = (cur?.pending || 0) + 1;
@@ -9511,23 +9516,22 @@ app.post('/api/tick', (req, res) => {
   const chainHash = computeTickHash(tickId, did, noteClean, tz, timeISO, prevHash, tickType, ref_tick, tagsClean);
   db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
 
-  // Referral revenue share: accumulate 1 DD per tick, pay out at 10 DD
-  if (isMember) {
+  // Referral revenue share: 10% of the 0.1 DD tick fee = 1 unit (0.01 DD) per tick,
+  // paid out in whole DD (every 100 ticks).
+  if (isMember && tickFeeBilled) {
     const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(did);
     if (wallet?.referred_by) {
-      // Accumulate 1 unit (1 DD) per tick
       db.prepare(`INSERT INTO referral_accumulators (referrer_did, source_did, accumulated, last_tick_id)
         VALUES (?, ?, 1, ?)
         ON CONFLICT(referrer_did, source_did) DO UPDATE SET
           accumulated = accumulated + 1,
           last_tick_id = ?`).run(wallet.referred_by, did, tickId, tickId);
 
-      // Pay out once 10 units (10 DD) have accumulated
       const acc = db.prepare('SELECT accumulated FROM referral_accumulators WHERE referrer_did = ? AND source_did = ?')
         .get(wallet.referred_by, did);
-      if (acc && acc.accumulated >= 10) {
-        const payoutDD = acc.accumulated;
-        const remainder = 0;
+      if (acc && acc.accumulated >= REFERRAL_SHARE_UNITS_PER_DD) {
+        const payoutDD = Math.floor(acc.accumulated / REFERRAL_SHARE_UNITS_PER_DD);
+        const remainder = acc.accumulated % REFERRAL_SHARE_UNITS_PER_DD;
         billing.creditBalance(db, wallet.referred_by, payoutDD, 'tick_referral_share',
           `10% tick share from ${did.slice(0, 20)} (${payoutDD} DD)`, `tick_ref_batch_${tickId}`);
         db.prepare('UPDATE referral_accumulators SET accumulated = ? WHERE referrer_did = ? AND source_did = ?')
@@ -10050,7 +10054,8 @@ setInterval(async () => {
       const timeISO = new Date().toISOString();
 
       // Bill 10 DD
-      billing.deductBalance(db, trigger.did, 10, 'tick', `chrono:${trigger.name}`);
+      const CHRONO_TICK_DD = 10;
+      const chronoDebit = billing.deductBalance(db, trigger.did, CHRONO_TICK_DD, 'tick', `chrono:${trigger.name}`);
 
       // Get previous tick for chain
       const prevTick = db.prepare('SELECT chain_hash FROM ticks WHERE did = ? ORDER BY id DESC LIMIT 1').get(trigger.did);
@@ -10065,17 +10070,18 @@ setInterval(async () => {
       const chainHash = computeTickHash(tickId, trigger.did, noteClean, 'UTC', timeISO, prevHash, 'tick', null, '[]');
       db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
 
-      // Referral accumulator
+      // Referral accumulator: 10% of the fee actually paid (1 DD = 100 units per chrono tick)
       const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(trigger.did);
-      if (wallet?.referred_by) {
+      if (wallet?.referred_by && chronoDebit.ok) {
+        const share = CHRONO_TICK_DD * REFERRAL_SHARE_UNITS_PER_DD / 10;
         db.prepare(`INSERT INTO referral_accumulators (referrer_did, source_did, accumulated, last_tick_id)
-          VALUES (?, ?, 1, ?) ON CONFLICT(referrer_did, source_did) DO UPDATE SET accumulated = accumulated + 1, last_tick_id = ?`)
-          .run(wallet.referred_by, trigger.did, tickId, tickId);
+          VALUES (?, ?, ?, ?) ON CONFLICT(referrer_did, source_did) DO UPDATE SET accumulated = accumulated + ?, last_tick_id = ?`)
+          .run(wallet.referred_by, trigger.did, share, tickId, share, tickId);
         const acc = db.prepare('SELECT accumulated FROM referral_accumulators WHERE referrer_did = ? AND source_did = ?')
           .get(wallet.referred_by, trigger.did);
-        if (acc && acc.accumulated >= 10) {
-          const payoutDD = acc.accumulated;
-          const remainder = 0;
+        if (acc && acc.accumulated >= REFERRAL_SHARE_UNITS_PER_DD) {
+          const payoutDD = Math.floor(acc.accumulated / REFERRAL_SHARE_UNITS_PER_DD);
+          const remainder = acc.accumulated % REFERRAL_SHARE_UNITS_PER_DD;
           billing.creditBalance(db, wallet.referred_by, payoutDD, 'tick_referral_share',
             `10% tick share from ${trigger.did.slice(0, 20)} (chrono)`, `tick_ref_chrono_${tickId}`);
           db.prepare('UPDATE referral_accumulators SET accumulated = ? WHERE referrer_did = ? AND source_did = ?')
@@ -10215,12 +10221,12 @@ const LOW_BALANCE_CENTS = Number(process.env.LOW_BALANCE_CENTS || 1000);
 let _lastLowBalanceAlert = 0;
 function notifyLowBalance(did, balance_cents, reason) {
   try {
-    console.warn('[buoy] LOW BALANCE ' + reason + ': ' + did + ' = ' + balance_cents + 'c');
+    console.warn('[buoy] LOW BALANCE ' + reason + ': ' + did + ' = ' + balance_cents + ' DD');
     if (!CONDUIT_CARBON_TOKEN) return;
     const nowMs = new Date().getTime();
     if (nowMs - _lastLowBalanceAlert < 3600000) return;
     _lastLowBalanceAlert = nowMs;
-    const bal = (Number(balance_cents) / 100).toFixed(2);
+    const bal = ddUnits.usdLabel(balance_cents).slice(1);
     fetch(CONDUIT_URL + '/api/messages/broadcast', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONDUIT_CARBON_TOKEN },
