@@ -71,15 +71,42 @@ function redactSecret(text, secret) {
 }
 
 // The body as JSON when the upstream sent JSON, else text, with the secret redacted.
-// Twice: on the raw text, and again on every string (keys and values) after parsing,
-// because an upstream may escape the secret in ways this code cannot list in advance
-// (\/ from PHP, \u0026 from Go and Rails, \u00e4 from Python, any letter as \uXXXX),
-// and parsing turns each of them back into the plain secret. Both passes are linear.
+// JSON is parsed first and then every string, key and number is redacted: an upstream may
+// escape the secret in ways this code cannot list in advance (\/ from PHP, \u0026 from Go
+// and Rails, \u00e4 from Python, any letter as \uXXXX, 1e3 for 1000), and parsing turns each
+// back into the plain value. Text that is not JSON is redacted as text (plain and
+// JSON-escaped forms). Last, if the secret still shows in what the caller will receive (a
+// crafted upstream can split it across a key and its value), the caller gets the redacted
+// text instead. Every pass is linear.
 function redactedBody(text, secret) {
-  const clean = redactSecret(text, secret);
+  if (!secret) { try { return JSON.parse(text); } catch (_) { return text; } }
   let parsed;
-  try { parsed = JSON.parse(clean); } catch (_) { return clean; }
-  return redactDeep(parsed, secret);
+  try { parsed = JSON.parse(redactNumberTokens(text, secret)); } catch (_) { return redactSecret(text, secret); }
+  const out = redactDeep(parsed, secret);
+  const wire = JSON.stringify(out);
+  if (wire.includes(secret) || wire.includes(JSON.stringify(secret).slice(1, -1))) return redactSecret(redactSecret(wire, secret), secret);
+  return out;
+}
+
+// Bare JSON numbers whose text, as the upstream wrote it, contains the secret become the
+// string "[REDACTED]" before parsing: past ~17 digits the parsed value is rounded and no
+// longer contains the secret. One linear scan that skips strings. (Node 20 in production
+// has no JSON.parse source-text access, so this cannot be left to a reviver.)
+function redactNumberTokens(text, secret) {
+  if (!/[0-9]/.test(secret) || !text.includes(secret)) return text;
+  let out = '', last = 0, inStr = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inStr) { if (c === 92) i++; else if (c === 34) inStr = false; continue; }   // \ escape, " end
+    if (c === 34) { inStr = true; continue; }
+    if (c === 45 || (c >= 48 && c <= 57)) {                                         // - or digit
+      let j = i + 1;
+      while (j < text.length && /[0-9eE+\-.]/.test(text[j])) j++;
+      if (text.slice(i, j).includes(secret)) { out += text.slice(last, i) + '"[REDACTED]"'; last = j; }
+      i = j - 1;
+    }
+  }
+  return out + text.slice(last);
 }
 
 // Every string in a parsed JSON value, keys included, redacted. Iterative: no recursion
@@ -87,6 +114,7 @@ function redactedBody(text, secret) {
 function redactDeep(value, secret) {
   if (!secret) return value;
   if (typeof value === 'string') return redactSecret(value, secret);
+  if (typeof value === 'number') return String(value).includes(secret) ? '[REDACTED]' : value;
   if (value === null || typeof value !== 'object') return value;
   const root = Array.isArray(value) ? [] : {};
   const stack = [[value, root]];
@@ -96,6 +124,8 @@ function redactDeep(value, secret) {
       const v = src[k];
       const key = Array.isArray(src) ? k : redactSecret(k, secret);
       let out = typeof v === 'string' ? redactSecret(v, secret) : v;
+      // A numeric secret can come back in another number form (1e3 for 1000); parsing makes it the number again.
+      if (typeof v === 'number' && String(v).includes(secret)) out = '[REDACTED]';
       if (v !== null && typeof v === 'object') { out = Array.isArray(v) ? [] : {}; stack.push([v, out]); }
       // defineProperty, not assignment: a "__proto__" key from JSON stays an ordinary key.
       Object.defineProperty(dst, key, { value: out, enumerable: true, writable: true, configurable: true });
