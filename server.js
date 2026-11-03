@@ -2196,7 +2196,7 @@ const FOUNDERS_MONTHLY_DD = 12000; // $12 of DD a month
 
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
-  try { event = stripeService.constructWebhookEvent(req.body, req.headers['stripe-signature']); }
+  try { event = await stripeService.constructWebhookEvent(req.body, req.headers['stripe-signature']); }
   catch (e) { return res.status(400).json({ error: 'webhook verification failed' }); }
 
   if (event.type === 'checkout.session.completed') {

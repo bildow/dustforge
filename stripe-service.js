@@ -113,14 +113,17 @@ async function createTopupCheckout(did, amount_cents) {
 }
 
 /**
- * Verify and parse Stripe webhook event
+ * Verify and parse Stripe webhook event. Nothing in an unverified body is trusted:
+ * with a signing secret the signature is checked; without one, the event is
+ * fetched from Stripe by id with our own key and that copy is used, so a forged
+ * POST (any event id Stripe never sent us) is refused.
  */
-function constructWebhookEvent(rawBody, signature) {
-  if (!WEBHOOK_SECRET) {
-    // No webhook secret configured — parse directly (test mode)
-    return JSON.parse(rawBody);
-  }
-  return getStripe().webhooks.constructEvent(rawBody, signature, WEBHOOK_SECRET);
+async function constructWebhookEvent(rawBody, signature) {
+  if (WEBHOOK_SECRET) return getStripe().webhooks.constructEvent(rawBody, signature, WEBHOOK_SECRET);
+  let claimed;
+  try { claimed = JSON.parse(rawBody); } catch (_) { throw new Error('webhook body is not JSON'); }
+  if (!claimed || typeof claimed.id !== 'string' || !/^evt_[A-Za-z0-9]+$/.test(claimed.id)) throw new Error('webhook event has no Stripe event id');
+  return getStripe().events.retrieve(claimed.id);
 }
 
 module.exports = {
