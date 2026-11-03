@@ -108,3 +108,9 @@ test('review gaps of #35: escaped forms the raw pass would break, a secret split
     assert.ok(!leaks(out, secret), `${secret} leaked from ${upstream}: ${JSON.stringify(out)}`);
   }
 });
+
+test('a long numeric secret echoed as a bare JSON number is redacted, not rounded into view', () => {
+  const secret = '12345678901234567890';
+  assert.deepEqual(L.redactedBody(`{"acct":${secret},"n":[98765432109876543210123]}`, secret), { acct: '[REDACTED]', n: [98765432109876543210123] });
+  assert.equal(L.redactedBody('98765432109876543210123', '98765432109876543210123'), '[REDACTED]');
+});

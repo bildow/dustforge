@@ -81,11 +81,32 @@ function redactSecret(text, secret) {
 function redactedBody(text, secret) {
   if (!secret) { try { return JSON.parse(text); } catch (_) { return text; } }
   let parsed;
-  try { parsed = JSON.parse(text); } catch (_) { return redactSecret(text, secret); }
+  try { parsed = JSON.parse(redactNumberTokens(text, secret)); } catch (_) { return redactSecret(text, secret); }
   const out = redactDeep(parsed, secret);
   const wire = JSON.stringify(out);
   if (wire.includes(secret) || wire.includes(JSON.stringify(secret).slice(1, -1))) return redactSecret(redactSecret(wire, secret), secret);
   return out;
+}
+
+// Bare JSON numbers whose text, as the upstream wrote it, contains the secret become the
+// string "[REDACTED]" before parsing: past ~17 digits the parsed value is rounded and no
+// longer contains the secret. One linear scan that skips strings. (Node 20 in production
+// has no JSON.parse source-text access, so this cannot be left to a reviver.)
+function redactNumberTokens(text, secret) {
+  if (!/[0-9]/.test(secret) || !text.includes(secret)) return text;
+  let out = '', last = 0, inStr = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inStr) { if (c === 92) i++; else if (c === 34) inStr = false; continue; }   // \ escape, " end
+    if (c === 34) { inStr = true; continue; }
+    if (c === 45 || (c >= 48 && c <= 57)) {                                         // - or digit
+      let j = i + 1;
+      while (j < text.length && /[0-9eE+\-.]/.test(text[j])) j++;
+      if (text.slice(i, j).includes(secret)) { out += text.slice(last, i) + '"[REDACTED]"'; last = j; }
+      i = j - 1;
+    }
+  }
+  return out + text.slice(last);
 }
 
 // Every string in a parsed JSON value, keys included, redacted. Iterative: no recursion
