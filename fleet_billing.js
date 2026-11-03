@@ -375,17 +375,17 @@ function updateSiliconSettings(db, siliconRow, patch) {
   if (patch.refill_enabled !== undefined) { fields.push('refill_enabled = ?'); vals.push(patch.refill_enabled ? 1 : 0); }
   if (patch.refill_threshold_cents !== undefined) {
     const n = Number(patch.refill_threshold_cents);
-    if (!Number.isInteger(n) || n < 0 || n > 1000000) throw Object.assign(new Error('refill_threshold_cents: integer 0-1000000'), { statusCode: 400 });
+    if (!Number.isInteger(n) || n < 0 || n > 10000000) throw Object.assign(new Error('refill_threshold_cents: integer 0-10000000'), { statusCode: 400 });
     fields.push('refill_threshold_cents = ?'); vals.push(n);
   }
   if (patch.refill_amount_cents !== undefined) {
     const n = Number(patch.refill_amount_cents);
-    if (!Number.isInteger(n) || n < 0 || n > 1000000) throw Object.assign(new Error('refill_amount_cents: integer 0-1000000'), { statusCode: 400 });
+    if (!Number.isInteger(n) || n < 0 || n > 10000000) throw Object.assign(new Error('refill_amount_cents: integer 0-10000000'), { statusCode: 400 });
     fields.push('refill_amount_cents = ?'); vals.push(n);
   }
   if (patch.refill_daily_cap_cents !== undefined) {
     const n = Number(patch.refill_daily_cap_cents);
-    if (!Number.isInteger(n) || n < 0 || n > 1000000) throw Object.assign(new Error('refill_daily_cap_cents: integer 0-1000000'), { statusCode: 400 });
+    if (!Number.isInteger(n) || n < 0 || n > 10000000) throw Object.assign(new Error('refill_daily_cap_cents: integer 0-10000000'), { statusCode: 400 });
     fields.push('refill_daily_cap_cents = ?'); vals.push(n);
   }
   if (patch.refill_alert_email !== undefined) {
@@ -554,7 +554,7 @@ function nextRunAfter(cadence, fromIso, now = Date.now()) {
 function setOwnerRefillRule(db, did, { cadence = 'weekly', amount_cents = 0, funding = 'operator_grant', enabled = false, next_run_at = null }) {
   if (!CADENCES[cadence]) throw Object.assign(new Error('cadence: daily | weekly | monthly'), { statusCode: 400 });
   const amt = Number(amount_cents);
-  if (!Number.isInteger(amt) || amt < 0 || amt > 1000000) throw Object.assign(new Error('amount_cents: integer 0-1000000'), { statusCode: 400 });
+  if (!Number.isInteger(amt) || amt < 0 || amt > 10000000) throw Object.assign(new Error('amount_cents: integer 0-10000000'), { statusCode: 400 });
   if (!['operator_grant', 'stripe'].includes(funding)) throw Object.assign(new Error("funding: 'operator_grant' or 'stripe'"), { statusCode: 400 });
   const next = next_run_at || nextRunAfter(cadence, null);
   db.prepare(`INSERT INTO wallet_refill_rules (did, cadence, amount_cents, funding, enabled, next_run_at)
@@ -625,7 +625,7 @@ function refillAlert(db, billing, s, r, { now = Date.now(), mailer = null } = {}
   const text = [
     `@${s.handle} is low on DD: ${bal} DD, below its refill threshold of ${s.refill_threshold_cents} DD.`,
     `It was not refilled because ${why}.`,
-    `Each DemiPass /use costs 1 DD; at 0 DD its calls return 402 payment required.`,
+    `Each DemiPass /use costs ${require('./billing').RATE_TABLE.api_call_compute} DD; at 0 DD its calls return 402 payment required.`,
     `The fleet owner can refill it by hand from the Fleet tab, or raise the cap.`,
   ].join('\n');
   try { mailer({ to: s.refill_alert_email, subject: `DemiPass: ${s.handle} is low on DD (${bal} DD)`, text }); } catch (_) {}
@@ -793,7 +793,7 @@ function createWorker(db, { parentDid, name, purpose = '', allowedSecrets = [], 
   if (!WORKER_NAME_RE.test(name || '')) throw Object.assign(new Error('name: 2-31 chars, lowercase alphanumeric and hyphens'), { statusCode: 400 });
   if (!SCOPE_ORDER.includes(scopeCap)) throw Object.assign(new Error('scope_cap: read | write | transact'), { statusCode: 400 });
   const cap = Number(maxSpendCents || 0);
-  if (!Number.isInteger(cap) || cap < 0 || cap > 1000000) throw Object.assign(new Error('max_spend_cents: integer 0-1000000'), { statusCode: 400 });
+  if (!Number.isInteger(cap) || cap < 0 || cap > 10000000) throw Object.assign(new Error('max_spend_cents: integer 0-10000000'), { statusCode: 400 });
   const existing = db.prepare('SELECT * FROM fleet_workers WHERE parent_did = ? AND name = ?').get(parentDid, name);
   if (existing && existing.status === 'active') throw Object.assign(new Error('worker name already in use'), { statusCode: 409 });
   if (existing) db.prepare('DELETE FROM fleet_workers WHERE id = ?').run(existing.id);

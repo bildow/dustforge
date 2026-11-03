@@ -38,7 +38,7 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
    ≤30d token for a silicon from the subpage. The rollover itself is the silicon's job (see below).
 9. **Onboarding.** `POST /api/fleet/:slug/silicons` with a handle, name, contact email: an existing identity is
    linked with consent (its own token, the admin key, or a one-time claim link emailed to its mailbox); otherwise
-   a new identity (mailbox + wallet) is created for 100 DD. Either way the DID record is emailed to the contact.
+   a new identity (mailbox + wallet) is created for 1000 DD. Either way the DID record is emailed to the contact.
 
 10. **Secrets a silicon uses** show on its subpage: its own stored secrets plus the ones delegated to it (use
     counts, status), with delegate / revoke controls for the owner.

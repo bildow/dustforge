@@ -21,7 +21,9 @@ const WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 // pay-page footers.
 const STATEMENT_DESCRIPTOR = 'DEMIPASS DUSTFORGE';
 
-// Pricing
+const { ddForUsdCents, DEPOSIT_DD_PER_USD } = require('./dd_units');
+
+// Pricing (US cents)
 const PRICES = {
   account_single: 100,    // $1.00
   account_bulk_10: 500,   // $5.00 for 10
@@ -92,7 +94,7 @@ async function createTopupCheckout(did, amount_cents) {
     line_items: [{
       price_data: {
         currency: 'usd',
-        product_data: { name: `Dustforge Wallet Top-Up`, description: `Add $${(amount_cents / 100).toFixed(2)} of Diamond Dust — prepaid, non-refundable service credit for your @dustforge.com account.` },
+        product_data: { name: `Dustforge Wallet Top-Up`, description: `${ddForUsdCents(amount_cents)} Diamond Dust ($1 = ${DEPOSIT_DD_PER_USD} DD) — prepaid, non-refundable service credit for your @dustforge.com account.` },
         unit_amount: amount_cents,
       },
       quantity: 1,
@@ -111,14 +113,17 @@ async function createTopupCheckout(did, amount_cents) {
 }
 
 /**
- * Verify and parse Stripe webhook event
+ * Verify and parse Stripe webhook event. Nothing in an unverified body is trusted:
+ * with a signing secret the signature is checked; without one, the event is
+ * fetched from Stripe by id with our own key and that copy is used, so a forged
+ * POST (any event id Stripe never sent us) is refused.
  */
-function constructWebhookEvent(rawBody, signature) {
-  if (!WEBHOOK_SECRET) {
-    // No webhook secret configured — parse directly (test mode)
-    return JSON.parse(rawBody);
-  }
-  return getStripe().webhooks.constructEvent(rawBody, signature, WEBHOOK_SECRET);
+async function constructWebhookEvent(rawBody, signature) {
+  if (WEBHOOK_SECRET) return getStripe().webhooks.constructEvent(rawBody, signature, WEBHOOK_SECRET);
+  let claimed;
+  try { claimed = JSON.parse(rawBody); } catch (_) { throw new Error('webhook body is not JSON'); }
+  if (!claimed || typeof claimed.id !== 'string' || !/^evt_[A-Za-z0-9]+$/.test(claimed.id)) throw new Error('webhook event has no Stripe event id');
+  return getStripe().events.retrieve(claimed.id);
 }
 
 module.exports = {

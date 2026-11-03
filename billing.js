@@ -54,10 +54,10 @@ function maybeNotifyZeroBalance(db, did, actionType, required) {
       `  1. Card top-up      https://dustforge.com/prepay.html`,
       `  2. Transfer from another account you control:`,
       `     POST https://api.dustforge.com/api/identity/transfer`,
-      `     { "to_username": "${w.username}", "amount_cents": 500 }`,
+      `     { "to_username": "${w.username}", "amount_cents": 5000 }`,
       `     (Bearer token, scope: transact)`,
       ``,
-      `1 Diamond Dust = 1 cent. Email costs 1 DD; most API calls cost less.`,
+      `1 Diamond Dust = $0.001; $1 buys 950 DD. Email costs 10 DD; most API calls cost less.`,
       `Check your balance any time: GET https://api.dustforge.com/api/identity/balance`,
       ``,
       `You will not get another one of these for 24 hours.`,
@@ -78,26 +78,26 @@ function maybeNotifyZeroBalance(db, did, actionType, required) {
 
 const crypto = require('crypto');
 
-// ── Rate Table (Diamond Dust — 1 DD = 1¢ = $0.01) ──
+// ── Rate Table (Diamond Dust — 1 DD = $0.001, see dd_units.js) ──
 const RATE_TABLE = {
   // Identity actions
-  'identity_create':      100,  // 100 DD ($1.00) — account creation fee
+  'identity_create':     1000,  // 1000 DD ($1.00) — account creation fee
   'identity_verify':        0,  // free — 2FA verification
   'identity_lookup':        0,  // free — public lookup
   'identity_token':         0,  // free — token verification
 
   // Email actions (via Dustforge)
-  'email_send':             1,  // 1 DD per email sent
-  'email_send_bulk':        1,  // 1 DD per email in bulk (per-email)
+  'email_send':            10,  // 10 DD ($0.01) per email sent
+  'email_send_bulk':       10,  // 10 DD per email in bulk (per-email)
 
   // API calls (per-call billing)
   'api_call_read':          0,  // free — read operations
-  'api_call_write':         0,  // $0.001 — write operations (future)
-  'api_call_compute':       1,  // $0.01 — compute-heavy operations
+  'api_call_write':         0,  // free — write operations (future)
+  'api_call_compute':      10,  // $0.01 — compute-heavy operations (DemiPass /use)
 
   // Platform actions
-  'round_dispatch':        10,  // $0.10 — dispatching a round (covers model costs)
-  'round_collaboration':   25,  // $0.25 — collaboration round (multi-pass)
+  'round_dispatch':       100,  // $0.10 — dispatching a round (covers model costs)
+  'round_collaboration':  250,  // $0.25 — collaboration round (multi-pass)
 };
 
 /**

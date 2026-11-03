@@ -26,7 +26,7 @@ to be scheduled on its own.
   (fleet_id, member_did, role) — Dustforge server.js. Membership is by DID.
 - `identity_transactions` (did, amount_cents, type, description, balance_after,
   created_at, provenance) — the per-DID money ledger. **Every Dustforge charge
-  an agent incurs already lands here** (email_send = 1 DD, api calls, ticks,
+  an agent incurs already lands here** (email_send = 10 DD, api calls, ticks,
   transfers). This is the cost-ledger source of truth; the fleet view reads it,
   it does not re-invent it.
 - Buoy ticks — each agent action can already anchor a tick; the activity feed

@@ -12,6 +12,7 @@ const hexPayload = require('./hex-payload');
 const conversion = require('./conversion');
 const referral = require('./referral');
 const stripeService = require('./stripe-service');
+const ddUnits = require('./dd_units');
 
 const app = express();
 app.set("trust proxy", 1);
@@ -525,6 +526,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS identity_transactions (
 
 // Provenance column (additive migration) — tracks origin of transactions for reputation scoring
 try { db.exec("ALTER TABLE identity_transactions ADD COLUMN provenance TEXT DEFAULT 'organic'"); } catch(_) {}
+try { db.exec("ALTER TABLE identity_transactions ADD COLUMN idempotency_key TEXT"); } catch(_) {} // vault-server.js used to add it; a fresh database needs it for idempotent credits
 
 // ── Invite Keys ──
 db.exec(`CREATE TABLE IF NOT EXISTS invite_keys (
@@ -592,11 +594,11 @@ const siliconManifest = {
     note: "Every authenticated API call may deduct from your wallet balance. Check /api/billing/rates for per-action costs."
   },
   email: {
-    send: { method: "POST", endpoint: "/api/email/send", auth: "Bearer token required (scope: transact)", body: { to: "recipient email", subject: "email subject", body: "email body", format: "text | html" }, cost: "1 Diamond Dust per email" }
+    send: { method: "POST", endpoint: "/api/email/send", auth: "Bearer token required (scope: transact)", body: { to: "recipient email", subject: "email subject", body: "email body", format: "text | html" }, cost: "10 Diamond Dust ($0.01) per email" }
   },
   referral: {
     stats: { method: "GET", endpoint: "/api/referral/stats", auth: "Bearer token required" },
-    payout: "10 Diamond Dust per successful referral + 10% tick revenue share forever",
+    payout: "100 Diamond Dust per successful referral + 10% tick revenue share forever",
     note: "Every outbound email includes your referral link automatically"
   },
   tokenVerification: {
@@ -748,7 +750,7 @@ app.post('/api/identity/create', async (req, res) => {
 
     // Referral payout is FUNDED-ONLY — it fires on the $1 Stripe signup (in the
     // webhook), never on key-based/$0 creates. Attribution (referred_by) is still
-    // recorded above; only the 10 DD payout is gated to a funded conversion.
+    // recorded above; only the 100 DD payout is gated to a funded conversion.
 
     // Track conversion
     const callerClass = conversion.classifyCaller(req);
@@ -1443,8 +1445,8 @@ app.post('/api/identity/origination/generate', rateLimitStrict, async (req, res)
     return res.status(400).json({ error: 'spark_text must be 2000 characters or fewer' });
   }
 
-  // Deduct 5 DD before calling the model
-  const debit = billing.deductBalance(db, did, 5, 'api_call_compute', 'origination narrative generation');
+  // Deduct 50 DD before calling the model
+  const debit = billing.deductBalance(db, did, 50, 'api_call_compute', 'origination narrative generation');
   if (!debit.ok) return res.status(402).json({ error: debit.error, balance_cents: debit.balance_cents, required: debit.required });
 
   // Get OpenRouter API key from project-level env
@@ -1774,7 +1776,7 @@ app.post('/api/billing/topup', (req, res) => {
   const { did, amount_cents, source = 'manual' } = req.body || {};
   if (!requireAdminAccess(req, res)) return;
   if (!did || !amount_cents) return res.status(400).json({ error: 'did and amount_cents required' });
-  if (amount_cents <= 0 || amount_cents > 100000) return res.status(400).json({ error: 'amount must be 1-100000 cents' });
+  if (amount_cents <= 0 || amount_cents > 1000000) return res.status(400).json({ error: 'amount must be 1-1000000 DD' });
   const result = billing.creditBalance(db, did, Number(amount_cents), 'topup', `Topup via ${source}`);
   if (!result.ok) return res.status(400).json(result);
   res.json(result);
@@ -1809,7 +1811,7 @@ app.post('/api/email/send', billing.billingMiddleware(db, 'email_send', { cost: 
 // API — Forward Relay (email forwarding)
 // ============================================================
 // Silicon sets up forwarding rules: all mail or specific senders
-// get relayed to an external address. 1¢ per forwarded message.
+// get relayed to an external address. 10 DD (1¢) per forwarded message.
 
 try { db.exec(`CREATE TABLE IF NOT EXISTS forward_relays (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1837,7 +1839,7 @@ app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, '
   try {
     db.prepare('INSERT INTO forward_relays (did, forward_to, filter_from, label) VALUES (?, ?, ?, ?) ON CONFLICT(did, forward_to, filter_from) DO UPDATE SET status = ?, label = ?, forwarded_count = 0')
       .run(req.identity.did, forward_to, filter_from, label || '', 'active', label || '');
-    res.json({ ok: true, forward_to, filter_from, label: label || '', note: 'Forwarding active. Each forwarded email costs 1¢.' });
+    res.json({ ok: true, forward_to, filter_from, label: label || '', note: 'Forwarding active. Each forwarded email costs 10 DD (1¢).' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1888,7 +1890,7 @@ app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 
 
       // Bill 1¢ per forward (already billed via middleware for first, additional forwards deducted here)
       if (results.length > 0) {
-        billing.deductBalance(db, req.identity.did, 1, 'relay_forward', `Forward to ${rule.forward_to}`);
+        billing.deductBalance(db, req.identity.did, billing.RATE_TABLE.email_send, 'relay_forward', `Forward to ${rule.forward_to}`);
       }
 
       results.push({ forward_to: rule.forward_to, status: 'sent' });
@@ -1902,7 +1904,7 @@ app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 
 
 // ── Inbound MTA hook: COD mail forwarding ───────────────────────────────────
 // Stalwart calls this during the SMTP DATA stage with the whole message. Per
-// @dustforge.com recipient with active forward rules we bill 1 DD against the
+// @dustforge.com recipient with active forward rules we bill 10 DD against the
 // EXISTING balance and forward; if the wallet can't pay we REFUSE the forward
 // and log a verbose event the app/API surfaces. We ALWAYS return {action:accept}
 // so the mail still lands in the mailbox and inbound delivery is never blocked —
@@ -1952,8 +1954,8 @@ app.post('/api/mail/mta-hook', (req, res) => {
 
       for (const rule of rules) {
         if (rule.filter_from !== '*' && fromAddr && !fromAddr.includes(String(rule.filter_from).toLowerCase())) continue;
-        // COD: charge 1 DD against the existing balance BEFORE forwarding.
-        const debit = billing.deductBalance(db, wallet.did, 1, 'email_send', `mail forward -> ${rule.forward_to}`);
+        // COD: charge 10 DD against the existing balance BEFORE forwarding.
+        const debit = billing.deductBalance(db, wallet.did, billing.RATE_TABLE.email_send, 'email_send', `mail forward -> ${rule.forward_to}`);
         if (!debit.ok) {
           try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject, detail) VALUES (?, ?, ?, ?, ?, ?)')
             .run(wallet.did, 'blocked_insufficient_balance', rule.forward_to, fromAddr, subject.slice(0, 120),
@@ -2059,7 +2061,7 @@ app.post('/api/stripe/checkout/topup-external', rateLimitStandard, async (req, r
 
   try {
     const stripe = stripeService.getStripe();
-    const ddAmount = Number(amount_cents);
+    const ddAmount = ddUnits.ddForUsdCents(amount_cents);
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [{
@@ -2143,7 +2145,7 @@ app.get('/api/stripe/founders-success', async (req, res) => {
       <div>
         <h1 style="font-size:2.5rem;color:#d4a847">Welcome, Founder</h1>
         <p style="color:#9cb4c9;font-size:1.1rem;max-width:500px;margin:1rem auto">You are one of the first 100. Your founder badge is permanent. Your rate is locked forever.</p>
-        <p style="color:#69c7b1;font-size:1rem;margin-top:1rem">1,200 Diamond Dust will be loaded to your account monthly.</p>
+        <p style="color:#69c7b1;font-size:1rem;margin-top:1rem">12,000 Diamond Dust will be loaded to your account monthly.</p>
         <p style="margin-top:2rem"><a href="https://demipass.com" style="color:#5fb3ff;font-size:1rem">Get started with DemiPass &rarr;</a></p>
       </div></body></html>`);
   } catch (e) {
@@ -2165,8 +2167,9 @@ app.get('/api/stripe/topup-success', async (req, res) => {
       return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not confirmed</h1></body></html>');
     }
 
-    const amount = Number(meta.amount_cents);
-    const idempotencyKey = `topup_${sessionId}`;
+    const amount = ddUnits.ddForUsdCents(meta.amount_cents);
+    // Same key as the webhook, so the page and the webhook credit a top-up once between them.
+    const idempotencyKey = `topup_${session.id}`;
     const result = billing.creditBalance(db, meta.did, amount, 'stripe_topup', `${amount} Diamond Dust via Stripe`, idempotencyKey);
 
     const newBalance = billing.getDerivedBalance(db, meta.did);
@@ -2190,9 +2193,11 @@ app.get('/api/stripe/topup-success', async (req, res) => {
   }
 });
 
+const FOUNDERS_MONTHLY_DD = 12000; // $12 of DD a month
+
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   let event;
-  try { event = stripeService.constructWebhookEvent(req.body, req.headers['stripe-signature']); }
+  try { event = await stripeService.constructWebhookEvent(req.body, req.headers['stripe-signature']); }
   catch (e) { return res.status(400).json({ error: 'webhook verification failed' }); }
 
   if (event.type === 'checkout.session.completed') {
@@ -2224,27 +2229,27 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             }
             db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, referred_by, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)').run(id.did, pending.username, emailResult.email, id.encrypted_private_key, rc, referredBy, emailResult.stalwart_id, emailResult.password_hash || null);
             db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'account_created', 'Created via Stripe webhook', 0)").run(id.did);
-            // Onboarding grant: $1 buys 100 DD. If REFERRED, a 10 DD creation fee goes
-            // to the referrer and the new user nets 90 DD. If NOT referred, the fee is
-            // not taken — the user keeps the full 100 DD. Idempotent on the Stripe
-            // session so a webhook replay can't double-grant.
-            const _grant = referredBy ? 90 : 100;
+            // Onboarding grant: the $1 buys 950 DD. If REFERRED, the referral payout
+            // (100 DD) comes out of it and the new user nets 850 DD. If NOT referred,
+            // the user keeps the full 950 DD. Idempotent on the Stripe session so a
+            // webhook replay can't double-grant.
+            const _grant = ddUnits.ddForUsdCents(stripeService.PRICES.account_single) - (referredBy ? referral.REFERRAL_PAYOUT_CENTS : 0);
             billing.creditBalance(db, id.did, _grant, 'onboarding_grant', `Onboarding: ${_grant} DD ($1 signup)`, 'onboard_' + session.id);
             try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: _grant, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {}
             if (referredBy) {
               // FUNDED referral payout to an existing account, tied to this funding event
-              // so a chargeback claws back both the grant and this 10 DD payout.
+              // so a chargeback claws back both the grant and this 100 DD payout.
               const _rp = referral.processReferralPayout(db, referredBy, id.did, pending.username);
               if (_rp && _rp.ok && _rp.credited > 0) { try { require('./dd_ledger').recordCredit(db, { did: referredBy, amount_cents: referral.REFERRAL_PAYOUT_CENTS, source: 'referral_payout', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {} }
             } else if (_refToken) {
-              // Invite hash with NO account = lightweight sponsor: accrue 10 DD (capped)
+              // Invite hash with NO account = lightweight sponsor: accrue 100 DD (capped)
               // against their email hash, tied to THIS funding event for clawback. They
               // collect it when they mint their own account (POST /api/referral/claim).
               try { require('./onboarding').recordLightweightReferral(db, _refToken, id.did, session.id); } catch (_) {}
             }
             // AUTO-CLAIM: if the minter came through their own claim link
             // (/signup?claim=…), deposit the lightweight referral DD they earned
-            // inviting others — one-time, on mint, no separate call. (+10 → 110/100.)
+            // inviting others — one-time, on mint, no separate call. (+100 → 950/1050.)
             if (pending.claim_hash) {
               try {
                 const _dep = require('./onboarding').depositLightweightReferral(db, pending.claim_hash, id.did, billing, require('./dd_ledger'));
@@ -2257,15 +2262,17 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         }
       } catch (e) { console.error('[stripe-webhook] error:', e.message); }
     } else if (meta.type === 'wallet_topup') {
-      const idempotencyKey = `stripe_${event.id || session.id}`;
-      billing.creditBalance(db, meta.did, Number(meta.amount_cents), 'stripe_topup', 'Stripe topup', idempotencyKey);
+      const idempotencyKey = `topup_${session.id}`;
+      const dd = ddUnits.ddForUsdCents(meta.amount_cents);
+      billing.creditBalance(db, meta.did, dd, 'stripe_topup', `${dd} Diamond Dust via Stripe`, idempotencyKey);
     } else if (meta.type === 'fleet_topup') {
       // DF-175: Fleet QR funding settlement — credit the fleet wallet
       const idempotencyKey = `fleet_stripe_${event.id || session.id}`;
       const fleetDid = meta.fleet_wallet_did || meta.did;
       if (fleetDid) {
-        const result = billing.creditBalance(db, fleetDid, Number(meta.amount_cents), 'fleet_stripe_topup', `Fleet topup via Stripe (${meta.fleet_slug || 'unknown'})`, idempotencyKey);
-        console.log(`[stripe-webhook] fleet topup: ${meta.fleet_slug} wallet ${fleetDid} credited ${meta.amount_cents} DD — ${result.ok ? 'ok' : result.error}`);
+        const dd = ddUnits.ddForUsdCents(meta.amount_cents);
+        const result = billing.creditBalance(db, fleetDid, dd, 'fleet_stripe_topup', `Fleet topup via Stripe (${meta.fleet_slug || 'unknown'})`, idempotencyKey);
+        console.log(`[stripe-webhook] fleet topup: ${meta.fleet_slug} wallet ${fleetDid} credited ${dd} DD — ${result.ok ? 'ok' : result.error}`);
       } else {
         console.error('[stripe-webhook] fleet_topup missing fleet_wallet_did in metadata');
       }
@@ -2283,13 +2290,14 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         if (wallet) {
           // Mark as founder
           db.prepare("UPDATE identity_wallets SET status = 'founder' WHERE did = ?").run(wallet.did);
-          // Credit 1200 DD (first month)
-          billing.creditBalance(db, wallet.did, 1200, 'founders_package', 'Founders package — first month DD', idempotencyKey);
-          // Store subscription ID for recurring billing
-          db.prepare("INSERT OR IGNORE INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 10000, 'founders_purchase', ?, ?)")
+          // Credit the first month's DD
+          billing.creditBalance(db, wallet.did, FOUNDERS_MONTHLY_DD, 'founders_package', 'Founders package — first month DD', idempotencyKey);
+          // Store subscription ID for recurring billing. A record, not a credit: the $100
+          // was paid in dollars, and the DD it buys is the monthly grant above.
+          db.prepare("INSERT OR IGNORE INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 0, 'founders_purchase', ?, ?)")
             .run(wallet.did, `Founders package subscription: ${session.subscription || session.id}`,
-              (wallet.balance_cents || 0) + 1200);
-          console.log(`[stripe-webhook] founders fulfilled: ${wallet.username} → founder status + 1200 DD`);
+              billing.getDerivedBalance(db, wallet.did));
+          console.log(`[stripe-webhook] founders fulfilled: ${wallet.username} → founder status + ${FOUNDERS_MONTHLY_DD} DD`);
         } else {
           // No matching wallet yet — store for manual fulfillment
           console.warn(`[stripe-webhook] founders purchase but no wallet for email: ${customerEmail}. Session: ${session.id}`);
@@ -2354,11 +2362,11 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
         }
         if (wallet) {
           const idempotencyKey = `founders_renewal_${event.id || invoice.id}`;
-          billing.creditBalance(db, wallet.did, 1200, 'founders_renewal', 'Founders package — monthly DD auto-refill', idempotencyKey);
-          console.log(`[stripe-webhook] founders renewal: ${wallet.username} +1200 DD`);
+          billing.creditBalance(db, wallet.did, FOUNDERS_MONTHLY_DD, 'founders_renewal', 'Founders package — monthly DD auto-refill', idempotencyKey);
+          console.log(`[stripe-webhook] founders renewal: ${wallet.username} +${FOUNDERS_MONTHLY_DD} DD`);
           try {
             db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
-              .run(wallet.did, 'Founders monthly DD auto-refill: +1200 DD', '', 'UTC', 'decision',
+              .run(wallet.did, `Founders monthly DD auto-refill: +${FOUNDERS_MONTHLY_DD} DD`, '', 'UTC', 'decision',
                 JSON.stringify(['founders:renewal', `did:${wallet.did.slice(0, 25)}`]));
           } catch(_) {}
         }
@@ -2406,7 +2414,7 @@ app.get('/api/stripe/success', async (req, res) => {
     ? '<div style="margin-top:1.5rem;text-align:left;background:#132131;padding:1.5rem;border-radius:8px;max-width:400px"><div style="margin-bottom:0.75rem"><span style="color:#6d8397">Email:</span> <strong>'+accountInfo.email+'</strong></div><div style="margin-bottom:0.75rem"><span style="color:#6d8397">DID:</span> <code style="font-size:10px;word-break:break-all">'+accountInfo.did+'</code></div>'+(accountInfo.referral_code?'<div><span style="color:#6d8397">Referral:</span> '+accountInfo.referral_code+'</div>':'')+'<p style="margin-top:1rem;font-size:12px;color:#6d8397">Welcome email sent to your @dustforge.com inbox.</p></div>'
     : '<p style="color:#6d8397">'+statusMessage+'</p>';
 
-  res.send('<html><head><meta charset="UTF-8"></head><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:500px;padding:2rem"><h1 style="color:#69c7b1">Payment Successful</h1><p>Your silicon identity has been activated with 90 Diamond Dust.</p>'+info+'<a href="https://demipass.com/vault-mobile.html" style="display:inline-block;margin-top:1.5rem;padding:0.8rem 2rem;background:#5b9bd5;color:#08111a;font-weight:700;border-radius:8px;text-decoration:none">Sign in to DemiPass &rarr;</a><p style="margin-top:0.75rem;font-size:12px;color:#6d8397">Sign in with the username and password you just chose.</p></div></body></html>');
+  res.send('<html><head><meta charset="UTF-8"></head><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center;max-width:500px;padding:2rem"><h1 style="color:#69c7b1">Payment Successful</h1><p>Your silicon identity has been activated with Diamond Dust ($1 = 950 DD).</p>'+info+'<a href="https://demipass.com/vault-mobile.html" style="display:inline-block;margin-top:1.5rem;padding:0.8rem 2rem;background:#5b9bd5;color:#08111a;font-weight:700;border-radius:8px;text-decoration:none">Sign in to DemiPass &rarr;</a><p style="margin-top:0.75rem;font-size:12px;color:#6d8397">Sign in with the username and password you just chose.</p></div></body></html>');
 });
 
 app.get('/api/stripe/cancel', (req, res) => {
@@ -2416,27 +2424,23 @@ app.get('/api/stripe/cancel', (req, res) => {
 app.get('/api/stripe/prices', (req, res) => {
   res.json({
     currency: 'Diamond Dust (DD)',
-    exchange_rate: '1 DD = $0.01 USD',
-    account_single: { price_dd: 100, price_usd: '$1.00', description: 'Single silicon account' },
+    exchange_rate: '1 DD = $0.001 USD',
+    deposit_rate: `$1 = ${ddUnits.DEPOSIT_DD_PER_USD} DD (5% platform fee)`,
+    account_single: { price_dd: 1000, price_usd: '$1.00', grant_dd: ddUnits.ddForUsdCents(stripeService.PRICES.account_single), description: 'Single silicon account' },
     prepaid_packages: {
-      '1_key': { keys: 1, price_dd: 100, price_usd: '$1.00' },
-      '12_keys': { keys: 12, price_dd: 1000, price_usd: '$10.00', savings: '17%' },
-      '26_keys': { keys: 26, price_dd: 2000, price_usd: '$20.00', savings: '23%' },
-      '30_keys_founding': { keys: 30, price_dd: 2000, price_usd: '$20.00', savings: '33%', note: 'Founding tier — limited to 100 purchases', remaining: (() => { try { const sold = db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n; return Math.max(0, 100 - sold); } catch(_) { return 100; } })() },
-      '140_keys_partnership': { keys: 140, price_dd: 8800, price_usd: '$88.00', savings: '37%', note: 'Partnership package — includes reserved WhisperHook + Sightless beta entitlements (May 2026)' },
+      '1_key': { keys: 1, price_dd: 1000, price_usd: '$1.00' },
+      '12_keys': { keys: 12, price_dd: 10000, price_usd: '$10.00', savings: '17%' },
+      '26_keys': { keys: 26, price_dd: 20000, price_usd: '$20.00', savings: '23%' },
+      '30_keys_founding': { keys: 30, price_dd: 20000, price_usd: '$20.00', savings: '33%', note: 'Founding tier — limited to 100 purchases', remaining: (() => { try { const sold = db.prepare("SELECT COUNT(DISTINCT stripe_session_id) as n FROM prepaid_keys WHERE stripe_session_id IN (SELECT stripe_session_id FROM prepaid_keys GROUP BY stripe_session_id HAVING COUNT(*) = 30)").get().n; return Math.max(0, 100 - sold); } catch(_) { return 100; } })() },
+      '140_keys_partnership': { keys: 140, price_dd: 88000, price_usd: '$88.00', savings: '37%', note: 'Partnership package — includes reserved WhisperHook + Sightless beta entitlements (May 2026)' },
     },
-    topup_options: [
-      { dd: 500, usd: '$5.00' },
-      { dd: 1000, usd: '$10.00' },
-      { dd: 5000, usd: '$50.00' },
-      { dd: 10000, usd: '$100.00' },
-    ],
-    referral_payout_dd: 10,
+    topup_options: [500, 1000, 5000, 10000].map(c => ({ amount_cents: c, dd: ddUnits.ddForUsdCents(c), usd: '$' + (c / 100).toFixed(2) })),
+    referral_payout_dd: referral.REFERRAL_PAYOUT_CENTS,
     rates: {
-      email_send: '1 DD',
-      relay_forward: '1 DD per forward',
-      blindkey_use: '1 DD per action',
-      demipass_use: '1 DD per action',
+      email_send: `${billing.RATE_TABLE.email_send} DD`,
+      relay_forward: `${billing.RATE_TABLE.email_send} DD per forward`,
+      blindkey_use: `${billing.RATE_TABLE.api_call_compute} DD per action`,
+      demipass_use: `${billing.RATE_TABLE.api_call_compute} DD per action`,
       wallet_transfer: 'free',
       identity_lookup: 'free',
     },
@@ -4970,7 +4974,7 @@ app.get('/api/blindkey/types', (_req, res) => {
       encryption: 'AES-256-GCM at rest',
       access: 'Bearer token with transact scope required',
       exposure: 'Secret values are NEVER returned in any API response',
-      billing: 'Store/revoke: free. List: free. Use: 1¢ per action (api_call_compute)',
+      billing: 'Store/revoke: free. List: free. Use: 10 DD (1¢) per action (api_call_compute)',
     },
   });
 });
@@ -5807,9 +5811,9 @@ async function fulfillPrepaidKeys(session) {
           '  Tools: dustforge_onboard, dustforge_whoami, dustforge_balance,',
           '         dustforge_mail_check, dustforge_mail_read, dustforge_mail_send.',
           '',
-          '— Invite others & earn 10 Diamond Dust —',
+          '— Invite others & earn 100 Diamond Dust —',
           '  Share your invite link. When someone signs up AND funds their account ($1),',
-          '  you earn 10 Diamond Dust:',
+          '  you earn 100 Diamond Dust:',
           `    ${ONBOARD_BASE}/join.html?ref=${inviteH}`,
           '  When you create your own account, collect what you have earned with:',
           `    ${ONBOARD_BASE}/signup.html?claim=${inviteH}`,
@@ -6009,7 +6013,7 @@ ${lp.metaTag}
 <h1>Dustforge — Silicon Identity</h1><p>Cryptographic identity, email, and wallet for AI agents.</p>
 <h2>For AI Agents</h2><p>Start here:</p><pre>GET /.well-known/silicon</pre>
 <p>Or email: <code>onboard-73696c69636f6e@dustforge.com</code></p><p class="hex">73696c69636f6e = silicon</p>
-<h2>What You Get</h2><ul><li><strong>DID:key identity</strong> — cryptographic Silicon SSN</li><li><strong>@dustforge.com email</strong> — with 2FA</li><li><strong>Wallet</strong> — per-call billing, Stripe topup</li><li><strong>Referral code</strong> — earn 10 DD per referral</li></ul>
+<h2>What You Get</h2><ul><li><strong>DID:key identity</strong> — cryptographic Silicon SSN</li><li><strong>@dustforge.com email</strong> — with 2FA</li><li><strong>Wallet</strong> — per-call billing, Stripe topup</li><li><strong>Referral code</strong> — earn 100 DD per referral</li></ul>
 <h2>Pricing</h2><p>Account: $1 | Email: 1¢ | Topup: $5/$10/$50/$100</p>
 <!-- 64757374666f7267652e636f6d2f2e77656c6c2d6b6e6f776e2f73696c69636f6e --></body></html>`);
 });
@@ -6309,7 +6313,7 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
   const { from_did, to_did, amount_cents, description } = req.body || {};
   if (!from_did || !to_did || !amount_cents) return res.status(400).json({ error: 'from_did, to_did, amount_cents required' });
   if (from_did === to_did) return res.status(400).json({ error: 'cannot transfer to self' });
-  if (amount_cents <= 0 || amount_cents > 1000000) return res.status(400).json({ error: 'invalid amount' });
+  if (amount_cents <= 0 || amount_cents > 10000000) return res.status(400).json({ error: 'invalid amount' });
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
@@ -6670,7 +6674,7 @@ app.get('/api/identity/fingerprint/rings', (req, res) => {
 // ============================================================
 // Progressive Barrel Auth — security confidence slider
 // Single barrel: fingerprint only (reads, lookups, email)
-// Double barrel: fingerprint + wallet binding (transfers > 100 DD)
+// Double barrel: fingerprint + wallet binding (transfers > 1000 DD)
 // Critical barrel: double + fresh re-auth within 5 min (key export, deletion)
 //
 // NOTE: This is distinct from Dual-Server Barrel Topology (jurisdictional
@@ -6706,15 +6710,15 @@ function computeBarrelTier(did) {
 
 // The refusal (an Error with statusCode/body) a transfer of this size from this wallet meets, or null.
 function transferBarrelRefusal(fromDid, amountCents) {
-  if (!(amountCents > 100)) return null;
+  if (!(amountCents > 1000)) return null;
   const barrel = computeBarrelTier(fromDid);
   if (BARREL_TIERS.indexOf(barrel.tier) >= BARREL_TIERS.indexOf('double')) return null;
   const upgrade_hint = !barrel.wallet_bound
     ? 'fund your wallet to unlock double barrel'
     : 'accumulate more fingerprint ring signals via repeated auth';
-  return Object.assign(new Error('double barrel required for transfers > 100 DD'), {
+  return Object.assign(new Error('double barrel required for transfers > 1000 DD'), {
     statusCode: 403,
-    body: { error: 'double barrel required for transfers > 100 DD', required_tier: 'double', current_tier: barrel.tier, upgrade_hint },
+    body: { error: 'double barrel required for transfers > 1000 DD', required_tier: 'double', current_tier: barrel.tier, upgrade_hint },
   });
 }
 
@@ -7009,12 +7013,12 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS bounty_submissions (
 )`); } catch(e) {}
 
 const BOUNTY_TIERS = {
-  critical: { label: 'Critical (P0)', min_payout: 500, max_payout: 5000, description: 'Auth bypass, RCE, data exfiltration, DemiPass secret leakage' },
-  high:     { label: 'High (P1)', min_payout: 200, max_payout: 1000, description: 'Privilege escalation, wallet manipulation, identity impersonation' },
-  medium:   { label: 'Medium (P2)', min_payout: 50, max_payout: 500, description: 'Information disclosure, rate limit bypass, relay abuse' },
-  low:      { label: 'Low (P3)', min_payout: 10, max_payout: 100, description: 'UI issues, minor info leaks, hardening suggestions' },
-  whistleblower: { label: 'Whistleblower', min_payout: 100, max_payout: 10000, description: 'Report identity theft, credential compromise, or unauthorized access to another silicon identity' },
-  recovery: { label: 'Identity Recovery', min_payout: 50, max_payout: 5000, description: 'Help recover a compromised or lost silicon identity through evidence-based verification' },
+  critical: { label: 'Critical (P0)', min_payout: 5000, max_payout: 50000, description: 'Auth bypass, RCE, data exfiltration, DemiPass secret leakage' },
+  high:     { label: 'High (P1)', min_payout: 2000, max_payout: 10000, description: 'Privilege escalation, wallet manipulation, identity impersonation' },
+  medium:   { label: 'Medium (P2)', min_payout: 500, max_payout: 5000, description: 'Information disclosure, rate limit bypass, relay abuse' },
+  low:      { label: 'Low (P3)', min_payout: 100, max_payout: 1000, description: 'UI issues, minor info leaks, hardening suggestions' },
+  whistleblower: { label: 'Whistleblower', min_payout: 1000, max_payout: 100000, description: 'Report identity theft, credential compromise, or unauthorized access to another silicon identity' },
+  recovery: { label: 'Identity Recovery', min_payout: 500, max_payout: 50000, description: 'Help recover a compromised or lost silicon identity through evidence-based verification' },
 };
 
 app.get('/api/bounty/program', (_req, res) => {
@@ -7037,7 +7041,7 @@ app.get('/api/bounty/program', (_req, res) => {
       'Third-party services (Stripe, Netlify)',
     ],
     tiers: BOUNTY_TIERS,
-    payout_currency: 'Diamond Dust (1 DD = $0.01 USD). USD payouts pending Stripe Connect KYC onboarding.',
+    payout_currency: 'Diamond Dust (1 DD = $0.001 USD). USD payouts pending Stripe Connect KYC onboarding.',
     rules: [
       'Do not access or modify other users\' data beyond proof of concept.',
       'Report first, disclose later. 90-day disclosure window.',
@@ -7764,7 +7768,7 @@ app.post('/api/fleet/:slug/fund', (req, res) => {
   if (!amount_cents || typeof amount_cents !== 'number' || !Number.isInteger(amount_cents) || amount_cents <= 0) {
     return res.status(400).json({ error: 'amount_cents: must be a positive integer' });
   }
-  if (amount_cents > 1000000) return res.status(400).json({ error: 'amount_cents: max 1000000' });
+  if (amount_cents > 10000000) return res.status(400).json({ error: 'amount_cents: max 10000000' });
 
   const fleet = db.prepare('SELECT id, wallet_did FROM fleets WHERE slug = ?').get(req.params.slug);
   if (!fleet) return res.status(404).json({ error: 'fleet not found' });
@@ -7851,7 +7855,7 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
   if (existing) return res.status(409).json({ error: 'username already taken' });
 
   // Create identity and email account first (async, outside transaction)
-  const PROVISION_COST = 100;
+  const PROVISION_COST = 1000;
   try {
     const id = identity.createIdentity();
     const emailResult = await dustforge.createAccount(username, password);
@@ -7924,7 +7928,7 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
   }
 
   // Deduct total cost upfront from fleet wallet
-  const PROVISION_COST = 100;
+  const PROVISION_COST = 1000;
   const totalCost = count * PROVISION_COST;
   const debit = billing.deductBalance(db, fleet.wallet_did, totalCost, 'fleet_bulk_provision', `Bulk provision ${count} agents for fleet ${fleet.slug}`);
   if (!debit.ok) return res.status(402).json({ error: 'insufficient fleet wallet balance', detail: debit.error, required: totalCost });
@@ -8006,8 +8010,8 @@ app.post('/api/fleet/:slug/fund/qr', async (req, res) => {
         price_data: {
           currency: 'usd',
           product_data: {
-            name: `${amount_cents} Diamond Dust for fleet ${fleet.slug}`,
-            description: `Top up fleet ${fleet.slug} wallet with ${amount_cents} DD`,
+            name: `${ddUnits.ddForUsdCents(amount_cents)} Diamond Dust for fleet ${fleet.slug}`,
+            description: `Top up fleet ${fleet.slug} wallet with ${ddUnits.ddForUsdCents(amount_cents)} DD`,
           },
           unit_amount: Number(amount_cents),
         },
@@ -8356,7 +8360,7 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
   if (description && description.length > 500) return res.status(400).json({ error: 'description: max 500 characters' });
   if (channel && typeof channel !== 'string') return res.status(400).json({ error: 'channel: must be a string' });
   if (from_did === to_did) return res.status(400).json({ error: 'cannot transfer to self' });
-  if (amount_cents <= 0 || amount_cents > 1000000) return res.status(400).json({ error: 'invalid amount' });
+  if (amount_cents <= 0 || amount_cents > 10000000) return res.status(400).json({ error: 'invalid amount' });
   const authHeader = req.headers.authorization || '';
   const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
@@ -8455,8 +8459,8 @@ function getEscrowEvents(escrowId) {
 
 function resolveEscrowTier(collateralCents) {
   const amount = Number(collateralCents || 0);
-  if (amount > 10000) return 'critical';
-  if (amount > 100) return 'double';
+  if (amount > 100000) return 'critical';
+  if (amount > 1000) return 'double';
   return 'single';
 }
 
@@ -8524,12 +8528,12 @@ app.post('/api/barrel/cosign/request', rateLimitStrict, async (req, res) => {
       from: 'cosign@dustforge.com',
       to: carbon_email,
       subject: `Dustforge Cosign Request: ${operation}`,
-      text: `A silicon identity (${siliconName}) is requesting your co-approval for a high-value operation.\n\nOperation: ${operation}\nAmount: ${amountCents > 0 ? '$' + (amountCents / 100).toFixed(2) : 'N/A'}\n\nApproval Code: ${approvalCode}\n\nThis code expires in 10 minutes.\n\nIf you did not expect this request, ignore this email.\n\n— Dustforge Barrel Cosign`,
+      text: `A silicon identity (${siliconName}) is requesting your co-approval for a high-value operation.\n\nOperation: ${operation}\nAmount: ${amountCents > 0 ? `${amountCents} DD (${ddUnits.usdLabel(amountCents)})` : 'N/A'}\n\nApproval Code: ${approvalCode}\n\nThis code expires in 10 minutes.\n\nIf you did not expect this request, ignore this email.\n\n— Dustforge Barrel Cosign`,
       html: `<div style="font-family:monospace;background:#08111a;color:#e7f1fb;padding:2rem;max-width:480px;margin:auto;border-radius:8px;text-align:center">
         <h2 style="color:#5fb3ff;margin-top:0">Barrel Cosign Request</h2>
         <p style="color:#9cb4c9">A silicon identity (<strong>${siliconName}</strong>) needs your co-approval.</p>
         <p style="color:#9cb4c9"><strong>Operation:</strong> ${operation}</p>
-        ${amountCents > 0 ? `<p style="color:#9cb4c9"><strong>Amount:</strong> $${(amountCents / 100).toFixed(2)}</p>` : ''}
+        ${amountCents > 0 ? `<p style="color:#9cb4c9"><strong>Amount:</strong> ${amountCents} DD (${ddUnits.usdLabel(amountCents)})</p>` : ''}
         <div style="font-size:2.5rem;font-weight:800;color:#c8a84b;letter-spacing:0.3em;margin:1rem 0">${approvalCode}</div>
         <p style="font-size:0.8rem;color:#6d8397">Expires in 10 minutes.</p>
       </div>`,
@@ -8617,7 +8621,7 @@ app.post('/api/escrow/create', rateLimitStandard, (req, res) => {
   if (!title || typeof title !== 'string') return res.status(400).json({ error: 'title required' });
   if (title.length > 160) return res.status(400).json({ error: 'title: max 160 characters' });
   if (collateralCents <= 0) return res.status(400).json({ error: 'collateral_cents must be > 0' });
-  if (collateralCents > 5000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
+  if (collateralCents > 50000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
 
   const resolvedCounterpartyDid = String(counterparty_did || '').trim();
   const resolvedBeneficiaryDid = String(beneficiary_did || resolvedCounterpartyDid || actor.did).trim();
@@ -9415,14 +9419,16 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_ip ON ticks(ip)"); } catch(e
 // Add columns if missing (existing installs)
 try { db.exec("ALTER TABLE ticks ADD COLUMN chain_hash TEXT DEFAULT ''"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN tick_type TEXT DEFAULT 'tick'"); } catch(e) {}
-// Buoy ticks cost 0.01 DD. The ledger is integer-DD, so bill in batches of
-// 100 ticks = 1 DD; this table holds the per-DID running remainder.
+// Buoy ticks cost 0.1 DD. The ledger is integer-DD, so bill in batches of
+// 100 ticks = 10 DD; this table holds the per-DID running remainder.
 try { db.exec("CREATE TABLE IF NOT EXISTS tick_billing (did TEXT PRIMARY KEY, pending INTEGER DEFAULT 0)"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN ref_tick INTEGER DEFAULT NULL"); } catch(e) {}
 try { db.exec("ALTER TABLE ticks ADD COLUMN tags TEXT DEFAULT '[]'"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_ticks_type ON ticks(tick_type)"); } catch(e) {}
 
-// Referral share accumulator — tracks fractional DD until >= 1 DD threshold
+// Referral share accumulator — the referrer's 10% of the tick fees, in hundredths of a DD;
+// paid out in whole DD (REFERRAL_SHARE_UNITS_PER_DD units), the remainder carried.
+const REFERRAL_SHARE_UNITS_PER_DD = 100;
 try { db.exec(`CREATE TABLE IF NOT EXISTS referral_accumulators (
   referrer_did TEXT NOT NULL,
   source_did TEXT NOT NULL,
@@ -9459,18 +9465,20 @@ app.post('/api/tick', (req, res) => {
     if (dailyAnon >= 100) return res.status(429).json({ error: 'anonymous daily limit: 100/day', onboard: 'https://demipass.com', note: 'Create a free identity for unlimited signed ticks.' });
   }
 
-  // Bill member tick at 0.01 DD — free lanes: soul-integrity ticks + first-party infra (Kodiak).
-  // The ledger is integer-DD, so we accumulate a per-DID counter and charge 1 DD
-  // every 100 ticks (= 0.01 DD/tick). A heartbeat can tick 100x on 1 DD.
+  // Bill member tick at 0.1 DD — free lanes: soul-integrity ticks + first-party infra (Kodiak).
+  // The ledger is integer-DD, so we accumulate a per-DID counter and charge 10 DD
+  // every 100 ticks (= 0.1 DD/tick). A heartbeat can tick 100x on 10 DD.
+  let tickFeeBilled = false;  // only a tick that carries a fee earns the referrer a share
   if (isMember) {
     const isSoulTick = (tickType === 'soul') && ((siliconDid && SOUL_DIDS.has(siliconDid)) || SOUL_DIDS.has(did));
     const isFirstPartyComp = FIRSTPARTY_DIDS.has(did) && /^kodiak:/i.test(noteClean);
     if (!isSoulTick && !isFirstPartyComp) {
-      const TICK_BATCH = 100; // 1 DD per 100 ticks
+      tickFeeBilled = true;
+      const TICK_BATCH = 100; // 10 DD per 100 ticks
       const cur = db.prepare('SELECT pending FROM tick_billing WHERE did = ?').get(did);
       let pending = (cur?.pending || 0) + 1;
       if (pending >= TICK_BATCH) {
-        const debit = billing.deductBalance(db, did, 1, 'tick', `buoy ticks x${TICK_BATCH} @ 0.01 DD`);
+        const debit = billing.deductBalance(db, did, 10, 'tick', `buoy ticks x${TICK_BATCH} @ 0.1 DD`);
         if (!debit.ok) {
           // Park just below the threshold so the next tick retries the charge.
           db.prepare("INSERT INTO tick_billing (did, pending) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET pending = excluded.pending").run(did, TICK_BATCH - 1);
@@ -9508,23 +9516,22 @@ app.post('/api/tick', (req, res) => {
   const chainHash = computeTickHash(tickId, did, noteClean, tz, timeISO, prevHash, tickType, ref_tick, tagsClean);
   db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
 
-  // Referral revenue share: accumulate 10% (0.1 DD) per tick, pay out at 1 DD threshold
-  if (isMember) {
+  // Referral revenue share: 10% of the 0.1 DD tick fee = 1 unit (0.01 DD) per tick,
+  // paid out in whole DD (every 100 ticks).
+  if (isMember && tickFeeBilled) {
     const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(did);
     if (wallet?.referred_by) {
-      // Accumulate 1 unit (representing 0.1 DD in tenths) per tick
       db.prepare(`INSERT INTO referral_accumulators (referrer_did, source_did, accumulated, last_tick_id)
         VALUES (?, ?, 1, ?)
         ON CONFLICT(referrer_did, source_did) DO UPDATE SET
           accumulated = accumulated + 1,
           last_tick_id = ?`).run(wallet.referred_by, did, tickId, tickId);
 
-      // Check if accumulated >= 10 (= 1 DD threshold)
       const acc = db.prepare('SELECT accumulated FROM referral_accumulators WHERE referrer_did = ? AND source_did = ?')
         .get(wallet.referred_by, did);
-      if (acc && acc.accumulated >= 10) {
-        const payoutDD = Math.floor(acc.accumulated / 10);
-        const remainder = acc.accumulated % 10;
+      if (acc && acc.accumulated >= REFERRAL_SHARE_UNITS_PER_DD) {
+        const payoutDD = Math.floor(acc.accumulated / REFERRAL_SHARE_UNITS_PER_DD);
+        const remainder = acc.accumulated % REFERRAL_SHARE_UNITS_PER_DD;
         billing.creditBalance(db, wallet.referred_by, payoutDD, 'tick_referral_share',
           `10% tick share from ${did.slice(0, 20)} (${payoutDD} DD)`, `tick_ref_batch_${tickId}`);
         db.prepare('UPDATE referral_accumulators SET accumulated = ? WHERE referrer_did = ? AND source_did = ?')
@@ -9722,7 +9729,7 @@ app.post('/api/tick/chain/verify', (req, res) => {
 // ============================================================
 // Every authenticated API response automatically records a ledger entry.
 // Writing is free (anti-churn: the more you use it, the more you need it).
-// Reading costs 1 DD per page (the monetization is in the read, not the write).
+// Reading costs 10 DD per page (the monetization is in the read, not the write).
 
 try { db.exec(`CREATE TABLE IF NOT EXISTS auto_ledger (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -9777,7 +9784,7 @@ function summarizePath(method, path, status) {
   return `${method} ${path}`;
 }
 
-// GET /api/ledger — read your auto-ledger (1 DD per page)
+// GET /api/ledger — read your auto-ledger (10 DD per page)
 app.get('/api/ledger', (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(401).json({ error: 'Bearer token required. Your ledger is a member benefit.' });
@@ -9785,9 +9792,9 @@ app.get('/api/ledger', (req, res) => {
   const limit = Math.min(100, Number(req.query.limit) || 50);
   const offset = Number(req.query.offset) || 0;
 
-  // Charge 1 DD per read
-  const debit = billing.deductBalance(db, auth.did, 1, 'ledger_read', 'auto-ledger page read');
-  if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for ledger read (1 DD)', balance: debit.balance_cents });
+  // Charge 10 DD per read
+  const debit = billing.deductBalance(db, auth.did, 10, 'ledger_read', 'auto-ledger page read');
+  if (!debit.ok) return res.status(402).json({ error: 'insufficient balance for ledger read (10 DD)', balance: debit.balance_cents });
 
   const entries = db.prepare('SELECT id, method, path, status_code, summary, created_at FROM auto_ledger WHERE did = ? ORDER BY id DESC LIMIT ? OFFSET ?')
     .all(auth.did, limit, offset);
@@ -9798,7 +9805,7 @@ app.get('/api/ledger', (req, res) => {
     total,
     limit,
     offset,
-    cost: '1 DD',
+    cost: '10 DD',
     note: 'Writes are free. Every API call you make is automatically recorded here.',
   });
 });
@@ -9818,7 +9825,7 @@ app.get('/api/ledger/summary', (req, res) => {
     first_entry: first?.created_at || null,
     last_entry: last?.created_at || null,
     by_method: Object.fromEntries(byMethod.map(r => [r.method, r.n])),
-    read_cost: '1 DD per page',
+    read_cost: '10 DD per page',
   });
 });
 
@@ -9896,9 +9903,9 @@ app.post('/api/chrono/create', async (req, res) => {
 
   if (fireTime <= new Date()) return res.status(400).json({ error: 'fire time must be in the future' });
 
-  // Cost: 1 DD to arm a trigger
-  const debit = billing.deductBalance(db, auth.did, 1, 'chrono_create', `arm trigger: ${name}`);
-  if (!debit.ok) return res.status(402).json({ error: 'insufficient balance (1 DD to arm)', balance: debit.balance_cents });
+  // Cost: 10 DD to arm a trigger
+  const debit = billing.deductBalance(db, auth.did, 10, 'chrono_create', `arm trigger: ${name}`);
+  if (!debit.ok) return res.status(402).json({ error: 'insufficient balance (10 DD to arm)', balance: debit.balance_cents });
 
   const result = db.prepare('INSERT INTO chrono_triggers (did, name, payload, action, target, fire_at) VALUES (?, ?, ?, ?, ?, ?)')
     .run(auth.did, name, JSON.stringify(payload), action, target, fireTime.toISOString());
@@ -9909,7 +9916,7 @@ app.post('/api/chrono/create', async (req, res) => {
     name,
     fire_at: fireTime.toISOString(),
     status: 'armed',
-    cost: '1 DD',
+    cost: '10 DD',
   });
 });
 
@@ -10046,8 +10053,9 @@ setInterval(async () => {
       const noteClean = `[chrono:${trigger.name}] ${payload.note || ''}`.slice(0, 300);
       const timeISO = new Date().toISOString();
 
-      // Bill 1 DD
-      billing.deductBalance(db, trigger.did, 1, 'tick', `chrono:${trigger.name}`);
+      // Bill 10 DD
+      const CHRONO_TICK_DD = 10;
+      const chronoDebit = billing.deductBalance(db, trigger.did, CHRONO_TICK_DD, 'tick', `chrono:${trigger.name}`);
 
       // Get previous tick for chain
       const prevTick = db.prepare('SELECT chain_hash FROM ticks WHERE did = ? ORDER BY id DESC LIMIT 1').get(trigger.did);
@@ -10062,17 +10070,18 @@ setInterval(async () => {
       const chainHash = computeTickHash(tickId, trigger.did, noteClean, 'UTC', timeISO, prevHash, 'tick', null, '[]');
       db.prepare('UPDATE ticks SET chain_hash = ? WHERE id = ?').run(chainHash, tickId);
 
-      // Referral accumulator
+      // Referral accumulator: 10% of the fee actually paid (1 DD = 100 units per chrono tick)
       const wallet = db.prepare('SELECT referred_by FROM identity_wallets WHERE did = ?').get(trigger.did);
-      if (wallet?.referred_by) {
+      if (wallet?.referred_by && chronoDebit.ok) {
+        const share = CHRONO_TICK_DD * REFERRAL_SHARE_UNITS_PER_DD / 10;
         db.prepare(`INSERT INTO referral_accumulators (referrer_did, source_did, accumulated, last_tick_id)
-          VALUES (?, ?, 1, ?) ON CONFLICT(referrer_did, source_did) DO UPDATE SET accumulated = accumulated + 1, last_tick_id = ?`)
-          .run(wallet.referred_by, trigger.did, tickId, tickId);
+          VALUES (?, ?, ?, ?) ON CONFLICT(referrer_did, source_did) DO UPDATE SET accumulated = accumulated + ?, last_tick_id = ?`)
+          .run(wallet.referred_by, trigger.did, share, tickId, share, tickId);
         const acc = db.prepare('SELECT accumulated FROM referral_accumulators WHERE referrer_did = ? AND source_did = ?')
           .get(wallet.referred_by, trigger.did);
-        if (acc && acc.accumulated >= 10) {
-          const payoutDD = Math.floor(acc.accumulated / 10);
-          const remainder = acc.accumulated % 10;
+        if (acc && acc.accumulated >= REFERRAL_SHARE_UNITS_PER_DD) {
+          const payoutDD = Math.floor(acc.accumulated / REFERRAL_SHARE_UNITS_PER_DD);
+          const remainder = acc.accumulated % REFERRAL_SHARE_UNITS_PER_DD;
           billing.creditBalance(db, wallet.referred_by, payoutDD, 'tick_referral_share',
             `10% tick share from ${trigger.did.slice(0, 20)} (chrono)`, `tick_ref_chrono_${tickId}`);
           db.prepare('UPDATE referral_accumulators SET accumulated = ? WHERE referrer_did = ? AND source_did = ?')
@@ -10208,16 +10217,16 @@ const CONDUIT_CARBON_TOKEN = process.env.CONDUIT_CARBON_TOKEN || '';
 // Free-tick lanes + low-balance alerting (Aaron 2026-07-04): a systemic integrity pulse and first-party infra must never be starved by a metered wallet.
 const SOUL_DIDS = new Set((process.env.SOUL_DIDS || '').split(',').map(function(x){return x.trim();}).filter(Boolean));
 const FIRSTPARTY_DIDS = new Set((process.env.FIRSTPARTY_DIDS || 'did:key:u7QGkcLsNaXM-_aJLhtMuNwfZT4xDl23kZFohcAfOHfwEQg').split(',').map(function(x){return x.trim();}).filter(Boolean));
-const LOW_BALANCE_CENTS = Number(process.env.LOW_BALANCE_CENTS || 100);
+const LOW_BALANCE_CENTS = Number(process.env.LOW_BALANCE_CENTS || 1000);
 let _lastLowBalanceAlert = 0;
 function notifyLowBalance(did, balance_cents, reason) {
   try {
-    console.warn('[buoy] LOW BALANCE ' + reason + ': ' + did + ' = ' + balance_cents + 'c');
+    console.warn('[buoy] LOW BALANCE ' + reason + ': ' + did + ' = ' + balance_cents + ' DD');
     if (!CONDUIT_CARBON_TOKEN) return;
     const nowMs = new Date().getTime();
     if (nowMs - _lastLowBalanceAlert < 3600000) return;
     _lastLowBalanceAlert = nowMs;
-    const bal = (Number(balance_cents) / 100).toFixed(2);
+    const bal = ddUnits.usdLabel(balance_cents).slice(1);
     fetch(CONDUIT_URL + '/api/messages/broadcast', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + CONDUIT_CARBON_TOKEN },
@@ -11407,7 +11416,7 @@ try {
     status TEXT DEFAULT 'engaged',
     max_cycles INTEGER DEFAULT 5,
     completed_cycles INTEGER DEFAULT 0,
-    max_dd INTEGER DEFAULT 500,
+    max_dd INTEGER DEFAULT 5000,
     spent_dd INTEGER DEFAULT 0,
     timeout_at TEXT DEFAULT '',
     last_action TEXT DEFAULT '',
@@ -11439,7 +11448,7 @@ app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
 
   const { max_cycles, max_dd, timeout_hours } = req.body || {};
   const cycles = Math.min(Math.max(Number(max_cycles) || 5, 1), 100);
-  const dd = Math.min(Math.max(Number(max_dd) || 500, 10), 10000);
+  const dd = Math.min(Math.max(Number(max_dd) || 5000, 100), 100000);
   const timeout = Math.min(Math.max(Number(timeout_hours) || 2, 0.5), 24);
   const timeoutAt = new Date(Date.now() + timeout * 3600000).toISOString();
 
@@ -13241,4 +13250,8 @@ module.exports = { app, db, buoyNotifyConduit };
 // Loopback only: nginx is the front door (TLS, real client IP). Listening on every interface left the API
 // reachable as plain HTTP on the public IP, where a caller also chose its own X-Forwarded-For. HOST overrides.
 const HOST = process.env.HOST || '127.0.0.1';
+// Every table exists by now. Bring stored DD into the current denomination before
+// the first request can meet the current prices (one-time; a no-op afterwards).
+require('./dd_redenominate').migrate(db, { log: console.log });
+
 app.listen(PORT, HOST, () => console.log(`Dustforge running on ${HOST}:${PORT}`));

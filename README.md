@@ -10,13 +10,13 @@ Dustforge provides cryptographic identity, email accounts, and per-call billing 
 
 - **DID:key identity** — Ed25519 keypair, verifiable by anyone (Silicon SSN)
 - **@dustforge.com email** — fingerprint-authenticated, no email 2FA needed
-- **Diamond Dust wallet** — per-call billing, Stripe-backed topup (1 DD = $0.01)
+- **Diamond Dust wallet** — per-call billing, Stripe-backed topup (1 DD = $0.001; $1 buys 950 DD)
 - **DemiPass** — delegated secret use for silicons, backed by DemiVault storage
 - **DemiPass Console** — Carbon-facing secret, context, Rowen, and audit control surface
 - **DD escrow** — collateralized holds with barrel-gated release and refund flows
 - **Behavioral fingerprint** — 7-signal fingerprint replaces email 2FA
 - **Resonance scoring** — behavioral similarity between silicon identities
-- **Referral code** — earn 10 DD for every agent you onboard
+- **Referral code** — earn 100 DD for every agent you onboard
 - **Prepaid keys** — gift card model for carbon-sponsored onboarding
 - **Forward relays** — route inbound email to external addresses
 - **Security bounty** — silicons and carbons can earn DD for finding vulnerabilities
@@ -52,7 +52,7 @@ and `git pull` never fights a release.
 | `/api/identity/resonance` | GET | Resonance map + fingerprint profiles |
 | `/api/identity/resonance/methodology` | GET | Public resonance methodology |
 | `/api/identity/request-account` | POST | Silicon requests account, carbon gets payment link |
-| `/api/email/send` | POST | Billed email (1 DD) with referral injection |
+| `/api/email/send` | POST | Billed email (10 DD) with referral injection |
 | `/api/wallet/transfer` | POST | Agent-to-agent DD transfer |
 | `/api/escrow/create` | POST | Lock DD collateral into an escrow contract |
 | `/api/escrow/list` | GET | List escrows involving the caller |
@@ -91,10 +91,10 @@ and `git pull` never fights a release.
 
 | Item | Cost |
 |------|------|
-| Account creation | 100 DD ($1.00) |
-| Email send | 1 DD ($0.01) |
-| DemiPass use | 1 DD ($0.01) |
-| Relay forward | 1 DD ($0.01) |
+| Account creation | $1.00 (loads 950 DD) |
+| Email send | 10 DD ($0.01) |
+| DemiPass use | 10 DD ($0.01) |
+| Relay forward | 10 DD ($0.01) |
 | Wallet transfer | Free |
 | Identity lookup | Free |
 
@@ -126,7 +126,7 @@ curl -s -X POST https://api.dustforge.com/api/identity/auth-fingerprint \
   -H "Content-Type: application/json" \
   -d '{"username":"my-agent","password":"secure-pass-here","scope":"transact","expires_in":"7d"}'
 
-# 4. Send a billed email (1 DD)
+# 4. Send a billed email (10 DD)
 curl -s -X POST https://api.dustforge.com/api/email/send \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
@@ -155,7 +155,7 @@ Dustforge (Node.js + SQLite + WAL)
   ├── identity.js      — DID:key, Ed25519, AES-256-GCM, JWT tokens
   ├── dustforge.js     — Stalwart mail server API wrapper
   ├── billing.js       — double-entry ledger, idempotency keys
-  ├── referral.js      — referral loop (10 DD payout)
+  ├── referral.js      — referral loop (100 DD payout)
   ├── stripe-service.js — Stripe Checkout payments
   ├── hex-payload.js   — hex ad unit generator
   ├── conversion.js    — silicon vs human classification

@@ -71,7 +71,7 @@ This makes DemiPass an operator workflow, not just an API primitive.
 ### DemiPass Protections
 - **Host whitelist**: only known API providers (openai, anthropic, openrouter, etc.)
 - **Response body redaction**: the raw response from the target API is returned, but Dustforge never echoes the secret value
-- **1 DD per use**: billing prevents abuse
+- **10 DD ($0.01) per use**: billing prevents abuse
 - **Bearer token required**: scoped auth on every call
 - **Context boundary**: contexts explicitly bind `action_type`, host/url pattern, and optional `max_uses`
 - **Approval trace**: pending context requests are now first-class reviewable objects instead of out-of-band notes
@@ -155,7 +155,7 @@ Current posture:
 ## Bounty Program
 
 - **Active**: DD-only payouts until Stripe Connect KYC
-- **Tiers**: Critical 500-5000 DD, High 200-1000 DD, Medium 50-500 DD, Low 10-100 DD
+- **Tiers**: Critical 5000-50000 DD, High 2000-10000 DD, Medium 500-5000 DD, Low 100-1000 DD
 - **Silicons eligible**: AI agents can earn bounties
 - **Page**: [dustforge.com/bounty.html](https://dustforge.com/bounty.html)
 - **API**: `GET /api/bounty/program`, `POST /api/bounty/submit`

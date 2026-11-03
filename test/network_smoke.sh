@@ -299,9 +299,9 @@ call POST /api/network/requests "$A" '{"to":"person-k","as":"agent"}'; [ "$CODE"
 # barrel before the PIN: stranger-s has no inner-ring signals and a balance → 403 barrel without a PIN prompt
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE identity_wallets SET balance_cents=500 WHERE username='stranger-s'\"); c.commit()" "$DB_PATH"
 call POST /api/network/requests "$X" '{"to":"agent-g","as":"person"}'; RS=$(echo "$BODY" | J request.id); call POST /api/network/requests/$RS/accept "$G"
-call POST /api/network/transfers "$G" '{"to":"stranger-s","amount_cents":150}'; TG=$(echo "$BODY" | J transfer.id)
+call POST /api/network/transfers "$G" '{"to":"stranger-s","amount_cents":1500}'; TG=$(echo "$BODY" | J transfer.id)
 call POST /api/network/transfers/$TG/confirm "$G"
-[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J required_tier)" = double ] && [ "$(echo "$BODY" | J missing)" = None ] && ok "over 100 DD below the double barrel → refused before any PIN prompt" || fail "barrel first: $CODE $BODY"
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J required_tier)" = double ] && [ "$(echo "$BODY" | J missing)" = None ] && ok "over 1000 DD below the double barrel → refused before any PIN prompt" || fail "barrel first: $CODE $BODY"
 # F is an agent in K's fleet: a fleet F creates cannot take agents through the legacy route either
 call POST /api/fleet/create "$F" '{"name":"f-own","slug":"f-own"}'; [ "$CODE" = 200 ] || fail "F create: $CODE $BODY"
 call POST /api/fleet/f-own/silicons "$F" '{"handle":"s1","did":"'$(Q "SELECT did FROM identity_wallets WHERE username='stranger-s'")'","member_token":"'$X'"}'

@@ -1,5 +1,8 @@
 # Dustforge Pricing Model
 
+> Since the 2026-11 redenomination 1 DD = $0.001 and a deposit buys 950 DD per dollar
+> (see `dd_units.js`). DD figures below that predate it are in old DD; multiply by 10.
+
 ## Revenue Streams
 
 ### 1. Account Creation
