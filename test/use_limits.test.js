@@ -63,3 +63,34 @@ test('redaction is linear: 2 MiB of near-misses and 2 MiB of hits each take well
     assert.ok(!out.includes(secret));
   }
 });
+
+test('redaction survives every way an upstream may escape the secret in JSON (review of #35)', () => {
+  const cases = [
+    ['abc/def+ghi==', '{"echo":"abc\\/def+ghi=="}'],                         // PHP escapes /
+    ['tok&en<x>', '{"echo":"tok\\u0026en\\u003cx\\u003e"}'],                // Go, Rails: & < >
+    ['pässwörd', '{"echo":"p\\u00e4ssw\\u00f6rd"}'],                         // Python: non-ASCII
+    ['hunter2', '{"echo":"hunt\\u0065r2"}'],                                 // any letter as \uXXXX
+    ['tok"en', '{"echo":"tok\\"en"}'],                                       // the case #35 first fixed
+    ['hunter2', '{"hunt\\u0065r2":["x",{"deep":["hunter2 again"]}]}'],       // keys and nesting
+  ];
+  for (const [secret, upstream] of cases) {
+    const out = JSON.stringify(L.redactedBody(upstream, secret));
+    assert.ok(!out.includes(secret) && !JSON.stringify(JSON.parse(out)).includes(secret), `${secret} leaked: ${out}`);
+    assert.match(out, /\[REDACTED\]/);
+  }
+});
+
+test('a "__proto__" key from the upstream stays data, and a BOM-prefixed JSON body still parses', async () => {
+  const out = L.redactedBody('{"__proto__":{"polluted":true},"a":"s3cret"}', 's3cret');
+  assert.equal(Object.getPrototypeOf(out), Object.prototype);
+  assert.deepEqual(Object.keys(out), ['__proto__', 'a']);
+  assert.equal(out.a, '[REDACTED]');
+  const bom = await L.readCapped(new Response(Buffer.from('﻿{"ok":true}')));
+  assert.deepEqual(L.redactedBody(bom, 'x'), { ok: true });
+});
+
+test('no body (HEAD, 204, 304) is never refused for its Content-Length', async () => {
+  for (const status of [204, 304]) {
+    assert.equal(await L.readCapped(new Response(null, { status, headers: { 'content-length': String(LIMIT * 4) } })), '');
+  }
+});

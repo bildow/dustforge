@@ -83,6 +83,18 @@ use "/bytes/$((LIMIT + 1))?chunked"
 [ "$CODE" = 413 ] && [ "$(J limit_bytes < "$S/out")" = "$LIMIT" ] && [ -n "$(J read_bytes < "$S/out")" ] && ok "over the limit, chunked (no Content-Length) → 413 too" || fail "over chunked: $CODE $(head -c 300 "$S/out")"
 grep -q "Internal\|<html" "$S/out" && fail "an HTML/500 body leaked" || ok "the 413 is JSON, not an HTML page"
 
+# Token mode: an over-limit upstream answer uses the token up (it was charged), so it cannot be replayed.
+OVER="https://repo.dustroot.com/bytes/$((LIMIT + 1))"
+UT=$(curl -s -X POST "$API/api/demipass/request-token" -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"name":"forge-token","action":"http_header","target_url":"'$OVER'"}' | J use_token)
+[ -n "$UT" ] && [ "$UT" != None ] || fail "request-token for the over-limit URL"
+uset(){ CODE=$(curl -s -o "$S/out" -w '%{http_code}' -X POST "$API/api/demipass/use" -H "Authorization: Bearer $TOK" -H 'content-type: application/json' -d '{"use_token":"'$UT'","header_prefix":"token "}'); }
+UC0=$(Q "SELECT use_count FROM blindkey_secrets WHERE name='forge-token'")
+uset; [ "$CODE" = 413 ] && ok "token mode: over-limit upstream → 413" || fail "token 413: $CODE $(head -c 200 "$S/out")"
+[ "$(Q "SELECT status FROM blindkey_use_tokens ORDER BY id DESC LIMIT 1")" = used ] && [ "$(Q "SELECT use_count FROM blindkey_secrets WHERE name='forge-token'")" = $((UC0 + 1)) ] \
+  && ok "…and the token is used up and the use counted" || fail "token not burned: $(Q "SELECT status FROM blindkey_use_tokens ORDER BY id DESC LIMIT 1")"
+uset; [ "$CODE" != 200 ] && [ "$CODE" != 413 ] && ok "replaying that token is refused ($CODE)" || fail "token replayed: $CODE"
+
 use /echo-secret
 [ "$CODE" = 200 ] && [ "$(J result.body.seen < "$S/out")" = "token [REDACTED]" ] && ! grep -q "0123456789" "$S/out" && ok "the secret echoed by the upstream comes back [REDACTED]" || fail "redact: $CODE $(cat "$S/out")"
 

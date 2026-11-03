@@ -316,8 +316,9 @@ app.use((req, res, next) => {
 // MTA hook above.
 const _jsonParser = express.json();
 const _useJsonParser = express.json({ limit: useLimits.USE_MAX_REQUEST_BYTES }); // POST /use: see use_limits.js
-const isUsePath = (p) => p === '/api/demipass/use' || p === '/api/blindkey/use';
+const isUsePath = (p) => /^\/api\/(demipass|blindkey)\/use\/?$/i.test(p);   // Express matches case- and trailing-slash-insensitively
 const _urlencodedParser = express.urlencoded({ extended: false });
+const _useUrlencodedParser = express.urlencoded({ extended: false, limit: useLimits.USE_MAX_REQUEST_BYTES });
 // A body the parser refuses is answered in JSON with what to fix (and the DemiPass menu), never Express's HTML page,
 // which also printed a stack trace with server paths. The body itself is not echoed.
 function badBody(req, res, err) {
@@ -334,7 +335,7 @@ function badBody(req, res, err) {
   return res.status(err && err.status >= 400 && err.status < 500 ? err.status : 400).json(body);
 }
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : (isUsePath(req.path) ? _useJsonParser : _jsonParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
-app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : _urlencodedParser(req, res, (err) => (err ? badBody(req, res, err) : next()))));
+app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : (isUsePath(req.path) ? _useUrlencodedParser : _urlencodedParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 // A "not enough DD" (402) answer to an agent paying for itself tells it how to ask its fleet owner for a top-up
 // (network_routes.js). Not for people, worker/silicon tokens, or a charge someone else pays.
 function topupHintFor(req, body) {
@@ -4612,7 +4613,17 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           .run(secret.id, req.identity.did, action, 'failure', e.message.slice(0, 200), req.identity?.agent_name || '');
       } catch(_) {}
 
-      if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
+      if (e.code === 'upstream_too_large') {
+        // The upstream call was made with the secret and is charged, so it also uses up the
+        // token and counts against the delegation and the secret, like a success.
+        try {
+          db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
+          if (tokenRow.delegation_id) db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
+          db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+          if (tokenRow.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
+        } catch (_) {}
+        return res.status(413).json(e.body);
+      }
       return res.status(500).json({ error: `action failed: ${e.message}` });
     }
   }

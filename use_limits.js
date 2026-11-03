@@ -37,12 +37,13 @@ function upstreamTooLarge(bytes, declared) {
 
 // The body of a fetch() Response as UTF-8 text, never more than `limit` bytes.
 async function readCapped(response, limit = USE_MAX_RESPONSE_BYTES) {
+  // HEAD, 204 and 304 have no body, whatever Content-Length says.
+  if (!response.body || response.status === 204 || response.status === 304) return '';
   const declared = Number(response.headers.get('content-length'));
   if (Number.isFinite(declared) && declared > limit) {
     try { await response.body?.cancel(); } catch (_) {}
     throw upstreamTooLarge(declared, true);
   }
-  if (!response.body) return '';
   const reader = response.body.getReader();
   const chunks = [];
   let n = 0;
@@ -56,7 +57,7 @@ async function readCapped(response, limit = USE_MAX_RESPONSE_BYTES) {
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks, n).toString('utf8');
+  return new TextDecoder().decode(Buffer.concat(chunks, n));   // like response.text(): UTF-8, a leading BOM dropped
 }
 
 // Replace every occurrence of the secret, as it is and as it appears inside a JSON
@@ -69,10 +70,38 @@ function redactSecret(text, secret) {
   return out;
 }
 
-// Redact first, then parse: the result is JSON when the upstream sent JSON, else text.
+// The body as JSON when the upstream sent JSON, else text, with the secret redacted.
+// Twice: on the raw text, and again on every string (keys and values) after parsing,
+// because an upstream may escape the secret in ways this code cannot list in advance
+// (\/ from PHP, \u0026 from Go and Rails, \u00e4 from Python, any letter as \uXXXX),
+// and parsing turns each of them back into the plain secret. Both passes are linear.
 function redactedBody(text, secret) {
   const clean = redactSecret(text, secret);
-  try { return JSON.parse(clean); } catch (_) { return clean; }
+  let parsed;
+  try { parsed = JSON.parse(clean); } catch (_) { return clean; }
+  return redactDeep(parsed, secret);
 }
 
-module.exports = { USE_MAX_REQUEST_BYTES, USE_MAX_RESPONSE_BYTES, readCapped, redactSecret, redactedBody, mib };
+// Every string in a parsed JSON value, keys included, redacted. Iterative: no recursion
+// limit on deeply nested input.
+function redactDeep(value, secret) {
+  if (!secret) return value;
+  if (typeof value === 'string') return redactSecret(value, secret);
+  if (value === null || typeof value !== 'object') return value;
+  const root = Array.isArray(value) ? [] : {};
+  const stack = [[value, root]];
+  while (stack.length) {
+    const [src, dst] = stack.pop();
+    for (const k of Object.keys(src)) {
+      const v = src[k];
+      const key = Array.isArray(src) ? k : redactSecret(k, secret);
+      let out = typeof v === 'string' ? redactSecret(v, secret) : v;
+      if (v !== null && typeof v === 'object') { out = Array.isArray(v) ? [] : {}; stack.push([v, out]); }
+      // defineProperty, not assignment: a "__proto__" key from JSON stays an ordinary key.
+      Object.defineProperty(dst, key, { value: out, enumerable: true, writable: true, configurable: true });
+    }
+  }
+  return root;
+}
+
+module.exports = { USE_MAX_REQUEST_BYTES, USE_MAX_RESPONSE_BYTES, readCapped, redactSecret, redactedBody, redactDeep, mib };
