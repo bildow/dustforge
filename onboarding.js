@@ -8,7 +8,7 @@
  * sponsor uses when they mint their own account (?claim=<hash>).
  *
  * Lightweight referral identity: a sponsor with no Dustforge account still earns
- * 10 DD when someone they invited FUNDS ($1). It's held (capped at 10 DD total —
+ * 100 DD when someone they invited FUNDS ($1). It's held (capped at 100 DD total —
  * one referral's worth) against their email hash and deposited one-time when the
  * sponsor mints their own account. Each earning is tied to the invitee's funding
  * event so a chargeback claws it back through the ledger.
@@ -17,8 +17,8 @@
 const crypto = require('crypto');
 const KEY = process.env.IDENTITY_MASTER_KEY || '';
 
-const REFERRAL_EARN_CENTS = 10;       // per completed referral
-const LIGHTWEIGHT_CAP_CENTS = 10;     // lightweight (account-less) ID earns at most this, total
+const REFERRAL_EARN_CENTS = 100;      // per completed referral
+const LIGHTWEIGHT_CAP_CENTS = 100;    // lightweight (account-less) ID earns at most this, total
 
 function inviteHash(email) {
   return crypto.createHmac('sha256', KEY).update('invite-v1:' + String(email || '').toLowerCase().trim()).digest('hex').slice(0, 24);
@@ -72,7 +72,7 @@ function resolveInviteToAccount(db, hash) {
   return null;
 }
 
-// Record a lightweight (account-less) referral earning. Capped at 10 DD per
+// Record a lightweight (account-less) referral earning. Capped at 100 DD per
 // sponsor hash, idempotent per (sponsor, invitee). origin = invitee funding event.
 function recordLightweightReferral(db, hash, invitee_did, origin_event_id) {
   if (!hash || !invitee_did) return { ok: false };

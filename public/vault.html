@@ -779,7 +779,7 @@ async function refreshActivity() {
           <div class="stat-card"><div class="stat-label">Last Entry</div><div style="font-size:0.8rem;color:var(--text2)">${l.last_entry ? new Date(l.last_entry).toLocaleDateString() : '—'}</div></div>
           <div class="stat-card"><div class="stat-label">By Method</div><div style="font-size:0.75rem;color:var(--text3)">${Object.entries(l.by_method||{}).map(([k,v])=>k+': '+v).join(', ')||'—'}</div></div>
         </div>
-        <p style="font-size:0.75rem;color:var(--text3);margin-top:0.75rem">Full ledger read costs 1 DD per page.</p>
+        <p style="font-size:0.75rem;color:var(--text3);margin-top:0.75rem">Full ledger read costs 10 DD per page.</p>
       `;
     }
   } catch {}

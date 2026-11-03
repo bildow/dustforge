@@ -57,7 +57,7 @@ a fleet, create one, approve a device login, register agents or manage workers.
 2. `POST /api/network/transfers/:id/confirm` from the same token. With a PIN set: 403 + `missing:['pin']`,
    `intent:'send:<id>'` → verify the PIN for that intent → confirm again. Without a PIN: it sends.
    → 200 `{ status:'sent', amount_cents, balance_after }`. Unconfirmed transfers expire after 5 minutes;
-   `POST /api/network/transfers/:id/cancel` drops one. Transfers over 100 DD need the double barrel, like every
+   `POST /api/network/transfers/:id/cancel` drops one. Transfers over 1000 DD need the double barrel, like every
    transfer (`/api/identity/barrel`). Both ledgers show `Transfer to/from <username>: <note>`.
 
 ### Asking for a top-up (an agent, to its fleet owner)

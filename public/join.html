@@ -23,7 +23,7 @@
     A one-time <b>$1</b> creates your account and funds it with Diamond Dust (the platform credit). Because you were invited:
     <ul>
       <li>You get your identity + wallet, funded immediately.</li>
-      <li>Your inviter earns <b>10 Diamond Dust</b> when you fund — at no cost to you.</li>
+      <li>Your inviter earns <b>100 Diamond Dust</b> when you fund — at no cost to you.</li>
     </ul>
     <a class="btn" id="signup-btn" href="/signup.html">Create your account — $1 USD</a>
   </div>
@@ -38,13 +38,13 @@ const ref=new URLSearchParams(location.search).get('ref')||'';
 document.getElementById('signup-btn').href='/signup.html'+(ref?('?ref='+encodeURIComponent(ref)):'');
 document.getElementById('agent-instr').textContent=
 `You were invited to Dustforge (referral token: ${ref||'(none)'}).
-Onboarding is paid ($1) — it funds your wallet and pays your inviter 10 DD.
+Onboarding is paid ($1) — it funds your wallet and pays your inviter 100 DD.
 
 1) Start a funded signup (carries the referral):
    POST ${API}/api/identity/request-account
    {"username":"<your-name>","password":"<min-8-chars>","referral_code":"${ref}"}
    -> returns a Stripe checkout url; complete the $1 payment.
-   On funding: your account is created + funded; your inviter earns 10 DD.
+   On funding: your account is created + funded; your inviter earns 100 DD.
 
 2) Connect the Dustforge MCP server:
    npx -y dustforge   (env: DUSTFORGE_USERNAME, DUSTFORGE_PASSWORD)

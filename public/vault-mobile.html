@@ -261,7 +261,7 @@
         </div>
       </div>
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:0.85rem;margin-bottom:1rem;font-size:0.78rem;color:var(--text2);line-height:1.55">
-        <strong style="color:var(--text)">Your @dustforge.com inbox is API-only.</strong> There's no webmail to log into — mail is reached programmatically or forwarded to an address you control. Choose where it lands below. Each forwarded email costs 1 DD.
+        <strong style="color:var(--text)">Your @dustforge.com inbox is API-only.</strong> There's no webmail to log into — mail is reached programmatically or forwarded to an address you control. Choose where it lands below. Each forwarded email costs 10 DD.
       </div>
       <div class="section-head" style="padding:0.25rem 0 0.5rem">
         <span class="section-title">Mail forwarding</span>
@@ -386,7 +386,7 @@
     <label>Identity</label>
     <select id="sil-mode" onchange="updateSiliconFields()">
       <option value="existing">Existing identity — matched by contact email or DID</option>
-      <option value="create">Create a new identity (mailbox + wallet, 100 DD)</option>
+      <option value="create">Create a new identity (mailbox + wallet, 1,000 DD)</option>
     </select>
     <div id="sil-existing-fields">
       <label>DID (optional, if the email doesn't match)</label><input type="text" id="sil-did" placeholder="did:key:…">
@@ -904,7 +904,7 @@ async function loadDustforge(){
   try {
     const fe = await api('GET','/api/mail/forward-events');
     const evs = fe.events||[];
-    if(fe.blocked>0){ banner.style.display='block'; banner.innerHTML='⚠ Forwarding paused — your last balance was too low to forward '+fe.blocked+' message'+(fe.blocked>1?'s':'')+'. Top up Diamond Dust to resume (1 DD per forwarded email).'; }
+    if(fe.blocked>0){ banner.style.display='block'; banner.innerHTML='⚠ Forwarding paused — your last balance was too low to forward '+fe.blocked+' message'+(fe.blocked>1?'s':'')+'. Top up Diamond Dust to resume (10 DD per forwarded email).'; }
     else { banner.style.display='none'; }
     if(!evs.length){ act.innerHTML='<div class="empty" style="font-size:0.78rem">No forwarding activity yet.</div>'; }
     else {

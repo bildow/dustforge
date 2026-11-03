@@ -4,7 +4,7 @@
 // Everything money-related goes through ./fleet_billing (unit-tested); this
 // file is HTTP plumbing + authorization.
 
-const PROVISION_COST = 100;   // DD, same as /api/fleet/:slug/provision
+const PROVISION_COST = 1000;  // DD ($1), same as /api/fleet/:slug/provision
 const TOKEN_SCOPE_CAP = 'transact';
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const passwords = require('./passwords');   // salted scrypt for the local password verifier
@@ -321,7 +321,7 @@ module.exports = function registerFleetRoutes(deps) {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
     const amount = Number((req.body || {}).amount_cents || s.refill_amount_cents);
-    if (!Number.isInteger(amount) || amount < 1 || amount > 1000000) return res.status(400).json({ error: 'amount_cents: integer 1-1000000' });
+    if (!Number.isInteger(amount) || amount < 1 || amount > 10000000) return res.status(400).json({ error: 'amount_cents: integer 1-10000000' });
     const r = fb.thresholdRefill(db, billing, s, { force: true, amount, ledger });
     if (!r.ok) return res.status(402).json({ error: r.error || r.skipped, from_did: r.from_did });
     res.json({ ok: true, ...r, silicon: fb.siliconView(db, billing, fb.getSilicon(db, a.fleet.id, s.handle), { fleet: a.fleet }) });

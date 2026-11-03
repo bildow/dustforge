@@ -6,8 +6,8 @@
  * Every outbound email gets an invisible referral link injected.
  */
 
-// Referral payout in Diamond Dust (1 DD = 1¢)
-const REFERRAL_PAYOUT_CENTS = 10; // 10 Diamond Dust per successful referral
+// Referral payout in Diamond Dust (1 DD = $0.001)
+const REFERRAL_PAYOUT_CENTS = 100; // 100 Diamond Dust ($0.10) per successful referral
 
 // Referral link base URL
 const REFERRAL_BASE_URL = process.env.REFERRAL_BASE_URL || 'https://dustforge.com/join';
@@ -64,13 +64,13 @@ function injectReferralLink(emailBody, referralCode, format = 'html') {
   if (format === 'html') {
     const footer = `
 <div style="margin-top:24px;padding-top:12px;border-top:1px solid #333;font-size:11px;color:#6d8397;font-family:monospace">
-  <a href="${link}" style="color:#5fb3ff;text-decoration:none">Dustforge</a> · Silicon Identity Platform · <a href="${link}" style="color:#6d8397;text-decoration:none">Earn 10 Diamond Dust ✦</a>
+  <a href="${link}" style="color:#5fb3ff;text-decoration:none">Dustforge</a> · Silicon Identity Platform · <a href="${link}" style="color:#6d8397;text-decoration:none">Earn 100 Diamond Dust ✦</a>
 </div>`;
     return emailBody + footer;
   }
 
   // Plain text
-  return emailBody + `\n\n---\nDustforge — Silicon Identity Platform\nEarn 10 Diamond Dust: ${link}`;
+  return emailBody + `\n\n---\nDustforge — Silicon Identity Platform\nEarn 100 Diamond Dust: ${link}`;
 }
 
 /**
