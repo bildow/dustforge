@@ -14,6 +14,7 @@ const referral = require('./referral');
 const stripeService = require('./stripe-service');
 const ddUnits = require('./dd_units');
 const useLimits = require('./use_limits');
+const secretTypes = require('./secret_types');
 
 const app = express();
 app.set("trust proxy", 1);
@@ -46,6 +47,8 @@ const BLINDKEY_SSH_HOSTS = new Set([
   '100.69.1.78',       // k1
   '100.103.90.79',     // flimflam
   '100.73.92.12',      // skypie (Aaron's laptop, tailnet)
+  // More hosts from the environment, comma-separated IPs or names (e.g. a box a person shares through DemiPass).
+  ...String(process.env.BLINDKEY_SSH_HOSTS_EXTRA || '').split(',').map(h => h.trim()).filter(h => /^[A-Za-z0-9.:-]{1,253}$/.test(h)),
 ]);
 // ssh with a password, and no shell on this server: sshpass gets user@host and the remote command as separate
 // arguments, and the password in SSHPASS. The remote command still runs in the remote user's shell, as each
@@ -2496,6 +2499,10 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN expires_at TEXT DEFAULT N
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN buoy_ingested_tick INTEGER DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN buoy_last_used_tick INTEGER DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN provider TEXT DEFAULT ''"); } catch(_) {}
+// Manual entry: the account the credential signs in as (ssh_exec's default user), and a free-text note
+// (where it came from, who it really belongs to: "received raw over Matrix; Kyle rotates it").
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN account_username TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN note TEXT DEFAULT ''"); } catch(_) {}
 
 // Known provider patterns — auto-detect expiration hints
 const PROVIDER_PATTERNS = {
@@ -2611,7 +2618,7 @@ function nextVersionName(did, baseName, version) {
 }
 
 function generateRefCode(secretType, name) {
-  const prefix = { api_key: 'API', password: 'PWD', token: 'TKN', ssh_key: 'SSH', cert: 'CRT', other: 'SEC' }[secretType] || 'SEC';
+  const prefix = secretTypes.refPrefix(secretType);
   const slug = name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toLowerCase();
   const nonce = crypto.randomBytes(4).toString('hex');
   return `DP-${prefix}-${slug}-${nonce}`;
@@ -2838,6 +2845,21 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS demipass_delegations (
 )`); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_dd_owner ON demipass_delegations(owner_did)"); } catch(e) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_dd_delegate ON demipass_delegations(delegate_did)"); } catch(e) {}
+// Person-to-person shares (secret_sharing.js). An offer to a person waits as status 'suspended' + offer_state
+// 'offered' — inert everywhere, since every use path reads status = 'active' — until that person accepts it.
+// Agent delegations keep delegate_kind 'agent' and offer_state '' (live at once, as before).
+for (const col of [
+  "delegate_kind TEXT DEFAULT 'agent'",      // 'agent' | 'person'
+  "offer_state TEXT DEFAULT ''",             // '' (agent) | 'offered' | 'accepted' | 'declined' | 'dropped'
+  'accepted_at TEXT DEFAULT NULL',
+  'reveal_allowed INTEGER DEFAULT 0',        // a separate, owner-granted permission: the person may see the value
+  'max_reveals INTEGER DEFAULT 0',
+  'reveals_used INTEGER DEFAULT 0',
+  'reveal_granted_at TEXT DEFAULT NULL',
+  'reveal_until TEXT DEFAULT NULL',          // the reveal grant's window closes here
+  "note TEXT DEFAULT ''",
+  "via TEXT DEFAULT ''",                     // '' | 'share' | 'transfer' (the access the old owner kept)
+]) { try { db.exec(`ALTER TABLE demipass_delegations ADD COLUMN ${col}`); } catch (_) {} }
 
 // Cleanup expired cosign requests every 60 seconds
 setInterval(() => {
@@ -3110,8 +3132,34 @@ function authorizeSecretMediation({ requestorDid, secretName, contextName, actio
 
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
-  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days, origins, login } = req.body || {};
+  const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days, origins, login,
+          username, host, note, if_absent } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
+  if (typeof name !== 'string' || typeof value !== 'string') return res.status(400).json({ error: 'name and value: strings' });
+  if (description !== undefined && description !== null && typeof description !== 'string') return res.status(400).json({ error: 'description: must be a string' });
+  // The account the credential signs in as (an SSH user, a panel login): ssh_exec uses it when the caller names no user.
+  let accountUsername = null;
+  if (username !== undefined && username !== null && username !== '') {
+    if (typeof username !== 'string' || username.length > 100 || /[\u0000-\u001f\u007f]/.test(username)) return res.status(400).json({ error: 'username: a string of at most 100 characters' });
+    accountUsername = username.trim();
+  }
+  // The host the credential is for: the default context is bound to it instead of to every allowed host.
+  let boundHost = null;
+  if (host !== undefined && host !== null && host !== '') {
+    const h = typeof host === 'string' ? host.trim().replace(/^[a-z]+:\/\//i, '').replace(/\/.*$/, '') : '';
+    if (!/^[A-Za-z0-9.-]{1,253}(:\d{1,5})?$/.test(h) && !/^\[[0-9a-fA-F:]+\](:\d{1,5})?$/.test(h)) return res.status(400).json({ error: 'host: a hostname or IP address, e.g. 192.0.2.10 or api.example.com' });
+    boundHost = h.toLowerCase();
+  }
+  if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > 500)) return res.status(400).json({ error: 'note: a string of at most 500 characters' });
+  // Re-storing an existing name without a type keeps the type it has (inference is for new secrets only).
+  const storedType = (secret_type === undefined || secret_type === null || secret_type === '')
+    ? (db.prepare('SELECT secret_type FROM blindkey_secrets WHERE did = ? AND name = ?').get(req.identity.did, name) || {}).secret_type : null;
+  const typeChoice = storedType ? { type: storedType, inferred: false } : secretTypes.resolveType(secret_type, value, { username: accountUsername || '' });
+  if (typeChoice.error) return res.status(400).json(typeChoice);
+  // if_absent: refuse instead of overwriting a secret already stored under this name (the app's manual entry sends it).
+  if (if_absent === true && db.prepare(`SELECT 1 FROM blindkey_secrets WHERE did = ? AND name = ? AND status NOT IN ('deleted')`).get(req.identity.did, name)) {
+    return res.status(409).json({ error: `you already have a secret named '${name}' — pick another name, or edit that one`, exists: true });
+  }
   // Browser fill fields. Left out (undefined/null) = keep what a re-store had; [] / '' clear them.
   let resolvedOrigins = null;
   if (origins !== undefined && origins !== null) {
@@ -3177,8 +3225,7 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     return res.status(400).json({ error: 'value exceeds 10KB and appears to be an encoded payload. If this is a legitimate certificate, use secret_type: certificate.' });
   }
 
-  const validTypes = ['api_key', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
-  const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
+  const resolvedType = typeChoice.type;
 
   // Accept optional expiration
   const { expires_in, expires_at: expiresAtRaw } = req.body || {};
@@ -3234,18 +3281,22 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     }
     if (resolvedOrigins !== null) db.prepare('UPDATE blindkey_secrets SET fill_origins = ? WHERE id = ?').run(resolvedOrigins, stored.id);
     if (login !== undefined && login !== null) db.prepare('UPDATE blindkey_secrets SET fill_username = ? WHERE id = ?').run(login, stored.id);
+    if (accountUsername !== null) db.prepare('UPDATE blindkey_secrets SET account_username = ? WHERE id = ?').run(accountUsername, stored.id);
+    if (note !== undefined && note !== null) db.prepare('UPDATE blindkey_secrets SET note = ? WHERE id = ?').run(cleanLabel(note, 500).trim(), stored.id);
 
     // Auto-create a default context so the secret is immediately usable.
     // Without this, secrets stored via the app have no context and can't get tokens.
     // A website login (stored with origins) is for browser fill only: no default ssh_exec/http context to any host.
+    // A host given with the secret binds the default context to that host (ssh) or that site (http), not to every host.
     const existingCtx = db.prepare('SELECT id FROM blindkey_contexts WHERE secret_id = ?').get(stored.id);
     const websiteLogin = browserFill.storedOrigins(db.prepare('SELECT fill_origins FROM blindkey_secrets WHERE id = ?').get(stored.id).fill_origins).length > 0;
     if (!existingCtx && !websiteLogin) {
-      const typeToAction = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
-      const defaultAction = typeToAction[resolvedType] || 'http_header';
+      const defaultAction = secretTypes.defaultAction(resolvedType);
+      const hostPattern = boundHost && defaultAction === 'ssh_exec' ? boundHost.replace(/:\d+$/, '') : '*';
+      const urlPattern = boundHost && ['http_header', 'http_body'].includes(defaultAction) ? `https://${boundHost}/*` : '*';
       db.prepare(
-        "INSERT OR IGNORE INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, 'default', ?, '*', '*', ?)"
-      ).run(stored.id, defaultAction, req.identity.did);
+        "INSERT OR IGNORE INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, 'default', ?, ?, ?, ?)"
+      ).run(stored.id, defaultAction, urlPattern, hostPattern, req.identity.did);
     }
 
     // Buoy ingestion tick — anchor this deposit in the tick chain
@@ -3258,7 +3309,9 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     } catch(_) {}
 
     res.json({
-      ok: true, name, ref: refCode, secret_type: resolvedType, description: description || '',
+      ok: true, name, ref: refCode, secret_type: resolvedType, ...(typeChoice.inferred ? { type_inferred: true } : {}),
+      ...(accountUsername !== null ? { username: accountUsername } : {}), ...(boundHost ? { host: boundHost } : {}),
+      description: description || '',
       provider: providerInfo.provider || null,
       expires_at: expiresAt,
       buoy_tick: buoyTickId,
@@ -3592,8 +3645,7 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
       });
       // If no contexts, derive default capability from secret_type
       if (capabilities.length === 0) {
-        const typeToAction = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
-        capabilities.push(typeToAction[s.secret_type] || 'http_header');
+        capabilities.push(secretTypes.defaultAction(s.secret_type));
       }
       // Opaque handle: first 8 chars of ref_code hash (no name leakage)
       const handle = s.ref_code ? s.ref_code.split('-').pop() : String(s.id);
@@ -3956,7 +4008,8 @@ setInterval(() => {
 // context_id is NULL here, and SQLite's UNIQUE treats NULLs as distinct, so ON CONFLICT never fires for it: the
 // newest row is updated in place and older duplicates are revoked, so one revoke always ends the access.
 function grantAllContextsDelegation(ownerDid, delegateDid, secretId, grantedBy, { maxUses = 0, expiresAt = null } = {}) {
-  const rows = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL ORDER BY id DESC')
+  // Agent rows only: a person's share (declined, revoked or live) is never revived or rewritten from here.
+  const rows = db.prepare("SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL AND COALESCE(delegate_kind, 'agent') = 'agent' ORDER BY id DESC")
     .all(ownerDid, delegateDid, secretId);
   if (!rows.length) {
     return Number(db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
@@ -3968,7 +4021,12 @@ function grantAllContextsDelegation(ownerDid, delegateDid, secretId, grantedBy, 
   return rows[0].id;
 }
 // The action a secret type is used with when the caller names none.
-const DEFAULT_ACTION_BY_TYPE = { api_key: 'http_header', password: 'ssh_exec', token: 'http_header', ssh_key: 'ssh_exec', cert: 'http_header', other: 'http_header' };
+// The action for a caller who names none: the secret's only active context decides when there is one (so a type
+// relabelled later never fights the context it was stored with), else the type's default (secret_types.js).
+function actionWhenUnnamed(secret) {
+  const ctx = db.prepare("SELECT DISTINCT action_type FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
+  return ctx.length === 1 ? ctx[0].action_type : secretTypes.defaultAction(secret.secret_type);
+}
 // Active secrets other owners share with `did` under `name` (latest version per owner).
 function sharedSecretsNamed(did, name) {
   return db.prepare(`SELECT d.owner_did, w.username AS owner_username, MAX(s.ref_code) AS ref_code
@@ -4053,9 +4111,7 @@ function requestUseTokenHandler(req, res) {
     }
 
     // Auto-resolve action from secret_type if not provided
-    if (!action) {
-      action = DEFAULT_ACTION_BY_TYPE[refSecret.secret_type] || 'http_header';
-    }
+    if (!action) action = actionWhenUnnamed(refSecret);
 
     // Auto-resolve context — use the first active context if not provided
     // Do NOT fabricate 'default' if no contexts exist — that causes enforceBlindkeyContext to reject
@@ -4088,8 +4144,9 @@ function requestUseTokenHandler(req, res) {
 
   const callerDid = req.identity.did;
 
-  // Try direct ownership first
-  let secret = resolveLatestBlindkeySecret(callerDid, name);
+  // Try direct ownership first — unless the ref (or the caller) named another owner: then it is that owner's secret
+  // or nothing, never the caller's own secret that happens to share the name.
+  let secret = owner_did && owner_did !== callerDid ? null : resolveLatestBlindkeySecret(callerDid, name);
   let delegation = null;
 
   // Not owned and no owner given: a secret someone shared with the caller under this name.
@@ -4162,7 +4219,7 @@ function requestUseTokenHandler(req, res) {
     if (picked.error) return res.status(400).json(picked);
     contextName = picked.context;
   }
-  if (!action) action = DEFAULT_ACTION_BY_TYPE[secret.secret_type] || 'http_header';
+  if (!action) action = actionWhenUnnamed(secret);
 
   // Validate context using existing enforceBlindkeyContext
   const ctxCheck = enforceBlindkeyContext(secret, contextName, action, target_url || null, target_host || null);
@@ -4274,7 +4331,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
   let { use_token } = req.body || {};
 
   const b = req.body || {};
-  if (!use_token && (b.ref || (b.name && typeof b.name === 'string' && !resolveLatestBlindkeySecret(req.identity.did, b.name)))) {
+  if (!use_token && (b.ref || (b.name && typeof b.name === 'string' && ((b.owner_did && b.owner_did !== req.identity.did) || !resolveLatestBlindkeySecret(req.identity.did, b.name))))) {
     const p = (b.params && typeof b.params === 'object') ? b.params : {};
     const issueReq = Object.create(req);
     issueReq.body = { ref: b.ref, name: b.name, action: b.action, context: b.context, owner_did: b.owner_did,
@@ -4301,6 +4358,18 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     if (!secret) {
       // Don't burn the token — secret is gone but token wasn't the problem
       return res.status(404).json({ error: 'secret referenced by use-token no longer exists or is revoked', token_preserved: true });
+    }
+    // The right to use it is checked again at redemption, not only when the token was issued: a delegation revoked
+    // or expired in between, or a secret that changed owner (transfer) since, ends a token not yet spent.
+    if (tokenRow.delegation_id) {
+      const d = db.prepare('SELECT status, expires_at, delegate_did, owner_did FROM demipass_delegations WHERE id = ?').get(tokenRow.delegation_id);
+      if (!d || d.status !== 'active' || d.delegate_did !== tokenRow.did || d.owner_did !== secret.did || (d.expires_at && new Date(d.expires_at) <= new Date())) {
+        db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
+        return res.status(403).json({ error: 'the delegation behind this use-token is no longer active' });
+      }
+    } else if (secret.did !== tokenRow.did) {
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
+      return res.status(403).json({ error: 'this secret is no longer yours; ask its owner to share it' });
     }
 
     let decryptedValue;
@@ -4356,7 +4425,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         case 'ssh_exec': {
           const { command, target_user, key_name } = action_params;
           if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
-          const effectiveUser = target_user || 'claude';
+          // The user named in the call, else the account the secret was stored for, else the old default.
+          const effectiveUser = target_user || secret.account_username || 'claude';
 
           if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
             logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: 'host not in SSH whitelist', ip: req.ip });
@@ -4980,13 +5050,32 @@ app.get('/api/blindkey/types', (_req, res) => {
   });
 });
 
-// POST /api/blindkey/deposit — carbon deposits a secret into a silicon's vault (admin only)
-// The secret never touches any silicon's context — only the carbon (human) and the server see it.
-app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
-  if (!requireAdminAccess(req, res)) return;
+// The vault a deposit may go into. Admin: any identity. A person: only a silicon of a fleet they own that they made
+// (fleet_silicons, joined_via 'owner') — not fleet_members (anyone can be added there without asking), not an agent
+// that joined through the network (its vault stays its own), never another person (share or transfer instead).
+// Returns { admin } when allowed, { status, error } when not.
+function depositTarget(req, targetDid) {
+  if (ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || req.body?.admin_key || '', ADMIN_API_KEY)) return { admin: true };
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return { status: auth.status || 401, error: auth.error || 'Bearer token or admin key required' };
+  if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) return { status: 403, error: 'only the owner deposits into an agent vault' };
+  const mine = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+      WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND COALESCE(s.joined_via, 'owner') != 'network'`).get(auth.did, targetDid);
+  if (!mine) return { status: 403, error: "you can deposit only into the vault of an agent you made in your fleet — to give a person a secret, share it (POST /api/demipass/shares) or transfer it (POST /api/demipass/transfer)" };
+  return { admin: false };
+}
 
-  const { target_did, target_username, name, value, description, secret_type, metadata, contexts } = req.body || {};
-  if ((!target_did && !target_username) || !name || !value) return res.status(400).json({ error: 'target_did or target_username, plus name and value required' });
+// POST /api/blindkey/deposit — a carbon deposits a secret into one of its silicons' vaults (owner of the fleet, or admin).
+// The secret never touches any silicon's context — only the carbon (human) and the server see it.
+// target_silicon (the SDK's name: username or DID) is accepted for target_did / target_username.
+app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
+  const body = req.body || {};
+  const { name, value, description, secret_type, metadata, contexts } = body;
+  let { target_did, target_username } = body;
+  if (!target_did && !target_username && typeof body.target_silicon === 'string') {
+    if (body.target_silicon.startsWith('did:')) target_did = body.target_silicon; else target_username = body.target_silicon;
+  }
+  if ((!target_did && !target_username) || !name || !value) return res.status(400).json({ error: 'target_did, target_username or target_silicon, plus name and value required' });
   if (target_did && typeof target_did !== 'string') return res.status(400).json({ error: 'target_did: must be a string' });
   if (target_username && typeof target_username !== 'string') return res.status(400).json({ error: 'target_username: must be a string' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
@@ -5003,9 +5092,16 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
   // Verify target DID exists
   const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedTargetDid);
   if (!targetWallet) return res.status(404).json({ error: 'target_did not found' });
+  const dt = depositTarget(req, resolvedTargetDid);
+  if (dt.error) return res.status(dt.status).json({ error: dt.error });
+  // A fleet owner adds to its agent's vault; it never overwrites a secret already there (admin keeps the old upsert).
+  if (!dt.admin && typeof name === 'string' && db.prepare("SELECT 1 FROM blindkey_secrets WHERE did = ? AND name = ? AND status != 'deleted'").get(resolvedTargetDid, name)) {
+    return res.status(409).json({ error: `that agent already has a secret named '${name}' — pick another name` });
+  }
 
-  const validTypes = ['passphrase', 'token', 'api_key', 'ssh_credential', 'multi_string', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
-  const resolvedType = validTypes.includes(secret_type) ? secret_type : 'api_key';
+  const typeChoice = secretTypes.resolveType(secret_type, value);
+  if (typeChoice.error) return res.status(400).json(typeChoice);
+  const resolvedType = typeChoice.type;
 
   try {
     const encrypted = blindkeyEncrypt(value);
@@ -5023,7 +5119,9 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
         updated_at = CURRENT_TIMESTAMP
     `).run(resolvedTargetDid, name, description || '', resolvedType, encrypted, metaJson);
 
-    const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(resolvedTargetDid, name);
+    const inserted = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(resolvedTargetDid, name);
+    let refCode = inserted.ref_code;
+    if (!refCode) { refCode = generateRefCode(resolvedType, name); db.prepare('UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?').run(refCode, inserted.id); }
 
     // Insert contexts if provided
     let contexts_created = 0;
@@ -5031,7 +5129,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
       contexts_created = insertBlindkeyContexts(inserted.id, contexts, 'carbon_deposit');
     }
 
-    res.json({ ok: true, secret_id: inserted.id, name, secret_type: resolvedType, target_did: resolvedTargetDid, contexts_created });
+    res.json({ ok: true, secret_id: inserted.id, ref: refCode, name, secret_type: resolvedType, ...(typeChoice.inferred ? { type_inferred: true } : {}), target_did: resolvedTargetDid, contexts_created });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -5045,7 +5143,6 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
   if (!Array.isArray(secrets) || secrets.length === 0) return res.status(400).json({ error: 'secrets array required' });
   if (secrets.length > 50) return res.status(400).json({ error: 'max 50 secrets per batch' });
 
-  const validTypes = ['passphrase', 'token', 'api_key', 'ssh_credential', 'multi_string', 'oauth_token', 'password', 'signing_key', 'webhook_secret', 'connection_string', 'certificate', 'other'];
   const results = [];
   const errors = [];
 
@@ -5073,15 +5170,19 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
       const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(s.target_did);
       if (!targetWallet) { errors.push({ index: i, error: 'target_did not found' }); continue; }
 
-      const resolvedType = validTypes.includes(s.secret_type) ? s.secret_type : 'api_key';
+      const typeChoice = secretTypes.resolveType(s.secret_type, s.value);
+      if (typeChoice.error) { errors.push({ index: i, error: typeChoice.error, valid_types: typeChoice.valid_types }); continue; }
+      const resolvedType = typeChoice.type;
       try {
         const encrypted = blindkeyEncrypt(s.value);
         const metaJson = s.metadata ? JSON.stringify(s.metadata) : '{}';
         const nameRefused = clearNameForStore(s.target_did, s.name);
         if (nameRefused) { errors.push({ index: i, error: nameRefused }); continue; }
         insertStmt.run(s.target_did, s.name, s.description || '', resolvedType, encrypted, metaJson);
-        const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
-        results.push({ ok: true, secret_id: inserted.id, name: s.name, secret_type: resolvedType, target_did: s.target_did });
+        const inserted = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
+        let refCode = inserted.ref_code;
+        if (!refCode) { refCode = generateRefCode(resolvedType, s.name); db.prepare('UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?').run(refCode, inserted.id); }
+        results.push({ ok: true, secret_id: inserted.id, ref: refCode, name: s.name, secret_type: resolvedType, target_did: s.target_did });
       } catch (e) {
         errors.push({ index: i, error: e.message });
       }
@@ -7549,6 +7650,11 @@ require('./network_routes')({
   app, db, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   barrelGuardedTransfer, transferRefusal: transferBarrelRefusal, sendMail: fleetRoutes.sendMail,
 });
+// Person-to-person shares and ownership transfer (docs/sharing.md).
+const secretSharing = require('./secret_sharing')({
+  app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
+  logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy,
+});
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
   try {
@@ -8962,6 +9068,17 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
 
   // Cannot delegate to yourself
   if (delegate_did === ownerDid) return res.status(400).json({ error: 'cannot delegate a secret to yourself' });
+  // A person in the owner's network gets a share they accept (use-only, expiring), never a live delegation pushed on them.
+  if (secretSharing.isPersonPeer(ownerDid, delegate_did)) {
+    return res.status(409).json({ error: 'that DID is a person in your network — share with them through POST /api/demipass/shares {"secret","to"}; they accept it in their app', use: 'POST /api/demipass/shares' });
+  }
+  // Otherwise a delegation goes to an agent (admin may delegate anywhere): it is live at once, so it is never pushed
+  // onto a person. An agent is an active silicon of some fleet — yours or another owner's (e.g. a partner's agent
+  // using your secret); fleet_silicons rows are made with the agent's consent, fleet_members can be written by
+  // anyone without asking, so it does not count.
+  if (actor.mode !== 'admin' && !secretSharing.isAgentWallet(delegate_did)) {
+    return res.status(403).json({ error: 'a delegation goes to an agent (a silicon in a fleet) — to give a person access, share it (POST /api/demipass/shares); they accept it in their app' });
+  }
 
   // If context_name specified, validate it exists and is active on the secret
   let contextId = null;
@@ -8988,9 +9105,14 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
         ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
           status = 'active', max_uses = excluded.max_uses, use_count = 0,
           granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
+        WHERE COALESCE(demipass_delegations.delegate_kind, 'agent') = 'agent'
       `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
-      delegation = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?')
+      delegation = db.prepare("SELECT id, COALESCE(delegate_kind, 'agent') AS kind FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?")
         .get(ownerDid, delegate_did, secret.id, contextId);
+      // The upsert skips a person's share on the same key; then nothing was granted — say so, write no grant event.
+      if (delegation && delegation.kind === 'person') {
+        return res.status(409).json({ error: 'that person holds a share of this secret for this context — manage it under shares (POST /api/demipass/shares/:id/…)', share_id: delegation.id });
+      }
     }
 
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
@@ -9106,6 +9228,8 @@ app.get('/api/blindkey/delegations', rateLimitStandard, (req, res) => {
     granted_at: d.granted_at,
     revoked_at: d.revoked_at,
     expires_at: d.expires_at,
+    kind: d.delegate_kind || 'agent',
+    ...(d.delegate_kind === 'person' ? { offer_state: d.offer_state, reveal_allowed: Boolean(d.reveal_allowed), via: d.via || 'share' } : {}),
     role: d.owner_did === callerDid ? 'owner' : 'delegate',
   }));
 
@@ -9298,11 +9422,14 @@ function buildAgentMenu(did, { compact = false, auth = null } = {}) {
     waiting = db.prepare(`SELECT r.id, w.username AS owner, r.secret_hint FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.owner_did
                           WHERE r.requester_did = ? AND r.status = 'pending' ORDER BY r.id DESC LIMIT 10`).all(did);
   } catch (_) {}
+  let offers = 0;
+  if (!restricted) try { offers = db.prepare("SELECT COUNT(*) AS n FROM demipass_delegations WHERE delegate_did = ? AND delegate_kind = 'person' AND status = 'suspended' AND offer_state = 'offered' AND (expires_at IS NULL OR expires_at > ?)").get(did, new Date().toISOString()).n; } catch (_) {}
   const menu = {
     your_secrets: own.slice(0, cap).map(s => describe(s)),
     shared_with_you: shared.slice(0, cap).map(s => describe(s, { owner: s.owner_username, ...(s.d_max ? { uses_left: Math.max(0, s.d_max - s.d_used) } : {}), ...(s.d_expires ? { expires_at: s.d_expires } : {}) })),
     can_ask: askable,
     waiting_on: waiting,
+    ...(offers ? { shares_waiting_for_you: `${offers} share${offers === 1 ? '' : 's'} from people in your network wait for you to accept in the DemiPass app (GET /api/demipass/shares)` } : {}),
     calls: MENU_CALLS,
     http_hosts: BLINDKEY_HTTP_HOSTS,
   };
@@ -12741,7 +12868,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access):\d{1,12}$/;   // fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
@@ -13133,6 +13260,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       rotatable: s.rotatable !== 0,
       category: s.category || '',
       labels: parsedLabels,
+      note: s.note || '',
+      username: s.account_username || null,
       security_depth: s.security_depth || 'standard',
       gate_policy: resolveGatePolicy(s),
       use_count: s.use_count,

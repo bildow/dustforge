@@ -1213,6 +1213,32 @@ test('access request card: hostile names stay inert, the owner picks a secret, S
   assert.equal(pg.calls.find(c => c.path === '/api/identity/gate/verify').body.intent, 'access:7');
 });
 
+// ── Shares from people: the recipient's one step is Accept, with their PIN ──
+test('share offer card: hostile names stay inert; Accept walks the PIN gate with intent share-accept:<id>', async () => {
+  const offer = { id: 12, state: 'offered', role: 'recipient', owner: '<img src=x onerror=alert(1)>', recipient: 'kyle',
+    secret: { name: 'x"><b>', ref: 'DP-PWD-racknerd-1', type: 'password' }, note: '</div><script>1</script>', expires_at: '2027-01-01T00:00:00Z' };
+  let accepts = 0;
+  const pg = page({ storage: signedIn, routes: renewRoutes((p) => {
+    if (p === '/api/blindkey/shares') return { json: { ok: true, given: [], received: [offer], waiting_for_you: 1 } };
+    if (p === '/api/blindkey/shares/12/accept') { accepts++; return accepts === 1 ? { status: 403, json: { error: 'pin', missing: ['pin'], required: ['pin'], intent: 'share-accept:12' } } : { json: { ok: true, share: { ...offer, state: 'active' } } }; }
+    if (p === '/api/identity/gate/verify') return { json: { ok: true } };
+  }) });
+  await settle();
+  vm.runInContext('vaultOpen = true;', pg.ctx);
+  await pg.ctx.loadShares();
+  const html = pg.el('share-requests').innerHTML;
+  assert.ok(!html.includes('<img') && !html.includes('<script>') && !html.includes('"><b>'), html);
+  assert.match(html, /shareAct\(12,'accept'\)/);
+  const done = pg.ctx.shareAct(12, 'accept');
+  await settle(10);
+  pg.el('pin-unlock').value = '8765';
+  await pg.ctx.submitPin();
+  await settle(10);
+  await done;
+  assert.equal(accepts, 2);
+  assert.equal(pg.calls.find(c => c.path === '/api/identity/gate/verify').body.intent, 'share-accept:12');
+});
+
 test('another window signed in as a different account: this one signs out, never renews or adopts that session', async () => {
   const pg = page({ storage: { ...signedIn, dp_refresh: 'dpr_mine' }, routes: renewRoutes(p => {
     if (p === '/api/x') return { status: 401, json: { error: 'expired' } };
