@@ -448,7 +448,9 @@
 <div id="modal-approval" class="modal-bg" onclick="if(event.target===this)closeApproval()">
   <div class="modal-sheet" style="text-align:center">
     <h3 id="ap-title">Approve this use?</h3>
-    <div id="ap-what" style="font-size:0.8rem;color:var(--text2);margin-bottom:0.75rem;text-align:left"></div>
+    <div id="ap-what" style="font-size:0.8rem;color:var(--text2);margin-bottom:0.5rem;text-align:left"></div>
+    <div style="font-size:0.65rem;color:var(--text3);text-align:left">Exactly what it will do — approve only this:</div>
+    <pre id="ap-call" style="text-align:left;font-size:0.65rem;max-height:30vh;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:0.5rem;white-space:pre-wrap;word-break:break-all;margin:0.25rem 0 0.75rem"></pre>
     <div id="ap-code" style="font-family:monospace;font-size:2.2rem;letter-spacing:0.3rem;font-weight:700;margin:0.5rem 0">······</div>
     <div id="ap-timer" style="font-size:0.7rem;color:var(--text3)"></div>
     <div style="font-size:0.7rem;color:var(--text3);margin:0.5rem 0 0.75rem">Approve sends this code for you. Read it out only if the agent is waiting in another channel — it works for this request only, for a minute at most.</div>
@@ -1446,7 +1448,7 @@ function renderApprovals(){
     +' <span style="font-size:0.65rem;color:'+(a.depth==='critical'?'var(--red)':'var(--orange)')+'">'+esc(a.depth)+'</span></div>'
     +'<div class="fr-origin">'+esc(a.summary||'')+'</div>'
     +(a.purpose?'<div style="margin-top:0.25rem">“'+esc(a.purpose)+'”</div>':'')
-    +'<div style="color:var(--text3);margin-top:0.25rem">Waits until '+esc(new Date(a.expires_at).toLocaleTimeString())+(a.needs_pin_to_open?' · your PIN opens it':'')+'</div>'
+    +'<div style="color:var(--text3);margin-top:0.25rem">Waits until '+esc(new Date(a.expires_at).toLocaleTimeString())+' · your PIN opens it, then you see the full call</div>'
     +'<div class="fr-row"><button class="btn-primary" onclick="openApproval('+Number(a.id)+')">Open</button><button class="btn-ghost" onclick="denyApproval('+Number(a.id)+')">Deny</button></div></div>').join('');
 }
 // Opens the request screen (critical: apiGated asks for the PIN). Resolves true when approved, false otherwise.
@@ -1467,6 +1469,7 @@ async function refreshApproval(first){
     apOpen.code=d.code;
     document.getElementById('ap-title').textContent=(a.kind==='reveal'?'Reveal ':'Approve ')+(a.secret&&a.secret.name||'')+'?';
     document.getElementById('ap-what').innerHTML='<b>@'+esc(a.requester||'')+'</b>'+(a.requester_label?' ('+esc(a.requester_label)+')':'')+'<br>'+esc(a.summary||'')+(a.purpose?'<br>“'+esc(a.purpose)+'”':'');
+    document.getElementById('ap-call').textContent=a.call?JSON.stringify(a.call,null,1):'';
     document.getElementById('ap-code').textContent=d.code;
     document.getElementById('ap-timer').textContent='code changes at '+new Date(d.code_valid_until).toLocaleTimeString()+' · request ends '+new Date(a.expires_at).toLocaleTimeString();
     return true;

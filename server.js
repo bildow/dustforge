@@ -4441,13 +4441,13 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       // Callers that guessed wrong got a silent empty-body failure that impersonated
       // a bad credential. Normalise once here so every case accepts either shape.
       const action_params = { ...(req.body || {}), ...((req.body || {}).params || {}) };
-      // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call.
+      // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call
+      // (the raw body, top level and params as sent — see use_approvals.js).
       {
         const g = useApprovals.gate(secret, approvalCaller(req),
-          { kind: 'use', action, targetHost: target_host, targetUrl: target_url, params: action_params, delegationId: tokenRow.delegation_id },
+          { kind: 'use', action, targetHost: target_host, targetUrl: target_url, params: req.body || {}, delegationId: tokenRow.delegation_id },
           action_params);
         if (!g.ok) {
-          if (g.status === 202) useApprovals.refundParked(req);
           // The token did not act: retire it, so parked calls never pile up against the concurrent-token limit.
           db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
           return res.status(g.status).json(g.body);
@@ -4515,6 +4515,9 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           let password = decryptedValue;
           if (key_name) {
             const keySecret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, key_name, 'active');
+            if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
+            // The key secret is used as fully as the primary one: one above standard depth would skip its own approval.
+            if (useApprovals.depthOf(keySecret) !== 'standard') return res.status(403).json({ error: `key_name secret '${key_name}' is ${useApprovals.depthOf(keySecret)}: use it directly (its own /use asks for approval), not as key_name` });
             if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
             try {
               password = blindkeyDecrypt(keySecret.encrypted_value);
@@ -4782,12 +4785,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     return res.status(403).json({ error: ctxCheck.error });
   }
   {
-    const directParams = { ...(req.body || {}), ...((req.body || {}).params || {}) };
-    const g = useApprovals.gate(secret, approvalCaller(req), { kind: 'use', action, targetHost, targetUrl, params: directParams }, directParams);
-    if (!g.ok) {
-      if (g.status === 202) useApprovals.refundParked(req);
-      return res.status(g.status).json(g.body);
-    }
+    const g = useApprovals.gate(secret, approvalCaller(req), { kind: 'use', action, targetHost, targetUrl, params: req.body || {} }, req.body || {});
+    if (!g.ok) return res.status(g.status).json(g.body);
   }
 
   let decryptedValue;
@@ -4913,6 +4912,9 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         let password = decryptedValue;
         if (key_name) {
           const keySecret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, key_name, 'active');
+          if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
+          // The key secret is used as fully as the primary one: one above standard depth would skip its own approval.
+          if (useApprovals.depthOf(keySecret) !== 'standard') return res.status(403).json({ error: `key_name secret '${key_name}' is ${useApprovals.depthOf(keySecret)}: use it directly (its own /use asks for approval), not as key_name` });
           if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
           try {
             // Use key_name secret as the password, original secret as supplemental
@@ -5593,6 +5595,10 @@ async function handleRowenDeliver(req, res) {
     return res.status(authorization.status || 500).json({ error: authorization.error });
   }
   const { secret, action, targetUrl, targetHost, contextCheck: ctxCheck } = authorization;
+  // Rowen/conductor deliveries carry no human approval: an elevated or critical secret goes through /use instead.
+  if (useApprovals.depthOf(secret) !== 'standard') {
+    return res.status(403).json({ error: `this secret is ${useApprovals.depthOf(secret)}: each use needs the owner's approval — use POST /api/demipass/use, not a mediated delivery` });
+  }
 
   // Generate the use-token (even though we'll redeem it immediately, it's an audit record)
   const useToken = crypto.randomBytes(32).toString('hex');
@@ -7740,6 +7746,7 @@ require('./network_routes')({
 const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy,
+  approvals: () => useApprovals,   // registered just below
 });
 // Security depth on use: per-use approval requests with request-bound rotating codes (docs/approvals.md).
 const useApprovals = require('./use_approvals')({

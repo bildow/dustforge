@@ -56,6 +56,7 @@ c=sqlite3.connect(sys.argv[1]); k=c.execute('SELECT code_key FROM use_approvals 
 st=int(time.time()//30)+int(sys.argv[3]); m=hmac.new(bytes.fromhex(k), f'dp-approval:{sys.argv[2]}:{st}'.encode(), hashlib.sha256).digest()
 print(str(int.from_bytes(m[:4],'big')%1000000).zfill(6))" "$DB_PATH" "$1" "${2:-0}"; }
 bal(){ Q "SELECT balance_cents FROM identity_wallets WHERE username='$1'"; }
+aopen(){ pin "$A" 4321 "approval-open:$1"; call POST /api/demipass/approvals/$1/open "$A"; }
 A=$(login owner-a); A2=$(login owner-a); AG=$(login owner-a); K=$(login person-k); X=$(login other-x)
 call POST /api/identity/pin "$A" '{"pin":"4321","password":"hunter22"}'; call POST /api/identity/pin "$K" '{"pin":"8765","password":"hunter22"}'
 call POST /api/network/requests "$A" '{"to":"person-k","as":"person"}'; R=$(echo "$BODY" | J request.id); call POST /api/network/requests/$R/accept "$K"
@@ -72,15 +73,17 @@ B0=$(bal owner-a)
 call POST /api/demipass/use "$AG" "$(USE deploy "" "" "deploy the site")"
 AP=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = approval_pending ] && [ -n "$AP" ] && echo "$BODY" | grep -q "Park this task" && ok "elevated: the first /use parks — 202 approval_pending, request $AP, told to park" || fail "park: $CODE $BODY"
-[ "$(bal owner-a)" = "$B0" ] && ok "a parked /use is refunded (charged only when it acts)" || fail "refund: $B0 → $(bal owner-a)"
-[ "$(Q "SELECT summary FROM use_approvals WHERE id=$AP")" = "http_header https://repo.dustroot.com/deploy" ] && [ "$(Q "SELECT purpose FROM use_approvals WHERE id=$AP")" = "deploy the site" ] && ok "the request names the exact call and the purpose" || fail "summary: $(Q "SELECT summary||' | '||purpose FROM use_approvals WHERE id=$AP")"
+[ "$(bal owner-a)" = "$((B0-10))" ] && ok "a parked /use is charged like any /use (10 DD; no refund, so the DD ledger stays whole)" || fail "charge: $B0 → $(bal owner-a)"
+[ "$(Q "SELECT summary FROM use_approvals WHERE id=$AP")" = "http_header https://repo.dustroot.com/deploy" ] && [ "$(Q "SELECT json_extract(bound_call,'$.body.params.url') FROM use_approvals WHERE id=$AP")" = "https://repo.dustroot.com/deploy" ] && [ "$(Q "SELECT purpose FROM use_approvals WHERE id=$AP")" = "deploy the site" ] && ok "the request names the exact call and the purpose" || fail "summary: $(Q "SELECT summary||' | '||purpose FROM use_approvals WHERE id=$AP")"
 [ -n "$(Q "SELECT notified_at FROM use_approvals WHERE id=$AP")" ] && ok "the owner was notified (mail: an approval is pending, nothing else)" || fail "notify"
 call POST /api/demipass/use "$AG" "$(USE deploy)"; [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J approval_id)" = "$AP" ] && ok "the same call again returns the same request (no pile of requests)" || fail "dedupe: $CODE $BODY"
 call POST /api/demipass/use "$AG" "$(USE deploy "$AP")"; [ "$CODE" = 202 ] && ok "with approval_id but no approval yet → still 202, no new request" || fail "pending w/ id: $CODE"
 call POST /api/demipass/use "$AG" "$(USE deploy "$AP" 123456)"; [ "$CODE" = 409 ] && echo "$BODY" | grep -q "not opened" && ok "before the owner opens it no code exists (409)" || fail "pre-open code: $CODE $BODY"
 call GET /api/demipass/approvals "$A"; [ "$(echo "$BODY" | J incoming.0.id)" = "$AP" ] && ! echo "$BODY" | grep -q '"code"' && ok "the owner's app lists it (no code in the list)" || fail "list: $BODY"
 call POST /api/demipass/approvals/$AP/open "$X"; [ "$CODE" = 404 ] && ok "another wallet cannot open it" || fail "X open: $CODE"
-call POST /api/demipass/approvals/$AP/open "$A"; C1=$(echo "$BODY" | J code)
+call POST /api/demipass/approvals/$AP/open "$AG"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "approval-open:$AP" ] && ok "an agent signed in as the owner cannot open it: the PIN opens every request (elevated too)" || fail "agent open: $CODE $BODY"
+aopen $AP; C1=$(echo "$BODY" | J code)
+[ "$(echo "$BODY" | J approval.call.body.params.url)" = "https://repo.dustroot.com/deploy" ] && ok "the screen shows the full bound call, not only a summary" || fail "call shown: $BODY"
 [ "$CODE" = 200 ] && [[ $C1 =~ ^[0-9]{6}$ ]] && [ "$C1" = "$(codeat $AP 0)" ] && ok "opening the screen starts a 6-digit code bound to request $AP" || fail "open: $CODE $BODY"
 WRONG=$( [ "$C1" = 000000 ] && echo 111111 || echo 000000 )
 call POST /api/demipass/use "$AG" "$(USE deploy "$AP" $WRONG)"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J attempts_left)" = 2 ] && ok "a wrong code → 403, 2 tries left" || fail "wrong1: $CODE $BODY"
@@ -93,14 +96,15 @@ call POST /api/demipass/use "$AG" "$(USE deploy "$AP" "$(codeat $AP 0)")"; [ "$C
 # Approve path: the app sends the code; the agent then acts once with only the approval_id
 call POST /api/demipass/use "$AG" "$(USE build)"; AP2=$(echo "$BODY" | J approval_id)
 call POST /api/demipass/approvals/$AP2/approve "$A" "$(jbody code 000000)"; [ "$CODE" = 409 ] && ok "Approve before opening → 409" || fail "approve unopened: $CODE"
-call POST /api/demipass/approvals/$AP2/open "$A"; CC=$(echo "$BODY" | J code)
+aopen $AP2; CC=$(echo "$BODY" | J code)
+call POST /api/demipass/approvals/$AP2/approve "$AG" "$(jbody code "$CC")"; [ "$CODE" = 403 ] && ok "Approve only from the session that opened it with the PIN (an agent's token cannot)" || fail "agent approve: $CODE $BODY"
 call POST /api/demipass/approvals/$AP2/approve "$A" "$(jbody code "$CC")"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J approval.status)" = approved ] && ok "Approve (code sent by the app, nobody typed it)" || fail "approve: $CODE $BODY"
 call POST /api/demipass/use "$AG" "$(USE build "$AP")"; [ "$CODE" = 404 ] || [ "$CODE" = 409 ] || [ "$CODE" = 410 ] && ok "another request's id does not open this call" || fail "cross id: $CODE"
 call POST /api/demipass/use "$AG" "$(USE build "$AP2" "$C1")"; [ "$CODE" = 200 ] && ok "after Approve the next /use acts (a stray code field is ignored once approved)" || fail "approved use: $CODE $BODY"
 call POST /api/demipass/use "$AG" "$(USE build "$AP2")"; [ "$CODE" = 410 ] && ok "…once" || fail "approved reuse: $CODE"
 
 # three wrong codes cancel; deny; expiry
-call POST /api/demipass/use "$AG" "$(USE c3)"; AP3=$(echo "$BODY" | J approval_id); call POST /api/demipass/approvals/$AP3/open "$A"; G=$(echo "$BODY" | J code)
+call POST /api/demipass/use "$AG" "$(USE c3)"; AP3=$(echo "$BODY" | J approval_id); aopen $AP3; G=$(echo "$BODY" | J code)
 BAD=$( [ "$G" = 999999 ] && echo 888888 || echo 999999 )
 for i in 1 2 3; do call POST /api/demipass/use "$AG" "$(USE c3 "$AP3" $BAD)"; done
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J cancelled)" = True ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP3")" = cancelled ] && ok "three wrong codes cancel the request" || fail "cancel: $CODE $BODY"
@@ -112,6 +116,22 @@ call POST /api/demipass/use "$AG" "$(USE ex)"; AP5=$(echo "$BODY" | J approval_i
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE use_approvals SET expires_at='2020-01-01T00:00:00Z' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$AP5"
 call POST /api/demipass/use "$AG" "$(USE ex "$AP5")"; [ "$CODE" = 410 ] && ok "after 5 minutes a request expires" || fail "expire: $CODE $BODY"
 
+# the raw body is bound: an extra top-level field (e.g. a command a path reads from the top level) → 409
+call POST /api/demipass/use "$AG" "$(USE raw)"; RW=$(echo "$BODY" | J approval_id); aopen $RW; call POST /api/demipass/approvals/$RW/approve "$A" "$(jbody code "$(echo "$BODY" | J code)")"
+call POST /api/demipass/use "$AG" "$(jbody ref "$REF" params '{"url":"https://repo.dustroot.com/raw","method":"GET"}' command "cat /etc/shadow" approval_id "$RW")"
+[ "$CODE" = 409 ] && ok "a field added outside params (top level) breaks the binding → 409" || fail "raw binding: $CODE $BODY"
+call POST /api/demipass/use "$AG" "$(jbody ref "$REF" params '{"url":"https://repo.dustroot.com/raw","method":"DELETE"}' approval_id "$RW")"
+[ "$CODE" = 409 ] && ok "another method → 409" || fail "method binding: $CODE"
+call POST /api/demipass/use "$AG" "$(USE raw "$RW")"; [ "$CODE" = 200 ] && ok "the exact approved call acts" || fail "raw exact: $CODE $BODY"
+# key_name may not bring in an elevated secret through a standard one
+call POST /api/demipass/store "$A" '{"name":"std-pw","value":"zzzzstdpw1","secret_type":"password","username":"root","host":"100.83.112.88"}'
+call POST /api/demipass/use "$AG" '{"name":"std-pw","action":"ssh_exec","target_host":"100.83.112.88","target_user":"root","command":"id","key_name":"forge-token"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "key_name secret 'forge-token' is elevated" && ok "an elevated secret cannot ride in as key_name of a standard one" || fail "key_name: $CODE $BODY"
+# per-requester cap
+for i in 1 2 3 4 5 6; do call POST /api/demipass/use "$AG" "$(USE cap$i)"; done
+[ "$CODE" = 429 ] && ok "at most 5 requests per requester wait on an owner (the 6th → 429)" || fail "cap: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE use_approvals SET status='expired' WHERE status='pending'\"); c.commit()" "$DB_PATH"
+
 # shares inherit the depth
 pin "$A" 4321 "share:$SID"; call POST /api/demipass/shares "$A" '{"secret":"forge-token","to":"person-k"}'; SH=$(echo "$BODY" | J share.id)
 pin "$K" 8765 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$K"
@@ -119,7 +139,7 @@ call POST /api/demipass/use "$K" "$(USE kuse)"; KP=$(echo "$BODY" | J approval_i
 [ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$KP")" = "$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")" ] && ok "K's /use on A's elevated secret parks on A's approval (depth inherited)" || fail "share inherit: $CODE $BODY"
 call POST /api/demipass/gate-policy "$K" "$(jbody ref "$REF" security_depth standard)"; [ "$CODE" = 404 ] && ok "K cannot lower A's depth" || fail "K lower: $CODE"
 call POST /api/demipass/approvals/$KP/open "$K"; [ "$CODE" = 404 ] && ok "K cannot open (approve) its own request" || fail "K self-open: $CODE"
-call POST /api/demipass/approvals/$KP/open "$A"; call POST /api/demipass/approvals/$KP/approve "$A" "$(jbody code "$(echo "$BODY" | J code)")"
+aopen $KP; call POST /api/demipass/approvals/$KP/approve "$A" "$(jbody code "$(echo "$BODY" | J code)")"
 call POST /api/demipass/use "$AG" "$(USE kuse "$KP")"; [ "$CODE" = 404 ] && ok "nobody else can spend K's approval" || fail "steal: $CODE"
 call POST /api/demipass/use "$K" "$(USE kuse "$KP")"; [ "$CODE" = 200 ] && ok "K's /use acts after A approves" || fail "K approved: $CODE $BODY"
 call GET /api/demipass/approvals "$K"; [ "$(echo "$BODY" | J outgoing.0.status)" = used ] && ok "K's account shows its request (audit on the requester's side)" || fail "K audit: $BODY"

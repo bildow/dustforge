@@ -26,7 +26,11 @@ const MAX_PENDING_PER_OWNER = 30;
 const MAIL_PER_OWNER_PER_HOUR = 20;
 const DEPTHS = new Set(['elevated', 'critical']);
 // Keys that steer the approval itself, never part of what it binds.
-const META_KEYS = new Set(['use_token', 'ref', 'name', 'owner_did', 'approval_id', 'approval_code', 'purpose', 'params', 'admin_key']);
+// The raw request body is bound as sent (top level and `params` both, never a merged view — /use paths read from
+// either), minus only the per-call token and these steering fields.
+const META_KEYS = new Set(['use_token', 'approval_id', 'approval_code', 'purpose', 'admin_key']);
+const MAX_BOUND_JSON = 4096;      // a call the owner cannot read in full is not offered for approval
+const MAX_PENDING_PER_REQUESTER = 5;
 
 module.exports = function registerUseApprovals(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
@@ -53,8 +57,10 @@ module.exports = function registerUseApprovals(deps) {
     approved_at TEXT, approved_via TEXT,
     used_at TEXT, decided_at TEXT,
     wrong_codes INTEGER DEFAULT 0,
-    notified_at TEXT
+    notified_at TEXT,
+    bound_call TEXT DEFAULT ''
   )`);
+  try { db.exec("ALTER TABLE use_approvals ADD COLUMN bound_call TEXT DEFAULT ''"); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_owner ON use_approvals(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_requester ON use_approvals(requester_did, status)');
 
@@ -76,17 +82,21 @@ module.exports = function registerUseApprovals(deps) {
     return v;
   }
   // What an approval binds: this secret, this action, this target, these exact parameters (the command, the body).
-  function bindingOf({ secretId, kind = 'use', action = '', targetHost = '', targetUrl = '', params = {} }) {
+  function boundCall({ kind = 'use', action = '', targetHost = '', targetUrl = '', params = {} }) {
     const p = {};
     for (const [k, v] of Object.entries(params || {})) if (!META_KEYS.has(k)) p[k] = v;
-    return crypto.createHash('sha256').update(JSON.stringify(canonical({ secretId, kind, action, targetHost: targetHost || '', targetUrl: targetUrl || '', params: p }))).digest('hex');
+    return canonical({ kind, action, target_host: targetHost || '', target_url: targetUrl || '', body: p });
   }
+  function bindingOf({ secretId, ...use }) {
+    return crypto.createHash('sha256').update(JSON.stringify({ secretId, call: boundCall(use) })).digest('hex');
+  }
+  // A one-line headline for the card. The owner approves the full bound call (`call`, shown as JSON), never this alone.
   function summaryOf({ kind, action, targetHost, targetUrl, params }) {
     if (kind === 'reveal') return 'reveal the value';
     const p = params || {};
-    const what = action === 'ssh_exec' ? `ssh ${p.target_user ? p.target_user + '@' : ''}${targetHost || ''}: ${String(p.command || '').slice(0, 160)}${p.sudo ? ` (sudo${p.sudo === 'password' ? ' with password' : ''})` : ''}`
-      : `${action} ${targetUrl || targetHost || ''}`;
-    return cleanLabel(what, 240);
+    const cmd = (p.params && p.params.command) || p.command || '';
+    const what = action === 'ssh_exec' ? `ssh ${targetHost || ''}: ${JSON.stringify(String(cmd)).slice(1, -1)}` : `${action} ${targetUrl || targetHost || ''}`;
+    return cleanLabel(what, 120) + (what.length > 120 ? ' …(see the full call)' : '');
   }
 
   // ── codes ──────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -114,8 +124,9 @@ module.exports = function registerUseApprovals(deps) {
       secret: { name: s.name || null, ref: s.ref_code || null },
       owner: usernameOf(row.owner_did), requester: usernameOf(row.requester_did), requester_label: row.requester_label || null,
       purpose: row.purpose || '', summary: row.summary || '',
+      ...(owner ? { call: row.bound_call ? JSON.parse(row.bound_call) : null } : {}),
       created_at: row.created_at, expires_at: row.expires_at,
-      ...(owner ? { opened: Boolean(row.opened_at), needs_pin_to_open: row.depth === 'critical' } : {}),
+      ...(owner ? { opened: Boolean(row.opened_at), needs_pin_to_open: true } : {}),
       ...(row.approved_at ? { approved_at: row.approved_at, approved_via: row.approved_via } : {}),
       ...(row.used_at ? { used_at: row.used_at } : {}), ...(row.wrong_codes ? { wrong_codes: row.wrong_codes } : {}),
     };
@@ -134,13 +145,17 @@ module.exports = function registerUseApprovals(deps) {
         text: 'An approval is pending in your DemiPass app.\n\nhttps://demipass.com/app\n' })).catch(() => {});
     } catch (_) {}
   }
-  function createRequest({ secret, kind, requesterDid, label, delegationId, purpose, binding, summary }) {
+  function createRequest({ secret, kind, requesterDid, label, delegationId, purpose, binding, summary, call }) {
+    const callJson = JSON.stringify(call);
+    if (Buffer.byteLength(callJson) > MAX_BOUND_JSON) return { error: `this call is too large to show the owner in full for approval (${Buffer.byteLength(callJson)} bytes > ${MAX_BOUND_JSON}); send a smaller one`, status: 413 };
+    const mine = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'pending'").get(requesterDid, secret.did).n;
+    if (mine >= MAX_PENDING_PER_REQUESTER) return { error: `you already have ${mine} requests waiting on this owner; wait for them`, status: 429 };
     const pending = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending'").get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
     const id = Number(db.prepare(`INSERT INTO use_approvals (kind, secret_id, owner_did, requester_did, requester_label, delegation_id, depth, purpose, summary,
-                                  binding, code_key, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+                                  binding, code_key, created_at, expires_at, bound_call) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),
-           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(TTL_SEC)).lastInsertRowid);
+           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(TTL_SEC), callJson).lastInsertRowid);
     const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id);
     event('approval_requested', requesterDid, secret.id, { approval_id: id, kind, owner_did: secret.did, depth: row.depth, summary });
     logSecurityEvent('approval_requested', 'info', { caller_did: requesterDid, capability: kind, target: secret.name, context: { approval_id: id, owner_did: secret.did } });
@@ -205,7 +220,8 @@ module.exports = function registerUseApprovals(deps) {
       .get(caller.did, secret.id, binding);
     if (same) return { status: 202, body: pendingReply(same, caller.did, { already_pending: true, ...(same.status === 'approved' ? { approved: true } : {}) }) };
     const made = createRequest({ secret, kind, requesterDid: caller.did, label: caller.label, delegationId: use.delegationId, purpose: body.purpose,
-      binding, summary: summaryOf({ kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params }) });
+      binding, call: boundCall({ kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params }),
+      summary: summaryOf({ kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params }) });
     if (made.error) return { status: made.status, body: { error: made.error } };
     return { status: 202, body: pendingReply(made.row, caller.did) };
   }
@@ -256,7 +272,10 @@ module.exports = function registerUseApprovals(deps) {
     const row = ownRow(req, res, auth); if (!row) return;
     if (row.status !== 'pending') return res.status(409).json({ error: `this request is ${row.status}`, approval: view(row, auth.did) });
     const session = gateSession(auth);
-    if (row.depth === 'critical' && row.opened_session !== session) {
+    // The PIN opens every request screen, at every depth: it is the one factor an agent signed in as the owner
+    // (device login, refreshed token) never holds, so it is what makes the approval a person's. (When the app's
+    // dormancy lock lands, its unlock can stand in for elevated; critical keeps asking.)
+    if (row.opened_session !== session) {
       const intent = `approval-open:${row.id}`;
       if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('approval-open', ['pin'], ['pin'], intent));
       const refused = spendSingleUse(auth.did, 'approval-open', ['pin'], auth, intent);
@@ -279,8 +298,8 @@ module.exports = function registerUseApprovals(deps) {
     const row = ownRow(req, res, auth); if (!row) return;
     if (row.status !== 'pending') return res.status(409).json({ error: `this request is ${row.status}` });
     if (!row.opened_at) return res.status(409).json({ error: 'open the request first' });
-    // A critical request is approved only from the session that opened it with the PIN.
-    if (row.depth === 'critical' && row.opened_session !== gateSession(auth)) return res.status(403).json({ error: 'open this request with your PIN in this session first' });
+    // Approved only from the session that opened it with the PIN.
+    if (row.opened_session !== gateSession(auth)) return res.status(403).json({ error: 'open this request with your PIN in this session first' });
     if (!codeMatches(row, String((req.body || {}).code || ''))) return res.status(409).json({ error: 'the code on the screen has rotated; try again' });
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
       .run(nowIso(), nowIso(), later(TTL_SEC), row.id).changes;
@@ -301,13 +320,5 @@ module.exports = function registerUseApprovals(deps) {
     res.json({ ok: true, approval: view(db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(row.id), auth.did) });
   });
 
-  // A /use that parks owes nothing: the call that is approved later is the one charged.
-  function refundParked(req) {
-    try {
-      const b = req.billing;
-      if (b && b.deducted > 0 && billing && billing.creditBalance) billing.creditBalance(db, b.payer_did || b.did, b.deducted, 'use_approval_parked', 'refund: /use parked for approval');
-    } catch (e) { console.error('[approvals] refund failed:', e.message); }
-  }
-
-  return { gate, depthOf, bindingOf, refundParked, _codeAt: codeAt, STEP_SEC, TTL_SEC };
+  return { gate, depthOf, bindingOf, _codeAt: codeAt, STEP_SEC, TTL_SEC };
 };
