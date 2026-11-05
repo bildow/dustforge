@@ -73,11 +73,23 @@ function sudoWrap(command, mode) {
   if (mode === 'password') return `IFS= read -r DP_SUDO_PW; printf '%s\\n' "$DP_SUDO_PW" | sudo -S -v -p '' 2>/dev/null; unset DP_SUDO_PW; sudo -n -- ${command}; exit $?`;
   return `sudo -n -- ${command}`;
 }
-function sudoRefusal(sudo, { owner, keyName }) {
+// A token that acts for an agent, not for the person: a fleet worker token, or a token a fleet owner minted for an
+// agent wallet. Read from the claims /use's middleware verified (req.identity), whatever the scope —
+// getBearerIdentity drops the claims of a below-transact token, which would read a write-scope worker as a person.
+function agentToken(req) {
+  const d = (req.identity && req.identity.decoded) || {};
+  return Boolean(d.wrk || d.auth_method === 'worker' || d.auth_method === 'fleet_owner_mint');
+}
+function sudoRefusal(sudo, { owner, keyName, secretId }) {
   if (sudo === undefined || sudo === false) return null;
   if (sudo !== true && sudo !== 'password') return "sudo: true (sudo -n, no password sent) or 'password' (owner only)";
   if (sudo === 'password' && !owner) return "sudo:'password' is for the secret's owner, in their own session — a delegate or agent token can use sudo:true where the host allows it without a password";
   if (sudo === 'password' && keyName) return "sudo:'password' needs the account password: use it without key_name";
+  // Anyone holding access to the account can write its shell startup files, and those run before the password is
+  // read: while the secret is delegated or shared, someone else could have planted a hook for the owner's call.
+  if (sudo === 'password' && secretId && db.prepare("SELECT 1 FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended')").get(secretId)) {
+    return "sudo:'password' is refused while this secret is delegated or shared (another holder could capture the password from the account's startup files) — revoke those first, or use sudo:true with a NOPASSWD rule";
+  }
   return null;
 }
 function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } = {}) {
@@ -4451,9 +4463,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           // content never has to be quoted into a shell command.
           if (stdin !== undefined && (typeof stdin !== 'string' || Buffer.byteLength(stdin) > 65536)) return res.status(400).json({ error: 'stdin: a string of at most 64 KiB' });
           {
-            const a = getBearerIdentity(req);
-            const owner = !tokenRow.delegation_id && secret.did === req.identity.did && !a.silicon && !(a.decoded && a.decoded.wrk);
-            const why = sudoRefusal(sudo, { owner, keyName: key_name });
+            const owner = !tokenRow.delegation_id && secret.did === req.identity.did && !agentToken(req);
+            const why = sudoRefusal(sudo, { owner, keyName: key_name, secretId: secret.id });
             if (why) return res.status(sudo === true || sudo === 'password' ? 403 : 400).json({ error: why });
           }
           // The user named in the call, else the account the secret was stored for, else the old default.
@@ -4831,8 +4842,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         if (stdin !== undefined && (typeof stdin !== 'string' || Buffer.byteLength(stdin) > 65536)) return res.status(400).json({ error: 'stdin: a string of at most 64 KiB' });
         {
           // Direct mode only ever runs the caller's own secret (looked up by its DID).
-          const a = getBearerIdentity(req);
-          const why = sudoRefusal(sudo, { owner: !a.silicon && !(a.decoded && a.decoded.wrk), keyName: key_name });
+          const why = sudoRefusal(sudo, { owner: !agentToken(req), keyName: key_name, secretId: secret.id });
           if (why) return res.status(sudo === true || sudo === 'password' ? 403 : 400).json({ error: why });
         }
 

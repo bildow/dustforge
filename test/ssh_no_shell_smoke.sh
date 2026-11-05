@@ -132,6 +132,9 @@ C=$(huse '{"ref":"'$BOXREF'","action":"ssh_exec","target_host":"100.83.112.88","
 [ "$C" = 403 ] && grep -q "for the secret's owner" "$S/use.json" && [ ! -e "$S/sudo.pw" ] && ok "a delegate asking for sudo:'password' → 403, no password sent" || fail "delegate password: $C $(cat "$S/use.json")"
 C=$(huse '{"ref":"'$BOXREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":true,"stdin":"d"}')
 [ "$C" = 200 ] && [ ! -e "$S/sudo.pw" ] && ok "a delegate may use sudo:true (no password sent; the host's NOPASSWD rules decide)" || fail "delegate true: $C $(cat "$S/use.json")"
+rm -f "$S/sudo.pw"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password"}')
+[ "$C" = 403 ] && grep -q "delegated or shared" "$S/use.json" && [ ! -e "$S/sudo.pw" ] && ok "while the secret is delegated, even the owner's sudo:'password' is refused (a holder could have planted a hook)" || fail "owner password while delegated: $C $(cat "$S/use.json")"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"yes"}'); [ "$C" = 400 ] && ok "sudo must be true or 'password'" || fail "sudo type: $C"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password","key_name":"k"}'); [ "$C" = 403 ] && ok "sudo:'password' with key_name refused" || fail "sudo key_name: $C"
 BIG=$(python3 -c 'print("x"*70000)'); C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"target_user\":\"deploy\",\"command\":\"cat\",\"stdin\":\"$BIG\"}"); [ "$C" = 400 ] && ok "stdin over 64 KiB refused" || fail "big stdin: $C"
