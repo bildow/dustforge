@@ -4423,8 +4423,14 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         case 'ssh_exec': {
-          const { command, target_user, key_name } = action_params;
+          const { command, target_user, key_name, sudo, stdin } = action_params;
           if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
+          // sudo:true — run the command with sudo, the stored password typed to sudo on stdin (never in a command
+          // string, never seen by the caller). stdin — text the command reads after that (e.g. `tee -a FILE`), so
+          // content never has to be quoted into a shell command.
+          if (sudo !== undefined && typeof sudo !== 'boolean') return res.status(400).json({ error: 'sudo: true or false' });
+          if (stdin !== undefined && (typeof stdin !== 'string' || Buffer.byteLength(stdin) > 65536)) return res.status(400).json({ error: 'stdin: a string of at most 64 KiB' });
+          if (sudo && key_name) return res.status(400).json({ error: 'sudo needs the account password: use it without key_name' });
           // The user named in the call, else the account the secret was stored for, else the old default.
           const effectiveUser = target_user || secret.account_username || 'claude';
 
@@ -4459,8 +4465,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
 
           try {
-            // No local shell: see sshRun.
-            const output = sshRun(effectiveUser, target_host, password, command);
+            // No local shell: see sshRun. With sudo, sudo -S reads the password as stdin's first line (-p '' keeps
+            // its prompt out of the output) and the command gets whatever follows.
+            const remote = sudo ? `sudo -S -p '' -- ${command}` : command;
+            const input = sudo ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+            const output = sshRun(effectiveUser, target_host, password, remote, { input });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
@@ -4789,10 +4798,14 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       case 'ssh_exec': {
         // SSH into a whitelisted host using stored credentials and run a command
         // The credentials NEVER appear in the response
-        const { target_host, target_user, command, key_name } = req.body;
+        const { target_host, target_user, command, key_name, sudo, stdin } = req.body;
         if (!target_host || !target_user || !command) {
           return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
         }
+        // sudo / stdin: as in use-token mode (see there).
+        if (sudo !== undefined && typeof sudo !== 'boolean') return res.status(400).json({ error: 'sudo: true or false' });
+        if (stdin !== undefined && (typeof stdin !== 'string' || Buffer.byteLength(stdin) > 65536)) return res.status(400).json({ error: 'stdin: a string of at most 64 KiB' });
+        if (sudo && key_name) return res.status(400).json({ error: 'sudo needs the account password: use it without key_name' });
 
         // Host whitelist check
         if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
@@ -4846,7 +4859,9 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         try {
           // No local shell: see sshRun.
-          const output = sshRun(target_user, target_host, password, command);
+          const remote = sudo ? `sudo -S -p '' -- ${command}` : command;
+          const input = sudo ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+          const output = sshRun(target_user, target_host, password, remote, { input });
 
           // Redact any echo of credentials in the output
           const redactedOutput = output

@@ -19,11 +19,13 @@ cat >"$S/bin/sshpass" <<'SH'
 #!/bin/bash
 echo "ARGV $*" >>"$FAKE_DIR/ssh.log"; echo "SSHPASS_SET ${SSHPASS:+yes}" >>"$FAKE_DIR/ssh.log"
 last="${@: -1}"
-if [ "$last" = "bash -s" ]; then PATH=$FAKE_DIR/remote:$PATH bash -s; else bash -c "$last"; fi
+if [ "$last" = "bash -s" ]; then PATH=$FAKE_DIR/remote:$PATH bash -s; else PATH=$FAKE_DIR/remote:$PATH bash -c "$last"; fi
 SH
 cat >"$S/remote/sudo" <<'SH'
 #!/bin/bash
-read -r pw; printf '%s' "$pw" >"$FAKE_DIR/sudo.pw"; shift; exec "$@"
+read -r pw; printf '%s' "$pw" >"$FAKE_DIR/sudo.pw"
+while [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do case "$1" in --) shift; break;; -p) shift 2;; *) shift;; esac; done
+exec "$@"
 SH
 cat >"$S/remote/chpasswd" <<'SH'
 #!/bin/bash
@@ -83,6 +85,17 @@ C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.
 [ "$C" = 400 ] && [ ! -e "$MARK" ] && [ ! -s "$S/ssh.log" ] && ok "command starting with - refused (400), ssh never ran" || fail "leading-dash command: $C $(cat "$S/use.json")"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo hi"}')
 grep -q '^ARGV -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -- deploy@100.83.112.88 echo hi$' "$S/ssh.log" && ok "ssh gets -- before user@host" || fail "ssh argv: $(cat "$S/ssh.log") ($C)"
+# sudo + stdin: the stored password reaches sudo on stdin (never argv); the command reads the rest of stdin
+: >"$S/ssh.log"; rm -f "$S/sudo.pw"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":true,"stdin":"relay block $(touch /tmp/never) `x` \"q\"\n"}')
+OUT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["stdout"])' "$S/use.json" 2>/dev/null)
+[ "$C" = 200 ] && [ "$(cat "$S/sudo.pw" 2>/dev/null)" = "$NEW" ] && [ "$OUT" = 'relay block $(touch /tmp/never) `x` "q"' ] && [ ! -e /tmp/never ] && ok "sudo:true — the password reaches sudo on stdin, the command gets the stdin text untouched" || fail "sudo stdin: $C $(cat "$S/use.json") pw=$(cat "$S/sudo.pw" 2>/dev/null | head -c 3)…"
+grep -qF -- "-- deploy@100.83.112.88 sudo -S -p '' -- cat" "$S/ssh.log" && ! grep -qF -- "$NEW" "$S/ssh.log" && ok "remote command is sudo -S -p '' -- cat; no password in argv" || fail "sudo argv: $(cat "$S/ssh.log")"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","stdin":"plain text"}')
+[ "$C" = 200 ] && grep -q '"stdout":"plain text"' "$S/use.json" && ok "stdin without sudo reaches the command" || fail "stdin: $C $(cat "$S/use.json")"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"yes"}'); [ "$C" = 400 ] && ok "sudo must be a boolean" || fail "sudo type: $C"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":true,"key_name":"k"}'); [ "$C" = 400 ] && ok "sudo with key_name refused" || fail "sudo key_name: $C"
+BIG=$(python3 -c 'print("x"*70000)'); C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"target_user\":\"deploy\",\"command\":\"cat\",\"stdin\":\"$BIG\"}"); [ "$C" = 400 ] && ok "stdin over 64 KiB refused" || fail "big stdin: $C"
 C=$(rot '{"ref":"DP-PWD-nul-0001","target_host":"100.83.112.88","target_user":"deploy"}')
 grep -q 'tail' "$S/last.json" && fail "a stored password leaked into the error: $(cat "$S/last.json")" || ok "a password ssh can't take is refused without echoing it ($C)"
 C=$(rot '{"ref":"DP-PWD-box-0001","target_host":"10.9.9.9"}'); grep -q '100\.' "$S/last.json" && fail "403 lists whitelisted hosts" || ok "a refused host doesn't learn the whitelist"
