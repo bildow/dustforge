@@ -90,7 +90,7 @@ module.exports = function registerUseApprovals(deps) {
     if (bad) return `the call carries a '${bad}' key — not accepted on an elevated/critical secret`;
     const p = body && body.params;
     if (p && typeof p === 'object' && !Array.isArray(p)) {
-      for (const k of Object.keys(p)) if (k in body && k !== 'params' && JSON.stringify(canonical(body[k])) !== JSON.stringify(canonical(p[k]))) {
+      for (const k of Object.keys(p)) if (Object.prototype.hasOwnProperty.call(body, k) && k !== 'params' && JSON.stringify(canonical(body[k])) !== JSON.stringify(canonical(p[k]))) {
         return `ambiguous call: '${k}' differs between the top level and params — send it once (or the same in both)`;
       }
     }
@@ -163,8 +163,12 @@ module.exports = function registerUseApprovals(deps) {
   function createRequest({ secret, kind, requesterDid, label, delegationId, purpose, binding, summary, call }) {
     const callJson = JSON.stringify(call);
     if (Buffer.byteLength(callJson) > MAX_BOUND_JSON) return { error: `this call is too large to show the owner in full for approval (${Buffer.byteLength(callJson)} bytes > ${MAX_BOUND_JSON}); send a smaller one`, status: 413 };
-    // Per requester and agent label: an owner's own agents all request as the owner's DID, each gets its own 5.
-    const mine = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND requester_label = ? AND status = 'pending'").get(requesterDid, secret.did, cleanLabel(label || '', 80)).n;
+    // An owner's own agents all request as the owner's DID: split by agent label only then. Anyone else gets 5 per DID,
+    // whatever labels it signs in under (labels are self-chosen).
+    const own = requesterDid === secret.did;
+    const mine = own
+      ? db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND requester_label = ? AND status = 'pending'").get(requesterDid, secret.did, cleanLabel(label || '', 80)).n
+      : db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'pending'").get(requesterDid, secret.did).n;
     if (mine >= MAX_PENDING_PER_REQUESTER) return { error: `you already have ${mine} requests waiting on this owner; wait for them`, status: 429 };
     const pending = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending'").get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
