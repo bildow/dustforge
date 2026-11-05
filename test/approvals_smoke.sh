@@ -123,6 +123,11 @@ call POST /api/demipass/use "$AG" "$(jbody ref "$REF" params '{"url":"https://re
 call POST /api/demipass/use "$AG" "$(jbody ref "$REF" params '{"url":"https://repo.dustroot.com/raw","method":"DELETE"}' approval_id "$RW")"
 [ "$CODE" = 409 ] && ok "another method → 409" || fail "method binding: $CODE"
 call POST /api/demipass/use "$AG" "$(USE raw "$RW")"; [ "$CODE" = 200 ] && ok "the exact approved call acts" || fail "raw exact: $CODE $BODY"
+# a call the owner could misread is refused before it is offered
+call POST /api/demipass/use "$AG" "$(jbody ref "$REF" command "rm -rf /srv/data" params '{"url":"https://repo.dustroot.com/amb","command":"uptime"}')"
+[ "$CODE" = 400 ] && echo "$BODY" | grep -q "ambiguous" && ok "the same key with different values at the top level and in params → 400 ambiguous (the headline could misname it)" || fail "ambiguous: $CODE $BODY"
+call POST /api/demipass/use "$AG" "$(jbody ref "$REF" params '{"url":"https://repo.dustroot.com/pp","__proto__":{"x":1}}')"
+[ "$CODE" = 400 ] && ok "a __proto__ key → 400" || fail "proto: $CODE $BODY"
 # key_name may not bring in an elevated secret through a standard one
 call POST /api/demipass/store "$A" '{"name":"std-pw","value":"zzzzstdpw1","secret_type":"password","username":"root","host":"100.83.112.88"}'
 call POST /api/demipass/use "$AG" '{"name":"std-pw","action":"ssh_exec","target_host":"100.83.112.88","target_user":"root","command":"id","key_name":"forge-token"}'

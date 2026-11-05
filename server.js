@@ -4518,7 +4518,6 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
             // The key secret is used as fully as the primary one: one above standard depth would skip its own approval.
             if (useApprovals.depthOf(keySecret) !== 'standard') return res.status(403).json({ error: `key_name secret '${key_name}' is ${useApprovals.depthOf(keySecret)}: use it directly (its own /use asks for approval), not as key_name` });
-            if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
             try {
               password = blindkeyDecrypt(keySecret.encrypted_value);
               db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(keySecret.id);
@@ -4915,7 +4914,6 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
           // The key secret is used as fully as the primary one: one above standard depth would skip its own approval.
           if (useApprovals.depthOf(keySecret) !== 'standard') return res.status(403).json({ error: `key_name secret '${key_name}' is ${useApprovals.depthOf(keySecret)}: use it directly (its own /use asks for approval), not as key_name` });
-          if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
           try {
             // Use key_name secret as the password, original secret as supplemental
             password = blindkeyDecrypt(keySecret.encrypted_value);

@@ -76,10 +76,25 @@ module.exports = function registerUseApprovals(deps) {
     const d = secret && secret.security_depth;
     return DEPTHS.has(d) ? d : 'standard';
   }
+  const BAD_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
   function canonical(v) {
     if (Array.isArray(v)) return v.map(canonical);
-    if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v).sort()) o[k] = canonical(v[k]); return o; }
+    if (v && typeof v === 'object') { const o = Object.create(null); for (const k of Object.keys(v).sort()) o[k] = canonical(v[k]); return o; }
     return v;
+  }
+  // A call the owner could misread is refused before it is offered: the same key at the top level and inside
+  // `params` with different values (paths read one or the other), or keys that do not survive as plain data.
+  function ambiguity(body) {
+    const walk = (v) => { if (v && typeof v === 'object') { for (const k of Object.keys(v)) { if (BAD_KEYS.has(k)) return k; const r = walk(v[k]); if (r) return r; } } return null; };
+    const bad = walk(body);
+    if (bad) return `the call carries a '${bad}' key — not accepted on an elevated/critical secret`;
+    const p = body && body.params;
+    if (p && typeof p === 'object' && !Array.isArray(p)) {
+      for (const k of Object.keys(p)) if (k in body && k !== 'params' && JSON.stringify(canonical(body[k])) !== JSON.stringify(canonical(p[k]))) {
+        return `ambiguous call: '${k}' differs between the top level and params — send it once (or the same in both)`;
+      }
+    }
+    return null;
   }
   // What an approval binds: this secret, this action, this target, these exact parameters (the command, the body).
   function boundCall({ kind = 'use', action = '', targetHost = '', targetUrl = '', params = {} }) {
@@ -148,7 +163,8 @@ module.exports = function registerUseApprovals(deps) {
   function createRequest({ secret, kind, requesterDid, label, delegationId, purpose, binding, summary, call }) {
     const callJson = JSON.stringify(call);
     if (Buffer.byteLength(callJson) > MAX_BOUND_JSON) return { error: `this call is too large to show the owner in full for approval (${Buffer.byteLength(callJson)} bytes > ${MAX_BOUND_JSON}); send a smaller one`, status: 413 };
-    const mine = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'pending'").get(requesterDid, secret.did).n;
+    // Per requester and agent label: an owner's own agents all request as the owner's DID, each gets its own 5.
+    const mine = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND requester_label = ? AND status = 'pending'").get(requesterDid, secret.did, cleanLabel(label || '', 80)).n;
     if (mine >= MAX_PENDING_PER_REQUESTER) return { error: `you already have ${mine} requests waiting on this owner; wait for them`, status: 429 };
     const pending = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending'").get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
@@ -173,6 +189,8 @@ module.exports = function registerUseApprovals(deps) {
   // `peek`: report whether an approved request is there without spending it (reveal checks the PIN in between).
   function gate(secret, caller, use, body = {}, { peek = false } = {}) {
     if (depthOf(secret) === 'standard') return { ok: true };
+    const amb = ambiguity(use.params);
+    if (amb) return { status: 400, body: { error: amb } };
     expireOld();
     const kind = use.kind || 'use';
     const binding = bindingOf({ secretId: secret.id, kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params });
