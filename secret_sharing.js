@@ -300,7 +300,18 @@ module.exports = function registerSecretSharing(deps) {
     const secret = db.prepare(`SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(row.secret_id, row.owner_did);
     if (!secret) return res.status(410).json({ error: 'the owner no longer has this secret' });
     if (secret.frozen) return res.status(423).json({ error: 'the owner froze this secret', frozen: true });
+    // Critical: a reveal also takes the owner's approval of this recipient's request (checked, then the PIN, then spent).
+    const approvals = deps.approvals && deps.approvals();
+    const critical = approvals && approvals.depthOf(secret) === 'critical';
+    if (critical) {
+      const g = approvals.gate(secret, { did: me.did, label: 'share reveal' }, { kind: 'reveal' }, req.body || {}, { peek: true });
+      if (!g.ok) return res.status(g.status).json(g.body);
+    }
     if (!requirePin(me, `share-reveal:${row.id}`, 'share-reveal', res)) return;
+    if (critical) {
+      const g = approvals.gate(secret, { did: me.did, label: 'share reveal' }, { kind: 'reveal' }, req.body || {});
+      if (!g.ok) return res.status(g.status).json(g.body);
+    }
     // Spend the reveal before decrypting: a reveal that cannot be counted is not given.
     const spent = db.prepare(`UPDATE demipass_delegations SET reveals_used = reveals_used + 1,
                               reveal_allowed = CASE WHEN reveals_used + 1 >= max_reveals THEN 0 ELSE 1 END

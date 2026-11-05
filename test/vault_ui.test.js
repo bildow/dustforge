@@ -1239,6 +1239,38 @@ test('share offer card: hostile names stay inert; Accept walks the PIN gate with
   assert.equal(pg.calls.find(c => c.path === '/api/identity/gate/verify').body.intent, 'share-accept:12');
 });
 
+// ── Approval requests (security depth): Open walks the PIN gate on critical; Approve sends the code on the screen ──
+test('approval card: hostile text stays inert; Open (critical) asks the PIN; Approve sends the code shown, nobody types it', async () => {
+  const req = { id: 41, kind: 'use', status: 'pending', depth: 'critical', secret: { name: 'x"><b>', ref: 'DP-PWD-r-1' }, requester: '<img src=x onerror=alert(1)>',
+    requester_label: 'agent', purpose: '</div><script>1</script>', summary: 'ssh root@192.0.2.1: hostname', expires_at: '2027-01-01T00:00:00Z', opened: false, needs_pin_to_open: true };
+  let opens = 0, approveBody = null;
+  const pg = page({ storage: signedIn, routes: renewRoutes((p, body) => {
+    if (p === '/api/blindkey/approvals') return { json: { ok: true, incoming: [req], outgoing: [], recent: [] } };
+    if (p === '/api/blindkey/approvals/41/open') { opens++; return opens === 1 ? { status: 403, json: { error: 'pin', missing: ['pin'], required: ['pin'], intent: 'approval-open:41' } }
+      : { json: { ok: true, approval: { ...req, opened: true }, code: '048213', code_valid_until: '2027-01-01T00:00:30Z', step_seconds: 30 } }; }
+    if (p === '/api/blindkey/approvals/41/approve') { approveBody = body; return { json: { ok: true, approval: { ...req, status: 'approved' } } }; }
+    if (p === '/api/identity/gate/verify') return { json: { ok: true } };
+  }) });
+  await settle();
+  vm.runInContext('vaultOpen = true;', pg.ctx);
+  await pg.ctx.loadApprovals();
+  const html = pg.el('approval-requests').innerHTML;
+  assert.ok(!html.includes('<img') && !html.includes('<script>') && !html.includes('"><b>'), html);
+  assert.match(html, /openApproval\(41\)/);
+  const done = pg.ctx.openApproval(41);
+  await settle(10);
+  pg.el('pin-unlock').value = '4321';
+  await pg.ctx.submitPin();
+  await settle(10);
+  assert.equal(pg.el('ap-code').textContent, '048213');
+  assert.equal(pg.calls.find(c => c.path === '/api/identity/gate/verify').body.intent, 'approval-open:41');
+  await pg.ctx.approveApproval();
+  await settle(10);
+  assert.equal(approveBody.code, '048213');
+  pg.ctx.closeApproval();
+  assert.equal(await done, false);   // closed by hand after approving in this test: the promise settles either way
+});
+
 test('another window signed in as a different account: this one signs out, never renews or adopts that session', async () => {
   const pg = page({ storage: { ...signedIn, dp_refresh: 'dpr_mine' }, routes: renewRoutes(p => {
     if (p === '/api/x') return { status: 401, json: { error: 'expired' } };
