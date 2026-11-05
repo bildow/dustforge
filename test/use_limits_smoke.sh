@@ -115,9 +115,9 @@ B0=$(BAL); use /echo POST "$S/1100k"
 # Redirects: the allow-list checks only the first URL, so a 30x must never carry the secret onward.
 LEAKS(){ curl -s "http://127.0.0.1:$UP_PORT/leak-count"; }
 use /bounce
-[ "$CODE" = 502 ] && [ "$(J upstream_status < "$S/out")" = 302 ] && ok "direct mode: an upstream 302 → 502 naming the redirect" || fail "302: $CODE $(head -c 300 "$S/out")"
+[ "$CODE" = 502 ] && [ "$(J upstream < "$S/out")" = redirect ] && ok "direct mode: an upstream 302 → 502 naming the redirect" || fail "302: $CODE $(head -c 300 "$S/out")"
 use /bounce307 POST "$S/900k"
-[ "$CODE" = 502 ] && [ "$(J upstream_status < "$S/out")" = 307 ] && ok "direct mode: an upstream 307 on a POST → 502" || fail "307: $CODE $(head -c 300 "$S/out")"
+[ "$CODE" = 502 ] && [ "$(J upstream < "$S/out")" = redirect ] && ok "direct mode: an upstream 307 on a POST → 502" || fail "307: $CODE $(head -c 300 "$S/out")"
 UT=$(curl -s -X POST "$API/api/demipass/request-token" -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
   -d '{"name":"forge-token","action":"http_header","target_url":"https://repo.dustroot.com/bounce"}' | J use_token)
 uset; [ "$CODE" = 502 ] && ok "token mode: an upstream 302 → 502" || fail "token 302: $CODE $(head -c 300 "$S/out")"

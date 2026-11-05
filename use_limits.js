@@ -136,20 +136,22 @@ function redactDeep(value, secret) {
 
 // fetch() for a call that carries a secret (in a header or the body). It never follows a redirect: on a 30x,
 // fetch would re-send custom headers such as X-Api-Key, and on a 307/308 the body too, to whatever origin the
-// Location names. The host allow-list checks only the first URL, so a redirect is refused instead (502).
-const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+// Location names. The host allow-list checks only the first URL, so redirect: 'error' makes any 30x fail before a
+// second request is sent, and the caller gets a 502 that says why. Other network errors pass through unchanged.
 async function secretFetch(url, init) {
-  const response = await fetch(url, { ...init, redirect: 'manual' });
-  if (REDIRECT_STATUSES.has(response.status) || response.type === 'opaqueredirect') {
-    let to = '';
-    try { const loc = response.headers.get('location'); if (loc) to = ` to ${new URL(loc, url).origin}`; } catch (_) {}
-    try { await response.body?.cancel(); } catch (_) {}
-    const err = new Error(`upstream answered ${response.status} (a redirect${to}); DemiPass does not follow redirects with a secret attached, call the final URL directly`);
+  try {
+    return await fetch(url, { ...init, redirect: 'error' });
+  } catch (e) {
+    if (!isRedirectError(e)) throw e;
+    const err = new Error('upstream answered with a redirect; DemiPass does not follow redirects with a secret attached, call the final URL directly');
     err.code = 'upstream_redirect';
-    err.body = { error: err.message, upstream_status: response.status };
+    err.body = { error: err.message, upstream: 'redirect' };
     throw err;
   }
-  return response;
+}
+// undici rejects a redirect under redirect: 'error' with TypeError('fetch failed', { cause: Error('unexpected redirect') }).
+function isRedirectError(e) {
+  return e instanceof TypeError && /unexpected redirect/i.test(String(e.cause && e.cause.message));
 }
 
 module.exports = { secretFetch, USE_MAX_REQUEST_BYTES, USE_MAX_RESPONSE_BYTES, readCapped, redactSecret, redactedBody, redactDeep, mib };
