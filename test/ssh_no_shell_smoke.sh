@@ -23,8 +23,12 @@ if [ "$last" = "bash -s" ]; then PATH=$FAKE_DIR/remote:$PATH bash -s; else PATH=
 SH
 cat >"$S/remote/sudo" <<'SH'
 #!/bin/bash
-read -r pw; printf '%s' "$pw" >"$FAKE_DIR/sudo.pw"
-while [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do case "$1" in --) shift; break;; -p) shift 2;; *) shift;; esac; done
+# A stand-in sudo. -S reads the password from stdin (logged); -v validates and exits; -n never prompts. When
+# FAKE_SUDO_NOPASSWD is set it behaves like a NOPASSWD rule: it never reads stdin at all.
+S_=0; V_=0
+while [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do case "$1" in --) shift; break;; -p) shift 2;; -S) S_=1; shift;; -v) V_=1; shift;; *) shift;; esac; done
+if [ $S_ = 1 ] && [ -z "${FAKE_SUDO_NOPASSWD:-}" ]; then read -r pw; printf '%s' "$pw" >"$FAKE_DIR/sudo.pw"; fi
+[ $V_ = 1 ] && exit 0
 exec "$@"
 SH
 cat >"$S/remote/chpasswd" <<'SH'
@@ -90,7 +94,12 @@ grep -q '^ARGV -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -- deploy
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":true,"stdin":"relay block $(touch /tmp/never) `x` \"q\"\n"}')
 OUT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["stdout"])' "$S/use.json" 2>/dev/null)
 [ "$C" = 200 ] && [ "$(cat "$S/sudo.pw" 2>/dev/null)" = "$NEW" ] && [ "$OUT" = 'relay block $(touch /tmp/never) `x` "q"' ] && [ ! -e /tmp/never ] && ok "sudo:true — the password reaches sudo on stdin, the command gets the stdin text untouched" || fail "sudo stdin: $C $(cat "$S/use.json") pw=$(cat "$S/sudo.pw" 2>/dev/null | head -c 3)…"
-grep -qF -- "-- deploy@100.83.112.88 sudo -S -p '' -- cat" "$S/ssh.log" && ! grep -qF -- "$NEW" "$S/ssh.log" && ok "remote command is sudo -S -p '' -- cat; no password in argv" || fail "sudo argv: $(cat "$S/ssh.log")"
+grep -qF -- "sudo -n -- cat" "$S/ssh.log" && grep -qF -- "IFS= read -r DP_SUDO_PW" "$S/ssh.log" && ! grep -qF -- "$NEW" "$S/ssh.log" && ok "remote command is sudo -S -p '' -- cat; no password in argv" || fail "sudo argv: $(cat "$S/ssh.log")"
+export FAKE_SUDO_NOPASSWD=1
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"base64","sudo":true}')
+OUT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["stdout"])' "$S/use.json" 2>/dev/null)
+[ "$C" = 200 ] && [ -z "$(printf '%s' "$OUT" | tr -d '\n')" ] && ok "a remote sudo that needs no password (NOPASSWD/cached) never passes the password line to the command" || fail "nopasswd leak: $C out=$(printf '%s' "$OUT" | head -c 12)"
+unset FAKE_SUDO_NOPASSWD
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","stdin":"plain text"}')
 [ "$C" = 200 ] && grep -q '"stdout":"plain text"' "$S/use.json" && ok "stdin without sudo reaches the command" || fail "stdin: $C $(cat "$S/use.json")"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"yes"}'); [ "$C" = 400 ] && ok "sudo must be a boolean" || fail "sudo type: $C"

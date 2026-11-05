@@ -59,6 +59,14 @@ const BLINDKEY_SSH_HOSTS = new Set([
 // Errors look like execSync's (stdout, stderr, status).
 const SSH_USER_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$/;
 const SSH_HOST_RE = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
+// ssh_exec with sudo:true. The password arrives as stdin's first line and is ALWAYS consumed by the remote shell's
+// `read` — never left for the command — then handed to `sudo -k -S -v` (validate, ignoring any cached credential) via
+// printf (a builtin: not in ps), and dropped. The command then runs with `sudo -n`, reading only the stdin that
+// follows. Without the read, a remote sudo that did not need the password (a NOPASSWD rule, a cached timestamp)
+// would pass the password line to the command, which could print it transformed (base64, rev) past redaction.
+function sudoWrap(command) {
+  return `IFS= read -r DP_SUDO_PW; printf '%s\\n' "$DP_SUDO_PW" | sudo -k -S -v -p '' 2>/dev/null; unset DP_SUDO_PW; sudo -n -- ${command}`;
+}
 function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } = {}) {
   const refuse = (why) => { throw Object.assign(new Error(why), { stdout: '', stderr: why, status: 2 }); };
   if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) refuse('invalid ssh user or host');
@@ -4467,7 +4475,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           try {
             // No local shell: see sshRun. With sudo, sudo -S reads the password as stdin's first line (-p '' keeps
             // its prompt out of the output) and the command gets whatever follows.
-            const remote = sudo ? `sudo -S -p '' -- ${command}` : command;
+            const remote = sudo ? sudoWrap(command) : command;
             const input = sudo ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
             const output = sshRun(effectiveUser, target_host, password, remote, { input });
             const redactedOutput = output
@@ -4859,7 +4867,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         try {
           // No local shell: see sshRun.
-          const remote = sudo ? `sudo -S -p '' -- ${command}` : command;
+          const remote = sudo ? sudoWrap(command) : command;
           const input = sudo ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
           const output = sshRun(target_user, target_host, password, remote, { input });
 
