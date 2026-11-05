@@ -59,6 +59,39 @@ const BLINDKEY_SSH_HOSTS = new Set([
 // Errors look like execSync's (stdout, stderr, status).
 const SSH_USER_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,63}$/;
 const SSH_HOST_RE = /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/;
+// ssh_exec sudo modes.
+//   sudo:true       → `sudo -n -- <command>`. No password is sent: it works where the host has a NOPASSWD rule for that
+//                     command (the safe way to let an agent run a privileged command), and fails cleanly elsewhere.
+//   sudo:'password' → the secret's OWNER only (never a delegate, never an agent token): the password arrives as
+//                     stdin's first line, the remote shell's `read` always consumes it (it never reaches the command),
+//                     `sudo -S -v` validates with it, then `sudo -n` runs the command; `; exit $?` keeps bash from
+//                     exec'ing the last sudo, so it shares the timestamp `sudo -v` wrote (no tty: keyed per parent).
+//                     RISK, documented: the account's shell startup files run before `read`, so anyone who can write
+//                     that account's dotfiles can capture the password from this mode. Use it for one-off admin (e.g.
+//                     installing a NOPASSWD rule), not for routine automation.
+function sudoWrap(command, mode) {
+  if (mode === 'password') return `IFS= read -r DP_SUDO_PW; printf '%s\\n' "$DP_SUDO_PW" | sudo -S -v -p '' 2>/dev/null; unset DP_SUDO_PW; sudo -n -- ${command}; exit $?`;
+  return `sudo -n -- ${command}`;
+}
+// A token that acts for an agent, not for the person: a fleet worker token, or a token a fleet owner minted for an
+// agent wallet. Read from the claims /use's middleware verified (req.identity), whatever the scope —
+// getBearerIdentity drops the claims of a below-transact token, which would read a write-scope worker as a person.
+function agentToken(req) {
+  const d = (req.identity && req.identity.decoded) || {};
+  return Boolean(d.wrk || d.auth_method === 'worker' || d.auth_method === 'fleet_owner_mint');
+}
+function sudoRefusal(sudo, { owner, keyName, secretId }) {
+  if (sudo === undefined || sudo === false) return null;
+  if (sudo !== true && sudo !== 'password') return "sudo: true (sudo -n, no password sent) or 'password' (owner only)";
+  if (sudo === 'password' && !owner) return "sudo:'password' is for the secret's owner, in their own session — a delegate or agent token can use sudo:true where the host allows it without a password";
+  if (sudo === 'password' && keyName) return "sudo:'password' needs the account password: use it without key_name";
+  // Anyone holding access to the account can write its shell startup files, and those run before the password is
+  // read: while the secret is delegated or shared, someone else could have planted a hook for the owner's call.
+  if (sudo === 'password' && secretId && db.prepare("SELECT 1 FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended')").get(secretId)) {
+    return "sudo:'password' is refused while this secret is delegated or shared (another holder could capture the password from the account's startup files) — revoke those first, or use sudo:true with a NOPASSWD rule";
+  }
+  return null;
+}
 function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } = {}) {
   const refuse = (why) => { throw Object.assign(new Error(why), { stdout: '', stderr: why, status: 2 }); };
   if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) refuse('invalid ssh user or host');
@@ -4423,8 +4456,17 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         case 'ssh_exec': {
-          const { command, target_user, key_name } = action_params;
+          const { command, target_user, key_name, sudo, stdin } = action_params;
           if (!target_host || !command) return res.status(400).json({ error: 'command required for ssh_exec (target_host comes from token)' });
+          // sudo:true — run the command with sudo, the stored password typed to sudo on stdin (never in a command
+          // string, never seen by the caller). stdin — text the command reads after that (e.g. `tee -a FILE`), so
+          // content never has to be quoted into a shell command.
+          if (stdin !== undefined && (typeof stdin !== 'string' || Buffer.byteLength(stdin) > 65536)) return res.status(400).json({ error: 'stdin: a string of at most 64 KiB' });
+          {
+            const owner = !tokenRow.delegation_id && secret.did === req.identity.did && !agentToken(req);
+            const why = sudoRefusal(sudo, { owner, keyName: key_name, secretId: secret.id });
+            if (why) return res.status(sudo === true || sudo === 'password' ? 403 : 400).json({ error: why });
+          }
           // The user named in the call, else the account the secret was stored for, else the old default.
           const effectiveUser = target_user || secret.account_username || 'claude';
 
@@ -4459,8 +4501,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
 
           try {
-            // No local shell: see sshRun.
-            const output = sshRun(effectiveUser, target_host, password, command);
+            // No local shell: see sshRun. With sudo, sudo -S reads the password as stdin's first line (-p '' keeps
+            // its prompt out of the output) and the command gets whatever follows.
+            const remote = sudo ? sudoWrap(command, sudo) : command;
+            const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+            const output = sshRun(effectiveUser, target_host, password, remote, { input });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
@@ -4789,9 +4834,16 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       case 'ssh_exec': {
         // SSH into a whitelisted host using stored credentials and run a command
         // The credentials NEVER appear in the response
-        const { target_host, target_user, command, key_name } = req.body;
+        const { target_host, target_user, command, key_name, sudo, stdin } = req.body;
         if (!target_host || !target_user || !command) {
           return res.status(400).json({ error: 'target_host, target_user, and command required for ssh_exec' });
+        }
+        // sudo / stdin: as in use-token mode (see there).
+        if (stdin !== undefined && (typeof stdin !== 'string' || Buffer.byteLength(stdin) > 65536)) return res.status(400).json({ error: 'stdin: a string of at most 64 KiB' });
+        {
+          // Direct mode only ever runs the caller's own secret (looked up by its DID).
+          const why = sudoRefusal(sudo, { owner: !agentToken(req), keyName: key_name, secretId: secret.id });
+          if (why) return res.status(sudo === true || sudo === 'password' ? 403 : 400).json({ error: why });
         }
 
         // Host whitelist check
@@ -4846,7 +4898,9 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         try {
           // No local shell: see sshRun.
-          const output = sshRun(target_user, target_host, password, command);
+          const remote = sudo ? sudoWrap(command, sudo) : command;
+          const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+          const output = sshRun(target_user, target_host, password, remote, { input });
 
           // Redact any echo of credentials in the output
           const redactedOutput = output

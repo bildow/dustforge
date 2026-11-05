@@ -19,11 +19,20 @@ cat >"$S/bin/sshpass" <<'SH'
 #!/bin/bash
 echo "ARGV $*" >>"$FAKE_DIR/ssh.log"; echo "SSHPASS_SET ${SSHPASS:+yes}" >>"$FAKE_DIR/ssh.log"
 last="${@: -1}"
-if [ "$last" = "bash -s" ]; then PATH=$FAKE_DIR/remote:$PATH bash -s; else bash -c "$last"; fi
+if [ "$last" = "bash -s" ]; then PATH=$FAKE_DIR/remote:$PATH bash -s; else PATH=$FAKE_DIR/remote:$PATH bash -c "$last"; fi
 SH
 cat >"$S/remote/sudo" <<'SH'
 #!/bin/bash
-read -r pw; printf '%s' "$pw" >"$FAKE_DIR/sudo.pw"; shift; exec "$@"
+# A stand-in sudo for a host where sudo needs a password. -S reads it from stdin (logged) and records a timestamp;
+# -v then exits; -n runs only with a timestamp ("a password is required" otherwise). FAKE_SUDO_NOPASSWD: a NOPASSWD
+# rule — it never reads stdin and never needs a timestamp.
+S_=0; V_=0; N_=0
+while [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do case "$1" in --) shift; break;; -p) shift 2;; -S) S_=1; shift;; -v) V_=1; shift;; -n) N_=1; shift;; *) shift;; esac; done
+TS="$FAKE_DIR/sudo.ts"
+if [ -n "${FAKE_SUDO_NOPASSWD:-}" ]; then [ $V_ = 1 ] && exit 0; exec "$@"; fi
+if [ $S_ = 1 ]; then read -r pw; printf '%s' "$pw" >"$FAKE_DIR/sudo.pw"; touch "$TS"; [ $V_ = 1 ] && exit 0; exec "$@"; fi
+if [ $N_ = 1 ] && [ ! -e "$TS" ]; then echo "sudo: a password is required" >&2; exit 1; fi
+exec "$@"
 SH
 cat >"$S/remote/chpasswd" <<'SH'
 #!/bin/bash
@@ -83,6 +92,52 @@ C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.
 [ "$C" = 400 ] && [ ! -e "$MARK" ] && [ ! -s "$S/ssh.log" ] && ok "command starting with - refused (400), ssh never ran" || fail "leading-dash command: $C $(cat "$S/use.json")"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo hi"}')
 grep -q '^ARGV -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -- deploy@100.83.112.88 echo hi$' "$S/ssh.log" && ok "ssh gets -- before user@host" || fail "ssh argv: $(cat "$S/ssh.log") ($C)"
+# sudo modes. stdin carries text the command reads; the password is sent only in the owner's sudo:'password' mode.
+J1(){ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); r=d.get("result") or {}; print(r.get(sys.argv[2], d.get(sys.argv[2], "")))' "$S/use.json" "$1" 2>/dev/null; }
+: >"$S/ssh.log"; rm -f "$S/sudo.pw" "$S/sudo.ts"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":true,"stdin":"x"}')
+[ "$C" = 200 ] && [ "$(J1 exit_code)" = 1 ] && J1 stderr | grep -q "password is required" && [ ! -e "$S/sudo.pw" ] && ok "sudo:true sends no password: on a host that wants one it fails cleanly" || fail "sudo true pw-host: $C $(cat "$S/use.json")"
+grep -qF -- "-- deploy@100.83.112.88 sudo -n -- cat" "$S/ssh.log" && ok "sudo:true is sudo -n -- <command>" || fail "sudo argv: $(cat "$S/ssh.log")"
+: >"$S/ssh.log"; rm -f "$S/sudo.ts"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password","stdin":"relay block $(touch /tmp/never) `x` \"q\"\n"}')
+OUT=$(J1 stdout)
+[ "$C" = 200 ] && [ "$(cat "$S/sudo.pw" 2>/dev/null)" = "$NEW" ] && [ "$OUT" = 'relay block $(touch /tmp/never) `x` "q"' ] && [ ! -e /tmp/never ] && ok "sudo:'password' (owner): the password reaches sudo -S -v on stdin, the command gets only the stdin text" || fail "sudo password: $C $(cat "$S/use.json")"
+grep -qF -- "IFS= read -r DP_SUDO_PW" "$S/ssh.log" && grep -qF -- "sudo -n -- cat; exit" "$S/ssh.log" && ! grep -qF -- "$NEW" "$S/ssh.log" && ok "the wrap reads the line itself, runs sudo -n, keeps the last sudo from being exec'd; no password in argv" || fail "wrap argv: $(cat "$S/ssh.log")"
+export FAKE_SUDO_NOPASSWD=1; rm -f "$S/sudo.ts"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"base64","sudo":"password"}')
+[ "$C" = 200 ] && [ -z "$(J1 stdout | tr -d '\n')" ] && ok "a NOPASSWD sudo never passes the password line to the command (base64 prints nothing)" || fail "nopasswd leak: $C $(J1 stdout | head -c 12)"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":true,"stdin":"via nopasswd"}')
+[ "$C" = 200 ] && [ "$(J1 stdout)" = "via nopasswd" ] && ok "sudo:true works where a NOPASSWD rule allows it" || fail "nopasswd true: $C $(cat "$S/use.json")"
+unset FAKE_SUDO_NOPASSWD
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","stdin":"plain text"}')
+[ "$C" = 200 ] && [ "$(J1 stdout)" = "plain text" ] && ok "stdin without sudo reaches the command" || fail "stdin: $C $(cat "$S/use.json")"
+# a delegate (an agent the owner delegated the box password to) may use sudo:true, never sudo:'password'
+node -e '
+const identity = require("./identity"), Database = require("better-sqlite3"), crypto = require("crypto");
+const db = new Database(process.env.DB_PATH); const id = identity.createIdentity();
+db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 1000, ?)")
+  .run(id.did, "helper", "helper@dustforge.com", id.encrypted_private_key || id.encryptedPrivateKey, crypto.createHash("sha256").update("helperpass1").digest("hex"));
+db.prepare("INSERT INTO identity_transactions (did, amount_cents, type) VALUES (?, 1000, ?)").run(id.did, "credit");
+const o = db.prepare("SELECT did FROM identity_wallets WHERE username = ?").get("owner").did;
+const cur = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND status = ? AND (name = ? OR name LIKE ?) ORDER BY version DESC LIMIT 1").get(o, "active", "box", "box_v%");
+const s = cur.id; require("fs").writeFileSync(process.env.DB_PATH + ".boxref", cur.ref_code);
+db.prepare("INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, status) VALUES (?, ?, ?, NULL, ?)").run(o, id.did, s, "active");
+const ctx = db.prepare("SELECT COUNT(*) AS n FROM blindkey_contexts WHERE secret_id = ?").get(s).n;
+if (!ctx) db.prepare("INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, ?, ?, ?, ?, ?)").run(s, "default", "ssh_exec", "*", "*", o);'
+BOXREF=$(cat "$DB_PATH.boxref")
+HTOK=$(curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'Content-Type: application/json' -d '{"username":"helper","password":"helperpass1","scope":"transact"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("token",""))')
+huse(){ curl -s -o "$S/use.json" -w '%{http_code}' -X POST "$API/api/blindkey/use" -H 'Content-Type: application/json' -H "Authorization: Bearer $HTOK" -d "$1"; }
+rm -f "$S/sudo.pw"
+C=$(huse '{"ref":"'$BOXREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password"}')
+[ "$C" = 403 ] && grep -q "for the secret's owner" "$S/use.json" && [ ! -e "$S/sudo.pw" ] && ok "a delegate asking for sudo:'password' → 403, no password sent" || fail "delegate password: $C $(cat "$S/use.json")"
+C=$(huse '{"ref":"'$BOXREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":true,"stdin":"d"}')
+[ "$C" = 200 ] && [ ! -e "$S/sudo.pw" ] && ok "a delegate may use sudo:true (no password sent; the host's NOPASSWD rules decide)" || fail "delegate true: $C $(cat "$S/use.json")"
+rm -f "$S/sudo.pw"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password"}')
+[ "$C" = 403 ] && grep -q "delegated or shared" "$S/use.json" && [ ! -e "$S/sudo.pw" ] && ok "while the secret is delegated, even the owner's sudo:'password' is refused (a holder could have planted a hook)" || fail "owner password while delegated: $C $(cat "$S/use.json")"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"yes"}'); [ "$C" = 400 ] && ok "sudo must be true or 'password'" || fail "sudo type: $C"
+C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password","key_name":"k"}'); [ "$C" = 403 ] && ok "sudo:'password' with key_name refused" || fail "sudo key_name: $C"
+BIG=$(python3 -c 'print("x"*70000)'); C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"target_user\":\"deploy\",\"command\":\"cat\",\"stdin\":\"$BIG\"}"); [ "$C" = 400 ] && ok "stdin over 64 KiB refused" || fail "big stdin: $C"
 C=$(rot '{"ref":"DP-PWD-nul-0001","target_host":"100.83.112.88","target_user":"deploy"}')
 grep -q 'tail' "$S/last.json" && fail "a stored password leaked into the error: $(cat "$S/last.json")" || ok "a password ssh can't take is refused without echoing it ($C)"
 C=$(rot '{"ref":"DP-PWD-box-0001","target_host":"10.9.9.9"}'); grep -q '100\.' "$S/last.json" && fail "403 lists whitelisted hosts" || ok "a refused host doesn't learn the whitelist"
