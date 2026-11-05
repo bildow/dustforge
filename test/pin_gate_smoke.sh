@@ -191,7 +191,7 @@ call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":
 call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J fresh.pin)" = False ] && ok "the policy change spent its PIN proof" || fail "spent by policy: $BODY"
 call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "reveal asks for the PIN again" || fail "reveal after policy: $CODE $BODY"
 call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"critical"}'
-[ "$CODE" = 400 ] && echo "$BODY" | J unprovable | grep -q sms && ok "critical refused: SMS cannot be proven on this server (it would lock the secret for good)" || fail "critical: $CODE $BODY"
+[ "$CODE" = 200 ] && ! echo "$BODY" | grep -q sms && ok "critical no longer asks for SMS (2026-11-05: per-use approvals instead), so it can be set on a server without SMS" || fail "critical: $CODE $BODY"
 call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","gate_policy":{"reveal":["pin","genesis"],"rotate":[],"delete":[],"use":[]}}'
 [ "$CODE" = 400 ] && echo "$BODY" | J unprovable | grep -q genesis && ok "a genesis factor without a genesis record is refused" || fail "genesis policy: $CODE $BODY"
 # an older policy may already hold a factor nobody can prove: lowering skips it, the provable ones still count

@@ -171,6 +171,7 @@
   <div id="fill-requests"></div>
   <div id="net-requests"></div>
   <div id="share-requests"></div>
+  <div id="approval-requests"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
   <div id="page-vault" class="page active">
@@ -443,6 +444,19 @@
   </div>
 </div>
 
+<!-- An approval request: the code rotates every 30 s; Approve sends it for you -->
+<div id="modal-approval" class="modal-bg" onclick="if(event.target===this)closeApproval()">
+  <div class="modal-sheet" style="text-align:center">
+    <h3 id="ap-title">Approve this use?</h3>
+    <div id="ap-what" style="font-size:0.8rem;color:var(--text2);margin-bottom:0.75rem;text-align:left"></div>
+    <div id="ap-code" style="font-family:monospace;font-size:2.2rem;letter-spacing:0.3rem;font-weight:700;margin:0.5rem 0">······</div>
+    <div id="ap-timer" style="font-size:0.7rem;color:var(--text3)"></div>
+    <div style="font-size:0.7rem;color:var(--text3);margin:0.5rem 0 0.75rem">Approve sends this code for you. Read it out only if the agent is waiting in another channel — it works for this request only, for a minute at most.</div>
+    <div id="ap-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="denyApproval()">Deny</button><button class="btn-primary" id="ap-go" onclick="approveApproval()">Approve</button></div>
+  </div>
+</div>
+
 <!-- Share a secret with a person (use-only), or transfer it to them -->
 <div id="modal-share" class="modal-bg" onclick="if(event.target===this)closeModal()">
   <div class="modal-sheet">
@@ -688,7 +702,7 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests','share-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];accessReqs=[];accessPick={};fillBusy.clear();shareData=null;shareBusy.clear();shareMode=null;detailName=null;netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests','share-requests','approval-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];accessReqs=[];accessPick={};fillBusy.clear();shareData=null;shareBusy.clear();shareMode=null;detailName=null;approvals=[];clearInterval(apTimer);apTimer=null;apOpen=null;if(apResolve){const r=apResolve;apResolve=null;r(false);}netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why','net-msg','send-msg','send-to-name','send-balance']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -1068,7 +1082,7 @@ async function showApp(){
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
-  loadFillRequests(); loadShares();
+  loadFillRequests(); loadShares(); loadApprovals();
   loadNetwork()}
 
 // ── Network: people, agents joining a fleet, sending DD ───────────────────
@@ -1416,6 +1430,72 @@ async function submitShare(){
     await loadShares();
     setTimeout(()=>{ closeSheet('share'); if(mode==='transfer') closeDetail(); else refreshDetail(); },900);
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
+}
+
+// ── Approval requests (security depth): an agent wants to use an elevated/critical secret ─────────────────────
+let approvals=[], apOpen=null, apTimer=null, apBusy=false, apResolve=null;
+async function loadApprovals(){
+  const epoch=sessionEpoch;
+  try{ const r=await api('GET','/api/blindkey/approvals'); if(epoch!==sessionEpoch||!vaultOpen) return; approvals=r.incoming||[]; }
+  catch(e){ if(sessionEnded(e)||e.status===429) return; }
+  renderApprovals();
+}
+function renderApprovals(){
+  const el=document.getElementById('approval-requests'); if(!el) return;
+  el.innerHTML=approvals.map(a=>'<div class="fill-req"><div><b>@'+esc(a.requester)+'</b>'+(a.requester_label?' <span style="color:var(--text3)">('+esc(a.requester_label)+')</span>':'')+' wants to use <b>'+esc(a.secret.name||'')+'</b>'
+    +' <span style="font-size:0.65rem;color:'+(a.depth==='critical'?'var(--red)':'var(--orange)')+'">'+esc(a.depth)+'</span></div>'
+    +'<div class="fr-origin">'+esc(a.summary||'')+'</div>'
+    +(a.purpose?'<div style="margin-top:0.25rem">“'+esc(a.purpose)+'”</div>':'')
+    +'<div style="color:var(--text3);margin-top:0.25rem">Waits until '+esc(new Date(a.expires_at).toLocaleTimeString())+(a.needs_pin_to_open?' · your PIN opens it':'')+'</div>'
+    +'<div class="fr-row"><button class="btn-primary" onclick="openApproval('+Number(a.id)+')">Open</button><button class="btn-ghost" onclick="denyApproval('+Number(a.id)+')">Deny</button></div></div>').join('');
+}
+// Opens the request screen (critical: apiGated asks for the PIN). Resolves true when approved, false otherwise.
+function openApproval(id){
+  return new Promise(async (resolve)=>{
+    apResolve=resolve; apOpen={id,code:null}; document.getElementById('ap-msg').textContent='';
+    if(!(await refreshApproval(true))){ settleApproval(false); return; }
+    openModal('approval');
+    clearInterval(apTimer); apTimer=setInterval(()=>refreshApproval(false),5000);
+  });
+}
+async function refreshApproval(first){
+  if(!apOpen) return false;
+  try{
+    const d=first?await apiGated('POST','/api/blindkey/approvals/'+apOpen.id+'/open',null,'Open this approval request? Your PIN opens it.')
+                 :await api('POST','/api/blindkey/approvals/'+apOpen.id+'/open');
+    const a=d.approval||{};
+    apOpen.code=d.code;
+    document.getElementById('ap-title').textContent=(a.kind==='reveal'?'Reveal ':'Approve ')+(a.secret&&a.secret.name||'')+'?';
+    document.getElementById('ap-what').innerHTML='<b>@'+esc(a.requester||'')+'</b>'+(a.requester_label?' ('+esc(a.requester_label)+')':'')+'<br>'+esc(a.summary||'')+(a.purpose?'<br>“'+esc(a.purpose)+'”':'');
+    document.getElementById('ap-code').textContent=d.code;
+    document.getElementById('ap-timer').textContent='code changes at '+new Date(d.code_valid_until).toLocaleTimeString()+' · request ends '+new Date(a.expires_at).toLocaleTimeString();
+    return true;
+  }catch(e){
+    if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ const m=document.getElementById('ap-msg'); m.textContent=e.message; m.className='modal-msg err'; if(first) alert(e.message); }
+    if(!first){ clearInterval(apTimer); }
+    return false;
+  }
+}
+function settleApproval(ok){ clearInterval(apTimer); apTimer=null; const r=apResolve; apResolve=null; apOpen=null; if(r) r(ok); }
+function closeApproval(){ closeSheet('approval'); settleApproval(false); }
+async function approveApproval(){
+  if(!apOpen||apBusy) return; apBusy=true;
+  const m=document.getElementById('ap-msg');
+  try{
+    // Approve sends the code on the screen; if it rotated in between, fetch the new one and send that.
+    try{ await api('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code}); }
+    catch(e){ if(!/rotated/.test(e.message)) throw e; await refreshApproval(false); await api('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code}); }
+    m.textContent='Approved'; m.className='modal-msg ok';
+    approvals=approvals.filter(a=>a.id!==apOpen.id); renderApprovals();
+    setTimeout(()=>{ closeSheet('approval'); settleApproval(true); },600);
+  }catch(e){ if(!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
+  finally{ apBusy=false; }
+}
+async function denyApproval(id){
+  const target=id||(apOpen&&apOpen.id); if(!target) return;
+  try{ await api('POST','/api/blindkey/approvals/'+target+'/deny'); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  approvals=approvals.filter(a=>a.id!==target); renderApprovals();
+  if(apOpen&&apOpen.id===target){ closeSheet('approval'); settleApproval(false); }
 }
 
 // Could not learn whether a PIN exists: stay closed, offer retry or sign out.
@@ -2053,7 +2133,14 @@ async function revealSecret(name) {
   try {
     // apiGated walks whatever factors this credential's policy demands
     // (PIN, +email, +SMS) and only then reveals.
-    const data = await apiGated('POST','/api/blindkey/reveal',{ name });
+    let data = await apiGated('POST','/api/blindkey/reveal',{ name });
+    // Critical depth: the server answers with an approval request first; open it (PIN), approve, then reveal.
+    if (data && data.status === 'approval_pending') {
+      btn.textContent = 'Waiting for approval...';
+      const approved = await openApproval(data.approval_id);
+      if (!approved) throw new Error('cancelled — not approved');
+      data = await apiGated('POST','/api/blindkey/reveal',{ name, approval_id: data.approval_id });
+    }
     valEl.textContent = data.value;
     valEl.style.display = 'block';
     btn.textContent = 'Revealed — auto-hides in 30s';
@@ -2174,7 +2261,7 @@ function openModal(id){document.getElementById('modal-'+id).classList.add('show'
 function closeSheet(id){document.getElementById('modal-'+id).classList.remove('show')}
 // Cancel / Escape / backdrop. The blocking PIN sheets (setup, status error) stay: only their own buttons or
 // sign-out end them. An open PIN unlock counts as cancelled, so the action waiting on it settles too.
-function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error')m.classList.remove('show')});settleUnlock(false)}
+function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error')m.classList.remove('show')});settleUnlock(false);if(apOpen&&!document.getElementById('modal-approval').classList.contains('show'))settleApproval(false)}
 function closeAllSheets(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
 // HTML-escape for text AND attribute values (quotes included).
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
@@ -2189,7 +2276,7 @@ document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.vis
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
 let pollN=0;
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();if(++pollN%4===0)loadShares();}},4000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0)loadShares();}},4000);
 
 // ── QR Scanner ──
 

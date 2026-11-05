@@ -3382,10 +3382,22 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
   }
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
 
+  // Critical depth: reveal also takes an approved request (its code), on top of the gate policy's PIN. Checked first
+  // without spending it, then the PIN, then spent — so a PIN prompt never wastes an approval.
+  const critical = useApprovals.depthOf(secret) === 'critical';
+  if (critical) {
+    const g = useApprovals.gate(secret, { did: actor.did, label: 'reveal (owner)' }, { kind: 'reveal' }, req.body || {}, { peek: true });
+    if (!g.ok) return res.status(g.status).json(g.body);
+  }
+
   // Per-credential gate policy. Default depth requires a fresh PIN for reveal;
   // elevated/critical add twofa/sms.
   const gate = checkGatePolicy(actor.did, 'reveal', secret, auth);
   if (!gate.ok) return res.status(gate.status || 403).json(gate);
+  if (critical) {
+    const g = useApprovals.gate(secret, { did: actor.did, label: 'reveal (owner)' }, { kind: 'reveal' }, req.body || {});
+    if (!g.ok) return res.status(g.status).json(g.body);
+  }
 
   // Decrypt the value
   let decrypted;
@@ -4429,6 +4441,18 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       // Callers that guessed wrong got a silent empty-body failure that impersonated
       // a bad credential. Normalise once here so every case accepts either shape.
       const action_params = { ...(req.body || {}), ...((req.body || {}).params || {}) };
+      // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call.
+      {
+        const g = useApprovals.gate(secret, approvalCaller(req),
+          { kind: 'use', action, targetHost: target_host, targetUrl: target_url, params: action_params, delegationId: tokenRow.delegation_id },
+          action_params);
+        if (!g.ok) {
+          if (g.status === 202) useApprovals.refundParked(req);
+          // The token did not act: retire it, so parked calls never pile up against the concurrent-token limit.
+          db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
+          return res.status(g.status).json(g.body);
+        }
+      }
       switch (action) {
         case 'http_header': {
           const { method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params;
@@ -4756,6 +4780,14 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
   const ctxCheck = enforceBlindkeyContext(secret, contextName || soleContext(secret, { action, targetUrl, targetHost }).context, action, targetUrl, targetHost);
   if (!ctxCheck.allowed) {
     return res.status(403).json({ error: ctxCheck.error });
+  }
+  {
+    const directParams = { ...(req.body || {}), ...((req.body || {}).params || {}) };
+    const g = useApprovals.gate(secret, approvalCaller(req), { kind: 'use', action, targetHost, targetUrl, params: directParams }, directParams);
+    if (!g.ok) {
+      if (g.status === 202) useApprovals.refundParked(req);
+      return res.status(g.status).json(g.body);
+    }
   }
 
   let decryptedValue;
@@ -7709,6 +7741,16 @@ const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy,
 });
+// Security depth on use: per-use approval requests with request-bound rotating codes (docs/approvals.md).
+const useApprovals = require('./use_approvals')({
+  app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
+  logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail,
+});
+// Who a /use caller is, for an approval request: the DID, and a label the owner recognises.
+function approvalCaller(req) {
+  const d = (req.identity && req.identity.decoded) || {};
+  return { did: req.identity.did, label: d.agent_label || d.username || '' };
+}
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
   try {
@@ -12922,7 +12964,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
@@ -12932,7 +12974,10 @@ const gateIntent = (action, secret) => `${action}:${secret.id}`;
 const SECURITY_DEPTH_PRESETS = {
   standard: { reveal: ['pin'], rotate: [], delete: [], use: [] },
   elevated: { reveal: ['pin', 'twofa'], rotate: ['twofa'], delete: ['twofa'], use: [] },
-  critical: { reveal: ['pin', 'twofa', 'sms'], rotate: ['pin', 'twofa'], delete: ['pin', 'twofa', 'sms'], use: [] },
+  // Critical no longer asks for SMS (most accounts cannot prove it, which made critical unsettable). On top of these
+  // factors, elevated and critical make every /use wait for an approved request, and critical reveal takes one too
+  // (use_approvals.js). The email code stays on critical reveal so elevated → critical is never a lowering.
+  critical: { reveal: ['pin', 'twofa'], rotate: ['pin', 'twofa'], delete: ['pin', 'twofa'], use: [] },
 };
 const DEFAULT_DEPTH = 'standard';
 
