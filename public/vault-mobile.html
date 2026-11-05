@@ -170,6 +170,7 @@
   <!-- Browser fill requests waiting for this person: the extension asked, the phone approves with the PIN -->
   <div id="fill-requests"></div>
   <div id="net-requests"></div>
+  <div id="share-requests"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
   <div id="page-vault" class="page active">
@@ -416,18 +417,21 @@
     <h3>Store a Secret</h3>
     <label>Name</label><input type="text" id="s-name" placeholder="e.g. RackNerd SSH">
     <label>Type</label>
-    <select id="s-type" onchange="updateStoreFields()"><option value="password">Password / Login</option><option value="api_key">API Key</option><option value="token">Token</option><option value="ssh_key">SSH Key</option><option value="other">Other</option></select>
+    <select id="s-type" onchange="updateStoreFields()"><option value="password">Password / Login</option><option value="ssh_credential">SSH key</option><option value="api_key">API Key</option><option value="token">Token</option><option value="other">Other</option></select>
+    <div id="s-user-fields">
+      <label>Username / Email</label><input type="text" id="s-username" placeholder="e.g. root or admin@example.com" autocapitalize="off" autocorrect="off" spellcheck="false">
+    </div>
     <div id="s-login-fields">
-      <label>Username / Email</label><input type="text" id="s-username" placeholder="e.g. root or admin@example.com">
-      <label>Password</label><input type="password" id="s-value" placeholder="The secret value">
+      <label>Password</label><input type="password" id="s-value" placeholder="The secret value" autocomplete="off">
     </div>
     <div id="s-key-fields" style="display:none">
-      <label>Key / Value</label><input type="password" id="s-key-value" placeholder="API key, token, or secret value">
+      <label>Key / Value</label><textarea id="s-key-value" rows="3" placeholder="API key, token, or the whole private key (-----BEGIN … KEY-----)" autocapitalize="off" autocorrect="off" spellcheck="false" style="width:100%;font-family:monospace;font-size:0.75rem;-webkit-text-security:disc"></textarea>
     </div>
     <label>URL / Host (optional)</label><input type="text" id="s-host" placeholder="e.g. 192.3.84.103 or api.example.com">
     <label>Category</label>
     <select id="s-category"><option value="">— pick a group —</option><option value="infrastructure">Infrastructure</option><option value="platform">Platform</option><option value="agents">Agents</option><option value="services">Services</option><option value="products">Products</option><option value="personal">Personal</option><option value="evidence">Evidence</option><option value="test">Test</option><option value="other">Other</option></select>
-    <label>Labels (optional, comma-separated)</label><input type="text" id="s-labels" placeholder="e.g. prod, kyle-shared">
+    <label>Labels (optional, comma-separated)</label><input type="text" id="s-labels" placeholder="e.g. prod, owner-kyle, received-raw">
+    <label>Note (optional)</label><input type="text" id="s-note" maxlength="500" placeholder="e.g. Kyle's box. Received raw over Matrix; he rotates it.">
     <label>Expires in (optional)</label>
     <input type="text" id="s-expires" placeholder="e.g. 30d, 90d, or leave blank">
     <label>Rotate every (optional, days)</label>
@@ -436,6 +440,26 @@
     <select id="s-depth"><option value="standard">Standard — reveal needs your PIN</option><option value="elevated">Elevated — + email code to reveal/rotate/delete</option><option value="critical">Critical — + SMS code, strongest</option></select>
     <div id="s-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="storeSecret()">Store</button></div>
+  </div>
+</div>
+
+<!-- Share a secret with a person (use-only), or transfer it to them -->
+<div id="modal-share" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3 id="sh-title">Share with a person</h3>
+    <div id="sh-what" style="font-size:0.8rem;color:var(--text2);margin-bottom:0.5rem"></div>
+    <label>Person (from your network)</label><select id="sh-to"></select>
+    <div id="sh-share-fields">
+      <label>Expires after</label>
+      <select id="sh-days"><option value="7">7 days</option><option value="30">30 days</option><option value="90" selected>90 days</option><option value="365">1 year</option></select>
+      <div style="font-size:0.72rem;color:var(--text3);margin-top:0.4rem">Use-only: their agents use it through DemiPass and nobody sees the value. They accept it in their app; you can revoke it any time.</div>
+    </div>
+    <div id="sh-transfer-fields" style="display:none">
+      <label style="display:flex;gap:0.5rem;align-items:center"><input type="checkbox" id="sh-keep" checked style="width:auto"> Keep use-only access for me</label>
+      <div style="font-size:0.72rem;color:var(--text3);margin-top:0.4rem">It moves to their vault with the same ref. Every other access you gave ends. They can see and revoke the access you keep.</div>
+    </div>
+    <div id="sh-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" id="sh-go" onclick="submitShare()">Share</button></div>
   </div>
 </div>
 
@@ -664,7 +688,7 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];accessReqs=[];accessPick={};fillBusy.clear();netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests','share-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];accessReqs=[];accessPick={};fillBusy.clear();shareData=null;shareBusy.clear();shareMode=null;detailName=null;netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why','net-msg','send-msg','send-to-name','send-balance']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -1044,7 +1068,7 @@ async function showApp(){
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
-  loadFillRequests();
+  loadFillRequests(); loadShares();
   loadNetwork()}
 
 // ── Network: people, agents joining a fleet, sending DD ───────────────────
@@ -1286,6 +1310,110 @@ async function decideFill(id, approve){
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
   finally{ fillBusy.delete(id); renderFillRequests(); }
 }
+// ── Shares between people (secret_sharing.js) ─────────────────────────────────────────────────────────────
+// Received offers wait here as cards: accepting is the one step on the recipient's side. Given shares are listed on
+// each secret's page. A reveal is the emergency door only: the owner opens it for one reveal, for an hour.
+let shareData=null, shareBusy=new Set(), shareMode=null;
+async function loadShares(){
+  const epoch=sessionEpoch;
+  try{ const r=await api('GET','/api/blindkey/shares'); if(epoch!==sessionEpoch||!vaultOpen) return; shareData=r; }
+  catch(e){ if(sessionEnded(e)||e.status===429) return; }
+  renderShareRequests();
+}
+function shareDate(iso){ return iso?new Date(iso).toLocaleDateString():'never'; }
+function renderShareRequests(){
+  const el=document.getElementById('share-requests'); if(!el) return;
+  const rec=(shareData&&shareData.received)||[];
+  const offers=rec.filter(x=>x.state==='offered'), live=rec.filter(x=>x.state==='active');
+  let h=offers.map(x=>'<div class="fill-req"><div><b>@'+esc(x.owner)+'</b> shares <b>'+esc(x.secret.name)+'</b> with you</div>'
+    +(x.note?'<div style="margin-top:0.25rem">“'+esc(x.note)+'”</div>':'')
+    +'<div style="color:var(--text3);margin-top:0.25rem">Use-only: your agents use it through DemiPass ('+esc(x.secret.ref||'')+'); nobody sees the value. Until '+esc(shareDate(x.expires_at))+'.</div>'
+    +'<div class="fr-row"><button class="btn-primary" '+(shareBusy.has(x.id)?'disabled ':'')+'onclick="shareAct('+Number(x.id)+',\'accept\')">Accept</button>'
+    +'<button class="btn-ghost" '+(shareBusy.has(x.id)?'disabled ':'')+'onclick="shareAct('+Number(x.id)+',\'decline\')">Decline</button></div></div>').join('');
+  if(live.length){
+    h+='<div style="padding:0.5rem 1rem 0"><div class="section-title" style="font-size:0.75rem">Shared with you</div>'+live.map(x=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">'
+      +'<span><b>'+esc(x.secret.name)+'</b> <span style="color:var(--text3)">from @'+esc(x.owner)+' · '+esc(x.secret.ref||'')+' · until '+esc(shareDate(x.expires_at))+'</span></span><span style="display:flex;gap:0.3rem">'
+      +(x.reveals_left>0?'<button class="btn-ghost" style="font-size:0.65rem;color:var(--orange)" onclick="shareReveal('+Number(x.id)+')">Emergency reveal</button>':'')
+      +'<button class="btn-ghost" style="font-size:0.65rem" '+(shareBusy.has(x.id)?'disabled ':'')+'onclick="shareAct('+Number(x.id)+',\'decline\')">Stop</button></span></div>').join('')+'<div id="share-reveal-out" style="display:none;font-family:monospace;word-break:break-all;color:var(--red);border:1px solid var(--red);border-radius:8px;padding:0.6rem;margin:0.5rem 0"></div></div>';
+  }
+  el.innerHTML=h;
+}
+async function shareAct(id, act){
+  if(shareBusy.has(id)) return;
+  const x=[...((shareData&&shareData.received)||[]),...((shareData&&shareData.given)||[])].find(y=>y.id===id); if(!x) return;
+  if(act==='decline'&&x.state==='active'&&!confirm('Stop using '+x.secret.name+' from @'+x.owner+'? Your agents lose it.')) return;
+  if(act==='revoke'&&!confirm('Revoke @'+x.recipient+'\'s access to '+x.secret.name+'?')) return;
+  shareBusy.add(id); renderShareRequests();
+  try{ await api('POST','/api/blindkey/shares/'+id+'/'+act); }
+  catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  finally{ shareBusy.delete(id); await loadShares(); if(act==='revoke'||act==='reveal-off') refreshDetail(); }
+}
+// The owner opens the emergency door: one reveal, for an hour, with the PIN. Or closes it again.
+async function revealGrant(id, allow){
+  const x=((shareData&&shareData.given)||[]).find(y=>y.id===id); if(!x) return;
+  if(allow&&!confirm('Let @'+x.recipient+' see the value of '+x.secret.name+' once, within the next hour? Only for typing it somewhere DemiPass cannot reach. It is logged on both accounts.')) return;
+  try{ if(allow) await apiGated('POST','/api/blindkey/shares/'+id+'/reveal-grant',{allow:true,reveals:1,minutes:60},'Allow one reveal of '+x.secret.name+' to @'+x.recipient+'? Your PIN approves it.');
+       else await api('POST','/api/blindkey/shares/'+id+'/reveal-grant',{allow:false}); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  await loadShares(); refreshDetail();
+}
+async function shareReveal(id){
+  const x=((shareData&&shareData.received)||[]).find(y=>y.id===id); if(!x) return;
+  if(!confirm('Reveal '+x.secret.name+'? Logged as a critical event on your account and on @'+x.owner+'\'s.')) return;
+  try{
+    const d=await apiGated('POST','/api/blindkey/shares/'+id+'/reveal',null,'Reveal '+x.secret.name+'? Your PIN approves it.');
+    const out=document.getElementById('share-reveal-out'); if(out){ out.textContent=d.value; out.style.display='block'; setTimeout(()=>{ out.textContent=''; out.style.display='none'; },30000); }
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadShares();
+}
+let detailName=null;
+function refreshDetail(){ if(detailName&&document.getElementById('page-detail').classList.contains('active')) showDetail(detailName); }
+// The secret page's "People" section: who it is shared with, and the share / transfer buttons.
+function peopleSection(s){
+  const given=((shareData&&shareData.given)||[]).filter(x=>x.secret.ref&&x.secret.ref===s.ref&&['offered','active'].includes(x.state));
+  let h='<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">People</div>';
+  if(!given.length) h+='<div style="font-size:0.72rem;color:var(--text3)">Not shared with anyone.</div>';
+  for(const x of given){
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:0.4rem;font-size:0.75rem;padding:0.3rem 0;color:var(--text2)"><span>@'+esc(x.recipient)+' — '+(x.state==='offered'?'waiting for them to accept':'use-only, '+x.use_count+' uses')+' · until '+esc(shareDate(x.expires_at))+(x.reveals_left>0?' · <span style="color:var(--orange)">1 reveal open</span>':'')+'</span><span style="display:flex;gap:0.3rem">'
+      +(x.state==='active'?(x.reveals_left>0?'<button class="btn-ghost" style="font-size:0.65rem" onclick="revealGrant('+Number(x.id)+',false)">Close reveal</button>':'<button class="btn-ghost" style="font-size:0.65rem;color:var(--orange)" onclick="revealGrant('+Number(x.id)+',true)">Emergency reveal…</button>'):'')
+      +'<button class="btn-ghost" style="font-size:0.65rem;color:var(--red)" onclick="shareAct('+Number(x.id)+',\'revoke\')">Revoke</button></span></div>';
+  }
+  h+='<div style="display:flex;gap:0.5rem;margin-top:0.5rem"><button class="btn-ghost" style="flex:1;font-size:0.75rem" onclick="openShare('+jsArg(s.name)+',\'share\')">Share with a person</button><button class="btn-ghost" style="flex:1;font-size:0.75rem" onclick="openShare('+jsArg(s.name)+',\'transfer\')">Transfer to a person</button></div></div>';
+  return h;
+}
+async function openShare(name, mode){
+  shareMode={name,mode};
+  const n=netData||await loadNetwork(); const people=(n&&n.people)||[];
+  document.getElementById('sh-title').textContent=mode==='transfer'?'Transfer to a person':'Share with a person';
+  document.getElementById('sh-what').textContent=name;
+  document.getElementById('sh-go').textContent=mode==='transfer'?'Transfer':'Share';
+  document.getElementById('sh-share-fields').style.display=mode==='share'?'block':'none';
+  document.getElementById('sh-transfer-fields').style.display=mode==='transfer'?'block':'none';
+  document.getElementById('sh-to').innerHTML=people.length?people.map(p=>'<option value="'+esc(p.username)+'">'+esc(p.username)+'</option>').join(''):'<option value="">no people in your network yet</option>';
+  const m=document.getElementById('sh-msg'); m.textContent=people.length?'':'Add them first: Fleet → + Wallet → “A person”.'; m.className='modal-msg'+(people.length?'':' err');
+  openModal('share');
+}
+async function submitShare(){
+  if(!shareMode) return;
+  const to=document.getElementById('sh-to').value, m=document.getElementById('sh-msg');
+  if(!to){ m.textContent='Pick a person'; m.className='modal-msg err'; return; }
+  const {name,mode}=shareMode;
+  try{
+    if(mode==='share'){
+      await apiGated('POST','/api/blindkey/shares',{secret:name,to,expires_in_days:Number(document.getElementById('sh-days').value)},'Share '+name+' with @'+to+' (use-only)? Your PIN approves it.');
+      m.textContent='Offered — @'+to+' accepts it in their app'; m.className='modal-msg ok';
+    } else {
+      const keep=document.getElementById('sh-keep').checked?'use':'none';
+      if(!confirm('Move '+name+' to @'+to+'\'s vault?'+(keep==='use'?' You keep use-only access.':' You keep nothing.'))) return;
+      await apiGated('POST','/api/blindkey/transfer',{secret:name,to,keep},'Transfer '+name+' to @'+to+'? Your PIN approves it.');
+      m.textContent='Transferred to @'+to; m.className='modal-msg ok';
+    }
+    await loadShares();
+    setTimeout(()=>{ closeSheet('share'); if(mode==='transfer') closeDetail(); else refreshDetail(); },900);
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
+}
+
 // Could not learn whether a PIN exists: stay closed, offer retry or sign out.
 function showPinCheckError(why){
   vaultOpen=false;
@@ -1515,6 +1643,7 @@ function toggleGroup(name){
 function showDetail(name) {
   const s = secrets.find(x => x.name === name);
   if(!s) return;
+  detailName = name;
   const el = document.getElementById('detail-content');
   const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
   const healthLabel = s.health==='red'?'FAILING':s.health==='yellow'?'WARNING':s.health==='green'?'HEALTHY':'UNUSED';
@@ -1530,6 +1659,8 @@ function showDetail(name) {
   h += `<div style="background:var(--card);border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.8rem">`;
   h += `<div style="color:var(--text3)">Ref Code</div><div style="font-family:monospace;font-size:0.7rem;margin-bottom:0.5rem;color:var(--accent)">${esc(s.ref||'none')}</div>`;
   if(s.description) h += `<div style="color:var(--text2);margin-bottom:0.5rem;font-size:0.85rem">${esc(s.description)}</div>`;
+  if(s.note) h += `<div style="color:var(--text2);margin-bottom:0.5rem;font-size:0.8rem;border-left:2px solid var(--accent);padding-left:0.5rem">${esc(s.note)}</div>`;
+  if(s.username) h += `<div style="margin-bottom:0.5rem"><span style="color:var(--text3)">Signs in as:</span> ${esc(s.username)}</div>`;
   h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:0.4rem">`;
   h += `<div><span style="color:var(--text3)">Type:</span> ${esc(s.type)}</div>`;
   h += `<div><span style="color:var(--text3)">Uses:</span> ${s.use_count}</div>`;
@@ -1622,6 +1753,8 @@ function showDetail(name) {
     }
     h += `</div>`;
   }
+
+  h += peopleSection(s);
 
   // Reveal section — blind by default, MFA-gated
   h += `<div id="reveal-section" style="margin-bottom:1rem">`;
@@ -1755,6 +1888,8 @@ function updateStoreFields() {
   const t = document.getElementById('s-type').value;
   const loginFields = document.getElementById('s-login-fields');
   const keyFields = document.getElementById('s-key-fields');
+  // A login and an SSH key both sign in as someone: the username is kept with the secret (ssh_exec's default user).
+  document.getElementById('s-user-fields').style.display = (t === 'password' || t === 'ssh_credential') ? 'block' : 'none';
   if (t === 'password') {
     loginFields.style.display = 'block';
     keyFields.style.display = 'none';
@@ -1770,7 +1905,8 @@ async function storeSecret(){
   const t = document.getElementById('s-type').value;
   const exp = document.getElementById('s-expires').value.trim();
   const host = document.getElementById('s-host').value.trim();
-  const username = document.getElementById('s-username')?.value.trim() || '';
+  const username = (t === 'password' || t === 'ssh_credential') ? (document.getElementById('s-username')?.value.trim() || '') : '';
+  const note = document.getElementById('s-note').value.trim();
   const m = document.getElementById('s-msg');
 
   // Get value from the right field based on type
@@ -1793,7 +1929,13 @@ async function storeSecret(){
   const rotDays = parseInt(document.getElementById('s-rotate-days').value, 10);
   const depth = document.getElementById('s-depth').value;
 
-  const body = { name: n, value: v, secret_type: t };
+  // if_absent: a name already in the vault is refused, not overwritten. username and host travel as fields (the host
+  // binds the default scope to that machine), not only as description text.
+  const body = { name: n, value: v, secret_type: t, if_absent: true };
+  if (username) body.username = username;
+  if (host) body.host = host;
+  if (note) body.note = note;
+  if (exp && !/^\d+(m|h|d)$/.test(exp)) { m.textContent='Expires in: a number and m, h or d — e.g. 30d'; m.className='modal-msg err'; return; }
   if (exp) body.expires_in = exp;
   if (desc) body.description = desc;
   if (cat) body.category = cat;
@@ -1809,6 +1951,7 @@ async function storeSecret(){
     document.getElementById('s-username').value='';
     document.getElementById('s-host').value='';
     document.getElementById('s-labels').value='';
+    document.getElementById('s-note').value='';
     document.getElementById('s-rotate-days').value='';
     // Apply non-default security depth after the secret exists.
     let depthErr='';
@@ -2041,7 +2184,8 @@ setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadVault
 document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadVault()});
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadFillRequests()},4000);
+let pollN=0;
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();if(++pollN%4===0)loadShares();}},4000);
 
 // ── QR Scanner ──
 
