@@ -1345,8 +1345,12 @@ async function shareAct(id, act){
   if(act==='decline'&&x.state==='active'&&!confirm('Stop using '+x.secret.name+' from @'+x.owner+'? Your agents lose it.')) return;
   if(act==='revoke'&&!confirm('Revoke @'+x.recipient+'\'s access to '+x.secret.name+'?')) return;
   shareBusy.add(id); renderShareRequests();
-  try{ await api('POST','/api/blindkey/shares/'+id+'/'+act); }
-  catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  try{
+    // Accepting takes the recipient's PIN (intent share-accept:<id>): apiGated asks for it and retries once.
+    if(act==='accept') await apiGated('POST','/api/blindkey/shares/'+id+'/accept',null,'Accept '+x.secret.name+' from @'+x.owner+'? Your PIN approves it.');
+    else await api('POST','/api/blindkey/shares/'+id+'/'+act);
+  }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
   finally{ shareBusy.delete(id); await loadShares(); if(act==='revoke'||act==='reveal-off') refreshDetail(); }
 }
 // The owner opens the emergency door: one reveal, for an hour, with the PIN. Or closes it again.

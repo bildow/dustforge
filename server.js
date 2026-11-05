@@ -9107,8 +9107,12 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
           granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
         WHERE COALESCE(demipass_delegations.delegate_kind, 'agent') = 'agent'
       `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
-      delegation = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?')
+      delegation = db.prepare("SELECT id, COALESCE(delegate_kind, 'agent') AS kind FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?")
         .get(ownerDid, delegate_did, secret.id, contextId);
+      // The upsert skips a person's share on the same key; then nothing was granted — say so, write no grant event.
+      if (delegation && delegation.kind === 'person') {
+        return res.status(409).json({ error: 'that person holds a share of this secret for this context — manage it under shares (POST /api/demipass/shares/:id/…)', share_id: delegation.id });
+      }
     }
 
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
