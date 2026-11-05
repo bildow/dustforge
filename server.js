@@ -4468,7 +4468,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
           }
 
-          const response = await fetch(effectiveUrl, {
+          const response = await useLimits.secretFetch(effectiveUrl, {
             method,
             headers: { [header_name]: header_prefix + decryptedValue, 'Content-Type': 'application/json' },
             body: reqBody ? JSON.stringify(reqBody) : undefined,
@@ -4569,7 +4569,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             ? JSON.stringify(body_template).replace(/\{\{SECRET\}\}/g, secretJsonSafe)
             : JSON.stringify({ key: decryptedValue });
 
-          const bodyResponse = await fetch(effectiveUrl, {
+          const bodyResponse = await useLimits.secretFetch(effectiveUrl, {
             method: bodyMethod,
             headers: { 'Content-Type': content_type },
             body: bodyStr,
@@ -4686,7 +4686,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(403).json({ error: `database host ${dbHost} not in whitelist` });
           }
 
-          const dbResponse = await fetch(db_url, {
+          const dbResponse = await useLimits.secretFetch(db_url, {
             method: 'POST',
             headers: {
               'Authorization': 'Bearer ' + decryptedValue,
@@ -4765,6 +4765,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         } catch (_) {}
         return res.status(413).json(e.body);
       }
+      if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
       return res.status(500).json({ error: `action failed: ${e.message}` });
     }
   }
@@ -4823,7 +4824,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${BLINDKEY_HTTP_HOSTS.join(', ')}. Contact support to add hosts.` });
         }
 
-        const response = await fetch(url, {
+        const response = await useLimits.secretFetch(url, {
           method,
           headers: {
             [header_name]: header_prefix + decryptedValue,
@@ -4959,6 +4960,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     res.json({ ok: true, action, secret_name: name, result });
   } catch (e) {
     if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
+    if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 });
@@ -5654,7 +5656,7 @@ async function handleRowenDeliver(req, res) {
           }
         }
 
-        const response = await fetch(url, {
+        const response = await useLimits.secretFetch(url, {
           method,
           headers: {
             [header_name]: header_prefix + decryptedValue,
@@ -5749,6 +5751,7 @@ async function handleRowenDeliver(req, res) {
     });
   } catch (e) {
     if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
+    if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 }
