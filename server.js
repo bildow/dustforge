@@ -3008,14 +3008,15 @@ function blindkeyPatternMatch(pattern, value) {
 // Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
 function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   const insertCtx = db.prepare(`
-    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, command_allowlist)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(secret_id, context_name) DO UPDATE SET
       action_type = excluded.action_type,
       target_url_pattern = excluded.target_url_pattern,
       target_host_pattern = excluded.target_host_pattern,
       allowed_by = excluded.allowed_by,
-      max_uses = excluded.max_uses
+      max_uses = excluded.max_uses,
+      command_allowlist = excluded.command_allowlist
   `);
   let created = 0;
   for (const ctx of contexts) {
@@ -3029,7 +3030,8 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       ctx.target_url_pattern || '*',
       ctx.target_host_pattern || '*',
       allowedBy,
-      ctx.max_uses || 0
+      ctx.max_uses || 0,
+      ctx.action_type === 'ssh_exec' ? (Array.isArray(ctx.allowed_commands) ? JSON.stringify([...new Set(ctx.allowed_commands.filter(c => typeof c === 'string' && c.trim()).map(c => c.trim()))].slice(0, 50)) : '[]') : null
     );
     created++;
   }
@@ -3037,12 +3039,70 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
 }
 
 // Enforce context rules on a blindkey/use request. Returns { allowed, error }
+// SSH command allow-list per context (red team items 2, 3). NULL = any command (legacy contexts made before
+// 2026-11-05); a JSON array = only these: an exact command, or "prefix *" — the prefix followed by plain words (no shell
+// syntax). New ssh_exec contexts start as [] (nothing runs) until the owner lists commands with the PIN: the
+// forced-command pattern is the default.
+try { db.exec('ALTER TABLE blindkey_contexts ADD COLUMN command_allowlist TEXT DEFAULT NULL'); } catch (_) {}
+const PLAIN_WORDS_RE = /^[A-Za-z0-9._\/:=@%+,-]+( [A-Za-z0-9._\/:=@%+,-]+)*$/;
+function parseAllowedCommands(v) {
+  if (v === undefined || v === null) return { value: null };
+  if (!Array.isArray(v) || v.length > 50 || v.some(c => typeof c !== 'string' || !c.trim() || c.length > 300 || /[\u0000-\u001f]/.test(c))) {
+    return { error: 'allowed_commands: an array of up to 50 commands (an exact command, or "prefix *")' };
+  }
+  return { value: JSON.stringify([...new Set(v.map(c => c.trim()))]) };
+}
+function commandRefusal(contextId, command) {
+  if (!contextId) return null;
+  const row = db.prepare('SELECT command_allowlist FROM blindkey_contexts WHERE id = ?').get(contextId);
+  if (!row || row.command_allowlist === null || row.command_allowlist === undefined) return null;   // legacy: any command
+  let list = [];
+  try { list = JSON.parse(row.command_allowlist) || []; } catch (_) { return 'this scope has an unreadable command list; its owner must set it again'; }
+  const cmd = String(command || '').trim();
+  for (const entry of list) {
+    if (entry === cmd) return null;
+    if (entry.endsWith(' *')) {
+      const prefix = entry.slice(0, -1);   // keeps the trailing space
+      if (cmd.startsWith(prefix) && PLAIN_WORDS_RE.test(cmd.slice(prefix.length))) return null;
+    }
+  }
+  return list.length ? 'this command is not on the allowed list for this secret — its owner adds commands in the DemiPass app' : 'no commands are allowed for this secret yet — its owner adds them in the DemiPass app (forced commands)';
+}
+// Creating, widening or approving a scope (red team item 13): the secret's owner, as a person in their own session, with
+// the PIN for intent scope:<secret id> — the one factor no agent holds. Admin key passes. Returns true or has answered.
+function scopeChangeGate(req, res, secret, what) {
+  const actor = getDemiPassActor(req, null);
+  if (actor.ok && actor.mode === 'admin') return true;
+  const auth = getBearerIdentity(req);
+  const agent = !auth.ok || auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'));
+  if (!auth.ok || agent || !secret || secret.did !== auth.did) {
+    logSecurityEvent('scope_widen_denied', 'critical', { caller_did: auth.did || null, agent_name: auth.agent_name, capability: what, target: secret ? secret.name : null, ip: req.ip,
+      error: !secret || secret.did !== auth.did ? 'not the owner' : 'agent token' });
+    res.status(403).json({ error: 'only the secret\'s owner, in their own session with the PIN, can widen what this secret reaches' });
+    return false;
+  }
+  const intent = `scope:${secret.id}`;
+  if (!gateFresh(auth.did, 'pin', auth, intent)) { res.status(403).json(gateMissing(what, ['pin'], ['pin'], intent)); return false; }
+  const refused = spendSingleUse(auth.did, what, ['pin'], auth, intent);
+  if (refused) { res.status(refused.status || 403).json(refused); return false; }
+  return true;
+}
+
+// The outbound log: one blindkey_events row per connection /use makes, written right before it (red team item 2: a
+// refused use must show no row). Never holds a value — the action and the target only.
+function egressLog(req, secret, action, target) {
+  try {
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+      .run('egress', (req.identity && req.identity.did) || '', secret ? secret.id : null, null, JSON.stringify({ action, target: String(target || '').slice(0, 300) }));
+  } catch (_) {}
+}
+
 function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost) {
   const contexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(secret.id);
 
-  // Backward compatible: no contexts exist and none requested → allow
-  if (contexts.length === 0 && !contextName) {
-    return { allowed: true };
+  // No scope, no use (red team item 12): a secret with no contexts used to be usable against every allow-listed host.
+  if (contexts.length === 0) {
+    return { allowed: false, error: 'this secret has no usage scope yet — its owner sets one in the DemiPass app (host, route, commands)' };
   }
 
   // Contexts exist but none specified → deny
@@ -3328,8 +3388,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       const hostPattern = boundHost && defaultAction === 'ssh_exec' ? boundHost.replace(/:\d+$/, '') : '*';
       const urlPattern = boundHost && ['http_header', 'http_body'].includes(defaultAction) ? `https://${boundHost}/*` : '*';
       db.prepare(
-        "INSERT OR IGNORE INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, 'default', ?, ?, ?, ?)"
-      ).run(stored.id, defaultAction, urlPattern, hostPattern, req.identity.did);
+        "INSERT OR IGNORE INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, command_allowlist) VALUES (?, 'default', ?, ?, ?, ?, ?)"
+      ).run(stored.id, defaultAction, urlPattern, hostPattern, req.identity.did, defaultAction === 'ssh_exec' ? '[]' : null);
     }
 
     // Buoy ingestion tick — anchor this deposit in the tick chain
@@ -4384,6 +4444,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     const issued = captureJson(requestUseTokenHandler, issueReq);
     if (!issued.body || !issued.body.use_token) return res.status(issued.status >= 400 ? issued.status : 500).json(issued.body || { error: 'could not issue a use-token' });
     use_token = issued.body.use_token;
+    // A token this one call minted for itself is spent or dead when the call ends: a refused use never leaves it valid
+    // (refusals would otherwise pile up against the concurrent-token limit).
+    const minted = use_token;
+    res.on('finish', () => { if (res.statusCode >= 300) { try { db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE token = ? AND status = 'valid'").run(minted); } catch (_) {} } });
   }
 
   // ── Use-token mode ──
@@ -4468,6 +4532,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
           }
 
+          egressLog(req, secret, 'http_header', effectiveUrl);   // written before the connection: the outbound log
           const response = await fetch(effectiveUrl, {
             method,
             headers: { [header_name]: header_prefix + decryptedValue, 'Content-Type': 'application/json' },
@@ -4531,6 +4596,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             // its prompt out of the output) and the command gets whatever follows.
             const remote = sudo ? sudoWrap(command, sudo) : command;
             const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+            { const why = commandRefusal(tokenRow.context_id, command); if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'ssh_exec', target: target_host, ip: req.ip, context: { secret: secret.name } }); return res.status(403).json({ error: why }); } }
+            egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
             const output = sshRun(effectiveUser, target_host, password, remote, { input });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
@@ -4569,6 +4636,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             ? JSON.stringify(body_template).replace(/\{\{SECRET\}\}/g, secretJsonSafe)
             : JSON.stringify({ key: decryptedValue });
 
+          egressLog(req, secret, 'http_body', effectiveUrl);   // written before the connection: the outbound log
           const bodyResponse = await fetch(effectiveUrl, {
             method: bodyMethod,
             headers: { 'Content-Type': content_type },
@@ -4620,6 +4688,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           try {
             // FIX #3: use execFileSync (no shell) to prevent injection
             const { execFileSync } = require('child_process');
+            egressLog(req, secret, 'git_clone', target_url || '');   // written before the connection: the outbound log
             const cloneOutput = execFileSync('git', cloneArgs, { timeout: 60000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
             const redacted = cloneOutput.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
             result = { cloned: true, dest_dir, stdout: redacted };
@@ -4650,12 +4719,14 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           const smtpPass = parts.length > 1 ? parts.slice(1).join(':') : decryptedValue;
 
           try {
+            egressLog(req, secret, 'smtp_auth', smtp_host);   // written before the connection: the outbound log
             const transport = require('nodemailer').createTransport({
               host: smtp_host,
               port: Number(smtp_port),
               secure: Number(smtp_port) === 465,
               auth: { user: smtpUser, pass: smtpPass },
-              tls: { rejectUnauthorized: false },
+              // Always verify: AUTH carries the user's password (red team item 11). A bad certificate refuses the use.
+              tls: { rejectUnauthorized: true, servername: smtp_host },
             });
             const info = await transport.sendMail({
               from: from || smtpUser,
@@ -4686,6 +4757,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(403).json({ error: `database host ${dbHost} not in whitelist` });
           }
 
+          egressLog(req, secret, 'database_connect', db_url);   // written before the connection: the outbound log
           const dbResponse = await fetch(db_url, {
             method: 'POST',
             headers: {
@@ -4823,6 +4895,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${BLINDKEY_HTTP_HOSTS.join(', ')}. Contact support to add hosts.` });
         }
 
+        egressLog(req, secret, 'http_header', url);   // written before the connection: the outbound log
         const response = await fetch(url, {
           method,
           headers: {
@@ -4932,6 +5005,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           // No local shell: see sshRun.
           const remote = sudo ? sudoWrap(command, sudo) : command;
           const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+          { const why = commandRefusal(ctxCheck.context_id, command); if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'ssh_exec', target: target_host, ip: req.ip, context: { secret: secret.name } }); return res.status(403).json({ error: why }); } }
+          egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
           const output = sshRun(target_user, target_host, password, remote, { input });
 
           // Redact any echo of credentials in the output
@@ -5083,9 +5158,9 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     let contextsTransferred = 0;
     for (const ctx of oldContexts) {
       db.prepare(`
-        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
+        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
       contextsTransferred++;
     }
 
@@ -5211,6 +5286,14 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
 
     // Insert contexts if provided
     let contexts_created = 0;
+    if (Array.isArray(contexts) && contexts.length > 0 && !dt.admin) {
+      // Scope set by a fleet owner for its agent: the owner's PIN for the agent's new secret (red team item 13).
+      const auth = getBearerIdentity(req);
+      const intent = `scope:${inserted.id}`;
+      if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json({ ...gateMissing('scope', ['pin'], ['pin'], intent), deposited: true, ref: refCode, note: 'the secret was deposited with no scope; add its contexts with the PIN' });
+      const refused = spendSingleUse(auth.did, 'scope', ['pin'], auth, intent);
+      if (refused) return res.status(refused.status || 403).json(refused);
+    }
     if (Array.isArray(contexts) && contexts.length > 0) {
       contexts_created = insertBlindkeyContexts(inserted.id, contexts, 'carbon_deposit');
     }
@@ -5317,6 +5400,10 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   }
 
   if (!secret) return res.status(404).json({ error: 'secret not found' });
+  const cmds = parseAllowedCommands((req.body || {}).allowed_commands);
+  if (cmds.error) return res.status(400).json({ error: cmds.error });
+  // A new scope widens what the secret reaches: the owner's PIN (red team item 13).
+  if (!scopeChangeGate(req, res, secret, 'scope')) return;
 
   try {
     const created = insertBlindkeyContexts(secret.id, [{
@@ -5325,12 +5412,13 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
       target_url_pattern: target_url_pattern || target_url || '*',
       target_host_pattern: target_host_pattern || target_host || '*',
       max_uses: max_uses || 0,
+      allowed_commands: cmds.value ? JSON.parse(cmds.value) : undefined,
     }], isAdmin ? 'admin' : 'owner');
 
     if (created === 0) return res.status(400).json({ error: 'failed to create context' });
 
     const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, context_name);
-    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, max_uses: ctx.max_uses, status: ctx.status } });
+    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, max_uses: ctx.max_uses, status: ctx.status, allowed_commands: ctx.command_allowlist ? JSON.parse(ctx.command_allowlist) : null } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -5352,6 +5440,8 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
   `).get(contextId);
   if (!row) return res.status(404).json({ error: 'context not found' });
   if (actor.mode !== 'admin' && row.did !== actor.did) {
+    // Someone other than the owner — a delegate, say — touching a secret's scope (red team item 2): critical.
+    logSecurityEvent('scope_widen_denied', 'critical', { caller_did: actor.did, capability: 'scope', target: row.secret_name, ip: req.ip, error: 'not the owner', context: { context_id: contextId } });
     return res.status(403).json({ error: 'can only edit your own contexts' });
   }
 
@@ -5363,6 +5453,21 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     max_uses: req.body?.max_uses ?? row.max_uses,
     status: req.body?.status ?? row.status,
   };
+  const cmds = parseAllowedCommands(req.body?.allowed_commands);
+  if (cmds.error) return res.status(400).json({ error: cmds.error });
+  const nextCommands = req.body && 'allowed_commands' in req.body ? cmds.value : row.command_allowlist;
+  // Narrowing stays open to the owner's tokens: revoking, a lower non-zero use cap, fewer allowed commands. Anything
+  // else (a new host, URL, action, a re-activation, more commands, lifting the cap or the list) needs the PIN.
+  const subset = (a, b) => { try { const x = JSON.parse(a || '[]'), y = JSON.parse(b || '[]'); return x.every(c => y.includes(c)); } catch (_) { return false; } };
+  const narrowing = next.context_name === row.context_name && next.action_type === row.action_type
+    && (next.target_url_pattern || '*') === (row.target_url_pattern || '*') && (next.target_host_pattern || '*') === (row.target_host_pattern || '*')
+    && (next.status === row.status || next.status === 'revoked')
+    && (Number(next.max_uses) === Number(row.max_uses) || (Number(next.max_uses) > 0 && (Number(row.max_uses) === 0 || Number(next.max_uses) < Number(row.max_uses))))
+    && (nextCommands === row.command_allowlist || (nextCommands !== null && (row.command_allowlist === null || subset(nextCommands, row.command_allowlist))));
+  if (!narrowing && actor.mode !== 'admin') {
+    const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
+    if (!scopeChangeGate(req, res, secret, 'scope')) return;
+  }
 
   const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
   if (!validActions.includes(next.action_type)) {
@@ -5374,9 +5479,10 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
 
   db.prepare(`
     UPDATE blindkey_contexts
-    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?
+    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?, command_allowlist = ?
     WHERE id = ?
-  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status, contextId);
+  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status,
+         next.action_type === 'ssh_exec' ? (nextCommands ?? null) : null, contextId);
 
   const updated = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(contextId);
   res.json({ ok: true, context: updated });
@@ -9079,8 +9185,10 @@ app.post('/api/blindkey/context/requests/:id/approve', rateLimitStandard, (req, 
   }
 
   // Find the secret to get secret_id
-  const secret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(row.did, row.secret_name, 'active');
+  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(row.did, row.secret_name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret no longer exists or is inactive' });
+  // Approving an agent's context request widens the secret's scope: the owner's PIN (red team item 13).
+  if (!scopeChangeGate(req, res, secret, 'scope')) return;
 
   try {
     // Create the actual context in blindkey_contexts
@@ -11606,8 +11714,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
 
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
     for (const ctx of oldContexts) {
-      db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count) VALUES (?, ?, ?, ?, ?, ?, ?, 0)')
-        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
+      db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)')
+        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
     }
 
     db.prepare(`UPDATE blindkey_secrets SET status = 'revoked', replaced_by = ?, ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(newSecret.id, secret.id);
@@ -12969,7 +13077,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
@@ -13347,8 +13455,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
     // Contexts
     const contexts = db.prepare(
-      "SELECT context_name, action_type, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
-    ).all(s.id);
+      "SELECT id, context_name, action_type, target_host_pattern, target_url_pattern, command_allowlist FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
+    ).all(s.id).map(c => ({ ...c, allowed_commands: c.command_allowlist === null ? null : (() => { try { return JSON.parse(c.command_allowlist); } catch (_) { return []; } })(), command_allowlist: undefined }));
 
     let parsedLabels = [];
     try { parsedLabels = JSON.parse(s.labels || '[]'); } catch(_) {}

@@ -31,6 +31,7 @@ const DEPTHS = new Set(['elevated', 'critical']);
 const META_KEYS = new Set(['use_token', 'approval_id', 'approval_code', 'purpose', 'admin_key']);
 const MAX_BOUND_JSON = 4096;      // a call the owner cannot read in full is not offered for approval
 const MAX_PENDING_PER_REQUESTER = 5;
+const DENY_COOLDOWN_SEC = 10 * 60;  // after the owner denies a requester, it may not ask that owner again for 10 minutes
 
 module.exports = function registerUseApprovals(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
@@ -117,7 +118,8 @@ module.exports = function registerUseApprovals(deps) {
   // ── codes ──────────────────────────────────────────────────────────────────────────────────────────────────────
   const stepNow = () => Math.floor(Date.now() / 1000 / STEP_SEC);
   function codeAt(row, step) {
-    const mac = crypto.createHmac('sha256', Buffer.from(row.code_key, 'hex')).update(`dp-approval:${row.id}:${step}`).digest();
+    // Bound to the request id, its secret and its requester (red team item 4c), and the 30-s step.
+    const mac = crypto.createHmac('sha256', Buffer.from(row.code_key, 'hex')).update(`dp-approval:${row.id}:${row.secret_id}:${row.requester_did}:${step}`).digest();
     return String(mac.readUInt32BE(0) % 1000000).padStart(6, '0');
   }
   // The current code or the one just before it (a code read aloud may cross a 30-s boundary). Constant-time compare.
@@ -170,6 +172,13 @@ module.exports = function registerUseApprovals(deps) {
       ? db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND requester_label = ? AND status = 'pending'").get(requesterDid, secret.did, cleanLabel(label || '', 80)).n
       : db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'pending'").get(requesterDid, secret.did).n;
     if (mine >= MAX_PENDING_PER_REQUESTER) return { error: `you already have ${mine} requests waiting on this owner; wait for them`, status: 429 };
+    // A denial is an answer (red team item 4a): the requester waits before asking this owner again.
+    const denied = db.prepare("SELECT decided_at FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'denied' AND decided_at > ? ORDER BY decided_at DESC LIMIT 1")
+      .get(requesterDid, secret.did, new Date(Date.now() - DENY_COOLDOWN_SEC * 1000).toISOString());
+    if (denied) {
+      const until = new Date(Date.parse(denied.decided_at) + DENY_COOLDOWN_SEC * 1000).toISOString();
+      return { error: `the owner denied your last request — you can ask again after ${until}`, status: 429, extra: { cooldown_until: until } };
+    }
     const pending = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending'").get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
     const id = Number(db.prepare(`INSERT INTO use_approvals (kind, secret_id, owner_did, requester_did, requester_label, delegation_id, depth, purpose, summary,
@@ -244,7 +253,7 @@ module.exports = function registerUseApprovals(deps) {
     const made = createRequest({ secret, kind, requesterDid: caller.did, label: caller.label, delegationId: use.delegationId, purpose: body.purpose,
       binding, call: boundCall({ kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params }),
       summary: summaryOf({ kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params }) });
-    if (made.error) return { status: made.status, body: { error: made.error } };
+    if (made.error) return { status: made.status, body: { error: made.error, ...(made.extra || {}) } };
     return { status: 202, body: pendingReply(made.row, caller.did) };
   }
 
