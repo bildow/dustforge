@@ -6,7 +6,9 @@
 #     chunked; never a dropped connection or a 500; it is charged (the upstream call was made);
 #   - the secret echoed by the upstream comes back [REDACTED];
 #   - a request body under 1 MiB reaches the upstream whole; one over 1 MiB → 413 JSON naming the limit, not charged;
-#   - the real FLEETGATE size (~300 kB diff) goes through.
+#   - the real FLEETGATE size (~300 kB diff) goes through;
+#   - an upstream redirect (302, 307) is refused with 502 and the secret never reaches the redirect target,
+#     in direct and token mode.
 # No network beyond 127.0.0.1.
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -22,11 +24,14 @@ LIMIT=$(node -e 'console.log(require("./use_limits").USE_MAX_RESPONSE_BYTES)')
 # Stand-in upstream. /bytes/N: N bytes of mixed UTF-8 text (sha256 in X-Sha256); add ?chunked to drop Content-Length.
 # /echo-secret: JSON echoing the secret it was sent. POST /echo: how many body bytes arrived.
 node -e '
-const http = require("http"), crypto = require("crypto");
+const http = require("http"), crypto = require("crypto"); let leaks = 0;
 function text(n) { const u = Buffer.from("diff --git a/x b/x\n+é \"q\" \\ ✓ {}\n"); const b = Buffer.alloc(n, 0x61); for (let i = 0; i + u.length <= n; i += u.length) u.copy(b, i); return b; }
 http.createServer((req, res) => {
   const u = new URL(req.url, "http://x"); let got = 0;
   req.on("data", c => got += c.length); req.on("end", () => {
+    if (u.pathname === "/bounce" || u.pathname === "/bounce307") { res.writeHead(u.pathname === "/bounce" ? 302 : 307, { location: "http://127.0.0.1:" + process.argv[1] + "/leak" }); return res.end(); }
+    if (u.pathname === "/leak") { leaks++; res.writeHead(200, { "content-type": "application/json" }); return res.end("{}"); }
+    if (u.pathname === "/leak-count") { res.writeHead(200); return res.end(String(leaks)); }
     const m = u.pathname.match(/^\/bytes\/(\d+)$/);
     if (m) { const b = text(+m[1]); const h = { "content-type": "text/plain; charset=utf-8", "x-sha256": crypto.createHash("sha256").update(b).digest("hex") };
       if (!u.searchParams.has("chunked")) h["content-length"] = b.length;
@@ -106,6 +111,17 @@ python3 -c 'print("r" * 1100000)' > "$S/1100k"
 B0=$(BAL); use /echo POST "$S/1100k"
 [ "$CODE" = 413 ] && [ "$(J limit_bytes < "$S/out")" = 1048576 ] && [ "$(J charged < "$S/out")" = False ] && ok "a 1.1 MB request body → 413 naming the 1048576-byte limit" || fail "big post: $CODE $(head -c 300 "$S/out")"
 [ "$(BAL)" = "$B0" ] && ok "the refused request is not charged" || fail "big post charged: $B0 → $(BAL)"
+
+# Redirects: the allow-list checks only the first URL, so a 30x must never carry the secret onward.
+LEAKS(){ curl -s "http://127.0.0.1:$UP_PORT/leak-count"; }
+use /bounce
+[ "$CODE" = 502 ] && [ "$(J upstream_status < "$S/out")" = 302 ] && ok "direct mode: an upstream 302 → 502 naming the redirect" || fail "302: $CODE $(head -c 300 "$S/out")"
+use /bounce307 POST "$S/900k"
+[ "$CODE" = 502 ] && [ "$(J upstream_status < "$S/out")" = 307 ] && ok "direct mode: an upstream 307 on a POST → 502" || fail "307: $CODE $(head -c 300 "$S/out")"
+UT=$(curl -s -X POST "$API/api/demipass/request-token" -H "Authorization: Bearer $TOK" -H 'content-type: application/json' \
+  -d '{"name":"forge-token","action":"http_header","target_url":"https://repo.dustroot.com/bounce"}' | J use_token)
+uset; [ "$CODE" = 502 ] && ok "token mode: an upstream 302 → 502" || fail "token 302: $CODE $(head -c 300 "$S/out")"
+[ "$(LEAKS)" = 0 ] && ok "the redirect target never received a request (no secret forwarded)" || fail "redirect followed: /leak hit $(LEAKS) time(s)"
 
 [ $fails -gt 0 ] && { echo "--- server.log"; grep -i -m5 "error" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))
