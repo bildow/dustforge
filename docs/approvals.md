@@ -19,9 +19,9 @@ A `/use` on an elevated/critical secret without an approval creates a request an
 { "status": "approval_pending", "approval_id": 41, "expires_at": "…", "owner": "aaron", "depth": "elevated",
   "next": "Park this task. … make the same call once more with approval_id 41 …" }
 ```
-- It binds the exact call: secret, action, target host/URL, and the parameters (command, body, sudo, stdin) —
-  everything except `use_token`, `ref`, `name`, `owner_did`, `approval_id`, `approval_code`, `purpose`, `params`.
-  The same call with another command or URL → 409.
+- It binds the exact call: secret, action, target host/URL, and the whole request body as sent — everything except
+  `use_token`, `approval_id`, `approval_code`, `purpose`. The same call with another command, URL, method or any
+  extra field → 409. Make the resumed call with the same shape as the first (the SDK does).
 - TTL 5 minutes (pending), and 5 minutes from approval to use. One use per approval.
 - The same caller asking for the same call again gets the same request back (no pile-up); its use-token is retired.
   A parked call is charged like any /use (no refund: the DD provenance ledger stays whole). At most 5 requests per
