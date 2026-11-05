@@ -55,3 +55,10 @@ minute). A code seen in a transcript opens no other request and is dead within a
 ## Agents (SDK / MCP)
 `use()` / `ssh()` return the 202 body as data. Park the task — no retry loop — and when it resumes make the same
 call once with `approval_id` (and `approval_code` if the owner read one out). `purpose` tells the owner why.
+
+## Queued (behind the dormancy lock)
+- **Device-bound approvals.** "Approved only from the session that opened it" is session-bound. The stronger form
+  binds the open/approve to a device key enrolled in the phone's secure enclave; it lands with the dormancy lock.
+- **A mechanically derived one-line summary** above the JSON on the request screen — host, action, command — built
+  from the bound body only (never from the agent's text), with the full JSON one tap away. Without it people approve
+  JSON they did not read, which is approval fatigue by another route.
