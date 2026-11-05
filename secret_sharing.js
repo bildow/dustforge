@@ -30,7 +30,7 @@ const MAX_LIST = 100;
 
 module.exports = function registerSecretSharing(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-          logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL } = deps;
+          logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy } = deps;
   const limiter = rateLimitFill || rateLimitStandard;
 
   const nowIso = () => new Date().toISOString();
@@ -42,10 +42,11 @@ module.exports = function registerSecretSharing(deps) {
   } catch (_) {} };
 
   // ── who ─────────────────────────────────────────────────────────────────────────────────────────────────────
-  // An agent wallet: a silicon of some fleet, or an agent member of one. People are every other wallet.
+  // An agent wallet: an active silicon of some fleet (fleet_silicons rows are made with the agent's consent: it was
+  // created by its owner or accepted the join). fleet_members is not used: a fleet owner can add any DID there
+  // without asking, so it would let anyone turn a person into "an agent".
   function isAgentWallet(did) {
-    return Boolean(db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND status = 'active'").get(did)
-      || db.prepare("SELECT 1 FROM fleet_members WHERE member_did = ? AND role = 'agent'").get(did));
+    return Boolean(db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND status = 'active'").get(did));
   }
   function isPeer(x, y) {
     const [a, b] = x < y ? [x, y] : [y, x];
@@ -78,21 +79,36 @@ module.exports = function registerSecretSharing(deps) {
     if (!w || w.status !== 'active') { res.status(403).json({ error: 'account not active' }); return null; }
     return { auth, did: auth.did, username: w.username };
   }
-  // PIN for `intent`, spent once. Returns null when proven, otherwise has already answered.
-  function requirePin(me, intent, action, res) {
-    if (!gateFresh(me.did, 'pin', me.auth, intent)) { res.status(403).json(gateMissing(action, ['pin'], ['pin'], intent)); return false; }
-    const refused = spendSingleUse(me.did, action, ['pin'], me.auth, intent);
+  // Every gate in `required` (the PIN at least) fresh for `intent`, single-use proofs spent once. Returns true when
+  // proven; otherwise it has already answered.
+  function requireGates(me, required, intent, action, res) {
+    const missing = required.filter(g => !gateFresh(me.did, g, me.auth, intent));
+    if (missing.length) { res.status(403).json(gateMissing(action, required, missing, intent)); return false; }
+    const refused = spendSingleUse(me.did, action, required, me.auth, intent);
     if (refused) { res.status(refused.status || 403).json(refused); return false; }
     return true;
   }
+  const requirePin = (me, intent, action, res) => requireGates(me, ['pin'], intent, action, res);
+  // What the owner proves to open a reveal for someone else: the secret's own reveal policy (PIN, plus email/SMS
+  // codes at higher depths) — never less than what revealing it to themselves would take.
+  function ownerRevealGates(secret) {
+    let g = ['pin'];
+    try { const r = resolveGatePolicy(secret).reveal; if (Array.isArray(r) && r.length) g = r; } catch (_) {}
+    return g.includes('pin') ? g : ['pin', ...g];
+  }
 
   // ── what ────────────────────────────────────────────────────────────────────────────────────────────────────
-  // The caller's own redeemable secret, by ref or by name (latest version).
+  // The caller's own live secret, by ref or by name: the active version (never a 'rotating' one on its way out).
+  // A name resolves the way /use resolves it (latest active version of the base name).
   function ownSecret(did, pick) {
     if (!pick || typeof pick !== 'string' || pick.length > 100) return null;
-    if (pick.startsWith('DP-')) return db.prepare(`SELECT * FROM blindkey_secrets WHERE ref_code = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(pick, did) || null;
-    return db.prepare(`SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND ${REDEEMABLE_STATUS_SQL} ORDER BY version DESC LIMIT 1`).get(did, pick) || null;
+    if (pick.startsWith('DP-')) return db.prepare("SELECT * FROM blindkey_secrets WHERE ref_code = ? AND did = ? AND status = 'active'").get(pick, did) || null;
+    return resolveLatestBlindkeySecret(did, pick) || null;
   }
+  const baseName = (n) => String(n).replace(/_v\d+$/, '');
+  // Any row of this name family (base or base_vN) the vault holds, in any status: UNIQUE(did, name) and version
+  // lookups both see them.
+  const nameFamilyTaken = (did, name) => Boolean(db.prepare('SELECT 1 FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?)').get(did, baseName(name), baseName(name) + '_v%'));
   function stateOf(row) {
     if (row.status === 'revoked') return ['declined', 'dropped'].includes(row.offer_state) ? row.offer_state : 'revoked';
     if (expired(row)) return 'expired';
@@ -205,6 +221,8 @@ module.exports = function registerSecretSharing(deps) {
     if (state !== 'offered') return res.status(409).json({ error: `this share is ${state}`, share: view(row, me.did) });
     const secret = db.prepare(`SELECT id FROM blindkey_secrets WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(row.secret_id, row.owner_did);
     if (!secret) return res.status(410).json({ error: 'the owner no longer has this secret' });
+    // The recipient's PIN: an agent signed in as them (device login) cannot take on a share for them.
+    if (!requirePin(me, `share-accept:${row.id}`, 'share-accept', res)) return;
     const done = db.prepare(`UPDATE demipass_delegations SET status = 'active', offer_state = 'accepted', accepted_at = CURRENT_TIMESTAMP
                              WHERE id = ? AND status = 'suspended' AND offer_state = 'offered'`).run(row.id).changes;
     if (done !== 1) return res.status(409).json({ error: 'this share changed meanwhile; reload' });
@@ -258,7 +276,9 @@ module.exports = function registerSecretSharing(deps) {
     if (!Number.isInteger(n) || n < 1 || n > MAX_REVEALS_PER_GRANT) return res.status(400).json({ error: `reveals: 1 to ${MAX_REVEALS_PER_GRANT}` });
     const mins = minutes === undefined || minutes === null ? REVEAL_DEFAULT_MINUTES : minutes;
     if (!Number.isInteger(mins) || mins < 1 || mins > REVEAL_MAX_MINUTES) return res.status(400).json({ error: `minutes: 1 to ${REVEAL_MAX_MINUTES} (a reveal grant is always time-boxed)` });
-    if (!requirePin(me, `reveal-grant:${row.id}`, 'reveal-grant', res)) return;
+    const gsecret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
+    if (!gsecret || gsecret.did !== me.did) return res.status(410).json({ error: 'you no longer own this secret' });
+    if (!requireGates(me, ownerRevealGates(gsecret), `reveal-grant:${row.id}`, 'reveal-grant', res)) return;
     const until = new Date(Date.now() + mins * 60000).toISOString();
     db.prepare('UPDATE demipass_delegations SET reveal_allowed = 1, max_reveals = ?, reveals_used = 0, reveal_granted_at = CURRENT_TIMESTAMP, reveal_until = ? WHERE id = ?').run(n, until, row.id);
     event('share_reveal_granted', me.did, row.secret_id, { delegation_id: row.id, delegate_did: row.delegate_did, reveals: n, until });
@@ -331,19 +351,27 @@ module.exports = function registerSecretSharing(deps) {
     if (!isPeer(me.did, target.did)) return res.status(403).json({ error: `you can transfer only to people you are connected to — add ${target.username} as a person in your network first` });
     if (!['use', 'none'].includes(keep)) return res.status(400).json({ error: "keep: 'use' (you keep use-only access) or 'none'" });
     const days = parseDays(keep_days, KEEP_DEFAULT_DAYS, SHARE_MAX_DAYS, 'keep_days', res); if (days === null) return;
-    let finalName = secret.name;
+    // Mid-rotation the old value is still live for its grace period: finish (or cancel) the rotation first.
+    if (db.prepare("SELECT 1 FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'rotating'").get(me.did, baseName(secret.name), baseName(secret.name) + '_v%')) {
+      return res.status(409).json({ error: `${secret.name} is being rotated — finish the rotation before transferring it` });
+    }
+    // It lands as version 1 under a plain name (no _vN): a version suffix would let it take over a same-named
+    // secret of theirs through /use's latest-version lookup.
+    let finalName = baseName(secret.name);
     if (new_name !== undefined && new_name !== null && new_name !== '') {
       if (typeof new_name !== 'string' || new_name.length > 64 || /[\u0000-\u001f\u007f]/.test(new_name)) return res.status(400).json({ error: 'new_name: at most 64 characters' });
       finalName = new_name.trim();
-    }
-    if (db.prepare('SELECT 1 FROM blindkey_secrets WHERE did = ? AND name = ?').get(target.did, finalName)) {
-      return res.status(409).json({ error: `${target.username} already has a secret named '${finalName}' — send new_name`, name_taken: true });
+      if (!finalName || /_v\d+$/.test(finalName)) return res.status(400).json({ error: 'new_name: a plain name, not ending in _v<number>' });
     }
     if (!requirePin(me, `transfer:${secret.id}`, 'transfer', res)) return;
+    // Checked after the PIN, so whether a name exists in their vault is never answered for free.
+    if (nameFamilyTaken(target.did, finalName)) {
+      return res.status(409).json({ error: `${target.username} already uses the name '${finalName}' — send new_name (the PIN is asked again)`, name_taken: true });
+    }
     let keptId = null, ended = [];
     try {
       db.transaction(() => {
-        const moved = db.prepare(`UPDATE blindkey_secrets SET did = ?, name = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`)
+        const moved = db.prepare(`UPDATE blindkey_secrets SET did = ?, name = ?, version = 1, replaced_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND did = ? AND status = 'active'`)
           .run(target.did, finalName, secret.id, me.did).changes;
         if (moved !== 1) throw Object.assign(new Error('the secret changed meanwhile; reload'), { status: 409 });
         let meta = {}; try { meta = JSON.parse(secret.metadata || '{}') || {}; } catch (_) {}

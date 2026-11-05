@@ -72,6 +72,7 @@ login(){ call POST /api/identity/auth-fingerprint "" '{"username":"'$1'","passwo
 jbody(){ python3 -c 'import json,sys; print(json.dumps(dict(zip(sys.argv[1::2], [json.loads(x) if x[:1] in "[{" or x in ("true","false") or x.lstrip("-").isdigit() else x for x in sys.argv[2::2]]))))' "$@"; }
 pin(){ call POST /api/identity/gate/verify "$1" "$(jbody gate pin pin "$2" intent "$3")"; [ "$CODE" = 200 ] || fail "pin $3: $CODE $BODY"; }
 did(){ Q "SELECT did FROM identity_wallets WHERE username='$1'"; }
+kaccept(){ pin "$K" 8765 "share-accept:$1"; call POST /api/demipass/shares/$1/accept "$K"; }
 noval(){ for v in "$SEC_A" "$SEC_K" "$SEC_KB" "$SEC_DUP"; do case "$BODY" in *"$v"*) return 1;; esac; done; return 0; }
 A=$(login owner-a); K=$(login person-k); X=$(login stranger-x); F=$(login agent-f)
 [ -n "$A" ] && [ "$A" != None ] && [ -n "$K" ] && [ "$K" != None ] && ok "four wallets signed in" || { fail "login: $CODE $BODY"; exit 1; }
@@ -108,8 +109,19 @@ call POST /api/demipass/store "$A" "$KB"; [ "$CODE" = 409 ] && ok "if_absent: st
 grep -q "203.0.113.7" <(node -e 'process.env.BLINDKEY_SSH_HOSTS_EXTRA="203.0.113.7, bad host;rm"; console.log(String(process.env.BLINDKEY_SSH_HOSTS_EXTRA).split(",").map(h=>h.trim()).filter(h=>/^[A-Za-z0-9.:-]{1,253}$/.test(h)).join(" "))') && ok "BLINDKEY_SSH_HOSTS_EXTRA parses (malformed entries dropped)" || fail "extra hosts"
 
 # ── deposit: owner into its own agent, never into a person ──
+call POST /api/demipass/store "$X" '{"name":"x-thing","value":"zzzzzzzz9"}'
 call POST /api/demipass/deposit "$A" '{"name":"f-key","value":"zzzzzzzz4","target_silicon":"agent-f"}'
-[ "$CODE" = 200 ] && [ "$(Q "SELECT did FROM blindkey_secrets WHERE name='f-key'")" = "$DF" ] && [[ $(echo "$BODY" | J ref) == DP-API-* ]] && ok "SDK-shaped deposit (target_silicon) into A's fleet agent → 200 with a ref" || fail "deposit F: $CODE $BODY"
+[ "$CODE" = 403 ] && ok "F joined through the network (its vault stays its own) → deposit refused" || fail "deposit network F: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET joined_via='owner' WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF"
+call POST /api/demipass/deposit "$A" '{"name":"f-key","value":"zzzzzzzz4","target_silicon":"agent-f"}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT did FROM blindkey_secrets WHERE name='f-key'")" = "$DF" ] && [[ $(echo "$BODY" | J ref) == DP-API-* ]] && ok "SDK-shaped deposit (target_silicon) into an agent A made → 200 with a ref" || fail "deposit F: $CODE $BODY"
+call POST /api/demipass/deposit "$A" '{"name":"f-key","value":"zzzzzzzz4b","target_silicon":"agent-f"}'; [ "$CODE" = 409 ] && ok "a deposit never overwrites a secret already in the agent's vault" || fail "deposit overwrite: $CODE $BODY"
+# H1: X makes a fleet, adds K to fleet_members without asking, then tries to deposit over K's secret
+call POST /api/demipass/store "$K" '{"name":"k-github","value":"zzzzzzzzkg"}'
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"INSERT INTO fleets (owner_did, name, slug) VALUES (?, 'x fleet', 'x-fleet')\", (sys.argv[2],)); fid=c.execute(\"SELECT id FROM fleets WHERE slug='x-fleet'\").fetchone()[0]; c.execute(\"INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')\", (fid, sys.argv[3])); c.commit()" "$DB_PATH" "$DX" "$DK"
+call POST /api/demipass/deposit "$X" '{"name":"k-github","value":"zzzzzzzzXX","target_username":"person-k"}'
+[ "$CODE" = 403 ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE did='$DK' AND name='k-github'")" = 1 ] && ok "a fleet that added K to fleet_members without asking cannot deposit into K's vault" || fail "H1 deposit: $CODE $BODY"
+call POST /api/demipass/delegate "$X" "$(jbody secret_name x-thing delegate_did "$DK")"; [ "$CODE" = 403 ] && ok "…nor push a live delegation onto K (K is a person, not an agent)" || fail "H1 delegate: $CODE $BODY"
 call POST /api/demipass/deposit "$A" '{"name":"k-key","value":"zzzzzzzz5","target_username":"person-k"}'; [ "$CODE" = 403 ] && ok "deposit into a person's vault → 403 (share or transfer instead)" || fail "deposit K: $CODE $BODY"
 call POST /api/demipass/deposit "$X" '{"name":"x-key","value":"zzzzzzzz6","target_silicon":"agent-f"}'; [ "$CODE" = 403 ] && ok "deposit into someone else's agent → 403" || fail "deposit X→F: $CODE $BODY"
 call POST /api/demipass/deposit "$A" '{"name":"f-bad","value":"zzzzzzzz7","target_silicon":"agent-f","secret_type":"nope"}'; [ "$CODE" = 400 ] && ok "deposit with an unknown type → 400" || fail "deposit type: $CODE $BODY"
@@ -126,7 +138,6 @@ call POST /api/demipass/shares "$F" '{"secret":"f-key","to":"owner-a"}'; [ "$COD
 call POST /api/demipass/shares "$SIL_K" '{"secret":"forge-token","to":"owner-a"}'; [ "$CODE" = 403 ] && ok "a silicon: token cannot share" || fail "silicon share: $CODE $BODY"
 call POST /api/demipass/shares "$K" '{"secret":"forge-token","to":"owner-a"}'; [ "$CODE" = 404 ] && ok "K cannot share A's secret" || fail "not owner: $CODE $BODY"
 # a stranger: register one not connected to A
-call POST /api/demipass/store "$X" '{"name":"x-thing","value":"zzzzzzzz9"}'
 call POST /api/demipass/shares "$X" '{"secret":"x-thing","to":"person-k"}'; [ "$CODE" = 403 ] && ok "share with someone you are not connected to → 403" || fail "unconnected: $CODE $BODY"
 call POST /api/demipass/shares "$A" '{"secret":"forge-token","to":"person-k","expires_in_days":0}'; [ "$CODE" = 400 ] && ok "a share always expires (0 days → 400)" || fail "days0: $CODE $BODY"
 call POST /api/demipass/shares "$A" '{"secret":"forge-token","to":"person-k","note":"for your fleet"}'
@@ -140,8 +151,11 @@ call GET /api/demipass/menu "$K"; echo "$BODY" | grep -q shares_waiting_for_you 
 call GET /api/demipass/shares "$K"; [ "$(echo "$BODY" | J waiting_for_you)" = 1 ] && [ "$(echo "$BODY" | J received.0.owner)" = owner-a ] && noval && ok "K sees the offer from owner-a (no value)" || fail "K list: $BODY"
 call POST /api/demipass/shares/$SH/accept "$X"; [ "$CODE" = 404 ] && ok "X cannot accept K's share" || fail "X accept: $CODE $BODY"
 call POST /api/demipass/shares/$SH/accept "$SIL_K"; [ "$CODE" = 403 ] && ok "K's silicon agent cannot accept for K" || fail "sil accept: $CODE $BODY"
-call POST /api/demipass/shares/$SH/accept "$K"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J share.state)" = active ] && ok "K accepts — the one step on K's side" || fail "accept: $CODE $BODY"
-call POST /api/demipass/shares/$SH/accept "$K"; [ "$CODE" = 409 ] && ok "accepting twice → 409" || fail "accept2: $CODE"
+call POST /api/demipass/shares/$SH/accept "$K"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "share-accept:$SH" ] && ok "accepting needs K's PIN (intent share-accept:$SH)" || fail "accept pin: $CODE $BODY"
+KDEV=$(node -e 'const identity=require("./identity"),Database=require("better-sqlite3");const db=new Database(process.env.DB_PATH);const w=db.prepare("SELECT * FROM identity_wallets WHERE username=?").get("person-k");console.log(identity.createTokenForIdentity(w.encrypted_private_key,w.did,{scope:"transact",expiresIn:"1h",metadata:{username:w.username,auth_method:"device",agent_label:"k-laptop-agent"}}))')
+call POST /api/demipass/shares/$SH/accept "$KDEV"; [ "$CODE" = 403 ] && ok "an agent signed in as K (device login) cannot accept without K's PIN" || fail "device accept: $CODE $BODY"
+kaccept $SH; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J share.state)" = active ] && ok "K accepts with the PIN — the one step on K's side" || fail "accept: $CODE $BODY"
+kaccept $SH; [ "$CODE" = 409 ] && ok "accepting twice → 409" || fail "accept2: $CODE"
 call POST /api/demipass/use "$K" "$USE_A"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J result.status)" = 200 ] && echo "$BODY" | grep -q REDACTED && noval && ok "K reaches A's secret through /use; the upstream echo comes back [REDACTED], the value is in no response" || fail "K use: $CODE $BODY"
 [ "$(Q "SELECT use_count FROM demipass_delegations WHERE id=$SH")" = 1 ] && ok "the share counts the use" || fail "use_count"
@@ -192,13 +206,13 @@ call POST /api/demipass/use "$K" "$USE_A"; [ "$CODE" = 403 ] && ok "K → 403 af
 pin "$A" 4321 "share:$SID_A"; call POST /api/demipass/shares "$A" '{"secret":"forge-token","to":"person-k"}'; SH2=$(echo "$BODY" | J share.id)
 call POST /api/demipass/shares/$SH2/decline "$K"; [ "$(echo "$BODY" | J share.state)" = declined ] && ok "K declines a new offer" || fail "decline: $CODE $BODY"
 pin "$A" 4321 "share:$SID_A"; call POST /api/demipass/shares "$A" '{"secret":"forge-token","to":"person-k","expires_in_days":1}'; SH3=$(echo "$BODY" | J share.id)
-call POST /api/demipass/shares/$SH3/accept "$K"
+kaccept $SH3
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('UPDATE demipass_delegations SET expires_at=? WHERE id=?', ('2020-01-01T00:00:00.000Z', int(sys.argv[2]))); c.commit()" "$DB_PATH" "$SH3"
 call POST /api/demipass/use "$K" "$USE_A"; [ "$CODE" = 403 ] && ok "an expired share → 403" || fail "expired: $CODE $BODY"
 
 # a ref names one owner's secret, even when the caller has one with the same name
 pin "$A" 4321 "share:$SID_A"; call POST /api/demipass/shares "$A" '{"secret":"forge-token","to":"person-k"}'; SH4=$(echo "$BODY" | J share.id)
-call POST /api/demipass/shares/$SH4/accept "$K"
+kaccept $SH4
 call POST /api/demipass/store "$K" "$(jbody name forge-token value "$SEC_K" secret_type api_key)"
 BA=$(Q "SELECT use_count FROM blindkey_secrets WHERE id=$SID_A"); BK=$(Q "SELECT use_count FROM blindkey_secrets WHERE did='$DK' AND name='forge-token'")
 call POST /api/demipass/use "$K" "$USE_A"
@@ -230,9 +244,25 @@ call POST /api/demipass/transfer "$A" '{"secret":"kyle-racknerd","to":"person-k"
 # name collision
 call POST /api/demipass/store "$K" "$(jbody name dup value zzzzzzzzk1)"; call POST /api/demipass/store "$A" "$(jbody name dup value "$SEC_DUP")"
 SID_D=$(Q "SELECT id FROM blindkey_secrets WHERE did='$DA' AND name='dup'")
-call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k"}'; [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J name_taken)" = True ] && ok "a name K already uses → 409 before any PIN is spent" || fail "dup: $CODE $BODY"
+call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k"}'; [ "$CODE" = 403 ] && ok "whether K has a name is not answered before the PIN" || fail "dup pre-pin: $CODE $BODY"
+pin "$A" 4321 "transfer:$SID_D"; call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k"}'; [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J name_taken)" = True ] && ok "a name K already uses → 409, nothing moved" || fail "dup: $CODE $BODY"
+pin "$A" 4321 "transfer:$SID_D"; call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k","new_name":"dup_v9"}'; [ "$CODE" = 400 ] && ok "new_name ending in _v<n> → 400 (could shadow K's own secret)" || fail "v-suffix: $CODE $BODY"
 pin "$A" 4321 "transfer:$SID_D"; call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k","new_name":"dup-from-a","keep":"none"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J name)" = dup-from-a ] && [ "$(echo "$BODY" | J kept)" = None ] && ok "with new_name it lands as dup-from-a; keep:none leaves A nothing" || fail "dup new_name: $CODE $BODY"
+
+# a versioned name lands as its plain base name, version 1 (never shadowing K's own same-named secret)
+call POST /api/demipass/store "$A" '{"name":"rot_v3","value":"zzzzzzzzr3"}'; python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET version=3 WHERE did=? AND name='rot_v3'\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DA"
+SID_R=$(Q "SELECT id FROM blindkey_secrets WHERE did='$DA' AND name='rot_v3'"); pin "$A" 4321 "transfer:$SID_R"
+call POST /api/demipass/transfer "$A" '{"secret":"rot_v3","to":"person-k","keep":"none"}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT name||'|'||version FROM blindkey_secrets WHERE id=$SID_R")" = "rot|1" ] && ok "rot_v3 (v3) lands in K's vault as 'rot', version 1" || fail "M1: $CODE $BODY $(Q "SELECT name||'|'||version FROM blindkey_secrets WHERE id=$SID_R")"
+# mid-rotation: refused
+call POST /api/demipass/store "$A" '{"name":"spin","value":"zzzzzzzzs1"}'; call POST /api/demipass/store "$A" '{"name":"spin_v2","value":"zzzzzzzzs2"}'
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET status='rotating', rotate_expires_at=datetime('now','+1 hour') WHERE did=? AND name='spin'\", (sys.argv[2],)); c.execute(\"UPDATE blindkey_secrets SET version=2 WHERE did=? AND name='spin_v2'\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DA"
+call POST /api/demipass/transfer "$A" '{"secret":"spin","to":"person-k"}'; [ "$CODE" = 409 ] && echo "$BODY" | grep -q rotat && ok "a secret mid-rotation cannot be transferred" || fail "M2: $CODE $BODY"
+# /use with name + owner_did reaches the owner's secret even when the caller has one with that name
+BA=$(Q "SELECT use_count FROM blindkey_secrets WHERE id=$SID_A")
+call POST /api/demipass/use "$K" "$(jbody name forge-token owner_did "$DA" params '{"url":"https://repo.dustroot.com/echo-secret","method":"GET"}')"
+[ "$CODE" = 200 ] && [ "$(Q "SELECT use_count FROM blindkey_secrets WHERE id=$SID_A")" = $((BA+1)) ] && ok "/use {name, owner_did} uses the owner's secret, not K's same-named one" || fail "L2: $CODE $BODY"
 
 # ── plaintext ──
 for v in "$SEC_A" "$SEC_K" "$SEC_KB" "$SEC_DUP"; do grep -qF -- "$v" "$S/server.log" && fail "a secret value is in the server log"; done; ok "no secret value in the server log"

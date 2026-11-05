@@ -3151,7 +3151,10 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     boundHost = h.toLowerCase();
   }
   if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > 500)) return res.status(400).json({ error: 'note: a string of at most 500 characters' });
-  const typeChoice = secretTypes.resolveType(secret_type, value, { username: accountUsername || '' });
+  // Re-storing an existing name without a type keeps the type it has (inference is for new secrets only).
+  const storedType = (secret_type === undefined || secret_type === null || secret_type === '')
+    ? (db.prepare('SELECT secret_type FROM blindkey_secrets WHERE did = ? AND name = ?').get(req.identity.did, name) || {}).secret_type : null;
+  const typeChoice = storedType ? { type: storedType, inferred: false } : secretTypes.resolveType(secret_type, value, { username: accountUsername || '' });
   if (typeChoice.error) return res.status(400).json(typeChoice);
   // if_absent: refuse instead of overwriting a secret already stored under this name (the app's manual entry sends it).
   if (if_absent === true && db.prepare(`SELECT 1 FROM blindkey_secrets WHERE did = ? AND name = ? AND status NOT IN ('deleted')`).get(req.identity.did, name)) {
@@ -4005,7 +4008,8 @@ setInterval(() => {
 // context_id is NULL here, and SQLite's UNIQUE treats NULLs as distinct, so ON CONFLICT never fires for it: the
 // newest row is updated in place and older duplicates are revoked, so one revoke always ends the access.
 function grantAllContextsDelegation(ownerDid, delegateDid, secretId, grantedBy, { maxUses = 0, expiresAt = null } = {}) {
-  const rows = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL ORDER BY id DESC')
+  // Agent rows only: a person's share (declined, revoked or live) is never revived or rewritten from here.
+  const rows = db.prepare("SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id IS NULL AND COALESCE(delegate_kind, 'agent') = 'agent' ORDER BY id DESC")
     .all(ownerDid, delegateDid, secretId);
   if (!rows.length) {
     return Number(db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
@@ -4017,7 +4021,12 @@ function grantAllContextsDelegation(ownerDid, delegateDid, secretId, grantedBy, 
   return rows[0].id;
 }
 // The action a secret type is used with when the caller names none.
-// (secret_types.js: one table for every type's ref prefix and default action.)
+// The action for a caller who names none: the secret's only active context decides when there is one (so a type
+// relabelled later never fights the context it was stored with), else the type's default (secret_types.js).
+function actionWhenUnnamed(secret) {
+  const ctx = db.prepare("SELECT DISTINCT action_type FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
+  return ctx.length === 1 ? ctx[0].action_type : secretTypes.defaultAction(secret.secret_type);
+}
 // Active secrets other owners share with `did` under `name` (latest version per owner).
 function sharedSecretsNamed(did, name) {
   return db.prepare(`SELECT d.owner_did, w.username AS owner_username, MAX(s.ref_code) AS ref_code
@@ -4102,9 +4111,7 @@ function requestUseTokenHandler(req, res) {
     }
 
     // Auto-resolve action from secret_type if not provided
-    if (!action) {
-      action = secretTypes.defaultAction(refSecret.secret_type);
-    }
+    if (!action) action = actionWhenUnnamed(refSecret);
 
     // Auto-resolve context — use the first active context if not provided
     // Do NOT fabricate 'default' if no contexts exist — that causes enforceBlindkeyContext to reject
@@ -4212,7 +4219,7 @@ function requestUseTokenHandler(req, res) {
     if (picked.error) return res.status(400).json(picked);
     contextName = picked.context;
   }
-  if (!action) action = secretTypes.defaultAction(secret.secret_type);
+  if (!action) action = actionWhenUnnamed(secret);
 
   // Validate context using existing enforceBlindkeyContext
   const ctxCheck = enforceBlindkeyContext(secret, contextName, action, target_url || null, target_host || null);
@@ -4324,7 +4331,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
   let { use_token } = req.body || {};
 
   const b = req.body || {};
-  if (!use_token && (b.ref || (b.name && typeof b.name === 'string' && !resolveLatestBlindkeySecret(req.identity.did, b.name)))) {
+  if (!use_token && (b.ref || (b.name && typeof b.name === 'string' && ((b.owner_did && b.owner_did !== req.identity.did) || !resolveLatestBlindkeySecret(req.identity.did, b.name))))) {
     const p = (b.params && typeof b.params === 'object') ? b.params : {};
     const issueReq = Object.create(req);
     issueReq.body = { ref: b.ref, name: b.name, action: b.action, context: b.context, owner_did: b.owner_did,
@@ -5043,18 +5050,19 @@ app.get('/api/blindkey/types', (_req, res) => {
   });
 });
 
-// The vault a deposit may go into. Admin: any identity. A person: their own agents only — a silicon of a fleet they
-// own, or an agent member of one. Never another person (that is POST /api/demipass/transfer, between connected people).
-function depositTargetRefusal(req, targetDid) {
-  if (ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || req.body?.admin_key || '', ADMIN_API_KEY)) return null;
+// The vault a deposit may go into. Admin: any identity. A person: only a silicon of a fleet they own that they made
+// (fleet_silicons, joined_via 'owner') — not fleet_members (anyone can be added there without asking), not an agent
+// that joined through the network (its vault stays its own), never another person (share or transfer instead).
+// Returns { admin } when allowed, { status, error } when not.
+function depositTarget(req, targetDid) {
+  if (ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || req.body?.admin_key || '', ADMIN_API_KEY)) return { admin: true };
   const auth = getBearerIdentity(req);
   if (!auth.ok) return { status: auth.status || 401, error: auth.error || 'Bearer token or admin key required' };
   if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) return { status: 403, error: 'only the owner deposits into an agent vault' };
-  const mine = db.prepare(`SELECT 1 FROM fleets f WHERE f.owner_did = ? AND f.status = 'active' AND (
-      EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.fleet_id = f.id AND s.member_did = ? AND s.status = 'active')
-      OR EXISTS (SELECT 1 FROM fleet_members m WHERE m.fleet_id = f.id AND m.member_did = ? AND m.role = 'agent'))`).get(auth.did, targetDid, targetDid);
-  if (!mine) return { status: 403, error: "you can deposit only into the vault of an agent in your fleet — to give a person a secret, share it (POST /api/demipass/shares) or transfer it (POST /api/demipass/transfer)" };
-  return null;
+  const mine = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+      WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND COALESCE(s.joined_via, 'owner') != 'network'`).get(auth.did, targetDid);
+  if (!mine) return { status: 403, error: "you can deposit only into the vault of an agent you made in your fleet — to give a person a secret, share it (POST /api/demipass/shares) or transfer it (POST /api/demipass/transfer)" };
+  return { admin: false };
 }
 
 // POST /api/blindkey/deposit — a carbon deposits a secret into one of its silicons' vaults (owner of the fleet, or admin).
@@ -5084,8 +5092,12 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
   // Verify target DID exists
   const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedTargetDid);
   if (!targetWallet) return res.status(404).json({ error: 'target_did not found' });
-  const refusedTarget = depositTargetRefusal(req, resolvedTargetDid);
-  if (refusedTarget) return res.status(refusedTarget.status).json({ error: refusedTarget.error });
+  const dt = depositTarget(req, resolvedTargetDid);
+  if (dt.error) return res.status(dt.status).json({ error: dt.error });
+  // A fleet owner adds to its agent's vault; it never overwrites a secret already there (admin keeps the old upsert).
+  if (!dt.admin && typeof name === 'string' && db.prepare("SELECT 1 FROM blindkey_secrets WHERE did = ? AND name = ? AND status != 'deleted'").get(resolvedTargetDid, name)) {
+    return res.status(409).json({ error: `that agent already has a secret named '${name}' — pick another name` });
+  }
 
   const typeChoice = secretTypes.resolveType(secret_type, value);
   if (typeChoice.error) return res.status(400).json(typeChoice);
@@ -7641,7 +7653,7 @@ require('./network_routes')({
 // Person-to-person shares and ownership transfer (docs/sharing.md).
 const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-  logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL,
+  logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy,
 });
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
@@ -9060,6 +9072,13 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
   if (secretSharing.isPersonPeer(ownerDid, delegate_did)) {
     return res.status(409).json({ error: 'that DID is a person in your network — share with them through POST /api/demipass/shares {"secret","to"}; they accept it in their app', use: 'POST /api/demipass/shares' });
   }
+  // Otherwise a delegation goes to an agent (admin may delegate anywhere): it is live at once, so it is never pushed
+  // onto a person. An agent is an active silicon of some fleet — yours or another owner's (e.g. a partner's agent
+  // using your secret); fleet_silicons rows are made with the agent's consent, fleet_members can be written by
+  // anyone without asking, so it does not count.
+  if (actor.mode !== 'admin' && !secretSharing.isAgentWallet(delegate_did)) {
+    return res.status(403).json({ error: 'a delegation goes to an agent (a silicon in a fleet) — to give a person access, share it (POST /api/demipass/shares); they accept it in their app' });
+  }
 
   // If context_name specified, validate it exists and is active on the secret
   let contextId = null;
@@ -9086,6 +9105,7 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
         ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
           status = 'active', max_uses = excluded.max_uses, use_count = 0,
           granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
+        WHERE COALESCE(demipass_delegations.delegate_kind, 'agent') = 'agent'
       `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
       delegation = db.prepare('SELECT id FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?')
         .get(ownerDid, delegate_did, secret.id, contextId);
@@ -12844,7 +12864,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|transfer|reveal-grant|share-reveal):\d{1,12}$/;   // share:/transfer:<secret id>, reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
