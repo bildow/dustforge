@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DemiPass browser extension</title>
+<meta name="description" content="Install the DemiPass browser extension: save logins to your vault and fill them after you approve on your phone.">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg:#08111a; --surface:#0e1824; --card:#132131; --border:#27445f;
+    --text:#e7f1fb; --text2:#9cb4c9; --text3:#6d8397;
+    --accent:#5fb3ff; --green:#69c7b1; --yellow:#c8a84b; --red:#e06c75;
+  }
+  body { background:var(--bg); color:var(--text); font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; line-height:1.6; min-height:100vh; }
+  a { color:var(--accent); }
+  .header { padding:1.25rem 1rem; max-width:720px; margin:0 auto; display:flex; justify-content:space-between; align-items:center; }
+  .logo { font-size:1.35rem; font-weight:800; text-decoration:none; color:var(--text); }
+  .logo span { color:var(--accent); }
+  .header nav a { color:var(--text2); text-decoration:none; font-size:0.9rem; margin-left:1rem; }
+  main { max-width:720px; margin:0 auto; padding:2rem 1rem 4rem; }
+  h1 { font-size:2rem; line-height:1.2; margin-bottom:0.75rem; }
+  .lede { color:var(--text2); margin-bottom:2rem; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:1.5rem; margin-bottom:1.25rem; }
+  .card h2 { font-size:1.05rem; margin-bottom:0.35rem; }
+  .card p { color:var(--text2); font-size:0.92rem; }
+  .muted { color:var(--text3); font-size:0.82rem; }
+  .btn { display:inline-block; margin-top:1rem; padding:0.85rem 1.6rem; border-radius:8px; border:0; background:var(--accent); color:#08111a; font-weight:800; font-size:1rem; text-decoration:none; cursor:pointer; font-family:inherit; }
+  .btn:hover { filter:brightness(1.08); }
+  .btn:focus-visible, input:focus-visible, .linkish:focus-visible { outline:2px solid var(--green); outline-offset:2px; }
+  .badge { display:inline-block; margin-top:1rem; padding:0.5rem 0.9rem; border-radius:999px; border:1px solid var(--yellow); color:var(--yellow); font-weight:700; font-size:0.9rem; }
+  form.wait { margin-top:1rem; display:flex; gap:0.5rem; flex-wrap:wrap; }
+  form.wait input { flex:1 1 220px; min-width:0; padding:0.7rem 0.85rem; border-radius:8px; border:1px solid var(--border); background:var(--bg); color:var(--text); font-size:0.95rem; font-family:inherit; }
+  form.wait .btn { margin-top:0; }
+  .msg { margin-top:0.6rem; font-size:0.88rem; min-height:1.2em; }
+  .msg.ok { color:var(--green); } .msg.err { color:var(--red); }
+  ul.browsers { list-style:none; margin-top:0.75rem; }
+  ul.browsers li { padding:0.45rem 0; border-top:1px solid var(--border); color:var(--text2); font-size:0.92rem; display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
+  ul.browsers li:first-child { border-top:0; }
+  ul.browsers b { color:var(--text); font-weight:600; }
+  .steps { counter-reset:s; margin-top:0.5rem; }
+  .steps li { list-style:none; counter-increment:s; position:relative; padding-left:2rem; margin:0.55rem 0; color:var(--text2); font-size:0.92rem; }
+  .steps li::before { content:counter(s); position:absolute; left:0; top:0.05rem; width:1.4rem; height:1.4rem; border-radius:50%; background:var(--surface); border:1px solid var(--border); color:var(--accent); font-size:0.75rem; font-weight:800; display:flex; align-items:center; justify-content:center; }
+  .linkish { background:none; border:0; color:var(--accent); font:inherit; font-size:0.88rem; cursor:pointer; text-decoration:underline; padding:0; }
+  code { font-family:'JetBrains Mono',ui-monospace,monospace; font-size:0.78rem; color:var(--text2); word-break:break-all; }
+  [hidden] { display:none !important; }
+  footer { max-width:720px; margin:0 auto; padding:0 1rem 3rem; color:var(--text3); font-size:0.82rem; }
+</style>
+</head>
+<body>
+<div class="header">
+  <a class="logo" href="/">Demi<span>Pass</span></a>
+  <nav><a href="/privacy">Privacy</a><a href="/vault-mobile.html">Sign in</a></nav>
+</div>
+<main>
+  <h1>DemiPass for your browser</h1>
+  <p class="lede">Save logins as you sign in, and fill them later after you approve on your phone. The password goes only to the site it was saved for.</p>
+
+  <!-- Release facts. To publish the Chrome listing: set chrome.status to "listed" (and check chrome.url). -->
+  <script type="application/json" id="release">
+  {
+    "version": "0.1.0",
+    "firefox": {
+      "xpi": "/downloads/demipass-firefox-0.1.0.xpi",
+      "sha256": "21e4cf46c95510aa19dfb55e64110a05092c1ededff9148eb3d8286a4f40f244",
+      "min_version": 153
+    },
+    "chrome": {
+      "status": "pending",
+      "url": "https://chromewebstore.google.com/detail/jmcjhbjckgiphgjdmbhfphffdnmonegd"
+    },
+    "waitlist_api": "https://api.dustforge.com/api/extension/waitlist"
+  }
+  </script>
+
+  <noscript>
+    <div class="card"><h2>Choose your browser</h2>
+      <p><b>Firefox or Zen (desktop):</b> <a href="/downloads/demipass-firefox-0.1.0.xpi">install DemiPass 0.1.0</a> (signed by Mozilla).</p>
+      <p><b>Chrome, Brave or Edge:</b> the Chrome Web Store listing is waiting for review. Turn on JavaScript here to join the waitlist.</p>
+    </div>
+  </noscript>
+
+  <section class="card" id="sec-firefox" data-target="firefox" hidden>
+    <h2 id="ff-title">Firefox</h2>
+    <p>Signed by Mozilla. Firefox asks you to allow the install, then shows what the extension can access.</p>
+    <a class="btn" id="ff-btn" href="/downloads/demipass-firefox-0.1.0.xpi" type="application/x-xpinstall">Add to Firefox</a>
+    <p class="msg err" id="ff-old" hidden></p>
+    <p class="muted" style="margin-top:0.9rem">Version <span class="v">0.1.0</span> · SHA-256 <code id="ff-sha"></code></p>
+  </section>
+
+  <section class="card" id="sec-chrome" data-target="chrome" hidden>
+    <h2 id="cr-title">Chrome</h2>
+    <div id="cr-listed" hidden>
+      <p>Install from the Chrome Web Store.</p>
+      <a class="btn" id="cr-btn" href="#" rel="noopener">Add from Chrome Web Store</a>
+    </div>
+    <div id="cr-pending" hidden>
+      <span class="badge">Pending store review</span>
+      <p style="margin-top:0.9rem">The Chrome Web Store is reviewing DemiPass. Leave your email and we'll write once, when it's listed.</p>
+      <form class="wait" id="wait-form" novalidate>
+        <label for="wait-email" class="muted" hidden>Email</label>
+        <input id="wait-email" type="email" name="email" placeholder="you@example.com" autocomplete="email" required>
+        <button class="btn" type="submit">Notify me</button>
+      </form>
+      <p class="msg" id="wait-msg" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <section class="card" id="sec-other" data-target="other" hidden>
+    <h2>Supported browsers</h2>
+    <p id="other-why">DemiPass doesn't support this browser yet. It works on desktop:</p>
+    <ul class="browsers">
+      <li><b>Firefox</b><span>version 153 or newer</span></li>
+      <li><b>Zen</b><span>current release</span></li>
+      <li><b>Google Chrome</b><span>Chrome Web Store</span></li>
+      <li><b>Brave</b><span>Chrome Web Store</span></li>
+      <li><b>Microsoft Edge</b><span>Chrome Web Store</span></li>
+    </ul>
+  </section>
+
+  <p style="margin:-0.25rem 0 1.5rem"><button class="linkish" id="show-all" type="button">Not your browser? Show every option</button></p>
+
+  <section class="card">
+    <h2>Before you start</h2>
+    <ol class="steps">
+      <li>Install the <a href="/app/demipass.apk">DemiPass Android app</a> and sign in. Your phone approves every pairing and every fill.</li>
+      <li>Add the extension, open it and pair it from the app.</li>
+      <li>Sign in to a site with a password you type, then tap <b>Save</b>.</li>
+      <li>Next time, choose the login and approve the fill with your PIN on your phone.</li>
+    </ol>
+    <p class="muted" style="margin-top:0.9rem">Installs only through your browser's own add-on prompt or store. DemiPass never asks you to run a script, change a browser policy or edit the registry.</p>
+  </section>
+</main>
+<footer>What the extension sends and stores: <a href="/privacy">demipass.com/privacy</a>. Help: <a href="mailto:support@dustforge.com">support@dustforge.com</a>.</footer>
+
+<script>
+(function () {
+  'use strict';
+  var R = JSON.parse(document.getElementById('release').textContent);
+  var $ = function (id) { return document.getElementById(id); };
+
+  // Which install path fits this browser: UA and client hints, confirmed by engine feature checks.
+  async function detect() {
+    var ua = navigator.userAgent || '';
+    var uad = navigator.userAgentData;
+    var brands = (uad && uad.brands ? uad.brands.map(function (b) { return b.brand; }) : []);
+    // Android tablets asking for the desktop site report mobile=false; they still can't run extensions.
+    var mobile = uad ? (!!uad.mobile || uad.platform === 'Android') : /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+    var css = window.CSS && CSS.supports ? CSS.supports.bind(CSS) : function () { return false; };
+
+    // Gecko: Firefox token in the UA and a Gecko-only CSS feature (Zen and other Firefox builds look the same).
+    var ff = /\bFirefox\/(\d+)/.exec(ua);
+    if (ff && /\bGecko\/\d/.test(ua) && css('-moz-appearance', 'none')) {
+      if (mobile) return { target: 'other', why: 'DemiPass for Firefox runs on desktop only.' };
+      return { target: 'firefox', version: +ff[1], name: 'Firefox' };
+    }
+
+    // Chromium: a Blink-only feature plus a brand.
+    var blink = !!window.chrome || brands.indexOf('Chromium') >= 0;
+    if (blink) {
+      if (mobile) return { target: 'other', why: 'Mobile Chrome, Brave and Edge do not run extensions.' };
+      var brave = false;
+      try { brave = !!(navigator.brave && await navigator.brave.isBrave()); } catch (e) {}
+      if (brave) return { target: 'chrome', name: 'Brave' };
+      // Apps built on WebView2 look like Edge but can't run extensions.
+      if (brands.indexOf('Microsoft Edge WebView2') >= 0) return { target: 'other' };
+      if (brands.indexOf('Microsoft Edge') >= 0 || /\bEdg\//.test(ua)) return { target: 'chrome', name: 'Edge' };
+      if (/\bOPR\/|\bYaBrowser\b|\bSamsungBrowser\b/.test(ua) || brands.indexOf('Opera') >= 0) return { target: 'other' };
+      if (brands.indexOf('Google Chrome') >= 0) return { target: 'chrome', name: 'Chrome' };
+      // Plain Chromium (and builds that report only the Chromium brand) install from the Chrome Web Store too.
+      if (brands.indexOf('Chromium') >= 0) return { target: 'chrome', name: 'Chromium' };
+      // No client hints (older Chrome, or hints withheld): fall back on the UA alone.
+      if (!brands.length && /\bChrome\/\d/.test(ua)) return { target: 'chrome', name: 'Chrome' };
+      return { target: 'other' };
+    }
+    return { target: 'other' };
+  }
+
+  function show(target) {
+    ['firefox', 'chrome', 'other'].forEach(function (t) { $('sec-' + t).hidden = target !== 'all' && t !== target; });
+  }
+
+  function setupFirefox(d) {
+    $('ff-btn').href = R.firefox.xpi;
+    $('ff-sha').textContent = R.firefox.sha256;
+    if (d && d.version && d.version < R.firefox.min_version) {
+      $('ff-old').hidden = false;
+      $('ff-old').textContent = 'DemiPass needs Firefox ' + R.firefox.min_version + ' or newer; this is ' + d.version + '. Update Firefox first.';
+    }
+  }
+
+  function setupChrome(d) {
+    var name = (d && d.name) || 'Chrome';
+    $('cr-title').textContent = name === 'Chrome' ? 'Chrome' : name + ' (Chrome Web Store)';
+    var listed = R.chrome.status === 'listed';
+    $('cr-listed').hidden = !listed;
+    $('cr-pending').hidden = listed;
+    if (listed) { $('cr-btn').href = R.chrome.url; $('cr-btn').textContent = 'Add to ' + name; }
+    var browser = name.toLowerCase();
+    $('wait-form').addEventListener('submit', async function (ev) {
+      ev.preventDefault();
+      var email = $('wait-email').value.trim();
+      var msg = $('wait-msg');
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { msg.className = 'msg err'; msg.textContent = 'Enter an email address.'; return; }
+      msg.className = 'msg'; msg.textContent = 'Sending…';
+      try {
+        var r = await fetch(R.waitlist_api, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: email, browser: browser }) });
+        if (!r.ok) throw new Error(r.status === 429 ? 'Too many tries. Wait a few minutes.' : 'That didn’t go through. Try again later.');
+        msg.className = 'msg ok'; msg.textContent = 'Thanks. We’ll email you once when DemiPass is in the Chrome Web Store.';
+        $('wait-form').reset();
+      } catch (e) {
+        msg.className = 'msg err'; msg.textContent = e.message && e.message.indexOf('Fetch') < 0 ? e.message : 'That didn’t go through. Try again later.';
+      }
+    });
+  }
+
+  detect().then(function (d) {
+    document.documentElement.dataset.target = d.target;
+    if (d.target === 'firefox') $('ff-title').textContent = 'Firefox and Zen';
+    if (d.why) $('other-why').textContent = d.why + ' DemiPass works on desktop:';
+    setupFirefox(d.target === 'firefox' ? d : null);
+    setupChrome(d.target === 'chrome' ? d : null);
+    show(d.target);
+    $('show-all').addEventListener('click', function () {
+      if (d.target !== 'other') $('other-why').textContent = 'DemiPass works on desktop:';
+      show('all'); $('show-all').parentNode.hidden = true;
+    });
+  });
+})();
+</script>
+</body>
+</html>

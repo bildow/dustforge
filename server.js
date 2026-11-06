@@ -8043,6 +8043,8 @@ require('./network_routes')({
   barrelGuardedTransfer, transferRefusal: transferBarrelRefusal, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys,   // registered below
 });
+// Browser extension install page (public/extension.html): the Chrome waitlist while the store listing is pending.
+require('./extension_routes')({ app, db });
 // Person-to-person shares and ownership transfer (docs/sharing.md).
 const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
