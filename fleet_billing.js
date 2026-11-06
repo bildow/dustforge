@@ -150,8 +150,11 @@ function initSchema(db) {
   // delegating to it, refilling it and arming its auto-refill take the owner's PIN (red team items 15, 16; #48).
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN created_by_fleet INTEGER DEFAULT 0`); } catch (_) {}
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_confirmed INTEGER DEFAULT 0`); } catch (_) {}
-  try { db.exec(`UPDATE fleet_silicons SET created_by_fleet = 1 WHERE created_by_fleet = 0 AND member_did IN
-      (SELECT did FROM identity_transactions WHERE type = 'account_created' AND provenance = 'fleet_provisioned')`); } catch (_) {}
+  // Backfill: provisioned by THIS row's fleet (the slug is in the account-creation entry), not by any fleet (#48 L).
+  try { db.exec(`UPDATE fleet_silicons SET created_by_fleet = 1 WHERE created_by_fleet = 0 AND EXISTS (
+      SELECT 1 FROM identity_transactions t JOIN fleets f ON f.id = fleet_silicons.fleet_id
+      WHERE t.did = fleet_silicons.member_did AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
+        AND t.description = 'Fleet-provisioned by ' || f.slug)`); } catch (_) {}
   // Threshold refills may be capped per rolling 24 h (0 = no cap). When a silicon is below its threshold and the
   // refill can't run (cap reached, or the source is short), refill_alert_email is told, once per 24 h.
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_daily_cap_cents INTEGER DEFAULT 0`); } catch (_) {}

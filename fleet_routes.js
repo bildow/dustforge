@@ -320,6 +320,12 @@ module.exports = function registerFleetRoutes(deps) {
     if ((req.body || {}).refill_enabled === false || (req.body || {}).refill_enabled === 0) db.prepare('UPDATE fleet_silicons SET refill_confirmed = 0 WHERE id = ?').run(s.id);
     try {
       const updated = fb.updateSiliconSettings(db, s, req.body || {});
+      // A confirmed auto-refill to a wallet the fleet did not create stays confirmed only as the owner confirmed it:
+      // any token-only change to its amounts, cap or source clears the confirmation (#48 review: PIN at 100, then a
+      // token raised it to 10 000 000). Arming again (refill_enabled with the PIN, above) confirms the new rule.
+      const rb = req.body || {};
+      const touched = ['refill_threshold_cents', 'refill_amount_cents', 'refill_daily_cap_cents', 'refill_source'].some(k => rb[k] !== undefined);
+      if (!fb.ownedOutright(s) && touched && !rb.refill_enabled) db.prepare('UPDATE fleet_silicons SET refill_confirmed = 0 WHERE id = ?').run(s.id);
       res.json({ ok: true, silicon: fb.siliconView(db, billing, updated, { fleet: a.fleet }) });
     } catch (e) { fail(res, e); }
   });

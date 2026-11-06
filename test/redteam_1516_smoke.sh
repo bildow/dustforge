@@ -78,6 +78,21 @@ echo "$R" | grep -q "PIN confirmation" && [ "$(Q "SELECT balance_cents FROM iden
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"refill:'$(Q "SELECT id FROM fleet_silicons WHERE handle='linked-h'")'"}'
 call POST /api/fleet/$SLUG/silicons/linked-h/refill "$A" '{"amount_cents":500}'; [ "$CODE" = 200 ] && ok "16: …the owner, with the PIN, refills it" || fail "linked refill pin: $CODE $BODY"
 
+# a fleet-made agent is no exit: its minted token makes no connections; it sends DD only inside the fleet (#48)
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET status='active', joined_via='owner', created_by_fleet=1 WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF"
+call POST /api/fleet/$SLUG/silicons/agent-f/token "$AG" '{"scope":"transact","expires_in":"1h"}'; FM=$(echo "$BODY" | J token)
+call POST /api/network/requests "$FM" '{"to":"outsider-o","as":"person"}'; [ "$CODE" = 403 ] && ok "16: a fleet-minted token cannot make a person connection" || fail "minted connect: $CODE $BODY"
+call POST /api/network/requests "$F" '{"to":"outsider-o","as":"person"}'; RQ=$(echo "$BODY" | J request.id); call POST /api/network/requests/$RQ/accept "$O"
+call POST /api/network/transfers "$F" '{"to":"outsider-o","amount_cents":100}'; [ "$CODE" = 403 ] && ok "16: a fleet-made agent cannot send DD out of its fleet" || fail "fleet exit send: $CODE $BODY"
+call POST /api/network/transfers "$F" '{"to":"owner-a","amount_cents":1}'; [ "$CODE" = 201 ] && ok "16: …it can still send to its owner" || fail "send to owner: $CODE $BODY"
+# a PIN-confirmed refill rule raised by a token alone is no longer confirmed (#48)
+LID=$(Q "SELECT id FROM fleet_silicons WHERE handle='linked-h'")
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"refill:'$LID'"}'
+call PATCH /api/fleet/$SLUG/silicons/linked-h "$A" '{"refill_enabled":true,"refill_threshold_cents":100,"refill_amount_cents":100}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT refill_confirmed FROM fleet_silicons WHERE id=$LID")" = 1 ] || fail "arm with pin: $CODE $BODY"
+call PATCH /api/fleet/$SLUG/silicons/linked-h "$AG" '{"refill_threshold_cents":10000000,"refill_amount_cents":10000000}'
+[ "$(Q "SELECT refill_confirmed FROM fleet_silicons WHERE id=$LID")" = 0 ] && ok "16: raising a confirmed refill on a token alone clears the confirmation" || fail "escalate: $CODE $(Q "SELECT refill_confirmed FROM fleet_silicons WHERE id=$LID")"
+
 # ── item 16 ──
 B0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")
 call POST /api/wallet/transfer "$AG" '{"from_did":"'$(did owner-a)'","to_did":"'$(did owner-b)'","amount_cents":5000}'

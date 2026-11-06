@@ -265,7 +265,9 @@ module.exports = function registerNetworkRoutes(deps) {
     const target = findWallet(b.to);
     if (!target || target.status !== 'active') return res.status(404).json({ error: 'no wallet by that name' });
     if (target.did === me) return res.status(400).json({ error: 'that is your own wallet' });
-    if (kind !== 'person' && w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot change fleet membership; sign in as this wallet' });
+    // A fleet-minted token speaks for the fleet's agent, which the owner controls on a token alone: it makes no
+    // connections of any kind (a person connection was its way to send DD out of the fleet — #48 review).
+    if (w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot make connections; sign in as this wallet' });
     // A `join` request hands the asker to the target's fleet with no step on the asker's side after this one, so
     // it is for wallets with no PIN (agents). A wallet with a PIN asks the owner to invite it and accepts with the PIN.
     if (kind === 'join' && w.wallet.pin_hash) {
@@ -445,6 +447,15 @@ module.exports = function registerNetworkRoutes(deps) {
     if (!to || to.status !== 'active') return res.status(404).json({ error: 'no wallet by that name' });
     if (to.did === me) return res.status(400).json({ error: 'that is your own wallet' });
     if (!connected(me, to.did)) return res.status(403).json({ error: `connect with ${to.username} first (Add wallet), then send` });
+    // An agent the fleet created moves DD only inside its fleet (its owner or a fellow fleet-created agent): it has no PIN and its
+    // owner can mint its tokens, so a send out of the fleet would be the owner's DD leaving on a token alone (#48 review).
+    {
+      const own = db.prepare(`SELECT s.fleet_id, f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+          WHERE s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1`).get(me);
+      if (own && to.did !== own.owner_did && !db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1").get(own.fleet_id, to.did)) {
+        return res.status(403).json({ error: 'an agent your fleet created sends DD only to its owner or another agent the fleet created' });
+      }
+    }
     const session = gateSession(w.auth);
     if (!session) return res.status(403).json({ error: 'this token cannot send DD — sign in again' });
     expireOld();
