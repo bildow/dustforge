@@ -17,7 +17,7 @@ H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
 for (const c of ["idempotency_key TEXT", "provenance TEXT DEFAULT '"'"'organic'"'"'"]) { try { db.exec("ALTER TABLE identity_transactions ADD COLUMN " + c); } catch (_) {} }
-for (const u of ["owner-a", "agent-f", "owner-b", "agent-g"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
+for (const u of ["owner-a", "agent-f", "owner-b", "agent-g", "outsider-o"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 100000, ?)").run(id.did, u, u + "@dustforge.com", enc, process.argv[1]);
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 100000, ?, ?, 100000)").run(id.did, "topup", "smoke"); }' "$H"
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
@@ -30,7 +30,7 @@ call(){ local m=$1 p=$2 t=$3 b=${4:-}
   BODY=$(curl -s -o - -w '\n%{http_code}' -X "$m" "$API$p" -H 'Content-Type: application/json' ${t:+-H "Authorization: Bearer $t"} ${b:+-d "$b"})
   CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}; }
 login(){ call POST /api/identity/auth-fingerprint "" '{"username":"'$1'","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
-A=$(login owner-a); AG=$(login owner-a); F=$(login agent-f); B=$(login owner-b); G=$(login agent-g)
+A=$(login owner-a); AG=$(login owner-a); F=$(login agent-f); B=$(login owner-b); G=$(login agent-g); O=$(login outsider-o)
 call POST /api/identity/pin "$A" '{"pin":"4321","password":"hunter22"}'
 did(){ Q "SELECT did FROM identity_wallets WHERE username='$1'"; }
 # agent-f joins A's fleet, agent-g joins B's (each accepts: consented fleet_silicons)
@@ -55,13 +55,28 @@ call POST /api/fleet/$SLUG/silicons/agent-f/delegate "$AG" '{"secret_name":"svc"
 call POST /api/fleet/$SLUG/silicons/agent-f/refill "$AG" '{"amount_cents":500}'; [ "$CODE" = 403 ] && ok "16: …and no refill to it on a token alone" || fail "refill laundered: $CODE $BODY"
 call PATCH /api/fleet/$SLUG/silicons/agent-f "$AG" '{"refill_enabled":true,"refill_amount_cents":500,"refill_threshold_cents":100}'; [ "$CODE" = 403 ] && ok "16: …nor automatic refills switched on for it" || fail "auto refill laundered: $CODE $BODY"
 # an agent the fleet itself made (it holds that wallet's key) stays the owner's own
-python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET joined_via='owner' WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET joined_via='owner', created_by_fleet=1 WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF"
 call POST /api/demipass/delegate "$AG" '{"secret_name":"svc","delegate_did":"'$DF'"}'
 [ "$CODE" = 200 ] && ok "15: delegating to an agent the owner's fleet made still works from the owner's session" || fail "own agent: $CODE $BODY"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET status='left' WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF" 2>/dev/null
 call POST /api/demipass/store "$A" '{"name":"svc2","value":"svc2-token-zz96","secret_type":"api_key","host":"repo.dustroot.com"}'
 call POST /api/demipass/delegate "$AG" '{"secret_name":"svc2","delegate_did":"'$DF'"}'
 [ "$CODE" = 403 ] && ok "15: an agent that left the owner's fleet is an outside agent again (PIN)" || fail "left agent: $CODE $BODY"
+
+# linking an existing wallet (owner token + its own sign-in token) does not make it the owner's (#48 review)
+call POST /api/fleet/$SLUG/silicons "$AG" '{"handle":"linked-h","did":"'$(did outsider-o)'","member_token":"'$O'","refill":{"enabled":true,"threshold_cents":100000000,"amount_cents":5000}}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT created_by_fleet||':'||refill_enabled FROM fleet_silicons WHERE handle='linked-h'")" = "0:0" ] && ok "15/16: a linked wallet is not owned outright, and no refill is armed at link time" || fail "link: $CODE $BODY $(Q "SELECT created_by_fleet||':'||refill_enabled FROM fleet_silicons WHERE handle='linked-h'")"
+call POST /api/demipass/delegate "$AG" '{"secret_name":"svc","delegate_did":"'$(did outsider-o)'"}'; [ "$CODE" = 403 ] && ok "15: …delegating to it takes the PIN" || fail "linked delegate: $CODE $BODY"
+B1=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")
+call POST /api/fleet/$SLUG/silicons/linked-h/refill "$AG" '{"amount_cents":500}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "refill:$(Q "SELECT id FROM fleet_silicons WHERE handle='linked-h'")" ] && ok "16: …refilling it takes the PIN" || fail "linked refill: $CODE $BODY"
+call PATCH /api/fleet/$SLUG/silicons/linked-h "$AG" '{"refill_enabled":true}'; [ "$CODE" = 403 ] && ok "16: …and so does arming its auto-refill" || fail "linked arm: $CODE $BODY"
+# the scheduler: a legacy armed row for a wallet the fleet did not create is skipped until the owner confirms
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET refill_enabled=1, refill_threshold_cents=100000000, refill_amount_cents=500 WHERE handle='linked-h'\"); c.commit()" "$DB_PATH"
+R=$(node -e 'const Database=require("better-sqlite3"); const db=new Database(process.env.DB_PATH); const fb=require("./fleet_billing"); const billing=require("./billing");
+const s=db.prepare("SELECT * FROM fleet_silicons WHERE handle=?").get("linked-h"); console.log(JSON.stringify(fb.thresholdRefill(db, billing, s, {})));')
+echo "$R" | grep -q "PIN confirmation" && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$B1" ] && ok "16: the auto-refill scheduler skips an unconfirmed wallet the fleet did not create" || fail "scheduler: $R"
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"refill:'$(Q "SELECT id FROM fleet_silicons WHERE handle='linked-h'")'"}'
+call POST /api/fleet/$SLUG/silicons/linked-h/refill "$A" '{"amount_cents":500}'; [ "$CODE" = 200 ] && ok "16: …the owner, with the PIN, refills it" || fail "linked refill pin: $CODE $BODY"
 
 # ── item 16 ──
 B0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")

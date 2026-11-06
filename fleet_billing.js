@@ -145,6 +145,13 @@ function initSchema(db) {
   // link: the owner holds its key and may mint its tokens and workers) or 'network' (the wallet accepted a network
   // request: it keeps its own key; the owner refills it, delegates to it and sees its spend, and mints nothing).
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN joined_via TEXT DEFAULT 'owner'`); } catch (_) {}
+  // Owned outright: a wallet this fleet created (it holds the key; nobody outside signs in as it). Only these take the
+  // owner's secrets and DD on the owner's token alone; a linked or network-joined wallet is someone's own, so
+  // delegating to it, refilling it and arming its auto-refill take the owner's PIN (red team items 15, 16; #48).
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN created_by_fleet INTEGER DEFAULT 0`); } catch (_) {}
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_confirmed INTEGER DEFAULT 0`); } catch (_) {}
+  try { db.exec(`UPDATE fleet_silicons SET created_by_fleet = 1 WHERE created_by_fleet = 0 AND member_did IN
+      (SELECT did FROM identity_transactions WHERE type = 'account_created' AND provenance = 'fleet_provisioned')`); } catch (_) {}
   // Threshold refills may be capped per rolling 24 h (0 = no cap). When a silicon is below its threshold and the
   // refill can't run (cap reached, or the source is short), refill_alert_email is told, once per 24 h.
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_daily_cap_cents INTEGER DEFAULT 0`); } catch (_) {}
@@ -502,10 +509,12 @@ function autoRefilledLast24h(db, did, now = Date.now()) {
   return r ? r.c : 0;
 }
 
+function ownedOutright(s) { return Boolean(s) && Number(s.created_by_fleet) === 1 && (s.joined_via || 'owner') !== 'network'; }
 function thresholdRefill(db, billing, s, { force = false, amount = null, now = Date.now(), ledger = null } = {}) {
   let amt = Number(amount != null ? amount : s.refill_amount_cents);
   if (!force) {
     if (!s.refill_enabled || !(s.refill_threshold_cents > 0) || !(amt > 0)) return { ok: false, skipped: 'rule disabled' };
+    if (!ownedOutright(s) && !Number(s.refill_confirmed)) return { ok: false, skipped: 'auto-refill to a wallet the fleet did not create needs the owner\'s PIN confirmation' };
     const bal = billing.getDerivedBalance(db, s.member_did);
     if (bal >= s.refill_threshold_cents) return { ok: false, skipped: 'above threshold', balance_cents: bal };
     if (s.last_refill_at && now - new Date(s.last_refill_at + 'Z').getTime() < REFILL_COOLDOWN_MS) return { ok: false, skipped: 'cooldown' };
@@ -970,6 +979,7 @@ function tokenWarningEmail({ silicon, token }) {
 }
 
 module.exports = {
+  ownedOutright,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,

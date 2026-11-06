@@ -8009,6 +8009,7 @@ billing.setAttribution(fleetBilling, require('./dd_ledger'));
 const fleetRoutes = require('./fleet_routes')({
   app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
   rateLimitStandard, adminKey: ADMIN_API_KEY, crypto, grantAllContextsDelegation,
+  getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
 });
 // Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
 require('./network_routes')({
@@ -9482,10 +9483,10 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
       logSecurityEvent('delegate_denied', 'critical', { caller_did: ownerDid, capability: 'delegate', target: secret.name, ip: req.ip, error: 'agent token', context: { delegate_did } });
       return res.status(403).json({ error: 'agents do not hand out secrets; the owner delegates from their own session' });
     }
-    // An agent the owner's fleet made (it holds that wallet's key); one that joined through the network is someone
-    // else's wallet, which a token alone can invite in (#48 review): that counts as outside.
+    // An agent the owner's fleet created (owned outright, fleet_billing.ownedOutright); a linked or network-joined
+    // wallet is someone's own, which a token alone can bring in (#48 review): that counts as outside.
     const ownAgent = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
-        WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND COALESCE(s.joined_via, 'owner') != 'network'`).get(ownerDid, delegate_did);
+        WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'`).get(ownerDid, delegate_did);
     if (!ownAgent && !scopeChangeGate(req, res, secret, 'delegate')) return;
   }
 
@@ -13296,7 +13297,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
