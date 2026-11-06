@@ -1589,6 +1589,8 @@ test('a waiting transfer is listed with Cancel for both sides; Cancel calls the 
   assert.match(h, /<b>@kyle<\/b> is transferring <b>wifi<\/b> to you/); assert.match(h, /Cancel transfer/); assert.doesNotMatch(h, /panel/, 'finished transfers are not listed as waiting');
   await pg.ctx.cancelTransfer(7); await settle();
   assert.equal(cancelled, 7);
+});
+
 // ── Vouching (red team item 6) ──
 test('an introduction shows the voucher and the other person; Accept goes through the PIN gate', async () => {
   let accepted = null;
