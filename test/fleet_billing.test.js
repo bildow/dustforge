@@ -5,6 +5,9 @@ const assert = require('node:assert/strict');
 const Database = require('better-sqlite3');
 const billing = require('../billing');
 const fb = require('../fleet_billing');
+// The silicons these tests make stand for fleet-created ones (owned outright: refills run on the owner's token).
+// A linked or network-joined wallet needs the owner's PIN first — covered by test/redteam_1516_smoke.sh.
+{ const up = fb.upsertSilicon; fb.upsertSilicon = (db, o) => { const s = up(db, o); db.prepare('UPDATE fleet_silicons SET created_by_fleet = 1 WHERE id = ?').run(s.id); return fb.getSilicon(db, o.fleetId, o.memberDid); }; }
 
 const OWNER = 'did:key:owner';
 const BRAIN = 'did:key:brain';

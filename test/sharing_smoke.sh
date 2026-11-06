@@ -112,7 +112,7 @@ grep -q "203.0.113.7" <(node -e 'process.env.BLINDKEY_SSH_HOSTS_EXTRA="203.0.113
 call POST /api/demipass/store "$X" '{"name":"x-thing","value":"zzzzzzzz9"}'
 call POST /api/demipass/deposit "$A" '{"name":"f-key","value":"zzzzzzzz4","target_silicon":"agent-f"}'
 [ "$CODE" = 403 ] && ok "F joined through the network (its vault stays its own) → deposit refused" || fail "deposit network F: $CODE $BODY"
-python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET joined_via='owner' WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET joined_via='owner', created_by_fleet=1 WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF"
 call POST /api/demipass/deposit "$A" '{"name":"f-key","value":"zzzzzzzz4","target_silicon":"agent-f"}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT did FROM blindkey_secrets WHERE name='f-key'")" = "$DF" ] && [[ $(echo "$BODY" | J ref) == DP-API-* ]] && ok "SDK-shaped deposit (target_silicon) into an agent A made → 200 with a ref" || fail "deposit F: $CODE $BODY"
 call POST /api/demipass/deposit "$A" '{"name":"f-key","value":"zzzzzzzz4b","target_silicon":"agent-f"}'; [ "$CODE" = 409 ] && ok "a deposit never overwrites a secret already in the agent's vault" || fail "deposit overwrite: $CODE $BODY"

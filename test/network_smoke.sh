@@ -174,11 +174,17 @@ call POST /api/network/topups "$F" '{"amount_cents":15}'; TUR=$(echo "$BODY" | J
 call POST /api/network/transfers "$F" '{"to":"owner-a","amount_cents":1}'; call POST /api/network/transfers/$(echo "$BODY" | J transfer.id)/confirm "$F"
 [ "$CODE" = 200 ] && [ "$(Q "SELECT status FROM network_topups WHERE id=$TUR")" = pending ] && ok "DD from the agent to its owner does not close its ask" || fail "agent→owner closed: $CODE $(Q "SELECT status FROM network_topups WHERE id=$TUR")"
 call POST /api/fleet/$SLUG/silicons/agent-f/refill "$A" '{"amount_cents":15}'
-[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUR")" = "sent:15" ] && ok "a fleet refill answers the ask too" || fail "refill close: $CODE $BODY $(Q "SELECT status FROM network_topups WHERE id=$TUR")"
+[ "$CODE" = 403 ] && ok "no token-only refill to an agent that joined through the network (red team 16, #48)" || fail "refill network agent: $CODE $BODY"
+psend(){ call POST /api/network/transfers "$A" '{"to":"agent-f","amount_cents":'$1'}'; local t; t=$(echo "$BODY" | J transfer.id)
+  call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"send:'$t'"}'; call POST /api/network/transfers/$t/confirm "$A"; }
+psend 15
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUR")" = "sent:15" ] && ok "a PIN-confirmed send answers the ask" || fail "send close: $CODE $BODY $(Q "SELECT status FROM network_topups WHERE id=$TUR")"
 call POST /api/network/topups "$F" '{"amount_cents":6}'; TUW=$(echo "$BODY" | J topup.id)
 FDID=$(Q "SELECT did FROM identity_wallets WHERE username='agent-f'"); ADID=$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")
 call POST /api/wallet/transfer "$A" '{"from_did":"'$ADID'","to_did":"'$FDID'","amount_cents":6}'
-[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUW")" = "sent:6" ] && ok "/api/wallet/transfer from the owner answers the ask too" || fail "wallet transfer close: $CODE $BODY"
+[ "$CODE" = 410 ] && ok "/api/wallet/transfer is retired (red team item 16): 410" || fail "wallet transfer retired: $CODE $BODY"
+psend 6
+[ "$CODE" = 200 ] && [ "$(Q "SELECT status||':'||sent_cents FROM network_topups WHERE id=$TUW")" = "sent:6" ] && ok "a second ask is answered the same way" || fail "send close 2: $CODE $BODY"
 call POST /api/network/transfers "$K" '{"to":"owner-a","amount_cents":999999}'; call POST /api/network/transfers/$(echo "$BODY" | J transfer.id)/confirm "$K"
 echo "$BODY" | grep -q '"topup"' && fail "a person (not an agent) got the top-up hint: $CODE" || ok "a person short of DD gets no top-up hint ($CODE)"
 call POST /api/identity/create "" '{"username":"nokey-x"}'; [ "$CODE" = 402 ] && ! echo "$BODY" | grep -q '"topup"' && ok "an anonymous 402 (account needs payment) carries no top-up hint" || fail "anon 402: $CODE $BODY"
@@ -252,7 +258,7 @@ call POST /api/network/leave-fleet "$L"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" 
 call GET /api/network "$LM"; [ "$CODE" = 401 ] && ok "A's minted token for L died" || fail "cut: $CODE $BODY"
 call GET /api/network "$LW"; [ "$CODE" = 401 ] && ok "A's worker token for L died" || fail "worker cut: $CODE $BODY"
 call POST /api/wallet/transfer "$LM" '{"from_did":"'$LDID'","to_did":"'$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")'","amount_cents":1}'
-[ "$CODE" = 401 ] && ok "the dead minted token cannot move DD through /api/wallet/transfer" || fail "legacy transfer with cut token: $CODE $BODY"
+{ [ "$CODE" = 401 ] || [ "$CODE" = 410 ]; } && ok "the dead minted token cannot move DD through /api/wallet/transfer" || fail "legacy transfer with cut token: $CODE $BODY"
 call POST /api/fleet/$SLUG/fund "$LM" '{"amount_cents":1}'; [ "$CODE" = 401 ] && ok "nor through /api/fleet/:slug/fund" || fail "fund with cut token: $CODE $BODY"
 L=$(login legacy-l); call GET /api/network "$L"; [ "$CODE" = 200 ] && ok "L signs in again" || fail "L relogin: $CODE"
 # owner removal revokes the workers the owner made: re-link L, make a worker, remove L
