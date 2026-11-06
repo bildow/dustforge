@@ -136,6 +136,8 @@ call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 200 
 for i in 1 2 3 4; do call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; done
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J attempts_left)" = 1 ] && ok "four misses in B → 1 try left" || fail "misses: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; [ "$CODE" = 429 ] && ok "fifth miss → 429 locked" || fail "lock: $CODE $BODY"
+call GET /api/identity/gate/status "$TK2"; [ "$CODE" = 401 ] && ok "…and the session that ran out of tries is ended (full login)" || fail "session after lock: $CODE"
+TK2=$(login)   # B ran out of tries: its session ended (5 wrong PINs → full login, red team item 8); sign in again
 call POST /api/blindkey/reveal "$TK" '{"name":"sightless"}'; [ "$CODE" = 403 ] && ok "A's pre-lock proof is void: reveal → 403 while locked" || fail "locked reveal: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 429 ] && [ "$(echo "$BODY" | J locked_for_seconds)" -gt 800 ] && ok "correct PIN while locked → 429 (~15 min)" || fail "locked-correct: $CODE $BODY"
 call POST /api/identity/pin "$TK" '{"pin":"5678","current_pin":"1234"}'; [ "$CODE" = 429 ] && ok "change with current PIN while locked → 429" || fail "change-locked: $CODE"
@@ -146,9 +148,11 @@ SQL "$LOCK_ENDED"   # the 15 minutes pass (the lock's end stays on record)
 # ── locks escalate: a lock within a day of the last doubles, the third in a row only the password clears ──
 for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; done
 [ "$CODE" = 429 ] && [ "$(echo "$BODY" | J locked_for_seconds)" = 1800 ] && ok "a second lock within a day lasts 30 min" || fail "lock 2: $CODE $BODY"
+TK2=$(login)   # B ran out of tries: its session ended (5 wrong PINs → full login, red team item 8); sign in again
 SQL "$LOCK_ENDED"
 for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; done
 [ "$CODE" = 429 ] && [ "$(echo "$BODY" | J hard_locked)" = True ] && ok "the third lock in a row is a hard lock" || fail "lock 3: $CODE $BODY"
+TK2=$(login)   # B ran out of tries: its session ended (5 wrong PINs → full login, red team item 8); sign in again
 call GET /api/identity/gate/status "$TK"; [ "$(echo "$BODY" | J pin_hard_locked)" = True ] && [ "$(echo "$BODY" | J pin_locked_for_seconds)" = None ] && ok "gate/status reports the hard lock" || fail "hard status: $BODY"
 call POST /api/identity/gate/verify "$TK" "$(PINB 1234 "$RI")"; [ "$CODE" = 429 ] && [ "$(echo "$BODY" | J hard_locked)" = True ] && ok "even the right PIN is refused while hard-locked" || fail "hard right pin: $CODE $BODY"
 call POST /api/identity/pin "$TK" '{"pin":"5678","current_pin":"1234"}'; [ "$CODE" = 429 ] && ok "no change with the current PIN while hard-locked" || fail "hard change: $CODE $BODY"
@@ -253,6 +257,7 @@ call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$RI")"; [ "$CODE" = 200 
 SQL "CREATE TRIGGER deny_sweep BEFORE DELETE ON gate_verifications BEGIN SELECT RAISE(ABORT, 'injected sweep failure'); END"
 for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$TK2" "$(PINB 0000 "$RI")"; done; C5=$CODE
 SQL "DROP TRIGGER deny_sweep"
+TK2=$(login)   # B ran out of tries: its session ended (5 wrong PINs → full login, red team item 8); sign in again
 python3 - "$DB_PATH" <<'PY' && [ "$C5" = 429 ] && ok "the lock is saved even though the proof sweep failed" || fail "lock lost with the sweep (5th miss $C5)"
 import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); v=c.execute("SELECT pin_locked_until FROM identity_wallets WHERE username='pintester'").fetchone()[0]; sys.exit(0 if v else 1)
 PY
