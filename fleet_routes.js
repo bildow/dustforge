@@ -335,6 +335,7 @@ module.exports = function registerFleetRoutes(deps) {
     const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
     db.transaction(() => {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, claim_code = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
+      fb.endOwnerDelegations(db, a.fleet.owner_did, s.member_did);   // the owner's secrets do not leave with it
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(a.fleet.id, s.member_did);
       fb.cutFleetTokens(db, s.member_did, a.fleet.slug);   // tokens this fleet minted for it stop working
       fb.revokeOwnerWorkers(db, s.member_did, a.fleet.owner_did);   // and workers its owner made for it

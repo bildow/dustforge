@@ -422,6 +422,7 @@ module.exports = function registerNetworkRoutes(deps) {
     const ownerHeldKey = (db.prepare('SELECT joined_via FROM fleet_silicons WHERE fleet_id = ? AND member_did = ?').get(mf.id, w.wallet.did) || {}).joined_via !== 'network';
     db.transaction(() => {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE fleet_id = ? AND member_did = ?").run(mf.id, w.wallet.did);
+      fb.endOwnerDelegations(db, mf.owner_did, w.wallet.did);   // the owner's secrets do not leave with it
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(mf.id, w.wallet.did);
       fb.cutFleetTokens(db, w.wallet.did, mf.slug);
       fb.revokeOwnerWorkers(db, w.wallet.did, mf.owner_did);

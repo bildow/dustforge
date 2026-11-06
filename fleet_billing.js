@@ -516,11 +516,17 @@ function autoRefilledLast24h(db, did, now = Date.now()) {
 // PIN and its owner mints its tokens, so DD leaving it is the owner's DD leaving on a token alone (#48 review: network
 // sends, escrow). Returns the refusal text, or null when the move is allowed.
 function fleetExitRefusal(db, fromDid, toDid) {
+  // Whatever its row's status now: leaving or being removed does not free a wallet a fleet created (its creator holds
+  // its password) — its DD can go back to that owner and nowhere else (#48 review: leave-fleet was an exit).
   const own = db.prepare(`SELECT s.fleet_id, f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
-      WHERE s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1`).get(fromDid);
+      WHERE s.member_did = ? AND s.created_by_fleet = 1 ORDER BY s.id DESC LIMIT 1`).get(fromDid);
   if (!own || !toDid || toDid === own.owner_did) return null;
   if (db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1").get(own.fleet_id, toDid)) return null;
   return 'an agent your fleet created moves DD only to its owner or another agent the fleet created';
+}
+// When an agent leaves or is removed: every delegation of the owner's secrets to it ends (#48 review).
+function endOwnerDelegations(db, ownerDid, memberDid) {
+  return db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE owner_did = ? AND delegate_did = ? AND status = 'active'").run(ownerDid, memberDid).changes;
 }
 function ownedOutright(s) { return Boolean(s) && Number(s.created_by_fleet) === 1 && (s.joined_via || 'owner') !== 'network'; }
 function thresholdRefill(db, billing, s, { force = false, amount = null, now = Date.now(), ledger = null } = {}) {
@@ -992,7 +998,7 @@ function tokenWarningEmail({ silicon, token }) {
 }
 
 module.exports = {
-  ownedOutright, fleetExitRefusal,
+  ownedOutright, fleetExitRefusal, endOwnerDelegations,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,

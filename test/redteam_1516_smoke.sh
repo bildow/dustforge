@@ -86,6 +86,12 @@ call POST /api/network/requests "$F" '{"to":"outsider-o","as":"person"}'; RQ=$(e
 call POST /api/network/transfers "$F" '{"to":"outsider-o","amount_cents":100}'; [ "$CODE" = 403 ] && ok "16: a fleet-made agent cannot send DD out of its fleet" || fail "fleet exit send: $CODE $BODY"
 call POST /api/network/transfers "$F" '{"to":"owner-a","amount_cents":1}'; [ "$CODE" = 201 ] && ok "16: …it can still send to its owner" || fail "send to owner: $CODE $BODY"
 call POST /api/escrow/create "$F" '{"counterparty_did":"'$(did outsider-o)'","collateral_cents":100,"title":"x"}'; [ "$CODE" = 403 ] && ok "16: …and cannot open an escrow with an outsider" || fail "escrow exit: $CODE $BODY"
+# leaving the fleet frees nothing: the delegations end, and its DD still goes only back to its owner (#48 review)
+ND=$(Q "SELECT COUNT(*) FROM demipass_delegations WHERE delegate_did='$DF' AND status='active'")
+call POST /api/network/leave-fleet "$F"; [ "$CODE" = 200 ] || fail "leave: $CODE $BODY"
+[ "$ND" -ge 1 ] && [ "$(Q "SELECT COUNT(*) FROM demipass_delegations WHERE delegate_did='$DF' AND status='active'")" = 0 ] && ok "16: a fleet-made agent that leaves loses every delegation of the owner's secrets" || fail "leave delegations: $ND → $(Q "SELECT COUNT(*) FROM demipass_delegations WHERE delegate_did='$DF' AND status='active'")"
+F2=$(login agent-f); call POST /api/network/transfers "$F2" '{"to":"outsider-o","amount_cents":100}'
+[ "$CODE" = 403 ] && ok "16: …and, signed in again, still cannot send DD out" || fail "leave exit: $CODE $BODY"
 # a PIN-confirmed refill rule raised by a token alone is no longer confirmed (#48)
 LID=$(Q "SELECT id FROM fleet_silicons WHERE handle='linked-h'")
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"refill:'$LID'"}'
