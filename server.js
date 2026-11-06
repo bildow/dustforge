@@ -1905,7 +1905,7 @@ app.post('/api/billing/topup', (req, res) => {
 
 // Order: authenticate (no charge) → headers → validate → reserve a cap slot → charge → send. A send the mail server
 // refuses is refunded (it never became mail) and its slot given back.
-app.post('/api/email/send', rateLimitStandard, mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, rateLimitStandard, emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
@@ -2032,7 +2032,7 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
     }
   }
   const sent = results.filter(r => r.status === 'sent').length;
-  res.status(sent || !results.length ? 200 : (results.some(r => r.error === 'payment required') ? 402 : 429))
+  res.status(sent || !results.length ? 200 : results.some(r => r.error === 'payment required') ? 402 : results.some(r => r.status === 'failed') ? 502 : 429)
     .json({ ok: sent > 0, forwarded: sent, results, billed });
 });
 
