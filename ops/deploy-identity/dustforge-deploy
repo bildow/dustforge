@@ -3,13 +3,14 @@
 # command its forced shell passes on. Installed 2026-11-05 on Aaron's order: RackNerd root is never the deploy
 # credential again.
 #   dustforge-deploy status            the live commit, the service state, the last backups, the deploy history
-#   dustforge-deploy <40-hex sha>      back up the DB, fast-forward /opt/dustforge to <sha>, restart dustforge
-#   dustforge-deploy rollback          back to the commit this script deployed before the live one (code only; the DB
-#                                      is NOT restored — an operator act; backups are listed by `status`)
+#   dustforge-deploy <40-hex sha>      <sha> must be the origin/main tip: back up the DB, fast-forward to it, restart
+#   dustforge-deploy rollback          undo the last deploy, one step (code only; the DB is NOT restored — an operator
+#                                      act; backups are listed by `status`)
 # Refused: a commit not on origin/main, anything but a fast-forward, a changed working tree, a changed
-# package.json/package-lock.json (dependency installs run code as root: an operator act). Rollback goes only to the
-# previous commit in this script's own root-only history — never to an arbitrary ancestor (which could bring back a
-# fixed root RCE; #46 review H1).
+# package.json/package-lock.json (dependency installs run code as root: an operator act), a target that would
+# overwrite an ignored file in the live checkout. The credential reaches exactly two states: the current origin/main
+# tip, and the commit that was live just before the last deploy — never a feature-branch commit that review held, nor
+# a walk back through history (#46 review H1 and its re-review).
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 umask 077
@@ -39,6 +40,13 @@ backup() {
 }
 clean_tree() { [ -z "$(g status --porcelain --untracked-files=no)" ] || die "tracked files changed on the server"; }
 deps_same() { g diff --quiet "$1" "$2" -- package.json package-lock.json; }
+# A path the target tracks that is an ignored, untracked file in the live checkout (e.g. a local .env) would be silently
+# overwritten by merge/reset: refused (#46 re-review Low).
+no_ignored_clobber() {
+  local clash
+  clash=$(comm -12 <(g ls-tree -r --name-only "$1" | sort) <(g ls-files -o -i --exclude-standard | sort) | head -5)
+  [ -z "$clash" ] || die "the target would overwrite ignored live file(s): $(echo $clash)"
+}
 record() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1 $2 $3" >> "$HIST"; }
 
 case "${1:-}" in
@@ -50,14 +58,18 @@ case "${1:-}" in
     { tail -n 3 "$HIST" 2>/dev/null || true; }
     exit 0 ;;
   rollback)
-    [ $# -eq 1 ] || die "usage: dustforge-deploy rollback (back to the commit deployed before the live one)"
+    [ $# -eq 1 ] || die "usage: dustforge-deploy rollback (undo the last deploy, one step)"
     live=$(g rev-parse HEAD)
-    # The last deploy (not rollback) that landed the live commit names where we came from.
-    to=$({ grep -E " [0-9a-f]{40} $live deploy\$" "$HIST" 2>/dev/null || true; } | tail -n 1 | awk '{print $2}')
-    [[ "$to" =~ ^[0-9a-f]{40}$ ]] || die "no recorded deploy of the live commit to roll back from; an operator rolls back"
+    # One step only: the history's LAST line must be the deploy that landed the live commit (a rollback after a
+    # rollback, or after anything else, is refused).
+    last=$({ tail -n 1 "$HIST" 2>/dev/null || true; })
+    read -r _ to landed kind <<< "$last" || true
+    [ "${kind:-}" = deploy ] && [ "${landed:-}" = "$live" ] && [[ "${to:-}" =~ ^[0-9a-f]{40}$ ]] \
+      || die "rollback undoes the last deploy only, once; an operator moves further back"
     g merge-base --is-ancestor "$to" HEAD || die "$to is not an ancestor of the live commit"
     clean_tree
     deps_same "$to" "$live" || die "dependencies differ; an operator rolls this back"
+    no_ignored_clobber "$to"
     backup
     g reset -q --keep "$to"
     record "$live" "$to" rollback
@@ -69,12 +81,13 @@ esac
 [ $# -eq 1 ] && [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die "usage: dustforge-deploy <40-hex sha> | status | rollback"
 sha=$1
 g fetch -q origin "+refs/heads/main:refs/remotes/origin/main"
-g merge-base --is-ancestor "$sha" refs/remotes/origin/main || die "$sha is not on origin/main"
+[ "$sha" = "$(g rev-parse refs/remotes/origin/main)" ] || die "$sha is not the origin/main tip (only the tip is deployed)"
 prev=$(g rev-parse HEAD)
 [ "$prev" != "$sha" ] || { echo "already at $sha"; exit 0; }
 g merge-base --is-ancestor "$prev" "$sha" || die "not a fast-forward from $prev"
 clean_tree
 deps_same "$prev" "$sha" || die "dependencies changed; an operator installs them"
+no_ignored_clobber "$sha"
 backup
 g merge -q --ff-only "$sha"
 record "$prev" "$sha" deploy
