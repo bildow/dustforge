@@ -3,7 +3,8 @@
 # server.js on a throwaway DB. Wallets: A (shows the QR), B (scans it), C (a third person), N (no PIN), G (an agent).
 #   - the QR token: 5-minute, one join, random 12-digit id; own code / wrong secret / second scanner refused; wrong
 #     codes count against the one presenting them (10 an hour), never against the pairing
-#   - both screens show the same 6-digit code naming this pairing and these two wallets
+#   - only the shower's screen gets the 6-digit code (naming this pairing and both wallets); the scanner must type it
+#     from that screen — a forwarded QR alone does not pair. 3 wrong codes cancel; no answer to the scanner names it
 #   - each side confirms with its PIN (intent pair:<id>); once a phone is linked, also its device key over "<other>|<code>"
 #   - both confirmed → a contact with verified_via='qr'; a contact made by name request cannot be shared with
 #   - cancel (codes differ) and expiry end it; agents and PIN-less wallets cannot pair
@@ -65,8 +66,10 @@ call POST /api/network/pair/start "$A"; P=$(echo "$BODY" | J pair_id); TOK=$(ech
 call POST /api/network/pair/join "$A" '{"token":"'$TOK'"}'; [ "$CODE" = 400 ] && ok "scanning your own code → 400" || fail "own: $CODE $BODY"
 call POST /api/network/pair/join "$C" '{"token":"'$P'.AAAAAAAAAAAAAAAAAAAAAA"}'; [ "$CODE" = 403 ] && [ "$(Q "SELECT status FROM contact_pairings WHERE id=$P")" = open ] && ok "a wrong secret for the id → 403, the pairing stays open" || fail "wrong: $CODE"
 call POST /api/network/pair/join "$B" '{"token":"'$QR'"}'   # the whole scanned URL works
-CB=$(echo "$BODY" | J code); [ "$CODE" = 200 ] && [[ "$CB" =~ ^[0-9]{6}$ ]] && [ "$(echo "$BODY" | J other)" = pa ] && ok "B scans it: B's screen shows pa and a 6-digit code" || fail "join: $CODE $BODY"
-call GET /api/network/pair/$P "$A"; [ "$(echo "$BODY" | J code)" = "$CB" ] && [ "$(echo "$BODY" | J other)" = pb ] && [ "$(echo "$BODY" | J status)" = joined ] && ok "A's screen shows pb and the same code" || fail "A view: $BODY"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J code)" = None ] && [ "$(echo "$BODY" | J type_code)" = True ] && [ "$(echo "$BODY" | J other)" = pa ] && ok "B scans it: B's screen shows pa and asks for the code — the server never sends B the code" || fail "join: $CODE $BODY"
+call GET /api/network/pair/$P "$B"; [ "$(echo "$BODY" | J code)" = None ] && [ "$(echo "$BODY" | J bind)" = None ] || fail "B's view leaks the code: $BODY"
+call GET /api/network/pair/$P "$A"; CB=$(echo "$BODY" | J code)
+[[ "$CB" =~ ^[0-9]{6}$ ]] && [ "$(echo "$BODY" | J other)" = pb ] && [ "$(echo "$BODY" | J status)" = joined ] && ok "A's screen shows pb and the 6-digit code" || fail "A view: $BODY"
 EXP=$(python3 -c 'import hmac,hashlib,sys; m=hmac.new(sys.argv[1].encode(),("dp-pair:%s:%s:%s"%(sys.argv[2],sys.argv[3],sys.argv[4])).encode(),hashlib.sha256).digest(); print("%06d"%(int.from_bytes(m[:4],"big")%1000000))' "${TOK#*.}" "$P" "$DA" "$DB")
 [ "$EXP" = "$CB" ] && ok "the code is HMAC(secret, pairing id, both DIDs): it names this pairing and these two wallets" || fail "code derivation: $EXP vs $CB"
 call POST /api/network/pair/join "$C" '{"token":"'$TOK'"}'; [ "$CODE" = 409 ] && ok "a second scanner of the same QR → 409 (one join per QR)" || fail "second: $CODE $BODY"
@@ -78,7 +81,14 @@ call POST /api/network/pair/$P/confirm "$A" '{}'; [ "$CODE" = 403 ] && [ "$(echo
 pin "$A" 1111 "pair:$P"; call POST /api/network/pair/$P/confirm "$A" '{}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J you_confirmed)" = True ] && [ "$(echo "$BODY" | J connected)" = False ] && ok "A confirms; not a confirmed contact until B does too" || fail "A confirm: $CODE $BODY"
 pin "$A" 1111 "share:$SID"; call POST /api/demipass/shares "$A" '{"secret":"wifi","to":"pb"}'; [ "$CODE" = 403 ] && ok "…still no share after one side" || fail "share half: $CODE"
-pin "$B" 2222 "pair:$P"; call POST /api/network/pair/$P/confirm "$B" '{}'
+call POST /api/network/pair/$P/confirm "$B" '{}'
+[ "$CODE" = 400 ] && [ "$(echo "$BODY" | J type_code)" = True ] && ok "B cannot confirm without typing A's code (a forwarded QR alone does not pair)" || fail "B no code: $CODE $BODY"
+WRONG=$(printf '%06d' $(( (10#$CB + 1) % 1000000 )))
+call POST /api/network/pair/$P/confirm "$B" '{"code":"'$WRONG'"}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J code_tries_left)" = 2 ] && ! echo "$BODY" | grep -q "$CB" && ok "a wrong code → 403, 2 tries left, and the answer does not name the right one" || fail "B wrong: $CODE $BODY"
+call POST /api/network/pair/$P/confirm "$B" '{"code":"'$CB'"}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "pair:$P" ] && ok "the right code → then the PIN (checked after the code, so the PIN prompt never confirms a wrong code)" || fail "B code then pin: $CODE $BODY"
+pin "$B" 2222 "pair:$P"; call POST /api/network/pair/$P/confirm "$B" '{"code":"'"${CB:0:3} ${CB:3}"'"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J connected)" = True ] && [ "$(Q "SELECT verified_via FROM network_peers WHERE (did_a='$DA' AND did_b='$DB') OR (did_a='$DB' AND did_b='$DA')")" = qr ] \
   && ok "B confirms → confirmed contacts (network_peers.verified_via = qr)" || fail "B confirm: $CODE $BODY"
 pin "$A" 1111 "share:$SID"; call POST /api/demipass/shares "$A" '{"secret":"wifi","to":"pb"}'; SH=$(echo "$BODY" | J share.id)
@@ -95,11 +105,15 @@ pin "$B" 2222 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$B"
 [ "$CODE" = 403 ] && [ "$(Q "SELECT COALESCE(verified_via,'none') FROM network_peers WHERE (did_a='$DA' AND did_b='$DB') OR (did_a='$DB' AND did_b='$DA')")" = none ] \
   && ok "re-added by name request: a contact again, but not confirmed — no share rights until they pair again" || fail "re-add keeps confirmation: $CODE $BODY"
 pair_again(){ call POST /api/network/pair/start "$A"; local p=$(echo "$BODY" | J pair_id) t=$(echo "$BODY" | J token)
-  call POST /api/network/pair/join "$B" '{"token":"'$t'"}'; pin "$A" 1111 "pair:$p"; call POST /api/network/pair/$p/confirm "$A" '{}'; pin "$B" 2222 "pair:$p"; call POST /api/network/pair/$p/confirm "$B" '{}'; }
+  call POST /api/network/pair/join "$B" '{"token":"'$t'"}'; call GET /api/network/pair/$p "$A"; local c=$(echo "$BODY" | J code)
+  pin "$A" 1111 "pair:$p"; call POST /api/network/pair/$p/confirm "$A" '{}'; pin "$B" 2222 "pair:$p"; call POST /api/network/pair/$p/confirm "$B" '{"code":"'$c'"}'; }
 pair_again; [ "$(echo "$BODY" | J connected)" = True ] || fail "pair again: $CODE $BODY"
 pin "$B" 2222 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$B"; [ "$CODE" = 200 ] && ok "…paired in person again, the share is taken" || fail "accept: $CODE $BODY"
 
 # ── mismatch, expiry, guessing ──
+call POST /api/network/pair/start "$C"; P6=$(echo "$BODY" | J pair_id); T6=$(echo "$BODY" | J token); call POST /api/network/pair/join "$A" '{"token":"'$T6'"}'
+for i in 1 2 3; do call POST /api/network/pair/$P6/confirm "$A" '{"code":"00000'$i'"}'; done
+[ "$CODE" = 403 ] && [ "$(Q "SELECT status||'/'||cancelled_by FROM contact_pairings WHERE id=$P6")" = cancelled/wrong-code ] && ok "3 wrong codes typed by the scanner cancel the pairing" || fail "3 wrong: $CODE $(Q "SELECT status FROM contact_pairings WHERE id=$P6")"
 call POST /api/network/pair/start "$C"; P2=$(echo "$BODY" | J pair_id); T2=$(echo "$BODY" | J token)
 call POST /api/network/pair/join "$A" '{"token":"'$T2'"}'
 call POST /api/network/pair/$P2/cancel "$A" '{"mismatch":true}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J status)" = cancelled ] && ok "codes differ → either side cancels" || fail "mismatch: $CODE $BODY"
@@ -143,5 +157,16 @@ pin "$C" 3333 "pair:$P5"; call POST /api/network/pair/$P5/confirm "$C" '{"device
 call POST /api/identity/device/challenge "$C" '{"purpose":"approve","intent":"pair:'$P5'","bind":"'"$BIND"'"}'; CH=$(echo "$BODY" | J challenge_id); SG=$(sig d "$(echo "$BODY" | J message)")
 pin "$C" 3333 "pair:$P5"; call POST /api/network/pair/$P5/confirm "$C" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J you_confirmed)" = True ] && ok "…the phone's signature over this pairing's name and code confirms it" || fail "device confirm: $CODE $BODY"
+
+# the scanner's phone: the typed code first, then 428, and its device key signs "<shower>|<code>"
+call POST /api/network/pair/start "$A"; P7=$(echo "$BODY" | J pair_id); T7=$(echo "$BODY" | J token); call POST /api/network/pair/join "$C" '{"token":"'$T7'"}'
+call GET /api/network/pair/$P7 "$A"; C7=$(echo "$BODY" | J code)
+pin "$C" 3333 "pair:$P7"; call POST /api/network/pair/$P7/confirm "$C" '{"code":"'$(printf '%06d' $(( (10#$C7 + 7) % 1000000 )))'"}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J challenge)" = None ] && ok "scanner with a linked phone: a wrong code is refused before the phone step (no 428 that would name the code)" || fail "scanner wrong first: $CODE $BODY"
+call POST /api/network/pair/$P7/confirm "$C" '{"code":"'$C7'"}'
+[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J challenge.bind)" = "pa|$C7" ] || fail "scanner 428: $CODE $BODY"
+call POST /api/identity/device/challenge "$C" '{"purpose":"approve","intent":"pair:'$P7'","bind":"pa|'$C7'"}'; CH=$(echo "$BODY" | J challenge_id); SG=$(sig d "$(echo "$BODY" | J message)")
+pin "$C" 3333 "pair:$P7"; call POST /api/network/pair/$P7/confirm "$C" '{"code":"'$C7'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J you_confirmed)" = True ] && ok "…the right code, then the phone's signature over \"pa|<code>\", confirms the scanner's side" || fail "scanner device confirm: $CODE $BODY"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails failure(s)"; exit $fails

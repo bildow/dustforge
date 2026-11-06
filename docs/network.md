@@ -80,6 +80,8 @@ Asks expire after 7 days, and are cancelled when the agent leaves or is removed 
 
 ## Pairing in person (QR) — confirmed contacts
 
+A forwarded QR alone does not pair: whoever scans it must also type the code on the shower's screen (Aaron 2026-11-06). The shower is told to show the code, not read it out.
+
 A contact made by name request (`POST /api/network/requests`, kind `person`) can send and receive DD, but it is not
 **confirmed**: name lookup is phishable, because someone can register "kyle" first. Shares and secret transfers go
 only to contacts confirmed in person (red team item 6). `GET /api/network` marks each person with `confirmed`.
@@ -87,10 +89,10 @@ only to contacts confirmed in person (red team item 6). `GET /api/network` marks
 | Step | Call | Notes |
 |---|---|---|
 | A shows a QR | `POST /api/network/pair/start` | → `{pair_id, token, qr}`. `qr` = `https://demipass.com/pair#<id>.<secret>`. The id is a random 12-digit number, the secret is 128 bits and the server keeps only its hash. One join, 5 min. At most 3 open per wallet. |
-| B scans it | `POST /api/network/pair/join {token}` | `token` may be the whole scanned URL. Both sides now see the other's name and the same 6-digit `code` = HMAC(secret, `dp-pair:<id>:<A did>:<B did>`). Wrong codes count against the wallet presenting them: 10 in an hour and that wallet is refused for the rest of the hour. A wrong code never cancels the pairing. |
+| B scans it | `POST /api/network/pair/join {token}` | `token` may be the whole scanned URL. Each side sees the other's name. **Only A gets the 6-digit `code`**, HMAC(secret, `dp-pair:<id>:<A did>:<B did>`). B gets `type_code: true` and never receives the code. Wrong join codes count against the wallet presenting them: 10 in an hour and that wallet is refused for the rest of the hour. |
 | Either polls | `GET /api/network/pair/:id` | `status` is one of open, joined, confirmed, cancelled or expired. Also returns `code`, `you_confirmed` and `they_confirmed`. |
-| Each confirms | `POST /api/network/pair/:id/confirm` | Takes the PIN, intent `pair:<id>` (biometric works too). Once a phone is linked, the phone's device key must also sign `"<other>|<code>"` (428 → challenge). |
-| Codes differ | `POST /api/network/pair/:id/cancel {mismatch:true}` | Either side can cancel before both have confirmed. A mismatch logs an alert. |
+| Each confirms | `POST /api/network/pair/:id/confirm` (B adds `{code}`) | B's typed code is checked first, before the PIN or the phone step, so no answer ever names the code. 3 wrong codes cancel the pairing. Each side then needs the PIN, intent `pair:<id>` (biometric works too). Once a phone is linked, the phone's device key must also sign `"<other>|<code>"` (428 → challenge). |
+| Wrong person | `POST /api/network/pair/:id/cancel {mismatch:true}` | Either side can cancel before both have confirmed. A mismatch logs an alert. |
 
 When both sides have confirmed, the pair is a contact with `verified_via = 'qr'`. Removing the contact removes the
 confirmation as well. Re-adding someone by name request makes them a contact again, but an unconfirmed one: a pending share offer cannot be accepted until the two pair again. Only people can pair: agent

@@ -1491,33 +1491,51 @@ test('423 locked from the server → the phone unlocks (biometric) and the appro
 });
 
 // ── Pair in person (QR, red team item 6) ──
-test('a scanned pairing URL joins the pairing and shows the other person and the 6-digit code', async () => {
+test('a scanned pairing URL joins and asks for the code on their screen (the scanner is never shown one)', async () => {
   const pg = page({ storage: signedIn, routes: async (p, b) => {
     if (p.startsWith('/api/identity/trust')) return { json: trustOk };
     if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
-    if (p === '/api/network/pair/join') { assert.equal(b.token, 'https://demipass.com/pair#12.AAAAAAAAAAAAAAAAAAAAAA'); return { json: { ok: true, pair_id: 12, status: 'joined', role: 'scanned', other: 'kyle', code: '037654', you_confirmed: false, they_confirmed: false } }; }
+    if (p === '/api/network/pair/join') { assert.equal(b.token, 'https://demipass.com/pair#123456789012.AAAAAAAAAAAAAAAAAAAAAA'); return { json: { ok: true, pair_id: 123456789012, status: 'joined', role: 'scanned', other: 'kyle', code: null, type_code: true, you_confirmed: false, they_confirmed: false } }; }
     return { json: { ok: true } };
   } });
   await settle();
-  await pg.ctx.handleScannedData('https://demipass.com/pair#12.AAAAAAAAAAAAAAAAAAAAAA');
+  await pg.ctx.handleScannedData('https://demipass.com/pair#123456789012.AAAAAAAAAAAAAAAAAAAAAA');
   await settle();
   const body = pg.el('pair-body').innerHTML;
-  assert.match(body, /<b>kyle<\/b>/); assert.match(body, /037 654/); assert.match(body, /Same code — confirm/);
+  assert.match(body, /<b>kyle<\/b>/); assert.match(body, /id="pair-code"/); assert.match(body, /Type the 6-digit code/);
   assert.ok(pg.shown('modal-pair'));
   assert.ok(!pg.calls.some(c => c.path === '/api/demipass/store'), 'a pairing QR is never treated as a deposit');
 });
 
-test('confirming a pairing goes through the PIN/phone gate and ends on "paired"', async () => {
+test('the shower sees the code and is told to show it, not read it out', async () => {
   const pg = page({ storage: signedIn, routes: async (p) => {
     if (p.startsWith('/api/identity/trust')) return { json: trustOk };
     if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
-    if (p === '/api/network/pair/12/confirm') return { json: { ok: true, pair_id: 12, status: 'confirmed', role: 'scanned', other: 'kyle', code: '037654', you_confirmed: true, they_confirmed: true, connected: true } };
     return { json: { ok: true } };
   } });
   await settle();
-  vm.runInContext("pairState={pair_id:12,status:'joined',role:'scanned',other:'kyle',code:'037654',you_confirmed:false,they_confirmed:false}", pg.ctx);
+  vm.runInContext("pairState={pair_id:12,status:'joined',role:'shown',other:'kyle',code:'037654',you_confirmed:false,they_confirmed:false}; pairRender()", pg.ctx);
+  const body = pg.el('pair-body').innerHTML;
+  assert.match(body, /037 654/); assert.match(body, /they type it on their phone/); assert.doesNotMatch(body, /id="pair-code"/);
+});
+
+test('the scanner confirms with the typed code; it goes through the PIN/phone gate and ends on "paired"', async () => {
+  let sent = null;
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/network/pair/12/confirm') { sent = b; return { json: { ok: true, pair_id: 12, status: 'confirmed', role: 'scanned', other: 'kyle', you_confirmed: true, they_confirmed: true, connected: true } }; }
+    return { json: { ok: true } };
+  } });
+  await settle();
+  vm.runInContext("pairState={pair_id:12,status:'joined',role:'scanned',other:'kyle',code:null,type_code:true,you_confirmed:false,they_confirmed:false}; pairRender()", pg.ctx);
+  pg.el('pair-code').value = '12';
   await pg.ctx.pairConfirm(); await settle();
-  assert.ok(pg.calls.some(c => c.method === 'POST' && c.path === '/api/network/pair/12/confirm'));
+  assert.equal(sent, null, 'fewer than 6 digits is not sent');
+  assert.match(pg.el('pair-msg').textContent, /6 digits/);
+  pg.el('pair-code').value = '037 654';
+  await pg.ctx.pairConfirm(); await settle();
+  assert.deepEqual(sent, { code: '037654' });
   assert.match(pg.el('pair-msg').textContent, /Paired/);
 });
 

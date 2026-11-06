@@ -2459,8 +2459,9 @@ let pollN=0;
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0)loadShares();}},4000);
 
 // ── Pair in person (QR): a contact confirmed face to face; only these can be shared with (red team item 6) ──────
-// One side shows a QR, the other scans it in this app; both screens then show the other's name and the same 6-digit
-// code. Each person compares the two screens and confirms with their PIN (biometric) — and the linked phone signs it.
+// One side shows a QR, the other scans it in this app. Only the shower's screen gets the 6-digit code; the scanner
+// types it from that screen (a forwarded QR alone does not pair). Each confirms with the PIN (biometric), and a linked
+// phone signs it.
 let pairState=null, pairTimer=null, scanFor='deposit';
 const vendorLoads={};
 function loadVendor(src){ return vendorLoads[src]||(vendorLoads[src]=new Promise((ok,no)=>{ const el=document.createElement('script'); el.src=src; el.onload=ok; el.onerror=()=>{ delete vendorLoads[src]; no(new Error('could not load '+src)); }; document.head.appendChild(el); })); }
@@ -2508,23 +2509,39 @@ function pairRender(){
     pairSet('<p style="font-size:0.9rem"><b>'+esc(p.other)+'</b> is now a contact you met in person.</p><p style="font-size:0.75rem;color:var(--text3)">You can share secrets with each other.</p>','Paired ✓'); loadNetwork(); return; }
   if(p.status==='cancelled'||p.status==='expired'){ clearInterval(pairTimer); pairTimer=null; pairSet('','This pairing was '+p.status+'. Start again if you still want to pair.',true); return; }
   if(p.status==='open'){ return; }   // still showing the QR
-  const code=String(p.code||''); const shown=code.slice(0,3)+' '+code.slice(3);
-  const head='<p style="font-size:0.85rem;margin-bottom:0.5rem">'+(p.role==='shown'?'Scanned by':'You scanned')+' <b>'+esc(p.other)+'</b></p>'
-    +'<div style="font-size:2.2rem;letter-spacing:0.15em;font-weight:700;font-family:monospace;margin:0.5rem 0" aria-label="code '+esc(code.split('').join(' '))+'">'+esc(shown)+'</div>';
+  if(p.role==='shown'){
+    const code=String(p.code||''), shown=code.slice(0,3)+' '+code.slice(3);
+    const head='<p style="font-size:0.85rem;margin-bottom:0.5rem">Scanned by <b>'+esc(p.other)+'</b></p>'
+      +'<div style="font-size:2.2rem;letter-spacing:0.15em;font-weight:700;font-family:monospace;margin:0.5rem 0" aria-label="code '+esc(code.split('').join(' '))+'">'+esc(shown)+'</div>'
+      +'<p style="font-size:0.8rem;color:var(--text3);margin-bottom:0.75rem">Show this code to '+esc(p.other)+': they type it on their phone. Don\'t read it out or send it.</p>';
+    if(p.you_confirmed){ pairSet(head+'<p style="font-size:0.8rem;color:var(--text3)">You confirmed. Waiting for '+esc(p.other)+' to type the code and confirm…</p>'); return; }
+    pairSet(head+'<p style="font-size:0.8rem;color:var(--text3);margin-bottom:0.75rem">Is '+esc(p.other)+' the person in front of you?</p>'
+      +'<div style="display:flex;gap:0.5rem"><button class="btn-primary" style="flex:1" onclick="pairConfirm()">Yes — confirm</button><button class="btn-ghost" style="flex:1" onclick="pairMismatch()">No — cancel</button></div>');
+    return;
+  }
+  const head='<p style="font-size:0.85rem;margin-bottom:0.5rem">You scanned <b>'+esc(p.other)+'</b>\'s code</p>';
+  const typedSoFar=String((document.getElementById('pair-code')||{}).value||'').replace(/[^\d ]/g,'').slice(0,7);   // a poll re-render keeps it
   if(p.you_confirmed){ pairSet(head+'<p style="font-size:0.8rem;color:var(--text3)">You confirmed. Waiting for '+esc(p.other)+' to confirm on their screen…</p>'); return; }
-  pairSet(head+'<p style="font-size:0.8rem;color:var(--text3);margin-bottom:0.75rem">Is this exactly the code on '+esc(p.other)+'\'s screen? Is this the person in front of you?</p>'
-    +'<div style="display:flex;gap:0.5rem"><button class="btn-primary" style="flex:1" onclick="pairConfirm()">Same code — confirm</button><button class="btn-ghost" style="flex:1" onclick="pairMismatch()">Different — cancel</button></div>');
+  pairSet(head+'<p style="font-size:0.8rem;color:var(--text3);margin-bottom:0.5rem">Type the 6-digit code shown on '+esc(p.other)+'\'s screen.</p>'
+    +'<input id="pair-code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" placeholder="000 000" value="'+esc(typedSoFar)+'" style="font-size:1.6rem;letter-spacing:0.2em;text-align:center;width:10ch;font-family:monospace;margin-bottom:0.75rem">'
+    +'<div style="display:flex;gap:0.5rem"><button class="btn-primary" style="flex:1" onclick="pairConfirm()">Confirm</button><button class="btn-ghost" style="flex:1" onclick="pairMismatch()">Cancel</button></div>');
 }
 async function pairConfirm(){
   const p=pairState; if(!p) return;
-  try{ const r=await apiGated('POST','/api/network/pair/'+p.pair_id+'/confirm',{},'Confirm '+p.other+' as a contact you met in person? Your PIN approves it.'); pairState=r; pairRender(); }
+  let body={};
+  if(p.role==='scanned'){
+    const typed=String((document.getElementById('pair-code')||{}).value||'').replace(/\s+/g,'');
+    if(!/^\d{6}$/.test(typed)){ document.getElementById('pair-msg').textContent='Type the 6 digits on '+p.other+'\'s screen'; document.getElementById('pair-msg').className='modal-msg err'; return; }
+    body={code:typed};
+  }
+  try{ const r=await apiGated('POST','/api/network/pair/'+p.pair_id+'/confirm',body,'Confirm '+p.other+' as a contact you met in person? Your PIN approves it.'); pairState=r; pairRender(); }
   catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) pairSet(document.getElementById('pair-body').innerHTML,e.message,true); }
 }
 async function pairMismatch(){
   const p=pairState; if(!p) return;
   try{ const r=await api('POST','/api/network/pair/'+p.pair_id+'/cancel',{mismatch:true}); pairState=r; } catch(_){}
   if(pairTimer){ clearInterval(pairTimer); pairTimer=null; }
-  pairSet('','Cancelled: the codes differed, so nothing was paired. If this keeps happening, someone else may be scanning your code.',true);
+  pairSet('','Cancelled: nothing was paired. If a code you did not expect keeps showing up, someone else may be scanning your QR.',true);
 }
 
 // ── QR Scanner ──
