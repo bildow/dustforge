@@ -228,9 +228,14 @@ call POST /api/demipass/transfer "$A" '{"secret":"kb-panel","to":"agent-f"}'; [ 
 call POST /api/demipass/transfer "$X" '{"secret":"x-thing","to":"person-k"}'; [ "$CODE" = 403 ] && ok "transfer to someone you are not connected to → 403" || fail "transfer unconnected: $CODE $BODY"
 call POST /api/demipass/transfer "$A" '{"secret":"kb-panel","to":"person-k"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "transfer:$SID_P" ] && ok "transfer needs A's PIN (intent transfer:$SID_P)" || fail "transfer pin: $CODE $BODY"
 pin "$A" 4321 "transfer:$SID_P"
-call POST /api/demipass/transfer "$A" '{"secret":"kb-panel","to":"person-k"}'
-KEPT=$(echo "$BODY" | J kept.id)
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J ref)" = "$REF_P" ] && [ "$(echo "$BODY" | J ended_delegations)" = 1 ] && [ "$(echo "$BODY" | J kept.state)" = active ] && ok "A → K transfer: same ref, F's delegation ended, A keeps a use-only share" || fail "transfer: $CODE $BODY"
+# A transfer waits for the owner's delay (red team item 6); due() makes one due now and lets the sweep carry it out.
+due(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE secret_transfers SET execute_at='2000-01-01T00:00:00.000Z' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$1"
+  call GET /api/demipass/transfers "$A"; TST=$(Q "SELECT status FROM secret_transfers WHERE id=$1"); }
+call POST /api/demipass/transfer "$A" '{"secret":"kb-panel","to":"person-k"}'; TID=$(echo "$BODY" | J transfer.id)
+[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J pending)" = True ] && [ "$(Q "SELECT did FROM blindkey_secrets WHERE id=$SID_P")" = "$DA" ] && ok "a transfer waits (202 pending); the secret is still A's" || fail "transfer pending: $CODE $BODY"
+due $TID; KEPT=$(Q "SELECT kept_delegation_id FROM secret_transfers WHERE id=$TID")
+[ "$TST" = done ] && [ "$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$SID_P")" = "$REF_P" ] && [ "$(Q "SELECT COUNT(*) FROM demipass_delegations WHERE secret_id=$SID_P AND delegate_did='$DF' AND status='revoked'")" -ge 1 ] && [ "$(Q "SELECT status FROM demipass_delegations WHERE id=$KEPT")" = active ] \
+  && ok "A → K transfer, when due: same ref, F's delegation ended, A keeps a use-only share" || fail "transfer: $TST kept=$KEPT"
 [ "$(Q "SELECT did FROM blindkey_secrets WHERE id=$SID_P")" = "$DK" ] && ok "the secret is in K's vault" || fail "owner"
 call POST /api/demipass/use "$A" "$(jbody use_token "$UTA" params '{"url":"https://repo.dustroot.com/echo-secret","method":"GET"}')"; { [ "$CODE" = 403 ] || [ "$CODE" = 410 ]; } && ok "a use-token A minted before the transfer no longer works" || fail "pre-transfer token: $CODE $BODY"
 call POST /api/demipass/use "$F" "$(jbody ref "$REF_P" params '{"url":"https://repo.dustroot.com/echo-secret","method":"GET"}')"; [ "$CODE" = 403 ] && ok "F's old delegation from A no longer opens it" || fail "F after transfer: $CODE"
@@ -240,22 +245,22 @@ call GET /api/demipass/shares "$K"; [ "$(echo "$BODY" | J given.0.via)" = transf
 call POST /api/demipass/shares/$KEPT/revoke "$K"; [ "$CODE" = 200 ] && ok "K can revoke A's kept access" || fail "K revoke kept: $CODE $BODY"
 call POST /api/demipass/use "$A" "$(jbody ref "$REF_P" params '{"url":"https://repo.dustroot.com/echo-secret","method":"GET"}')"; [ "$CODE" = 403 ] && ok "then A → 403" || fail "A after K revoke: $CODE"
 SID_KB=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$REF_KB'"); pin "$A" 4321 "transfer:$SID_KB"
-call POST /api/demipass/transfer "$A" '{"secret":"kyle-racknerd","to":"person-k","keep":"use"}'
-[ "$CODE" = 200 ] && [ "$(Q "SELECT did||'|'||account_username||'|'||target_host_pattern FROM blindkey_secrets s JOIN blindkey_contexts c ON c.secret_id=s.id WHERE s.id=$SID_KB")" = "$DK|root|203.0.113.7" ] && ok "the raw-received RackNerd entry moves to K with its user, host binding and note" || fail "kb transfer: $CODE $BODY"
+call POST /api/demipass/transfer "$A" '{"secret":"kyle-racknerd","to":"person-k","keep":"use"}'; due "$(echo "$BODY" | J transfer.id)"
+[ "$TST" = done ] && [ "$(Q "SELECT did||'|'||account_username||'|'||target_host_pattern FROM blindkey_secrets s JOIN blindkey_contexts c ON c.secret_id=s.id WHERE s.id=$SID_KB")" = "$DK|root|203.0.113.7" ] && ok "the raw-received RackNerd entry moves to K with its user, host binding and note" || fail "kb transfer: $CODE $BODY"
 # name collision
 call POST /api/demipass/store "$K" "$(jbody name dup value zzzzzzzzk1)"; call POST /api/demipass/store "$A" "$(jbody name dup value "$SEC_DUP")"
 SID_D=$(Q "SELECT id FROM blindkey_secrets WHERE did='$DA' AND name='dup'")
 call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k"}'; [ "$CODE" = 403 ] && ok "whether K has a name is not answered before the PIN" || fail "dup pre-pin: $CODE $BODY"
 pin "$A" 4321 "transfer:$SID_D"; call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k"}'; [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J name_taken)" = True ] && ok "a name K already uses → 409, nothing moved" || fail "dup: $CODE $BODY"
 pin "$A" 4321 "transfer:$SID_D"; call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k","new_name":"dup_v9"}'; [ "$CODE" = 400 ] && ok "new_name ending in _v<n> → 400 (could shadow K's own secret)" || fail "v-suffix: $CODE $BODY"
-pin "$A" 4321 "transfer:$SID_D"; call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k","new_name":"dup-from-a","keep":"none"}'
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J name)" = dup-from-a ] && [ "$(echo "$BODY" | J kept)" = None ] && ok "with new_name it lands as dup-from-a; keep:none leaves A nothing" || fail "dup new_name: $CODE $BODY"
+pin "$A" 4321 "transfer:$SID_D"; call POST /api/demipass/transfer "$A" '{"secret":"dup","to":"person-k","new_name":"dup-from-a","keep":"none"}'; due "$(echo "$BODY" | J transfer.id)"
+[ "$TST" = done ] && [ "$(Q "SELECT name||'|'||did FROM blindkey_secrets WHERE id=$SID_D")" = "dup-from-a|$DK" ] && [ "$(Q "SELECT COUNT(*) FROM demipass_delegations WHERE secret_id=$SID_D AND delegate_did='$DA' AND status='active'")" = 0 ] && ok "with new_name it lands as dup-from-a; keep:none leaves A nothing" || fail "dup new_name: $CODE $BODY"
 
 # a versioned name lands as its plain base name, version 1 (never shadowing K's own same-named secret)
 call POST /api/demipass/store "$A" '{"name":"rot_v3","value":"zzzzzzzzr3"}'; python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET version=3 WHERE did=? AND name='rot_v3'\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DA"
 SID_R=$(Q "SELECT id FROM blindkey_secrets WHERE did='$DA' AND name='rot_v3'"); pin "$A" 4321 "transfer:$SID_R"
-call POST /api/demipass/transfer "$A" '{"secret":"rot_v3","to":"person-k","keep":"none"}'
-[ "$CODE" = 200 ] && [ "$(Q "SELECT name||'|'||version FROM blindkey_secrets WHERE id=$SID_R")" = "rot|1" ] && ok "rot_v3 (v3) lands in K's vault as 'rot', version 1" || fail "M1: $CODE $BODY $(Q "SELECT name||'|'||version FROM blindkey_secrets WHERE id=$SID_R")"
+call POST /api/demipass/transfer "$A" '{"secret":"rot_v3","to":"person-k","keep":"none"}'; due "$(echo "$BODY" | J transfer.id)"
+[ "$TST" = done ] && [ "$(Q "SELECT name||'|'||version FROM blindkey_secrets WHERE id=$SID_R")" = "rot|1" ] && ok "rot_v3 (v3) lands in K's vault as 'rot', version 1" || fail "M1: $CODE $BODY $(Q "SELECT name||'|'||version FROM blindkey_secrets WHERE id=$SID_R")"
 # mid-rotation: refused
 call POST /api/demipass/store "$A" '{"name":"spin","value":"zzzzzzzzs1"}'; call POST /api/demipass/store "$A" '{"name":"spin_v2","value":"zzzzzzzzs2"}'
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET status='rotating', rotate_expires_at=datetime('now','+1 hour') WHERE did=? AND name='spin'\", (sys.argv[2],)); c.execute(\"UPDATE blindkey_secrets SET version=2 WHERE did=? AND name='spin_v2'\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DA"

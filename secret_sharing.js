@@ -19,6 +19,10 @@
 // A transfer moves a secret to another person's vault (PIN, intent transfer:<secret id>). The ref stays the same;
 // the old owner keeps a use-only share unless they choose not to; every other delegation of it ends, so the new
 // owner starts with a vault entry nobody else reaches but the one share they can see and revoke.
+// A transfer is near-irreversible, so it waits (red team item 6): it is recorded pending and carried out after the
+// owner's transfer delay (identity_wallets.transfer_delay_sec, default 1 hour, 5 minutes–7 days; lowering it takes the
+// PIN). Either side cancels it meanwhile (POST /api/blindkey/transfers/:id/cancel); both are mailed when it starts and
+// when it completes, fails or is cancelled. Every check is made again when it is carried out.
 
 const SHARE_DEFAULT_DAYS = 90;
 const SHARE_MAX_DAYS = 365;
@@ -27,6 +31,9 @@ const MAX_REVEALS_PER_GRANT = 5;
 const REVEAL_DEFAULT_MINUTES = 60;      // a reveal grant is the emergency door: time-boxed, default one hour
 const REVEAL_MAX_MINUTES = 24 * 60;
 const MAX_LIST = 100;
+const TRANSFER_DELAY_DEFAULT = 3600;
+const TRANSFER_DELAY_MIN = 300;
+const TRANSFER_DELAY_MAX = 7 * 86400;
 
 module.exports = function registerSecretSharing(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
@@ -39,6 +46,36 @@ module.exports = function registerSecretSharing(deps) {
     return false;
   }
   const limiter = rateLimitFill || rateLimitStandard;
+  db.exec(`CREATE TABLE IF NOT EXISTS secret_transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    secret_id INTEGER NOT NULL,
+    from_did TEXT NOT NULL,
+    to_did TEXT NOT NULL,
+    final_name TEXT NOT NULL,
+    keep TEXT NOT NULL,
+    keep_days INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',      -- pending | executing | done | failed | cancelled
+    created_at TEXT NOT NULL,
+    execute_at TEXT NOT NULL,
+    decided_at TEXT DEFAULT NULL,
+    cancelled_by TEXT DEFAULT NULL,
+    error TEXT DEFAULT NULL,
+    kept_delegation_id INTEGER DEFAULT NULL
+  )`);
+  db.exec("CREATE INDEX IF NOT EXISTS idx_st_due ON secret_transfers(status, execute_at)");
+  db.exec('CREATE INDEX IF NOT EXISTS idx_st_from ON secret_transfers(from_did, id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_st_to ON secret_transfers(to_did, id)');
+  try { db.exec(`ALTER TABLE identity_wallets ADD COLUMN transfer_delay_sec INTEGER DEFAULT ${TRANSFER_DELAY_DEFAULT}`); } catch (_) {}
+  const transferDelay = (did) => {
+    const w = db.prepare('SELECT transfer_delay_sec FROM identity_wallets WHERE did = ?').get(did);
+    const v = Number(w && w.transfer_delay_sec);
+    return Number.isInteger(v) && v >= TRANSFER_DELAY_MIN && v <= TRANSFER_DELAY_MAX ? v : TRANSFER_DELAY_DEFAULT;
+  };
+  const walletOf = (did) => db.prepare('SELECT did, username, email, status FROM identity_wallets WHERE did = ?').get(did) || {};
+  const notify = (did, subject, text) => {
+    const w = walletOf(did);
+    try { if (w.email && deps.sendMail) Promise.resolve(deps.sendMail({ to: w.email, subject, text })).catch(() => {}); } catch (_) {}
+  };
 
   const nowIso = () => new Date().toISOString();
   const expired = (row) => Boolean(row.expires_at) && new Date(row.expires_at) <= new Date();
@@ -406,38 +443,150 @@ module.exports = function registerSecretSharing(deps) {
     if (nameFamilyTaken(target.did, finalName)) {
       return res.status(409).json({ error: `${target.username} already uses the name '${finalName}' — send new_name (the PIN is asked again)`, name_taken: true });
     }
+    if (db.prepare("SELECT 1 FROM secret_transfers WHERE secret_id = ? AND status IN ('pending','executing')").get(secret.id)) {
+      return res.status(409).json({ error: `${secret.name} already has a transfer waiting — cancel it first` });
+    }
+    const delay = transferDelay(me.did);
+    const id = Number(db.prepare(`INSERT INTO secret_transfers (secret_id, from_did, to_did, final_name, keep, keep_days, created_at, execute_at)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(secret.id, me.did, target.did, finalName, keep, days, nowIso(), new Date(Date.now() + delay * 1000).toISOString()).lastInsertRowid);
+    const t = transferRow(id);
+    event('secret_transfer_started', me.did, secret.id, { transfer_id: id, from_did: me.did, to_did: target.did, name: finalName, execute_at: t.execute_at });
+    logSecurityEvent('secret_transfer_started', 'warn', { caller_did: me.did, capability: 'transfer', target: secret.name, ip: req.ip,
+      context: { ref: secret.ref_code, to: target.username, transfer_id: id, execute_at: t.execute_at } });
+    const when = `${t.execute_at.slice(0, 16).replace('T', ' ')} UTC`;
+    notify(me.did, `DemiPass: you are transferring ${secret.name} to ${target.username}`,
+      `You started transferring ${secret.name} to ${target.username}. It happens at ${when}.\n\nUntil then either of you can cancel it in the DemiPass app (Vault → Transfers). If this was not you, cancel it and change your PIN.\n`);
+    notify(target.did, `DemiPass: ${me.username} is transferring ${finalName} to you`,
+      `${me.username} started transferring ${finalName} to you. It lands in your vault at ${when}.\n\nUntil then either of you can cancel it in the DemiPass app (Vault → Transfers).\n`);
+    tick(target.did, `secret transfer from ${me.username} waiting: ${finalName}`, ['demipass:transfer-pending', `secret:${finalName}`]);
+    res.status(202).json({ ok: true, pending: true, transfer: transferView(t, me.did),
+      note: `${target.username} gets ${secret.name} at ${when}; until then either of you can cancel (POST /api/blindkey/transfers/${id}/cancel)` });
+  });
+
+  // ── pending transfers: carried out when due ───────────────────────────────────────────────────────────────────
+  function transferRow(id) { return db.prepare('SELECT * FROM secret_transfers WHERE id = ?').get(Number(id)) || null; }
+  function transferView(t, me) {
+    const s2 = db.prepare('SELECT name, ref_code FROM blindkey_secrets WHERE id = ?').get(t.secret_id) || {};
+    return { id: t.id, direction: t.from_did === me ? 'outgoing' : 'incoming', secret: t.from_did === me ? s2.name : t.final_name,
+             ref: s2.ref_code || null, from: walletOf(t.from_did).username, to: walletOf(t.to_did).username, keep: t.keep,
+             status: t.status, created_at: t.created_at, execute_at: t.execute_at, decided_at: t.decided_at, error: t.error || null,
+             can_cancel: t.status === 'pending' };
+  }
+  // Every check of the request, again, at the moment it happens. Returns null or why not.
+  function transferBlocker(t) {
+    const secret = db.prepare("SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND status = 'active'").get(t.secret_id, t.from_did);
+    if (!secret) return 'the secret is no longer in the sender\'s vault (deleted, rotated or moved)';
+    if (secret.frozen) return 'the secret is frozen';
+    if (db.prepare("SELECT 1 FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'rotating'").get(t.from_did, baseName(secret.name), baseName(secret.name) + '_v%')) return 'the secret is being rotated';
+    const from = walletOf(t.from_did), to = walletOf(t.to_did);
+    if (from.status !== 'active') return 'the sender\'s account is not active';
+    if (to.status !== 'active') return 'the recipient\'s account is not active';
+    if (isAgentWallet(t.to_did)) return 'the recipient is now an agent';
+    if (!isConfirmedPeer(t.from_did, t.to_did)) return 'they are no longer contacts confirmed in person';
+    if (nameFamilyTaken(t.to_did, t.final_name)) return `the recipient now has a secret named '${t.final_name}'`;
+    return null;
+  }
+  function executeTransfer(t) {
+    const why = transferBlocker(t);
+    const from = walletOf(t.from_did), to = walletOf(t.to_did);
+    if (why) {
+      db.prepare("UPDATE secret_transfers SET status = 'failed', decided_at = ?, error = ? WHERE id = ? AND status = 'executing'").run(nowIso(), why, t.id);
+      event('secret_transfer_failed', t.from_did, t.secret_id, { transfer_id: t.id, error: why });
+      notify(t.from_did, `DemiPass: your transfer to ${to.username} did not happen`, `The transfer of ${t.final_name} to ${to.username} did not happen: ${why}. Nothing changed.\n`);
+      notify(t.to_did, `DemiPass: ${from.username}'s transfer to you did not happen`, `The transfer of ${t.final_name} from ${from.username} did not happen: ${why}. Nothing changed.\n`);
+      return;
+    }
+    const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(t.secret_id);
     let keptId = null, ended = [];
     try {
       db.transaction(() => {
         const moved = db.prepare(`UPDATE blindkey_secrets SET did = ?, name = ?, version = 1, replaced_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND did = ? AND status = 'active'`)
-          .run(target.did, finalName, secret.id, me.did).changes;
-        if (moved !== 1) throw Object.assign(new Error('the secret changed meanwhile; reload'), { status: 409 });
+          .run(t.to_did, t.final_name, t.secret_id, t.from_did).changes;
+        if (moved !== 1) throw new Error('the secret changed meanwhile');
         let meta = {}; try { meta = JSON.parse(secret.metadata || '{}') || {}; } catch (_) {}
-        meta.transfers = [...(Array.isArray(meta.transfers) ? meta.transfers : []), { from: me.username, to: target.username, at: nowIso() }].slice(-20);
-        db.prepare('UPDATE blindkey_secrets SET metadata = ? WHERE id = ?').run(JSON.stringify(meta), secret.id);
+        meta.transfers = [...(Array.isArray(meta.transfers) ? meta.transfers : []), { from: from.username, to: to.username, at: nowIso(), transfer_id: t.id }].slice(-20);
+        db.prepare('UPDATE blindkey_secrets SET metadata = ? WHERE id = ?').run(JSON.stringify(meta), t.secret_id);
         // Every access the old owner gave ends: the new owner starts from nothing they did not choose.
-        ended = db.prepare("SELECT id, delegate_did FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended')").all(secret.id);
-        db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now'), reveal_allowed = 0 WHERE secret_id = ? AND status IN ('active', 'suspended')").run(secret.id);
-        db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE secret_id = ? AND status = 'valid'").run(secret.id);
-        if (keep === 'use') {
+        ended = db.prepare("SELECT id, delegate_did FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended')").all(t.secret_id);
+        db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now'), reveal_allowed = 0 WHERE secret_id = ? AND status IN ('active', 'suspended')").run(t.secret_id);
+        db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE secret_id = ? AND status = 'valid'").run(t.secret_id);
+        if (t.keep === 'use') {
           keptId = Number(db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, status, max_uses, granted_by, granted_at,
                                       expires_at, delegate_kind, offer_state, accepted_at, note, via)
                                       VALUES (?, ?, ?, NULL, 'active', 0, ?, CURRENT_TIMESTAMP, ?, 'person', 'accepted', CURRENT_TIMESTAMP, ?, 'transfer')`)
-            .run(target.did, me.did, secret.id, me.did, daysFromNow(days), `kept by ${me.username} when they transferred it to you`).lastInsertRowid);
+            .run(t.to_did, t.from_did, t.secret_id, t.from_did, daysFromNow(t.keep_days), `kept by ${from.username} when they transferred it to you`).lastInsertRowid);
         }
-        event('secret_transferred', me.did, secret.id, { from_did: me.did, to_did: target.did, name: finalName, ref: secret.ref_code, kept_delegation_id: keptId,
-          ended_delegations: ended.map(d => d.id) });
+        db.prepare("UPDATE secret_transfers SET status = 'done', decided_at = ?, kept_delegation_id = ? WHERE id = ? AND status = 'executing'").run(nowIso(), keptId, t.id);
+        event('secret_transferred', t.from_did, t.secret_id, { transfer_id: t.id, from_did: t.from_did, to_did: t.to_did, name: t.final_name, ref: secret.ref_code,
+          kept_delegation_id: keptId, ended_delegations: ended.map(d => d.id) });
       })();
     } catch (e) {
-      return res.status(e.status || 500).json({ error: e.status ? e.message : 'could not transfer the secret; nothing changed' });
+      db.prepare("UPDATE secret_transfers SET status = 'failed', decided_at = ?, error = ? WHERE id = ? AND status = 'executing'").run(nowIso(), e.message, t.id);
+      notify(t.from_did, `DemiPass: your transfer to ${to.username} did not happen`, `The transfer of ${t.final_name} to ${to.username} did not happen: ${e.message}. Nothing changed.\n`);
+      return;
     }
-    logSecurityEvent('secret_transferred', 'warn', { caller_did: me.did, capability: 'transfer', target: secret.name, ip: req.ip,
-      context: { ref: secret.ref_code, to: target.username, kept_delegation_id: keptId, ended_delegations: ended.length } });
-    tick(target.did, `secret received from ${me.username}: ${finalName}`, ['demipass:transfer-in', `secret:${finalName}`]);
-    res.json({ ok: true, ref: secret.ref_code, name: finalName, owner: target.username, ended_delegations: ended.length,
-      ...(keptId ? { kept: view(shareRow(keptId), me.did) } : {}),
-      note: keptId ? `${target.username} owns it now; you keep use-only access through share ${keptId}, which they can see and revoke` : `${target.username} owns it now; you have no access to it` });
+    logSecurityEvent('secret_transferred', 'warn', { caller_did: t.from_did, capability: 'transfer', target: t.final_name,
+      context: { ref: secret.ref_code, to: to.username, transfer_id: t.id, kept_delegation_id: keptId, ended_delegations: ended.length } });
+    tick(t.to_did, `secret received from ${from.username}: ${t.final_name}`, ['demipass:transfer-in', `secret:${t.final_name}`]);
+    notify(t.from_did, `DemiPass: ${t.final_name} now belongs to ${to.username}`,
+      `The transfer to ${to.username} is complete.${keptId ? ' You keep use-only access, which they can see and revoke.' : ' You have no access to it now.'}\n`);
+    notify(t.to_did, `DemiPass: ${t.final_name} is now in your vault`, `${from.username}'s transfer of ${t.final_name} to you is complete.${ended.length ? ` ${ended.length} earlier access grant(s) of it ended.` : ''}\n`);
+  }
+  // Carry out what is due. Each row is claimed once (pending → executing) so two sweeps never both run it.
+  function completeDueTransfers() {
+    let due = [];
+    try { due = db.prepare("SELECT * FROM secret_transfers WHERE status = 'pending' AND execute_at <= ? ORDER BY execute_at LIMIT 50").all(nowIso()); } catch (_) { return; }
+    for (const t of due) {
+      if (db.prepare("UPDATE secret_transfers SET status = 'executing' WHERE id = ? AND status = 'pending'").run(t.id).changes !== 1) continue;
+      try { executeTransfer({ ...t, status: 'executing' }); }
+      catch (e) { try { db.prepare("UPDATE secret_transfers SET status = 'failed', decided_at = ?, error = ? WHERE id = ? AND status = 'executing'").run(nowIso(), 'internal error', t.id); } catch (_) {} }
+    }
+  }
+  const sweep = setInterval(completeDueTransfers, Number(process.env.TRANSFER_SWEEP_MS) || 30000);
+  if (sweep.unref) sweep.unref();
+
+  // ── GET /api/blindkey/transfers — transfers you started or are receiving ───────────────────────────────────────
+  app.get('/api/blindkey/transfers', rateLimitStandard, (req, res) => {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    completeDueTransfers();
+    const rows = db.prepare('SELECT * FROM secret_transfers WHERE from_did = ? OR to_did = ? ORDER BY id DESC LIMIT ?').all(auth.did, auth.did, MAX_LIST);
+    const v = rows.map(t => transferView(t, auth.did));
+    res.json({ ok: true, transfers: v, pending: v.filter(x => x.status === 'pending').length, delay_sec: transferDelay(auth.did) });
   });
 
-  return { isPersonPeer, isAgentWallet, isPeer, isConfirmedPeer };
+  // ── POST /api/blindkey/transfers/:id/cancel — either side, while it waits ─────────────────────────────────────
+  // No PIN: cancelling only keeps things as they are. An agent token cannot (it is a decision for the people).
+  app.post('/api/blindkey/transfers/:id/cancel', limiter, (req, res) => {
+    const me = personAuth(req, res); if (!me) return;
+    const t = transferRow(req.params.id);
+    if (!t || (t.from_did !== me.did && t.to_did !== me.did)) return res.status(404).json({ error: 'transfer not found' });
+    const n = db.prepare("UPDATE secret_transfers SET status = 'cancelled', decided_at = ?, cancelled_by = ? WHERE id = ? AND status = 'pending'").run(nowIso(), me.did, t.id).changes;
+    if (n !== 1) return res.status(409).json({ error: `this transfer is ${transferRow(t.id).status}`, transfer: transferView(transferRow(t.id), me.did) });
+    event('secret_transfer_cancelled', me.did, t.secret_id, { transfer_id: t.id, by: me.did });
+    const from = walletOf(t.from_did), to = walletOf(t.to_did);
+    const by = me.did === t.from_did ? from.username : to.username;
+    notify(t.from_did, `DemiPass: transfer of ${t.final_name} to ${to.username} cancelled`, `${by} cancelled the transfer of ${t.final_name} to ${to.username}. Nothing changed.\n`);
+    notify(t.to_did, `DemiPass: transfer of ${t.final_name} from ${from.username} cancelled`, `${by} cancelled the transfer of ${t.final_name} from ${from.username}. Nothing changed.\n`);
+    res.json({ ok: true, transfer: transferView(transferRow(t.id), me.did) });
+  });
+
+  // ── GET/PUT /api/identity/transfer-delay — the owner's wait before a transfer happens ─────────────────────────
+  // Raising it is free; lowering it takes the PIN (intent transfer-delay:0). 5 minutes to 7 days, default 1 hour.
+  app.get('/api/identity/transfer-delay', rateLimitStandard, (req, res) => {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    res.json({ ok: true, delay_sec: transferDelay(auth.did), default: TRANSFER_DELAY_DEFAULT, min: TRANSFER_DELAY_MIN, max: TRANSFER_DELAY_MAX });
+  });
+  app.put('/api/identity/transfer-delay', limiter, (req, res) => {
+    const me = personAuth(req, res); if (!me) return;
+    const v = Number((req.body || {}).delay_sec);
+    if (!Number.isInteger(v) || v < TRANSFER_DELAY_MIN || v > TRANSFER_DELAY_MAX) return res.status(400).json({ error: `delay_sec: ${TRANSFER_DELAY_MIN}–${TRANSFER_DELAY_MAX} seconds` });
+    if (v < transferDelay(me.did) && !requirePin(me, 'transfer-delay:0', 'transfer-delay', res)) return;
+    db.prepare('UPDATE identity_wallets SET transfer_delay_sec = ? WHERE did = ?').run(v, me.did);
+    res.json({ ok: true, delay_sec: v });
+  });
+
+  return { isPersonPeer, isAgentWallet, isPeer, isConfirmedPeer, completeDueTransfers };
 };

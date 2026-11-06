@@ -352,6 +352,12 @@
           <option value="900">15 minutes</option><option value="1800">30 minutes</option><option value="3600">1 hour</option>
         </select>
         <div style="font-size:0.68rem;color:var(--text3);margin-top:0.2rem">A shorter time needs nothing; a longer one asks for your PIN.</div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Transfers wait before they happen</div>
+        <select id="transfer-delay" onchange="setTransferDelay(this.value)" style="width:100%;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem">
+          <option value="300">5 minutes</option><option value="900">15 minutes</option><option value="3600">1 hour</option><option value="21600">6 hours</option>
+          <option value="86400">1 day</option><option value="259200">3 days</option><option value="604800">7 days</option>
+        </select>
+        <div style="font-size:0.68rem;color:var(--text3);margin-top:0.2rem">Until then either side can cancel; you both get an email. A longer wait needs nothing; a shorter one asks for your PIN.</div>
       </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
@@ -944,7 +950,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();}
+  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -1370,12 +1376,20 @@ async function decideFill(id, approve){
 // Received offers wait here as cards: accepting is the one step on the recipient's side. Given shares are listed on
 // each secret's page. A reveal is the emergency door only: the owner opens it for one reveal, for an hour.
 let shareData=null, shareBusy=new Set(), shareMode=null;
+let transferData=null;
 async function loadShares(){
   if(lockState.locked) return;
   const epoch=sessionEpoch;
   try{ const r=await api('GET','/api/blindkey/shares'); if(epoch!==sessionEpoch||!vaultOpen) return; shareData=r; }
   catch(e){ if(sessionEnded(e)||e.status===429) return; }
+  try{ const t=await api('GET','/api/blindkey/transfers'); if(epoch!==sessionEpoch||!vaultOpen) return; transferData=t; }catch(e){ if(sessionEnded(e)) return; }
   renderShareRequests();
+}
+async function cancelTransfer(id){
+  if(shareBusy.has('t'+id)) return; shareBusy.add('t'+id); renderShareRequests();
+  try{ await api('POST','/api/blindkey/transfers/'+Number(id)+'/cancel',{}); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  finally{ shareBusy.delete('t'+id); }
+  loadShares();
 }
 function shareDate(iso){ return iso?new Date(iso).toLocaleDateString():'never'; }
 function renderShareRequests(){
@@ -1393,6 +1407,13 @@ function renderShareRequests(){
       +'<span><b>'+esc(x.secret.name)+'</b> <span style="color:var(--text3)">from @'+esc(x.owner)+' · '+esc(x.secret.ref||'')+' · until '+esc(shareDate(x.expires_at))+'</span></span><span style="display:flex;gap:0.3rem">'
       +(x.reveals_left>0?'<button class="btn-ghost" style="font-size:0.65rem;color:var(--orange)" onclick="shareReveal('+Number(x.id)+')">Emergency reveal</button>':'')
       +'<button class="btn-ghost" style="font-size:0.65rem" '+(shareBusy.has(x.id)?'disabled ':'')+'onclick="shareAct('+Number(x.id)+',\'decline\')">Stop</button></span></div>').join('')+'<div id="share-reveal-out" style="display:none;font-family:monospace;word-break:break-all;color:var(--red);border:1px solid var(--red);border-radius:8px;padding:0.6rem;margin:0.5rem 0"></div></div>';
+  }
+  const waiting=((transferData&&transferData.transfers)||[]).filter(t=>t.status==='pending');
+  if(waiting.length){
+    h+='<div style="padding:0.5rem 1rem 0"><div class="section-title" style="font-size:0.75rem">Transfers</div>'+waiting.map(t=>
+      '<div class="fill-req"><div>'+(t.direction==='outgoing'?'You are transferring <b>'+esc(t.secret||'')+'</b> to <b>@'+esc(t.to)+'</b>':'<b>@'+esc(t.from)+'</b> is transferring <b>'+esc(t.secret||'')+'</b> to you')+'</div>'
+      +'<div style="color:var(--text3);margin-top:0.25rem">Happens '+esc(new Date(t.execute_at).toLocaleString())+'. Either of you can cancel until then.</div>'
+      +'<div class="fr-row"><button class="btn-ghost" '+(shareBusy.has('t'+t.id)?'disabled ':'')+'onclick="cancelTransfer('+Number(t.id)+')">Cancel transfer</button></div></div>').join('')+'</div>';
   }
   el.innerHTML=h;
 }
@@ -1467,11 +1488,12 @@ async function submitShare(){
     } else {
       const keep=document.getElementById('sh-keep').checked?'use':'none';
       if(!confirm('Move '+name+' to @'+to+'\'s vault?'+(keep==='use'?' You keep use-only access.':' You keep nothing.'))) return;
-      await apiGated('POST','/api/blindkey/transfer',{secret:name,to,keep},'Transfer '+name+' to @'+to+'? Your PIN approves it.');
-      m.textContent='Transferred to @'+to; m.className='modal-msg ok';
+      const r=await apiGated('POST','/api/blindkey/transfer',{secret:name,to,keep},'Transfer '+name+' to @'+to+'? Your PIN approves it.');
+      const at=r&&r.transfer&&r.transfer.execute_at?new Date(r.transfer.execute_at).toLocaleString():'later';
+      m.textContent='Transfer to @'+to+' starts '+at+'. Until then either of you can cancel it (Vault → Transfers).'; m.className='modal-msg ok';
     }
     await loadShares();
-    setTimeout(()=>{ closeSheet('share'); if(mode==='transfer') closeDetail(); else refreshDetail(); },900);
+    setTimeout(()=>{ closeSheet('share'); refreshDetail(); },mode==='transfer'?2500:900);
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ m.textContent=e.message; m.className='modal-msg err'; } }
 }
 
@@ -2208,6 +2230,16 @@ async function unlockTry(usePin){
 }
 async function loadLockSetting(){
   try{ const r=await api('GET','/api/identity/lock'); lockState.after=Number(r.lock_after_sec)||300; const el=document.getElementById('lock-after'); if(el) el.value=String(lockState.after); }catch(_){}
+}
+// Secret transfers wait (red team item 6): the owner's delay, cancellable from either side meanwhile.
+async function loadTransferDelay(){
+  try{ const r=await api('GET','/api/identity/transfer-delay'); const el=document.getElementById('transfer-delay'); if(!el) return;
+    const v=String(r.delay_sec); if(!(el.options||[]).length||[...el.options].some(o=>o.value===v)) el.value=v; }catch(_){}
+}
+async function setTransferDelay(v){
+  try{ await apiGated('PUT','/api/identity/transfer-delay',{delay_sec:Number(v)},'Make transfers happen sooner? Your PIN confirms it.'); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadTransferDelay();
 }
 async function setLockAfter(v){
   try{ const r=await apiGated('PUT','/api/identity/lock',{lock_after_sec:Number(v)},'Lock less often? Your PIN confirms it.'); lockState.after=r.lock_after_sec; }
