@@ -1406,6 +1406,24 @@ app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
     return res.status(400).json({ error: 'provide security_depth or gate_policy' });
   }
 
+  // Item 1: elevated/critical secrets are wrapped to the owner's phone; leaving those depths re-exposes the value to the
+  // host, which only the phone can do (it unwraps: unwrap_session + unwrap in this body).
+  const targetDepth = security_depth !== undefined ? security_depth : 'custom';
+  const wantWrapped = ['elevated', 'critical'].includes(targetDepth);
+  const unwrapNeeded = cryptoDepth.isWrapped(secret) && !wantWrapped;
+  const takeUnwrap = () => {
+    try { return { value: cryptoDepth.unwrapForOwner(ownerDid, secret, req.body) }; }
+    catch (e) { return { fail: { status: e.status || 409, body: { error: e.message, unwrap_required: true, unwrap_session: 'POST /api/demipass/wrap/unwrap-session {"secret"}' } } }; }
+  };
+  const afterUpdate = (plain) => {
+    if (plain !== null && plain !== undefined) cryptoDepth.unwrapToHost(secret, plain);
+    if (wantWrapped) {
+      const fresh = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(secret.id);
+      const w = cryptoDepth.wrapSecret(fresh);
+      reply.wrapped = Boolean(w.ok);
+      if (!w.ok) reply.wrap_note = w.error;
+    }
+  };
   // A credential may only ask for factors this account can prove; anything else would lock it for good.
   const unprovable = [...new Set(Object.values(reply.effective).flat())].filter(g => !gateProvable(ownerDid, g));
   if (unprovable.length) {
@@ -1429,14 +1447,18 @@ app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
       return res.status(403).json(out);
     }
     // The PIN proof is spent and the policy lowered together, or neither.
+    let plain = null;
+    if (unwrapNeeded) { const u = takeUnwrap(); if (u.fail) return res.status(u.fail.status).json(u.fail.body); plain = u.value; }
     let refused = null;
-    try { db.transaction(() => { refused = spendSingleUse(ownerDid, 'gate-policy', prove, auth, intent); if (!refused) update(); })(); }
+    try { db.transaction(() => { refused = spendSingleUse(ownerDid, 'gate-policy', prove, auth, intent); if (!refused) { update(); afterUpdate(plain); } })(); }
     catch (e) { console.error('[gate-policy] change not applied:', e.message); return res.status(503).json({ error: 'could not apply the policy change; nothing changed — try again', retry: true }); }
     if (refused) return res.status(refused.status || 403).json(refused);
     logSecurityEvent('gate_policy_weakened', 'alert', { caller_did: ownerDid, target: secret.name, ip: req.ip, weakens: weakened.actions, from: current, to: reply.effective });
     return res.json(reply);
   }
-  try { update(); } catch (e) { return res.status(503).json({ error: 'could not apply the policy change; nothing changed — try again', retry: true }); }
+  let plain = null;
+  if (unwrapNeeded) { const u = takeUnwrap(); if (u.fail) return res.status(u.fail.status).json(u.fail.body); plain = u.value; }
+  try { db.transaction(() => { update(); afterUpdate(plain); })(); } catch (e) { return res.status(503).json({ error: 'could not apply the policy change; nothing changed — try again', retry: true }); }
   res.json(reply);
 });
 
@@ -2708,7 +2730,7 @@ try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_sv_ref ON blindkey_secrets(
 const DEAD_SECRET_STATUSES = new Set(['deleted', 'retired', 'revoked']);
 // A secret that can never be served again loses its encrypted value at once: deleted, revoked, and retired (a
 // rotated-out version once its grace period ends). The row stays as history; nothing decrypts a dead row.
-const ERASE_VALUE_SQL = "encrypted_value = ''";
+const ERASE_VALUE_SQL = "encrypted_value = '', wrapped_value = NULL";   // a retired value is gone, wrapped or not (item 1)
 // Catches what the inline erasures can miss: values from before this existed, a rotation grace that ended while
 // the process was down (its setTimeout never fired), and a paid signup's sealed password once the checkout is
 // done or abandoned (Stripe retries a webhook for 3 days). Runs at start and every 10 minutes.
@@ -3635,6 +3657,7 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
     secret = db.prepare('SELECT * FROM blindkey_secrets WHERE name = ? AND did = ? AND status = ?').get(name, actor.did, 'active');
   }
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
+  if (cryptoDepth.isWrapped(secret)) return res.status(409).json({ error: 'this secret is wrapped to your phone, so the server cannot reveal it — lower its depth to standard first (your phone unwraps it)', wrapped: true });
 
   // Critical depth: reveal also takes an approved request (its code), on top of the gate policy's PIN. Checked first
   // without spending it, then the PIN, then spent — so a PIN prompt never wastes an approval.
@@ -4706,7 +4729,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       return res.status(423).json({ error: 'secret is frozen — its owner unfreezes it in the DemiPass app', frozen: true });
     }
     let decryptedValue;
-    try {
+    // A wrapped secret (item 1) is opened only after the approval below, from the phone's unwrap.
+    if (!cryptoDepth.isWrapped(secret)) try {
       decryptedValue = blindkeyDecrypt(secret.encrypted_value);
     } catch (e) {
       // Don't burn the token — decryption failed, not the caller's fault
@@ -4759,6 +4783,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         const approved = approvedBody(g.call);
         if (approved) action_params = { ...approved, ...(approved.params || {}) };
         approvedElevatedUse = Boolean(g.approval_id) && !g.peeked;
+        if (cryptoDepth.isWrapped(secret)) {
+          try { decryptedValue = cryptoDepth.plaintextFor(secret, g.approval_id); }
+          catch (e) { return res.status(e.status || 409).json({ error: e.message, wrapped: true }); }
+        }
       }
       switch (action) {
         case 'http_header': {
@@ -5137,12 +5165,14 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     if (!g.ok) return res.status(g.status).json(g.body);
     const approved = approvedBody(g.call);   // red team item 14: run what was approved, as stored
     if (approved) params = approved.params;
+    var useApprovalId = g.approval_id || null;   // eslint-disable-line no-var
   }
 
   let decryptedValue;
   try {
-    decryptedValue = blindkeyDecrypt(secret.encrypted_value);
+    decryptedValue = cryptoDepth.plaintextFor(secret, useApprovalId);   // host key, or (wrapped, item 1) the phone's unwrap
   } catch (e) {
+    if (cryptoDepth.isWrapped(secret)) return res.status(e.status || 409).json({ error: e.message, wrapped: true });
     return res.status(500).json({ error: 'failed to decrypt secret' });
   }
 
@@ -5415,6 +5445,9 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
            existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null);
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
+    if (['elevated', 'critical'].includes(existing.security_depth)) {   // item 1: the new value is wrapped like the old
+      try { cryptoDepth.wrapSecret(db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(newSecret.id)); } catch (e) { console.error('[rotate] wrap:', e.message); }
+    }
 
     // The ref code is the STABLE handle agents hold — it must follow the live
     // version. Move it old→new (old row keeps working by name until retired).
@@ -8181,9 +8214,13 @@ const deviceKeys = require('./device_keys')({
 require('./leak_scan')({ app, db, express, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, blindkeyDecrypt, blindkeyEncrypt, cleanLabel, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys });
 // Security depth on use: per-use approval requests with request-bound rotating codes (docs/approvals.md).
+// Cryptographic depth (red team item 1): elevated/critical secrets wrapped to the owner's phone; the host reads them
+// only inside an approval, from the phone's unwrap.
+const cryptoDepth = require('./crypto_depth')({ app, db, rateLimitStandard, getBearerIdentity, gateSession, logSecurityEvent,
+  blindkeyDecrypt, blindkeyEncrypt, devices: () => deviceKeys });
 const useApprovals = require('./use_approvals')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-  logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail, deviceKeys,
+  logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail, deviceKeys, cryptoDepth,
 });
 // Who a /use caller is, for an approval request: the DID, and a label the owner recognises.
 function approvalCaller(req) {
@@ -13473,7 +13510,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
