@@ -75,3 +75,35 @@ A share offer, the acceptance of an offer, and a secret transfer all need the tw
 person** by QR pairing (docs/network.md, "Pairing in person"). A contact made by name request alone gets
 `403 {pair_required: true}`. Shares that were already accepted keep working.
 
+## Transfers wait (2026-11-06, red team item 6)
+
+A transfer (`POST /api/blindkey/transfer`) no longer happens at once.
+
+**Starting it**
+- The call answers `202 {pending: true, transfer: {id, execute_at, …}}`.
+- The transfer runs after the owner's delay. The default is 1 hour; it can be set from 5 minutes to 7 days.
+- Both sides are emailed when it starts.
+- While it waits, the secret stays the owner's, and a second transfer of the same secret gets 409.
+
+**Cancelling and listing**
+- Either side can cancel: `POST /api/blindkey/transfers/:id/cancel`. No PIN is needed, because cancelling keeps things as they are.
+- Both sides are emailed on a cancel.
+- `GET /api/blindkey/transfers` lists transfers in and out.
+
+**When it runs**
+- A 30-second sweep carries it out. Every check is made again at that moment:
+  - the owner still has the secret, active, not frozen and not rotating;
+  - both accounts are active;
+  - the recipient is not an agent;
+  - they are still contacts confirmed in person;
+  - the name is free in the recipient's vault.
+- If any check fails, the status becomes `failed` with the reason and nothing changes.
+- Both sides are emailed either way.
+
+**The delay setting**
+- `GET/PUT /api/identity/transfer-delay {delay_sec}`.
+- Raising it applies at once.
+- Lowering it takes the PIN (intent `transfer-delay:0`) and, once a phone is linked, the phone's signature. It takes effect only after the current delay has passed, and the owner is mailed.
+- A transfer claimed by a process that died before committing goes back to pending and is tried again.
+- A waiting transfer whose secret was deleted, rotated or moved ends within one sweep.
+

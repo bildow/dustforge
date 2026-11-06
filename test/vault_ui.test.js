@@ -1568,3 +1568,25 @@ test('a closed pairing scan does not leave the deposit scanner in pairing mode (
   assert.equal(pg.el('scan-title').textContent, 'Scan QR Deposit');
   assert.equal(vm.runInContext('scanFor', pg.ctx), 'deposit');
 });
+
+// ── Delayed transfers (red team item 6) ──
+test('a waiting transfer is listed with Cancel for both sides; Cancel calls the cancel route', async () => {
+  let cancelled = null;
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/shares') return { json: { ok: true, given: [], received: [] } };
+    if (p === '/api/blindkey/transfers') return { json: { ok: true, transfers: [
+      { id: 7, direction: 'incoming', secret: 'wifi', from: 'kyle', to: 'me', status: 'pending', execute_at: '2026-11-07T01:00:00Z', can_cancel: true },
+      { id: 8, direction: 'outgoing', secret: 'panel', from: 'me', to: 'kyle', status: 'done', execute_at: '2026-11-06T01:00:00Z' } ] } };
+    if (p === '/api/blindkey/transfers/7/cancel') { cancelled = 7; return { json: { ok: true } }; }
+    return { json: { ok: true } };
+  } });
+  await settle();
+  vm.runInContext('vaultOpen = true', pg.ctx);
+  await pg.ctx.loadShares(); await settle();
+  const h = pg.el('share-requests').innerHTML;
+  assert.match(h, /<b>@kyle<\/b> is transferring <b>wifi<\/b> to you/); assert.match(h, /Cancel transfer/); assert.doesNotMatch(h, /panel/, 'finished transfers are not listed as waiting');
+  await pg.ctx.cancelTransfer(7); await settle();
+  assert.equal(cancelled, 7);
+});
