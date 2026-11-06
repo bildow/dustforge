@@ -50,15 +50,20 @@ leak_gate() {   # <from> <to>
   [ -f "$SCANNER" ] || die "leak gate: the scanner is not installed ($SCANNER)"
   [ -f "$SCAN_TOKEN" ] || die "leak gate: no scan token ($SCAN_TOKEN) — an operator places one"
   local t; t=$(mktemp -d); trap 'rm -rf "$t"' RETURN
-  local files; files=$(g diff --name-only --diff-filter=ACMR "$1" "$2")
-  [ -n "$files" ] || return 0
-  printf '%s\n' "$files" | while IFS= read -r f; do mkdir -p "$t/$(dirname "$f")"; g show "$2:$f" > "$t/$f"; done
+  # Every path the deploy adds or changes, of any type — renames, copies, type changes (a symlink turned into a file),
+  # mode changes — NUL-separated so no file name can split or quote itself (#45 review M1). Deletions bring nothing.
+  local n=0 f
+  while IFS= read -r -d '' f; do
+    n=$((n+1)); mkdir -p "$t/files/$n"
+    g cat-file blob "$2:$f" > "$t/files/$n/blob" 2>/dev/null || true   # a submodule or a symlink target is not a blob: nothing to read
+  done < <(g diff -z --name-only --no-renames --diff-filter=d "$1" "$2")
+  [ "$n" -gt 0 ] || return 0
   local out rc=0
-  out=$(DEMIPASS_SCAN_TOKEN_FILE="$SCAN_TOKEN" node "$SCANNER" "$t" 2>&1) || rc=$?
-  echo "$out" | sed "s#$t/#  #"
+  out=$(DEMIPASS_SCAN_TOKEN_FILE="$SCAN_TOKEN" node "$SCANNER" --strict "$t/files" 2>&1) || rc=$?
+  echo "$out" | sed "s#$t/files/#  file #"
   case $rc in
     0) ;;
-    1) logger -p auth.crit -t dustforge-deploy -- "leak gate: a vault value is in $2; deploy refused" 2>/dev/null || true; die "leak gate: a vault value is in this commit (see above) — rotate it, remove it, and place a new scan token" ;;
+    1) logger -p auth.crit -t dustforge-deploy -- "leak gate: a vault value is in $2; deploy refused" 2>/dev/null || true; die "leak gate: a vault value is in this commit — the owner was told which and where (DemiPass app, mail); rotate it, remove it, and place a new scan token" ;;
     *) die "leak gate: the scan could not run (exit $rc) — nothing deployed" ;;
   esac
 }

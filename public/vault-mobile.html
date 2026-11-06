@@ -2294,12 +2294,14 @@ async function loadScanTokens(){
     const r=await api('GET','/api/blindkey/leak-scan/tokens');
     const live=(r.tokens||[]).filter(t=>!t.revoked_at), hit=(r.tokens||[]).filter(t=>t.revoked_reason==='hit').slice(0,3);
     el.innerHTML=(live.length?live.map(t=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:0.3rem 0"><span>'+esc(t.label||('token '+t.id))+' <span style="color:var(--text3)">'+(t.last_used_at?'last scan '+esc(String(t.last_used_at).slice(0,16).replace('T',' ')):'never used')+'</span></span><button class="btn-ghost" style="font-size:0.65rem" onclick="revokeScanToken('+Number(t.id)+')">Revoke</button></div>').join(''):'<div style="color:var(--text3)">No scan tokens.</div>')
-      +hit.map(t=>'<div style="color:var(--orange);margin-top:0.2rem">'+esc(t.label||('token '+t.id))+' found a leak and was revoked '+esc(String(t.revoked_at).slice(0,16).replace('T',' '))+'</div>').join('');
+      +(r.hits||[]).slice(0,5).map(h=>'<div style="color:var(--orange);margin-top:0.3rem">'+esc(h.token_label||('token '+h.token_id))+' found '+esc(String(h.created_at).slice(0,16).replace('T',' '))+': '
+        +[...new Set((h.found||[]).map(f=>f.name))].map(esc).join(', ')+'<div style="color:var(--text3);font-size:0.68rem">'+(h.found||[]).slice(0,6).map(f=>esc(f.chunk)).join('<br>')+'</div></div>').join('')
+      +(hit.length&&!(r.hits||[]).length?hit.map(t=>'<div style="color:var(--orange);margin-top:0.2rem">'+esc(t.label||('token '+t.id))+' found a leak and was revoked</div>').join(''):'');
   }catch(e){ if(!sessionEnded(e)) el.textContent=e.message; }
 }
 async function revokeScanToken(id){
   if(!confirm('Revoke this scan token? Whatever uses it stops scanning.')) return;
-  try{ await api('DELETE','/api/blindkey/leak-scan/tokens/'+Number(id)); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  try{ await apiGated('DELETE','/api/blindkey/leak-scan/tokens/'+Number(id),null,'Revoke this scan token? Your PIN confirms it.'); }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
   loadScanTokens();
 }
 async function loadLockSetting(){

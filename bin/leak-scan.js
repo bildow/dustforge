@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 'use strict';
 // leak-scan — does any of my DemiPass vault values appear in these files? (red team item 5)
-//   node bin/leak-scan.js <path>...      exit 0 clean, 1 a value was found, 2 the scan could not run
+//   node bin/leak-scan.js [--strict] [--incremental <state.json>] <path>...
+//        exit 0 clean, 1 a value was found, 2 the scan could not run (or, with --strict, a file could not be scanned)
+//        --strict       the deploy gate and CI: nothing is skipped (no directory but .git; a file too large → exit 2)
+//        --incremental  only the bytes appended since the last run (append-only logs such as transcripts); offsets
+//                       are kept in <state.json> and advanced only after a clean scan
 //   node bin/leak-scan.js --request <dir> <label>...
 //        ask for one scan token per label; the owner approves in the DemiPass app; each token is written to
 //        <dir>/<label>.token (0600) and never printed. Asks with the owner's DemiPass session (DEMIPASS_TOKEN, or the
 //        SDK credentials file ~/.config/demipass/credentials.json); waits up to 15 minutes.
-// The server does the matching (only it holds the values) and answers with refs, names and file:lines — this program
-// never receives, holds or prints a value. Zero dependencies (Node ≥ 18), so CI and pane hooks can copy it as is.
+// The server does the matching (only it holds the values) and answers one bit — leak or clean. Which secret and where
+// go to the owner only (mail and the app). This program never receives, holds or prints a value. Zero dependencies (Node ≥ 18), so CI and pane hooks can copy it as is.
 // Scanning takes a scan token: DEMIPASS_SCAN_TOKEN, or DEMIPASS_SCAN_TOKEN_FILE (a 0600 file). A session token is
 // refused by the server (no oracle for agents). A hit revokes the token: fix the leak, then request a new one.
 // DEMIPASS_URL overrides the server.
@@ -58,19 +62,31 @@ async function requestTokens(dir, labels) {
   }
   throw new Error('the request expired before it was approved');
 }
+let STRICT = false;
+const skipped = [];
 function* files(p) {
   let st; try { st = fs.lstatSync(p); } catch (_) { return; }
-  if (st.isSymbolicLink()) return;
-  if (st.isDirectory()) { if (SKIP_DIRS.has(path.basename(p))) return; for (const e of fs.readdirSync(p).sort()) yield* files(path.join(p, e)); return; }
-  if (st.isFile() && st.size > 0 && st.size <= MAX_FILE) yield p;
+  if (st.isSymbolicLink()) return;   // what it points at is scanned where it lives (or is outside what was asked)
+  if (st.isDirectory()) { const b = path.basename(p); if (b === '.git' || (!STRICT && SKIP_DIRS.has(b))) return; for (const e of fs.readdirSync(p).sort()) yield* files(path.join(p, e)); return; }
+  if (!st.isFile() || st.size === 0) return;
+  if (st.size > MAX_FILE) { skipped.push(`${p} (${st.size} bytes, too large)`); return; }
+  yield p;
 }
-// Line-bounded chunks with a "file:first-last" label. A value split across a chunk border is caught by the 512-byte
-// overlap each chunk carries from the one before.
-function* chunks(file) {
-  const buf = fs.readFileSync(file);
-  if (buf.subarray(0, 8192).includes(0)) return;   // binary
-  const text = buf.toString('utf8');
-  const lines = text.split('\n');
+// Chunks with a label: "file:first-last" (lines) for text, "file@offset" (bytes) for binary or incremental reads. A
+// binary file is scanned too, byte for byte as latin1 (an ASCII value in it is found as it is; #45 review M2). A value
+// split across a chunk border is caught by the 512-byte overlap each chunk carries from the one before.
+function* chunks(file, from = 0) {
+  let buf = fs.readFileSync(file);
+  if (from > 0) buf = buf.subarray(from <= buf.length ? from : 0);
+  const binary = buf.subarray(0, 8192).includes(0);
+  if (binary || from > 0) {
+    for (let o = 0; o < buf.length; o += CHUNK_BYTES) {
+      const start = Math.max(0, o - 512);
+      yield { id: `${file}@${from + o}`, text: buf.subarray(start, o + CHUNK_BYTES).toString(binary ? 'latin1' : 'utf8') };
+    }
+    return;
+  }
+  const lines = buf.toString('utf8').split('\n');
   let cur = [], size = 0, first = 1, carry = '';
   for (let i = 0; i < lines.length; i++) {
     cur.push(lines[i]); size += Buffer.byteLength(lines[i]) + 1;
@@ -81,35 +97,56 @@ function* chunks(file) {
     }
   }
 }
-let revokedNote = null;
+let leak = false, revokedNote = null;
 async function post(auth, batch) {
   const r = await fetch(API + '/api/demipass/leak-scan', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: JSON.stringify({ chunks: batch }) });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`scan refused: HTTP ${r.status}: ${d.error || ''}`);
-  if (d.token_revoked) revokedNote = d.note;
-  return d.hits || [];
+  if (d.leak) { leak = true; revokedNote = d.note || 'a vault value was found; the owner has the details'; }
 }
 (async () => {
   if (process.argv[2] === '--request') return requestTokens(process.argv[3], process.argv.slice(4));
-  const targets = process.argv.slice(2);
-  if (!targets.length) { console.error('usage: leak-scan <path>...'); process.exit(2); }
+  const args = process.argv.slice(2);
+  let stateFile = null;
+  for (;;) {
+    if (args[0] === '--strict') { STRICT = true; args.shift(); continue; }
+    if (args[0] === '--incremental') { args.shift(); stateFile = args.shift(); continue; }
+    break;
+  }
+  const targets = args;
+  if (!targets.length || (stateFile !== null && !stateFile)) { console.error('usage: leak-scan [--strict] [--incremental <state.json>] <path>...'); process.exit(2); }
   const tok = authHeader();
-  let batch = [], bytes = 0, nfiles = 0, total = 0;
-  const hits = [];
-  const flush = async () => { if (batch.length) { hits.push(...await post(tok, batch)); batch = []; bytes = 0; } };
+  let state = {};
+  if (stateFile) { try { state = JSON.parse(fs.readFileSync(stateFile, 'utf8')) || {}; } catch (_) { state = {}; } }
+  const next = {};
+  let batch = [], bytes = 0, nfiles = 0, total = 0, done = [];
+  // Offsets are saved as soon as a file's last chunk has been scanned clean, so a run stopped by the daily budget
+  // picks up where it stopped the next day.
+  const saveState = () => { if (!stateFile || leak || !done.length) return; for (const f of done) state[f] = next[f]; done = [];
+    fs.writeFileSync(stateFile + '.tmp', JSON.stringify(state), { mode: 0o600 }); fs.renameSync(stateFile + '.tmp', stateFile); };
+  let ending = [];
+  const flush = async () => { if (batch.length) { await post(tok, batch); batch = []; bytes = 0; done.push(...ending); ending = []; saveState(); } };
   scan: for (const t of targets) for (const f of files(path.resolve(t))) {
-    if (revokedNote) break scan;   // a hit revoked the token: report what was found, stop
+    if (leak) break scan;   // a hit revoked the token: stop
+    let from = 0;
+    if (stateFile) {
+      const size = fs.statSync(f).size, seen = Number(state[f]) || 0;
+      from = seen <= size ? seen : 0;   // a file that shrank was replaced: scan it whole
+      next[f] = size;
+      if (from === size) continue;
+    }
     nfiles++;
-    for (const c of chunks(f)) {
-      if (revokedNote) break scan;
+    for (const c of chunks(f, from)) {
+      if (leak) break scan;
       const b = Buffer.byteLength(c.text);
       if (bytes + b > BATCH_BYTES || batch.length >= 150) await flush();
       batch.push(c); bytes += b; total += b;
     }
+    if (stateFile) ending.push(f);
   }
-  if (!revokedNote) await flush();
-  for (const h of hits) console.log(`LEAK  ${h.ref || '(no ref)'}  ${h.name}  at ${h.chunk}  ×${h.count}`);
-  console.log(`leak-scan: ${nfiles} files, ${total} bytes, ${hits.length} hit${hits.length === 1 ? '' : 's'}`);
-  if (revokedNote) console.log('leak-scan: ' + revokedNote);
-  process.exit(hits.length ? 1 : 0);
+  if (!leak) await flush();
+  if (stateFile && !leak) { for (const f of Object.keys(next)) if (!(f in state) || state[f] !== next[f]) { if (!ending.includes(f) && !done.includes(f)) done.push(f); } saveState(); }
+  for (const k of skipped) console.log(`SKIPPED  ${k}`);
+  console.log(`leak-scan: ${nfiles} files, ${total} bytes, ${leak ? 'LEAK — ' + revokedNote : 'clean'}`);
+  process.exit(leak ? 1 : (STRICT && skipped.length) ? 2 : 0);
 })().catch(e => { console.error('leak-scan: ' + e.message); process.exit(2); });

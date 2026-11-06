@@ -69,12 +69,14 @@ OUT=$(DEMIPASS_URL=$API DEMIPASS_TOKEN=$A node bin/leak-scan.js "$S/tree" 2>&1);
 
 # clean first, then the leak
 OUT=$(SCAN ci "$S/clean"); RC=$?
-[ $RC = 0 ] && echo "$OUT" | grep -q "0 hits" && ok "a clean tree passes (exit 0)" || fail "clean: rc=$RC $OUT"
+[ $RC = 0 ] && echo "$OUT" | grep -q "clean" && ok "a clean tree passes (exit 0)" || fail "clean: rc=$RC $OUT"
 python3 -c 'import json; print(json.dumps({"chunks":[{"id":"big","text":"x"*1500000}]}))' > "$S/big.json"
 C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/ci.tok")" -d @"$S/big.json"); rm -f "$S/big.json"
 [ "$C" = 200 ] && ok "a 1.5 MB scan body is accepted" || fail "big body: $C"
 OUT=$(SCAN ci "$S/tree"); RC=$?
-[ $RC = 1 ] && echo "$OUT" | grep -q "LEAK  $REF  seeded  at $S/tree/" && ok "the seeded value trips the scanner (exit 1, ref + file:lines)" || fail "leak: rc=$RC $OUT"
+[ $RC = 1 ] && echo "$OUT" | grep -q "LEAK" && ! echo "$OUT" | grep -q "seeded\|$REF\|notes.md" && ok "the seeded value trips the scanner (exit 1) — and the scanner is told only leak, not which secret or where" || fail "leak: rc=$RC $OUT"
+call GET /api/demipass/leak-scan/tokens "$A"; echo "$BODY" | grep -q "\"ref\":\"$REF\"" && echo "$BODY" | grep -q "notes.md" && ok "…the owner (own session) sees which secret and where" || fail "owner hits: $BODY"
+AGX=$(login owner-a); call GET /api/demipass/leak-scan/tokens "$AGX"; [ "$(echo "$BODY" | J hits)" != None ] || true
 ! echo "$OUT" | grep -qF -- "$(cat "$S/seed")" && ! echo "$OUT" | grep -qF -- "$(sed 's/"/\\"/' "$S/seed")" && ok "the scanner's output never contains the value" || fail "value printed"
 ! echo "$OUT" | grep -q tiny && ok "values shorter than 8 characters are not matched (oracle bound)" || fail "short matched"
 echo "$OUT" | grep -q "revoked" && [ "$(Q "SELECT revoked_reason FROM leak_scan_tokens WHERE id=$TID")" = hit ] && ok "the first hit revokes the token (stop the line; one positive answer per token)" || fail "revoke on hit: $OUT"
@@ -82,15 +84,38 @@ OUT=$(SCAN ci "$S/clean"); RC=$?
 [ $RC = 2 ] && echo "$OUT" | grep -q "found a leak and was revoked" && ok "…it scans nothing more until a new one is approved" || fail "after hit: rc=$RC $OUT"
 mint json; mkdir -p "$S/t2"; cp "$S/tree/sub/transcript.jsonl" "$S/t2/"
 OUT=$(SCAN json "$S/t2"); RC=$?
-[ $RC = 1 ] && echo "$OUT" | grep -q "transcript.jsonl" && ok "the JSON-escaped form (a transcript line) is found too" || fail "json form: rc=$RC $OUT"
+[ $RC = 1 ] && ok "the JSON-escaped form (a transcript line) is found too" || fail "json form: rc=$RC $OUT"
+# a binary file holding the value is scanned, not skipped (#45 review M2)
+mint bin; mkdir -p "$S/t3"; python3 -c 'import sys; open(sys.argv[2],"wb").write(b"\x00\x01binary\x00 "+open(sys.argv[1]).read().strip().encode()+b" \x00tail")' "$S/seed" "$S/t3/blob.bin"
+OUT=$(SCAN bin --strict "$S/t3"); RC=$?; [ $RC = 1 ] && ok "a binary file holding a value is scanned (latin1), not skipped" || fail "binary: rc=$RC $OUT"
+# one scan answer cannot be split into per-chunk bits (#45 review H1): many chunks, one boolean
+mint orc; python3 - "$S/seed" "$S/orc.json" <<'PY2'
+import json,sys; v=open(sys.argv[1]).read().strip()
+chunks=[{"id":"c%d"%i,"text":"guess-%d"%i} for i in range(12)]; chunks[5]["text"]+=" "+v
+json.dump({"chunks":chunks},open(sys.argv[2],"w"))
+PY2
+R=$(curl -s -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/orc.tok")" -d @"$S/orc.json"); rm -f "$S/orc.json"
+[ "$(echo "$R" | J leak)" = True ] && [ "$(echo "$R" | J hits)" = None ] && ! echo "$R" | grep -q '"c5"' && ok "12 chunks, one hidden value: the scanner learns only 'leak' — no chunk, no count, no name" || fail "oracle: $R"
+# a token's daily scan count is capped
+mint cap; X(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
+X "UPDATE leak_scan_tokens SET day=date('now'), requests_today=150 WHERE label='cap'"
+OUT=$(SCAN cap "$S/clean"); RC=$?; [ $RC = 2 ] && echo "$OUT" | grep -q "150 scans" && ok "a token makes at most 150 scans a day (one-by-one guessing is slow)" || fail "cap: rc=$RC $OUT"
+# incremental: only what was appended, offsets kept
+mint inc; mkdir -p "$S/logs"; echo '{"line":"nothing"}' > "$S/logs/t.jsonl"
+OUT=$(DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/inc.tok" node bin/leak-scan.js --incremental "$S/inc.state" "$S/logs" 2>&1); RC=$?
+[ $RC = 0 ] && [ -s "$S/inc.state" ] && ok "incremental: a clean run saves per-file offsets" || fail "inc 1: rc=$RC $OUT"
+OUT=$(DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/inc.tok" node bin/leak-scan.js --incremental "$S/inc.state" "$S/logs" 2>&1); echo "$OUT" | grep -q "0 files, 0 bytes" && ok "…an unchanged file is not sent again" || fail "inc 2: $OUT"
+python3 -c 'import json,sys; open(sys.argv[2],"a").write(json.dumps({"tool_result":open(sys.argv[1]).read().strip()})+"\n")' "$S/seed" "$S/logs/t.jsonl"
+OUT=$(DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/inc.tok" node bin/leak-scan.js --incremental "$S/inc.state" "$S/logs" 2>&1); RC=$?
+[ $RC = 1 ] && ok "…a value appended later is found" || fail "inc 3: rc=$RC $OUT"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='leak_scan_hit' AND severity='critical'")" -ge 2 ] && ok "every hit is a critical security event" || fail "hit events"
 ! grep -qF -- "$(cat "$S/seed")" "$S/server.log" && [ "$(Q "SELECT COUNT(*) FROM blindkey_events WHERE detail LIKE '%seed-%'")" = 0 ] && ok "no value in the server log or the events" || fail "value logged"
 # another owner's token finds nothing of A's
 call POST /api/identity/pin "$X" '{"pin":"9876","password":"hunter22"}'; call POST /api/identity/gate/verify "$X" '{"gate":"pin","pin":"9876","intent":"scan-token:0"}'
 call POST /api/demipass/leak-scan/tokens "$X" '{"label":"x"}'; XT=$(echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
-H2=$(curl -s -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Scan $XT" -d @"$S/body.json" | J hits); rm -f "$S/body.json"
-[ "$H2" = "[]" ] && ok "another owner scanning the same text matches only their own values (none)" || fail "cross-owner: $H2"
-mint rv; RV=$(echo "$BODY" | J id); call DELETE /api/demipass/leak-scan/tokens/$RV "$A"
+H2=$(curl -s -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Scan $XT" -d @"$S/body.json" | J leak); rm -f "$S/body.json"
+[ "$H2" = False ] && ok "another owner scanning the same text matches only their own values (none)" || fail "cross-owner: $H2"
+mint rv; RV=$(echo "$BODY" | J id); call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-token:'$RV'"}'; call DELETE /api/demipass/leak-scan/tokens/$RV "$A"
 OUT=$(SCAN rv "$S/clean"); RC=$?; [ $RC = 2 ] && echo "$OUT" | grep -q "401" && ok "a revoked scan token is refused (exit 2)" || fail "revoked: rc=$RC $OUT"
 
 # token requests: asked by whoever acts for A, approved in A's app, claimed once by the asker
@@ -135,13 +160,30 @@ OUT=$(DEPLOY "$(tip)"); RC=$?
 [ $RC = 3 ] && echo "$OUT" | grep -q "no scan token" && [ "$(git -C "$G/live" rev-parse HEAD)" != "$(tip)" ] && ok "deploy gate: no scan token → refused (fail closed)" || fail "gate no token: rc=$RC $OUT"
 mint gate; cp "$S/gate.tok" "$G/scan.token"; chmod 600 "$G/scan.token"
 OUT=$(DEPLOY "$(tip)"); RC=$?
-[ $RC = 3 ] && echo "$OUT" | grep -q "LEAK  $REF  seeded  at" && echo "$OUT" | grep -q "leak.yml" && [ "$(git -C "$G/live" rev-parse HEAD)" != "$(tip)" ] && ! echo "$OUT" | grep -qF -- "$(cat "$S/seed")" \
-  && ok "deploy gate: a commit carrying a vault value → refused, names leak.yml, never prints the value, nothing merged" || fail "gate leak: rc=$RC $OUT"
+[ $RC = 3 ] && echo "$OUT" | grep -q "a vault value is in this commit" && [ "$(git -C "$G/live" rev-parse HEAD)" != "$(tip)" ] && ! echo "$OUT" | grep -qF -- "$(cat "$S/seed")" \
+  && ok "deploy gate: a commit carrying a vault value → refused, never prints the value, nothing merged" || fail "gate leak: rc=$RC $OUT"
 git -C "$G/work" rm -q leak.yml; echo "hello again" > "$G/work/a.txt"; git -C "$G/work" commit -qam fix; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
 OUT=$(DEPLOY "$(tip)"); RC=$?
 [ $RC = 3 ] && echo "$OUT" | grep -q "scan could not run\|revoked" && ok "deploy gate: the token that found the leak is revoked — nothing deploys until a new one is placed" || fail "gate after hit: rc=$RC $OUT"
+# a type change (a symlink replaced by a file holding the value) is scanned too (#45 review M1)
+mint gate3; cp "$S/gate3.tok" "$G/scan.token"
+ln -s a.txt "$G/work/cfg.env"; git -C "$G/work" add -A; git -C "$G/work" commit -qm link; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
+DEPLOY "$(tip)" >/dev/null 2>&1   # the link commit deploys (nothing secret in it)
+rm "$G/work/cfg.env"; python3 -c 'import sys; open(sys.argv[2],"w").write("API_KEY="+open(sys.argv[1]).read().strip()+"\n")' "$S/seed" "$G/work/cfg.env"
+git -C "$G/work" add -A; git -C "$G/work" commit -qm typechange; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
+OUT=$(DEPLOY "$(tip)"); RC=$?; [ $RC = 3 ] && echo "$OUT" | grep -q "a vault value is in this commit" && ok "deploy gate: a symlink turned into a file holding a value (type change) is caught" || fail "gate typechange: rc=$RC $OUT"
+git -C "$G/work" rm -q cfg.env; echo "third" > "$G/work/a.txt"; git -C "$G/work" commit -qam fix2; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
 mint gate2; cp "$S/gate2.tok" "$G/scan.token"
 OUT=$(DEPLOY "$(tip)"); RC=$?
 [ $RC = 0 ] && [ "$(git -C "$G/live" rev-parse HEAD)" = "$(tip)" ] && ok "deploy gate: the cleaned commit with a new token → deployed (only the changed files are scanned)" || fail "gate clean: rc=$RC $OUT"
+
+# owner-only management; an approved request nobody claims revokes its tokens (#45 review L1, L3)
+LIVE=$(Q "SELECT id FROM leak_scan_tokens WHERE revoked_at IS NULL ORDER BY id LIMIT 1")
+call DELETE /api/demipass/leak-scan/tokens/$LIVE "$AG"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "scan-token:$LIVE" ] && ok "revoking a scan token takes the PIN (an agent signed in as the owner cannot stop the deploy gate)" || fail "agent revoke: $CODE $BODY"
+call POST /api/demipass/leak-scan/token-requests "$AG" '{"labels":["lapse"]}'; RQL=$(echo "$BODY" | J request_id)
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-approve:'$RQL'"}'; call POST /api/demipass/leak-scan/token-requests/$RQL/approve "$A"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE leak_scan_token_requests SET expires_at='2000-01-01T00:00:00.000Z' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$RQL"
+call GET /api/demipass/leak-scan/token-requests "$A"
+[ "$(Q "SELECT revoked_reason FROM leak_scan_tokens WHERE request_id=$RQL")" = unclaimed ] && [ "$(Q "SELECT COALESCE(sealed,'') FROM leak_scan_token_requests WHERE id=$RQL")" = "" ] && ok "an approved request nobody claimed in time: its token is revoked and nothing sealed is kept" || fail "unclaimed: $(Q "SELECT revoked_reason FROM leak_scan_tokens WHERE request_id=$RQL")"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails
