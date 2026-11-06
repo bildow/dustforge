@@ -8179,7 +8179,7 @@ const deviceKeys = require('./device_keys')({
 });
 // Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
 require('./leak_scan')({ app, db, express, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-  logSecurityEvent, blindkeyDecrypt, cleanLabel });
+  logSecurityEvent, blindkeyDecrypt, blindkeyEncrypt, cleanLabel, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys });
 // Security depth on use: per-use approval requests with request-bound rotating codes (docs/approvals.md).
 const useApprovals = require('./use_approvals')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,

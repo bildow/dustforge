@@ -1,0 +1,6 @@
+[Unit]
+Description=DemiPass leak scan: today's transcripts and the tome (red team item 5)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/demipass/daily.sh

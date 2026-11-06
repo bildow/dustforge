@@ -28,6 +28,10 @@ step files
 install -d -m 0755 /usr/local/libexec
 install -o root -g root -m 0755 -T "$SRC/dustforge-deploy" /usr/local/sbin/dustforge-deploy
 install -o root -g root -m 0755 -T "$SRC/dustforge-deploy-shell" /usr/local/libexec/dustforge-deploy-shell
+# The leak gate's scanner (red team item 5): a root-owned copy, so a deployed commit cannot change its own gate. The
+# scan token goes in /etc/dustforge-deploy/scan.token (root 0600), placed by the operator from an approved request.
+if [ -f "$SRC/leak-scan.js" ]; then install -o root -g root -m 0755 -T "$SRC/leak-scan.js" /usr/local/libexec/dustforge-leak-scan.js; fi
+install -d -o root -g root -m 0700 /etc/dustforge-deploy
 bash -n /usr/local/sbin/dustforge-deploy && bash -n /usr/local/libexec/dustforge-deploy-shell
 [ -d /opt/backups ] || install -d -m 0700 /opt/backups
 install -d -m 0700 -o root -g root /opt/backups/dustforge-deploy /var/lib/dustforge-deploy

@@ -180,6 +180,7 @@
   <div id="fill-requests"></div>
   <div id="net-requests"></div>
   <div id="share-requests"></div>
+  <div id="scan-requests"></div>
   <div id="approval-requests"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
@@ -346,6 +347,9 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Phones (approvals come from a linked phone; its fingerprint/face stands in for the PIN)</div>
         <div id="devices" style="margin-top:0.3rem"></div>
         <div id="device-out" style="font-size:0.72rem;color:var(--green);margin-top:0.25rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Leak scanner tokens (pane start, deploy gate, CI)</div>
+        <div id="scan-tokens" style="margin-top:0.3rem;font-size:0.75rem"></div>
+        <div style="font-size:0.68rem;color:var(--text3);margin-top:0.2rem">A token only asks “is one of my values in this text?”. The first leak it finds revokes it.</div>
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Lock after (idle)</div>
         <select id="lock-after" onchange="setLockAfter(this.value)" style="width:100%;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem">
           <option value="60">1 minute</option><option value="120">2 minutes</option><option value="300">5 minutes</option><option value="600">10 minutes</option>
@@ -951,7 +955,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();}
+  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -2263,6 +2267,41 @@ async function unlockTry(usePin){
     noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadNetwork();
   }catch(e){ if(!sessionEnded(e)) m.textContent=e.message; }
 }
+// ── Leak scanner (red team item 5): something acting for you asks for scan tokens; you approve here ───────────────
+let scanReqs=[], scanBusy=new Set();
+async function loadScanRequests(){
+  if(lockState.locked) return;
+  try{ const r=await api('GET','/api/blindkey/leak-scan/token-requests'); scanReqs=r.requests||[]; }catch(e){ if(sessionEnded(e)) return; }
+  const el=document.getElementById('scan-requests'); if(!el) return;
+  el.innerHTML=scanReqs.map(q=>'<div class="fill-req"><div>A leak scanner asks for '+(q.labels.length===1?'a scan token':q.labels.length+' scan tokens')+': <b>'+q.labels.map(esc).join(', ')+'</b></div>'
+    +(q.requested_by?'<div style="color:var(--text3);margin-top:0.25rem">from '+esc(q.requested_by)+'</div>':'')
+    +'<div style="color:var(--text3);margin-top:0.25rem">A token only asks whether one of your values appears in some text; it never sees a value. Approve only if you started this (pane set-up, CI).</div>'
+    +'<div class="fr-row"><button class="btn-primary" '+(scanBusy.has(q.id)?'disabled ':'')+'onclick="scanDecide('+Number(q.id)+',true)">Approve</button>'
+    +'<button class="btn-ghost" '+(scanBusy.has(q.id)?'disabled ':'')+'onclick="scanDecide('+Number(q.id)+',false)">Deny</button></div></div>').join('');
+}
+async function scanDecide(id, ok){
+  if(scanBusy.has(id)) return; scanBusy.add(id); loadScanRequests();
+  try{
+    if(ok) await apiGated('POST','/api/blindkey/leak-scan/token-requests/'+id+'/approve',{},'Approve the leak-scan token request? Your PIN approves it.');
+    else await api('POST','/api/blindkey/leak-scan/token-requests/'+id+'/deny',{});
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ scanBusy.delete(id); }
+  loadScanRequests(); loadScanTokens();
+}
+async function loadScanTokens(){
+  const el=document.getElementById('scan-tokens'); if(!el) return;
+  try{
+    const r=await api('GET','/api/blindkey/leak-scan/tokens');
+    const live=(r.tokens||[]).filter(t=>!t.revoked_at), hit=(r.tokens||[]).filter(t=>t.revoked_reason==='hit').slice(0,3);
+    el.innerHTML=(live.length?live.map(t=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:0.3rem 0"><span>'+esc(t.label||('token '+t.id))+' <span style="color:var(--text3)">'+(t.last_used_at?'last scan '+esc(String(t.last_used_at).slice(0,16).replace('T',' ')):'never used')+'</span></span><button class="btn-ghost" style="font-size:0.65rem" onclick="revokeScanToken('+Number(t.id)+')">Revoke</button></div>').join(''):'<div style="color:var(--text3)">No scan tokens.</div>')
+      +hit.map(t=>'<div style="color:var(--orange);margin-top:0.2rem">'+esc(t.label||('token '+t.id))+' found a leak and was revoked '+esc(String(t.revoked_at).slice(0,16).replace('T',' '))+'</div>').join('');
+  }catch(e){ if(!sessionEnded(e)) el.textContent=e.message; }
+}
+async function revokeScanToken(id){
+  if(!confirm('Revoke this scan token? Whatever uses it stops scanning.')) return;
+  try{ await api('DELETE','/api/blindkey/leak-scan/tokens/'+Number(id)); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  loadScanTokens();
+}
 async function loadLockSetting(){
   try{ const r=await api('GET','/api/identity/lock'); lockState.after=Number(r.lock_after_sec)||300; const el=document.getElementById('lock-after'); if(el) el.value=String(lockState.after); }catch(_){}
 }
@@ -2524,7 +2563,7 @@ document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.vis
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
 let pollN=0;
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0)loadShares();}},4000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0){loadShares();loadScanRequests();}}},4000);
 
 // ── Pair in person (QR): a contact confirmed face to face; only these can be shared with (red team item 6) ──────
 // One side shows a QR, the other scans it in this app. Only the shower's screen gets the 6-digit code; the scanner

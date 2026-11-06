@@ -1,7 +1,9 @@
 #!/bin/bash
 # Leak scanner smoke (red team item 5): a seeded vault value planted in a file trips the scanner (plain and JSON-escaped),
 # a clean tree passes, the scanner's output never contains the value, scan tokens are minted with the PIN only and are
-# good only for scanning, another owner's values are not matched, a revoked token is refused, every hit is critical.
+# good only for scanning, another owner's values are not matched, every hit is critical. No session token scans (no
+# oracle for agents); the first hit revokes the token (one positive answer per token). Tokens can be requested by
+# whoever acts for the owner and approved in the app with the PIN; the requester claims them once (--request).
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-leakscan-smoke.XXXXXX)
@@ -51,34 +53,95 @@ PY
 
 # minting
 call POST /api/demipass/leak-scan/tokens "$A" '{"label":"ci"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "scan-token:0" ] && ok "a scan token needs the owner's PIN" || fail "mint no pin: $CODE $BODY"
-call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-token:0"}'
-call POST /api/demipass/leak-scan/tokens "$A" '{"label":"ci"}'
-[ "$CODE" = 201 ] || fail "mint: $CODE"
-echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' > "$S/scantok"; chmod 600 "$S/scantok"
-TID=$(echo "$BODY" | J id)
+mint(){ call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-token:0"}'; call POST /api/demipass/leak-scan/tokens "$A" '{"label":"'$1'"}'
+  [ "$CODE" = 201 ] || fail "mint: $CODE"; echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' > "$S/$1.tok"; chmod 600 "$S/$1.tok"; }
+mint ci; TID=$(echo "$BODY" | J id)
 [ "$(Q "SELECT COUNT(*) FROM leak_scan_tokens WHERE token_hash LIKE 'dpscan_%'")" = 0 ] && ok "the scan token is stored hashed" || fail "token stored raw"
-call GET /api/demipass/menu "" ; curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(cat "$S/scantok")" "$API/api/demipass/menu" | grep -q 401 && ok "a scan token is good for nothing but scanning (Bearer → 401)" || fail "scan token as bearer"
+curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(cat "$S/ci.tok")" "$API/api/demipass/menu" | grep -q 401 && ok "a scan token is good for nothing but scanning (Bearer → 401)" || fail "scan token as bearer"
+SCAN(){ DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/$1.tok" node bin/leak-scan.js "${@:2}" 2>&1; }
 
-# scanning
-OUT=$(DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/scantok" node bin/leak-scan.js "$S/tree" 2>&1); RC=$?
-[ $RC = 1 ] && echo "$OUT" | grep -q "LEAK  $REF  seeded  at $S/tree/notes.md:" && echo "$OUT" | grep -q "transcript.jsonl" && ok "the seeded value trips the scanner — plain and JSON-escaped (exit 1, ref + file:lines)" || fail "seed: rc=$RC $OUT"
+# no session token scans
+python3 -c 'import json,sys; print(json.dumps({"chunks":[{"id":"t","text":open(sys.argv[1]).read()}]}))' "$S/tree/notes.md" > "$S/body.json"
+C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Bearer $A" -d @"$S/body.json")
+[ "$C" = 403 ] && ok "the owner's own session token cannot scan (no oracle for an agent holding it)" || fail "bearer scan: $C"
+OUT=$(DEMIPASS_URL=$API DEMIPASS_TOKEN=$A node bin/leak-scan.js "$S/tree" 2>&1); RC=$?
+[ $RC = 2 ] && ok "…and the client will not scan without a scan token" || fail "client bearer: rc=$RC $OUT"
+
+# clean first, then the leak
+OUT=$(SCAN ci "$S/clean"); RC=$?
+[ $RC = 0 ] && echo "$OUT" | grep -q "0 hits" && ok "a clean tree passes (exit 0)" || fail "clean: rc=$RC $OUT"
+python3 -c 'import json; print(json.dumps({"chunks":[{"id":"big","text":"x"*1500000}]}))' > "$S/big.json"
+C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/ci.tok")" -d @"$S/big.json"); rm -f "$S/big.json"
+[ "$C" = 200 ] && ok "a 1.5 MB scan body is accepted" || fail "big body: $C"
+OUT=$(SCAN ci "$S/tree"); RC=$?
+[ $RC = 1 ] && echo "$OUT" | grep -q "LEAK  $REF  seeded  at $S/tree/" && ok "the seeded value trips the scanner (exit 1, ref + file:lines)" || fail "leak: rc=$RC $OUT"
 ! echo "$OUT" | grep -qF -- "$(cat "$S/seed")" && ! echo "$OUT" | grep -qF -- "$(sed 's/"/\\"/' "$S/seed")" && ok "the scanner's output never contains the value" || fail "value printed"
 ! echo "$OUT" | grep -q tiny && ok "values shorter than 8 characters are not matched (oracle bound)" || fail "short matched"
-OUT=$(DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/scantok" node bin/leak-scan.js "$S/clean" 2>&1); RC=$?
-[ $RC = 0 ] && echo "$OUT" | grep -q "0 hits" && ok "a clean tree passes (exit 0)" || fail "clean: rc=$RC $OUT"
+echo "$OUT" | grep -q "revoked" && [ "$(Q "SELECT revoked_reason FROM leak_scan_tokens WHERE id=$TID")" = hit ] && ok "the first hit revokes the token (stop the line; one positive answer per token)" || fail "revoke on hit: $OUT"
+OUT=$(SCAN ci "$S/clean"); RC=$?
+[ $RC = 2 ] && echo "$OUT" | grep -q "found a leak and was revoked" && ok "…it scans nothing more until a new one is approved" || fail "after hit: rc=$RC $OUT"
+mint json; mkdir -p "$S/t2"; cp "$S/tree/sub/transcript.jsonl" "$S/t2/"
+OUT=$(SCAN json "$S/t2"); RC=$?
+[ $RC = 1 ] && echo "$OUT" | grep -q "transcript.jsonl" && ok "the JSON-escaped form (a transcript line) is found too" || fail "json form: rc=$RC $OUT"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='leak_scan_hit' AND severity='critical'")" -ge 2 ] && ok "every hit is a critical security event" || fail "hit events"
 ! grep -qF -- "$(cat "$S/seed")" "$S/server.log" && [ "$(Q "SELECT COUNT(*) FROM blindkey_events WHERE detail LIKE '%seed-%'")" = 0 ] && ok "no value in the server log or the events" || fail "value logged"
-# another owner's session finds nothing of A's
-python3 -c 'import json,sys; print(json.dumps({"chunks":[{"id":"t","text":open(sys.argv[1]).read()}]}))' "$S/tree/notes.md" > "$S/body.json"
-H2=$(curl -s -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Bearer $X" -d @"$S/body.json" | J hits); rm -f "$S/body.json"
+# another owner's token finds nothing of A's
+call POST /api/identity/pin "$X" '{"pin":"9876","password":"hunter22"}'; call POST /api/identity/gate/verify "$X" '{"gate":"pin","pin":"9876","intent":"scan-token:0"}'
+call POST /api/demipass/leak-scan/tokens "$X" '{"label":"x"}'; XT=$(echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+H2=$(curl -s -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Scan $XT" -d @"$S/body.json" | J hits); rm -f "$S/body.json"
 [ "$H2" = "[]" ] && ok "another owner scanning the same text matches only their own values (none)" || fail "cross-owner: $H2"
-# a 1.5 MB body is accepted (its own parser, not the global 100 kB one)
-python3 -c 'import json; print(json.dumps({"chunks":[{"id":"big","text":"x"*1500000}]}))' > "$S/big.json"
-C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/scantok")" -d @"$S/big.json"); rm -f "$S/big.json"
-[ "$C" = 200 ] && ok "a 1.5 MB scan body is accepted" || fail "big body: $C"
-# revoke
-call DELETE /api/demipass/leak-scan/tokens/$TID "$A"
-OUT=$(DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/scantok" node bin/leak-scan.js "$S/tree" 2>&1); RC=$?
-[ $RC = 2 ] && echo "$OUT" | grep -q "401" && ok "a revoked scan token is refused (exit 2)" || fail "revoked: rc=$RC $OUT"
+mint rv; RV=$(echo "$BODY" | J id); call DELETE /api/demipass/leak-scan/tokens/$RV "$A"
+OUT=$(SCAN rv "$S/clean"); RC=$?; [ $RC = 2 ] && echo "$OUT" | grep -q "401" && ok "a revoked scan token is refused (exit 2)" || fail "revoked: rc=$RC $OUT"
+
+# token requests: asked by whoever acts for A, approved in A's app, claimed once by the asker
+AG=$(login owner-a)   # an agent's session of A (it holds no PIN proof, and never types one)
+call POST /api/demipass/leak-scan/token-requests "$AG" '{"labels":["ci-dustforge","ci-demipass"]}'; RQ=$(echo "$BODY" | J request_id); CS=$(echo "$BODY" | J claim_secret)
+[ "$CODE" = 202 ] && [ -n "$CS" ] && ok "an agent session of A asks for two scan tokens (202, a claim secret only it holds)" || fail "request: $CODE $BODY"
+call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"'$CS'"}'; [ "$CODE" = 202 ] && ok "claiming before the owner decides → 202 waiting" || fail "claim early: $CODE"
+call GET /api/demipass/leak-scan/token-requests "$A"; [ "$(echo "$BODY" | J requests.0.id)" = "$RQ" ] && ok "A's app lists the request" || fail "list: $BODY"
+call POST /api/demipass/leak-scan/token-requests/$RQ/approve "$AG"; [ "$CODE" = 403 ] && ok "the asking session cannot approve its own request without the PIN" || fail "self approve: $CODE"
+call POST /api/demipass/leak-scan/token-requests/$RQ/approve "$A"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "scan-approve:$RQ" ] && ok "approving takes the PIN (scan-approve:<id>)" || fail "approve pin: $CODE $BODY"
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-approve:'$RQ'"}'; call POST /api/demipass/leak-scan/token-requests/$RQ/approve "$A"
+[ "$CODE" = 200 ] && ok "A approves in the app" || fail "approve: $CODE $BODY"
+call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"wrong-wrong-wrong"}'; [ "$CODE" = 404 ] && ok "a wrong claim secret gets nothing" || fail "wrong claim: $CODE"
+call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"'$CS'"}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J tokens.1.label)" = ci-demipass ] && [ "$(Q "SELECT COALESCE(sealed,'') FROM leak_scan_token_requests WHERE id=$RQ")" = "" ] && ok "the asker claims both tokens once; nothing sealed is kept" || fail "claim: $CODE"
+call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"'$CS'"}'; [ "$CODE" = 410 ] && ok "…a second claim gets nothing (410)" || fail "reclaim: $CODE"
+call POST /api/demipass/leak-scan/token-requests "$AG" '{"labels":["nope"]}'; RQ2=$(echo "$BODY" | J request_id); CS2=$(echo "$BODY" | J claim_secret)
+call POST /api/demipass/leak-scan/token-requests/$RQ2/deny "$A"; call POST /api/demipass/leak-scan/token-requests/$RQ2/claim "" '{"claim_secret":"'$CS2'"}'
+[ "$CODE" = 410 ] && ok "a denied request yields nothing" || fail "deny: $CODE"
+# the client's --request mode: writes 0600 files, prints no token
+( DEMIPASS_URL=$API DEMIPASS_TOKEN=$AG node bin/leak-scan.js --request "$S/tokdir" pane-start > "$S/req.out" 2>&1; echo $? > "$S/req.rc" ) &
+for i in $(seq 1 20); do RQ3=$(Q "SELECT id FROM leak_scan_token_requests WHERE labels='[\"pane-start\"]' AND status='pending'"); [ -n "$RQ3" ] && break; sleep 0.5; done
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-approve:'$RQ3'"}'; call POST /api/demipass/leak-scan/token-requests/$RQ3/approve "$A"
+for i in $(seq 1 30); do [ -f "$S/req.rc" ] && break; sleep 0.5; done
+[ "$(cat "$S/req.rc" 2>/dev/null)" = 0 ] && [ "$(stat -c %a "$S/tokdir/pane-start.token")" = 600 ] && ! grep -q dpscan_ "$S/req.out" \
+  && ok "leak-scan --request: approved in the app, token written 0600, never printed" || fail "--request: rc=$(cat "$S/req.rc" 2>/dev/null) $(cat "$S/req.out")"
+OUT=$(DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE="$S/tokdir/pane-start.token" node bin/leak-scan.js "$S/clean" 2>&1); [ $? = 0 ] && ok "…and the claimed token scans" || fail "claimed scan: $OUT"
+
+# ── the deploy gate (ops/deploy-identity/dustforge-deploy) against a throwaway origin and live checkout ──
+G=$S/gate; mkdir -p "$G/stub"; git init -q --bare "$G/origin.git"
+git clone -q "$G/origin.git" "$G/work" 2>/dev/null; git -C "$G/work" config user.email t@t; git -C "$G/work" config user.name t
+echo '{"name":"x"}' > "$G/work/package.json"; echo hello > "$G/work/a.txt"; git -C "$G/work" add -A; git -C "$G/work" commit -qm one; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
+git clone -q -b main "$G/origin.git" "$G/live" 2>/dev/null; mkdir -p "$G/live/data"; sqlite3 "$G/live/data/dustforge.db" 'create table t(x)'
+printf '#!/bin/sh\nexit 0\n' > "$G/stub/systemd-run"; chmod +x "$G/stub/systemd-run"
+sed -e "s#^export PATH=.*#export PATH=$G/stub:\$PATH LC_ALL=C#" -e "s#^REPO=.*#REPO=$G/live#" -e "s#^BK=.*#BK=$G/bk#" -e "s#^STATE=.*#STATE=$G/state#" \
+    -e "s#^SCANNER=.*#SCANNER=$W/bin/leak-scan.js#" -e "s#^SCAN_TOKEN=.*#SCAN_TOKEN=$G/scan.token#" ops/deploy-identity/dustforge-deploy > "$G/deploy"; chmod +x "$G/deploy"
+DEPLOY(){ DEMIPASS_URL=$API bash "$G/deploy" "$1" 2>&1; }
+tip(){ git -C "$G/work" rev-parse HEAD; }
+python3 -c 'import sys; open(sys.argv[2],"w").write("config:\n  key: "+open(sys.argv[1]).read().strip()+"\n")' "$S/seed" "$G/work/leak.yml"
+git -C "$G/work" add -A; git -C "$G/work" commit -qm leak; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
+OUT=$(DEPLOY "$(tip)"); RC=$?
+[ $RC = 3 ] && echo "$OUT" | grep -q "no scan token" && [ "$(git -C "$G/live" rev-parse HEAD)" != "$(tip)" ] && ok "deploy gate: no scan token → refused (fail closed)" || fail "gate no token: rc=$RC $OUT"
+mint gate; cp "$S/gate.tok" "$G/scan.token"; chmod 600 "$G/scan.token"
+OUT=$(DEPLOY "$(tip)"); RC=$?
+[ $RC = 3 ] && echo "$OUT" | grep -q "LEAK  $REF  seeded  at" && echo "$OUT" | grep -q "leak.yml" && [ "$(git -C "$G/live" rev-parse HEAD)" != "$(tip)" ] && ! echo "$OUT" | grep -qF -- "$(cat "$S/seed")" \
+  && ok "deploy gate: a commit carrying a vault value → refused, names leak.yml, never prints the value, nothing merged" || fail "gate leak: rc=$RC $OUT"
+git -C "$G/work" rm -q leak.yml; echo "hello again" > "$G/work/a.txt"; git -C "$G/work" commit -qam fix; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
+OUT=$(DEPLOY "$(tip)"); RC=$?
+[ $RC = 3 ] && echo "$OUT" | grep -q "scan could not run\|revoked" && ok "deploy gate: the token that found the leak is revoked — nothing deploys until a new one is placed" || fail "gate after hit: rc=$RC $OUT"
+mint gate2; cp "$S/gate2.tok" "$G/scan.token"
+OUT=$(DEPLOY "$(tip)"); RC=$?
+[ $RC = 0 ] && [ "$(git -C "$G/live" rev-parse HEAD)" = "$(tip)" ] && ok "deploy gate: the cleaned commit with a new token → deployed (only the changed files are scanned)" || fail "gate clean: rc=$RC $OUT"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails

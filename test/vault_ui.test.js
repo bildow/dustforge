@@ -1607,3 +1607,21 @@ test('an introduction shows the voucher and the other person; Accept goes throug
   await pg.ctx.vouchAct(4, true); await settle();
   assert.equal(accepted, 4);
 });
+
+// ── Leak scanner token requests (red team item 5) ──
+test('a scan-token request shows its labels (escaped) and Approve goes through the PIN gate', async () => {
+  let approved = null;
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/leak-scan/token-requests') return { json: { ok: true, requests: [{ id: 3, labels: ['ci-dustforge', '<b>x</b>'], requested_by: 'pane', status: 'pending' }] } };
+    if (p === '/api/blindkey/leak-scan/token-requests/3/approve') { approved = 3; return { json: { ok: true } }; }
+    return { json: { ok: true } };
+  } });
+  await settle();
+  await pg.ctx.loadScanRequests();
+  const h = pg.el('scan-requests').innerHTML;
+  assert.match(h, /ci-dustforge/); assert.doesNotMatch(h, /<b>x<\/b>/, 'labels are escaped');
+  await pg.ctx.scanDecide(3, true); await settle();
+  assert.equal(approved, 3);
+});
