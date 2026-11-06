@@ -102,5 +102,8 @@ A transfer (`POST /api/blindkey/transfer`) no longer happens at once.
 
 **The delay setting**
 - `GET/PUT /api/identity/transfer-delay {delay_sec}`.
-- Raising it is free. Lowering it takes the PIN (intent `transfer-delay:0`).
+- Raising it applies at once.
+- Lowering it takes the PIN (intent `transfer-delay:0`) and, once a phone is linked, the phone's signature. It takes effect only after the current delay has passed, and the owner is mailed.
+- A transfer claimed by a process that died before committing goes back to pending and is tried again.
+- A waiting transfer whose secret was deleted, rotated or moved ends within one sweep.
 

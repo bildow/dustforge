@@ -65,11 +65,21 @@ module.exports = function registerSecretSharing(deps) {
   db.exec("CREATE INDEX IF NOT EXISTS idx_st_due ON secret_transfers(status, execute_at)");
   db.exec('CREATE INDEX IF NOT EXISTS idx_st_from ON secret_transfers(from_did, id)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_st_to ON secret_transfers(to_did, id)');
-  try { db.exec(`ALTER TABLE identity_wallets ADD COLUMN transfer_delay_sec INTEGER DEFAULT ${TRANSFER_DELAY_DEFAULT}`); } catch (_) {}
+  for (const c of [`transfer_delay_sec INTEGER DEFAULT ${TRANSFER_DELAY_DEFAULT}`, 'transfer_delay_next_sec INTEGER DEFAULT NULL', 'transfer_delay_next_at TEXT DEFAULT NULL']) {
+    try { db.exec('ALTER TABLE identity_wallets ADD COLUMN ' + c); } catch (_) {}
+  }
+  try { db.exec('ALTER TABLE secret_transfers ADD COLUMN claimed_at TEXT DEFAULT NULL'); } catch (_) {}
+  const validDelay = (v) => Number.isInteger(v) && v >= TRANSFER_DELAY_MIN && v <= TRANSFER_DELAY_MAX;
+  // The delay in force. A lowered delay waits out the delay it replaces (#54 review: whoever has the session and PIN
+  // must not cut the owner's warning time at once); it applies itself once its time comes.
   const transferDelay = (did) => {
-    const w = db.prepare('SELECT transfer_delay_sec FROM identity_wallets WHERE did = ?').get(did);
-    const v = Number(w && w.transfer_delay_sec);
-    return Number.isInteger(v) && v >= TRANSFER_DELAY_MIN && v <= TRANSFER_DELAY_MAX ? v : TRANSFER_DELAY_DEFAULT;
+    const w = db.prepare('SELECT transfer_delay_sec, transfer_delay_next_sec, transfer_delay_next_at FROM identity_wallets WHERE did = ?').get(did) || {};
+    if (w.transfer_delay_next_at && Date.parse(w.transfer_delay_next_at) <= Date.now() && validDelay(Number(w.transfer_delay_next_sec))) {
+      db.prepare('UPDATE identity_wallets SET transfer_delay_sec = transfer_delay_next_sec, transfer_delay_next_sec = NULL, transfer_delay_next_at = NULL WHERE did = ? AND transfer_delay_next_at = ?').run(did, w.transfer_delay_next_at);
+      return Number(w.transfer_delay_next_sec);
+    }
+    const v = Number(w.transfer_delay_sec);
+    return validDelay(v) ? v : TRANSFER_DELAY_DEFAULT;
   };
   const walletOf = (did) => db.prepare('SELECT did, username, email, status FROM identity_wallets WHERE did = ?').get(did) || {};
   const notify = (did, subject, text) => {
@@ -438,6 +448,10 @@ module.exports = function registerSecretSharing(deps) {
       finalName = new_name.trim();
       if (!finalName || /_v\d+$/.test(finalName)) return res.status(400).json({ error: 'new_name: a plain name, not ending in _v<number>' });
     }
+    // Checked before the PIN, so a refused call does not spend the proof (#54 review).
+    if (db.prepare("SELECT 1 FROM secret_transfers WHERE secret_id = ? AND status IN ('pending','executing')").get(secret.id)) {
+      return res.status(409).json({ error: `${secret.name} already has a transfer waiting — cancel it first` });
+    }
     if (!requirePin(me, `transfer:${secret.id}`, 'transfer', res, { kind: 'transfer', id: secret.id, bind: [to, keep, new_name || ''].join('|'), req })) return;
     // Checked after the PIN, so whether a name exists in their vault is never answered for free.
     if (nameFamilyTaken(target.did, finalName)) {
@@ -535,10 +549,24 @@ module.exports = function registerSecretSharing(deps) {
   }
   // Carry out what is due. Each row is claimed once (pending → executing) so two sweeps never both run it.
   function completeDueTransfers() {
+    // A claim whose process died before it committed (the move is one transaction: nothing moved) goes back to pending
+    // and is tried again with every check (#54 review: it blocked the secret for good).
+    try { db.prepare("UPDATE secret_transfers SET status = 'pending', claimed_at = NULL WHERE status = 'executing' AND claimed_at <= ?").run(new Date(Date.now() - 5 * 60000).toISOString()); } catch (_) {}
+    // A waiting transfer whose secret was deleted, rotated or moved meanwhile ends now, not at its due time.
+    try {
+      const stale = db.prepare(`SELECT t.* FROM secret_transfers t LEFT JOIN blindkey_secrets s ON s.id = t.secret_id
+                                WHERE t.status = 'pending' AND (s.id IS NULL OR s.did != t.from_did OR s.status != 'active') LIMIT 50`).all();
+      for (const t of stale) {
+        if (db.prepare("UPDATE secret_transfers SET status = 'failed', decided_at = ?, error = ? WHERE id = ? AND status = 'pending'").run(nowIso(), 'the secret was deleted, rotated or moved meanwhile', t.id).changes !== 1) continue;
+        const to = walletOf(t.to_did), from = walletOf(t.from_did);
+        notify(t.from_did, `DemiPass: your transfer to ${to.username} ended`, `The transfer of ${t.final_name} to ${to.username} ended: the secret was deleted, rotated or moved. Nothing was transferred.\n`);
+        notify(t.to_did, `DemiPass: ${from.username}'s transfer to you ended`, `The transfer of ${t.final_name} from ${from.username} ended: the secret was deleted, rotated or moved. Nothing was transferred.\n`);
+      }
+    } catch (_) {}
     let due = [];
     try { due = db.prepare("SELECT * FROM secret_transfers WHERE status = 'pending' AND execute_at <= ? ORDER BY execute_at LIMIT 50").all(nowIso()); } catch (_) { return; }
     for (const t of due) {
-      if (db.prepare("UPDATE secret_transfers SET status = 'executing' WHERE id = ? AND status = 'pending'").run(t.id).changes !== 1) continue;
+      if (db.prepare("UPDATE secret_transfers SET status = 'executing', claimed_at = ? WHERE id = ? AND status = 'pending'").run(nowIso(), t.id).changes !== 1) continue;
       try { executeTransfer({ ...t, status: 'executing' }); }
       catch (e) { try { db.prepare("UPDATE secret_transfers SET status = 'failed', decided_at = ?, error = ? WHERE id = ? AND status = 'executing'").run(nowIso(), 'internal error', t.id); } catch (_) {} }
     }
@@ -577,14 +605,27 @@ module.exports = function registerSecretSharing(deps) {
   app.get('/api/identity/transfer-delay', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-    res.json({ ok: true, delay_sec: transferDelay(auth.did), default: TRANSFER_DELAY_DEFAULT, min: TRANSFER_DELAY_MIN, max: TRANSFER_DELAY_MAX });
+    const cur = transferDelay(auth.did);
+    const w = db.prepare('SELECT transfer_delay_next_sec, transfer_delay_next_at FROM identity_wallets WHERE did = ?').get(auth.did) || {};
+    res.json({ ok: true, delay_sec: cur, ...(w.transfer_delay_next_at ? { next_delay_sec: w.transfer_delay_next_sec, next_from: w.transfer_delay_next_at } : {}),
+               default: TRANSFER_DELAY_DEFAULT, min: TRANSFER_DELAY_MIN, max: TRANSFER_DELAY_MAX });
   });
   app.put('/api/identity/transfer-delay', limiter, (req, res) => {
     const me = personAuth(req, res); if (!me) return;
     const v = Number((req.body || {}).delay_sec);
     if (!Number.isInteger(v) || v < TRANSFER_DELAY_MIN || v > TRANSFER_DELAY_MAX) return res.status(400).json({ error: `delay_sec: ${TRANSFER_DELAY_MIN}–${TRANSFER_DELAY_MAX} seconds` });
-    if (v < transferDelay(me.did) && !requirePin(me, 'transfer-delay:0', 'transfer-delay', res)) return;
-    db.prepare('UPDATE identity_wallets SET transfer_delay_sec = ? WHERE did = ?').run(v, me.did);
+    const cur = transferDelay(me.did);
+    if (v < cur) {
+      // Lowering: the PIN and the linked phone; it takes effect only after the current delay has passed.
+      if (!requirePin(me, 'transfer-delay:0', 'transfer-delay', res, { kind: 'transfer-delay', id: 0, bind: String(v), req })) return;
+      const at = new Date(Date.now() + cur * 1000).toISOString();
+      db.prepare('UPDATE identity_wallets SET transfer_delay_next_sec = ?, transfer_delay_next_at = ? WHERE did = ?').run(v, at, me.did);
+      notify(me.did, 'DemiPass: your transfer delay is being shortened', `Your transfer delay goes from ${cur / 60} to ${v / 60} minutes at ${at.slice(0, 16).replace('T', ' ')} UTC. Until then transfers still wait ${cur / 60} minutes.\n\nIf this was not you, set it back in the DemiPass app (Settings) and change your PIN.\n`);
+      return res.json({ ok: true, delay_sec: cur, next_delay_sec: v, next_from: at, note: `transfers keep waiting ${cur} s until ${at}` });
+    }
+    // Raising (or keeping): at once, and any pending lowering is dropped.
+    db.prepare('UPDATE identity_wallets SET transfer_delay_sec = ?, transfer_delay_next_sec = NULL, transfer_delay_next_at = NULL WHERE did = ?').run(v, me.did);
+    if (v !== cur) notify(me.did, 'DemiPass: your transfer delay changed', `Transfers now wait ${v / 60} minutes before they happen.\n`);
     res.json({ ok: true, delay_sec: v });
   });
 

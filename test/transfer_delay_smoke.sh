@@ -65,7 +65,7 @@ EXP=$(echo "$BODY" | J transfer.execute_at)
   && [ "$(owner $S1)" = A ] && ok "a transfer is recorded pending (202), due in 1 hour; the secret stays A's meanwhile" || fail "start: $CODE $BODY"
 [ "$(mails ta)" = $((MA+1)) ] && [ "$(mails tb)" = $((MB+1)) ] && ok "both sides are mailed when it starts" || fail "start mails: ta $MA→$(mails ta) tb $MB→$(mails tb)"
 call GET /api/demipass/transfers "$B"; [ "$(echo "$BODY" | J transfers.0.direction)" = incoming ] && [ "$(echo "$BODY" | J transfers.0.can_cancel)" = True ] && ok "B sees it incoming, cancellable" || fail "B list: $BODY"
-send $S1 one; [ "$CODE" = 409 ] && ok "a second transfer of the same secret while one waits → 409" || fail "second: $CODE $BODY"
+call POST /api/demipass/transfer "$A" '{"secret":"one","to":"tb"}'; [ "$CODE" = 409 ] && ok "a second transfer of the same secret while one waits → 409, before the PIN is asked (no proof spent)" || fail "second: $CODE $BODY"
 
 # ── cancel from either side ──
 MA=$(mails ta); MB=$(mails tb)
@@ -101,7 +101,20 @@ call PUT /api/identity/transfer-delay "$A" '{"delay_sec":86400}'; [ "$CODE" = 20
 S5=$(store five); send $S5 five
 python3 -c "import sys,datetime as d; t=d.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')); n=d.datetime.now(d.timezone.utc); sys.exit(0 if 86390 < (t-n).total_seconds() <= 86400 else 1)" "$(echo "$BODY" | J transfer.execute_at)" && ok "…and applies to the next transfer" || fail "raised delay: $BODY"
 call PUT /api/identity/transfer-delay "$A" '{"delay_sec":600}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "transfer-delay:0" ] && ok "lowering it takes the PIN" || fail "lower: $CODE $BODY"
-pin "$A" 1111 transfer-delay:0; call PUT /api/identity/transfer-delay "$A" '{"delay_sec":600}'; [ "$CODE" = 200 ] && ok "…with the PIN it is lowered" || fail "lower pin: $CODE $BODY"
+MA=$(mails ta)
+pin "$A" 1111 transfer-delay:0; call PUT /api/identity/transfer-delay "$A" '{"delay_sec":600}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J delay_sec)" = 86400 ] && [ "$(echo "$BODY" | J next_delay_sec)" = 600 ] && ok "…with the PIN a lower delay is scheduled, but the current one (1 day) stays in force until it has passed" || fail "lower pin: $CODE $BODY"
+[ "$(mails ta)" = $((MA+1)) ] && ok "…and the owner is mailed about it" || fail "lower mail"
+S6=$(store six); send $S6 six
+python3 -c "import sys,datetime as d; t=d.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')); n=d.datetime.now(d.timezone.utc); sys.exit(0 if (t-n).total_seconds() > 86000 else 1)" "$(echo "$BODY" | J transfer.execute_at)" && ok "a transfer started meanwhile still waits the full day" || fail "lowered too soon: $BODY"
+X "UPDATE identity_wallets SET transfer_delay_next_at='2000-01-01T00:00:00.000Z' WHERE did='$DA'"
+call GET /api/identity/transfer-delay "$A"; [ "$(echo "$BODY" | J delay_sec)" = 600 ] && ok "once that time has passed, the lower delay applies" || fail "applied: $BODY"
+call PUT /api/identity/transfer-delay "$A" '{"delay_sec":3600}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J delay_sec)" = 3600 ] && ok "raising applies at once" || fail "raise again: $CODE $BODY"
+# a claim whose process died goes back to pending and runs; a waiting transfer whose secret was deleted ends at once
+S7=$(store seven); send $S7 seven; X "UPDATE secret_transfers SET status='executing', claimed_at='2000-01-01T00:00:00.000Z', execute_at='2000-01-01T00:00:00.000Z' WHERE id=$TID"; sleep 1.5
+[ "$(Q "SELECT status FROM secret_transfers WHERE id=$TID")" = done ] && [ "$(owner $S7)" = B ] && ok "a transfer stuck in 'executing' (process died) is retried with every check and completes" || fail "stuck: $(Q "SELECT status FROM secret_transfers WHERE id=$TID")"
+S8=$(store eight); send $S8 eight; X "UPDATE blindkey_secrets SET status='deleted' WHERE id=$S8"; sleep 1.5
+[ "$(Q "SELECT status FROM secret_transfers WHERE id=$TID")" = failed ] && ok "a waiting transfer of a deleted secret ends within a sweep, not at its due time" || fail "stale: $(Q "SELECT status FROM secret_transfers WHERE id=$TID")"
 for v in 0 299 604801 '"x"'; do call PUT /api/identity/transfer-delay "$A" '{"delay_sec":'$v'}'; [ "$CODE" = 400 ] || fail "bound $v: $CODE"; done; ok "5 minutes to 7 days, nothing else"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails failure(s)"; exit $fails

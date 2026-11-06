@@ -357,7 +357,7 @@
           <option value="300">5 minutes</option><option value="900">15 minutes</option><option value="3600">1 hour</option><option value="21600">6 hours</option>
           <option value="86400">1 day</option><option value="259200">3 days</option><option value="604800">7 days</option>
         </select>
-        <div style="font-size:0.68rem;color:var(--text3);margin-top:0.2rem">Until then either side can cancel; you both get an email. A longer wait needs nothing; a shorter one asks for your PIN.</div>
+        <div style="font-size:0.68rem;color:var(--text3);margin-top:0.2rem">Until then either side can cancel; you both get an email. A longer wait applies at once; a shorter one asks for your PIN and starts only after the current wait has passed.</div>
       </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
@@ -2237,7 +2237,8 @@ async function loadTransferDelay(){
     const v=String(r.delay_sec); if(!(el.options||[]).length||[...el.options].some(o=>o.value===v)) el.value=v; }catch(_){}
 }
 async function setTransferDelay(v){
-  try{ await apiGated('PUT','/api/identity/transfer-delay',{delay_sec:Number(v)},'Make transfers happen sooner? Your PIN confirms it.'); }
+  try{ const r=await apiGated('PUT','/api/identity/transfer-delay',{delay_sec:Number(v)},'Make transfers happen sooner? Your PIN confirms it.');
+    if(r&&r.next_from) alert('The shorter wait starts '+new Date(r.next_from).toLocaleString()+'. Until then transfers keep the current wait.'); }
   catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
   loadTransferDelay();
 }
