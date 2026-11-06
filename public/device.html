@@ -202,19 +202,36 @@ async function decide(decision, mode) {
     } else {
       const u = $('u').value.trim(), p = $('p').value;
       if (!u || !p) { msg('m-review', 'Username and password required.', 'err'); return; }
-      const { status, d } = await api('POST', '/api/identity/auth-fingerprint', { username: u, password: p, scope: req.scope, expires_in: '30m' });
+      // At least transact: approving needs a session that can ask the linked phone for a signature.
+      const { status, d } = await api('POST', '/api/identity/auth-fingerprint', { username: u, password: p, scope: req.scope === 'admin' ? 'admin' : 'transact', expires_in: '30m' });
       if (status >= 400 || !d.token) { msg('m-review', status === 404 ? 'No identity with that username.' : (d.error || 'Sign-in failed'), 'err'); return; }
       bearer = d.token; $('p').value = '';
     }
     let { status, d } = await api('POST', '/api/identity/device/approve', { user_code: req.user_code, decision }, bearer);
-    // A wallet with a linked phone approves new sessions from that phone only: its device key signs (red team item 4b).
-    if (status === 428 && d.device_required && d.challenge) {
+    // A wallet with a linked phone approves new sessions from that phone only (red team item 4b): unlocked (423 → the
+    // phone's biometric), then signed by its device key (428).
+    const phone = (kind, message, title, sub) => new Promise((res) => {
+      if (!window.DemiPassDevice) return res({ ok: false, error: 'not in the DemiPass app' });
+      const id = 'dv' + Date.now() + Math.random().toString(36).slice(2, 6);
+      window.DemiPassDeviceCb = (cid, json) => { if (cid === id) { try { res(JSON.parse(json)); } catch (_) { res({ ok: false }); } } };
+      try { window.DemiPassDevice.sign(id, kind, message, title || '', sub || ''); } catch (_) { res({ ok: false, error: 'this phone is not linked' }); }
+    });
+    let extra = {};
+    for (let round = 0; round < 3 && (status === 423 || status === 428); round++) {
       if (!window.DemiPassDevice) { msg('m-review', 'Your wallet has a linked phone: approve this in the DemiPass app on that phone (open this page there).', 'err'); return; }
-      const ch = await api('POST', '/api/identity/device/challenge', { purpose: 'approve', intent: d.challenge.intent, bind: d.challenge.bind || '' }, bearer);
-      if (ch.status >= 400) { msg('m-review', ch.d.error || 'Could not get a challenge', 'err'); return; }
-      const sig = await new Promise((res) => { const id = 'dl' + Date.now(); window.DemiPassDeviceCb = (cid, json) => { if (cid === id) { try { res(JSON.parse(json)); } catch (_) { res({ ok: false }); } } }; try { window.DemiPassDevice.sign(id, 'D', ch.d.message, '', ''); } catch (_) { res({ ok: false, error: 'this phone is not linked' }); } });
-      if (!sig.ok) { msg('m-review', sig.error || 'This phone could not sign', 'err'); return; }
-      ({ status, d } = await api('POST', '/api/identity/device/approve', { user_code: req.user_code, decision, device_challenge_id: ch.d.challenge_id, device_signature: sig.signature }, bearer));
+      if (status === 423) {
+        const g = await api('POST', '/api/identity/device/challenge', { purpose: 'gate', intent: 'unlock:0' }, bearer);
+        const un = g.status < 400 ? await phone('P', g.d.message, 'Unlock DemiPass', 'Approve a new agent sign-in') : { ok: false };
+        if (!un.ok) { msg('m-review', 'Unlock DemiPass on this phone to approve.', 'err'); return; }
+        await api('POST', '/api/identity/gate/verify', { gate: 'device', intent: 'unlock:0', challenge_id: g.d.challenge_id, signature: un.signature }, bearer);
+      } else {
+        const ch = await api('POST', '/api/identity/device/challenge', { purpose: 'approve', intent: d.challenge.intent, bind: d.challenge.bind || '' }, bearer);
+        if (ch.status >= 400) { msg('m-review', ch.d.error || 'Could not get a challenge', 'err'); return; }
+        const sig = await phone('D', ch.d.message);
+        if (!sig.ok) { msg('m-review', sig.error || 'This phone could not sign', 'err'); return; }
+        extra = { device_challenge_id: ch.d.challenge_id, device_signature: sig.signature };
+      }
+      ({ status, d } = await api('POST', '/api/identity/device/approve', { user_code: req.user_code, decision, ...extra }, bearer));
     }
     if (status === 403 && mode === 'known') { msg('m-review', 'Your vault session cannot approve "' + req.scope + '" — sign in with your password to approve at that scope.', 'err'); useOther(); return; }
     if (status === 401 && mode === 'known') { msg('m-review', 'Your vault session has expired — sign in below.', 'err'); useOther(); return; }

@@ -145,7 +145,7 @@
 
 <!-- App -->
 <!-- Dormancy lock: the session stays signed in; the vault stays hidden until PIN or biometric (red team item 8) -->
-<div id="lock-screen" style="display:none;position:fixed;inset:0;z-index:50;background:var(--bg);flex-direction:column;align-items:center;justify-content:center;gap:0.9rem;padding:2rem;text-align:center">
+<div id="lock-screen" style="display:none;position:fixed;inset:0;z-index:95;background:var(--bg);flex-direction:column;align-items:center;justify-content:center;gap:0.9rem;padding:2rem;text-align:center">
   <div style="font-size:2.2rem">🔒</div>
   <div style="font-size:1rem;font-weight:600">DemiPass is locked</div>
   <div style="font-size:0.78rem;color:var(--text3);max-width:18rem">You're still signed in. Unlock to see your vault — anything waiting for you will be there.</div>
@@ -641,7 +641,8 @@ let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the
 let pinBusy=null;           // the unlock flow whose PIN check is in flight: a second tap must not mint a second proof
 let pinSentFor=null, pinOpenAttempts=[];   // the unlock flow that sent PINs, and its checks that may have minted a proof
 let pinSaveBusy=null, pinChangeBusy=null;   // a PIN setup (its flow) / PIN change (its session) save in flight
-let vaultOpen=false;        // true only once the vault is past the PIN gate; the background refresh runs only then
+let vaultOpen=false;
+const lockState={after:300,last:Date.now(),locked:false,pingAt:0};   // dormancy lock (below); declared early so every loader can check it        // true only once the vault is past the PIN gate; the background refresh runs only then
 let dashboardData=null, vaultLoadedAt=0, vaultSeq=0, fleetSlug=null, fleetData=null, siliconHandle=null;   // per-account state (sign-out clears it)
 let scanStream=null, scanInterval=null, revealTimer=null;
 
@@ -1098,11 +1099,14 @@ async function showApp(){
 
   const freshLogin=!!loginPw;
   loginPw='';
-  document.getElementById('app').style.display='block';
   vaultOpen=true;
-  // The last activity this phone recorded; none recorded (first start of this version) counts as now.
+  // The last activity this phone recorded; none recorded (first start of this version) counts as now. The vault
+  // stays hidden until that is decided (#47 review L7).
   lockState.last=freshLogin?Date.now():(Number((()=>{try{return localStorage.getItem('dp_last_active')}catch(_){return 0}})())||Date.now());
-  loadLockSetting().then(()=>{ if(!freshLogin&&Date.now()-lockState.last>lockState.after*1000) lockNow(); else noteActive(true); });
+  await loadLockSetting();
+  if (!live()) return;
+  if(!freshLogin&&Date.now()-lockState.last>lockState.after*1000) lockNow();
+  else { document.getElementById('app').style.display='block'; noteActive(true); }
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
@@ -1114,6 +1118,7 @@ async function showApp(){
 // also show as cards on the vault home. Accepting an invite to join someone's fleet needs the PIN (join:<id>); a
 // send is created first (amount + recipient fixed) and confirmed with the PIN (send:<id>).
 async function loadNetwork(){
+  if(lockState.locked) return;
   const epoch=sessionEpoch;
   try{ const r=await api('GET','/api/network'); if(epoch!==sessionEpoch) return null; netData=r; }
   catch(e){ if(sessionEnded(e)||epoch!==sessionEpoch) return null; if(e.status!==429) netData=null; }
@@ -1287,6 +1292,7 @@ async function leaveFleet(){
 // The browser extension asks to fill a login into a page; the request waits here until approved with the PIN
 // (its intent is fill:<id>, so the proof opens that one fill) or denied. Polled every 4 s while the vault is open.
 async function loadFillRequests(){
+  if(lockState.locked) return;   // a locked phone shows nothing it is asked (red team item 8)
   const epoch=sessionEpoch;
   try{ const r=await api('GET','/api/blindkey/fill/pending'); if(epoch!==sessionEpoch||!vaultOpen) return; fillReqs=(r.requests||[]).filter(q=>!q.own_session); grantReqs=r.grants||[]; accessReqs=r.access_requests||[]; }
   catch(e){ if(sessionEnded(e)) return; if(e.status===429) return; fillReqs=[]; grantReqs=[]; accessReqs=[]; }   // rate-limited: keep the cards, retry next poll
@@ -1354,6 +1360,7 @@ async function decideFill(id, approve){
 // each secret's page. A reveal is the emergency door only: the owner opens it for one reveal, for an hour.
 let shareData=null, shareBusy=new Set(), shareMode=null;
 async function loadShares(){
+  if(lockState.locked) return;
   const epoch=sessionEpoch;
   try{ const r=await api('GET','/api/blindkey/shares'); if(epoch!==sessionEpoch||!vaultOpen) return; shareData=r; }
   catch(e){ if(sessionEnded(e)||e.status===429) return; }
@@ -1460,6 +1467,7 @@ async function submitShare(){
 // ── Approval requests (security depth): an agent wants to use an elevated/critical secret ─────────────────────
 let approvals=[], apOpen=null, apTimer=null, apBusy=false, apResolve=null;
 async function loadApprovals(){
+  if(lockState.locked) return;
   const epoch=sessionEpoch;
   try{ const r=await api('GET','/api/blindkey/approvals'); if(epoch!==sessionEpoch||!vaultOpen) return; approvals=r.incoming||[]; }
   catch(e){ if(sessionEnded(e)||e.status===429) return; }
@@ -1636,6 +1644,7 @@ async function savePinChange(){
 }
 
 async function loadVault(){
+  if(lockState.locked) return;   // nothing rendered behind the lock screen
   const seq=++vaultSeq;
   try {
     const fresh = await api('GET','/api/demipass/dashboard');
@@ -2156,7 +2165,6 @@ async function deviceApprove(challenge){
   return {device_challenge_id:ch.challenge_id,device_signature:r.signature};
 }
 // ── dormancy lock (red team item 8): idle past the owner's lock time → the vault hides until PIN or biometric ────
-const lockState={after:300,last:Date.now(),locked:false,pingAt:0};
 function noteActive(force){
   if(lockState.locked||!vaultOpen) return;
   lockState.last=Date.now(); try{ localStorage.setItem('dp_last_active',String(lockState.last)); }catch(_){}
@@ -2169,6 +2177,7 @@ if(typeof document!=='undefined'&&document.addEventListener) document.addEventLi
 function lockNow(){
   if(lockState.locked) return;
   lockState.locked=true;
+  try{ closeApproval(); }catch(_){} try{ closeModal(); }catch(_){}   // no sheet stays up over a locked vault (#47 H2)
   document.getElementById('app').style.display='none';
   document.getElementById('lock-screen').style.display='flex';
   document.getElementById('lock-bio').style.display=dev.linked()?'block':'none';
@@ -2183,7 +2192,7 @@ async function unlockTry(usePin){
     if(!ok) ok=await unlockWithPin('Unlock DemiPass','unlock:0');
     if(!ok){ m.textContent='Still locked.'; return; }
     lockState.locked=false; document.getElementById('lock-screen').style.display='none'; document.getElementById('app').style.display='block';
-    noteActive(true); loadVault(); loadFillRequests(); loadApprovals();
+    noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadNetwork();
   }catch(e){ if(!sessionEnded(e)) m.textContent=e.message; }
 }
 async function loadLockSetting(){
@@ -2202,7 +2211,9 @@ async function linkPhone(){
     const ch=await api('POST','/api/identity/device/challenge',{purpose:'enrol',intent:'device-enrol:0'});
     const r=await dev.call('enrol',ch.message);
     if(!r.ok) throw new Error(r.error||'could not link this phone');
-    await apiGated('POST','/api/identity/device/enrol',{challenge_id:ch.challenge_id,device_id:r.device_id,label:r.label,key_d:r.key_d,key_p:r.key_p,sig_d:r.sig_d,sig_p:r.sig_p},'Link this phone for approvals? Your PIN confirms it.');
+    try{ await apiGated('POST','/api/identity/device/enrol',{challenge_id:ch.challenge_id,device_id:r.device_id,label:r.label,key_d:r.key_d,key_p:r.key_p,sig_d:r.sig_d,sig_p:r.sig_p},'Link this phone for approvals? Your PIN and account password confirm it.'); }
+    catch(e){ try{ globalThis.DemiPassDevice.abandonEnrol(); }catch(_){} throw e; }   // the working keys stay
+    try{ globalThis.DemiPassDevice.commitEnrol(); }catch(_){}
     if(out) out.textContent='This phone is linked: approvals come from it, and your fingerprint/face can stand in for the PIN.';
     loadDevices();
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
@@ -2224,6 +2235,7 @@ async function loadDevices(){
 }
 
 async function apiGated(method, path, body, what){
+  if(lockState.locked) throw new Error('cancelled — DemiPass is locked');
   if(!(await ensureSession())) throw new Error('session expired');
   const epoch=sessionEpoch; let renewed=false;
   const call = async () => {
@@ -2238,12 +2250,18 @@ async function apiGated(method, path, body, what){
     return {status:r.status,d:d||{}};
   };
   let {status,d}=await call();
-  for(let round=0; round<3; round++){
+  for(let round=0; round<4; round++){
     if(status===403 && Array.isArray(d.missing) && d.missing.length){
       // Codes first, the PIN last: its proof opens only this action (d.intent), once, so it is typed right
       // before the retry — never ahead of a code step that might still be cancelled.
       const order=[...d.missing.filter(g=>g!=='pin'), ...d.missing.filter(g=>g==='pin')];
       for(const g of order){ if(!await satisfyGate(g, what, d.intent)) throw new Error('cancelled — '+g+' not verified'); }
+      ({status,d}=await call());
+    } else if(status===423 && d.locked){
+      // The linked phone approves only while unlocked: biometric (or the PIN), then try again.
+      let ok=false; try{ ok=await deviceGate('unlock:0','Unlock DemiPass'); }catch(e){ if(sessionEnded(e)) throw e; }
+      if(!ok) ok=await unlockWithPin('Unlock DemiPass','unlock:0');
+      if(!ok) throw new Error('cancelled — still locked');
       ({status,d}=await call());
     } else if(status===428 && d.device_required && d.challenge){
       body={...(body||{}),...(await deviceApprove(d.challenge))};   // the linked phone signs this decision

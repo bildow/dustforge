@@ -63,8 +63,10 @@ chsign "$A" d enrol device-enrol:0 phone-0001; CHD=$CH; SGD=$SG; SGP=$(sig p "$(
 ENROL(){ printf '{"challenge_id":%s,"device_id":"phone-0001","label":"Pixel","key_d":"%s","key_p":"%s","sig_d":"%s","sig_p":"%s"}' "$CHD" "$(cat $S/d.pub)" "$(cat $S/p.pub)" "$SGD" "$SGP"; }
 call POST /api/identity/device/enrol "$A" "$(ENROL)"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = device-enrol:0 ] && ok "enrolling a phone takes the PIN" || fail "enrol no pin: $CODE $BODY"
 pin "$A" device-enrol:0; call POST /api/identity/device/enrol "$A" "$(ENROL)"
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q password && ok "…and the account password: knowing the PIN alone plants no device (#47 H1)" || fail "enrol no password: $CODE $BODY"
+call POST /api/identity/gate/verify "$A" '{"gate":"password","password":"hunter22"}'; call POST /api/identity/device/enrol "$A" "$(ENROL)"
 [ "$CODE" = 201 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-0001' AND revoked_at IS NULL")" = 2 ] && ok "a phone enrols two keys (device D, presence P), each signing the challenge" || fail "enrol: $CODE $BODY"
-call POST /api/identity/device/enrol "$A" "$(ENROL)"; [ "$CODE" = 403 ] && ok "an enrol challenge works once" || fail "enrol replay: $CODE"
+pin "$A" device-enrol:0; call POST /api/identity/device/enrol "$A" "$(ENROL)"; { [ "$CODE" = 403 ] || [ "$CODE" = 409 ]; } && ok "an enrol challenge works once, and an active device id cannot be enrolled over" || fail "enrol replay: $CODE"
 call POST /api/identity/device/challenge "$AG" '{"purpose":"approve","intent":"approval:1"}'; [ "$CODE" = 200 ] && ok "(an agent session can ask for a challenge — it cannot sign one)" || fail "agent challenge: $CODE"
 
 # ── (a) approvals need the phone ──
@@ -74,7 +76,10 @@ USE='{"ref":"'$HK'","params":{"url":"https://repo.dustroot.com/hook","method":"G
 call POST /api/demipass/use "$AG" "$USE"; AP=$(echo "$BODY" | J approval_id); [ "$CODE" = 202 ] || fail "park: $CODE $BODY"
 pin "$A2" "approval-open:$AP"; call POST /api/demipass/approvals/$AP/open "$A2"; C2=$(echo "$BODY" | J code)
 call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'"}'
-[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J device_required)" = True ] && ok "(a) a session with the PIN but no device signature cannot approve (428 device_required)" || fail "a no sig: $CODE $BODY"
+[ "$CODE" = 423 ] && [ "$(echo "$BODY" | J locked)" = True ] && ok "(a) a locked session approves nothing (423), before any signature is spent (#47 H2)" || fail "a locked: $CODE $BODY"
+pin "$A2" unlock:0; C2=$(curl -s -X POST "$API/api/demipass/approvals/$AP/open" -H "Authorization: Bearer $A2" | J code)
+call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'"}'
+[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J device_required)" = True ] && ok "(a) unlocked, but no device signature → 428 device_required" || fail "a no sig: $CODE $BODY"
 BIND=$(Q "SELECT binding FROM use_approvals WHERE id=$AP")
 chsign "$A2" x approve "approval:$AP" "$BIND"; C2=$(curl -s -X POST "$API/api/demipass/approvals/$AP/open" -H "Authorization: Bearer $A2" | J code)
 call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
@@ -105,6 +110,7 @@ chsign "$A" d gate "approval-open:$AP2"; call POST /api/identity/gate/verify "$A
 
 # ── (c) dormancy: an elevated open rides on a fresh unlock; critical never does ──
 call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's#/hook#/hook3#')"; AP3=$(echo "$BODY" | J approval_id)
+call POST /api/identity/lock/now "$A2"
 call POST /api/demipass/approvals/$AP3/open "$A2"; [ "$CODE" = 403 ] && ok "(c) a locked session opens nothing without the PIN" || fail "c locked: $CODE"
 pin "$A2" unlock:0; call GET /api/identity/lock "$A2"; [ "$(echo "$BODY" | J unlocked)" = True ] || fail "c unlock state: $BODY"
 call POST /api/demipass/approvals/$AP3/open "$A2"; [ "$CODE" = 200 ] && ok "(c) after unlocking (PIN or biometric) an elevated request opens without another PIN" || fail "c elevated: $CODE $BODY"
@@ -129,16 +135,27 @@ call PUT /api/identity/lock "$AG" '{"lock_after_sec":3600}'; [ "$CODE" = 403 ] &
 
 # ── (f) device revoke ──
 call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 403 ] || fail "f revoke no pin: $CODE"
-pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 200 ] || fail "f revoke: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM gate_verifications WHERE gate_type='password'\"); c.commit()" "$DB_PATH"   # the enrolment's password proof has lapsed
+pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-0001 "$A"
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q password && ok "(f) removing a phone takes more than the PIN (password or a linked phone's biometric)" || fail "f pin only: $CODE $BODY"
+call POST /api/identity/gate/verify "$A" '{"gate":"password","password":"hunter22"}'; call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 200 ] || fail "f revoke: $CODE $BODY"
 chsign "$A" p gate "reveal:1"; call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"reveal:1","challenge_id":'$CH',"signature":"'$SG'"}'
 [ "$CODE" = 403 ] && ok "(f) a revoked phone's biometric is refused at once" || fail "f revoked P: $CODE"
 
-# ── (d) 5 wrong PINs end the session (last: it locks the wallet's PIN) ──
-call POST /api/identity/auth-fingerprint "" '{"username":"owner-a","password":"hunter22","scope":"transact","expires_in":"1h"}'; B=$(echo "$BODY" | J token); BREF=$(echo "$BODY" | J refresh_token)
-[ -n "$BREF" ] && [ "$BREF" != None ] || fail "d: no refresh token issued"
-for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$B" '{"gate":"pin","pin":"0000","intent":"reveal:1"}'; done
-call GET /api/identity/lock "$B"; [ "$CODE" = 401 ] && ok "(d) the 5th wrong PIN ends that session (full login)" || fail "d session: $CODE $BODY"
-call POST /api/identity/refresh "" '{"refresh_token":"'$BREF'"}'; [ "$CODE" = 401 ] && ok "(d) …and its refresh token is dead too" || fail "d refresh: $CODE $BODY"
+# ── (d) 5 wrong PINs end the session — every token of it, refreshed ones too — and only that session ──
+UNLOCK="UPDATE identity_wallets SET pin_failures = 0, pin_locked_until = NULL, pin_lock_count = 0"
+SQLX(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
+X=$(login); for i in 1 2 3 4; do call POST /api/identity/gate/verify "$X" '{"gate":"pin","pin":"0000","intent":"reveal:1"}'; done
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"0000","intent":"reveal:1"}'
+call GET /api/identity/lock "$A"; [ "$CODE" = 200 ] && ok "(d) 4 misses elsewhere + 1 here do not end this session (#47 L6)" || fail "d L6: $CODE"
+SQLX "$UNLOCK"
+call POST /api/identity/auth-fingerprint "" '{"username":"owner-a","password":"hunter22","scope":"transact","expires_in":"1h"}'; B0=$(echo "$BODY" | J token); R0=$(echo "$BODY" | J refresh_token)
+call POST /api/identity/refresh "" '{"refresh_token":"'$R0'"}'; B1=$(echo "$BODY" | J token); R1=$(echo "$BODY" | J refresh_token)
+[ -n "$B1" ] && [ "$B1" != None ] || fail "d: refresh did not mint"
+for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$B1" '{"gate":"pin","pin":"0000","intent":"reveal:1"}'; done
+call GET /api/identity/lock "$B1"; C1=$CODE; call GET /api/identity/lock "$B0"; C0=$CODE
+[ "$C1" = 401 ] && [ "$C0" = 401 ] && ok "(d) the 5th wrong PIN ends the session: the refreshed token AND the one it came from (#47 M1)" || fail "d session: B1 $C1 B0 $C0"
+call POST /api/identity/refresh "" '{"refresh_token":"'$R1'"}'; [ "$CODE" = 401 ] && ok "(d) …and its refresh chain is dead" || fail "d refresh: $CODE $BODY"
 call GET /api/identity/lock "$A"; [ "$CODE" = 200 ] && ok "(d) other sessions keep going" || fail "d others: $CODE"
 
 ! grep -qE "hook-token-zz90|crit-token-zz91" "$S/server.log" && ok "no value in the server log" || fail "value in log"

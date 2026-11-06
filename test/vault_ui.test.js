@@ -1457,3 +1457,35 @@ test('428 with no linked phone in this browser → a clear refusal, nothing sign
   await settle();
   await assert.rejects(pg.ctx.apiGated('POST', '/api/blindkey/fill/9/approve', null, 'Fill?'), /linked phone/);
 });
+
+test('locking closes an open approval sheet and refuses approvals until unlocked (#47 review H2)', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    return { json: { ok: true } };
+  } });
+  await settle();
+  pg.el('modal-approval').classList.add('show');
+  pg.ctx.lockNow(); await settle();
+  assert.equal(pg.shown('modal-approval'), false, 'approval sheet closed');
+  assert.equal(pg.el('lock-screen').style.display, 'flex');
+  await assert.rejects(pg.ctx.apiGated('POST', '/api/blindkey/approvals/1/approve', { code: '123456' }, 'x'), /locked/);
+  assert.ok(!pg.calls.some(c => c.path === '/api/blindkey/approvals/1/approve'), 'nothing sent while locked');
+});
+
+test('423 locked from the server → the phone unlocks (biometric) and the approval is retried', async () => {
+  const signs = []; let approves = 0;
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/device/challenge') return { json: { challenge_id: 3, message: 'demipass:' + b.purpose + ':' + b.intent } };
+    if (p === '/api/identity/gate/verify') return { json: { ok: true } };
+    if (p === '/api/blindkey/approvals/4/approve') { approves++; return approves === 1 ? { status: 423, json: { locked: true, error: 'unlock DemiPass on your phone first' } } : { json: { ok: true } }; }
+    return { json: { ok: true } };
+  } });
+  pg.ctx.DemiPassDevice = fakePhone(pg.ctx, signs);
+  await settle();
+  const d = await pg.ctx.apiGated('POST', '/api/blindkey/approvals/4/approve', { code: '1' }, 'Approve');
+  assert.equal(d.ok, true); assert.equal(approves, 2);
+  assert.equal(signs[0].kind, 'P'); assert.match(signs[0].message, /unlock:0/);
+});

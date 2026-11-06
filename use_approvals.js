@@ -313,7 +313,8 @@ module.exports = function registerUseApprovals(deps) {
     // an agent signed in as the owner (device login, refreshed token) never holds. An elevated request is covered by a
     // fresh unlock of this session (the app's dormancy lock, unlocked by PIN or biometric within the owner's lock
     // time); a critical one asks again every time (red team item 8).
-    const coveredByUnlock = row.depth === 'elevated' && deviceKeys && deviceKeys.unlockFresh(auth);
+    // Only with a linked phone: without one, the PIN still opens each request (#47 review M3).
+    const coveredByUnlock = row.depth === 'elevated' && deviceKeys && deviceKeys.hasDevice(auth.did) && deviceKeys.unlockFresh(auth);
     if (row.opened_session !== session && !coveredByUnlock) {
       const intent = `approval-open:${row.id}`;
       if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('approval-open', ['pin'], ['pin'], intent));

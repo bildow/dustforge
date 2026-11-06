@@ -29,6 +29,13 @@ const TOPUP_MAX_PER_DAY = 5;             // asks per agent per 24 h (each one ma
 module.exports = function registerNetworkRoutes(deps) {
   const { app, db, billing, fleetBilling: fb, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing,
           spendSingleUse, barrelGuardedTransfer, transferRefusal, sendMail } = deps;
+  // Once the wallet has a linked phone, decisions that move DD or fleet membership are signed by it (red team 4b).
+  function deviceRefusal(w, kind, id, bind, req, res) {
+    const dk = deps.devices && deps.devices();
+    const r = dk && w.auth && w.auth.ok ? dk.approvalRefusal(w.auth, kind, id, bind, req.body) : null;
+    if (r) { res.status(r.status).json(r.body); return true; }
+    return false;
+  }
   const log = deps.log || ((...a) => console.log('[network]', ...a));
 
   db.exec(`CREATE TABLE IF NOT EXISTS network_requests (
@@ -347,6 +354,7 @@ module.exports = function registerNetworkRoutes(deps) {
         return res.status(403).json({ ...gateMissing('join', ['pin'], ['pin'], intent), error: 'joining a fleet needs your PIN' });
       }
     }
+    if (r.kind !== 'person' && deviceRefusal(w, 'join', r.id, `${r.kind}|${walletName(r.requester_did)}`, req, res)) return;
     try {
       let result;
       db.transaction(() => {
@@ -480,6 +488,7 @@ module.exports = function registerNetworkRoutes(deps) {
     if (required.length && !gateFresh(me, 'pin', w.auth, intent)) {
       return res.status(403).json({ ...gateMissing('send', required, required, intent), error: `sending ${t.amount_cents} DD to ${to.username} needs your PIN` });
     }
+    if (deviceRefusal(w, 'send', t.id, `${t.amount_cents}|${to.username}`, req, res)) return;
     try {
       let debit;
       db.transaction(() => {
