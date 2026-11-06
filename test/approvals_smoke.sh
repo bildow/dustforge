@@ -134,6 +134,8 @@ call POST /api/demipass/use "$AG" "$(jbody ref "$REF" params '{"url":"https://re
 [ "$CODE" = 400 ] && ok "a __proto__ key → 400" || fail "proto: $CODE $BODY"
 # key_name may not bring in an elevated secret through a standard one
 call POST /api/demipass/store "$A" '{"name":"std-pw","value":"zzzzstdpw1","secret_type":"password","username":"root","host":"100.83.112.88"}'
+SPW=$(Q "SELECT id FROM blindkey_secrets WHERE name='std-pw'"); SPC=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SPW")
+pin "$A" 4321 "scope:$SPW"; call PATCH /api/demipass/context/$SPC "$A" '{"allowed_commands":["id"]}'; [ "$CODE" = 200 ] || fail "std-pw commands: $CODE $BODY"
 call POST /api/demipass/use "$AG" '{"name":"std-pw","action":"ssh_exec","target_host":"100.83.112.88","target_user":"root","command":"id","key_name":"forge-token"}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "key_name secret 'forge-token' is elevated" && ok "an elevated secret cannot ride in as key_name of a standard one" || fail "key_name: $CODE $BODY"
 # per-requester cap

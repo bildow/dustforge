@@ -173,8 +173,14 @@ module.exports = function registerUseApprovals(deps) {
       : db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'pending'").get(requesterDid, secret.did).n;
     if (mine >= MAX_PENDING_PER_REQUESTER) return { error: `you already have ${mine} requests waiting on this owner; wait for them`, status: 429 };
     // A denial is an answer (red team item 4a): the requester waits before asking this owner again.
-    const denied = db.prepare("SELECT decided_at FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'denied' AND decided_at > ? ORDER BY decided_at DESC LIMIT 1")
-      .get(requesterDid, secret.did, new Date(Date.now() - DENY_COOLDOWN_SEC * 1000).toISOString());
+    // Keyed like the pending cap: the owner's own agents per label (one denied agent does not lock out the others or
+    // the owner's own reveals), anyone else per DID.
+    const since = new Date(Date.now() - DENY_COOLDOWN_SEC * 1000).toISOString();
+    const denied = own
+      ? db.prepare("SELECT decided_at FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND requester_label = ? AND status = 'denied' AND decided_at > ? ORDER BY decided_at DESC LIMIT 1")
+          .get(requesterDid, secret.did, cleanLabel(label || '', 80), since)
+      : db.prepare("SELECT decided_at FROM use_approvals WHERE requester_did = ? AND owner_did = ? AND status = 'denied' AND decided_at > ? ORDER BY decided_at DESC LIMIT 1")
+          .get(requesterDid, secret.did, since);
     if (denied) {
       const until = new Date(Date.parse(denied.decided_at) + DENY_COOLDOWN_SEC * 1000).toISOString();
       return { error: `the owner denied your last request — you can ask again after ${until}`, status: 429, extra: { cooldown_until: until } };
@@ -219,7 +225,7 @@ module.exports = function registerUseApprovals(deps) {
         const took = db.prepare("UPDATE use_approvals SET status = 'used', used_at = ? WHERE id = ? AND status = 'approved'").run(nowIso(), row.id).changes;
         if (took !== 1) return { status: 410, body: { error: 'this approval was already used' } };
         event('approval_used', caller.did, secret.id, { approval_id: row.id, via: row.approved_via });
-        return { ok: true, approval_id: row.id };
+        return { ok: true, approval_id: row.id, call: row.bound_call || null };
       }
       if (row.status === 'pending') {
         const code = body.approval_code;
@@ -232,7 +238,7 @@ module.exports = function registerUseApprovals(deps) {
           if (took !== 1) return { status: 410, body: { error: 'this request was decided meanwhile' } };
           event('approval_used', caller.did, secret.id, { approval_id: row.id, via: 'code' });
           logSecurityEvent('approval_code_accepted', 'info', { caller_did: caller.did, capability: kind, target: secret.name, context: { approval_id: row.id, owner_did: row.owner_did } });
-          return { ok: true, approval_id: row.id };
+          return { ok: true, approval_id: row.id, call: row.bound_call || null };
         }
         const wrong = db.prepare('UPDATE use_approvals SET wrong_codes = wrong_codes + 1 WHERE id = ? RETURNING wrong_codes').get(row.id).wrong_codes;
         event('approval_code_wrong', caller.did, secret.id, { approval_id: row.id, wrong_codes: wrong });

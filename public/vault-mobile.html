@@ -1838,7 +1838,7 @@ function showDetail(name) {
       }
     }
   } else {
-    h += `<div style="font-size:0.72rem;color:var(--text3)">No scope defined yet — a default is created on first use.</div>`;
+    h += `<div style="font-size:0.72rem;color:var(--text3)">No scope yet — this secret can't be used until you add one.</div>`;
   }
   h += `</div>`;
 
@@ -2136,7 +2136,7 @@ async function setCommands(contextId, list, name){
   catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
 }
 async function addCommand(contextId, current, name){
-  const cmd=prompt('Allow which command? Exact, or end with " *" for plain arguments (e.g. "systemctl status *").');
+  const cmd=prompt('Allow which command? Exact, or end with " *" for plain arguments (e.g. "systemctl status *"; no "-options" or ".." in them). Start with "sudo " for a root command. End with " <stdin" if it may read input (e.g. "tee -a /srv/app.log <stdin").');
   if(!cmd||!cmd.trim()) return;
   const list=JSON.parse(current); if(!list.includes(cmd.trim())) list.push(cmd.trim());
   await setCommands(contextId, list, name);

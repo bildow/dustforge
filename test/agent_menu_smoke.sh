@@ -119,6 +119,8 @@ call GET /api/demipass/menu "$A"
 [ "$(echo "$BODY" | J shared_with_you.0.name)" = svc-token ] && [ "$(echo "$BODY" | J shared_with_you.0.owner)" = owner ] && [ "$(echo "$BODY" | J shared_with_you.0.ref)" = "$REF" ] \
   && ok "the agent's menu now lists svc-token, shared by owner, with its ref" || fail "menu after approve: $BODY"
 call POST /api/demipass/request-token "$A" '{"name":"svc-token"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "needs a target URL" && ok "request-token with no target → 403 (a token is for one target; red team item 2)" || fail "no target: $CODE $BODY"
+call POST /api/demipass/request-token "$A" '{"name":"svc-token","target_url":"http://127.0.0.1:9/x"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J delegated)" = True ] && [ "$(echo "$BODY" | J context)" = default ] && [ "$(echo "$BODY" | J action)" = http_header ] \
   && ok "request-token by NAME alone: owner, context and action filled in" || fail "by name: $CODE $BODY"
 call POST /api/demipass/use "$A" '{"name":"svc-token","params":{"url":"http://127.0.0.1:9/x"}}'
@@ -139,7 +141,7 @@ AD=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.exe
 call POST /api/demipass/delegate "$P" '{"secret_name":"svc-token","delegate_did":"'$AD'"}'
 call POST /api/demipass/request-token "$A" '{"name":"svc-token"}'
 [ "$CODE" = 409 ] && echo "$BODY" | grep -q "$REF" && echo "$BODY" | grep -q "$PREF" && ok "two owners share 'svc-token' → 409 listing both refs" || fail "ambiguous: $CODE $BODY"
-call POST /api/demipass/request-token "$A" '{"ref":"'$PREF'"}'
+call POST /api/demipass/request-token "$A" '{"ref":"'$PREF'","target_url":"http://127.0.0.1:9/x"}'
 [ "$CODE" = 200 ] && ok "the ref picks one" || fail "ref pick: $CODE $BODY"
 
 # ── review findings (PR #32 round 1) ──
