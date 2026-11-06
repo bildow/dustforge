@@ -3017,7 +3017,7 @@ function canonicalTargetUrl(raw) {
   if (u.protocol !== 'https:' || u.username || u.password || !u.hostname) return null;
   // Encoded separators and dots pass the parser untouched but some servers (nginx proxy_pass with a path, frameworks
   // that decode before routing) turn them into a traversal: never sent (#43 re-audit follow-up 1).
-  if (/%(2f|5c|2e|25)/i.test(u.pathname)) return null;
+  if (/%(2f|5c|2e|25)/i.test(u.pathname)) return null;   // (callers' message: see enforceBlindkeyContext)
   u.hash = '';
   return u.origin + u.pathname + u.search;
 }
@@ -3220,7 +3220,7 @@ function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHo
   if (URL_ACTIONS.has(action)) {
     if (!targetUrl) return { allowed: false, error: `${action} needs a target URL (params.${action === 'git_clone' ? 'repo_url' : 'url'})` };
     canonicalUrl = canonicalTargetUrl(targetUrl);
-    if (!canonicalUrl) return { allowed: false, error: 'target URL must be a plain https URL (no user:password@ part)' };
+    if (!canonicalUrl) return { allowed: false, error: 'target URL must be a plain https URL: no user:password@ part, no encoded / \\ . or % in the path' };
     if (!urlPatternMatch(ctx.target_url_pattern, canonicalUrl)) {
       return { allowed: false, error: `target URL does not match context pattern '${ctx.target_url_pattern}'` };
     }
@@ -4665,7 +4665,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
 
           egressLog(req, secret, 'http_header', effectiveUrl);   // written before the connection: the outbound log
-          const response = await fetch(effectiveUrl, {
+          const response = await useLimits.secretFetch(effectiveUrl, {
             method,
             headers: { [header_name]: header_prefix + decryptedValue, 'Content-Type': 'application/json' },
             body: reqBody ? JSON.stringify(reqBody) : undefined,
@@ -4763,7 +4763,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             : JSON.stringify({ key: decryptedValue });
 
           egressLog(req, secret, 'http_body', effectiveUrl);   // written before the connection: the outbound log
-          const bodyResponse = await fetch(effectiveUrl, {
+          const bodyResponse = await useLimits.secretFetch(effectiveUrl, {
             method: bodyMethod,
             headers: { 'Content-Type': content_type },
             body: bodyStr,
@@ -4893,7 +4893,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           }
 
           egressLog(req, secret, 'database_connect', db_url);   // written before the connection: the outbound log
-          const dbResponse = await fetch(db_url, {
+          const dbResponse = await useLimits.secretFetch(db_url, {
             method: 'POST',
             headers: {
               'Authorization': 'Bearer ' + decryptedValue,
@@ -4972,6 +4972,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         } catch (_) {}
         return res.status(413).json(e.body);
       }
+      if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
       return res.status(500).json({ error: `action failed: ${e.message}` });
     }
   }
@@ -5041,7 +5042,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         }
 
         egressLog(req, secret, 'http_header', url);   // written before the connection: the outbound log
-        const response = await fetch(url, {
+        const response = await useLimits.secretFetch(url, {
           method,
           headers: {
             [header_name]: header_prefix + decryptedValue,
@@ -5174,6 +5175,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     res.json({ ok: true, action, secret_name: name, result });
   } catch (e) {
     if (e.code === 'upstream_too_large') { countUse(); return res.status(413).json(e.body); }
+    if (e.code === 'upstream_redirect') { countUse(); return res.status(502).json(e.body); }   // the request went out
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 });
@@ -5918,7 +5920,7 @@ async function handleRowenDeliver(req, res) {
         }
 
         egressLog(egressReq, secret, 'http_header', url);   // written before the connection: the outbound log
-        const response = await fetch(url, {
+        const response = await useLimits.secretFetch(url, {
           method,
           headers: {
             [header_name]: header_prefix + decryptedValue,
@@ -6014,6 +6016,7 @@ async function handleRowenDeliver(req, res) {
     });
   } catch (e) {
     if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
+    if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 }
@@ -11818,18 +11821,20 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const baseName = secret.name.replace(/_v\d+$/, '');
   const target = nextVersionName(ownerDid, baseName, secret.version);
   if (target.conflict) return res.status(409).json({ error: target.conflict });
-  // The login rotated is the account the secret was stored for; naming another one is refused (#43 re-audit
-  // follow-up 3: a shared password must not let the caller reset whichever account it names).
-  if (secret.account_username && target_user && target_user !== secret.account_username) {
-    return res.status(403).json({ error: `this secret is the password of '${secret.account_username}'; rotate that account` });
-  }
-  const sshUser = target_user || secret.account_username || 'root';
   // Same hosts as every other SSH action. Before 2026-10-28 target_host and target_user went into a shell
   // command on this server unchecked, which let any account run commands here.
   if (typeof target_host !== 'string' || !BLINDKEY_SSH_HOSTS.has(target_host)) {
     logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), error: 'host not in SSH whitelist', ip: req.ip });
     return res.status(403).json({ error: 'host not in SSH whitelist' });
   }
+  // The login rotated is the account the secret was stored for; naming another one is refused (#43 re-audit
+  // follow-up 3: a shared password must not let the caller reset whichever account it names).
+  if (secret.account_username && target_user && target_user !== secret.account_username) {
+    return res.status(403).json({ error: `this secret is the password of '${secret.account_username}'; rotate that account` });
+  }
+  // A secret stored without its account: the caller names it (no silent root), and this rotation records it.
+  if (!secret.account_username && !target_user) return res.status(400).json({ error: 'name the account to rotate (target_user); it is recorded with the new version and binds later rotations' });
+  const sshUser = target_user || secret.account_username;
   if (typeof sshUser !== 'string' || !SSH_USER_RE.test(sshUser)) return res.status(400).json({ error: 'invalid target_user' });
   // The chpasswd script goes to `bash -s` on the host over stdin: no file on this server, and every value is
   // single-quoted for the remote shell (a stored password may hold $, ` or ").
@@ -11873,11 +11878,12 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const newRefCode = generateRefCode('password', newName);
     db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code,
                                               provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
-                                              security_depth, gate_policy, fill_origins, fill_username)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)`)
+                                              security_depth, gate_policy, fill_origins, fill_username, account_username)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)`)
       .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
            secret.provider || '', secret.ownership || 'sole', secret.rotatable ?? 1, secret.category, secret.labels, secret.rotation_interval_days,
-           secret.security_depth, secret.gate_policy, secret.fill_origins ?? null, secret.fill_username ?? null);
+           secret.security_depth, secret.gate_policy, secret.fill_origins ?? null, secret.fill_username ?? null,
+           sshUser);   // the account this password now belongs to: kept, so the next rotation is bound to it
 
     const newSecret = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 

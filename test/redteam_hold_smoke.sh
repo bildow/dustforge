@@ -178,6 +178,10 @@ R0=$(runs); call POST /api/demipass/rotate-blind "$AG" '{"ref":"'$(Q "SELECT ref
 call POST /api/demipass/rotate-blind "$AG" '{"ref":"'$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$BOX")'","target_host":"'$HOST'","target_user":"someoneelse"}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "password of 'root'" && [ "$(runs)" = "$R0" ] && ok "follow-up 3: rotate-blind of another account than the secret's → 403" || fail "rotate user: $CODE $BODY"
 
+call POST /api/demipass/store "$A" '{"name":"nouser","value":"nouser-pw-zz89","secret_type":"password","host":"'$HOST'"}'
+call POST /api/demipass/rotate-blind "$AG" '{"ref":"'$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='nouser'")'","target_host":"'$HOST'"}'
+[ "$CODE" = 400 ] && echo "$BODY" | grep -q "name the account" && [ "$(runs)" = "$R0" ] && ok "rotate-blind of a secret with no stored account: the caller must name it (no silent root)" || fail "rotate no user: $CODE $BODY"
+
 # ── N5: frozen means frozen; unfreezing takes the PIN ──
 call POST /api/demipass/request-token "$AG" '{"name":"box","action":"ssh_exec","target_host":"'$HOST'"}'; FT=$(echo "$BODY" | J use_token)
 call POST /api/demipass/freeze "$AG" '{"name":"box","freeze":true}'; [ "$CODE" = 200 ] || fail "freeze: $CODE $BODY"

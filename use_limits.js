@@ -134,4 +134,24 @@ function redactDeep(value, secret) {
   return root;
 }
 
-module.exports = { USE_MAX_REQUEST_BYTES, USE_MAX_RESPONSE_BYTES, readCapped, redactSecret, redactedBody, redactDeep, mib };
+// fetch() for a call that carries a secret (in a header or the body). It never follows a redirect: on a 30x,
+// fetch would re-send custom headers such as X-Api-Key, and on a 307/308 the body too, to whatever origin the
+// Location names. The host allow-list checks only the first URL, so redirect: 'error' makes any 30x fail before a
+// second request is sent, and the caller gets a 502 that says why. Other network errors pass through unchanged.
+async function secretFetch(url, init) {
+  try {
+    return await fetch(url, { ...init, redirect: 'error' });
+  } catch (e) {
+    if (!isRedirectError(e)) throw e;
+    const err = new Error('upstream answered with a redirect; DemiPass does not follow redirects with a secret attached, call the final URL directly');
+    err.code = 'upstream_redirect';
+    err.body = { error: err.message, upstream: 'redirect' };
+    throw err;
+  }
+}
+// undici rejects a redirect under redirect: 'error' with TypeError('fetch failed', { cause: Error('unexpected redirect') }).
+function isRedirectError(e) {
+  return e instanceof TypeError && /unexpected redirect/i.test(String(e.cause && e.cause.message));
+}
+
+module.exports = { secretFetch, USE_MAX_REQUEST_BYTES, USE_MAX_RESPONSE_BYTES, readCapped, redactSecret, redactedBody, redactDeep, mib };
