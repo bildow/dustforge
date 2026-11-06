@@ -424,6 +424,7 @@ app.post('/vault/blindkey-use', hmacAuth, lockdownCheck, async (req, res) => {
         }
 
         const response = await fetch(url, {
+          redirect: 'error', // never re-send the secret header to a redirect target
           method,
           headers: {
             [header_name]: header_prefix + decryptedValue,
