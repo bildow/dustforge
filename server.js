@@ -9109,6 +9109,11 @@ app.post('/api/escrow/create', rateLimitStandard, (req, res) => {
   if (collateralCents > 50000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
 
   const resolvedCounterpartyDid = String(counterparty_did || '').trim();
+  // A fleet-made agent's DD stays inside its fleet: no escrow with anyone else (#48 review: escrow was an exit).
+  for (const other of [resolvedCounterpartyDid, String(beneficiary_did || '').trim()]) {
+    const why = other ? fleetBilling.fleetExitRefusal(db, actor.did, other) : null;
+    if (why) return res.status(403).json({ error: why });
+  }
   const resolvedBeneficiaryDid = String(beneficiary_did || resolvedCounterpartyDid || actor.did).trim();
   if (resolvedCounterpartyDid) {
     const wallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedCounterpartyDid);
@@ -9190,6 +9195,7 @@ app.post('/api/escrow/:id/release', rateLimitStandard, (req, res) => {
   const row = getEscrowById(req.params.id);
   if (!row) return res.status(404).json({ error: 'escrow not found' });
   if (row.creator_did !== actor.did) return res.status(403).json({ error: 'only creator can release escrow' });
+  { const why = fleetBilling.fleetExitRefusal(db, actor.did, row.beneficiary_did || row.counterparty_did); if (why) return res.status(403).json({ error: why }); }
   // Releasing pays the beneficiary: a wallet with a PIN (a person) says yes with it; an agent's wallet (no PIN) stays
   // token-driven (red team item 16, #48 review: escrow paid any counterparty on a token alone).
   {

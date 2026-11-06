@@ -85,6 +85,7 @@ call POST /api/network/requests "$FM" '{"to":"outsider-o","as":"person"}'; [ "$C
 call POST /api/network/requests "$F" '{"to":"outsider-o","as":"person"}'; RQ=$(echo "$BODY" | J request.id); call POST /api/network/requests/$RQ/accept "$O"
 call POST /api/network/transfers "$F" '{"to":"outsider-o","amount_cents":100}'; [ "$CODE" = 403 ] && ok "16: a fleet-made agent cannot send DD out of its fleet" || fail "fleet exit send: $CODE $BODY"
 call POST /api/network/transfers "$F" '{"to":"owner-a","amount_cents":1}'; [ "$CODE" = 201 ] && ok "16: …it can still send to its owner" || fail "send to owner: $CODE $BODY"
+call POST /api/escrow/create "$F" '{"counterparty_did":"'$(did outsider-o)'","collateral_cents":100,"title":"x"}'; [ "$CODE" = 403 ] && ok "16: …and cannot open an escrow with an outsider" || fail "escrow exit: $CODE $BODY"
 # a PIN-confirmed refill rule raised by a token alone is no longer confirmed (#48)
 LID=$(Q "SELECT id FROM fleet_silicons WHERE handle='linked-h'")
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"refill:'$LID'"}'

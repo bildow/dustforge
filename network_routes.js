@@ -449,13 +449,7 @@ module.exports = function registerNetworkRoutes(deps) {
     if (!connected(me, to.did)) return res.status(403).json({ error: `connect with ${to.username} first (Add wallet), then send` });
     // An agent the fleet created moves DD only inside its fleet (its owner or a fellow fleet-created agent): it has no PIN and its
     // owner can mint its tokens, so a send out of the fleet would be the owner's DD leaving on a token alone (#48 review).
-    {
-      const own = db.prepare(`SELECT s.fleet_id, f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
-          WHERE s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1`).get(me);
-      if (own && to.did !== own.owner_did && !db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1").get(own.fleet_id, to.did)) {
-        return res.status(403).json({ error: 'an agent your fleet created sends DD only to its owner or another agent the fleet created' });
-      }
-    }
+    { const why = fb.fleetExitRefusal(db, me, to.did); if (why) return res.status(403).json({ error: why }); }
     const session = gateSession(w.auth);
     if (!session) return res.status(403).json({ error: 'this token cannot send DD — sign in again' });
     expireOld();
@@ -487,6 +481,7 @@ module.exports = function registerNetworkRoutes(deps) {
     const intent = `send:${t.id}`;
     const barrel = transferRefusal ? transferRefusal(me, t.amount_cents) : null;   // say so before asking for a PIN
     if (barrel) return res.status(barrel.statusCode || 403).json(barrel.body || { error: barrel.message });
+    { const why = fb.fleetExitRefusal(db, me, t.to_did); if (why) return res.status(403).json({ error: why }); }   // also for sends started earlier
     const required = w.wallet.pin_hash ? ['pin'] : [];
     if (required.length && !gateFresh(me, 'pin', w.auth, intent)) {
       return res.status(403).json({ ...gateMissing('send', required, required, intent), error: `sending ${t.amount_cents} DD to ${to.username} needs your PIN` });

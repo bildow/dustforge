@@ -512,6 +512,16 @@ function autoRefilledLast24h(db, did, now = Date.now()) {
   return r ? r.c : 0;
 }
 
+// A wallet its fleet created moves DD only inside that fleet: to its owner or another agent the fleet created. It has no
+// PIN and its owner mints its tokens, so DD leaving it is the owner's DD leaving on a token alone (#48 review: network
+// sends, escrow). Returns the refusal text, or null when the move is allowed.
+function fleetExitRefusal(db, fromDid, toDid) {
+  const own = db.prepare(`SELECT s.fleet_id, f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+      WHERE s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1`).get(fromDid);
+  if (!own || !toDid || toDid === own.owner_did) return null;
+  if (db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1").get(own.fleet_id, toDid)) return null;
+  return 'an agent your fleet created moves DD only to its owner or another agent the fleet created';
+}
 function ownedOutright(s) { return Boolean(s) && Number(s.created_by_fleet) === 1 && (s.joined_via || 'owner') !== 'network'; }
 function thresholdRefill(db, billing, s, { force = false, amount = null, now = Date.now(), ledger = null } = {}) {
   let amt = Number(amount != null ? amount : s.refill_amount_cents);
@@ -982,7 +992,7 @@ function tokenWarningEmail({ silicon, token }) {
 }
 
 module.exports = {
-  ownedOutright,
+  ownedOutright, fleetExitRefusal,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
