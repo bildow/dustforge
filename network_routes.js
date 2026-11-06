@@ -64,7 +64,7 @@ module.exports = function registerNetworkRoutes(deps) {
     UNIQUE(did_a, did_b)
   )`);
   // Set by an in-person pairing (pairing.js, red team item 6); cleared when the contact is removed or re-added by name.
-  for (const c of ['verified_via TEXT DEFAULT NULL', 'verified_at TEXT DEFAULT NULL']) {
+  for (const c of ['verified_via TEXT DEFAULT NULL', 'verified_at TEXT DEFAULT NULL', 'vouched_by TEXT DEFAULT NULL']) {
     try { db.exec('ALTER TABLE network_peers ADD COLUMN ' + c); } catch (_) {}
   }
   db.exec(`CREATE TABLE IF NOT EXISTS network_transfers (
@@ -376,7 +376,7 @@ module.exports = function registerNetworkRoutes(deps) {
           const [a, b] = pair(r.requester_did, r.target_did);
           db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id) VALUES (?, ?, ?)
                       ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', request_id = excluded.request_id, created_at = CURRENT_TIMESTAMP, removed_at = NULL,
-                        verified_via = NULL, verified_at = NULL`)   // re-added by name: not confirmed in person (#52 review)
+                        verified_via = NULL, verified_at = NULL, vouched_by = NULL`)   // re-added by name: not confirmed in person (#52 review)
             .run(a, b, r.id);
           result = { kind: 'person', with: walletName(r.requester_did) };
           return;
@@ -425,7 +425,7 @@ module.exports = function registerNetworkRoutes(deps) {
     if (!other) return res.status(404).json({ error: 'no wallet by that name' });
     const [a, b] = pair(w.wallet.did, other.did);
     // Removing a contact also removes its in-person confirmation: share rights come back only by pairing again (#52 review).
-    const n = db.prepare("UPDATE network_peers SET status = 'removed', removed_at = CURRENT_TIMESTAMP, verified_via = NULL, verified_at = NULL WHERE did_a = ? AND did_b = ? AND status = 'active'").run(a, b).changes;
+    const n = db.prepare("UPDATE network_peers SET status = 'removed', removed_at = CURRENT_TIMESTAMP, verified_via = NULL, verified_at = NULL, vouched_by = NULL WHERE did_a = ? AND did_b = ? AND status = 'active'").run(a, b).changes;
     if (!n) return res.status(404).json({ error: 'not a contact' });
     res.json({ ok: true });
   });

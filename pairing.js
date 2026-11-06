@@ -214,8 +214,10 @@ module.exports = function registerPairing(deps) {
           db.prepare("UPDATE contact_pairings SET status = 'confirmed', decided_at = ?, code = NULL WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
           const [a, b] = pairDids(cur.initiator_did, cur.joiner_did);
           db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id, verified_via, verified_at) VALUES (?, ?, NULL, 'qr', ?)
-                      ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', removed_at = NULL, verified_via = 'qr', verified_at = excluded.verified_at`)
+                      ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', removed_at = NULL, verified_via = 'qr', verified_at = excluded.verified_at, vouched_by = NULL`)
             .run(a, b, nowIso());
+          // They met in person: any introduction of these two that is still waiting is moot.
+          try { db.prepare("UPDATE contact_vouches SET status = 'withdrawn', decided_at = ?, decided_by = 'paired-in-person' WHERE did_a = ? AND did_b = ? AND status = 'pending'").run(nowIso(), a, b); } catch (_) {}
           done = true;
         }
       }).immediate();
@@ -379,8 +381,13 @@ module.exports = function registerPairing(deps) {
         const cur = db.prepare('SELECT * FROM contact_vouches WHERE id = ?').get(v.id);
         if (cur.a_accepted_at && cur.b_accepted_at) {
           db.prepare("UPDATE contact_vouches SET status = 'confirmed', decided_at = ? WHERE id = ? AND status = 'pending'").run(nowIso(), v.id);
+          // A first-hand (QR) link they made meanwhile stays first-hand: a vouch never downgrades it (#55 review).
           db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id, verified_via, verified_at, vouched_by) VALUES (?, ?, NULL, 'vouch', ?, ?)
-                      ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', removed_at = NULL, verified_via = 'vouch', verified_at = excluded.verified_at, vouched_by = excluded.vouched_by`)
+                      ON CONFLICT(did_a, did_b) DO UPDATE SET
+                        verified_via = CASE WHEN network_peers.status = 'active' AND network_peers.verified_via = 'qr' THEN 'qr' ELSE 'vouch' END,
+                        vouched_by = CASE WHEN network_peers.status = 'active' AND network_peers.verified_via = 'qr' THEN NULL ELSE excluded.vouched_by END,
+                        verified_at = CASE WHEN network_peers.status = 'active' AND network_peers.verified_via = 'qr' THEN network_peers.verified_at ELSE excluded.verified_at END,
+                        status = 'active', removed_at = NULL`)
             .run(cur.did_a, cur.did_b, nowIso(), cur.voucher_did);
           done = true;
         }

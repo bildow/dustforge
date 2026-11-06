@@ -87,6 +87,18 @@ pin "$A" 1111 "vouch:$V4"; call POST /api/network/vouches/$V4/accept "$A"
 [ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM contact_vouches WHERE id=$V4")" = withdrawn ] && ok "the voucher's own link to D ended → the introduction lapses" || fail "lapse: $CODE $BODY"
 call POST /api/network/vouches/$V4/accept "$G"; [ "$CODE" = 404 ] && ok "a stranger cannot see or accept it" || fail "stranger: $CODE"
 
+# ── a vouch never downgrades a first-hand link; pairing in person closes a waiting introduction (#55 review) ──
+pair_in_person "$C" 3333 "$D" 4444   # C's link to D was removed above
+pin "$C" 3333 vouch:0; call POST /api/network/vouch "$C" '{"a":"va","b":"vd"}'; V5=$(echo "$BODY" | J vouch.id); [ "$CODE" = 200 ] || fail "vouch A-D: $CODE $BODY"
+pin "$A" 1111 "vouch:$V5"; call POST /api/network/vouches/$V5/accept "$A"
+pair_in_person "$A" 1111 "$D" 4444
+[ "$(Q "SELECT status||'/'||decided_by FROM contact_vouches WHERE id=$V5")" = withdrawn/paired-in-person ] && [ "$(peer va vd)" = "qr|" ] && ok "A and D pair in person while an introduction waits → it is closed; their link is first-hand (qr)" || fail "pair closes vouch: $(Q "SELECT status FROM contact_vouches WHERE id=$V5") $(peer va vd)"
+pin "$C" 3333 vouch:0; call POST /api/network/vouch "$C" '{"a":"va","b":"vd"}'; [ "$CODE" = 409 ] && ok "…and no new introduction of a confirmed pair" || fail "vouch confirmed: $CODE"
+# removal and a name re-add clear vouched_by too
+call POST /api/network/people/remove "$B" '{"username":"va"}'
+call POST /api/network/requests "$A" '{"to":"vb","as":"person"}'; R=$(echo "$BODY" | J request.id); call POST /api/network/requests/$R/accept "$B"
+[ "$(peer va vb)" = "none|" ] && ok "removed and re-added by name: neither confirmed nor vouched_by" || fail "vouched_by kept: $(peer va vb)"
+
 # ── agents never ──
 call POST /api/network/requests "$C" '{"to":"vg","as":"agent"}'; R=$(echo "$BODY" | J request.id); pin "$G" 5555 "join:$R"; call POST /api/network/requests/$R/accept "$G"
 call POST /api/network/vouch "$G" '{"a":"va","b":"vb"}'; [ "$CODE" = 403 ] && ok "an agent cannot vouch" || fail "agent vouch: $CODE"
