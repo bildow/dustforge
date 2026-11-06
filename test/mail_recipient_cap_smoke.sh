@@ -58,7 +58,12 @@ const c = require("./mail_recipient_cap"); const eq = (a, b) => { if (a !== b) {
 eq(c.canonicalRecipient("Aaron.X+loop@GoogleMail.com"), "aaronx@gmail.com");
 eq(c.canonicalRecipient("\"Aaron\" <aaronx@gmail.com>"), "aaronx@gmail.com");
 eq(c.canonicalRecipient("kyle.m+a@hotmail.com"), "kyle.m@hotmail.com");
-eq(c.recipientList("a@x.io, A@X.io ,b@x.io").join(","), "a@x.io,b@x.io");' && ok "canonical recipient: case, display name, +tag and Gmail dots fold to one inbox" || fail "canonical"
+eq(c.recipientList("a@x.io, A@X.io ,b@x.io").join(","), "a@x.io,b@x.io");
+// #51 review: every spelling nodemailer delivers to one inbox is one count
+for (const s of ["victim@x.com (n1)", "<victim@x.com> junk", "\"victim\"@x.com", "Grp: victim@x.com;", "VICTIM+z@x.com"]) eq(c.recipientList(s).join(","), "victim@x.com");
+eq(c.recipientList("a@b.com; victim@x.com").join(","), "a@b.com,victim@x.com");
+eq(c.recipientList([{ address: "Victim@x.com" }]).join(","), "victim@x.com");
+eq(c.canonicalRecipient("v@b\u00fccher.de"), c.canonicalRecipient("v@xn--bcher-kva.de"));' && ok "canonical recipient: case, display name, +tag and Gmail dots fold to one inbox" || fail "canonical"
 
 # ── /api/email/send ──
 B0=$(bal mailer)
@@ -85,6 +90,8 @@ SEND "reject-me@example.com"
 # ── /api/relay/forward ──
 call POST /api/relay/create "$T" '{"forward_to":"aaronx@gmail.com"}'; [ "$CODE" = 200 ] || fail "relay create: $CODE $BODY"
 call POST /api/relay/create "$T" '{"forward_to":"fresh@example.com"}'
+call POST /api/relay/create "$T" '{"forward_to":"aaronx@gmail.com(c1)"}'
+[ "$CODE" = 400 ] && ok "/relay/create refuses an address with a comment (one inbox under many spellings)" || fail "relay comment: $CODE $BODY"
 B3=$(bal mailer)
 call POST /api/relay/forward "$T" '{"subject":"fw","body":"b"}'
 R1=$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(r["forward_to"]+"="+r["status"] for r in d["results"]))')
@@ -103,6 +110,8 @@ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"INSE
 : >"$S/smtp.log"
 call POST /api/demipass/use "$AG" "$(SMTPCALL loop@example.com)"
 [ "$CODE" = 429 ] && [ ! -s "$S/smtp.log" ] && [ "$(echo "$BODY" | J recipient)" = loop@example.com ] && ok "smtp_auth on a standard secret, inbox at 5 today → 429 before any connection" || fail "smtp std capped: $CODE $BODY $(tr '\n' ' ' <"$S/smtp.log")"
+: >"$S/smtp.log"; call POST /api/demipass/use "$AG" "$(SMTPCALL "loop@example.com (n1)")"
+[ "$CODE" = 400 ] && [ ! -s "$S/smtp.log" ] && ok "smtp_auth refuses a commented or decorated address (plain addresses only), before any connection" || fail "smtp comment: $CODE $BODY"
 call POST /api/demipass/use "$AG" "$(SMTPCALL newbox@example.com)"; sleep 0.3
 [ "$CODE" = 200 ] && grep -q EHLO "$S/smtp.log" && [ "$(cnt "$AD" newbox@example.com)" = 0 ] && ok "smtp_auth to a fresh inbox reaches the server; the send failed (no STARTTLS), so it is not counted" || fail "smtp fresh: $CODE $BODY cnt $(cnt "$AD" newbox@example.com)"
 call POST /api/demipass/gate-policy "$A" '{"ref":"'$MR'","security_depth":"elevated"}'; [ "$CODE" = 200 ] || fail "elevate: $CODE $BODY"

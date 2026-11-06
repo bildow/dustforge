@@ -1964,7 +1964,9 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_fr_did ON forward_relays(did)"); }
 app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
   const { forward_to, filter_from = '*', label } = req.body || {};
   if (!forward_to) return res.status(400).json({ error: 'forward_to email required' });
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(forward_to)) return res.status(400).json({ error: 'invalid forward_to email' });
+  // The same strict address check as /api/email/send: no comments, display names or lists that deliver one inbox under
+  // many spellings (#51 review: N rules → 5×N forwards a day to one inbox).
+  if (typeof forward_to !== 'string' || forward_to.length > 254 || !EMAIL_ADDR_RE.test(forward_to)) return res.status(400).json({ error: 'invalid forward_to email' });
 
   // Max 5 forwarding rules per silicon
   const count = db.prepare('SELECT COUNT(*) as n FROM forward_relays WHERE did = ? AND status = ?').get(req.identity.did, 'active').n;
@@ -4935,6 +4937,13 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           // Send an email through an external SMTP server using stored credentials
           const { smtp_host, smtp_port = 587, to, subject, body: emailBody, from } = action_params;
           if (!smtp_host || !to || !subject) return res.status(400).json({ error: 'params.smtp_host, to, subject required for smtp_auth action' });
+          // A mail call: the day's allowance on every answer (Aaron 2026-11-06), as on the other mail routes.
+          try { const mr = mailRemaining(req.identity && req.identity.did); if (mr.remaining != null) res.setHeader('X-Mail-Remaining', String(mr.remaining)); if (mr.limit != null) res.setHeader('X-Mail-Limit', String(mr.limit)); } catch (_) {}
+          // Plain addresses only, checked like /api/email/send: the recipient bound counts what is delivered (#51 review).
+          {
+            const rcpts = typeof to === 'string' ? to.split(',').map(x => x.trim()).filter(Boolean) : [];
+            if (!rcpts.length || rcpts.length > 10 || rcpts.some(a => !EMAIL_ADDR_RE.test(a))) return res.status(400).json({ error: 'params.to: 1–10 plain addresses, comma-separated' });
+          }
 
           // The host is the token's (checked against the scope at issue), and it is on the global SMTP list either way:
           // a scope never reaches past the list (red team items 2, 11).
@@ -4985,7 +4994,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
               text: emailBody || '',
             });
             result = { sent: true, messageId: info.messageId, accepted: info.accepted };
-            if (rslot) result.recipient_remaining = rslot.remaining;
+            if (rslot) {
+              result.recipient_remaining = rslot.remaining;
+              res.setHeader('X-Mail-Recipient-Limit', String(mailRecipientCap.LIMIT));
+              if (rslot.remaining !== null) res.setHeader('X-Mail-Recipient-Remaining', String(rslot.remaining));
+            }
           } catch (smtpErr) {
             if (rslot) rslot.release();
             result = { sent: false, error: smtpErr.message.replace(new RegExp(smtpPass.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]') };
