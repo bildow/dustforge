@@ -275,8 +275,10 @@ module.exports = function registerLeakScan(deps) {
       // Stop the line: this token is done (one positive answer, ever, per token).
       revoked = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'hit' WHERE id = ? AND revoked_at IS NULL").run(nowIso(), caller.tokenRow.id).changes === 1;
       const names = [...new Set(hits.map(h => h.name))];
+      // Names only — where it was found is in the app behind the PIN: an owner mailbox a pane can read must not become
+      // the chunk channel (#45 re-review, low).
       mailOwner(caller.did, `DemiPass: a vault value was found by the leak scanner (${caller.tokenRow.label || 'scan token ' + caller.tokenRow.id})`,
-        `The leak scanner "${caller.tokenRow.label || caller.tokenRow.id}" found ${hits.length} place(s) holding a value of: ${names.join(', ')}.\nWhere: ${hits.slice(0, 20).map(h => h.chunk).join('; ')}\n\nRotate those secrets and remove the copies. The scan token was revoked; approve a new one when it is clean.\n`);
+        `The leak scanner "${caller.tokenRow.label || caller.tokenRow.id}" found a value of: ${names.join(', ')}.\n\nWhere it was found: DemiPass app → Settings → Leak scanner → "where?" (your PIN). Rotate those secrets and remove the copies. The scan token was revoked; approve a new one when it is clean.\n`);
     }
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
       .run('leak_scan', caller.did, null, null, JSON.stringify({ bytes, chunks: chunks.length, hits: hits.length, token_id: caller.tokenRow.id, revoked }));
