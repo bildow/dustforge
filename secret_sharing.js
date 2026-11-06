@@ -31,6 +31,13 @@ const MAX_LIST = 100;
 module.exports = function registerSecretSharing(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
           logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy } = deps;
+  // Decisions that give access away are signed by the owner's enrolled phone once there is one (red team item 4b).
+  function deviceRefusal(me, kind, id, bind, req, res) {
+    const dk = deps.devices && deps.devices();
+    const r = dk ? dk.approvalRefusal(me.auth, kind, id, bind, req.body) : null;
+    if (r) { res.status(r.status).json(r.body); return true; }
+    return false;
+  }
   const limiter = rateLimitFill || rateLimitStandard;
 
   const nowIso = () => new Date().toISOString();
@@ -179,6 +186,7 @@ module.exports = function registerSecretSharing(deps) {
     if (prior && ['active', 'offered'].includes(stateOf(prior))) {
       return res.status(409).json({ error: `${target.username} already has ${stateOf(prior) === 'active' ? 'this share' : 'this offer waiting'}`, share: view(prior, me.did) });
     }
+    if (deviceRefusal(me, 'share', secret.id, String((req.body || {}).to || ''), req, res)) return;
     if (!requirePin(me, `share:${secret.id}`, 'share', res)) return;
     const expiresAt = daysFromNow(days);
     const cleanNote = note ? cleanLabel(note, 300).trim() : '';
@@ -222,6 +230,7 @@ module.exports = function registerSecretSharing(deps) {
     const secret = db.prepare(`SELECT id FROM blindkey_secrets WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(row.secret_id, row.owner_did);
     if (!secret) return res.status(410).json({ error: 'the owner no longer has this secret' });
     // The recipient's PIN: an agent signed in as them (device login) cannot take on a share for them.
+    if (deviceRefusal(me, 'share-accept', row.id, String(row.secret_id), req, res)) return;
     if (!requirePin(me, `share-accept:${row.id}`, 'share-accept', res)) return;
     const done = db.prepare(`UPDATE demipass_delegations SET status = 'active', offer_state = 'accepted', accepted_at = CURRENT_TIMESTAMP
                              WHERE id = ? AND status = 'suspended' AND offer_state = 'offered'`).run(row.id).changes;
@@ -374,6 +383,7 @@ module.exports = function registerSecretSharing(deps) {
       finalName = new_name.trim();
       if (!finalName || /_v\d+$/.test(finalName)) return res.status(400).json({ error: 'new_name: a plain name, not ending in _v<number>' });
     }
+    if (deviceRefusal(me, 'transfer', secret.id, String((req.body || {}).to || ''), req, res)) return;
     if (!requirePin(me, `transfer:${secret.id}`, 'transfer', res)) return;
     // Checked after the PIN, so whether a name exists in their vault is never answered for free.
     if (nameFamilyTaken(target.did, finalName)) {

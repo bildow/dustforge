@@ -35,7 +35,7 @@ const DENY_COOLDOWN_SEC = 10 * 60;  // after the owner denies a requester, it ma
 
 module.exports = function registerUseApprovals(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-          logSecurityEvent, cleanLabel, billing, sendMail } = deps;
+          logSecurityEvent, cleanLabel, billing, sendMail, deviceKeys } = deps;
   const limiter = rateLimitFill || rateLimitStandard;
 
   db.exec(`CREATE TABLE IF NOT EXISTS use_approvals (
@@ -309,10 +309,12 @@ module.exports = function registerUseApprovals(deps) {
     const row = ownRow(req, res, auth); if (!row) return;
     if (row.status !== 'pending') return res.status(409).json({ error: `this request is ${row.status}`, approval: view(row, auth.did) });
     const session = gateSession(auth);
-    // The PIN opens every request screen, at every depth: it is the one factor an agent signed in as the owner
-    // (device login, refreshed token) never holds, so it is what makes the approval a person's. (When the app's
-    // dormancy lock lands, its unlock can stand in for elevated; critical keeps asking.)
-    if (row.opened_session !== session) {
+    // The PIN (or the phone's biometric, which mints the same proof) opens every request screen: it is the one factor
+    // an agent signed in as the owner (device login, refreshed token) never holds. An elevated request is covered by a
+    // fresh unlock of this session (the app's dormancy lock, unlocked by PIN or biometric within the owner's lock
+    // time); a critical one asks again every time (red team item 8).
+    const coveredByUnlock = row.depth === 'elevated' && deviceKeys && deviceKeys.unlockFresh(auth);
+    if (row.opened_session !== session && !coveredByUnlock) {
       const intent = `approval-open:${row.id}`;
       if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('approval-open', ['pin'], ['pin'], intent));
       const refused = spendSingleUse(auth.did, 'approval-open', ['pin'], auth, intent);
@@ -338,6 +340,9 @@ module.exports = function registerUseApprovals(deps) {
     // Approved only from the session that opened it with the PIN.
     if (row.opened_session !== gateSession(auth)) return res.status(403).json({ error: 'open this request with your PIN in this session first' });
     if (!codeMatches(row, String((req.body || {}).code || ''))) return res.status(409).json({ error: 'the code on the screen has rotated; try again' });
+    // Bound to the phone (red team item 4b): once the owner has a device enrolled, its device key signs this decision
+    // (the request id and the exact call's binding); a session token alone approves nothing.
+    if (deviceKeys) { const r = deviceKeys.approvalRefusal(auth, 'approval', row.id, row.binding, req.body); if (r) return res.status(r.status).json(r.body); }
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
       .run(nowIso(), nowIso(), later(TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'this request was decided meanwhile' });

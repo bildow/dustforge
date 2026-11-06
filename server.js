@@ -546,6 +546,9 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS refresh_tokens (
   last_used_at TEXT,
   rotated_to TEXT
 )`); } catch (e) { console.error('refresh_tokens table:', e.message); }
+// The access token a refresh token was issued with (and so the session it continues): ending a session ends its
+// refresh chain too (5 wrong PINs → full login, red team item 8).
+try { db.exec('ALTER TABLE refresh_tokens ADD COLUMN access_jti TEXT'); } catch (_) {}
 
 db.exec(`CREATE TABLE IF NOT EXISTS identity_2fa_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -678,11 +681,11 @@ function _genUserCode() {
 // ── Refresh-token helpers (OAuth-style) ──────────────────────────────────────
 const REFRESH_TTL_DAYS = 90;
 function _refreshHash(t) { return require('crypto').createHash('sha256').update(t).digest('hex'); }
-function issueRefreshToken(did, scope) {
+function issueRefreshToken(did, scope, accessToken = null) {
   const raw = 'dpr_' + require('crypto').randomBytes(32).toString('base64url');
   const exp = new Date(Date.now() + REFRESH_TTL_DAYS*24*3600*1000).toISOString();
-  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at) VALUES (?,?,?,?)')
-    .run(did, _refreshHash(raw), scope || 'read', exp);
+  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at, access_jti) VALUES (?,?,?,?,?)')
+    .run(did, _refreshHash(raw), scope || 'read', exp, accessToken ? tokenJti(accessToken) : null);
   return { refresh_token: raw, refresh_expires_at: exp };
 }
 // Validate + single-use rotate: returns {did, scope} or null. Old token is revoked + linked to new.
@@ -1128,7 +1131,9 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
   const { gate } = req.body || {};
-  if (!GATE_TYPES.includes(gate)) return res.status(400).json({ error: `gate must be one of ${GATE_TYPES.join(', ')}` });
+  // Biometric: the enrolled phone's presence key signs a gate challenge — a PIN proof for that intent (device_keys.js).
+  if (gate === 'device') return deviceKeys.verifyDeviceGate(req, res, auth);
+  if (!GATE_TYPES.includes(gate)) return res.status(400).json({ error: `gate must be one of ${GATE_TYPES.join(', ')}, or device` });
   const did = auth.did;
 
   if (gate === 'twofa' || gate === 'sms') {
@@ -1188,6 +1193,7 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
       }).immediate();
     } catch (e) { return res.status(503).json({ error: 'could not record the PIN verification; try again', retry: true }); }
     if (cancelled) return res.status(409).json({ error: 'this PIN attempt was cancelled; nothing was recorded', cancelled: true });
+    if (intent === 'unlock:0' && !auth.silicon) deviceKeys.markUnlocked(did, session, 'pin');   // the app's lock screen
     return res.json({ ok: true, gate, single_use: true, intent, valid_for_seconds: PIN_PROOF_SEC, note: `opens ${intent} once, in this session, within ${PIN_PROOF_SEC} s` });
   }
 
@@ -3783,6 +3789,7 @@ app.post('/api/blindkey/fill/:id/approve', rateLimitFill, (req, res) => {
   const intent = `fill:${row.id}`;
   const missing = required.filter(g => !gateFresh(auth.did, g, auth, intent));
   if (missing.length) return res.status(403).json(gateMissing('fill', required, missing, intent));
+  { const r = deviceKeys.approvalRefusal(auth, 'fill', row.id, row.origin, req.body); if (r) return res.status(r.status).json(r.body); }   // bound to the phone (item 4b)
   const refused = spendSingleUse(auth.did, 'fill', required, auth, intent);
   if (refused) return res.status(refused.status || 403).json(refused);
   const changed = db.prepare("UPDATE blindkey_fill_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP, decided_session = ? WHERE id = ? AND status = 'pending'").run(session, row.id).changes;
@@ -6586,7 +6593,7 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
     metadata: { email: wallet.email, username: wallet.username, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash },
   });
   // REFRESH: issue alongside access token so agents never hit the hour-25 wall
-  const _rf = issueRefreshToken(wallet.did, scope);
+  const _rf = issueRefreshToken(wallet.did, scope, token);
   res.json({ ok: true, token, refresh_token: _rf.refresh_token, refresh_expires_at: _rf.refresh_expires_at, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
 });
 
@@ -6635,7 +6642,7 @@ app.post('/api/identity/device/token', rateLimitStandard, (req, res) => {
       metadata: { email: wallet.email, username: wallet.username, auth_method: 'device', agent_label: row.agent_label },
     });
   } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
-  const rf = issueRefreshToken(wallet.did, row.scope);
+  const rf = issueRefreshToken(wallet.did, row.scope, token);
   db.prepare("UPDATE device_auth SET status = 'claimed' WHERE device_code = ?").run(device_code);
   res.json({ ok: true, token, refresh_token: rf.refresh_token, refresh_expires_at: rf.refresh_expires_at,
     did: wallet.did, scope: row.scope, email: wallet.email, auth_method: 'device', agent_label: row.agent_label });
@@ -6682,6 +6689,11 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
     });
   }
   const status = decision === 'deny' ? 'denied' : 'approved';
+  // A device login is a new session of this wallet: once a phone is enrolled, approving one is signed by it (item 4b).
+  if (status === 'approved') {
+    const a = getBearerIdentity(req);
+    if (a.ok) { const r = deviceKeys.approvalRefusal(a, 'device-login', 0, uc, req.body); if (r) return res.status(r.status).json(r.body); }
+  }
   db.prepare('UPDATE device_auth SET status = ?, approved_did = ? WHERE device_code = ?')
     .run(status, status === 'approved' ? approverDid : null, row.device_code);
   res.json({ ok: true, decision: status, user_code: uc, agent_label: row.agent_label, scope: row.scope });
@@ -6704,7 +6716,7 @@ app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
     });
   } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
   // Rotate: issue new refresh token, revoke the consumed one (linked for audit)
-  const nrf = issueRefreshToken(wallet.did, rec.scope);
+  const nrf = issueRefreshToken(wallet.did, rec.scope, token);
   if (rec.successorId) {
     // Its reply was lost: retire that successor, and keep the old token's rotation time so the grace never extends.
     revokeRefreshToken(rec.successorId, null);   // retired, not rotated: it gets no grace of its own
@@ -8002,11 +8014,17 @@ const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy,
   approvals: () => useApprovals,   // registered just below
+  devices: () => deviceKeys,       // registered just below
+});
+// Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
+const deviceKeys = require('./device_keys')({
+  app, db, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
+  logSecurityEvent, cleanLabel, sendMail: fleetRoutes.sendMail, recordGate, pinIntentOk: (s) => PIN_INTENT_RE.test(s),
 });
 // Security depth on use: per-use approval requests with request-bound rotating codes (docs/approvals.md).
 const useApprovals = require('./use_approvals')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-  logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail,
+  logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail, deviceKeys,
 });
 // Who a /use caller is, for an approval request: the DID, and a label the owner recognises.
 function approvalCaller(req) {
@@ -9338,7 +9356,8 @@ app.post('/api/blindkey/context/requests/:id/approve', rateLimitStandard, (req, 
   // Find the secret to get secret_id
   const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(row.did, row.secret_name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret no longer exists or is inactive' });
-  // Approving an agent's context request widens the secret's scope: the owner's PIN (red team item 13).
+  // Approving an agent's context request widens the secret's scope: the owner's PIN (red team item 13), from the phone.
+  if (actor.mode !== 'admin') { const auth = getBearerIdentity(req); if (auth.ok) { const r = deviceKeys.approvalRefusal(auth, 'scope-request', row.id, row.requested_context || '', req.body); if (r) return res.status(r.status).json(r.body); } }
   if (!scopeChangeGate(req, res, secret, 'scope')) return;
 
   try {
@@ -9710,6 +9729,7 @@ app.post('/api/blindkey/access-requests/:id/approve', rateLimitFill, (req, res) 
   if (!secret) return res.status(404).json({ error: `you have no active secret '${pick}'; send {"secret":"<name or ref>"} to share another` });
   const intent = `access:${row.id}`;
   if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('access', ['pin'], ['pin'], intent));
+  { const r = deviceKeys.approvalRefusal(auth, 'access', row.id, '', req.body); if (r) return res.status(r.status).json(r.body); }   // bound to the phone (item 4b)
   const refused = spendSingleUse(auth.did, 'access', ['pin'], auth, intent);
   if (refused) return res.status(refused.status || 403).json(refused);
   let delegationId;
@@ -13000,6 +13020,7 @@ app.post('/api/blindkey/silicon/grants/:id/approve', rateLimitFill, (req, res) =
   const { auth, row } = d;
   const intent = `grant:${row.id}`;
   if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('grant', ['pin'], ['pin'], intent));
+  { const r = deviceKeys.approvalRefusal(auth, 'grant', row.id, row.agent_name || '', req.body); if (r) return res.status(r.status).json(r.body); }   // bound to the phone (item 4b)
   const refused = spendSingleUse(auth.did, 'grant', ['pin'], auth, intent);
   if (refused) return res.status(refused.status || 403).json(refused);
   const agent = db.prepare("SELECT token_hash FROM silicon_agents WHERE agent_name = ? AND carbon_did = ? AND status = 'active'").get(row.agent_name, auth.did);
@@ -13239,7 +13260,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|unlock|device-enrol|device-revoke|lock-setting):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
@@ -13334,11 +13355,24 @@ function tryPin(did, pin, req, context) {
     try { db.prepare('UPDATE identity_wallets SET pin_failures = 0, pin_locked_until = ?, pin_lock_count = ? WHERE did = ?').run(next.pin_locked_until, next.pin_lock_count, did); }
     catch (e) { console.error('[pin] lock not saved:', e.message); }
     try { invalidatePinProofs(did); } catch (e) { console.error('[gate] lockout sweep failed:', e.message); }
+    // The session that ran out of tries ends: its token and its refresh chain (full login on that device). Other
+    // sessions keep going — the wallet-level lock above already stops every PIN prompt.
+    try { endSessionOf(req); } catch (e) { console.error('[pin] session not ended:', e.message); }
   }
   logSecurityEvent('pin_failed', next.locked ? 'alert' : 'warn', { caller_did: did, ip: req.ip, context, locked: next.locked, hard: Boolean(next.hard), attempts_left: next.attempts_left });
   if (next.hard) return { status: 429, body: { error: 'incorrect PIN — locked after repeated wrong tries; set a new PIN with your account password', hard_locked: true, locked_for_seconds: null, attempts_left: 0 } };
   if (next.locked) return { status: 429, body: { error: `incorrect PIN — locked for ${Math.round(next.lock_seconds / 60)} minutes`, locked_for_seconds: next.lock_seconds, attempts_left: 0 } };
   return { status: 403, body: { error: `incorrect PIN (${next.attempts_left} ${next.attempts_left === 1 ? 'try' : 'tries'} left)`, attempts_left: next.attempts_left } };
+}
+function endSessionOf(req) {
+  const auth = getBearerIdentity(req);
+  const jti = auth && auth.ok && !auth.silicon && auth.decoded && auth.decoded.jti;
+  if (!jti) return false;
+  db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ? AND did = ?").run(jti, auth.did);
+  db.prepare('UPDATE refresh_tokens SET revoked = 1, rotated_to = NULL WHERE access_jti = ? AND did = ?').run(jti, auth.did);
+  db.prepare('DELETE FROM session_unlocks WHERE session = ?').run(jti);
+  logSecurityEvent('session_ended_pin_lock', 'alert', { caller_did: auth.did, ip: req.ip, context: { jti } });
+  return true;
 }
 function pinLockedBody(wallet, locked) {
   return pinGate.isHardLocked(wallet)
