@@ -8,6 +8,7 @@ const Database = require('better-sqlite3');
 const identity = require('./identity');
 const dustforge = require('./dustforge');
 const billing = require('./billing');
+const mailRecipientCap = require('./mail_recipient_cap');
 const hexPayload = require('./hex-payload');
 const conversion = require('./conversion');
 const referral = require('./referral');
@@ -213,6 +214,10 @@ function mailHeaders(req, res, next) {
   res.json = (body) => {
     try {
       if (res.statusCode >= 400 && req.mailSlot) req.mailSlot.release();
+      if (res.statusCode >= 400 && req.rcptSlot) {
+        req.rcptSlot.release();
+        if (req.rcptSlot.remaining !== null && req.rcptSlot.remaining !== undefined) res.setHeader('X-Mail-Recipient-Remaining', String(req.rcptSlot.remaining + 1));
+      }
       const r = mailRemaining(req.identity && req.identity.did);
       if (r.remaining !== null && r.remaining !== undefined) res.setHeader('X-Mail-Remaining', String(r.remaining));
       if (r.limit !== null && r.limit !== undefined) res.setHeader('X-Mail-Limit', String(r.limit));
@@ -1905,7 +1910,7 @@ app.post('/api/billing/topup', (req, res) => {
 
 // Order: authenticate (no charge) → headers → validate → reserve a cap slot → charge → send. A send the mail server
 // refuses is refunded (it never became mail) and its slot given back.
-app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, rateLimitStandard, emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, rateLimitStandard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db), billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
@@ -2013,8 +2018,11 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
     if (rule.filter_from !== '*' && original_from && !original_from.includes(rule.filter_from)) continue;
     const slot = reserveMailSlot(did);
     if (!slot.ok) { results.push({ forward_to: rule.forward_to, status: 'skipped', error: slot.body.error }); continue; }
+    // Per-recipient daily bound (5 a day to one inbox).
+    const rslot = mailRecipientCap.reserveRecipients(db, did, rule.forward_to);
+    if (!rslot.ok) { slot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: rslot.body.error }); continue; }
     const charge = billing.deductBalance(db, did, cost, 'relay_forward', `Forward to ${rule.forward_to}`, { tokenJti: jti });
-    if (!charge.ok) { slot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: 'payment required' }); continue; }
+    if (!charge.ok) { slot.release(); rslot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: 'payment required' }); continue; }
     try {
       await t.sendMail({
         from: fromAddr,
@@ -2026,7 +2034,7 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
       billed += cost;
       results.push({ forward_to: rule.forward_to, status: 'sent' });
     } catch (e) {
-      slot.release();
+      slot.release(); rslot.release();
       billing.refundCharge(db, did, cost, 'relay_forward_refund', `Refund: forward to ${rule.forward_to} not accepted`, { tokenJti: jti });
       results.push({ forward_to: rule.forward_to, status: 'failed', error: e.message });
     }
@@ -4728,6 +4736,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       }
       // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call
       // (the raw body, top level and params as sent — see use_approvals.js).
+      let approvedElevatedUse = false;
       {
         const g = useApprovals.gate(secret, approvalCaller(req),
           { kind: 'use', action, targetHost: target_host, targetUrl: target_url, params: req.body || {}, delegationId: tokenRow.delegation_id },
@@ -4741,6 +4750,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         // shown on the card, not this request's own serialization of it.
         const approved = approvedBody(g.call);
         if (approved) action_params = { ...approved, ...(approved.params || {}) };
+        approvedElevatedUse = Boolean(g.approval_id) && !g.peeked;
       }
       switch (action) {
         case 'http_header': {
@@ -4941,6 +4951,18 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           const smtpUser = parts.length > 1 ? parts[0] : (action_params.smtp_user || '');
           const smtpPass = parts.length > 1 ? parts.slice(1).join(':') : decryptedValue;
 
+          // Per-recipient daily bound: 5 a day from this identity to one inbox, unless this call runs on an approved
+          // request for an elevated (or critical) secret.
+          let rslot = null;
+          if (!approvedElevatedUse) {
+            rslot = mailRecipientCap.reserveRecipients(db, req.identity.did, to);
+            if (!rslot.ok) {
+              db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
+              res.setHeader('X-Mail-Recipient-Limit', String(mailRecipientCap.LIMIT));
+              res.setHeader('X-Mail-Recipient-Remaining', '0');
+              return res.status(rslot.status).json(rslot.body);
+            }
+          }
           try {
             egressLog(req, secret, 'smtp_auth', smtp_host);   // written before the connection: the outbound log
             const transport = require('nodemailer').createTransport({
@@ -4963,7 +4985,9 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
               text: emailBody || '',
             });
             result = { sent: true, messageId: info.messageId, accepted: info.accepted };
+            if (rslot) result.recipient_remaining = rslot.remaining;
           } catch (smtpErr) {
+            if (rslot) rslot.release();
             result = { sent: false, error: smtpErr.message.replace(new RegExp(smtpPass.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]') };
           }
           break;

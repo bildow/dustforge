@@ -70,7 +70,7 @@ test('database failure refuses without calling downstream', () => {
 test('real route authenticates with scope/revocation before quota, charges only after quota', () => {
   const source = fs.readFileSync(path.join(__dirname, '../server.js'), 'utf8');
   // auth (no charge) → headers → validation → cap → charge (Aaron 2026-11-06: validate before the cap and billing)
-  assert.match(source, /app\.post\('\/api\/email\/send', mailHeaders, billing\.billingMiddleware\(db, 'email_send', \{ cost: 0 \}\), validateEmailSend, rateLimitStandard, emailWarmupGuard, billing\.billingMiddleware\(db, 'email_send'\)/);
+  assert.match(source, /app\.post\('\/api\/email\/send', mailHeaders, billing\.billingMiddleware\(db, 'email_send', \{ cost: 0 \}\), validateEmailSend, rateLimitStandard, emailWarmupGuard, mailRecipientCap\.recipientCapGuard\(db\), billing\.billingMiddleware\(db, 'email_send'\)/);
 });
 
 test('real communal guard remains independent: Brain passes at 80, other caller refuses; at 79 other passes', () => {
