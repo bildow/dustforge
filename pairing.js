@@ -3,11 +3,14 @@
 // Name lookup alone is phishable (someone registers "kyle" first). A confirmed contact is made face to face:
 //   1. A shows a QR (POST /api/network/pair/start): https://demipass.com/pair#<id>.<secret>. The secret is 128 random
 //      bits; the server keeps only its hash. The fragment never reaches a server log.
-//   2. B scans it in the app (POST /api/network/pair/join {token}). Both screens now show the other's name and the same
-//      6-digit code = HMAC(secret, "dp-pair:<id>:<A did>:<B did>"), so it names this pairing AND these two wallets.
-//   3. Each side compares the codes on the two screens and confirms (POST /pair/:id/confirm) with the PIN (intent
-//      pair:<id>; biometric stands in for it) and, once a phone is linked, the phone's device key over
-//      "<other name>|<code>". A mismatch is a cancel (POST /pair/:id/cancel), never a retry on the same pairing.
+//   2. B scans it in the app (POST /api/network/pair/join {token}). Each screen shows the other's name. Only A's screen
+//      shows the 6-digit code: random, drawn by the server at join, stored on this pairing (between these two wallets)
+//      and derived from nothing in the QR. B never receives it: B types what A's screen shows (Aaron 2026-11-06: a
+//      forwarded QR alone no longer pairs — whoever scanned it must also read A's screen).
+//   3. Each side confirms (POST /pair/:id/confirm) with the PIN (intent pair:<id>; biometric stands in for it) and,
+//      once a phone is linked, the phone's device key over "<other name>|<code>". B's confirm carries {code}; it is
+//      checked before anything else, so no answer to B ever contains the code. 3 wrong codes cancel the pairing (only
+//      B, a party to it, can type). Either side can cancel (POST /pair/:id/cancel).
 //   4. Both confirmed → the two wallets are contacts with verified_via = 'qr'. Shares and secret transfers go only to
 //      such contacts (secret_sharing.js); contacts made by name request still exist for DD, but carry no share rights.
 // People only: agents (fleet silicons), silicon/worker tokens and fleet-minted tokens cannot pair, and a wallet pairs
@@ -21,6 +24,7 @@ const MAX_OPEN = 3;             // open or joined pairings one wallet may have s
 const MAX_WRONG_PER_HOUR = 10; // wrong pairing codes one wallet may present in an hour (per caller: nobody can cancel
                                 // someone else's pairing by guessing at it — #52 review)
 const TOKEN_RE = /^(\d{1,12})\.([A-Za-z0-9_-]{22})$/;
+const MAX_CODE_TRIES = 3;       // wrong codes the scanner may type into one pairing before it is cancelled
 
 module.exports = function registerPairing(deps) {
   const { app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, logSecurityEvent } = deps;
@@ -35,7 +39,7 @@ module.exports = function registerPairing(deps) {
     status TEXT NOT NULL DEFAULT 'open',          -- open | joined | confirmed | cancelled | expired
     initiator_confirmed_at TEXT DEFAULT NULL,
     joiner_confirmed_at TEXT DEFAULT NULL,
-    wrong_joins INTEGER NOT NULL DEFAULT 0,
+    wrong_joins INTEGER NOT NULL DEFAULT 0,       -- wrong codes typed by the scanner (3 cancel the pairing)
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     joined_at TEXT DEFAULT NULL,
@@ -55,12 +59,11 @@ module.exports = function registerPairing(deps) {
   const pairDids = (x, y) => (x < y ? [x, y] : [y, x]);
   const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
   const name = (did) => { const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did); return w ? w.username : null; };
-  const codeFor = (secret, id, a, b) => {
-    const mac = crypto.createHmac('sha256', String(secret)).update(`dp-pair:${id}:${a}:${b}`).digest();
-    return String(mac.readUInt32BE(0) % 1000000).padStart(6, '0');
-  };
+  // The code is drawn at join, server-side, from nothing in the QR: the scanner holds the QR's secret and both DIDs, so
+  // a code derived from them (as in #52) could be computed without ever seeing the shower's screen.
+  const newCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   function expireOld() {
-    db.prepare("UPDATE contact_pairings SET status = 'expired', decided_at = ? WHERE status IN ('open','joined') AND expires_at <= ?").run(nowIso(), nowIso());
+    db.prepare("UPDATE contact_pairings SET status = 'expired', decided_at = ?, code = NULL WHERE status IN ('open','joined') AND expires_at <= ?").run(nowIso(), nowIso());
   }
 
   // A person's own wallet token, with a PIN set. Returns { auth, wallet } or null (answer sent).
@@ -91,12 +94,17 @@ module.exports = function registerPairing(deps) {
     const mine = role === 'shown' ? row.initiator_confirmed_at : row.joiner_confirmed_at;
     const theirs = role === 'shown' ? row.joiner_confirmed_at : row.initiator_confirmed_at;
     const joined = row.status === 'joined' || row.status === 'confirmed';
+    // The code goes only to the one who showed the QR; the scanner types it from that screen.
+    const shown = role === 'shown';
     return {
       pair_id: row.id, status: row.status, role,
       other: other ? name(other) : null, other_did: other || null,
-      code: joined ? row.code : null,
+      code: joined && shown ? row.code : null,
+      type_code: joined && !shown && !mine,
+      code_tries_left: !shown ? Math.max(0, MAX_CODE_TRIES - (row.wrong_joins || 0)) : null,
       you_confirmed: Boolean(mine), they_confirmed: Boolean(theirs),
-      intent: `pair:${row.id}`, bind: joined && other ? `${name(other)}|${row.code}` : null,
+      intent: `pair:${row.id}`, bind: joined && other && shown ? `${name(other)}|${row.code}` : null,
+      bind_prefix: joined && other ? `${name(other)}|` : null,
       expires_at: row.expires_at,
     };
   }
@@ -143,13 +151,13 @@ module.exports = function registerPairing(deps) {
     }
     if (row.initiator_did === p.wallet.did) return res.status(400).json({ error: 'that is your own pairing code' });
     if (row.status !== 'open') return res.status(409).json({ error: row.status === 'joined' ? 'someone has already scanned this code — ask them to cancel it and show a new one' : `this pairing is ${row.status}` });
-    const code = codeFor(m[2], row.id, row.initiator_did, p.wallet.did);
+    const code = newCode();
     const took = db.prepare("UPDATE contact_pairings SET joiner_did = ?, code = ?, status = 'joined', joined_at = ?, expires_at = ? WHERE id = ? AND status = 'open'")
       .run(p.wallet.did, code, nowIso(), later(TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'someone has already scanned this code — ask them to show a new one' });
     log(`pairing ${row.id}: ${name(row.initiator_did)} ← ${p.wallet.username} joined`);
     res.json({ ok: true, ...view(db.prepare('SELECT * FROM contact_pairings WHERE id = ?').get(row.id), p.wallet.did),
-               next: 'compare this code with the one on their screen; confirm only if they are the same' });
+               next: `type the 6-digit code shown on ${name(row.initiator_did)}'s screen, then confirm with your PIN` });
   });
 
   // ── state, for either side (the screen polls it) ────────────────────────────────────────────────────────────────
@@ -170,12 +178,28 @@ module.exports = function registerPairing(deps) {
     if (row.status !== 'joined') return res.status(409).json({ error: row.status === 'open' ? 'nobody has scanned this code yet' : `this pairing is ${row.status}`, ...view(row, me) });
     const v = view(row, me);
     if (v.you_confirmed) return res.json({ ok: true, ...v });
+    // The scanner proves it reads the shower's screen: the typed code, checked first (before the PIN and the phone,
+    // whose answers would otherwise name the code).
+    if (row.joiner_did === me) {
+      const typed = String((req.body || {}).code || '').replace(/\s+/g, '');
+      if (!/^\d{6}$/.test(typed)) return res.status(400).json({ error: `type the 6-digit code shown on ${v.other}'s screen`, type_code: true });
+      const a = Buffer.from(typed), b = Buffer.from(String(row.code));
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        const tries = db.prepare('UPDATE contact_pairings SET wrong_joins = wrong_joins + 1 WHERE id = ? RETURNING wrong_joins').get(row.id).wrong_joins;
+        if (tries >= MAX_CODE_TRIES) {
+          db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = 'wrong-code', code = NULL WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
+          logSecurityEvent('pairing_code_mismatch', 'alert', { caller_did: me, capability: 'pair', target: String(row.id), ip: req.ip, error: 'wrong code typed 3 times' });
+          return res.status(403).json({ error: `that is not the code on ${v.other}'s screen — the pairing is cancelled; start again face to face`, status: 'cancelled' });
+        }
+        return res.status(403).json({ error: `that is not the code on ${v.other}'s screen`, code_tries_left: MAX_CODE_TRIES - tries });
+      }
+    }
     const intent = `pair:${row.id}`;
     if (!gateFresh(me, 'pin', p.auth, intent)) {
       return res.status(403).json({ ...gateMissing('pair', ['pin'], ['pin'], intent), error: 'confirming a contact needs your PIN' });
     }
     const dk = deps.devices && deps.devices();
-    const refused = dk ? dk.approvalRefusal(p.auth, 'pair', row.id, v.bind, req.body) : null;
+    const refused = dk ? dk.approvalRefusal(p.auth, 'pair', row.id, `${v.other}|${row.code}`, req.body) : null;
     if (refused) return res.status(refused.status).json(refused.body);
     const col = row.initiator_did === me ? 'initiator_confirmed_at' : 'joiner_confirmed_at';
     try {
@@ -187,7 +211,7 @@ module.exports = function registerPairing(deps) {
         if (n !== 1) throw Object.assign(new Error('this pairing changed meanwhile'), { statusCode: 409 });
         const cur = db.prepare('SELECT * FROM contact_pairings WHERE id = ?').get(row.id);
         if (cur.initiator_confirmed_at && cur.joiner_confirmed_at) {
-          db.prepare("UPDATE contact_pairings SET status = 'confirmed', decided_at = ? WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
+          db.prepare("UPDATE contact_pairings SET status = 'confirmed', decided_at = ?, code = NULL WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
           const [a, b] = pairDids(cur.initiator_did, cur.joiner_did);
           db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id, verified_via, verified_at) VALUES (?, ?, NULL, 'qr', ?)
                       ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', removed_at = NULL, verified_via = 'qr', verified_at = excluded.verified_at`)
@@ -207,7 +231,7 @@ module.exports = function registerPairing(deps) {
     const auth = getBearerIdentity(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     const row = rowFor(req, res, auth.did); if (!row) return;
-    const n = db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = ? WHERE id = ? AND status IN ('open','joined')")
+    const n = db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = ?, code = NULL WHERE id = ? AND status IN ('open','joined')")
       .run(nowIso(), auth.did, row.id).changes;
     if (n !== 1) return res.status(409).json({ error: `this pairing is ${db.prepare('SELECT status FROM contact_pairings WHERE id = ?').get(row.id).status}` });
     if ((req.body || {}).mismatch) logSecurityEvent('pairing_code_mismatch', 'alert', { caller_did: auth.did, capability: 'pair', target: String(row.id), ip: req.ip });
