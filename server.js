@@ -4961,18 +4961,18 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           .run(secret.id, req.identity.did, action, 'failure', e.message.slice(0, 200), req.identity?.agent_name || '');
       } catch(_) {}
 
-      if (e.code === 'upstream_too_large') {
+      if (e.code === 'upstream_too_large' || e.code === 'upstream_redirect') {
         // The upstream call was made with the secret and is charged, so it also uses up the
-        // token and counts against the delegation and the secret, like a success.
+        // token and counts against the delegation and the secret, like a success. A refused redirect too: the
+        // request went out (the #44 merge left it uncounted — a token could re-send for its 30 s; #43 re-audit).
         try {
           db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
           if (tokenRow.delegation_id) db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
           db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
           if (tokenRow.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
         } catch (_) {}
-        return res.status(413).json(e.body);
+        return res.status(e.code === 'upstream_redirect' ? 502 : 413).json(e.body);
       }
-      if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
       return res.status(500).json({ error: `action failed: ${e.message}` });
     }
   }

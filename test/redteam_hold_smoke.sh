@@ -26,7 +26,7 @@ SH
 chmod +x "$S/bin/sshpass"
 node -e '
 const fs = require("fs");
-require("http").createServer((q, r) => { const b = []; q.on("data", c => b.push(c)); q.on("end", () => { fs.writeFileSync(process.argv[2], Buffer.concat(b)); fs.appendFileSync(process.argv[2] + ".paths", q.url + "\n"); r.writeHead(200, { "content-type": "application/json" }); r.end("{\"ok\":true}"); }); })
+require("http").createServer((q, r) => { const b = []; q.on("data", c => b.push(c)); q.on("end", () => { fs.writeFileSync(process.argv[2], Buffer.concat(b)); fs.appendFileSync(process.argv[2] + ".paths", q.url + "\n"); if (q.url.startsWith("/repos/bildow/bounce")) { r.writeHead(302, { location: "https://example.com/" }); return r.end(); } r.writeHead(200, { "content-type": "application/json" }); r.end("{\"ok\":true}"); }); })
   .listen(+process.argv[1], "127.0.0.1");' $UP_PORT "$S/up.body" & UP=$!
 node -e '
 const fs = require("fs");
@@ -170,6 +170,15 @@ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDA
 rm -f "$S/up.body.paths"; GHUSE 'https://repo.dustroot.com/repos/bildow/z'; [ "$CODE" = 200 ] && ok "a legacy pattern without a scheme still matches https" || fail "legacy no-scheme: $CODE $BODY"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_contexts SET target_url_pattern='http://repo.dustroot.com/*' WHERE secret_id=? AND context_name='repos'\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$GH"
 GHUSE 'https://repo.dustroot.com/repos/bildow/z'; [ "$CODE" = 403 ] && ok "a legacy http:// pattern fails closed (its owner re-scopes it to https)" || fail "legacy http: $CODE"
+
+# a redirecting upstream: refused (502), and the token is spent and counted — it cannot re-send for its 30 s
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_contexts SET target_url_pattern='https://repo.dustroot.com/repos/bildow/*' WHERE secret_id=? AND context_name='repos'\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$GH"
+call POST /api/demipass/request-token "$AG" '{"name":"gh","context":"repos","target_url":"https://repo.dustroot.com/repos/bildow/bounce"}'; BT=$(echo "$BODY" | J use_token)
+U0=$(Q "SELECT use_count FROM blindkey_contexts WHERE secret_id=$GH AND context_name='repos'")
+call POST /api/demipass/use "$AG" '{"use_token":"'$BT'","method":"POST"}'; C1=$CODE
+call POST /api/demipass/use "$AG" '{"use_token":"'$BT'","method":"POST"}'
+[ "$C1" = 502 ] && [ "$CODE" = 410 ] && [ "$(Q "SELECT use_count FROM blindkey_contexts WHERE secret_id=$GH AND context_name='repos'")" = "$((U0+1))" ] \
+  && ok "a redirect is refused (502) and spends + counts the token; a re-send → 410" || fail "redirect token: $C1 then $CODE $BODY"
 
 # ── N2: rotate-blind only to a host the scope covers ──
 R0=$(runs); call POST /api/demipass/rotate-blind "$AG" '{"ref":"'$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$BOX")'","target_host":"100.69.1.78","target_user":"root"}'
