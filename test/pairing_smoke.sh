@@ -71,7 +71,7 @@ call GET /api/network/pair/$P "$B"; [ "$(echo "$BODY" | J code)" = None ] && [ "
 call GET /api/network/pair/$P "$A"; CB=$(echo "$BODY" | J code)
 [[ "$CB" =~ ^[0-9]{6}$ ]] && [ "$(echo "$BODY" | J other)" = pb ] && [ "$(echo "$BODY" | J status)" = joined ] && ok "A's screen shows pb and the 6-digit code" || fail "A view: $BODY"
 EXP=$(python3 -c 'import hmac,hashlib,sys; m=hmac.new(sys.argv[1].encode(),("dp-pair:%s:%s:%s"%(sys.argv[2],sys.argv[3],sys.argv[4])).encode(),hashlib.sha256).digest(); print("%06d"%(int.from_bytes(m[:4],"big")%1000000))' "${TOK#*.}" "$P" "$DA" "$DB")
-[ "$EXP" = "$CB" ] && ok "the code is HMAC(secret, pairing id, both DIDs): it names this pairing and these two wallets" || fail "code derivation: $EXP vs $CB"
+[ "$EXP" != "$CB" ] && ok "the code is not derivable from the QR (secret + DIDs): the scanner has to read it off A's screen" || fail "code derivable from the QR: $EXP"
 call POST /api/network/pair/join "$C" '{"token":"'$TOK'"}'; [ "$CODE" = 409 ] && ok "a second scanner of the same QR → 409 (one join per QR)" || fail "second: $CODE $BODY"
 call GET /api/network/pair/$P "$C"; [ "$CODE" = 404 ] && ok "a third wallet cannot read the pairing" || fail "C read: $CODE"
 

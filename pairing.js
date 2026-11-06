@@ -4,9 +4,9 @@
 //   1. A shows a QR (POST /api/network/pair/start): https://demipass.com/pair#<id>.<secret>. The secret is 128 random
 //      bits; the server keeps only its hash. The fragment never reaches a server log.
 //   2. B scans it in the app (POST /api/network/pair/join {token}). Each screen shows the other's name. Only A's screen
-//      shows the 6-digit code = HMAC(secret, "dp-pair:<id>:<A did>:<B did>") — it names this pairing AND these two
-//      wallets. B never receives it from the server: B types what A's screen shows (Aaron 2026-11-06: a forwarded QR
-//      alone no longer pairs — whoever scanned it must also read A's screen).
+//      shows the 6-digit code: random, drawn by the server at join, stored on this pairing (between these two wallets)
+//      and derived from nothing in the QR. B never receives it: B types what A's screen shows (Aaron 2026-11-06: a
+//      forwarded QR alone no longer pairs — whoever scanned it must also read A's screen).
 //   3. Each side confirms (POST /pair/:id/confirm) with the PIN (intent pair:<id>; biometric stands in for it) and,
 //      once a phone is linked, the phone's device key over "<other name>|<code>". B's confirm carries {code}; it is
 //      checked before anything else, so no answer to B ever contains the code. 3 wrong codes cancel the pairing (only
@@ -59,10 +59,9 @@ module.exports = function registerPairing(deps) {
   const pairDids = (x, y) => (x < y ? [x, y] : [y, x]);
   const sha = (s) => crypto.createHash('sha256').update(String(s)).digest('hex');
   const name = (did) => { const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did); return w ? w.username : null; };
-  const codeFor = (secret, id, a, b) => {
-    const mac = crypto.createHmac('sha256', String(secret)).update(`dp-pair:${id}:${a}:${b}`).digest();
-    return String(mac.readUInt32BE(0) % 1000000).padStart(6, '0');
-  };
+  // The code is drawn at join, server-side, from nothing in the QR: the scanner holds the QR's secret and both DIDs, so
+  // a code derived from them (as in #52) could be computed without ever seeing the shower's screen.
+  const newCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   function expireOld() {
     db.prepare("UPDATE contact_pairings SET status = 'expired', decided_at = ? WHERE status IN ('open','joined') AND expires_at <= ?").run(nowIso(), nowIso());
   }
@@ -152,7 +151,7 @@ module.exports = function registerPairing(deps) {
     }
     if (row.initiator_did === p.wallet.did) return res.status(400).json({ error: 'that is your own pairing code' });
     if (row.status !== 'open') return res.status(409).json({ error: row.status === 'joined' ? 'someone has already scanned this code — ask them to cancel it and show a new one' : `this pairing is ${row.status}` });
-    const code = codeFor(m[2], row.id, row.initiator_did, p.wallet.did);
+    const code = newCode();
     const took = db.prepare("UPDATE contact_pairings SET joiner_did = ?, code = ?, status = 'joined', joined_at = ?, expires_at = ? WHERE id = ? AND status = 'open'")
       .run(p.wallet.did, code, nowIso(), later(TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'someone has already scanned this code — ask them to show a new one' });
