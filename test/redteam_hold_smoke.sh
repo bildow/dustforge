@@ -162,15 +162,30 @@ GHUSE 'https://repo.dustroot.com/repos/bildow/x/../y?q=1'
 [ "$CODE" = 200 ] && [ "$(cat "$S/up.body.paths")" = "/repos/bildow/y?q=1" ] && [ "$(Q "SELECT json_extract(detail,'\$.target') FROM blindkey_events WHERE event_type='egress' AND secret_id=$GH")" = "https://repo.dustroot.com/repos/bildow/y?q=1" ] \
   && ok "N1: an in-scope URL is requested and logged as resolved" || fail "N1 in scope: $CODE $BODY $(cat "$S/up.body.paths" 2>/dev/null)"
 
+for u in 'https://repo.dustroot.com/repos/bildow/..%2f..%2fuser/keys' 'https://repo.dustroot.com/repos/bildow/%252e%252e/x' 'https://repo.dustroot.com/repos/bildow/%5Cx'; do
+  rm -f "$S/up.body.paths"; GHUSE "$u"; { [ "$CODE" = 403 ] && [ ! -s "$S/up.body.paths" ]; } || fail "encoded separator reached upstream: $u $CODE"
+done; ok "follow-up 1: %2f, %252e and %5c in the path are never sent"
+# legacy stored patterns (made before 11-05): no scheme still means https; an http:// pattern now matches nothing
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_contexts SET target_url_pattern='repo.dustroot.com/repos/bildow/*' WHERE secret_id=? AND context_name='repos'\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$GH"
+rm -f "$S/up.body.paths"; GHUSE 'https://repo.dustroot.com/repos/bildow/z'; [ "$CODE" = 200 ] && ok "a legacy pattern without a scheme still matches https" || fail "legacy no-scheme: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_contexts SET target_url_pattern='http://repo.dustroot.com/*' WHERE secret_id=? AND context_name='repos'\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$GH"
+GHUSE 'https://repo.dustroot.com/repos/bildow/z'; [ "$CODE" = 403 ] && ok "a legacy http:// pattern fails closed (its owner re-scopes it to https)" || fail "legacy http: $CODE"
+
 # ── N2: rotate-blind only to a host the scope covers ──
 R0=$(runs); call POST /api/demipass/rotate-blind "$AG" '{"ref":"'$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$BOX")'","target_host":"100.69.1.78","target_user":"root"}'
 [ "$CODE" = 403 ] && [ "$(runs)" = "$R0" ] && ok "N2: rotate-blind to a host off the secret's scope → 403, no SSH" || fail "N2: $CODE $BODY runs=$(runs)"
 
+call POST /api/demipass/rotate-blind "$AG" '{"ref":"'$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$BOX")'","target_host":"'$HOST'","target_user":"someoneelse"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "password of 'root'" && [ "$(runs)" = "$R0" ] && ok "follow-up 3: rotate-blind of another account than the secret's → 403" || fail "rotate user: $CODE $BODY"
+
 # ── N5: frozen means frozen; unfreezing takes the PIN ──
+call POST /api/demipass/request-token "$AG" '{"name":"box","action":"ssh_exec","target_host":"'$HOST'"}'; FT=$(echo "$BODY" | J use_token)
 call POST /api/demipass/freeze "$AG" '{"name":"box","freeze":true}'; [ "$CODE" = 200 ] || fail "freeze: $CODE $BODY"
 R0=$(runs); SSH "ls /srv x"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q frozen && [ "$(runs)" = "$R0" ] && ok "N5: a frozen secret runs nothing" || fail "N5 frozen use: $CODE $BODY"
 call POST /api/demipass/use "$AG" '{"name":"rootkey","action":"ssh_exec","target_host":"'$HOST'","target_user":"root","command":"ls /srv x","key_name":"box"}'
 [ "$CODE" = 403 ] && [ "$(runs)" = "$R0" ] && ok "N5: …nor rides in as key_name" || fail "N5 key_name: $CODE $BODY"
+call POST /api/demipass/use "$AG" '{"use_token":"'$FT'","target_user":"root","command":"ls /srv x"}'
+[ "$CODE" = 423 ] && [ "$(runs)" = "$R0" ] && ok "follow-up 2: a token issued before the freeze dies with it" || fail "frozen token: $CODE $BODY"
 call POST /api/demipass/freeze "$AG" '{"name":"box","freeze":false}'; [ "$CODE" = 403 ] && ok "N5: unfreezing without the PIN → 403" || fail "N5 unfreeze no pin: $CODE $BODY"
 pin "scope:$BOX"; call POST /api/demipass/freeze "$A" '{"name":"box","freeze":false}'; [ "$CODE" = 200 ] && ok "N5: the owner unfreezes with the PIN" || fail "N5 unfreeze: $CODE $BODY"
 

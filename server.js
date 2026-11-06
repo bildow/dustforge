@@ -3015,6 +3015,9 @@ function canonicalTargetUrl(raw) {
   if (typeof raw !== 'string' || !raw || raw.length > 2048) return null;
   let u; try { u = new URL(raw); } catch (_) { return null; }
   if (u.protocol !== 'https:' || u.username || u.password || !u.hostname) return null;
+  // Encoded separators and dots pass the parser untouched but some servers (nginx proxy_pass with a path, frameworks
+  // that decode before routing) turn them into a traversal: never sent (#43 re-audit follow-up 1).
+  if (/%(2f|5c|2e|25)/i.test(u.pathname)) return null;
   u.hash = '';
   return u.origin + u.pathname + u.search;
 }
@@ -4592,6 +4595,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       return res.status(403).json({ error: 'this secret is no longer yours; ask its owner to share it' });
     }
 
+    // Frozen after the token was issued: the token dies with it (#43 re-audit follow-up 2).
+    if (secret.frozen) {
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
+      return res.status(423).json({ error: 'secret is frozen — its owner unfreezes it in the DemiPass app', frozen: true });
+    }
     let decryptedValue;
     try {
       decryptedValue = blindkeyDecrypt(secret.encrypted_value);
@@ -4783,7 +4791,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           const { branch } = action_params;
           const repo_url = target_url;
           if (!repo_url) return res.status(400).json({ error: 'the use-token has no repo URL (params.repo_url when asking for it)' });
-          if (action_params.repo_url && action_params.repo_url !== repo_url) return res.status(403).json({ error: 'params.repo_url does not match the use-token\'s repo URL' });
+          if (action_params.repo_url && canonicalTargetUrl(action_params.repo_url) !== repo_url) return res.status(403).json({ error: 'params.repo_url does not match the use-token\'s repo URL' });
 
           // FIX #1: whitelist git hosts
           const GIT_ALLOWED_HOSTS = BLINDKEY_GIT_HOSTS;
@@ -11810,7 +11818,12 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const baseName = secret.name.replace(/_v\d+$/, '');
   const target = nextVersionName(ownerDid, baseName, secret.version);
   if (target.conflict) return res.status(409).json({ error: target.conflict });
-  const sshUser = target_user || 'root';
+  // The login rotated is the account the secret was stored for; naming another one is refused (#43 re-audit
+  // follow-up 3: a shared password must not let the caller reset whichever account it names).
+  if (secret.account_username && target_user && target_user !== secret.account_username) {
+    return res.status(403).json({ error: `this secret is the password of '${secret.account_username}'; rotate that account` });
+  }
+  const sshUser = target_user || secret.account_username || 'root';
   // Same hosts as every other SSH action. Before 2026-10-28 target_host and target_user went into a shell
   // command on this server unchecked, which let any account run commands here.
   if (typeof target_host !== 'string' || !BLINDKEY_SSH_HOSTS.has(target_host)) {
