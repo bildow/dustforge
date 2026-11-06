@@ -44,6 +44,7 @@ module.exports = function registerDeviceKeys(deps) {
     session TEXT NOT NULL,
     purpose TEXT NOT NULL,
     intent TEXT NOT NULL,
+    bind TEXT NOT NULL DEFAULT '',
     nonce TEXT NOT NULL,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
@@ -86,17 +87,19 @@ module.exports = function registerDeviceKeys(deps) {
   const activeKeys = (did, kind) => db.prepare('SELECT * FROM device_keys WHERE did = ? AND kind = ? AND revoked_at IS NULL').all(did, kind);
   const hasDevice = (did) => activeKeys(did, 'D').length > 0;
 
-  // The text a key signs. Plain and readable on purpose: the phone shows it.
+  // The text a key signs. Plain and readable on purpose: the phone shows it. For an approval it ends with what is being
+  // decided (the request's binding, a fill's origin, a share's recipient…), named when the challenge was asked for.
   function messageFor(ch, extra = '') {
-    return `demipass:${ch.purpose}:${ch.did}:${ch.session}:${ch.intent}:${ch.nonce}${extra ? ':' + extra : ''}`;
+    const tail = [ch.bind || '', extra || ''].filter(Boolean).join(':');
+    return `demipass:${ch.purpose}:${ch.did}:${ch.session}:${ch.intent}:${ch.nonce}${tail ? ':' + tail : ''}`;
   }
-  function newChallenge(did, session, purpose, intent) {
+  function newChallenge(did, session, purpose, intent, bind = '') {
     const nonce = crypto.randomBytes(24).toString('base64url');
     const created = nowIso(), expires = new Date(Date.now() + CHALLENGE_TTL_SEC * 1000).toISOString();
     db.prepare("DELETE FROM device_challenges WHERE expires_at < ?").run(new Date(Date.now() - 3600 * 1000).toISOString());
-    const id = Number(db.prepare('INSERT INTO device_challenges (did, session, purpose, intent, nonce, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(did, session, purpose, intent, nonce, created, expires).lastInsertRowid);
-    return { id, did, session, purpose, intent, nonce, expires_at: expires };
+    const id = Number(db.prepare('INSERT INTO device_challenges (did, session, purpose, intent, bind, nonce, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(did, session, purpose, intent, bind, nonce, created, expires).lastInsertRowid);
+    return { id, did, session, purpose, intent, bind, nonce, expires_at: expires };
   }
   // Take a challenge for this wallet/session/purpose/intent and mark it used — whatever the signature turns out to be,
   // a challenge is tried once. Returns the row or null.
@@ -128,11 +131,13 @@ module.exports = function registerDeviceKeys(deps) {
     const intent = `${kind}:${id}`;
     const b = body || {};
     if (!b.device_challenge_id || !b.device_signature) {
-      return { status: 428, body: { error: 'approve from your enrolled phone: this approval needs its device signature', device_required: true, challenge: { purpose: 'approve', intent } } };
+      return { status: 428, body: { error: 'approve from your enrolled phone: this approval needs its device signature', device_required: true, challenge: { purpose: 'approve', intent, bind: String(bind || '') } } };
     }
     const ch = takeChallenge(auth.did, gateSession(auth), b.device_challenge_id, 'approve', intent);
     if (!ch) return { status: 403, body: { error: 'device challenge missing, used, expired or for another approval — ask for a new one' } };
-    const k = signer(auth.did, 'D', messageFor(ch, String(bind || '')), b.device_signature);
+    // The challenge named what the phone was shown; it must be what is actually being decided.
+    if (String(ch.bind || '') !== String(bind || '')) return { status: 409, body: { error: 'the signed approval was for something else than this decision — ask for a new challenge', expected_bind: String(bind || '') } };
+    const k = signer(auth.did, 'D', messageFor(ch), b.device_signature);
     if (!k) {
       logSecurityEvent('device_signature_refused', 'critical', { caller_did: auth.did, capability: 'approve', target: intent, context: { kind } });
       return { status: 403, body: { error: 'this approval is not signed by an enrolled device of yours' } };
@@ -191,13 +196,15 @@ module.exports = function registerDeviceKeys(deps) {
   app.post('/api/identity/device/challenge', rateLimitStandard, (req, res) => {
     const auth = personAuth(req, res); if (!auth) return;
     const { purpose, intent } = req.body || {};
+    const bind = String((req.body || {}).bind ?? '');
+    if (bind.length > 300 || /[\u0000-\u001f]/.test(bind)) return res.status(400).json({ error: 'bind: up to 300 printable characters' });
     if (!PURPOSES.has(purpose)) return res.status(400).json({ error: "purpose: 'enrol', 'gate' or 'approve'" });
     if (typeof intent !== 'string' || intent.length > 80 || !/^[a-z-]+:[0-9]{1,12}$/.test(intent)) return res.status(400).json({ error: 'intent: <action>:<id>' });
     if (purpose === 'gate' && !pinIntentOk(intent)) return res.status(400).json({ error: 'not a PIN intent' });
     if (purpose === 'enrol' && intent !== 'device-enrol:0') return res.status(400).json({ error: 'enrol intent is device-enrol:0' });
-    const ch = newChallenge(auth.did, gateSession(auth), purpose, intent);
+    const ch = newChallenge(auth.did, gateSession(auth), purpose, intent, purpose === 'approve' ? bind : '');
     res.json({ ok: true, challenge_id: ch.id, message: messageFor(ch), expires_at: ch.expires_at,
-      ...(purpose === 'approve' ? { note: 'sign message + ":" + the decision\'s binding with the device key (D)' } : {}) });
+      sign_with: purpose === 'gate' ? 'P' : purpose === 'approve' ? 'D' : 'D and P' });
   });
 
   // POST /api/identity/device/enrol {challenge_id, device_id, label, key_d, key_p, sig_d, sig_p} — PIN (device-enrol:0)

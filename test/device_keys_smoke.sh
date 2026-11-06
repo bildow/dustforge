@@ -51,7 +51,8 @@ for (const n of ["d", "p", "x"]) { const { privateKey, publicKey } = c.generateK
 sig(){ node -e 'const c=require("crypto"),fs=require("fs"); process.stdout.write(c.sign("sha256", Buffer.from(process.argv[2]), fs.readFileSync(process.argv[1])).toString("base64"))' "$S/$1.pem" "$2"; }
 # challenge → signature, for a purpose/intent; sets CH (id) and SG (signature); extra = text appended after ":"
 chsign(){ local tok=$1 key=$2 purpose=$3 intent=$4 extra=${5:-}
-  call POST /api/identity/device/challenge "$tok" '{"purpose":"'$purpose'","intent":"'$intent'"}'
+  if [ "$purpose" = approve ]; then call POST /api/identity/device/challenge "$tok" '{"purpose":"approve","intent":"'$intent'","bind":"'$extra'"}'; extra=""
+  else call POST /api/identity/device/challenge "$tok" '{"purpose":"'$purpose'","intent":"'$intent'"}'; fi
   CH=$(echo "$BODY" | J challenge_id); local msg; msg=$(echo "$BODY" | J message); [ -n "$extra" ] && msg="$msg:$extra"; SG=$(sig $key "$msg"); }
 
 A=$(login); A2=$(login); AG=$(login)   # A = the phone app; A2 = another session of the owner (browser); AG = an agent's device login
@@ -82,6 +83,11 @@ chsign "$A2" d approve "approval:$AP" "$BIND"; C2=$(curl -s -X POST "$API/api/de
 call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP")" = approved ] && ok "(a) signed by the enrolled device key → approved" || fail "a signed: $CODE $BODY"
 call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's/}$/,"approval_id":'$AP'}/')"; [ "$CODE" = 200 ] && ok "(a) …and the agent's parked call runs once" || fail "a run: $CODE $BODY"
+call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's#/hook#/hookB#')"; APB=$(echo "$BODY" | J approval_id)
+pin "$A2" "approval-open:$APB"; CB=$(curl -s -X POST "$API/api/demipass/approvals/$APB/open" -H "Authorization: Bearer $A2" | J code)
+chsign "$A2" d approve "approval:$APB" "$BIND"   # the phone was shown the OTHER request's binding
+call POST /api/demipass/approvals/$APB/approve "$A2" '{"code":"'$CB'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
+[ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$APB")" = pending ] && ok "(a) a signature over another decision's binding approves nothing (409)" || fail "a wrong bind: $CODE $BODY"
 
 # ── (b) biometric = a PIN proof for exactly one intent ──
 call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's#/hook#/hook2#')"; AP2=$(echo "$BODY" | J approval_id)
@@ -122,10 +128,9 @@ pin "$A" lock-setting:0; call PUT /api/identity/lock "$A" '{"lock_after_sec":900
 call PUT /api/identity/lock "$AG" '{"lock_after_sec":3600}'; [ "$CODE" = 403 ] && ok "(e) …and an agent session cannot lengthen it without the PIN" || fail "e agent: $CODE"
 
 # ── (f) device revoke ──
-call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's#/hook#/hook6#')"; AP6=$(echo "$BODY" | J approval_id)
 call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 403 ] || fail "f revoke no pin: $CODE"
 pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 200 ] || fail "f revoke: $CODE $BODY"
-chsign "$A" p gate "approval-open:$AP6"; call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"approval-open:'$AP6'","challenge_id":'$CH',"signature":"'$SG'"}'
+chsign "$A" p gate "reveal:1"; call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"reveal:1","challenge_id":'$CH',"signature":"'$SG'"}'
 [ "$CODE" = 403 ] && ok "(f) a revoked phone's biometric is refused at once" || fail "f revoked P: $CODE"
 
 # ── (d) 5 wrong PINs end the session (last: it locks the wallet's PIN) ──

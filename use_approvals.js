@@ -141,7 +141,7 @@ module.exports = function registerUseApprovals(deps) {
       secret: { name: s.name || null, ref: s.ref_code || null },
       owner: usernameOf(row.owner_did), requester: usernameOf(row.requester_did), requester_label: row.requester_label || null,
       purpose: row.purpose || '', summary: row.summary || '',
-      ...(owner ? { call: row.bound_call ? JSON.parse(row.bound_call) : null } : {}),
+      ...(owner ? { call: row.bound_call ? JSON.parse(row.bound_call) : null, binding: row.binding } : {}),   // binding: what the phone signs
       created_at: row.created_at, expires_at: row.expires_at,
       ...(owner ? { opened: Boolean(row.opened_at), needs_pin_to_open: true } : {}),
       ...(row.approved_at ? { approved_at: row.approved_at, approved_via: row.approved_via } : {}),
