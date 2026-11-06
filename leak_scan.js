@@ -123,8 +123,24 @@ module.exports = function registerLeakScan(deps) {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     // The hits (what was found where) only to a person's own session — an agent of the owner sees the tokens, not them.
     const person = !(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) && gateSession(auth);
+    // Which secrets a token found, by name — never where or how often: an agent signed in as the owner reads this too,
+    // and chunk labels or counts would rebuild the oracle the one-bit answer closed (#45 re-review). Where: with the PIN.
     res.json({ ok: true, tokens: db.prepare('SELECT id, label, created_at, revoked_at, revoked_reason, last_used_at, bytes_today, requests_today, day FROM leak_scan_tokens WHERE owner_did = ? ORDER BY id DESC').all(auth.did),
-      ...(person ? { hits: db.prepare('SELECT token_id, token_label, found, created_at FROM leak_scan_hits WHERE owner_did = ? ORDER BY id DESC LIMIT 20').all(auth.did).map(h => ({ ...h, found: JSON.parse(h.found) })) } : {}) });
+      ...(person ? { hits: db.prepare('SELECT id, token_id, token_label, found, created_at FROM leak_scan_hits WHERE owner_did = ? ORDER BY id DESC LIMIT 20').all(auth.did)
+        .map(h => ({ id: h.id, token_id: h.token_id, token_label: h.token_label, created_at: h.created_at, secrets: [...new Set(JSON.parse(h.found).map(f => f.name))] })) } : {}) });
+  });
+  // POST /api/blindkey/leak-scan/hits/:id — where a hit was found (file:lines), for the owner with the PIN
+  // (intent scan-hits:<id>).
+  app.post('/api/blindkey/leak-scan/hits/:id', rateLimitStandard, (req, res) => {
+    const auth = personAuth(req, res); if (!auth) return;
+    const id = Number(req.params.id);
+    const h = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM leak_scan_hits WHERE id = ? AND owner_did = ?').get(id, auth.did) : null;
+    if (!h) return res.status(404).json({ error: 'no such hit' });
+    const intent = `scan-hits:${id}`;
+    if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('scan-hits', ['pin'], ['pin'], intent));
+    const spent = spendSingleUse(auth.did, 'scan-hits', ['pin'], auth, intent);
+    if (spent) return res.status(spent.status || 403).json(spent);
+    res.json({ ok: true, id, token_label: h.token_label, created_at: h.created_at, found: JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk })) });
   });
   // DELETE /api/blindkey/leak-scan/tokens/:id — revoke.
   // Revoking and denying are the owner's, in their own session (#45 review L3: an agent could revoke the deploy gate's
@@ -255,7 +271,7 @@ module.exports = function registerLeakScan(deps) {
     let revoked = false;
     if (hits.length) {
       db.prepare('INSERT INTO leak_scan_hits (owner_did, token_id, token_label, found, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(caller.did, caller.tokenRow.id, caller.tokenRow.label || '', JSON.stringify(hits.slice(0, 200)), nowIso());
+        .run(caller.did, caller.tokenRow.id, caller.tokenRow.label || '', JSON.stringify(hits.slice(0, 200).map(h => ({ name: h.name, ref: h.ref, chunk: h.chunk }))), nowIso());
       // Stop the line: this token is done (one positive answer, ever, per token).
       revoked = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'hit' WHERE id = ? AND revoked_at IS NULL").run(nowIso(), caller.tokenRow.id).changes === 1;
       const names = [...new Set(hits.map(h => h.name))];
@@ -264,7 +280,8 @@ module.exports = function registerLeakScan(deps) {
     }
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
       .run('leak_scan', caller.did, null, null, JSON.stringify({ bytes, chunks: chunks.length, hits: hits.length, token_id: caller.tokenRow.id, revoked }));
-    for (const h of hits) logSecurityEvent('leak_scan_hit', 'critical', { caller_did: caller.did, capability: 'leak-scan', target: h.name, context: { ref: h.ref, chunk: h.chunk, count: h.count, token_id: caller.tokenRow.id } });
+    // One critical event per secret found, naming the token — no chunk labels, no counts (readable by an owner session).
+    for (const name of [...new Set(hits.map(h => h.name))]) logSecurityEvent('leak_scan_hit', 'critical', { caller_did: caller.did, capability: 'leak-scan', target: name, context: { ref: (hits.find(h => h.name === name) || {}).ref, token_id: caller.tokenRow.id } });
     // One bit to the scanner: what and where go to the owner only (mail and the app).
     res.json({ ok: true, scanned_bytes: bytes, leak: hits.length > 0,
       ...(hits.length ? { token_revoked: revoked, note: 'a vault value was found: what and where were sent to the owner (DemiPass app → Settings → Leak scanner, and mail); this scan token is revoked' } : {}) });

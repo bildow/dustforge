@@ -77,12 +77,15 @@ function* files(p) {
 // split across a chunk border is caught by the 512-byte overlap each chunk carries from the one before.
 function* chunks(file, from = 0) {
   let buf = fs.readFileSync(file);
-  if (from > 0) buf = buf.subarray(from <= buf.length ? from : 0);
+  // An incremental read starts 512 bytes before the last offset, so a value split across it is still whole.
+  if (from > 0) { from = Math.max(0, Math.min(from, buf.length) - 512); buf = buf.subarray(from); }
   const binary = buf.subarray(0, 8192).includes(0);
   if (binary || from > 0) {
     for (let o = 0; o < buf.length; o += CHUNK_BYTES) {
       const start = Math.max(0, o - 512);
-      yield { id: `${file}@${from + o}`, text: buf.subarray(start, o + CHUNK_BYTES).toString(binary ? 'latin1' : 'utf8') };
+      const part = buf.subarray(start, o + CHUNK_BYTES);
+      // Binary: byte for byte (latin1), and as UTF-16LE too, so a value written in UTF-16 is found.
+      yield { id: `${file}@${from + o}`, text: binary ? part.toString('latin1') + '\n' + part.toString('utf16le') : part.toString('utf8') };
     }
     return;
   }

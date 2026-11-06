@@ -75,8 +75,12 @@ C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan"
 [ "$C" = 200 ] && ok "a 1.5 MB scan body is accepted" || fail "big body: $C"
 OUT=$(SCAN ci "$S/tree"); RC=$?
 [ $RC = 1 ] && echo "$OUT" | grep -q "LEAK" && ! echo "$OUT" | grep -q "seeded\|$REF\|notes.md" && ok "the seeded value trips the scanner (exit 1) — and the scanner is told only leak, not which secret or where" || fail "leak: rc=$RC $OUT"
-call GET /api/demipass/leak-scan/tokens "$A"; echo "$BODY" | grep -q "\"ref\":\"$REF\"" && echo "$BODY" | grep -q "notes.md" && ok "…the owner (own session) sees which secret and where" || fail "owner hits: $BODY"
-AGX=$(login owner-a); call GET /api/demipass/leak-scan/tokens "$AGX"; [ "$(echo "$BODY" | J hits)" != None ] || true
+call GET /api/demipass/leak-scan/tokens "$A"; HID=$(echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["hits"][0]["id"])')
+echo "$BODY" | grep -q '"seeded"' && ! echo "$BODY" | grep -q "notes.md\|chunk\|count" && ok "the token listing names the secret found — never where or how often (an agent signed in as the owner reads it too)" || fail "listing: $BODY"
+call GET "/api/demipass/security-events?severity=critical" "$A"; ! echo "$BODY" | grep -q "notes.md\|\"chunk\"\|\"count\"" && ok "…nor do the security events" || fail "events leak chunks: $(echo "$BODY" | head -c 300)"
+call POST /api/demipass/leak-scan/hits/$HID "$A" '{}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "scan-hits:$HID" ] && ok "where it was found takes the PIN" || fail "hits pin: $CODE $BODY"
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-hits:'$HID'"}'; call POST /api/demipass/leak-scan/hits/$HID "$A" '{}'
+[ "$CODE" = 200 ] && echo "$BODY" | grep -q "notes.md" && ! echo "$BODY" | grep -qF -- "$(cat "$S/seed")" && ok "…with it, the owner sees which secret and where (never the value)" || fail "hits: $CODE $BODY"
 ! echo "$OUT" | grep -qF -- "$(cat "$S/seed")" && ! echo "$OUT" | grep -qF -- "$(sed 's/"/\\"/' "$S/seed")" && ok "the scanner's output never contains the value" || fail "value printed"
 ! echo "$OUT" | grep -q tiny && ok "values shorter than 8 characters are not matched (oracle bound)" || fail "short matched"
 echo "$OUT" | grep -q "revoked" && [ "$(Q "SELECT revoked_reason FROM leak_scan_tokens WHERE id=$TID")" = hit ] && ok "the first hit revokes the token (stop the line; one positive answer per token)" || fail "revoke on hit: $OUT"
@@ -88,6 +92,8 @@ OUT=$(SCAN json "$S/t2"); RC=$?
 # a binary file holding the value is scanned, not skipped (#45 review M2)
 mint bin; mkdir -p "$S/t3"; python3 -c 'import sys; open(sys.argv[2],"wb").write(b"\x00\x01binary\x00 "+open(sys.argv[1]).read().strip().encode()+b" \x00tail")' "$S/seed" "$S/t3/blob.bin"
 OUT=$(SCAN bin --strict "$S/t3"); RC=$?; [ $RC = 1 ] && ok "a binary file holding a value is scanned (latin1), not skipped" || fail "binary: rc=$RC $OUT"
+mint u16; mkdir -p "$S/t4"; python3 -c 'import sys; open(sys.argv[2],"wb").write(("\ufeffkey="+open(sys.argv[1]).read().strip()+"\n").encode("utf-16-le"))' "$S/seed" "$S/t4/notes-utf16.txt"
+OUT=$(SCAN u16 --strict "$S/t4"); RC=$?; [ $RC = 1 ] && ok "a value in a UTF-16 file is found" || fail "utf16: rc=$RC $OUT"
 # one scan answer cannot be split into per-chunk bits (#45 review H1): many chunks, one boolean
 mint orc; python3 - "$S/seed" "$S/orc.json" <<'PY2'
 import json,sys; v=open(sys.argv[1]).read().strip()

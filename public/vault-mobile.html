@@ -2295,9 +2295,16 @@ async function loadScanTokens(){
     const live=(r.tokens||[]).filter(t=>!t.revoked_at), hit=(r.tokens||[]).filter(t=>t.revoked_reason==='hit').slice(0,3);
     el.innerHTML=(live.length?live.map(t=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:0.3rem 0"><span>'+esc(t.label||('token '+t.id))+' <span style="color:var(--text3)">'+(t.last_used_at?'last scan '+esc(String(t.last_used_at).slice(0,16).replace('T',' ')):'never used')+'</span></span><button class="btn-ghost" style="font-size:0.65rem" onclick="revokeScanToken('+Number(t.id)+')">Revoke</button></div>').join(''):'<div style="color:var(--text3)">No scan tokens.</div>')
       +(r.hits||[]).slice(0,5).map(h=>'<div style="color:var(--orange);margin-top:0.3rem">'+esc(h.token_label||('token '+h.token_id))+' found '+esc(String(h.created_at).slice(0,16).replace('T',' '))+': '
-        +[...new Set((h.found||[]).map(f=>f.name))].map(esc).join(', ')+'<div style="color:var(--text3);font-size:0.68rem">'+(h.found||[]).slice(0,6).map(f=>esc(f.chunk)).join('<br>')+'</div></div>').join('')
+        +(h.secrets||[]).map(esc).join(', ')+' <a href="#" style="color:var(--accent)" onclick="showScanHit('+Number(h.id)+');return false">where?</a><div id="scan-hit-'+Number(h.id)+'" style="color:var(--text3);font-size:0.68rem"></div></div>').join('')
       +(hit.length&&!(r.hits||[]).length?hit.map(t=>'<div style="color:var(--orange);margin-top:0.2rem">'+esc(t.label||('token '+t.id))+' found a leak and was revoked</div>').join(''):'');
   }catch(e){ if(!sessionEnded(e)) el.textContent=e.message; }
+}
+// Where a leak was found: the PIN shows it (an agent signed in as you cannot read it — it would be a guessing oracle).
+async function showScanHit(id){
+  const el=document.getElementById('scan-hit-'+Number(id));
+  try{ const r=await apiGated('POST','/api/blindkey/leak-scan/hits/'+Number(id),{},'Show where the leak scanner found a value? Your PIN shows it.');
+    if(el) el.innerHTML=(r.found||[]).map(f=>esc(f.name)+' — '+esc(f.where)).join('<br>'); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)&&el) el.textContent=e.message; }
 }
 async function revokeScanToken(id){
   if(!confirm('Revoke this scan token? Whatever uses it stops scanning.')) return;
