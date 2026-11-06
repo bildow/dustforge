@@ -6765,7 +6765,14 @@ app.post('/api/identity/request-account', rateLimitStrict, async (req, res) => {
 });
 
 // POST /api/wallet/transfer — agent-to-agent transfer
-app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
+// Retired (red team item 16): a transact token alone moved DD to any wallet — no PIN, no connection. Sending DD is
+// POST /api/network/transfers (to a connected person or agent, confirmed with the PIN). The admin key keeps working.
+app.post('/api/wallet/transfer', rateLimitStandard, (req, res, next) => {
+  const admin = ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || '', ADMIN_API_KEY);
+  if (admin) return next();
+  logSecurityEvent('wallet_transfer_retired', 'warn', { caller_did: null, capability: 'wallet_transfer', ip: req.ip });
+  return res.status(410).json({ error: 'this route is retired: send DD with POST /api/network/transfers (to a connection; you confirm it with your PIN)', use: 'POST /api/network/transfers' });
+}, (req, res) => {
   const { from_did, to_did, amount_cents, description } = req.body || {};
   if (!from_did || !to_did || !amount_cents) return res.status(400).json({ error: 'from_did, to_did, amount_cents required' });
   if (from_did === to_did) return res.status(400).json({ error: 'cannot transfer to self' });
@@ -8002,6 +8009,7 @@ billing.setAttribution(fleetBilling, require('./dd_ledger'));
 const fleetRoutes = require('./fleet_routes')({
   app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
   rateLimitStandard, adminKey: ADMIN_API_KEY, crypto, grantAllContextsDelegation,
+  getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
 });
 // Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
 require('./network_routes')({
@@ -8822,7 +8830,12 @@ function wrapLedgerResponse(data, did) {
   return encryptChannelPayload('ledger', JSON.stringify(data), did);
 }
 
-app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res) => {
+// Retired with /api/wallet/transfer (red team item 16, #48 review: the same token-only send to any wallet).
+app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res, next) => {
+  if (ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || '', ADMIN_API_KEY)) return next();
+  logSecurityEvent('wallet_transfer_retired', 'warn', { caller_did: null, capability: 'wallet_transfer_secure', ip: req.ip });
+  return res.status(410).json({ error: 'this route is retired: send DD with POST /api/network/transfers (to a connection; you confirm it with your PIN)', use: 'POST /api/network/transfers' });
+}, (req, res) => {
   const { from_did, to_did, amount_cents, description, channel } = req.body || {};
   if (!from_did || !to_did || !amount_cents) return res.status(400).json({ error: 'from_did, to_did, amount_cents required' });
   if (typeof from_did !== 'string') return res.status(400).json({ error: 'from_did: must be a string' });
@@ -9096,6 +9109,11 @@ app.post('/api/escrow/create', rateLimitStandard, (req, res) => {
   if (collateralCents > 50000000) return res.status(400).json({ error: 'collateral_cents exceeds max' });
 
   const resolvedCounterpartyDid = String(counterparty_did || '').trim();
+  // A fleet-made agent's DD stays inside its fleet: no escrow with anyone else (#48 review: escrow was an exit).
+  for (const other of [resolvedCounterpartyDid, String(beneficiary_did || '').trim()]) {
+    const why = other ? fleetBilling.fleetExitRefusal(db, actor.did, other) : null;
+    if (why) return res.status(403).json({ error: why });
+  }
   const resolvedBeneficiaryDid = String(beneficiary_did || resolvedCounterpartyDid || actor.did).trim();
   if (resolvedCounterpartyDid) {
     const wallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(resolvedCounterpartyDid);
@@ -9177,6 +9195,18 @@ app.post('/api/escrow/:id/release', rateLimitStandard, (req, res) => {
   const row = getEscrowById(req.params.id);
   if (!row) return res.status(404).json({ error: 'escrow not found' });
   if (row.creator_did !== actor.did) return res.status(403).json({ error: 'only creator can release escrow' });
+  { const why = fleetBilling.fleetExitRefusal(db, actor.did, row.beneficiary_did || row.counterparty_did); if (why) return res.status(403).json({ error: why }); }
+  // Releasing pays the beneficiary: a wallet with a PIN (a person) says yes with it; an agent's wallet (no PIN) stays
+  // token-driven (red team item 16, #48 review: escrow paid any counterparty on a token alone).
+  {
+    const w = db.prepare('SELECT pin_hash FROM identity_wallets WHERE did = ?').get(actor.did);
+    if (w && w.pin_hash && !actor.silicon) {
+      const intent = `escrow:${row.id}`;
+      if (!gateFresh(actor.did, 'pin', actor, intent)) return res.status(403).json(gateMissing('escrow', ['pin'], ['pin'], intent));
+      const refused = spendSingleUse(actor.did, 'escrow', ['pin'], actor, intent);
+      if (refused) return res.status(refused.status || 403).json(refused);
+    }
+  }
   // Defect fix #6: only allow release from 'active' (counterparty accepted), not 'pending'
   if (row.status !== 'active') return res.status(409).json({ error: `cannot release escrow in status ${row.status} — counterparty must accept first` });
   try {
@@ -9449,6 +9479,21 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
   // anyone without asking, so it does not count.
   if (actor.mode !== 'admin' && !secretSharing.isAgentWallet(delegate_did)) {
     return res.status(403).json({ error: 'a delegation goes to an agent (a silicon in a fleet) — to give a person access, share it (POST /api/demipass/shares); they accept it in their app' });
+  }
+  // Who may hand a secret to an agent (red team item 15): never an agent token (silicon, worker, fleet-minted). The
+  // owner's own session may delegate to an agent of the owner's own fleet (consented fleet_silicons); anyone else's
+  // agent takes the owner, as a person, with the PIN (scope:<secret id>) — a token alone gave any outside agent a secret.
+  if (actor.mode !== 'admin') {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok || auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) {
+      logSecurityEvent('delegate_denied', 'critical', { caller_did: ownerDid, capability: 'delegate', target: secret.name, ip: req.ip, error: 'agent token', context: { delegate_did } });
+      return res.status(403).json({ error: 'agents do not hand out secrets; the owner delegates from their own session' });
+    }
+    // An agent the owner's fleet created (owned outright, fleet_billing.ownedOutright); a linked or network-joined
+    // wallet is someone's own, which a token alone can bring in (#48 review): that counts as outside.
+    const ownAgent = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+        WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'`).get(ownerDid, delegate_did);
+    if (!ownAgent && !scopeChangeGate(req, res, secret, 'delegate')) return;
   }
 
   // If context_name specified, validate it exists and is active on the secret
@@ -13258,7 +13303,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

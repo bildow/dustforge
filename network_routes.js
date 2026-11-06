@@ -265,7 +265,9 @@ module.exports = function registerNetworkRoutes(deps) {
     const target = findWallet(b.to);
     if (!target || target.status !== 'active') return res.status(404).json({ error: 'no wallet by that name' });
     if (target.did === me) return res.status(400).json({ error: 'that is your own wallet' });
-    if (kind !== 'person' && w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot change fleet membership; sign in as this wallet' });
+    // A fleet-minted token speaks for the fleet's agent, which the owner controls on a token alone: it makes no
+    // connections of any kind (a person connection was its way to send DD out of the fleet — #48 review).
+    if (w.minted) return res.status(403).json({ error: 'a fleet-minted token cannot make connections; sign in as this wallet' });
     // A `join` request hands the asker to the target's fleet with no step on the asker's side after this one, so
     // it is for wallets with no PIN (agents). A wallet with a PIN asks the owner to invite it and accepts with the PIN.
     if (kind === 'join' && w.wallet.pin_hash) {
@@ -420,6 +422,7 @@ module.exports = function registerNetworkRoutes(deps) {
     const ownerHeldKey = (db.prepare('SELECT joined_via FROM fleet_silicons WHERE fleet_id = ? AND member_did = ?').get(mf.id, w.wallet.did) || {}).joined_via !== 'network';
     db.transaction(() => {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE fleet_id = ? AND member_did = ?").run(mf.id, w.wallet.did);
+      fb.endOwnerDelegations(db, mf.owner_did, w.wallet.did);   // the owner's secrets do not leave with it
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(mf.id, w.wallet.did);
       fb.cutFleetTokens(db, w.wallet.did, mf.slug);
       fb.revokeOwnerWorkers(db, w.wallet.did, mf.owner_did);
@@ -445,6 +448,9 @@ module.exports = function registerNetworkRoutes(deps) {
     if (!to || to.status !== 'active') return res.status(404).json({ error: 'no wallet by that name' });
     if (to.did === me) return res.status(400).json({ error: 'that is your own wallet' });
     if (!connected(me, to.did)) return res.status(403).json({ error: `connect with ${to.username} first (Add wallet), then send` });
+    // An agent the fleet created moves DD only inside its fleet (its owner or a fellow fleet-created agent): it has no PIN and its
+    // owner can mint its tokens, so a send out of the fleet would be the owner's DD leaving on a token alone (#48 review).
+    { const why = fb.fleetExitRefusal(db, me, to.did); if (why) return res.status(403).json({ error: why }); }
     const session = gateSession(w.auth);
     if (!session) return res.status(403).json({ error: 'this token cannot send DD — sign in again' });
     expireOld();
@@ -476,6 +482,7 @@ module.exports = function registerNetworkRoutes(deps) {
     const intent = `send:${t.id}`;
     const barrel = transferRefusal ? transferRefusal(me, t.amount_cents) : null;   // say so before asking for a PIN
     if (barrel) return res.status(barrel.statusCode || 403).json(barrel.body || { error: barrel.message });
+    { const why = fb.fleetExitRefusal(db, me, t.to_did); if (why) return res.status(403).json({ error: why }); }   // also for sends started earlier
     const required = w.wallet.pin_hash ? ['pin'] : [];
     if (required.length && !gateFresh(me, 'pin', w.auth, intent)) {
       return res.status(403).json({ ...gateMissing('send', required, required, intent), error: `sending ${t.amount_cents} DD to ${to.username} needs your PIN` });

@@ -145,6 +145,16 @@ function initSchema(db) {
   // link: the owner holds its key and may mint its tokens and workers) or 'network' (the wallet accepted a network
   // request: it keeps its own key; the owner refills it, delegates to it and sees its spend, and mints nothing).
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN joined_via TEXT DEFAULT 'owner'`); } catch (_) {}
+  // Owned outright: a wallet this fleet created (it holds the key; nobody outside signs in as it). Only these take the
+  // owner's secrets and DD on the owner's token alone; a linked or network-joined wallet is someone's own, so
+  // delegating to it, refilling it and arming its auto-refill take the owner's PIN (red team items 15, 16; #48).
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN created_by_fleet INTEGER DEFAULT 0`); } catch (_) {}
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_confirmed INTEGER DEFAULT 0`); } catch (_) {}
+  // Backfill: provisioned by THIS row's fleet (the slug is in the account-creation entry), not by any fleet (#48 L).
+  try { db.exec(`UPDATE fleet_silicons SET created_by_fleet = 1 WHERE created_by_fleet = 0 AND EXISTS (
+      SELECT 1 FROM identity_transactions t JOIN fleets f ON f.id = fleet_silicons.fleet_id
+      WHERE t.did = fleet_silicons.member_did AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
+        AND t.description = 'Fleet-provisioned by ' || f.slug)`); } catch (_) {}
   // Threshold refills may be capped per rolling 24 h (0 = no cap). When a silicon is below its threshold and the
   // refill can't run (cap reached, or the source is short), refill_alert_email is told, once per 24 h.
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_daily_cap_cents INTEGER DEFAULT 0`); } catch (_) {}
@@ -502,10 +512,28 @@ function autoRefilledLast24h(db, did, now = Date.now()) {
   return r ? r.c : 0;
 }
 
+// A wallet its fleet created moves DD only inside that fleet: to its owner or another agent the fleet created. It has no
+// PIN and its owner mints its tokens, so DD leaving it is the owner's DD leaving on a token alone (#48 review: network
+// sends, escrow). Returns the refusal text, or null when the move is allowed.
+function fleetExitRefusal(db, fromDid, toDid) {
+  // Whatever its row's status now: leaving or being removed does not free a wallet a fleet created (its creator holds
+  // its password) — its DD can go back to that owner and nowhere else (#48 review: leave-fleet was an exit).
+  const own = db.prepare(`SELECT s.fleet_id, f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+      WHERE s.member_did = ? AND s.created_by_fleet = 1 ORDER BY s.id DESC LIMIT 1`).get(fromDid);
+  if (!own || !toDid || toDid === own.owner_did) return null;
+  if (db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1").get(own.fleet_id, toDid)) return null;
+  return 'an agent your fleet created moves DD only to its owner or another agent the fleet created';
+}
+// When an agent leaves or is removed: every delegation of the owner's secrets to it ends (#48 review).
+function endOwnerDelegations(db, ownerDid, memberDid) {
+  return db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE owner_did = ? AND delegate_did = ? AND status = 'active'").run(ownerDid, memberDid).changes;
+}
+function ownedOutright(s) { return Boolean(s) && Number(s.created_by_fleet) === 1 && (s.joined_via || 'owner') !== 'network'; }
 function thresholdRefill(db, billing, s, { force = false, amount = null, now = Date.now(), ledger = null } = {}) {
   let amt = Number(amount != null ? amount : s.refill_amount_cents);
   if (!force) {
     if (!s.refill_enabled || !(s.refill_threshold_cents > 0) || !(amt > 0)) return { ok: false, skipped: 'rule disabled' };
+    if (!ownedOutright(s) && !Number(s.refill_confirmed)) return { ok: false, skipped: 'auto-refill to a wallet the fleet did not create needs the owner\'s PIN confirmation' };
     const bal = billing.getDerivedBalance(db, s.member_did);
     if (bal >= s.refill_threshold_cents) return { ok: false, skipped: 'above threshold', balance_cents: bal };
     if (s.last_refill_at && now - new Date(s.last_refill_at + 'Z').getTime() < REFILL_COOLDOWN_MS) return { ok: false, skipped: 'cooldown' };
@@ -970,6 +998,7 @@ function tokenWarningEmail({ silicon, token }) {
 }
 
 module.exports = {
+  ownedOutright, fleetExitRefusal, endOwnerDelegations,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,

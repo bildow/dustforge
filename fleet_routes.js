@@ -10,7 +10,16 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const passwords = require('./passwords');   // salted scrypt for the local password verifier
 
 module.exports = function registerFleetRoutes(deps) {
-  const { app, db, identity, billing, fleetBilling: fb, ledger, dustforge, createEmailTransport, rateLimitStandard, adminKey, crypto, grantAllContextsDelegation } = deps;
+  const { app, db, identity, billing, fleetBilling: fb, ledger, dustforge, createEmailTransport, rateLimitStandard, adminKey, crypto, grantAllContextsDelegation,
+          getBearerIdentity, gateFresh, gateMissing, spendSingleUse } = deps;
+  // The owner's PIN for a refill decision about a wallet the fleet did not create (intent refill:<silicon row id>).
+  function refillPin(req, res, a, s) {
+    const auth = getBearerIdentity(req); const intent = `refill:${s.id}`;
+    if (!auth.ok || !gateFresh(a.did, 'pin', auth, intent)) { res.status(403).json({ ...gateMissing('refill', ['pin'], ['pin'], intent), error: `@${s.handle} is a wallet your fleet did not create: refilling it takes your PIN` }); return false; }
+    const refused = spendSingleUse(a.did, 'refill', ['pin'], auth, intent);
+    if (refused) { res.status(refused.status || 403).json(refused); return false; }
+    return true;
+  }
   const log = deps.log || ((...a) => console.log('[fleet]', ...a));
   const apiBase = deps.apiBase || 'https://api.dustforge.com';
   const vaultBase = deps.vaultBase || 'https://demipass.com';
@@ -190,7 +199,10 @@ module.exports = function registerFleetRoutes(deps) {
         db.transaction(() => {
           freePrior(wallet.did);
           fb.clearStaleSiliconRows(db, wallet.did, fleet.id);
-          s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill });
+          s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: wallet.did, handle, displayName, contactEmail: contactEmail || wallet.email, refill: {} });
+          // A linked wallet is its own: never owned outright, and no refill armed on a token alone (PIN, later).
+          db.prepare("UPDATE fleet_silicons SET created_by_fleet = 0, refill_enabled = 0, refill_confirmed = 0 WHERE id = ?").run(s.id);
+          s = fb.getSilicon(db, fleet.id, wallet.did);
           if (proof) db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, wallet.did);
           else claim = fb.issueClaim(db, s);
         })();
@@ -236,7 +248,9 @@ module.exports = function registerFleetRoutes(deps) {
       });
       txn();
       freePrior(id.did);
-      const s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
+      let s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
+      db.prepare('UPDATE fleet_silicons SET created_by_fleet = 1 WHERE id = ?').run(s.id);   // owned outright: the fleet made it
+      s = fb.getSilicon(db, fleet.id, id.did);
       const walletRow = { username, email: emailResult.email };
       const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet: walletRow, apiBase });
       const subject = `DemiPass: ${handle} created in fleet ${fleet.slug} — your DID record`;
@@ -298,8 +312,20 @@ module.exports = function registerFleetRoutes(deps) {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
     if (s.joined_via === 'network' && (req.body || {}).contact_email !== undefined) return res.status(403).json({ error: `@${s.handle} joined through the network: its contact email is its own` });
+    // Arming automatic refills to a wallet the fleet did not create moves DD to someone's own wallet: the owner's PIN.
+    if (!fb.ownedOutright(s) && (req.body || {}).refill_enabled) {
+      if (!refillPin(req, res, a, s)) return;
+      db.prepare('UPDATE fleet_silicons SET refill_confirmed = 1 WHERE id = ?').run(s.id);
+    }
+    if ((req.body || {}).refill_enabled === false || (req.body || {}).refill_enabled === 0) db.prepare('UPDATE fleet_silicons SET refill_confirmed = 0 WHERE id = ?').run(s.id);
     try {
       const updated = fb.updateSiliconSettings(db, s, req.body || {});
+      // A confirmed auto-refill to a wallet the fleet did not create stays confirmed only as the owner confirmed it:
+      // any token-only change to its amounts, cap or source clears the confirmation (#48 review: PIN at 100, then a
+      // token raised it to 10 000 000). Arming again (refill_enabled with the PIN, above) confirms the new rule.
+      const rb = req.body || {};
+      const touched = ['refill_threshold_cents', 'refill_amount_cents', 'refill_daily_cap_cents', 'refill_source'].some(k => rb[k] !== undefined);
+      if (!fb.ownedOutright(s) && touched && !rb.refill_enabled) db.prepare('UPDATE fleet_silicons SET refill_confirmed = 0 WHERE id = ?').run(s.id);
       res.json({ ok: true, silicon: fb.siliconView(db, billing, updated, { fleet: a.fleet }) });
     } catch (e) { fail(res, e); }
   });
@@ -309,6 +335,7 @@ module.exports = function registerFleetRoutes(deps) {
     const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
     db.transaction(() => {
       db.prepare("UPDATE fleet_silicons SET status = 'removed', refill_enabled = 0, claim_code = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(s.id);
+      fb.endOwnerDelegations(db, a.fleet.owner_did, s.member_did);   // the owner's secrets do not leave with it
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(a.fleet.id, s.member_did);
       fb.cutFleetTokens(db, s.member_did, a.fleet.slug);   // tokens this fleet minted for it stop working
       fb.revokeOwnerWorkers(db, s.member_did, a.fleet.owner_did);   // and workers its owner made for it
@@ -320,6 +347,8 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/refill', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    // A wallet the fleet did not create is someone's own: a token alone could link it in and pay it (#48 review).
+    if (!fb.ownedOutright(s) && !refillPin(req, res, a, s)) return;
     const amount = Number((req.body || {}).amount_cents || s.refill_amount_cents);
     if (!Number.isInteger(amount) || amount < 1 || amount > 10000000) return res.status(400).json({ error: 'amount_cents: integer 1-10000000' });
     const r = fb.thresholdRefill(db, billing, s, { force: true, amount, ledger });
@@ -353,6 +382,8 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/delegate', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    // Same rule as /api/blindkey/delegate (red team 15): only an agent the fleet created takes a secret on a token alone.
+    if (!fb.ownedOutright(s)) return res.status(403).json({ error: `@${s.handle} is a wallet your fleet did not create: delegate with POST /api/demipass/delegate, which asks for your PIN`, use: 'POST /api/demipass/delegate' });
     const { secret_name, ref, max_uses = 0, expires_in } = req.body || {};
     let secret = null;
     if (ref) secret = db.prepare("SELECT * FROM blindkey_secrets WHERE ref_code = ? AND did = ? AND status = 'active'").get(String(ref), a.did);
