@@ -1590,3 +1590,20 @@ test('a waiting transfer is listed with Cancel for both sides; Cancel calls the 
   await pg.ctx.cancelTransfer(7); await settle();
   assert.equal(cancelled, 7);
 });
+
+// ── Vouching (red team item 6) ──
+test('an introduction shows the voucher and the other person; Accept goes through the PIN gate', async () => {
+  let accepted = null;
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/network/vouches/4/accept') { accepted = 4; return { json: { ok: true, connected: false } }; }
+    return { json: { ok: true } };
+  } });
+  await settle();
+  vm.runInContext("vouchData={vouches:[{id:4,role:'introduced',voucher:'cara',other:'<img src=x onerror=alert(1)>',note:'',status:'pending',you_accepted:false}]}", pg.ctx);
+  const h = pg.ctx.networkSection({ people: [], agents: [], incoming: [], outgoing: [], topups: {}, me: {} });
+  assert.match(h, /<b>@cara<\/b> introduces/); assert.doesNotMatch(h, /<img/, 'names are escaped');
+  await pg.ctx.vouchAct(4, true); await settle();
+  assert.equal(accepted, 4);
+});

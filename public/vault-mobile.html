@@ -651,6 +651,7 @@ let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the pre
 let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
 let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
 let accessReqs=[], accessPick={};  // agents in your fleets asking for a secret (ids share fillBusy as 'a'+id), and the secret picked per card
+let vouchData=null;   // introductions (vouches): GET /api/network/vouches
 let netData=null, netBusy=new Set(), sendTo=null, sendBusy=false, topupBusy=false;   // network: GET /api/network, requests being decided, the open send
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
@@ -1138,6 +1139,7 @@ async function loadNetwork(){
   const epoch=sessionEpoch;
   try{ const r=await api('GET','/api/network'); if(epoch!==sessionEpoch) return null; netData=r; }
   catch(e){ if(sessionEnded(e)||epoch!==sessionEpoch) return null; if(e.status!==429) netData=null; }
+  try{ const v=await api('GET','/api/network/vouches'); if(epoch!==sessionEpoch) return null; vouchData=v; }catch(e){ if(sessionEnded(e)) return null; }
   renderNetRequests();
   return netData;
 }
@@ -1197,16 +1199,49 @@ function networkSection(n){
   }
   h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">People</span><span style="font-size:0.7rem;color:var(--text3)">'+dd(n.me&&n.me.balance_cents)+' DD in your wallet</span></div>';
   h+='<button class="btn-primary" style="width:100%;margin:0 0 0.6rem" onclick="openPair()">Pair in person (QR)</button>';
+  const qrPeople=(n.people||[]).filter(p=>p.confirmed_via==='qr');
+  if(qrPeople.length>=2) h+='<button class="btn-ghost" style="width:100%;margin:0 0 0.6rem;font-size:0.75rem" onclick="openVouch()">Introduce two people you met in person</button>';
+  const intros=((vouchData&&vouchData.vouches)||[]).filter(v=>v.status==='pending');
+  for(const v of intros){
+    if(v.role==='introduced'){
+      h+='<div class="fill-req"><div><b>@'+esc(v.voucher)+'</b> introduces <b>@'+esc(v.other)+'</b> to you</div>'+(v.note?'<div style="margin-top:0.25rem">“'+esc(v.note)+'”</div>':'')
+        +'<div style="color:var(--text3);margin-top:0.25rem">If you both accept, you become confirmed contacts on '+esc(v.voucher)+'\'s word and can share secrets. Accept only if you know who '+esc(v.other)+' is.</div>'
+        +(v.you_accepted?'<div style="color:var(--text3);margin-top:0.25rem">You accepted; waiting for '+esc(v.other)+'.</div>'
+          :'<div class="fr-row"><button class="btn-primary" '+(netBusy.has('v'+v.id)?'disabled ':'')+'onclick="vouchAct('+Number(v.id)+',true)">Accept</button><button class="btn-ghost" '+(netBusy.has('v'+v.id)?'disabled ':'')+'onclick="vouchAct('+Number(v.id)+',false)">Decline</button></div>')+'</div>';
+    } else {
+      h+='<div style="font-size:0.75rem;color:var(--text3);margin-bottom:0.5rem">You introduced <b>@'+esc(v.a)+'</b> and <b>@'+esc(v.b)+'</b> — waiting for both ('+(v.a_accepted?'✓':'…')+' / '+(v.b_accepted?'✓':'…')+'). <a href="#" style="color:var(--accent)" onclick="vouchAct('+Number(v.id)+',false);return false">Withdraw</a></div>';
+    }
+  }
   if(!(n.people||[]).length) h+='<div class="empty" style="font-size:0.75rem">No contacts yet. Meet them and tap “Pair in person”: you can share secrets only with people you paired with face to face.</div>';
   for(const p of n.people||[]){
     h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.5rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.82rem">';
-    h+='<span><strong>'+esc(p.username||String(p.did).slice(8,20)+'…')+'</strong> '+(p.confirmed?'<span title="paired in person" style="font-size:0.65rem;color:var(--green,#3fb950)">✓ met in person</span>':'<span style="font-size:0.65rem;color:var(--text3)">not paired — no sharing</span>')+'</span><span style="display:flex;gap:0.4rem"><button class="btn-primary" style="font-size:0.7rem;padding:0.35rem 0.6rem" onclick="openSend('+jsArg(p.username)+')">Send DD</button><button class="btn-ghost" style="font-size:0.7rem" onclick="removePerson('+jsArg(p.username)+')">Remove</button></span></div>';
+    h+='<span><strong>'+esc(p.username||String(p.did).slice(8,20)+'…')+'</strong> '+(p.confirmed?'<span title="confirmed" style="font-size:0.65rem;color:var(--green,#3fb950)">'+(p.confirmed_via==='vouch'?'✓ vouched by @'+esc(p.vouched_by||''):'✓ met in person')+'</span>':'<span style="font-size:0.65rem;color:var(--text3)">not paired — no sharing</span>')+'</span><span style="display:flex;gap:0.4rem"><button class="btn-primary" style="font-size:0.7rem;padding:0.35rem 0.6rem" onclick="openSend('+jsArg(p.username)+')">Send DD</button><button class="btn-ghost" style="font-size:0.7rem" onclick="removePerson('+jsArg(p.username)+')">Remove</button></span></div>';
   }
   if((n.agents||[]).length){
     h+='<div style="font-size:0.7rem;color:var(--text3);margin:0.6rem 0 1rem">Your agents are under Silicons below. To send one DD: <span>';
     h+=(n.agents||[]).map(a=>'<a href="#" style="color:var(--accent)" onclick="openSend('+jsArg(a.username)+');return false">@'+esc(a.handle)+'</a>').join(' · ')+'</span></div>';
   } else h+='<div style="height:1rem"></div>';
   return h;
+}
+async function vouchAct(id, accept){
+  const v=((vouchData&&vouchData.vouches)||[]).find(x=>x.id===id); if(!v||netBusy.has('v'+id)) return;
+  netBusy.add('v'+id); renderNetRequests();
+  try{
+    if(accept) await apiGated('POST','/api/network/vouches/'+id+'/accept',{},'Accept @'+v.other+' as a confirmed contact on @'+v.voucher+'\'s word? Your PIN approves it.');
+    else await api('POST','/api/network/vouches/'+id+'/decline',{});
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ netBusy.delete('v'+id); }
+  loadFleet();
+}
+async function openVouch(){
+  const people=((netData&&netData.people)||[]).filter(p=>p.confirmed_via==='qr').map(p=>p.username);
+  if(people.length<2) return;
+  const a=prompt('Introduce whom? (one of: '+people.join(', ')+')'); if(!a||!people.includes(a.trim())) return;
+  const b=prompt('…to whom? (one of: '+people.filter(x=>x!==a.trim()).join(', ')+')'); if(!b||!people.includes(b.trim())||b.trim()===a.trim()) return;
+  const note=prompt('A note for both (optional):')||'';
+  try{ await apiGated('POST','/api/network/vouch',{a:a.trim(),b:b.trim(),note},'Vouch that @'+a.trim()+' and @'+b.trim()+' should be confirmed contacts? Your PIN approves it.'); alert('Introduced: they each accept in their app.'); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadFleet();
 }
 async function decideNet(id, accept){
   const r=netData&&(netData.incoming||[]).find(x=>x.id===id); if(!r||netBusy.has(id)) return;

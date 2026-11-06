@@ -214,8 +214,10 @@ module.exports = function registerPairing(deps) {
           db.prepare("UPDATE contact_pairings SET status = 'confirmed', decided_at = ?, code = NULL WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
           const [a, b] = pairDids(cur.initiator_did, cur.joiner_did);
           db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id, verified_via, verified_at) VALUES (?, ?, NULL, 'qr', ?)
-                      ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', removed_at = NULL, verified_via = 'qr', verified_at = excluded.verified_at`)
+                      ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', removed_at = NULL, verified_via = 'qr', verified_at = excluded.verified_at, vouched_by = NULL`)
             .run(a, b, nowIso());
+          // They met in person: any introduction of these two that is still waiting is moot.
+          try { db.prepare("UPDATE contact_vouches SET status = 'withdrawn', decided_at = ?, decided_by = 'paired-in-person' WHERE did_a = ? AND did_b = ? AND status = 'pending'").run(nowIso(), a, b); } catch (_) {}
           done = true;
         }
       }).immediate();
@@ -238,7 +240,179 @@ module.exports = function registerPairing(deps) {
     res.json({ ok: true, ...view(db.prepare('SELECT * FROM contact_pairings WHERE id = ?').get(row.id), auth.did) });
   });
 
-  // A confirmed (in-person) contact: active, and verified by QR.
+  // ── vouching: a contact both people met in person introduces them (red team item 6) ─────────────────────────────
+  // C, confirmed in person (QR) with both A and B, vouches that A and B should be confirmed contacts. A and B each
+  // accept with their PIN (intent vouch:<id>) and, once a phone is linked, its signature over "<voucher>|<other>".
+  // Both accepted → a confirmed contact, verified_via = 'vouch', vouched_by = C. Only first-hand (QR) links vouch: a
+  // contact confirmed by a vouch cannot vouch for anyone (no chains). The voucher states it with its own PIN
+  // (vouch:0) and phone. 7 days to accept; a voucher has at most 10 open; either side declines; mail to both.
+  const VOUCH_TTL_DAYS = 7, VOUCH_MAX_OPEN = 10;
+  db.exec(`CREATE TABLE IF NOT EXISTS contact_vouches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    voucher_did TEXT NOT NULL,
+    did_a TEXT NOT NULL,
+    did_b TEXT NOT NULL,
+    note TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',      -- pending | confirmed | declined | expired | withdrawn
+    a_accepted_at TEXT DEFAULT NULL,
+    b_accepted_at TEXT DEFAULT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    decided_at TEXT DEFAULT NULL,
+    decided_by TEXT DEFAULT NULL
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cv_a ON contact_vouches(did_a, status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cv_b ON contact_vouches(did_b, status)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cv_v ON contact_vouches(voucher_did, status)');
+  try { db.exec('ALTER TABLE network_peers ADD COLUMN vouched_by TEXT DEFAULT NULL'); } catch (_) {}
+  const peerRow = (x, y) => { const [a, b] = pairDids(x, y); return db.prepare("SELECT * FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active'").get(a, b) || null; };
+  const metInPerson = (x, y) => { const r = peerRow(x, y); return Boolean(r && r.verified_via === 'qr'); };
+  const walletBy = (q) => {
+    const v = String(q || '').trim().toLowerCase();
+    if (!v || v.length > 200) return null;
+    return db.prepare('SELECT did, username, email, status, pin_hash FROM identity_wallets WHERE did = ? OR username = ?').get(String(q).trim(), v) || null;
+  };
+  const mailTo = (did, subject, text) => {
+    const w = db.prepare('SELECT email FROM identity_wallets WHERE did = ?').get(did);
+    try { if (w && w.email && deps.sendMail) Promise.resolve(deps.sendMail({ to: w.email, subject, text })).catch(() => {}); } catch (_) {}
+  };
+  function expireVouches() {
+    db.prepare("UPDATE contact_vouches SET status = 'expired', decided_at = ? WHERE status = 'pending' AND expires_at <= ?").run(nowIso(), nowIso());
+  }
+  function vouchView(v, me) {
+    const side = me === v.did_a ? 'a' : me === v.did_b ? 'b' : 'voucher';
+    const other = side === 'a' ? v.did_b : side === 'b' ? v.did_a : null;
+    return { id: v.id, role: side === 'voucher' ? 'voucher' : 'introduced', voucher: name(v.voucher_did),
+             a: name(v.did_a), b: name(v.did_b), other: other ? name(other) : null, note: v.note || '', status: v.status,
+             you_accepted: side === 'a' ? Boolean(v.a_accepted_at) : side === 'b' ? Boolean(v.b_accepted_at) : null,
+             a_accepted: Boolean(v.a_accepted_at), b_accepted: Boolean(v.b_accepted_at),
+             intent: `vouch:${v.id}`, bind: other ? `${name(v.voucher_did)}|${name(other)}` : null,
+             created_at: v.created_at, expires_at: v.expires_at };
+  }
+  function vouchFor(req, res, me) {
+    const id = Number(req.params.id);
+    const v = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM contact_vouches WHERE id = ?').get(id) : null;
+    if (!v || ![v.voucher_did, v.did_a, v.did_b].includes(me)) { res.status(404).json({ error: 'introduction not found' }); return null; }
+    return v;
+  }
+
+  // POST /api/network/vouch {a, b, note?} — C introduces two people C has met in person.
+  app.post('/api/network/vouch', rateLimitStandard, (req, res) => {
+    const p = personAuth(req, res); if (!p) return;
+    expireVouches();
+    const me = p.wallet.did;
+    const { a, b, note } = req.body || {};
+    const wa = walletBy(a), wb = walletBy(b);
+    if (!wa || !wb) return res.status(404).json({ error: 'a and b: the usernames of two people you met in person' });
+    if (wa.did === wb.did || wa.did === me || wb.did === me) return res.status(400).json({ error: 'introduce two other people to each other' });
+    if (!metInPerson(me, wa.did) || !metInPerson(me, wb.did)) {
+      return res.status(403).json({ error: 'you can vouch only for people you paired with in person (QR) — both of them', pair_required: true });
+    }
+    for (const w of [wa, wb]) {
+      if (w.status !== 'active') return res.status(403).json({ error: `${w.username} is not active` });
+      if (db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND status = 'active'").get(w.did)) return res.status(409).json({ error: `${w.username} is an agent` });
+      if (!w.pin_hash) return res.status(409).json({ error: `${w.username} has no PIN yet, so they could not accept` });
+    }
+    const existing = peerRow(wa.did, wb.did);
+    if (existing && existing.verified_via) return res.status(409).json({ error: `${wa.username} and ${wb.username} are already confirmed contacts` });
+    const [da, dbb] = pairDids(wa.did, wb.did);
+    if (db.prepare("SELECT 1 FROM contact_vouches WHERE did_a = ? AND did_b = ? AND status = 'pending'").get(da, dbb)) return res.status(409).json({ error: 'an introduction of these two is already waiting' });
+    if (db.prepare("SELECT COUNT(*) AS n FROM contact_vouches WHERE voucher_did = ? AND status = 'pending'").get(me).n >= VOUCH_MAX_OPEN) {
+      return res.status(429).json({ error: `at most ${VOUCH_MAX_OPEN} introductions waiting at once` });
+    }
+    const cleanNote = String(note == null ? '' : note).replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 200);
+    // The voucher's word is a decision too: PIN, and the linked phone signs who is introduced to whom.
+    const intent = 'vouch:0';
+    if (!gateFresh(me, 'pin', p.auth, intent)) return res.status(403).json({ ...gateMissing('vouch', ['pin'], ['pin'], intent), error: 'vouching needs your PIN' });
+    const dk = deps.devices && deps.devices();
+    const refused = dk ? dk.approvalRefusal(p.auth, 'vouch', 0, `${name(da)}|${name(dbb)}`, req.body) : null;
+    if (refused) return res.status(refused.status).json(refused.body);
+    const spent = spendSingleUse(me, 'vouch', ['pin'], p.auth, intent);
+    if (spent) return res.status(spent.status || 403).json(spent);
+    const id = Number(db.prepare('INSERT INTO contact_vouches (voucher_did, did_a, did_b, note, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(me, da, dbb, cleanNote, nowIso(), later(VOUCH_TTL_DAYS * 86400)).lastInsertRowid);
+    for (const [x, y] of [[da, dbb], [dbb, da]]) {
+      mailTo(x, `DemiPass: ${p.wallet.username} introduces ${name(y)} to you`,
+        `${p.wallet.username}, whom you met in person, vouches for ${name(y)}.${cleanNote ? `\n\n"${cleanNote}"` : ''}\n\nIf you both accept in the DemiPass app (Fleet), you become confirmed contacts and can share secrets. Accept only if you know who ${name(y)} is. Nothing happens otherwise; the introduction expires in ${VOUCH_TTL_DAYS} days.\n`);
+    }
+    log(`vouch ${id}: ${p.wallet.username} introduces ${name(da)} and ${name(dbb)}`);
+    res.json({ ok: true, vouch: vouchView(db.prepare('SELECT * FROM contact_vouches WHERE id = ?').get(id), me) });
+  });
+
+  // GET /api/network/vouches — introductions you made or that name you.
+  app.get('/api/network/vouches', rateLimitStandard, (req, res) => {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    expireVouches();
+    const rows = db.prepare('SELECT * FROM contact_vouches WHERE voucher_did = ? OR did_a = ? OR did_b = ? ORDER BY id DESC LIMIT 100').all(auth.did, auth.did, auth.did);
+    const v = rows.map(r => vouchView(r, auth.did));
+    res.json({ ok: true, vouches: v, waiting_for_you: v.filter(x => x.role === 'introduced' && x.status === 'pending' && !x.you_accepted).length });
+  });
+
+  // POST /api/network/vouches/:id/accept — one of the two introduced; PIN (vouch:<id>) and the linked phone.
+  app.post('/api/network/vouches/:id/accept', rateLimitStandard, (req, res) => {
+    const p = personAuth(req, res); if (!p) return;
+    expireVouches();
+    const me = p.wallet.did;
+    const v = vouchFor(req, res, me); if (!v) return;
+    if (me !== v.did_a && me !== v.did_b) return res.status(403).json({ error: 'only the two people introduced accept it' });
+    if (v.status !== 'pending') return res.status(409).json({ error: `this introduction is ${v.status}`, vouch: vouchView(v, me) });
+    const view0 = vouchView(v, me);
+    if (view0.you_accepted) return res.json({ ok: true, vouch: view0 });
+    // The voucher must still have met both in person: an introduction does not outlive the voucher's own links.
+    if (!metInPerson(v.voucher_did, v.did_a) || !metInPerson(v.voucher_did, v.did_b)) {
+      db.prepare("UPDATE contact_vouches SET status = 'withdrawn', decided_at = ?, decided_by = 'voucher-link-ended' WHERE id = ? AND status = 'pending'").run(nowIso(), v.id);
+      return res.status(409).json({ error: `${name(v.voucher_did)} is no longer a confirmed contact of both of you; this introduction lapsed` });
+    }
+    const intent = `vouch:${v.id}`;
+    if (!gateFresh(me, 'pin', p.auth, intent)) return res.status(403).json({ ...gateMissing('vouch', ['pin'], ['pin'], intent), error: 'accepting an introduction needs your PIN' });
+    const dk = deps.devices && deps.devices();
+    const refused = dk ? dk.approvalRefusal(p.auth, 'vouch', v.id, view0.bind, req.body) : null;
+    if (refused) return res.status(refused.status).json(refused.body);
+    const col = me === v.did_a ? 'a_accepted_at' : 'b_accepted_at';
+    try {
+      let done = false;
+      db.transaction(() => {
+        const spent = spendSingleUse(me, 'vouch', ['pin'], p.auth, intent);
+        if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
+        if (db.prepare(`UPDATE contact_vouches SET ${col} = ? WHERE id = ? AND status = 'pending' AND ${col} IS NULL AND expires_at > ?`).run(nowIso(), v.id, nowIso()).changes !== 1) {
+          throw Object.assign(new Error('this introduction changed meanwhile'), { statusCode: 409 });
+        }
+        const cur = db.prepare('SELECT * FROM contact_vouches WHERE id = ?').get(v.id);
+        if (cur.a_accepted_at && cur.b_accepted_at) {
+          db.prepare("UPDATE contact_vouches SET status = 'confirmed', decided_at = ? WHERE id = ? AND status = 'pending'").run(nowIso(), v.id);
+          // A first-hand (QR) link they made meanwhile stays first-hand: a vouch never downgrades it (#55 review).
+          db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id, verified_via, verified_at, vouched_by) VALUES (?, ?, NULL, 'vouch', ?, ?)
+                      ON CONFLICT(did_a, did_b) DO UPDATE SET
+                        verified_via = CASE WHEN network_peers.status = 'active' AND network_peers.verified_via = 'qr' THEN 'qr' ELSE 'vouch' END,
+                        vouched_by = CASE WHEN network_peers.status = 'active' AND network_peers.verified_via = 'qr' THEN NULL ELSE excluded.vouched_by END,
+                        verified_at = CASE WHEN network_peers.status = 'active' AND network_peers.verified_via = 'qr' THEN network_peers.verified_at ELSE excluded.verified_at END,
+                        status = 'active', removed_at = NULL`)
+            .run(cur.did_a, cur.did_b, nowIso(), cur.voucher_did);
+          done = true;
+        }
+      }).immediate();
+      const now = db.prepare('SELECT * FROM contact_vouches WHERE id = ?').get(v.id);
+      if (done) {
+        log(`vouch ${v.id}: ${name(now.did_a)} ⇄ ${name(now.did_b)} confirmed (vouched by ${name(now.voucher_did)})`);
+        mailTo(now.voucher_did, `DemiPass: ${name(now.did_a)} and ${name(now.did_b)} accepted your introduction`, `${name(now.did_a)} and ${name(now.did_b)} are now confirmed contacts on your word.\n`);
+      }
+      res.json({ ok: true, vouch: vouchView(now, me), connected: done });
+    } catch (e) { res.status(e.statusCode || 500).json(e.body || { error: e.message }); }
+  });
+
+  // POST /api/network/vouches/:id/decline — either introduced person declines; the voucher withdraws. No PIN.
+  app.post('/api/network/vouches/:id/decline', rateLimitStandard, (req, res) => {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const v = vouchFor(req, res, auth.did); if (!v) return;
+    const st = auth.did === v.voucher_did ? 'withdrawn' : 'declined';
+    const n = db.prepare("UPDATE contact_vouches SET status = ?, decided_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'").run(st, nowIso(), auth.did, v.id).changes;
+    if (n !== 1) return res.status(409).json({ error: `this introduction is ${db.prepare('SELECT status FROM contact_vouches WHERE id = ?').get(v.id).status}` });
+    res.json({ ok: true, vouch: vouchView(db.prepare('SELECT * FROM contact_vouches WHERE id = ?').get(v.id), auth.did) });
+  });
+
+  // A confirmed contact: active, and verified in person by QR or by the vouch of someone both met in person.
   function isConfirmedPeer(x, y) {
     const [a, b] = pairDids(x, y);
     return Boolean(db.prepare("SELECT 1 FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active' AND verified_via IS NOT NULL").get(a, b));
