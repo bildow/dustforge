@@ -19,7 +19,11 @@ Narrowing (revoking, a lower use cap, fewer commands) needs no PIN.
 | `ssh_exec` | the host | `target_host_pattern` | SSH host list; the command list below |
 | `smtp_auth` | `params.smtp_host` | `target_host_pattern` | global SMTP list always; STARTTLS required off port 465 |
 
-A call that names no target is refused, not waved through. A secret with no active scope is refused. A use token is
+URLs are matched as they will be requested: parsed first (so `../`, `%2e%2e` and `\` segments are resolved), https
+only, no `user:password@` part; the parsed URL is what is fetched and logged. A pattern's host is matched whole.
+
+A call that names no target is refused, not waved through. A frozen secret is used by nothing; unfreezing takes the
+owner's PIN. `rotate-blind` sends the current password only to a host the secret's own ssh_exec scope covers. A secret with no active scope is refused. A use token is
 for the one target it was issued for.
 
 ## SSH command lists (forced commands)
@@ -27,7 +31,9 @@ for the one target it was issued for.
 - `null`: any command. Only contexts made before 2026-11-05; the app shows them with a *restrict* link.
 - `[]`: nothing runs. Every new ssh_exec scope starts here, including one PATCHed into ssh_exec from another action.
 - Entries: an exact command, or `prefix *`. The words a `*` matches are plain (no shell syntax), and none may start
-  with `-` (no added options) or contain `..`. Absolute paths still match: list `ls /srv *`, not `ls *`, if that matters.
+  with `-` or contain `..`. That is all a `*` holds back: absolute paths, `key=value` operands (`dd if=… of=…`) and
+  remote targets (`scp file user@host:`) still match. So a `*` belongs only after a command whose every plain argument
+  is safe — list `systemctl status *`, never `dd *`, `scp *`, `tar *` or an interpreter; prefer exact entries.
 - What is matched is what runs: with `sudo: true` the call is `sudo <command>`, so a root command needs its own
   `sudo …` entry.
 - `stdin` (text the command reads) is code to an interpreter, so it is allowed only on an entry ending ` <stdin`, e.g.

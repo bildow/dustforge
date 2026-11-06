@@ -3008,6 +3008,36 @@ function blindkeyPatternMatch(pattern, value) {
   return cleanValue === cleanPattern;
 }
 
+// A URL a secret is sent to, as fetch() and git will actually request it (#43 re-review N1): parsed by the WHATWG URL
+// parser, so "../", "%2e%2e" and "\" segments are resolved before any scope is matched; https only (a pattern for
+// https must never let the token go out in clear); no user:password@ part; no fragment. Returns the string or null.
+function canonicalTargetUrl(raw) {
+  if (typeof raw !== 'string' || !raw || raw.length > 2048) return null;
+  let u; try { u = new URL(raw); } catch (_) { return null; }
+  if (u.protocol !== 'https:' || u.username || u.password || !u.hostname) return null;
+  u.hash = '';
+  return u.origin + u.pathname + u.search;
+}
+// A scope's URL pattern against a canonical URL: '*' or empty = any (host lists still apply); "https://host/path*" =
+// that host, path starting with that prefix; an exact pattern = that URL. A pattern's host is matched whole: a prefix
+// ending inside the host ("https://api.github.com*") never reaches "api.github.com.evil.example".
+function urlPatternMatch(pattern, canonical) {
+  if (!pattern || pattern === '*') return true;
+  if (!canonical) return false;
+  const wild = pattern.endsWith('*');
+  const body = wild ? pattern.slice(0, -1) : pattern;
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(body) ? body : 'https://' + body;
+  let p; try { p = new URL(withScheme || 'https://invalid.'); } catch (_) { return false; }
+  if (p.protocol !== 'https:') return false;
+  let v; try { v = new URL(canonical); } catch (_) { return false; }
+  if (v.host !== p.host) return false;
+  const hostOnly = !/^https?:\/\/[^/]+\//i.test(withScheme);   // "https://host" or "https://host*": the whole host
+  if (hostOnly) return wild || (v.pathname === '/' && !v.search);
+  const pathPrefix = p.pathname + p.search;
+  const vPath = v.pathname + v.search;
+  return wild ? vPath.startsWith(pathPrefix) : vPath === pathPrefix;
+}
+
 // Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
 function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   const insertCtx = db.prepare(`
@@ -3145,6 +3175,8 @@ function egressLog(req, secret, action, target) {
 const URL_ACTIONS = new Set(['http_header', 'http_body', 'git_clone', 'database_connect']);
 const HOST_ACTIONS = new Set(['ssh_exec', 'smtp_auth']);
 function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost) {
+  // A frozen secret is used by nothing — /use, request-token, key_name, Rowen, rotation (#43 re-review N5).
+  if (secret.frozen) return { allowed: false, frozen: true, error: 'secret is frozen — its owner unfreezes it in the DemiPass app' };
   const contexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(secret.id);
 
   // No scope, no use (red team item 12): a secret with no contexts used to be usable against every allow-listed host.
@@ -3181,9 +3213,12 @@ function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHo
   // The scope's pattern is checked for every action that connects, and a call that names no target is refused, not
   // waved through (red team items 2, 11): URL actions against target_url_pattern, host actions against
   // target_host_pattern. The target checked here is the one the token carries and the action then uses.
+  let canonicalUrl = null;
   if (URL_ACTIONS.has(action)) {
     if (!targetUrl) return { allowed: false, error: `${action} needs a target URL (params.${action === 'git_clone' ? 'repo_url' : 'url'})` };
-    if (!blindkeyPatternMatch(ctx.target_url_pattern, targetUrl)) {
+    canonicalUrl = canonicalTargetUrl(targetUrl);
+    if (!canonicalUrl) return { allowed: false, error: 'target URL must be a plain https URL (no user:password@ part)' };
+    if (!urlPatternMatch(ctx.target_url_pattern, canonicalUrl)) {
       return { allowed: false, error: `target URL does not match context pattern '${ctx.target_url_pattern}'` };
     }
   }
@@ -3202,6 +3237,7 @@ function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHo
   return {
     allowed: true,
     context_id: ctx.id,
+    target_url: canonicalUrl,   // URL actions: the URL to request and log (canonical), never the raw one asked
     context: {
       id: ctx.id,
       context_name: ctx.context_name,
@@ -3709,11 +3745,13 @@ app.post('/api/blindkey/fill/withdraw', rateLimitFill, (req, res) => {
 app.get('/api/blindkey/fill/pending', rateLimitFill, (req, res) => {
   const auth = fillAuth(req, res); if (!auth) return;
   if (auth.silicon) return res.status(403).json({ error: 'only the owner approves fills' });
-  const rows = db.prepare(`SELECT r.*, s.name, s.ref_code, s.fill_username FROM blindkey_fill_requests r JOIN blindkey_secrets s ON s.id = r.secret_id
+  const rows = db.prepare(`SELECT r.*, s.name, s.ref_code, s.fill_username, s.fill_origins FROM blindkey_fill_requests r JOIN blindkey_secrets s ON s.id = r.secret_id
                            WHERE r.did = ? AND r.status = 'pending' ORDER BY r.id`).all(auth.did);
   const session = gateSession(auth);
   const requests = rows.filter(r => !fillExpired(r)).map(r => ({
     id: r.id, intent: `fill:${r.id}`, name: r.name, ref: r.ref_code, username: r.fill_username || '', origin: r.origin,
+    // Not yet confirmed for this login: approving binds the site for good (agents with a fill grant then fill it).
+    new_origin: !browserFill.storedOrigins(r.fill_origins).includes(r.origin),
     client_label: r.client_label || '', created_at: r.created_at, expires_at: r.expires_at,
     own_session: r.requester_session === session,   // the wallet cannot approve a request it made itself
   }));
@@ -4218,7 +4256,7 @@ function soleContext(secret, { action = null, targetUrl = null, targetHost = nul
   if (all.length === 1) return { context: all[0].context_name };
   if (action || targetUrl || targetHost) {
     const fit = all.filter(c => (!action || c.action_type === action)
-      && (!targetUrl || !URL_ACTIONS.has(c.action_type) || blindkeyPatternMatch(c.target_url_pattern, targetUrl))
+      && (!targetUrl || !URL_ACTIONS.has(c.action_type) || urlPatternMatch(c.target_url_pattern, canonicalTargetUrl(targetUrl)))
       && (!targetHost || !HOST_ACTIONS.has(c.action_type) || blindkeyPatternMatch(c.target_host_pattern, targetHost)));
     if (fit.length === 1) return { context: fit[0].context_name };
   }
@@ -4459,7 +4497,7 @@ function requestUseTokenHandler(req, res) {
     db.prepare(`
       INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at, delegation_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'), ?)
-    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '', delegation ? delegation.id : null);
+    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, ctxCheck.target_url || '', target_host || '', delegation ? delegation.id : null);
 
     // If this was a delegated request, increment use_count and log
     if (delegation) {
@@ -4799,7 +4837,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
           // Secret format: "username:password" or just "password" (username from params)
           const parts = decryptedValue.split(':');
-          const smtpUser = parts.length > 1 ? parts[0] : (req.body.params.smtp_user || '');
+          const smtpUser = parts.length > 1 ? parts[0] : (action_params.smtp_user || '');
           const smtpPass = parts.length > 1 ? parts.slice(1).join(':') : decryptedValue;
 
           try {
@@ -4832,7 +4870,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'database_connect': {
           // Execute a query against a database using stored credentials
-          const { query } = req.body.params || {};
+          const { query } = action_params;
           // FIX #1: use ONLY the token's pre-validated URL, never caller-supplied db_url
           const db_url = target_url;
           if (!db_url || !query) return res.status(400).json({ error: 'target_url must be set on the use-token, and params.query is required' });
@@ -4965,13 +5003,12 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     return res.status(500).json({ error: 'failed to decrypt secret' });
   }
 
-  // Update usage stats
-  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
-
-  // Increment context use_count if a context was used
-  if (ctxCheck.context_id) {
-    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
-  }
+  // Usage stats move once the action has run (or reached the upstream), never for a call refused on the way —
+  // a malformed call must not use up a capped scope (#43 re-review N7).
+  const countUse = () => {
+    db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+    if (ctxCheck.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
+  };
 
   // Execute the action with the secret injected
   try {
@@ -4982,8 +5019,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         // Make an HTTP request with the secret as a header value
         // SECURITY: only allow requests to whitelisted API providers
         // The response body is REDACTED to prevent echo-based exfiltration
-        const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = params || {};
-        if (!url) return res.status(400).json({ error: 'params.url required for http_header action' });
+        const { url: askedUrl, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = params || {};
+        if (!askedUrl) return res.status(400).json({ error: 'params.url required for http_header action' });
+        const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
+        if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
 
         // Whitelist: only known API providers — prevents exfiltration to attacker-controlled servers
         // Use the same consolidated whitelist as direct DemiPass use
@@ -5123,9 +5162,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, sign, verify_match, inject_env, ssh_exec` });
     }
 
+    countUse();
     res.json({ ok: true, action, secret_name: name, result });
   } catch (e) {
-    if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
+    if (e.code === 'upstream_too_large') { countUse(); return res.status(413).json(e.body); }
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 });
@@ -5853,8 +5893,10 @@ async function handleRowenDeliver(req, res) {
 
     switch (action) {
       case 'http_header': {
-        const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params || {};
-        if (!url) return res.status(400).json({ error: 'action_params.url required for http_header action' });
+        const { url: askedUrl, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params || {};
+        if (!askedUrl) return res.status(400).json({ error: 'action_params.url required for http_header action' });
+        const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
+        if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
 
         const ALLOWED_HOSTS = BLINDKEY_HTTP_HOSTS;
         let urlHost;
@@ -11747,6 +11789,16 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
       error: 'Rotation is disabled for this secret. Set rotatable=1 to enable.',
     });
   }
+  // The current password goes to target_host as the SSH login and to sudo there: only a host the secret's own ssh_exec
+  // scope covers (#43 re-review N2 — this route never checked the scope).
+  if (actor.mode !== 'admin') {
+    const picked = soleContext(secret, { action: 'ssh_exec', targetHost: target_host });
+    const chk = enforceBlindkeyContext(secret, picked.context, 'ssh_exec', null, typeof target_host === 'string' ? target_host : null);
+    if (!chk.allowed) {
+      logSecurityEvent('rotate_scope_denied', 'alert', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), ip: req.ip, error: chk.error, context: { secret: secret.name } });
+      return res.status(403).json({ error: `rotation goes only to a host this secret's scope covers: ${chk.error}` });
+    }
+  }
 
   let currentPassword;
   try { currentPassword = blindkeyDecrypt(secret.encrypted_value); }
@@ -11774,6 +11826,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     + 'echo ' + done + '\n';
 
   try {
+    egressLog(req, secret, 'rotate_blind', target_host);   // written before the connection: the outbound log
     const result = sshRun(sshUser, target_host, currentPassword, 'bash -s', { input: chpasswdScript(currentPassword, newPassword, 'ROTATED') });
 
     if (!result.includes('ROTATED')) {
@@ -13652,6 +13705,9 @@ app.post('/api/blindkey/freeze', rateLimitStandard, (req, res) => {
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
   const frozen = freeze !== false && freeze !== 0 ? 1 : 0;
+  // Freezing is open to any of the owner's tokens (an agent can stop its own use); unfreezing gives the secret its
+  // reach back, so it is the owner's, with the PIN (intent scope:<id>) — #43 re-review N5.
+  if (!frozen && secret.frozen && !scopeChangeGate(req, res, secret, 'scope')) return;
   db.prepare('UPDATE blindkey_secrets SET frozen = ? WHERE id = ?').run(frozen, secret.id);
 
   // Buoy tick

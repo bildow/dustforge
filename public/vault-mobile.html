@@ -1274,6 +1274,7 @@ function renderFillRequests(){
   const el=document.getElementById('fill-requests');
   el.innerHTML=fillReqs.map(q=>'<div class="fill-req"><div>Fill <b>'+esc(q.name)+'</b>'+(q.username?' ('+esc(q.username)+')':'')+' into</div>'
     +'<div class="fr-origin">'+esc(q.origin)+'</div>'
+    +(q.new_origin?'<div style="color:var(--orange);margin-top:0.25rem"><b>New site for this login.</b> Approving also adds it for good — agents you let fill this login could then fill it here too. Deny if you don\'t recognise it.</div>':'')
     +(q.client_label?'<div style="color:var(--text3);margin-top:0.25rem">asked by '+esc(q.client_label)+'</div>':'')
     +'<div class="fr-row"><button class="btn-primary" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',true)">Approve</button>'
     +'<button class="btn-ghost" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',false)">Deny</button></div></div>').join('')

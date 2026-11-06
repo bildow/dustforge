@@ -26,7 +26,7 @@ SH
 chmod +x "$S/bin/sshpass"
 node -e '
 const fs = require("fs");
-require("http").createServer((q, r) => { const b = []; q.on("data", c => b.push(c)); q.on("end", () => { fs.writeFileSync(process.argv[2], Buffer.concat(b)); r.writeHead(200, { "content-type": "application/json" }); r.end("{\"ok\":true}"); }); })
+require("http").createServer((q, r) => { const b = []; q.on("data", c => b.push(c)); q.on("end", () => { fs.writeFileSync(process.argv[2], Buffer.concat(b)); fs.appendFileSync(process.argv[2] + ".paths", q.url + "\n"); r.writeHead(200, { "content-type": "application/json" }); r.end("{\"ok\":true}"); }); })
   .listen(+process.argv[1], "127.0.0.1");' $UP_PORT "$S/up.body" & UP=$!
 node -e '
 const fs = require("fs");
@@ -148,5 +148,31 @@ call POST /api/demipass/approvals/$AP/approve "$A" '{"code":"'$CD'"}'; [ "$CODE"
 rm -f "$S/up.body"; call POST /api/demipass/use "$AG" "$HOOK,\"approval_id\":$AP}"
 [ "$CODE" = 200 ] && [ "$(cat "$S/up.body")" = '{"a":{"b":3,"y":2},"z":1}' ] && ok "14: the upstream receives the approved call's bytes (as shown to the owner), not the agent's key order" || fail "approved bytes: $CODE $BODY up=$(cat "$S/up.body" 2>/dev/null)"
 
-! grep -qE "box-pw-zz81|rootkey-pw-zz82|SMTP-PASSWORD-xyz|db-key-zz83|git-key-zz84|f-ssh-pw-zz85|hook-token-zz87" "$S/server.log" && ok "no value in the server log" || fail "value in log"
+# ── N1: a URL scope cannot be walked out of ──
+call POST /api/demipass/store "$A" '{"name":"gh","value":"gh-token-zz88","secret_type":"api_key"}'; GH=$(sid gh); GHR=$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$GH")
+pin "scope:$GH"; call POST /api/demipass/context/add "$A" '{"secret_name":"gh","context_name":"repos","action_type":"http_header","target_url_pattern":"https://repo.dustroot.com/repos/bildow/*"}'
+GHUSE(){ call POST /api/demipass/use "$AG" "$(python3 -c 'import json,sys; print(json.dumps({"ref":sys.argv[1],"context":"repos","params":{"url":sys.argv[2],"method":"POST"}}))' "$GHR" "$1")"; }
+rm -f "$S/up.body.paths"
+for u in 'https://repo.dustroot.com/repos/bildow/../../user/keys' 'https://repo.dustroot.com/repos/bildow/%2e%2e/%2E%2e/user/keys' 'https://repo.dustroot.com/repos/bildow\..\..\user/keys' \
+         'http://repo.dustroot.com/repos/bildow/x' 'https://u:p@repo.dustroot.com/repos/bildow/x' 'https://repo.dustroot.com.evil.example/repos/bildow/x'; do
+  GHUSE "$u"; [ "$CODE" = 403 ] || fail "N1 escaped with $u: $CODE $BODY"
+done
+[ ! -s "$S/up.body.paths" ] && [ "$(egress $GH)" = 0 ] && ok "N1: ../, %2e%2e, backslashes, http, user@ and a lookalike host → 403, the upstream never asked" || fail "N1: upstream saw $(cat "$S/up.body.paths" 2>/dev/null | tr '\n' ' ')"
+GHUSE 'https://repo.dustroot.com/repos/bildow/x/../y?q=1'
+[ "$CODE" = 200 ] && [ "$(cat "$S/up.body.paths")" = "/repos/bildow/y?q=1" ] && [ "$(Q "SELECT json_extract(detail,'\$.target') FROM blindkey_events WHERE event_type='egress' AND secret_id=$GH")" = "https://repo.dustroot.com/repos/bildow/y?q=1" ] \
+  && ok "N1: an in-scope URL is requested and logged as resolved" || fail "N1 in scope: $CODE $BODY $(cat "$S/up.body.paths" 2>/dev/null)"
+
+# ── N2: rotate-blind only to a host the scope covers ──
+R0=$(runs); call POST /api/demipass/rotate-blind "$AG" '{"ref":"'$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$BOX")'","target_host":"100.69.1.78","target_user":"root"}'
+[ "$CODE" = 403 ] && [ "$(runs)" = "$R0" ] && ok "N2: rotate-blind to a host off the secret's scope → 403, no SSH" || fail "N2: $CODE $BODY runs=$(runs)"
+
+# ── N5: frozen means frozen; unfreezing takes the PIN ──
+call POST /api/demipass/freeze "$AG" '{"name":"box","freeze":true}'; [ "$CODE" = 200 ] || fail "freeze: $CODE $BODY"
+R0=$(runs); SSH "ls /srv x"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q frozen && [ "$(runs)" = "$R0" ] && ok "N5: a frozen secret runs nothing" || fail "N5 frozen use: $CODE $BODY"
+call POST /api/demipass/use "$AG" '{"name":"rootkey","action":"ssh_exec","target_host":"'$HOST'","target_user":"root","command":"ls /srv x","key_name":"box"}'
+[ "$CODE" = 403 ] && [ "$(runs)" = "$R0" ] && ok "N5: …nor rides in as key_name" || fail "N5 key_name: $CODE $BODY"
+call POST /api/demipass/freeze "$AG" '{"name":"box","freeze":false}'; [ "$CODE" = 403 ] && ok "N5: unfreezing without the PIN → 403" || fail "N5 unfreeze no pin: $CODE $BODY"
+pin "scope:$BOX"; call POST /api/demipass/freeze "$A" '{"name":"box","freeze":false}'; [ "$CODE" = 200 ] && ok "N5: the owner unfreezes with the PIN" || fail "N5 unfreeze: $CODE $BODY"
+
+! grep -qE "gh-token-zz88|box-pw-zz81|rootkey-pw-zz82|SMTP-PASSWORD-xyz|db-key-zz83|git-key-zz84|f-ssh-pw-zz85|hook-token-zz87" "$S/server.log" && ok "no value in the server log" || fail "value in log"
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails

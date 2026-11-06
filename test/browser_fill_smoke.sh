@@ -113,7 +113,9 @@ call POST /api/blindkey/fill/redeem "$E" '{"request_id":"'$R4'"}'; [ "$CODE" = 4
 call POST /api/blindkey/origins "$E" '{"ref":"'$REF'","origins":["'$ORIG'"],"mode":"add"}'
 [ "$(echo "$BODY" | J origins.0)" = "http://localhost:8080" ] && [ "$(echo "$BODY" | J pending_origins.0)" = "$ORIG" ] && [ "$(echo "$BODY" | J origins)" = "['http://localhost:8080']" ] \
   && ok "origins add keeps the existing ones; a new one is pending, not bound (review M5)" || fail "origins add: $BODY"
-call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'; R5=$(echo "$BODY" | J request_id); approve
+call POST /api/blindkey/fill/request "$E" '{"ref":"'$REF'","origin":"'$ORIG'"}'; R5=$(echo "$BODY" | J request_id)
+call GET /api/blindkey/fill/pending "$Wt"; [ "$(echo "$BODY" | J requests.0.new_origin)" = True ] && ok "the wallet card marks a fill on a not-yet-confirmed site as a new site" || fail "new_origin flag: $BODY"
+approve
 [ "$(echo "$BODY" | J origin_confirmed)" = True ] && python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute('SELECT fill_origins FROM blindkey_secrets WHERE ref_code=?',(sys.argv[2],)).fetchone()[0]; sys.exit(0 if sys.argv[3] in r else 1)" "$DB_PATH" "$REF" "$ORIG" \
   && ok "approving the first fill there with the PIN confirms the pending origin" || fail "confirm origin: $BODY"
 SQL "UPDATE blindkey_secrets SET frozen = 1 WHERE ref_code = '$REF'"

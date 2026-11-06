@@ -120,17 +120,17 @@ call GET /api/demipass/menu "$A"
   && ok "the agent's menu now lists svc-token, shared by owner, with its ref" || fail "menu after approve: $BODY"
 call POST /api/demipass/request-token "$A" '{"name":"svc-token"}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "needs a target URL" && ok "request-token with no target → 403 (a token is for one target; red team item 2)" || fail "no target: $CODE $BODY"
-call POST /api/demipass/request-token "$A" '{"name":"svc-token","target_url":"http://127.0.0.1:9/x"}'
+call POST /api/demipass/request-token "$A" '{"name":"svc-token","target_url":"https://127.0.0.1:9/x"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J delegated)" = True ] && [ "$(echo "$BODY" | J context)" = default ] && [ "$(echo "$BODY" | J action)" = http_header ] \
   && ok "request-token by NAME alone: owner, context and action filled in" || fail "by name: $CODE $BODY"
-call POST /api/demipass/use "$A" '{"name":"svc-token","params":{"url":"http://127.0.0.1:9/x"}}'
+call POST /api/demipass/use "$A" '{"name":"svc-token","params":{"url":"https://127.0.0.1:9/x"}}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q 'not in whitelist' && [ "$(echo "$BODY" | J menu.shared_with_you.0.name)" = svc-token ] \
   && ok "one-call /use by name reaches the use step (host check) and the error carries the menu" || fail "one-call: $CODE $BODY"
 TOKS=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute(\"SELECT COUNT(*) FROM blindkey_use_tokens u JOIN identity_wallets w ON w.did=u.did WHERE w.username='agent' AND u.delegation_id IS NOT NULL\").fetchone()[0])" "$DB_PATH")
 [ "$TOKS" -ge 2 ] && ok "both went through use-tokens bound to the delegation" || fail "use tokens: $TOKS"
-call POST /api/demipass/use "$A" '{"ref":"'$REF'","params":{"url":"http://127.0.0.1:9/x"}}'
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","params":{"url":"https://127.0.0.1:9/x"}}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q 'not in whitelist' && ok "one-call /use by ref works the same" || fail "one-call ref: $CODE $BODY"
-call POST /api/demipass/use "$A" '{"name":"other-token","params":{"url":"http://127.0.0.1:9/x"}}'
+call POST /api/demipass/use "$A" '{"name":"other-token","params":{"url":"https://127.0.0.1:9/x"}}'
 [ "$CODE" = 404 ] && ok "a secret that was not shared stays out of reach" || fail "not shared: $CODE $BODY"
 grep -h 'value-owner' "$S/server.log" >/dev/null && fail "server log holds a secret value" || ok "no secret value in the server log"
 
@@ -141,7 +141,7 @@ AD=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.exe
 call POST /api/demipass/delegate "$P" '{"secret_name":"svc-token","delegate_did":"'$AD'"}'
 call POST /api/demipass/request-token "$A" '{"name":"svc-token"}'
 [ "$CODE" = 409 ] && echo "$BODY" | grep -q "$REF" && echo "$BODY" | grep -q "$PREF" && ok "two owners share 'svc-token' → 409 listing both refs" || fail "ambiguous: $CODE $BODY"
-call POST /api/demipass/request-token "$A" '{"ref":"'$PREF'","target_url":"http://127.0.0.1:9/x"}'
+call POST /api/demipass/request-token "$A" '{"ref":"'$PREF'","target_url":"https://127.0.0.1:9/x"}'
 [ "$CODE" = 200 ] && ok "the ref picks one" || fail "ref pick: $CODE $BODY"
 
 # ── review findings (PR #32 round 1) ──
