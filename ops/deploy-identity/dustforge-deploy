@@ -11,6 +11,10 @@
 # overwrite an ignored file in the live checkout. The credential reaches exactly two states: the current origin/main
 # tip, and the commit that was live just before the last deploy — never a feature-branch commit that review held, nor
 # a walk back through history (#46 review H1 and its re-review).
+# Leak gate (red team item 5): before a deploy merges, the files it changes are scanned for the owner's vault values by
+# the scanner root installed (/usr/local/libexec/dustforge-leak-scan.js — never the one in the commit being deployed)
+# with the root-only scan token /etc/dustforge-deploy/scan.token. A hit, a missing token or a scan that cannot run
+# refuses the deploy (fail closed; an operator deploys by hand in an emergency). A hit also revokes that token.
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 umask 077
@@ -40,6 +44,29 @@ backup() {
 }
 clean_tree() { [ -z "$(g status --porcelain --untracked-files=no)" ] || die "tracked files changed on the server"; }
 deps_same() { g diff --quiet "$1" "$2" -- package.json package-lock.json; }
+SCANNER=/usr/local/libexec/dustforge-leak-scan.js
+SCAN_TOKEN=/etc/dustforge-deploy/scan.token
+leak_gate() {   # <from> <to>
+  [ -f "$SCANNER" ] || die "leak gate: the scanner is not installed ($SCANNER)"
+  [ -f "$SCAN_TOKEN" ] || die "leak gate: no scan token ($SCAN_TOKEN) — an operator places one"
+  local t; t=$(mktemp -d); trap 'rm -rf "$t"' RETURN
+  # Every path the deploy adds or changes, of any type — renames, copies, type changes (a symlink turned into a file),
+  # mode changes — NUL-separated so no file name can split or quote itself (#45 review M1). Deletions bring nothing.
+  local n=0 f
+  while IFS= read -r -d '' f; do
+    n=$((n+1)); mkdir -p "$t/files/$n"
+    g cat-file blob "$2:$f" > "$t/files/$n/blob" 2>/dev/null || true   # a submodule or a symlink target is not a blob: nothing to read
+  done < <(g diff -z --name-only --no-renames --diff-filter=d "$1" "$2")
+  [ "$n" -gt 0 ] || return 0
+  local out rc=0
+  out=$(DEMIPASS_SCAN_TOKEN_FILE="$SCAN_TOKEN" node "$SCANNER" --strict "$t/files" 2>&1) || rc=$?
+  echo "$out" | sed "s#$t/files/#  file #"
+  case $rc in
+    0) ;;
+    1) logger -p auth.crit -t dustforge-deploy -- "leak gate: a vault value is in $2; deploy refused" 2>/dev/null || true; die "leak gate: a vault value is in this commit — the owner was told which and where (DemiPass app, mail); rotate it, remove it, and place a new scan token" ;;
+    *) die "leak gate: the scan could not run (exit $rc) — nothing deployed" ;;
+  esac
+}
 # A path the target tracks that is an ignored, untracked file in the live checkout (e.g. a local .env) would be silently
 # overwritten by merge/reset: refused (#46 re-review Low).
 # Also a path under an ignored file, directory or symlink (racknerd's public/app is an ignored symlink): git would
@@ -94,6 +121,7 @@ g merge-base --is-ancestor "$prev" "$sha" || die "not a fast-forward from $prev"
 clean_tree
 deps_same "$prev" "$sha" || die "dependencies changed; an operator installs them"
 no_ignored_clobber "$sha"
+leak_gate "$prev" "$sha"
 backup
 gw merge -q --ff-only "$sha"
 record "$prev" "$sha" deploy

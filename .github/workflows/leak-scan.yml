@@ -1,0 +1,29 @@
+# Red team item 5: on every push to main, is any of the owner's DemiPass vault values in this repository?
+# The server does the matching (bin/leak-scan.js never receives a value) and answers leak/clean; which and where go to
+# the owner. A hit fails the run, is a critical event, mails the owner and revokes the scan token.
+# The token is an ENVIRONMENT secret of `leak-scan`, whose deployment branch policy is main only: a pushed branch —
+# even one that edits this file — never receives it (#45 review H2). The deploy gate scans what is actually deployed.
+name: leak-scan
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    environment: leak-scan
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Scan for DemiPass vault values
+        env:
+          DEMIPASS_SCAN_TOKEN: ${{ secrets.DEMIPASS_SCAN_TOKEN }}
+        run: |
+          if [ -z "$DEMIPASS_SCAN_TOKEN" ]; then echo "::error::the DEMIPASS_SCAN_TOKEN secret is not set (red team item 5)"; exit 1; fi
+          node bin/leak-scan.js --strict .

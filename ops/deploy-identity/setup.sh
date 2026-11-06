@@ -1,7 +1,7 @@
 #!/bin/bash
 # One-time setup of the dustforge deploy identity on racknerd (2026-11-05, Aaron's order: root is never the deploy
 # credential again). Run once as root; idempotent:
-#   DEPLOY_HASH='<sha512-crypt>' bash setup.sh <dir holding dustforge-deploy and dustforge-deploy-shell>
+#   DEPLOY_HASH='<sha512-crypt>' bash setup.sh <dir holding dustforge-deploy, dustforge-deploy-shell and leak-scan.js>
 # Creates user dustforge-deploy whose login shell and sshd ForceCommand allow only
 # "sudo /usr/local/sbin/dustforge-deploy <sha>|status|rollback", and whose only sudo right is that script.
 # The password arrives as a SHA-512 crypt hash only (chpasswd -e) and is set LAST, once the sshd restrictions are in
@@ -28,6 +28,13 @@ step files
 install -d -m 0755 /usr/local/libexec
 install -o root -g root -m 0755 -T "$SRC/dustforge-deploy" /usr/local/sbin/dustforge-deploy
 install -o root -g root -m 0755 -T "$SRC/dustforge-deploy-shell" /usr/local/libexec/dustforge-deploy-shell
+# The leak gate's scanner (red team item 5): a root-owned copy, so a deployed commit cannot change its own gate. The
+# scan token goes in /etc/dustforge-deploy/scan.token (root 0600), placed by the operator from an approved request.
+# The bootstrap extracts bin/leak-scan.js of the same commit into $SRC beside the deploy scripts; without it every
+# deploy would be refused, so setup stops here instead (#45 review M3).
+[ -f "$SRC/leak-scan.js" ] || { echo "setup: $SRC/leak-scan.js missing (extract bin/leak-scan.js of this commit there)" >&2; exit 1; }
+install -o root -g root -m 0755 -T "$SRC/leak-scan.js" /usr/local/libexec/dustforge-leak-scan.js
+install -d -o root -g root -m 0700 /etc/dustforge-deploy
 bash -n /usr/local/sbin/dustforge-deploy && bash -n /usr/local/libexec/dustforge-deploy-shell
 [ -d /opt/backups ] || install -d -m 0700 /opt/backups
 install -d -m 0700 -o root -g root /opt/backups/dustforge-deploy /var/lib/dustforge-deploy

@@ -1,0 +1,9 @@
+[Unit]
+Description=DemiPass leak scan, daily
+
+[Timer]
+OnCalendar=*-*-* 04:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

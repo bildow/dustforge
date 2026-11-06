@@ -417,6 +417,8 @@ app.use((req, res, next) => {
 const _jsonParser = express.json();
 const _useJsonParser = express.json({ limit: useLimits.USE_MAX_REQUEST_BYTES }); // POST /use: see use_limits.js
 const isUsePath = (p) => /^\/api\/(demipass|blindkey)\/use\/?$/i.test(p);   // Express matches case- and trailing-slash-insensitively
+// The leak scanner parses its own (2 MiB) body: the global parser leaves it alone (leak_scan.js).
+const isLeakScanPath = (p) => /^\/api\/(demipass|blindkey)\/leak-scan\/?$/i.test(p);
 const _urlencodedParser = express.urlencoded({ extended: false });
 const _useUrlencodedParser = express.urlencoded({ extended: false, limit: useLimits.USE_MAX_REQUEST_BYTES });
 // A body the parser refuses is answered in JSON with what to fix (and the DemiPass menu), never Express's HTML page,
@@ -434,7 +436,7 @@ function badBody(req, res, err) {
   }
   return res.status(err && err.status >= 400 && err.status < 500 ? err.status : 400).json(body);
 }
-app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : (isUsePath(req.path) ? _useJsonParser : _jsonParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
+app.use((req, res, next) => (req.path === '/api/stripe/webhook' || isLeakScanPath(req.path) ? next() : (isUsePath(req.path) ? _useJsonParser : _jsonParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : (isUsePath(req.path) ? _useUrlencodedParser : _urlencodedParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 // A "not enough DD" (402) answer to an agent paying for itself tells it how to ask its fleet owner for a top-up
 // (network_routes.js). Not for people, worker/silicon tokens, or a charge someone else pays.
@@ -8175,6 +8177,9 @@ const deviceKeys = require('./device_keys')({
   app, db, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, cleanLabel, sendMail: fleetRoutes.sendMail, recordGate, pinIntentOk: (s) => PIN_INTENT_RE.test(s),
 });
+// Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
+require('./leak_scan')({ app, db, express, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
+  logSecurityEvent, blindkeyDecrypt, blindkeyEncrypt, cleanLabel, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys });
 // Security depth on use: per-use approval requests with request-bound rotating codes (docs/approvals.md).
 const useApprovals = require('./use_approvals')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
@@ -13468,7 +13473,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
