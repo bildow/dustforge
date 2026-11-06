@@ -90,6 +90,20 @@ function recordSpend(db, did, amount_cents) {
   }
 }
 
+// Refund of a charge: give back what recordSpend attributed, tainted-first again, so a refunded spend restores the
+// same lots (and their chargeback flag) instead of turning tainted DD into untraceable balance (#50 review).
+function recordUnspend(db, did, amount_cents) {
+  if (!did || !amount_cents || amount_cents <= 0) return;
+  let need = amount_cents;
+  for (const lot of liveLots(db, didHash(did))) {
+    if (need <= 0) break;
+    if (lot.spent_cents <= 0) continue;
+    const back = Math.min(lot.spent_cents, need);
+    db.prepare(`UPDATE dd_ledger SET spent_cents = spent_cents - ? WHERE lot_id=?`).run(back, lot.lot_id);
+    need -= back;
+  }
+}
+
 // Transfer A->B: consume `amount_cents` from A's live lots (tainted-first) and
 // create child lots at B, each inheriting its parent's origin + chargeback flag,
 // so the lineage (and any future clawback) follows the dust into fleet wallets.
@@ -145,4 +159,4 @@ function clawback(db, origin_event_id, billing) {
   return { ok: true, origin_event_id, evaporated_lots: count, total_charged_cents: charged, audit };
 }
 
-module.exports = { didHash, initSchema, recordCredit, recordSpend, recordTransfer, clawback, resolveHolders };
+module.exports = { didHash, initSchema, recordCredit, recordSpend, recordUnspend, recordTransfer, clawback, resolveHolders };

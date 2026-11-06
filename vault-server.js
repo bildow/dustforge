@@ -61,6 +61,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS vault_audit_log (
 try {
   db.exec(`ALTER TABLE identity_transactions ADD COLUMN idempotency_key TEXT`);
 } catch (_) { /* column already exists */ }
+try { db.exec(`ALTER TABLE identity_transactions ADD COLUMN token_jti TEXT`); } catch (_) { /* exists */ }
 
 // ── Express setup ──
 const app = express();

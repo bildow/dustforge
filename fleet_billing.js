@@ -327,13 +327,13 @@ function _resolvePayerBase(db, billing, { callerDid, a, cost }) {
 // Deducts `cost` from the resolved payer and records the attribution row in the
 // same transaction. After a successful charge, a silicon with a threshold rule
 // is refilled inline so it never stalls mid-task.
-function chargeAttributed(db, billing, { callerDid, cost, actionType, description = '', attribution = {}, ledger = null }) {
+function chargeAttributed(db, billing, { callerDid, cost, actionType, description = '', attribution = {}, ledger = null, tokenJti = null }) {
   const r = resolvePayer(db, billing, { callerDid, attribution, cost });
   if (!r.ok) return r;
   if (!(cost > 0)) return { ok: true, payer_did: r.payer_did, initiator: r.initiator, project: r.project, deducted: 0, balance_after: null };
 
   const txn = db.transaction(() => {
-    const d = billing.deductBalance(db, r.payer_did, cost, actionType, description || `API call: ${actionType}`);
+    const d = billing.deductBalance(db, r.payer_did, cost, actionType, description || `API call: ${actionType}`, { tokenJti });
     if (!d.ok) return { ...d, ok: false, payer_did: r.payer_did, initiator: r.initiator, project: r.project };
     const tx = db.prepare('SELECT id FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT 1').get(r.payer_did);
     const ins = db.prepare(`INSERT INTO billing_attributions (tx_id, payer_did, actor_did, fleet_id, project, initiator, work_link_id, agent, action_type, cost_cents, worker_id)
