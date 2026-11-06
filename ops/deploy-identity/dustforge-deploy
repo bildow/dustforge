@@ -42,11 +42,17 @@ clean_tree() { [ -z "$(g status --porcelain --untracked-files=no)" ] || die "tra
 deps_same() { g diff --quiet "$1" "$2" -- package.json package-lock.json; }
 # A path the target tracks that is an ignored, untracked file in the live checkout (e.g. a local .env) would be silently
 # overwritten by merge/reset: refused (#46 re-review Low).
+# Also a path under an ignored file, directory or symlink (racknerd's public/app is an ignored symlink): git would
+# replace it with a directory.
 no_ignored_clobber() {
   local clash
-  clash=$(comm -12 <(g ls-tree -r --name-only "$1" | sort) <(g ls-files -o -i --exclude-standard | sort) | head -5)
-  [ -z "$clash" ] || die "the target would overwrite ignored live file(s): $(echo $clash)"
+  clash=$(g ls-tree -r --name-only "$1" | awk 'NR==FNR { ign[$0]=1; next }
+    { p=$0; if (p in ign) { print p; next } n=split(p, a, "/"); q=""; for (i=1; i<n; i++) { q = q (i>1 ? "/" : "") a[i]; if (q in ign || (q "/") in ign) { print p; break } } }' \
+    <(g ls-files -o -i --exclude-standard --directory | sed 's#/$##') - | head -5)
+  [ -z "$clash" ] || die "the target would overwrite ignored live path(s): $(echo $clash)"
 }
+# The code itself keeps git's normal modes (0644/0755): anything that reads /opt/dustforge as non-root (nginx) still can.
+gw() { (umask 022; g "$@"); }
 record() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1 $2 $3" >> "$HIST"; }
 
 case "${1:-}" in
@@ -71,7 +77,7 @@ case "${1:-}" in
     deps_same "$to" "$live" || die "dependencies differ; an operator rolls this back"
     no_ignored_clobber "$to"
     backup
-    g reset -q --keep "$to"
+    gw reset -q --keep "$to"
     record "$live" "$to" rollback
     restart
     echo "rolled back $live -> $to; dustforge restarts in 3 s"
@@ -89,7 +95,7 @@ clean_tree
 deps_same "$prev" "$sha" || die "dependencies changed; an operator installs them"
 no_ignored_clobber "$sha"
 backup
-g merge -q --ff-only "$sha"
+gw merge -q --ff-only "$sha"
 record "$prev" "$sha" deploy
 restart
 echo "deployed $prev -> $sha; dustforge restarts in 3 s"
