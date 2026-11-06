@@ -4727,6 +4727,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       // Callers that guessed wrong got a silent empty-body failure that impersonated
       // a bad credential. Normalise once here so every case accepts either shape.
       let action_params = { ...(req.body || {}), ...((req.body || {}).params || {}) };
+      // smtp_auth is a mail call: the day's allowance on every answer, refusals included (Aaron 2026-11-06; #51 review).
+      if (action === 'smtp_auth') {
+        try { const mr = mailRemaining(req.identity && req.identity.did); if (mr.remaining != null) res.setHeader('X-Mail-Remaining', String(mr.remaining)); if (mr.limit != null) res.setHeader('X-Mail-Limit', String(mr.limit)); } catch (_) {}
+      }
       // A command off the scope's list is refused before the owner is ever asked to approve it.
       if (action === 'ssh_exec') {
         const why = commandRefusal(tokenRow.context_id, action_params.command, { sudo: action_params.sudo, stdin: action_params.stdin });
@@ -4937,8 +4941,6 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           // Send an email through an external SMTP server using stored credentials
           const { smtp_host, smtp_port = 587, to, subject, body: emailBody, from } = action_params;
           if (!smtp_host || !to || !subject) return res.status(400).json({ error: 'params.smtp_host, to, subject required for smtp_auth action' });
-          // A mail call: the day's allowance on every answer (Aaron 2026-11-06), as on the other mail routes.
-          try { const mr = mailRemaining(req.identity && req.identity.did); if (mr.remaining != null) res.setHeader('X-Mail-Remaining', String(mr.remaining)); if (mr.limit != null) res.setHeader('X-Mail-Limit', String(mr.limit)); } catch (_) {}
           // Plain addresses only, checked like /api/email/send: the recipient bound counts what is delivered (#51 review).
           {
             const rcpts = typeof to === 'string' ? to.split(',').map(x => x.trim()).filter(Boolean) : [];
