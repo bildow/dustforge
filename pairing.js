@@ -63,7 +63,7 @@ module.exports = function registerPairing(deps) {
   // a code derived from them (as in #52) could be computed without ever seeing the shower's screen.
   const newCode = () => String(crypto.randomInt(0, 1000000)).padStart(6, '0');
   function expireOld() {
-    db.prepare("UPDATE contact_pairings SET status = 'expired', decided_at = ? WHERE status IN ('open','joined') AND expires_at <= ?").run(nowIso(), nowIso());
+    db.prepare("UPDATE contact_pairings SET status = 'expired', decided_at = ?, code = NULL WHERE status IN ('open','joined') AND expires_at <= ?").run(nowIso(), nowIso());
   }
 
   // A person's own wallet token, with a PIN set. Returns { auth, wallet } or null (answer sent).
@@ -187,7 +187,7 @@ module.exports = function registerPairing(deps) {
       if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
         const tries = db.prepare('UPDATE contact_pairings SET wrong_joins = wrong_joins + 1 WHERE id = ? RETURNING wrong_joins').get(row.id).wrong_joins;
         if (tries >= MAX_CODE_TRIES) {
-          db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = 'wrong-code' WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
+          db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = 'wrong-code', code = NULL WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
           logSecurityEvent('pairing_code_mismatch', 'alert', { caller_did: me, capability: 'pair', target: String(row.id), ip: req.ip, error: 'wrong code typed 3 times' });
           return res.status(403).json({ error: `that is not the code on ${v.other}'s screen — the pairing is cancelled; start again face to face`, status: 'cancelled' });
         }
@@ -211,7 +211,7 @@ module.exports = function registerPairing(deps) {
         if (n !== 1) throw Object.assign(new Error('this pairing changed meanwhile'), { statusCode: 409 });
         const cur = db.prepare('SELECT * FROM contact_pairings WHERE id = ?').get(row.id);
         if (cur.initiator_confirmed_at && cur.joiner_confirmed_at) {
-          db.prepare("UPDATE contact_pairings SET status = 'confirmed', decided_at = ? WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
+          db.prepare("UPDATE contact_pairings SET status = 'confirmed', decided_at = ?, code = NULL WHERE id = ? AND status = 'joined'").run(nowIso(), row.id);
           const [a, b] = pairDids(cur.initiator_did, cur.joiner_did);
           db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id, verified_via, verified_at) VALUES (?, ?, NULL, 'qr', ?)
                       ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', removed_at = NULL, verified_via = 'qr', verified_at = excluded.verified_at`)
@@ -231,7 +231,7 @@ module.exports = function registerPairing(deps) {
     const auth = getBearerIdentity(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     const row = rowFor(req, res, auth.did); if (!row) return;
-    const n = db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = ? WHERE id = ? AND status IN ('open','joined')")
+    const n = db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = ?, code = NULL WHERE id = ? AND status IN ('open','joined')")
       .run(nowIso(), auth.did, row.id).changes;
     if (n !== 1) return res.status(409).json({ error: `this pairing is ${db.prepare('SELECT status FROM contact_pairings WHERE id = ?').get(row.id).status}` });
     if ((req.body || {}).mismatch) logSecurityEvent('pairing_code_mismatch', 'alert', { caller_did: auth.did, capability: 'pair', target: String(row.id), ip: req.ip });
