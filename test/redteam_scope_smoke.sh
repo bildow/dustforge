@@ -65,6 +65,7 @@ call POST /api/demipass/context/add "$A" '{"secret_name":"svc","context_name":"g
 [ "$CODE" = 200 ] && ok "the owner, with the PIN, widens it" || fail "owner add: $CODE $BODY"
 # a delegate (person share) tries to widen its own entry
 call POST /api/network/requests "$A" '{"to":"person-k","as":"person"}'; R=$(echo "$BODY" | J request.id); call POST /api/network/requests/$R/accept "$K"
+. "$W/test/lib/pair_in_person.sh"; pair_in_person "$A" 4321 "$K" 8765
 pin "$A" 4321 "share:$SID"; call POST /api/demipass/shares "$A" '{"secret":"svc","to":"person-k"}'; SH=$(echo "$BODY" | J share.id)
 pin "$K" 8765 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$K"
 B0=$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE severity='critical'")

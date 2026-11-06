@@ -87,6 +87,7 @@ for who in person-k stranger-x; do
 done
 call POST /api/network/requests "$A" '{"to":"agent-f","as":"agent"}'; R=$(echo "$BODY" | J request.id)
 call POST /api/network/requests/$R/accept "$F"; [ "$CODE" = 200 ] && ok "A is connected to K and X (people) and F joined A's fleet" || fail "fleet join: $CODE $BODY"
+. "$W/test/lib/pair_in_person.sh"; pair_in_person "$A" 4321 "$K" 8765 && ok "A and K paired in person (QR, both PINs): a confirmed contact"
 
 # ── vault types and manual-entry fields ──
 call POST /api/demipass/store "$A" '{"name":"t-bogus","value":"zzzzzzzz1","secret_type":"bogus"}'

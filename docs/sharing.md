@@ -68,3 +68,10 @@ rule above (a person types the value); the next ingress paths are photo, extensi
 
 ## SSH hosts
 `BLINDKEY_SSH_HOSTS_EXTRA` (comma-separated) adds hosts to the built-in ssh_exec allow-list.
+
+## Confirmed contacts only (2026-11-06, red team item 6)
+
+A share offer, the acceptance of an offer, and a secret transfer all need the two wallets to be contacts **confirmed in
+person** by QR pairing (docs/network.md, "Pairing in person"). A contact made by name request alone gets
+`403 {pair_required: true}`. Shares that were already accepted keep working.
+

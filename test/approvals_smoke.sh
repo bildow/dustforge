@@ -61,6 +61,7 @@ aopen(){ pin "$A" 4321 "approval-open:$1"; call POST /api/demipass/approvals/$1/
 A=$(login owner-a); A2=$(login owner-a); AG=$(login owner-a); K=$(login person-k); X=$(login other-x)
 call POST /api/identity/pin "$A" '{"pin":"4321","password":"hunter22"}'; call POST /api/identity/pin "$K" '{"pin":"8765","password":"hunter22"}'
 call POST /api/network/requests "$A" '{"to":"person-k","as":"person"}'; R=$(echo "$BODY" | J request.id); call POST /api/network/requests/$R/accept "$K"
+. "$W/test/lib/pair_in_person.sh"; pair_in_person "$A" 4321 "$K" 8765
 call POST /api/demipass/store "$A" "$(jbody name forge-token value "$SEC" secret_type api_key)"; REF=$(echo "$BODY" | J ref)
 SID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$REF'")
 USE(){ jbody ref "$REF" params "{\"url\":\"https://repo.dustroot.com/$1\",\"method\":\"GET\"}" ${2:+approval_id $2} ${3:+approval_code $3} ${4:+purpose "$4"}; }
