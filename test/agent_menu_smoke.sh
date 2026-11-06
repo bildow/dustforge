@@ -138,6 +138,12 @@ grep -h 'value-owner' "$S/server.log" >/dev/null && fail "server log holds a sec
 call POST /api/demipass/store "$P" '{"name":"svc-token","value":"value-other-1","secret_type":"api_key"}'
 PREF=$(echo "$BODY" | J ref)
 AD=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute(\"SELECT did FROM identity_wallets WHERE username='agent'\").fetchone()[0])" "$DB_PATH")
+# 'agent' is not in P's fleet: handing it P's secret takes P, as a person, with the PIN (red team item 15)
+PSID=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT id FROM blindkey_secrets WHERE ref_code=?',(sys.argv[2],)).fetchone()[0])" "$DB_PATH" "$PREF")
+call POST /api/demipass/delegate "$P" '{"secret_name":"svc-token","delegate_did":"'$AD'"}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "scope:$PSID" ] && ok "another owner's token alone cannot hand 'agent' a secret (PIN asked)" || fail "outside delegate: $CODE $BODY"
+call POST /api/identity/pin "$P" '{"pin":"2468","password":"hunter22"}'
+call POST /api/identity/gate/verify "$P" '{"gate":"pin","pin":"2468","intent":"scope:'$PSID'"}'
 call POST /api/demipass/delegate "$P" '{"secret_name":"svc-token","delegate_did":"'$AD'"}'
 call POST /api/demipass/request-token "$A" '{"name":"svc-token"}'
 [ "$CODE" = 409 ] && echo "$BODY" | grep -q "$REF" && echo "$BODY" | grep -q "$PREF" && ok "two owners share 'svc-token' → 409 listing both refs" || fail "ambiguous: $CODE $BODY"

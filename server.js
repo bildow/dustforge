@@ -6765,7 +6765,14 @@ app.post('/api/identity/request-account', rateLimitStrict, async (req, res) => {
 });
 
 // POST /api/wallet/transfer — agent-to-agent transfer
-app.post('/api/wallet/transfer', rateLimitStandard, (req, res) => {
+// Retired (red team item 16): a transact token alone moved DD to any wallet — no PIN, no connection. Sending DD is
+// POST /api/network/transfers (to a connected person or agent, confirmed with the PIN). The admin key keeps working.
+app.post('/api/wallet/transfer', rateLimitStandard, (req, res, next) => {
+  const admin = ADMIN_API_KEY && safeSecretEqual(req.headers['x-admin-key'] || '', ADMIN_API_KEY);
+  if (admin) return next();
+  logSecurityEvent('wallet_transfer_retired', 'warn', { caller_did: null, capability: 'wallet_transfer', ip: req.ip });
+  return res.status(410).json({ error: 'this route is retired: send DD with POST /api/network/transfers (to a connection; you confirm it with your PIN)', use: 'POST /api/network/transfers' });
+}, (req, res) => {
   const { from_did, to_did, amount_cents, description } = req.body || {};
   if (!from_did || !to_did || !amount_cents) return res.status(400).json({ error: 'from_did, to_did, amount_cents required' });
   if (from_did === to_did) return res.status(400).json({ error: 'cannot transfer to self' });
@@ -9449,6 +9456,19 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
   // anyone without asking, so it does not count.
   if (actor.mode !== 'admin' && !secretSharing.isAgentWallet(delegate_did)) {
     return res.status(403).json({ error: 'a delegation goes to an agent (a silicon in a fleet) — to give a person access, share it (POST /api/demipass/shares); they accept it in their app' });
+  }
+  // Who may hand a secret to an agent (red team item 15): never an agent token (silicon, worker, fleet-minted). The
+  // owner's own session may delegate to an agent of the owner's own fleet (consented fleet_silicons); anyone else's
+  // agent takes the owner, as a person, with the PIN (scope:<secret id>) — a token alone gave any outside agent a secret.
+  if (actor.mode !== 'admin') {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok || auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) {
+      logSecurityEvent('delegate_denied', 'critical', { caller_did: ownerDid, capability: 'delegate', target: secret.name, ip: req.ip, error: 'agent token', context: { delegate_did } });
+      return res.status(403).json({ error: 'agents do not hand out secrets; the owner delegates from their own session' });
+    }
+    const ownAgent = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+        WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active'`).get(ownerDid, delegate_did);
+    if (!ownAgent && !scopeChangeGate(req, res, secret, 'delegate')) return;
   }
 
   // If context_name specified, validate it exists and is active on the secret
