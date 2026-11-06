@@ -8,6 +8,7 @@
 # (prism2-mail-backup.timer, 03:30/15:30 UTC). racknerd no longer produces mail backups.
 # TODO: off-site / cloud DR tier for both dustforge and mail (currently phasewhip-only for mail).
 set -uo pipefail
+umask 077   # archives hold .env (IDENTITY_MASTER_KEY): owner-only, whatever the directory mode (#46 review M2)
 
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 DEST=/opt/backups
