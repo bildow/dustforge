@@ -1,0 +1,17 @@
+#!/bin/bash
+# /usr/local/libexec/dustforge-deploy-shell — login shell and sshd ForceCommand of the dustforge-deploy user. Whatever the client
+# asks for, only "sudo /usr/local/sbin/dustforge-deploy <word> [<word>]" (words: lowercase letters and digits) runs;
+# no shell, no other command, no forwarding (see /etc/ssh/sshd_config.d/dustforge-deploy.conf).
+set -f
+# As sshd ForceCommand the request is in SSH_ORIGINAL_COMMAND; as the login shell it arrives as "-c <command>".
+cmd=${SSH_ORIGINAL_COMMAND:-}
+[ -z "$cmd" ] && [ "${1:-}" = -c ] && cmd=${2:-}
+read -r -a w <<< "$cmd"
+ok=1
+[ "${#w[@]}" -ge 3 ] && [ "${#w[@]}" -le 4 ] || ok=0
+[ "${w[0]:-}" = sudo ] && [ "${w[1]:-}" = /usr/local/sbin/dustforge-deploy ] || ok=0
+for a in "${w[@]:2}"; do [[ "$a" =~ ^[a-z0-9]{1,40}$ ]] || ok=0; done
+if [ $ok = 1 ]; then exec /usr/bin/sudo -n /usr/local/sbin/dustforge-deploy "${w[@]:2}"; fi
+logger -t dustforge-deploy -- "refused forced command from ${SSH_CLIENT%% *}" 2>/dev/null || true
+echo "dustforge-deploy: only 'sudo /usr/local/sbin/dustforge-deploy <sha>|status|rollback <sha>' runs here" >&2
+exit 126

@@ -1,0 +1,71 @@
+#!/bin/bash
+# /usr/local/sbin/dustforge-deploy — the only thing the dustforge-deploy user may run as root (sudoers), and the only
+# command its forced shell passes on. Installed 2026-11-05 on Aaron's order: RackNerd root is never the deploy
+# credential again.
+#   dustforge-deploy status            the live commit, the service state, the last backups
+#   dustforge-deploy <40-hex sha>      back up the DB, fast-forward /opt/dustforge to <sha>, restart dustforge
+#   dustforge-deploy rollback <sha>    move back to <sha> (an ancestor of the live commit), restart; the DB is NOT
+#                                      restored — that stays an operator act (backups are listed by `status`)
+# Refused: a commit not on origin/main, anything but a fast-forward, a changed working tree, a changed
+# package.json/package-lock.json (dependency installs run code as root: an operator act).
+set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+REPO=${DUSTFORGE_DEPLOY_REPO_TEST:-/opt/dustforge}
+DB=$REPO/data/dustforge.db
+BK=${DUSTFORGE_DEPLOY_BACKUPS_TEST:-/opt/backups/dustforge-deploy}
+RESTART=${DUSTFORGE_DEPLOY_RESTART_TEST:-systemd-run}
+umask 077
+g() { git -c safe.directory="$REPO" -C "$REPO" "$@"; }
+die() { echo "refused: $*" >&2; exit 3; }
+logger -t dustforge-deploy -- "invoked by ${SUDO_USER:-$USER}: $*" 2>/dev/null || true
+
+restart() {
+  if [ "$RESTART" = systemd-run ]; then
+    systemd-run --quiet --on-active=3 --unit="dustforge-deploy-restart-$(date -u +%s)" systemctl restart dustforge
+  else "$RESTART"; fi
+}
+backup() {
+  mkdir -p "$BK"
+  local f
+  f="$BK/dustforge-$(date -u +%Y%m%dT%H%M%SZ)-$(g rev-parse --short=12 HEAD).db"
+  sqlite3 "$DB" ".backup $f"
+  [ -s "$f" ] || die "backup failed"
+  ls -1t "$BK"/dustforge-*.db | tail -n +11 | xargs -r rm -f --
+  echo "backup $f"
+}
+clean_tree() { [ -z "$(g status --porcelain --untracked-files=no)" ] || die "tracked files changed on the server"; }
+
+case "${1:-}" in
+  status)
+    [ $# -eq 1 ] || die "status takes no arguments"
+    g log --oneline -1
+    systemctl is-active dustforge 2>/dev/null || true
+    { ls -1t "$BK"/dustforge-*.db 2>/dev/null || true; } | head -3
+    exit 0 ;;
+  rollback)
+    [ $# -eq 2 ] && [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "usage: dustforge-deploy rollback <40-hex sha>"
+    to=$2
+    g merge-base --is-ancestor "$to" HEAD || die "$to is not an ancestor of the live commit"
+    clean_tree
+    prev=$(g rev-parse HEAD)
+    g diff --quiet "$to" "$prev" -- package.json package-lock.json || die "dependencies differ; an operator rolls this back"
+    backup
+    g reset -q --keep "$to"
+    restart
+    echo "rolled back $prev -> $to; dustforge restarts in 3 s"
+    exit 0 ;;
+esac
+
+[ $# -eq 1 ] && [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die "usage: dustforge-deploy <40-hex sha> | status | rollback <sha>"
+sha=$1
+g fetch -q origin main
+g merge-base --is-ancestor "$sha" origin/main || die "$sha is not on origin/main"
+prev=$(g rev-parse HEAD)
+[ "$prev" != "$sha" ] || { echo "already at $sha"; exit 0; }
+g merge-base --is-ancestor "$prev" "$sha" || die "not a fast-forward from $prev"
+clean_tree
+g diff --quiet "$prev" "$sha" -- package.json package-lock.json || die "dependencies changed; an operator installs them"
+backup
+g merge -q --ff-only "$sha"
+restart
+echo "deployed $prev -> $sha; dustforge restarts in 3 s"
