@@ -127,13 +127,21 @@ function syncCachedBalance(db, did) {
  */
 // Every charge and refund row names the token that made it (Aaron 2026-11-06: a billed mail send must be attributable
 // to its token — and through DemiPass egress rows, to the delegation behind it).
+// The column is added at startup (server.js, vault-server.js). This is the fallback for other handles (tests): it is
+// remembered only once the column really exists — an ALTER inside a transaction that rolls back must not be cached
+// as done (#50 review: every charge would then fail until restart).
 const _jtiColumn = new WeakSet();   // per database handle
 function ensureTokenColumn(db) {
   if (_jtiColumn.has(db)) return;
-  try { db.exec('ALTER TABLE identity_transactions ADD COLUMN token_jti TEXT'); } catch (_) {}
-  try { db.exec('CREATE INDEX IF NOT EXISTS idx_it_token_jti ON identity_transactions(token_jti)'); } catch (_) {}
-  _jtiColumn.add(db);
+  let has = false;
+  try { has = db.prepare("SELECT 1 FROM pragma_table_info('identity_transactions') WHERE name = 'token_jti'").get() !== undefined; } catch (_) {}
+  if (!has && !db.inTransaction) {
+    try { db.exec('ALTER TABLE identity_transactions ADD COLUMN token_jti TEXT'); has = true; } catch (_) {}
+    try { db.exec('CREATE INDEX IF NOT EXISTS idx_it_token_jti ON identity_transactions(token_jti)'); } catch (_) {}
+  }
+  if (has) _jtiColumn.add(db);
 }
+function tokenColumn(db) { ensureTokenColumn(db); return _jtiColumn.has(db); }
 function deductBalance(db, did, amount_cents, type, description = '', opts = {}) {
   ensureTokenColumn(db);
   const wallet = db.prepare('SELECT id, status FROM identity_wallets WHERE did = ?').get(did);
@@ -156,8 +164,10 @@ function deductBalance(db, did, amount_cents, type, description = '', opts = {})
     const newBalance = currentBalance - amount_cents;
     const provenance = /fleet|bulk|provision/i.test(type) ? 'fleet_provisioned' : 'organic';
     db.prepare(
-      'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance, token_jti) VALUES (?, ?, ?, ?, ?, ?, ?)'
-    ).run(did, -amount_cents, type, description, newBalance, provenance, (opts && opts.tokenJti) || null);
+      tokenColumn(db)
+        ? 'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance, token_jti) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        : 'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(...[did, -amount_cents, type, description, newBalance, provenance, ...(tokenColumn(db) ? [(opts && opts.tokenJti) || null] : [])]);
 
     // Update cache
     db.prepare('UPDATE identity_wallets SET balance_cents = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
@@ -229,8 +239,10 @@ function creditBalance(db, did, amount_cents, type, description = '', idempotenc
     const provenance = /fleet|bulk|provision/i.test(type) ? 'fleet_provisioned' : 'organic';
 
     db.prepare(
-      'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, idempotency_key, provenance, token_jti) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(did, amount_cents, type, description, newBalance, idempotency_key || null, provenance, (opts && opts.tokenJti) || null);
+      tokenColumn(db)
+        ? 'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, idempotency_key, provenance, token_jti) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        : 'INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, idempotency_key, provenance) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(...[did, amount_cents, type, description, newBalance, idempotency_key || null, provenance, ...(tokenColumn(db) ? [(opts && opts.tokenJti) || null] : [])]);
 
     // Update cache
     db.prepare('UPDATE identity_wallets SET balance_cents = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
@@ -380,7 +392,18 @@ function billingMiddleware(db, actionType, options = {}) {
   };
 }
 
+// Give back a charge for something that never happened (a send the mail server refused): the balance and the DD
+// lots it was spent from, together, with the token id on the row.
+function refundCharge(db, did, amount_cents, type, description = '', opts = {}) {
+  return db.transaction(() => {
+    const r = creditBalance(db, did, amount_cents, type, description, null, opts);
+    if (r && r.ok) { try { require('./dd_ledger').recordUnspend(db, did, amount_cents); } catch (_) {} }
+    return r;
+  })();
+}
+
 module.exports = {
+  refundCharge,
   setAttribution,
   RATE_TABLE,
   deductBalance,

@@ -77,4 +77,18 @@ call POST /api/email/send "$T" '{"to":"","subject":"x","body":"b"}'
 [ "$CODE" = 400 ] && ok "…while a malformed one still gets its 400, not 429 (validation first)" || fail "400 at cap: $CODE"
 call POST /api/relay/forward "$T" '{"subject":"s","body":"b"}'
 [ "$CODE" = 404 ] && [ "$(bal)" = "$B2" ] && ok "/relay/forward with no rules → 404 before any charge" || fail "relay: $CODE bal $(bal)"
+# /relay/forward: each forward takes a slot and its own charge (cap is used up here, so: refused, nothing charged)
+call POST /api/relay/create "$T" '{"forward_to":"fwd1@example.com"}'; call POST /api/relay/create "$T" '{"forward_to":"fwd2@example.com","filter_from":"x"}'
+B3=$(bal); D0=$(grep -c DELIVERED "$S/smtp.log")
+call POST /api/relay/forward "$T" '{"subject":"s","body":"b","original_from":"x@y.z"}'
+[ "$(bal)" = "$B3" ] && [ "$(grep -c DELIVERED "$S/smtp.log")" = "$D0" ] && [ "$CODE" = 429 ] && ok "/relay/forward with the cap used up: nothing sent, nothing charged (each forward needs a slot)" || fail "forward at cap: $CODE $BODY bal $B3→$(bal)"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE email_warmup_daily SET sent = 0\"); c.commit()" "$DB_PATH"
+call POST /api/relay/forward "$T" '{"subject":"s","body":"b","original_from":"x@y.z"}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J forwarded)" = 2 ] && [ "$(slots)" = 2 ] && [ "$(Q "SELECT COUNT(*) FROM identity_transactions WHERE type='relay_forward' AND token_jti='$JTI'")" = 2 ] \
+  && ok "two forwards: two slots, two charges, each row with the token id" || fail "forward: $CODE $BODY slots $(slots)"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE identity_wallets SET balance_cents = 10 WHERE username='mailer'\"); c.execute(\"INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) SELECT did, -(SELECT COALESCE(SUM(amount_cents),0) FROM identity_transactions t WHERE t.did=w.did) + 10, 'adjust', 'smoke: 10 DD left', 10 FROM identity_wallets w WHERE username='mailer'\"); c.execute(\"UPDATE email_warmup_daily SET sent = 0\"); c.commit()" "$DB_PATH"
+D1=$(grep -c DELIVERED "$S/smtp.log")
+call POST /api/relay/forward "$T" '{"subject":"s","body":"b","original_from":"x@y.z"}'
+[ "$(echo "$BODY" | J forwarded)" = 1 ] && [ "$(grep -c DELIVERED "$S/smtp.log")" = "$((D1+1))" ] && ok "a wallet that can pay for one forward gets one, not two (charge checked per forward)" || fail "underfunded forward: $BODY delivered $(( $(grep -c DELIVERED "$S/smtp.log") - D1 ))"
+
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails

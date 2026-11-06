@@ -145,16 +145,25 @@ function createEmailTransport() {
 // mail and internal alerts use the same relay but are exempt from this cap.
 function emailWarmupGuard(req, res, next) {
   if (require('./brain_mail_quota').brainMailQuota(db, req, res, next)) return;
+  const slot = reserveWarmupSlot();
+  if (!slot.ok) return res.status(slot.status).json(slot.body);
+  req.mailSlot = slot;
+  res.once('finish', () => { if (res.statusCode >= 400) slot.release(); });
+  next();
+}
+// One slot of the communal warmup ramp: { ok, release } or { ok: false, status, body }. No ramp configured → a no-op
+// slot. Brain's identity allowance is require('./brain_mail_quota').reserveBrainSlot; reserveMailSlot picks.
+function reserveWarmupSlot(now = Date.now()) {
+  const noop = { ok: true, release() {} };
   const start = process.env.MAIL_WARMUP_START_UTC;
-  if (!start) return next();
+  if (!start) return noop;
   const startMs = Date.parse(start);
-  if (!Number.isFinite(startMs)) return res.status(503).json({ error: 'mail warmup start is invalid' });
+  if (!Number.isFinite(startMs)) return { ok: false, status: 503, body: { error: 'mail warmup start is invalid' } };
   const initial = Number(process.env.MAIL_WARMUP_INITIAL_DAILY_LIMIT || 10);
   const maximum = Number(process.env.MAIL_WARMUP_MAX_DAILY_LIMIT || 100);
   if (!Number.isInteger(initial) || !Number.isInteger(maximum) || initial < 1 || maximum < initial) {
-    return res.status(503).json({ error: 'mail warmup limits are invalid' });
+    return { ok: false, status: 503, body: { error: 'mail warmup limits are invalid' } };
   }
-  const now = Date.now();
   const day = new Date(now).toISOString().slice(0, 10);
   const weeks = Math.max(0, Math.floor((now - startMs) / (7 * 86400000)));
   const limit = Math.min(maximum, initial * (2 ** Math.min(weeks, 30)));
@@ -164,19 +173,21 @@ function emailWarmupGuard(req, res, next) {
       db.prepare('INSERT INTO email_warmup_daily (day, sent) VALUES (?, 0) ON CONFLICT(day) DO NOTHING').run(day);
       return db.prepare('UPDATE email_warmup_daily SET sent = sent + 1 WHERE day = ? AND sent < ?').run(day, limit).changes === 1;
     })();
-    if (!reserved) return res.status(429).json({ error: 'daily mail warmup cap reached', day, limit, remaining: 0 });
+    if (!reserved) return { ok: false, status: 429, body: { error: 'daily mail warmup cap reached', day, limit, remaining: 0 } };
     let released = false;
-    req.mailSlot = { release() {
+    return { ok: true, release() {
       if (released) return; released = true;
       try { db.prepare('UPDATE email_warmup_daily SET sent = MAX(0, sent - 1) WHERE day = ?').run(day); }
       catch (error) { console.error('[email] warmup reservation release failed:', error.message); }
     } };
-    res.once('finish', () => { if (res.statusCode >= 400) req.mailSlot.release(); });
-    next();
   } catch (error) {
     console.error('[email] warmup guard failed:', error.message);
-    res.status(503).json({ error: 'mail warmup unavailable' });
+    return { ok: false, status: 503, body: { error: 'mail warmup unavailable' } };
   }
+}
+function reserveMailSlot(did) {
+  const bq = require('./brain_mail_quota');
+  return did === bq.BRAIN_DID ? bq.reserveBrainSlot(db) : reserveWarmupSlot();
 }
 
 // What is left of today's mail allowance for this caller: Brain's own identity allowance, else the communal warmup
@@ -626,6 +637,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS identity_transactions (
 // Provenance column (additive migration) — tracks origin of transactions for reputation scoring
 try { db.exec("ALTER TABLE identity_transactions ADD COLUMN provenance TEXT DEFAULT 'organic'"); } catch(_) {}
 try { db.exec("ALTER TABLE identity_transactions ADD COLUMN idempotency_key TEXT"); } catch(_) {} // vault-server.js used to add it; a fresh database needs it for idempotent credits
+// The token that made each charge/refund (billing.js; Aaron 2026-11-06: every send row carries its token id).
+try { db.exec("ALTER TABLE identity_transactions ADD COLUMN token_jti TEXT"); } catch(_) {}
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_it_token_jti ON identity_transactions(token_jti)"); } catch(_) {}
 
 // ── Invite Keys ──
 db.exec(`CREATE TABLE IF NOT EXISTS invite_keys (
@@ -1891,7 +1905,7 @@ app.post('/api/billing/topup', (req, res) => {
 
 // Order: authenticate (no charge) → headers → validate → reserve a cap slot → charge → send. A send the mail server
 // refuses is refunded (it never became mail) and its slot given back.
-app.post('/api/email/send', billing.billingMiddleware(db, 'email_send', { cost: 0 }), mailHeaders, validateEmailSend, emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+app.post('/api/email/send', rateLimitStandard, mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
@@ -1914,7 +1928,8 @@ app.post('/api/email/send', billing.billingMiddleware(db, 'email_send', { cost: 
     // Refused by the mail server: it never became mail, so the charge comes back (same token id on the refund row).
     let refunded = 0;
     if (req.billing && req.billing.deducted > 0) {
-      const r = billing.creditBalance(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'email_send_refund', 'Refund: mail not accepted by the mail server', null, { tokenJti: req.billing.token_jti || null });
+      // refundCharge also gives back the DD lots it was spent from (chargeback lineage stays intact — #50 review).
+      const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'email_send_refund', 'Refund: mail not accepted by the mail server', { tokenJti: req.billing.token_jti || null });
       if (r && r.ok) refunded = req.billing.deducted;
     }
     res.status(502).json({ error: "delivery failed: " + e.message, refunded });
@@ -1975,28 +1990,31 @@ app.delete('/api/relay/remove', rateLimitStandard, billing.billingMiddleware(db,
 });
 
 // POST /api/relay/forward — trigger forwarding for a message (called internally or by silicon)
-// Validated (and the rules looked up) before the charge: a call with nothing to forward costs nothing.
-app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 'email_send', { cost: 0 }), mailHeaders, (req, res, next) => {
+// Validated (and the rules looked up) before anything is charged. Each forward is a mail: it takes a cap slot and its
+// own checked charge (token id on the row) before it is sent, and a forward the mail server refuses is given back —
+// only forwards that went out are paid for (#50 review: 5 mails per call, no slot, an empty wallet paid nothing).
+app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), (req, res, next) => {
   const { subject, body } = req.body || {};
   if (!subject || !body || typeof subject !== 'string' || typeof body !== 'string') return res.status(400).json({ error: 'subject and body required' });
+  if (subject.length > 900 || /[\r\n]/.test(subject)) return res.status(400).json({ error: 'subject: one line, at most 900 characters' });
   if (!db.prepare('SELECT 1 FROM forward_relays WHERE did = ? AND status = ?').get(req.identity.did, 'active')) return res.status(404).json({ error: 'no active forwarding rules' });
   next();
-}, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+}, async (req, res) => {
   const { subject, body, original_from } = req.body || {};
-
-  const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(req.identity.did);
-  const rules = db.prepare('SELECT * FROM forward_relays WHERE did = ? AND status = ?').all(req.identity.did, 'active');
-
-  if (rules.length === 0) return res.status(404).json({ error: 'no active forwarding rules' });
-
+  const did = req.identity.did, jti = (req.identity.decoded && req.identity.decoded.jti) || null;
+  const cost = billing.RATE_TABLE.email_send;
+  const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did);
+  const rules = db.prepare('SELECT * FROM forward_relays WHERE did = ? AND status = ?').all(did, 'active');
   const fromAddr = wallet ? wallet.username + '@dustforge.com' : 'relay@dustforge.com';
   const t = createEmailTransport();
   const results = [];
-
+  let billed = 0;
   for (const rule of rules) {
-    // Check filter
     if (rule.filter_from !== '*' && original_from && !original_from.includes(rule.filter_from)) continue;
-
+    const slot = reserveMailSlot(did);
+    if (!slot.ok) { results.push({ forward_to: rule.forward_to, status: 'skipped', error: slot.body.error }); continue; }
+    const charge = billing.deductBalance(db, did, cost, 'relay_forward', `Forward to ${rule.forward_to}`, { tokenJti: jti });
+    if (!charge.ok) { slot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: 'payment required' }); continue; }
     try {
       await t.sendMail({
         from: fromAddr,
@@ -2004,21 +2022,18 @@ app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 
         subject: `[Fwd: ${wallet?.username || 'silicon'}] ${subject}`,
         text: `Forwarded from ${fromAddr}\nOriginal sender: ${original_from || 'unknown'}\n\n${body}`,
       });
-
       db.prepare('UPDATE forward_relays SET forwarded_count = forwarded_count + 1 WHERE id = ?').run(rule.id);
-
-      // Bill 1¢ per forward (already billed via middleware for first, additional forwards deducted here)
-      if (results.length > 0) {
-        billing.deductBalance(db, req.identity.did, billing.RATE_TABLE.email_send, 'relay_forward', `Forward to ${rule.forward_to}`);
-      }
-
+      billed += cost;
       results.push({ forward_to: rule.forward_to, status: 'sent' });
     } catch (e) {
+      slot.release();
+      billing.refundCharge(db, did, cost, 'relay_forward_refund', `Refund: forward to ${rule.forward_to} not accepted`, { tokenJti: jti });
       results.push({ forward_to: rule.forward_to, status: 'failed', error: e.message });
     }
   }
-
-  res.json({ ok: true, forwarded: results.length, results, billed: results.length });
+  const sent = results.filter(r => r.status === 'sent').length;
+  res.status(sent || !results.length ? 200 : (results.some(r => r.error === 'payment required') ? 402 : 429))
+    .json({ ok: sent > 0, forwarded: sent, results, billed });
 });
 
 // ── Inbound MTA hook: COD mail forwarding ───────────────────────────────────
