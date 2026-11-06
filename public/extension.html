@@ -144,7 +144,8 @@
     var ua = navigator.userAgent || '';
     var uad = navigator.userAgentData;
     var brands = (uad && uad.brands ? uad.brands.map(function (b) { return b.brand; }) : []);
-    var mobile = uad ? !!uad.mobile : /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+    // Android tablets asking for the desktop site report mobile=false; they still can't run extensions.
+    var mobile = uad ? (!!uad.mobile || uad.platform === 'Android') : /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
     var css = window.CSS && CSS.supports ? CSS.supports.bind(CSS) : function () { return false; };
 
     // Gecko: Firefox token in the UA and a Gecko-only CSS feature (Zen and other Firefox builds look the same).
@@ -161,8 +162,10 @@
       var brave = false;
       try { brave = !!(navigator.brave && await navigator.brave.isBrave()); } catch (e) {}
       if (brave) return { target: 'chrome', name: 'Brave' };
+      // Apps built on WebView2 look like Edge but can't run extensions.
+      if (brands.indexOf('Microsoft Edge WebView2') >= 0) return { target: 'other' };
       if (brands.indexOf('Microsoft Edge') >= 0 || /\bEdg\//.test(ua)) return { target: 'chrome', name: 'Edge' };
-      if (/\bOPR\/|\bVivaldi\b|\bYaBrowser\b|\bSamsungBrowser\b/.test(ua) || brands.indexOf('Opera') >= 0) return { target: 'other' };
+      if (/\bOPR\/|\bYaBrowser\b|\bSamsungBrowser\b/.test(ua) || brands.indexOf('Opera') >= 0) return { target: 'other' };
       if (brands.indexOf('Google Chrome') >= 0) return { target: 'chrome', name: 'Chrome' };
       // Plain Chromium (and builds that report only the Chromium brand) install from the Chrome Web Store too.
       if (brands.indexOf('Chromium') >= 0) return { target: 'chrome', name: 'Chromium' };

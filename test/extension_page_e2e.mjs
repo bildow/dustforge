@@ -167,6 +167,10 @@ async function chromium(name, binary, expectName) {
           brands: ['Opera', 'Chromium'], mobile: false, platform: 'Windows', target: 'other' },
         { as: 'android-chrome', ua: `Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${V} Mobile Safari/537.36`,
           brands: ['Google Chrome', 'Chromium'], mobile: true, platform: 'Android', target: 'other', why: /do not run extensions/ },
+        { as: 'android-tablet-desktop-site', ua: `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${V} Safari/537.36`,
+          brands: ['Google Chrome', 'Chromium'], mobile: false, platform: 'Android', target: 'other', why: /do not run extensions/ },
+        { as: 'webview2', ua: `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${V} Safari/537.36 Edg/${V}`,
+          brands: ['Microsoft Edge WebView2', 'Microsoft Edge', 'Chromium'], mobile: false, platform: 'Windows', target: 'other' },
       ];
       for (const c of cases) {
         await cdp.send('Emulation.setUserAgentOverride', { userAgent: c.ua, userAgentMetadata: {
