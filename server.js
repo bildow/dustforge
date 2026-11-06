@@ -2567,6 +2567,9 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN ownership TEXT DEFAULT 's
 // Browser fill: the origins a login may be filled into (JSON array, exact origins) and the account it belongs to.
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN fill_origins TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN fill_username TEXT DEFAULT NULL"); } catch(_) {}
+// Origins added to an existing login by a session without the PIN (red team item 13 / review M5): pending until the
+// owner approves a fill there in the wallet (that approval takes the PIN and shows the origin). Agents never fill them.
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN fill_origins_pending TEXT DEFAULT NULL"); } catch(_) {}
 // One fill: asked by a session (the extension or an agent's fill tool), approved on another (the phone wallet,
 // with the PIN) or by a silicon permission, redeemed once by the asking session.
 try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_fill_requests (
@@ -3005,17 +3008,51 @@ function blindkeyPatternMatch(pattern, value) {
   return cleanValue === cleanPattern;
 }
 
+// A URL a secret is sent to, as fetch() and git will actually request it (#43 re-review N1): parsed by the WHATWG URL
+// parser, so "../", "%2e%2e" and "\" segments are resolved before any scope is matched; https only (a pattern for
+// https must never let the token go out in clear); no user:password@ part; no fragment. Returns the string or null.
+function canonicalTargetUrl(raw) {
+  if (typeof raw !== 'string' || !raw || raw.length > 2048) return null;
+  let u; try { u = new URL(raw); } catch (_) { return null; }
+  if (u.protocol !== 'https:' || u.username || u.password || !u.hostname) return null;
+  // Encoded separators and dots pass the parser untouched but some servers (nginx proxy_pass with a path, frameworks
+  // that decode before routing) turn them into a traversal: never sent (#43 re-audit follow-up 1).
+  if (/%(2f|5c|2e|25)/i.test(u.pathname)) return null;   // (callers' message: see enforceBlindkeyContext)
+  u.hash = '';
+  return u.origin + u.pathname + u.search;
+}
+// A scope's URL pattern against a canonical URL: '*' or empty = any (host lists still apply); "https://host/path*" =
+// that host, path starting with that prefix; an exact pattern = that URL. A pattern's host is matched whole: a prefix
+// ending inside the host ("https://api.github.com*") never reaches "api.github.com.evil.example".
+function urlPatternMatch(pattern, canonical) {
+  if (!pattern || pattern === '*') return true;
+  if (!canonical) return false;
+  const wild = pattern.endsWith('*');
+  const body = wild ? pattern.slice(0, -1) : pattern;
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(body) ? body : 'https://' + body;
+  let p; try { p = new URL(withScheme || 'https://invalid.'); } catch (_) { return false; }
+  if (p.protocol !== 'https:') return false;
+  let v; try { v = new URL(canonical); } catch (_) { return false; }
+  if (v.host !== p.host) return false;
+  const hostOnly = !/^https?:\/\/[^/]+\//i.test(withScheme);   // "https://host" or "https://host*": the whole host
+  if (hostOnly) return wild || (v.pathname === '/' && !v.search);
+  const pathPrefix = p.pathname + p.search;
+  const vPath = v.pathname + v.search;
+  return wild ? vPath.startsWith(pathPrefix) : vPath === pathPrefix;
+}
+
 // Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
 function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   const insertCtx = db.prepare(`
-    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, command_allowlist)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(secret_id, context_name) DO UPDATE SET
       action_type = excluded.action_type,
       target_url_pattern = excluded.target_url_pattern,
       target_host_pattern = excluded.target_host_pattern,
       allowed_by = excluded.allowed_by,
-      max_uses = excluded.max_uses
+      max_uses = excluded.max_uses,
+      command_allowlist = excluded.command_allowlist
   `);
   let created = 0;
   for (const ctx of contexts) {
@@ -3029,7 +3066,8 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       ctx.target_url_pattern || '*',
       ctx.target_host_pattern || '*',
       allowedBy,
-      ctx.max_uses || 0
+      ctx.max_uses || 0,
+      ctx.action_type === 'ssh_exec' ? (parseAllowedCommands(ctx.allowed_commands).value || '[]') : null   // invalid or absent → nothing runs
     );
     created++;
   }
@@ -3037,12 +3075,116 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
 }
 
 // Enforce context rules on a blindkey/use request. Returns { allowed, error }
+// SSH command allow-list per context (red team items 2, 3). NULL = any command (legacy contexts made before
+// 2026-11-05); a JSON array = only these: an exact command, or "prefix *" — the prefix followed by plain words (no shell
+// syntax). New ssh_exec contexts start as [] (nothing runs) until the owner lists commands with the PIN: the
+// forced-command pattern is the default.
+try { db.exec('ALTER TABLE blindkey_contexts ADD COLUMN command_allowlist TEXT DEFAULT NULL'); } catch (_) {}
+const PLAIN_WORDS_RE = /^[A-Za-z0-9._\/:=@%+,-]+( [A-Za-z0-9._\/:=@%+,-]+)*$/;
+function parseAllowedCommands(v) {
+  if (v === undefined || v === null) return { value: null };
+  if (!Array.isArray(v) || v.length > 50 || v.some(c => typeof c !== 'string' || !c.trim() || c.length > 300 || /[\u0000-\u001f]/.test(c))) {
+    return { error: 'allowed_commands: an array of up to 50 commands (an exact command, or "prefix *")' };
+  }
+  return { value: JSON.stringify([...new Set(v.map(c => c.trim()))]) };
+}
+// What is matched is what runs: with sudo the call is "sudo <command>", so a root command needs its own "sudo …" entry.
+// A "prefix *" entry's words may not start with "-" (no added options) or hold ".." (no climbing out of a path); they
+// may still be absolute paths. Text on stdin is code to an interpreter, so it is allowed only by an entry that ends in
+// " <stdin" (e.g. "tee -a /srv/app.log <stdin").
+const STDIN_SUFFIX = ' <stdin';
+function wildcardWordsOk(rest) {
+  return PLAIN_WORDS_RE.test(rest) && rest.split(' ').every(w => !w.startsWith('-') && !w.includes('..'));
+}
+function commandRefusal(contextId, command, { sudo = false, stdin } = {}) {
+  if (!contextId) return 'this use has no scope to check the command against';
+  const row = db.prepare('SELECT command_allowlist FROM blindkey_contexts WHERE id = ?').get(contextId);
+  if (!row) return 'this use has no scope to check the command against';
+  if (row.command_allowlist === null || row.command_allowlist === undefined) return null;   // legacy: any command
+  let list = [];
+  try { list = JSON.parse(row.command_allowlist) || []; } catch (_) { return 'this scope has an unreadable command list; its owner must set it again'; }
+  const cmd = (sudo ? 'sudo ' : '') + String(command || '').trim();
+  const withStdin = stdin !== undefined && stdin !== null;
+  for (const raw of list) {
+    const stdinOk = raw.endsWith(STDIN_SUFFIX);
+    const entry = stdinOk ? raw.slice(0, -STDIN_SUFFIX.length).trim() : raw;
+    if (withStdin && !stdinOk) continue;
+    if (entry === cmd) return null;
+    if (entry.endsWith(' *')) {
+      const prefix = entry.slice(0, -1);   // keeps the trailing space
+      if (cmd.startsWith(prefix) && wildcardWordsOk(cmd.slice(prefix.length))) return null;
+    }
+  }
+  if (withStdin && list.length) return 'this command may not read stdin here — its owner allows that per command in the DemiPass app';
+  return list.length ? 'this command is not on the allowed list for this secret — its owner adds commands in the DemiPass app' : 'no commands are allowed for this secret yet — its owner adds them in the DemiPass app (forced commands)';
+}
+// ssh_exec's key_name: a second secret of the caller's, used as the login. It is a use of that secret too, so it needs
+// its own scope (an ssh_exec context on this host), the same command on its own list, and standard depth (a deeper one
+// would skip its own approval). Returns { secret, value } or { error, status }; the caller writes its egress row.
+function keyNameSecret(req, keyName, targetHost, command, opts) {
+  const keySecret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, keyName, 'active');
+  if (!keySecret) return { status: 404, error: `key_name secret '${keyName}' not found` };
+  if (useApprovals.depthOf(keySecret) !== 'standard') return { status: 403, error: `key_name secret '${keyName}' is ${useApprovals.depthOf(keySecret)}: use it directly (its own /use asks for approval), not as key_name` };
+  const picked = soleContext(keySecret, { action: 'ssh_exec', targetHost });
+  const chk = enforceBlindkeyContext(keySecret, picked.context, 'ssh_exec', null, targetHost);
+  if (!chk.allowed) return { status: 403, error: `key_name secret '${keyName}': ${chk.error}` };
+  const why = commandRefusal(chk.context_id, command, opts);
+  if (why) {
+    logSecurityEvent('command_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'ssh_exec', target: targetHost, ip: req.ip, context: { secret: keySecret.name, key_name: true } });
+    return { status: 403, error: `key_name secret '${keyName}': ${why}` };
+  }
+  let value;
+  try { value = blindkeyDecrypt(keySecret.encrypted_value); } catch (_) { return { status: 500, error: 'failed to decrypt key_name secret' }; }
+  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(keySecret.id);
+  db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(chk.context_id);
+  return { secret: keySecret, value };
+}
+
+// The body of an approved call as stored when it was offered to the owner (use_approvals boundCall), or null.
+function approvedBody(callJson) {
+  if (!callJson) return null;
+  try { const c = JSON.parse(callJson); return c && c.body && typeof c.body === 'object' && !Array.isArray(c.body) ? c.body : null; } catch (_) { return null; }
+}
+
+// Creating, widening or approving a scope (red team item 13): the secret's owner, as a person in their own session, with
+// the PIN for intent scope:<secret id> — the one factor no agent holds. Admin key passes. Returns true or has answered.
+function scopeChangeGate(req, res, secret, what) {
+  const actor = getDemiPassActor(req, null);
+  if (actor.ok && actor.mode === 'admin') return true;
+  const auth = getBearerIdentity(req);
+  const agent = !auth.ok || auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'));
+  if (!auth.ok || agent || !secret || secret.did !== auth.did) {
+    logSecurityEvent('scope_widen_denied', 'critical', { caller_did: auth.did || null, agent_name: auth.agent_name, capability: what, target: secret ? secret.name : null, ip: req.ip,
+      error: !secret || secret.did !== auth.did ? 'not the owner' : 'agent token' });
+    res.status(403).json({ error: 'only the secret\'s owner, in their own session with the PIN, can widen what this secret reaches' });
+    return false;
+  }
+  const intent = `scope:${secret.id}`;
+  if (!gateFresh(auth.did, 'pin', auth, intent)) { res.status(403).json(gateMissing(what, ['pin'], ['pin'], intent)); return false; }
+  const refused = spendSingleUse(auth.did, what, ['pin'], auth, intent);
+  if (refused) { res.status(refused.status || 403).json(refused); return false; }
+  return true;
+}
+
+// The outbound log: one blindkey_events row per connection /use makes, written right before it (red team item 2: a
+// refused use must show no row). Never holds a value — the action and the target only.
+function egressLog(req, secret, action, target) {
+  try {
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+      .run('egress', (req.identity && req.identity.did) || '', secret ? secret.id : null, null, JSON.stringify({ action, target: String(target || '').slice(0, 300) }));
+  } catch (_) {}
+}
+
+const URL_ACTIONS = new Set(['http_header', 'http_body', 'git_clone', 'database_connect']);
+const HOST_ACTIONS = new Set(['ssh_exec', 'smtp_auth']);
 function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost) {
+  // A frozen secret is used by nothing — /use, request-token, key_name, Rowen, rotation (#43 re-review N5).
+  if (secret.frozen) return { allowed: false, frozen: true, error: 'secret is frozen — its owner unfreezes it in the DemiPass app' };
   const contexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(secret.id);
 
-  // Backward compatible: no contexts exist and none requested → allow
-  if (contexts.length === 0 && !contextName) {
-    return { allowed: true };
+  // No scope, no use (red team item 12): a secret with no contexts used to be usable against every allow-listed host.
+  if (contexts.length === 0) {
+    return { allowed: false, error: 'this secret has no usage scope yet — its owner sets one in the DemiPass app (host, route, commands)' };
   }
 
   // Contexts exist but none specified → deny
@@ -3071,15 +3213,20 @@ function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHo
     return { allowed: false, error: `context '${contextName}' allows action '${ctx.action_type}' but '${action}' was requested` };
   }
 
-  // Check target_url_pattern for http actions
-  if ((action === 'http_header' || action === 'http_body') && targetUrl) {
-    if (!blindkeyPatternMatch(ctx.target_url_pattern, targetUrl)) {
+  // The scope's pattern is checked for every action that connects, and a call that names no target is refused, not
+  // waved through (red team items 2, 11): URL actions against target_url_pattern, host actions against
+  // target_host_pattern. The target checked here is the one the token carries and the action then uses.
+  let canonicalUrl = null;
+  if (URL_ACTIONS.has(action)) {
+    if (!targetUrl) return { allowed: false, error: `${action} needs a target URL (params.${action === 'git_clone' ? 'repo_url' : 'url'})` };
+    canonicalUrl = canonicalTargetUrl(targetUrl);
+    if (!canonicalUrl) return { allowed: false, error: 'target URL must be a plain https URL: no user:password@ part, no encoded / \\ . or % in the path' };
+    if (!urlPatternMatch(ctx.target_url_pattern, canonicalUrl)) {
       return { allowed: false, error: `target URL does not match context pattern '${ctx.target_url_pattern}'` };
     }
   }
-
-  // Check target_host_pattern for ssh_exec
-  if (action === 'ssh_exec' && targetHost) {
+  if (HOST_ACTIONS.has(action)) {
+    if (!targetHost) return { allowed: false, error: `${action} needs a target host (params.${action === 'smtp_auth' ? 'smtp_host' : 'target_host'})` };
     if (!blindkeyPatternMatch(ctx.target_host_pattern, targetHost)) {
       return { allowed: false, error: `target host does not match context pattern '${ctx.target_host_pattern}'` };
     }
@@ -3093,6 +3240,7 @@ function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHo
   return {
     allowed: true,
     context_id: ctx.id,
+    target_url: canonicalUrl,   // URL actions: the URL to request and log (canonical), never the raw one asked
     context: {
       id: ctx.id,
       context_name: ctx.context_name,
@@ -3312,7 +3460,9 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       refCode = generateRefCode(resolvedType, name);
       db.prepare("UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?").run(refCode, stored.id);
     }
-    if (resolvedOrigins !== null) db.prepare('UPDATE blindkey_secrets SET fill_origins = ? WHERE id = ?').run(resolvedOrigins, stored.id);
+    // Storing sets the value too, so the origins given here bind a value the caller itself just supplied: they apply
+    // at once (unlike /origins, which binds an existing value to a new site and so waits for the owner).
+    if (resolvedOrigins !== null) db.prepare("UPDATE blindkey_secrets SET fill_origins = ?, fill_origins_pending = '[]' WHERE id = ?").run(resolvedOrigins, stored.id);
     if (login !== undefined && login !== null) db.prepare('UPDATE blindkey_secrets SET fill_username = ? WHERE id = ?').run(login, stored.id);
     if (accountUsername !== null) db.prepare('UPDATE blindkey_secrets SET account_username = ? WHERE id = ?').run(accountUsername, stored.id);
     if (note !== undefined && note !== null) db.prepare('UPDATE blindkey_secrets SET note = ? WHERE id = ?').run(cleanLabel(note, 500).trim(), stored.id);
@@ -3328,8 +3478,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       const hostPattern = boundHost && defaultAction === 'ssh_exec' ? boundHost.replace(/:\d+$/, '') : '*';
       const urlPattern = boundHost && ['http_header', 'http_body'].includes(defaultAction) ? `https://${boundHost}/*` : '*';
       db.prepare(
-        "INSERT OR IGNORE INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, 'default', ?, ?, ?, ?)"
-      ).run(stored.id, defaultAction, urlPattern, hostPattern, req.identity.did);
+        "INSERT OR IGNORE INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, command_allowlist) VALUES (?, 'default', ?, ?, ?, ?, ?)"
+      ).run(stored.id, defaultAction, urlPattern, hostPattern, req.identity.did, defaultAction === 'ssh_exec' ? '[]' : null);
     }
 
     // Buoy ingestion tick — anchor this deposit in the tick chain
@@ -3478,13 +3628,20 @@ app.post('/api/blindkey/origins', rateLimitFill, (req, res) => {
   if (parsed.error) return res.status(400).json({ error: `origins: ${parsed.error}` });
   const secret = fillSecret(auth.did, req.body || {});
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
-  let next = parsed.origins;
-  if (mode === 'add') next = [...new Set([...browserFill.storedOrigins(secret.fill_origins), ...parsed.origins])];
-  if (next.length > browserFill.MAX_ORIGINS) return res.status(400).json({ error: `origins: at most ${browserFill.MAX_ORIGINS} origins per secret` });
-  db.prepare('UPDATE blindkey_secrets SET fill_origins = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(JSON.stringify(next), secret.id);
+  // Narrowing applies at once. Widening never does from here: a new origin waits (fill_origins_pending) until the
+  // owner approves a fill on it in the wallet with the PIN, so a token alone cannot point the login at a new site.
+  const active = browserFill.storedOrigins(secret.fill_origins);
+  const pendingNow = browserFill.storedOrigins(secret.fill_origins_pending);
+  const wanted = mode === 'add' ? [...new Set([...active, ...pendingNow, ...parsed.origins])] : parsed.origins;
+  if (wanted.length > browserFill.MAX_ORIGINS) return res.status(400).json({ error: `origins: at most ${browserFill.MAX_ORIGINS} origins per secret` });
+  const nextActive = active.filter(o => wanted.includes(o));
+  const nextPending = wanted.filter(o => !active.includes(o));
+  db.prepare('UPDATE blindkey_secrets SET fill_origins = ?, fill_origins_pending = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+    .run(JSON.stringify(nextActive), JSON.stringify(nextPending), secret.id);
   db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
-    .run('fill_origins_set', auth.did, secret.id, null, JSON.stringify({ origins: next }));
-  res.json({ ok: true, ref: secret.ref_code, name: secret.name, origins: next });
+    .run('fill_origins_set', auth.did, secret.id, null, JSON.stringify({ origins: nextActive, pending: nextPending }));
+  res.json({ ok: true, ref: secret.ref_code, name: secret.name, origins: nextActive, pending_origins: nextPending,
+    ...(nextPending.length ? { note: 'a new site is confirmed the first time you approve a fill there in your DemiPass wallet' } : {}) });
 });
 
 // GET /api/blindkey/fill/candidates?origin= — the logins this caller could fill on that origin. Never a value.
@@ -3492,9 +3649,9 @@ app.get('/api/blindkey/fill/candidates', rateLimitFill, (req, res) => {
   const auth = fillAuth(req, res); if (!auth) return;
   const origin = browserFill.normalizeOrigin(String(req.query.origin || ''));
   if (!origin) return res.status(400).json({ error: 'origin must be an https URL (http only for localhost)' });
-  const rows = db.prepare(`SELECT * FROM blindkey_secrets WHERE did = ? AND status = 'active' AND fill_origins IS NOT NULL AND fill_origins != '[]' ORDER BY name`).all(auth.did);
+  const rows = db.prepare(`SELECT * FROM blindkey_secrets WHERE did = ? AND status = 'active' AND ((fill_origins IS NOT NULL AND fill_origins != '[]') OR (fill_origins_pending IS NOT NULL AND fill_origins_pending != '[]')) ORDER BY name`).all(auth.did);
   const candidates = rows
-    .filter(s => browserFill.storedOrigins(s.fill_origins).includes(origin))
+    .filter(s => browserFill.storedOrigins(s.fill_origins).includes(origin) || (!auth.silicon && browserFill.storedOrigins(s.fill_origins_pending).includes(origin)))
     .filter(s => !auth.silicon || siliconMayFill(auth.agent_name, s))
     .map(s => ({ ref: s.ref_code, name: s.name, username: s.fill_username || '', secret_type: s.secret_type, frozen: Boolean(s.frozen) }));
   res.json({ ok: true, origin, candidates });
@@ -3510,7 +3667,10 @@ app.post('/api/blindkey/fill/request', rateLimitFill, (req, res) => {
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
   if (secret.frozen) return res.status(423).json({ error: 'secret is frozen — unfreeze before use', frozen: true });
   const bound = browserFill.storedOrigins(secret.fill_origins);
-  if (!bound.includes(origin)) {
+  // A pending origin may be asked for by a person's session only: the request waits for the owner's PIN in the
+  // wallet, and approving it is what confirms the origin. An agent fills active origins only.
+  const pendingOrigin = !auth.silicon && !bound.includes(origin) && browserFill.storedOrigins(secret.fill_origins_pending).includes(origin);
+  if (!bound.includes(origin) && !pendingOrigin) {
     logSecurityEvent('fill_origin_refused', 'warn', { caller_did: auth.did, agent_name: auth.agent_name, capability: 'browser_fill', target: secret.name, ip: req.ip, context: { origin, bound } });
     return res.status(403).json({ error: `this login is not bound to ${origin}`, bound_origins: bound });
   }
@@ -3588,11 +3748,13 @@ app.post('/api/blindkey/fill/withdraw', rateLimitFill, (req, res) => {
 app.get('/api/blindkey/fill/pending', rateLimitFill, (req, res) => {
   const auth = fillAuth(req, res); if (!auth) return;
   if (auth.silicon) return res.status(403).json({ error: 'only the owner approves fills' });
-  const rows = db.prepare(`SELECT r.*, s.name, s.ref_code, s.fill_username FROM blindkey_fill_requests r JOIN blindkey_secrets s ON s.id = r.secret_id
+  const rows = db.prepare(`SELECT r.*, s.name, s.ref_code, s.fill_username, s.fill_origins FROM blindkey_fill_requests r JOIN blindkey_secrets s ON s.id = r.secret_id
                            WHERE r.did = ? AND r.status = 'pending' ORDER BY r.id`).all(auth.did);
   const session = gateSession(auth);
   const requests = rows.filter(r => !fillExpired(r)).map(r => ({
     id: r.id, intent: `fill:${r.id}`, name: r.name, ref: r.ref_code, username: r.fill_username || '', origin: r.origin,
+    // Not yet confirmed for this login: approving binds the site for good (agents with a fill grant then fill it).
+    new_origin: !browserFill.storedOrigins(r.fill_origins).includes(r.origin),
     client_label: r.client_label || '', created_at: r.created_at, expires_at: r.expires_at,
     own_session: r.requester_session === session,   // the wallet cannot approve a request it made itself
   }));
@@ -3628,7 +3790,18 @@ app.post('/api/blindkey/fill/:id/approve', rateLimitFill, (req, res) => {
   if (refused) return res.status(refused.status || 403).json(refused);
   const changed = db.prepare("UPDATE blindkey_fill_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP, decided_session = ? WHERE id = ? AND status = 'pending'").run(session, row.id).changes;
   if (changed !== 1) return res.status(409).json({ error: 'this fill request was decided meanwhile' });
-  res.json({ ok: true, id: row.id, status: 'approved', origin: row.origin });
+  // Approving a fill on a pending origin (shown on the card) is the owner confirming that origin with the PIN.
+  const pendingList = browserFill.storedOrigins(secret.fill_origins_pending);
+  let confirmed = false;
+  if (pendingList.includes(row.origin)) {
+    const active = browserFill.storedOrigins(secret.fill_origins);
+    db.prepare('UPDATE blindkey_secrets SET fill_origins = ?, fill_origins_pending = ? WHERE id = ?')
+      .run(JSON.stringify([...new Set([...active, row.origin])]), JSON.stringify(pendingList.filter(o => o !== row.origin)), secret.id);
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+      .run('fill_origin_confirmed', auth.did, secret.id, null, JSON.stringify({ origin: row.origin, fill_request: row.id }));
+    confirmed = true;
+  }
+  res.json({ ok: true, id: row.id, status: 'approved', origin: row.origin, ...(confirmed ? { origin_confirmed: true } : {}) });
 });
 
 // POST /api/blindkey/fill/:id/deny
@@ -4086,8 +4259,8 @@ function soleContext(secret, { action = null, targetUrl = null, targetHost = nul
   if (all.length === 1) return { context: all[0].context_name };
   if (action || targetUrl || targetHost) {
     const fit = all.filter(c => (!action || c.action_type === action)
-      && (!targetUrl || !['http_header', 'http_body'].includes(c.action_type) || blindkeyPatternMatch(c.target_url_pattern, targetUrl))
-      && (!targetHost || c.action_type !== 'ssh_exec' || blindkeyPatternMatch(c.target_host_pattern, targetHost)));
+      && (!targetUrl || !URL_ACTIONS.has(c.action_type) || urlPatternMatch(c.target_url_pattern, canonicalTargetUrl(targetUrl)))
+      && (!targetHost || !HOST_ACTIONS.has(c.action_type) || blindkeyPatternMatch(c.target_host_pattern, targetHost)));
     if (fit.length === 1) return { context: fit[0].context_name };
   }
   const names = all.map(c => c.context_name);
@@ -4327,7 +4500,7 @@ function requestUseTokenHandler(req, res) {
     db.prepare(`
       INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at, delegation_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+${expiresInSeconds} seconds'), ?)
-    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, target_url || '', target_host || '', delegation ? delegation.id : null);
+    `).run(token, callerDid, secret.id, ctxCheck.context_id || null, action, ctxCheck.target_url || '', target_host || '', delegation ? delegation.id : null);
 
     // If this was a delegated request, increment use_count and log
     if (delegation) {
@@ -4380,10 +4553,15 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     const p = (b.params && typeof b.params === 'object') ? b.params : {};
     const issueReq = Object.create(req);
     issueReq.body = { ref: b.ref, name: b.name, action: b.action, context: b.context, owner_did: b.owner_did,
-                      target_url: p.url || b.target_url, target_host: p.target_host || b.target_host };
+                      target_url: p.url || p.repo_url || b.target_url, target_host: p.target_host || p.smtp_host || b.target_host };
     const issued = captureJson(requestUseTokenHandler, issueReq);
     if (!issued.body || !issued.body.use_token) return res.status(issued.status >= 400 ? issued.status : 500).json(issued.body || { error: 'could not issue a use-token' });
     use_token = issued.body.use_token;
+    // A token this one call minted for itself is spent or dead when the call ends: a refused use never leaves it valid
+    // (refusals would otherwise pile up against the concurrent-token limit).
+    const minted = use_token;
+    // 'close' also fires when the client goes away before the answer ('finish' does not).
+    res.on('close', () => { if (!res.writableFinished || res.statusCode >= 300) { try { db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE token = ? AND status = 'valid'").run(minted); } catch (_) {} } });
   }
 
   // ── Use-token mode ──
@@ -4417,6 +4595,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       return res.status(403).json({ error: 'this secret is no longer yours; ask its owner to share it' });
     }
 
+    // Frozen after the token was issued: the token dies with it (#43 re-audit follow-up 2).
+    if (secret.frozen) {
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
+      return res.status(423).json({ error: 'secret is frozen — its owner unfreezes it in the DemiPass app', frozen: true });
+    }
     let decryptedValue;
     try {
       decryptedValue = blindkeyDecrypt(secret.encrypted_value);
@@ -4440,7 +4623,16 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
       // req.body directly while http_header/http_body/git_clone read req.body.params.
       // Callers that guessed wrong got a silent empty-body failure that impersonated
       // a bad credential. Normalise once here so every case accepts either shape.
-      const action_params = { ...(req.body || {}), ...((req.body || {}).params || {}) };
+      let action_params = { ...(req.body || {}), ...((req.body || {}).params || {}) };
+      // A command off the scope's list is refused before the owner is ever asked to approve it.
+      if (action === 'ssh_exec') {
+        const why = commandRefusal(tokenRow.context_id, action_params.command, { sudo: action_params.sudo, stdin: action_params.stdin });
+        if (why) {
+          db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
+          logSecurityEvent('command_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'ssh_exec', target: target_host, ip: req.ip, context: { secret: secret.name } });
+          return res.status(403).json({ error: why });
+        }
+      }
       // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call
       // (the raw body, top level and params as sent — see use_approvals.js).
       {
@@ -4452,6 +4644,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
           return res.status(g.status).json(g.body);
         }
+        // An approved call runs from what the owner approved (red team item 14): the stored call, in the key order
+        // shown on the card, not this request's own serialization of it.
+        const approved = approvedBody(g.call);
+        if (approved) action_params = { ...approved, ...(approved.params || {}) };
       }
       switch (action) {
         case 'http_header': {
@@ -4468,6 +4664,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(403).json({ error: `host ${urlHost} not in whitelist` });
           }
 
+          egressLog(req, secret, 'http_header', effectiveUrl);   // written before the connection: the outbound log
           const response = await useLimits.secretFetch(effectiveUrl, {
             method,
             headers: { [header_name]: header_prefix + decryptedValue, 'Content-Type': 'application/json' },
@@ -4512,18 +4709,12 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(400).json({ error: 'invalid target_user' });
           }
 
-          let password = decryptedValue;
+          { const why = commandRefusal(tokenRow.context_id, command, { sudo, stdin }); if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'ssh_exec', target: target_host, ip: req.ip, context: { secret: secret.name } }); return res.status(403).json({ error: why }); } }
+          let password = decryptedValue, keySecret = null;
           if (key_name) {
-            const keySecret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, key_name, 'active');
-            if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
-            // The key secret is used as fully as the primary one: one above standard depth would skip its own approval.
-            if (useApprovals.depthOf(keySecret) !== 'standard') return res.status(403).json({ error: `key_name secret '${key_name}' is ${useApprovals.depthOf(keySecret)}: use it directly (its own /use asks for approval), not as key_name` });
-            try {
-              password = blindkeyDecrypt(keySecret.encrypted_value);
-              db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(keySecret.id);
-            } catch (e) {
-              return res.status(500).json({ error: 'failed to decrypt key_name secret' });
-            }
+            const k = keyNameSecret(req, key_name, target_host, command, { sudo, stdin });
+            if (k.error) return res.status(k.status).json({ error: k.error });
+            keySecret = k.secret; password = k.value;
           }
 
           try {
@@ -4531,6 +4722,8 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             // its prompt out of the output) and the command gets whatever follows.
             const remote = sudo ? sudoWrap(command, sudo) : command;
             const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+            egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
+            if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
             const output = sshRun(effectiveUser, target_host, password, remote, { input });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
@@ -4569,6 +4762,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             ? JSON.stringify(body_template).replace(/\{\{SECRET\}\}/g, secretJsonSafe)
             : JSON.stringify({ key: decryptedValue });
 
+          egressLog(req, secret, 'http_body', effectiveUrl);   // written before the connection: the outbound log
           const bodyResponse = await useLimits.secretFetch(effectiveUrl, {
             method: bodyMethod,
             headers: { 'Content-Type': content_type },
@@ -4593,8 +4787,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'git_clone': {
           // Clone a private repo using the secret as a token in the URL
-          const { repo_url, branch } = action_params;
-          if (!repo_url) return res.status(400).json({ error: 'params.repo_url required for git_clone action' });
+          // Only the token's URL (checked against the scope at issue) is cloned; a repo_url in the call must be it.
+          const { branch } = action_params;
+          const repo_url = target_url;
+          if (!repo_url) return res.status(400).json({ error: 'the use-token has no repo URL (params.repo_url when asking for it)' });
+          if (action_params.repo_url && canonicalTargetUrl(action_params.repo_url) !== repo_url) return res.status(403).json({ error: 'params.repo_url does not match the use-token\'s repo URL' });
 
           // FIX #1: whitelist git hosts
           const GIT_ALLOWED_HOSTS = BLINDKEY_GIT_HOSTS;
@@ -4620,6 +4817,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           try {
             // FIX #3: use execFileSync (no shell) to prevent injection
             const { execFileSync } = require('child_process');
+            egressLog(req, secret, 'git_clone', repo_url);   // written before the connection: the outbound log (the URL cloned)
             const cloneOutput = execFileSync('git', cloneArgs, { timeout: 60000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
             const redacted = cloneOutput.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
             result = { cloned: true, dest_dir, stdout: redacted };
@@ -4635,27 +4833,35 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           const { smtp_host, smtp_port = 587, to, subject, body: emailBody, from } = action_params;
           if (!smtp_host || !to || !subject) return res.status(400).json({ error: 'params.smtp_host, to, subject required for smtp_auth action' });
 
-          // FIX #1: smtp host must match token's target_host or be whitelisted
-          const SMTP_ALLOWED_HOSTS = BLINDKEY_SMTP_HOSTS;
-          if (target_host && smtp_host !== target_host) {
-            return res.status(403).json({ error: `smtp_host ${smtp_host} does not match token target_host ${target_host}` });
+          // The host is the token's (checked against the scope at issue), and it is on the global SMTP list either way:
+          // a scope never reaches past the list (red team items 2, 11).
+          if (!target_host || smtp_host !== target_host) {
+            return res.status(403).json({ error: `smtp_host ${smtp_host} does not match token target_host ${target_host || '(none)'}` });
           }
-          if (!target_host && !SMTP_ALLOWED_HOSTS.includes(smtp_host)) {
+          if (!BLINDKEY_SMTP_HOSTS.includes(smtp_host)) {
+            logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, capability: 'smtp_auth', target: smtp_host, error: 'host not in SMTP whitelist', ip: req.ip });
             return res.status(403).json({ error: `smtp_host ${smtp_host} not in whitelist` });
           }
 
           // Secret format: "username:password" or just "password" (username from params)
           const parts = decryptedValue.split(':');
-          const smtpUser = parts.length > 1 ? parts[0] : (req.body.params.smtp_user || '');
+          const smtpUser = parts.length > 1 ? parts[0] : (action_params.smtp_user || '');
           const smtpPass = parts.length > 1 ? parts.slice(1).join(':') : decryptedValue;
 
           try {
+            egressLog(req, secret, 'smtp_auth', smtp_host);   // written before the connection: the outbound log
             const transport = require('nodemailer').createTransport({
               host: smtp_host,
               port: Number(smtp_port),
               secure: Number(smtp_port) === 465,
+              // Off 465, STARTTLS is required: without it nodemailer would AUTH in the clear to a server (or a man in
+              // the middle) that doesn't offer it.
+              requireTLS: Number(smtp_port) !== 465,
+              // A server that stalls (or a TLS handshake that never starts) ends the use, not the request's life.
+              connectionTimeout: 15000, greetingTimeout: 15000, socketTimeout: 30000,
               auth: { user: smtpUser, pass: smtpPass },
-              tls: { rejectUnauthorized: false },
+              // Always verify: AUTH carries the user's password (red team item 11). A bad certificate refuses the use.
+              tls: { rejectUnauthorized: true, servername: smtp_host },
             });
             const info = await transport.sendMail({
               from: from || smtpUser,
@@ -4672,7 +4878,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
         case 'database_connect': {
           // Execute a query against a database using stored credentials
-          const { query } = req.body.params || {};
+          const { query } = action_params;
           // FIX #1: use ONLY the token's pre-validated URL, never caller-supplied db_url
           const db_url = target_url;
           if (!db_url || !query) return res.status(400).json({ error: 'target_url must be set on the use-token, and params.query is required' });
@@ -4686,6 +4892,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             return res.status(403).json({ error: `database host ${dbHost} not in whitelist` });
           }
 
+          egressLog(req, secret, 'database_connect', db_url);   // written before the connection: the outbound log
           const dbResponse = await useLimits.secretFetch(db_url, {
             method: 'POST',
             headers: {
@@ -4754,24 +4961,25 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           .run(secret.id, req.identity.did, action, 'failure', e.message.slice(0, 200), req.identity?.agent_name || '');
       } catch(_) {}
 
-      if (e.code === 'upstream_too_large') {
+      if (e.code === 'upstream_too_large' || e.code === 'upstream_redirect') {
         // The upstream call was made with the secret and is charged, so it also uses up the
-        // token and counts against the delegation and the secret, like a success.
+        // token and counts against the delegation and the secret, like a success. A refused redirect too: the
+        // request went out (the #44 merge left it uncounted — a token could re-send for its 30 s; #43 re-audit).
         try {
           db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
           if (tokenRow.delegation_id) db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
           db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
           if (tokenRow.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
         } catch (_) {}
-        return res.status(413).json(e.body);
+        return res.status(e.code === 'upstream_redirect' ? 502 : 413).json(e.body);
       }
-      if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
       return res.status(500).json({ error: `action failed: ${e.message}` });
     }
   }
 
   // ── Direct mode (backward compatible) ──
-  const { name, action, params, context: contextName } = req.body || {};
+  const { name, action, context: contextName } = req.body || {};
+  let params = (req.body || {}).params;
   if (!name || !action) return res.status(400).json({ error: 'name and action required (or provide use_token)' });
 
   const secret = resolveLatestBlindkeySecret(req.identity.did, name);
@@ -4784,9 +4992,17 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
   if (!ctxCheck.allowed) {
     return res.status(403).json({ error: ctxCheck.error });
   }
+  // A refused command neither runs nor counts against the scope's max_uses.
+  if (action === 'ssh_exec') {
+    const b2 = req.body || {};
+    const why = commandRefusal(ctxCheck.context_id, b2.command, { sudo: b2.sudo, stdin: b2.stdin });
+    if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'ssh_exec', target: targetHost, ip: req.ip, context: { secret: secret.name } }); return res.status(403).json({ error: why }); }
+  }
   {
     const g = useApprovals.gate(secret, approvalCaller(req), { kind: 'use', action, targetHost, targetUrl, params: req.body || {} }, req.body || {});
     if (!g.ok) return res.status(g.status).json(g.body);
+    const approved = approvedBody(g.call);   // red team item 14: run what was approved, as stored
+    if (approved) params = approved.params;
   }
 
   let decryptedValue;
@@ -4796,13 +5012,12 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     return res.status(500).json({ error: 'failed to decrypt secret' });
   }
 
-  // Update usage stats
-  db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
-
-  // Increment context use_count if a context was used
-  if (ctxCheck.context_id) {
-    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
-  }
+  // Usage stats move once the action has run (or reached the upstream), never for a call refused on the way —
+  // a malformed call must not use up a capped scope (#43 re-review N7).
+  const countUse = () => {
+    db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+    if (ctxCheck.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
+  };
 
   // Execute the action with the secret injected
   try {
@@ -4813,8 +5028,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         // Make an HTTP request with the secret as a header value
         // SECURITY: only allow requests to whitelisted API providers
         // The response body is REDACTED to prevent echo-based exfiltration
-        const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = params || {};
-        if (!url) return res.status(400).json({ error: 'params.url required for http_header action' });
+        const { url: askedUrl, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = params || {};
+        if (!askedUrl) return res.status(400).json({ error: 'params.url required for http_header action' });
+        const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
+        if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
 
         // Whitelist: only known API providers — prevents exfiltration to attacker-controlled servers
         // Use the same consolidated whitelist as direct DemiPass use
@@ -4824,6 +5041,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           return res.status(403).json({ error: `host ${urlHost} not in whitelist. Allowed: ${BLINDKEY_HTTP_HOSTS.join(', ')}. Contact support to add hosts.` });
         }
 
+        egressLog(req, secret, 'http_header', url);   // written before the connection: the outbound log
         const response = await useLimits.secretFetch(url, {
           method,
           headers: {
@@ -4909,30 +5127,26 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         if (/^\s*-/.test(command)) return res.status(400).json({ error: 'command must not start with "-"' });
 
         // Optionally load a second secret (e.g. an SSH key) by key_name
-        let password = decryptedValue;
-        if (key_name) {
-          const keySecret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(req.identity.did, key_name, 'active');
-          if (!keySecret) return res.status(404).json({ error: `key_name secret '${key_name}' not found` });
-          // The key secret is used as fully as the primary one: one above standard depth would skip its own approval.
-          if (useApprovals.depthOf(keySecret) !== 'standard') return res.status(403).json({ error: `key_name secret '${key_name}' is ${useApprovals.depthOf(keySecret)}: use it directly (its own /use asks for approval), not as key_name` });
-          try {
-            // Use key_name secret as the password, original secret as supplemental
-            password = blindkeyDecrypt(keySecret.encrypted_value);
-            db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(keySecret.id);
-          } catch (e) {
-            return res.status(500).json({ error: 'failed to decrypt key_name secret' });
-          }
-        }
-
         // Sanitize user and host to prevent injection in the ssh command itself
         if (!/^[a-zA-Z0-9._-]+$/.test(target_user)) {
           return res.status(400).json({ error: 'invalid target_user' });
+        }
+        // (the command was checked against this scope's list before the use was counted — see above)
+
+        // Optionally use a second secret (e.g. an SSH key) by key_name: its own scope and command list (keyNameSecret)
+        let password = decryptedValue, keySecret = null;
+        if (key_name) {
+          const k = keyNameSecret(req, key_name, target_host, command, { sudo, stdin });
+          if (k.error) return res.status(k.status).json({ error: k.error });
+          keySecret = k.secret; password = k.value;
         }
 
         try {
           // No local shell: see sshRun.
           const remote = sudo ? sudoWrap(command, sudo) : command;
           const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
+          egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
+          if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
           const output = sshRun(target_user, target_host, password, remote, { input });
 
           // Redact any echo of credentials in the output
@@ -4957,10 +5171,11 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
         return res.status(400).json({ error: `unknown action: ${action}. Supported: http_header, sign, verify_match, inject_env, ssh_exec` });
     }
 
+    countUse();
     res.json({ ok: true, action, secret_name: name, result });
   } catch (e) {
-    if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
-    if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
+    if (e.code === 'upstream_too_large') { countUse(); return res.status(413).json(e.body); }
+    if (e.code === 'upstream_redirect') { countUse(); return res.status(502).json(e.body); }   // the request went out
     res.status(500).json({ error: `action failed: ${e.message}` });
   }
 });
@@ -5085,9 +5300,9 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     let contextsTransferred = 0;
     for (const ctx of oldContexts) {
       db.prepare(`
-        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0)
-      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
+        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
       contextsTransferred++;
     }
 
@@ -5191,6 +5406,21 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
   if (typeChoice.error) return res.status(400).json(typeChoice);
   const resolvedType = typeChoice.type;
 
+  // Scope set by a fleet owner for its agent (red team item 13): the owner, as a person, with the PIN — checked before
+  // anything is stored, so a first attempt without it leaves no scopeless secret behind and the retry just works. The
+  // secret has no id yet: the intent is scope:0 ("a new deposit's scope"), single-use and bound to this session.
+  if (Array.isArray(contexts) && contexts.length > 0 && !dt.admin) {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok || auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) {
+      logSecurityEvent('scope_widen_denied', 'critical', { caller_did: auth.did || null, capability: 'scope', target: name, ip: req.ip, error: 'agent token', context: { deposit_to: resolvedTargetDid } });
+      return res.status(403).json({ error: 'only the owner, in their own session with the PIN, can set what a deposited secret reaches' });
+    }
+    const intent = 'scope:0';
+    if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('scope', ['pin'], ['pin'], intent));
+    const refused = spendSingleUse(auth.did, 'scope', ['pin'], auth, intent);
+    if (refused) return res.status(refused.status || 403).json(refused);
+  }
+
   try {
     const encrypted = blindkeyEncrypt(value);
     const nameRefused = clearNameForStore(resolvedTargetDid, name);
@@ -5213,7 +5443,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
 
     // Insert contexts if provided
     let contexts_created = 0;
-    if (Array.isArray(contexts) && contexts.length > 0) {
+    if (Array.isArray(contexts) && contexts.length > 0) {   // PIN-gated above
       contexts_created = insertBlindkeyContexts(inserted.id, contexts, 'carbon_deposit');
     }
 
@@ -5319,6 +5549,10 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   }
 
   if (!secret) return res.status(404).json({ error: 'secret not found' });
+  const cmds = parseAllowedCommands((req.body || {}).allowed_commands);
+  if (cmds.error) return res.status(400).json({ error: cmds.error });
+  // A new scope widens what the secret reaches: the owner's PIN (red team item 13).
+  if (!scopeChangeGate(req, res, secret, 'scope')) return;
 
   try {
     const created = insertBlindkeyContexts(secret.id, [{
@@ -5327,12 +5561,13 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
       target_url_pattern: target_url_pattern || target_url || '*',
       target_host_pattern: target_host_pattern || target_host || '*',
       max_uses: max_uses || 0,
+      allowed_commands: cmds.value ? JSON.parse(cmds.value) : undefined,
     }], isAdmin ? 'admin' : 'owner');
 
     if (created === 0) return res.status(400).json({ error: 'failed to create context' });
 
     const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, context_name);
-    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, max_uses: ctx.max_uses, status: ctx.status } });
+    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, max_uses: ctx.max_uses, status: ctx.status, allowed_commands: ctx.command_allowlist ? JSON.parse(ctx.command_allowlist) : null } });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -5354,6 +5589,8 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
   `).get(contextId);
   if (!row) return res.status(404).json({ error: 'context not found' });
   if (actor.mode !== 'admin' && row.did !== actor.did) {
+    // Someone other than the owner — a delegate, say — touching a secret's scope (red team item 2): critical.
+    logSecurityEvent('scope_widen_denied', 'critical', { caller_did: actor.did, capability: 'scope', target: row.secret_name, ip: req.ip, error: 'not the owner', context: { context_id: contextId } });
     return res.status(403).json({ error: 'can only edit your own contexts' });
   }
 
@@ -5365,6 +5602,21 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     max_uses: req.body?.max_uses ?? row.max_uses,
     status: req.body?.status ?? row.status,
   };
+  const cmds = parseAllowedCommands(req.body?.allowed_commands);
+  if (cmds.error) return res.status(400).json({ error: cmds.error });
+  const nextCommands = req.body && 'allowed_commands' in req.body ? cmds.value : row.command_allowlist;
+  // Narrowing stays open to the owner's tokens: revoking, a lower non-zero use cap, fewer allowed commands. Anything
+  // else (a new host, URL, action, a re-activation, more commands, lifting the cap or the list) needs the PIN.
+  const subset = (a, b) => { try { const x = JSON.parse(a || '[]'), y = JSON.parse(b || '[]'); return x.every(c => y.includes(c)); } catch (_) { return false; } };
+  const narrowing = next.context_name === row.context_name && next.action_type === row.action_type
+    && (next.target_url_pattern || '*') === (row.target_url_pattern || '*') && (next.target_host_pattern || '*') === (row.target_host_pattern || '*')
+    && (next.status === row.status || next.status === 'revoked')
+    && (Number(next.max_uses) === Number(row.max_uses) || (Number(next.max_uses) > 0 && (Number(row.max_uses) === 0 || Number(next.max_uses) < Number(row.max_uses))))
+    && (nextCommands === row.command_allowlist || (nextCommands !== null && (row.command_allowlist === null || subset(nextCommands, row.command_allowlist))));
+  if (!narrowing && actor.mode !== 'admin') {
+    const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
+    if (!scopeChangeGate(req, res, secret, 'scope')) return;
+  }
 
   const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
   if (!validActions.includes(next.action_type)) {
@@ -5376,9 +5628,12 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
 
   db.prepare(`
     UPDATE blindkey_contexts
-    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?
+    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?, command_allowlist = ?
     WHERE id = ?
-  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status, contextId);
+  `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status,
+         next.action_type !== 'ssh_exec' ? null
+           // a scope that becomes ssh_exec starts from "nothing runs", never the legacy "any command"
+           : (row.action_type !== 'ssh_exec' ? (nextCommands ?? '[]') : (nextCommands ?? null)), contextId);
 
   const updated = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(contextId);
   res.json({ ok: true, context: updated });
@@ -5599,6 +5854,12 @@ async function handleRowenDeliver(req, res) {
   if (useApprovals.depthOf(secret) !== 'standard') {
     return res.status(403).json({ error: `this secret is ${useApprovals.depthOf(secret)}: each use needs the owner's approval — use POST /api/demipass/use, not a mediated delivery` });
   }
+  // The same forced commands as /use (red team item 3): a mediated delivery is no way around the owner's list.
+  if (action === 'ssh_exec') {
+    const why = commandRefusal(ctxCheck.context_id, (action_params || {}).command);
+    if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: requestor_did, capability: 'ssh_exec', target: targetHost, ip: req.ip, context: { secret: secret.name, mediated: true } }); return res.status(403).json({ error: why }); }
+  }
+  const egressReq = { identity: { did: requestor_did } };
 
   // Generate the use-token (even though we'll redeem it immediately, it's an audit record)
   const useToken = crypto.randomBytes(32).toString('hex');
@@ -5642,8 +5903,10 @@ async function handleRowenDeliver(req, res) {
 
     switch (action) {
       case 'http_header': {
-        const { url, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params || {};
-        if (!url) return res.status(400).json({ error: 'action_params.url required for http_header action' });
+        const { url: askedUrl, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params || {};
+        if (!askedUrl) return res.status(400).json({ error: 'action_params.url required for http_header action' });
+        const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
+        if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
 
         const ALLOWED_HOSTS = BLINDKEY_HTTP_HOSTS;
         let urlHost;
@@ -5656,6 +5919,7 @@ async function handleRowenDeliver(req, res) {
           }
         }
 
+        egressLog(egressReq, secret, 'http_header', url);   // written before the connection: the outbound log
         const response = await useLimits.secretFetch(url, {
           method,
           headers: {
@@ -5690,6 +5954,7 @@ async function handleRowenDeliver(req, res) {
         if (/^\s*-/.test(command)) return res.status(400).json({ error: 'command must not start with "-"' });
         try {
           // No local shell: see sshRun.
+          egressLog(egressReq, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
           const output = sshRun(target_user, target_host, decryptedValue, command);
           const redactedOutput = output.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
           result = { stdout: redactedOutput, exit_code: 0 };
@@ -9082,8 +9347,10 @@ app.post('/api/blindkey/context/requests/:id/approve', rateLimitStandard, (req, 
   }
 
   // Find the secret to get secret_id
-  const secret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(row.did, row.secret_name, 'active');
+  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(row.did, row.secret_name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret no longer exists or is inactive' });
+  // Approving an agent's context request widens the secret's scope: the owner's PIN (red team item 13).
+  if (!scopeChangeGate(req, res, secret, 'scope')) return;
 
   try {
     // Create the actual context in blindkey_contexts
@@ -9490,7 +9757,7 @@ const MENU_SIGNED_OUT = {
 };
 const MENU_CALLS = {
   use: 'POST /api/demipass/use {"ref":"DP-…","params":{"url":"https://…","method":"GET","body":{}}} — one call; DemiPass injects the secret and returns the response, you never see the value. SSH: {"ref","action":"ssh_exec","command":"…"}',
-  use_two_step: 'POST /api/demipass/request-token {"ref"} → {"use_token"} (single use, 30 s), then POST /api/demipass/use {"use_token","params":{…}}',
+  use_two_step: 'POST /api/demipass/request-token {"ref","target_url"} (or "target_host" for ssh_exec/smtp_auth: the token is good for that target only) → {"use_token"} (single use, 30 s), then POST /api/demipass/use {"use_token","params":{…}}',
   names: "a name works in place of a ref, for your own secrets and for ones shared with you; context and action are filled in when there is only one choice",
   ask_for_access: 'POST /api/demipass/access-requests {"owner":"<username>","secret":"<name or ref>","reason":"…"} — the owner approves it in the DemiPass app with their PIN; check GET /api/demipass/access-requests',
   store: 'POST /api/demipass/store {"name","value","secret_type"}',
@@ -11533,6 +11800,16 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
       error: 'Rotation is disabled for this secret. Set rotatable=1 to enable.',
     });
   }
+  // The current password goes to target_host as the SSH login and to sudo there: only a host the secret's own ssh_exec
+  // scope covers (#43 re-review N2 — this route never checked the scope).
+  if (actor.mode !== 'admin') {
+    const picked = soleContext(secret, { action: 'ssh_exec', targetHost: target_host });
+    const chk = enforceBlindkeyContext(secret, picked.context, 'ssh_exec', null, typeof target_host === 'string' ? target_host : null);
+    if (!chk.allowed) {
+      logSecurityEvent('rotate_scope_denied', 'alert', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), ip: req.ip, error: chk.error, context: { secret: secret.name } });
+      return res.status(403).json({ error: `rotation goes only to a host this secret's scope covers: ${chk.error}` });
+    }
+  }
 
   let currentPassword;
   try { currentPassword = blindkeyDecrypt(secret.encrypted_value); }
@@ -11544,13 +11821,20 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const baseName = secret.name.replace(/_v\d+$/, '');
   const target = nextVersionName(ownerDid, baseName, secret.version);
   if (target.conflict) return res.status(409).json({ error: target.conflict });
-  const sshUser = target_user || 'root';
   // Same hosts as every other SSH action. Before 2026-10-28 target_host and target_user went into a shell
   // command on this server unchecked, which let any account run commands here.
   if (typeof target_host !== 'string' || !BLINDKEY_SSH_HOSTS.has(target_host)) {
     logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), error: 'host not in SSH whitelist', ip: req.ip });
     return res.status(403).json({ error: 'host not in SSH whitelist' });
   }
+  // The login rotated is the account the secret was stored for; naming another one is refused (#43 re-audit
+  // follow-up 3: a shared password must not let the caller reset whichever account it names).
+  if (secret.account_username && target_user && target_user !== secret.account_username) {
+    return res.status(403).json({ error: `this secret is the password of '${secret.account_username}'; rotate that account` });
+  }
+  // A secret stored without its account: the caller names it (no silent root), and this rotation records it.
+  if (!secret.account_username && !target_user) return res.status(400).json({ error: 'name the account to rotate (target_user); it is recorded with the new version and binds later rotations' });
+  const sshUser = target_user || secret.account_username;
   if (typeof sshUser !== 'string' || !SSH_USER_RE.test(sshUser)) return res.status(400).json({ error: 'invalid target_user' });
   // The chpasswd script goes to `bash -s` on the host over stdin: no file on this server, and every value is
   // single-quoted for the remote shell (a stored password may hold $, ` or ").
@@ -11560,6 +11844,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     + 'echo ' + done + '\n';
 
   try {
+    egressLog(req, secret, 'rotate_blind', target_host);   // written before the connection: the outbound log
     const result = sshRun(sshUser, target_host, currentPassword, 'bash -s', { input: chpasswdScript(currentPassword, newPassword, 'ROTATED') });
 
     if (!result.includes('ROTATED')) {
@@ -11593,11 +11878,12 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const newRefCode = generateRefCode('password', newName);
     db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code,
                                               provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
-                                              security_depth, gate_policy, fill_origins, fill_username)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)`)
+                                              security_depth, gate_policy, fill_origins, fill_username, account_username)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)`)
       .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
            secret.provider || '', secret.ownership || 'sole', secret.rotatable ?? 1, secret.category, secret.labels, secret.rotation_interval_days,
-           secret.security_depth, secret.gate_policy, secret.fill_origins ?? null, secret.fill_username ?? null);
+           secret.security_depth, secret.gate_policy, secret.fill_origins ?? null, secret.fill_username ?? null,
+           sshUser);   // the account this password now belongs to: kept, so the next rotation is bound to it
 
     const newSecret = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
@@ -11609,8 +11895,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
 
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
     for (const ctx of oldContexts) {
-      db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count) VALUES (?, ?, ?, ?, ?, ?, ?, 0)')
-        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses);
+      db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)')
+        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
     }
 
     db.prepare(`UPDATE blindkey_secrets SET status = 'revoked', replaced_by = ?, ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(newSecret.id, secret.id);
@@ -12972,7 +13258,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
@@ -13350,8 +13636,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
     // Contexts
     const contexts = db.prepare(
-      "SELECT context_name, action_type, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
-    ).all(s.id);
+      "SELECT id, context_name, action_type, target_host_pattern, target_url_pattern, command_allowlist FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
+    ).all(s.id).map(c => ({ ...c, allowed_commands: c.command_allowlist === null ? null : (() => { try { return JSON.parse(c.command_allowlist); } catch (_) { return []; } })(), command_allowlist: undefined }));
 
     let parsedLabels = [];
     try { parsedLabels = JSON.parse(s.labels || '[]'); } catch(_) {}
@@ -13438,6 +13724,9 @@ app.post('/api/blindkey/freeze', rateLimitStandard, (req, res) => {
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
   const frozen = freeze !== false && freeze !== 0 ? 1 : 0;
+  // Freezing is open to any of the owner's tokens (an agent can stop its own use); unfreezing gives the secret its
+  // reach back, so it is the owner's, with the PIN (intent scope:<id>) — #43 re-review N5.
+  if (!frozen && secret.frozen && !scopeChangeGate(req, res, secret, 'scope')) return;
   db.prepare('UPDATE blindkey_secrets SET frozen = ? WHERE id = ?').run(frozen, secret.id);
 
   // Buoy tick

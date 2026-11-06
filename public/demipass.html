@@ -261,6 +261,8 @@
 
 <div class="features">
   <div class="features-inner">
+    <h2>What you are trusting</h2>
+    <p style="max-width:720px;margin:0.5rem auto 2rem;line-height:1.6"><strong>The proxy holds every secret in plaintext at the moment <code>/use</code> fires. Whoever has root on the DemiPass host has every standard-depth secret.</strong> That is the trust model today. Encryption at rest protects a stolen disk, nothing more. Elevated and critical secrets add a human approval of each exact use; making them unreadable to the host itself (wrapped under a key on your own device) is the work in progress. Details: <a href="https://github.com/bildow/dustforge/blob/main/docs/trust-model.md" style="color:var(--accent)">trust model</a>.</p>
     <h2>Why DemiPass</h2>
     <p class="sub">Every other vault gives the caller the plaintext. DemiPass gives the caller a use-token.</p>
     <div class="feature-grid">

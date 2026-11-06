@@ -53,7 +53,8 @@ pin(){ call POST /api/identity/gate/verify "$1" "$(jbody gate pin pin "$2" inten
 codeat(){ python3 -c "
 import sqlite3,sys,hmac,hashlib,time
 c=sqlite3.connect(sys.argv[1]); k=c.execute('SELECT code_key FROM use_approvals WHERE id=?',(int(sys.argv[2]),)).fetchone()[0]
-st=int(time.time()//30)+int(sys.argv[3]); m=hmac.new(bytes.fromhex(k), f'dp-approval:{sys.argv[2]}:{st}'.encode(), hashlib.sha256).digest()
+sid,req=c.execute('SELECT secret_id, requester_did FROM use_approvals WHERE id=?',(int(sys.argv[2]),)).fetchone()
+st=int(time.time()//30)+int(sys.argv[3]); m=hmac.new(bytes.fromhex(k), f'dp-approval:{sys.argv[2]}:{sid}:{req}:{st}'.encode(), hashlib.sha256).digest()
 print(str(int.from_bytes(m[:4],'big')%1000000).zfill(6))" "$DB_PATH" "$1" "${2:-0}"; }
 bal(){ Q "SELECT balance_cents FROM identity_wallets WHERE username='$1'"; }
 aopen(){ pin "$A" 4321 "approval-open:$1"; call POST /api/demipass/approvals/$1/open "$A"; }
@@ -112,6 +113,9 @@ for i in 1 2 3; do call POST /api/demipass/use "$AG" "$(USE c3 "$AP3" $BAD)"; do
 call POST /api/demipass/use "$AG" "$(USE c3 "$AP3" "$(codeat $AP3 0)")"; [ "$CODE" = 410 ] && ok "a cancelled request stays dead, right code or not" || fail "after cancel: $CODE"
 call POST /api/demipass/use "$AG" "$(USE dn)"; AP4=$(echo "$BODY" | J approval_id); call POST /api/demipass/approvals/$AP4/deny "$A"
 call POST /api/demipass/use "$AG" "$(USE dn "$AP4")"; [ "$CODE" = 410 ] && ok "denied → the agent gets 410" || fail "deny: $CODE $BODY"
+call POST /api/demipass/use "$AG" "$(USE dn2)"; [ "$CODE" = 429 ] && [ -n "$(echo "$BODY" | J cooldown_until)" ] && ok "after a denial the requester waits 10 minutes before asking this owner again (red team 4a)" || fail "cooldown: $CODE $BODY"
+call GET /api/demipass/approvals "$A"; echo "$BODY" | grep -q '"status":"denied"' && ok "the denial stays visible in the owner's history" || fail "deny history"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE use_approvals SET decided_at='2020-01-01T00:00:00Z' WHERE status='denied'\"); c.commit()" "$DB_PATH"
 call POST /api/demipass/use "$AG" "$(USE ex)"; AP5=$(echo "$BODY" | J approval_id)
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE use_approvals SET expires_at='2020-01-01T00:00:00Z' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$AP5"
 call POST /api/demipass/use "$AG" "$(USE ex "$AP5")"; [ "$CODE" = 410 ] && ok "after 5 minutes a request expires" || fail "expire: $CODE $BODY"
@@ -130,6 +134,8 @@ call POST /api/demipass/use "$AG" "$(jbody ref "$REF" params '{"url":"https://re
 [ "$CODE" = 400 ] && ok "a __proto__ key → 400" || fail "proto: $CODE $BODY"
 # key_name may not bring in an elevated secret through a standard one
 call POST /api/demipass/store "$A" '{"name":"std-pw","value":"zzzzstdpw1","secret_type":"password","username":"root","host":"100.83.112.88"}'
+SPW=$(Q "SELECT id FROM blindkey_secrets WHERE name='std-pw'"); SPC=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SPW")
+pin "$A" 4321 "scope:$SPW"; call PATCH /api/demipass/context/$SPC "$A" '{"allowed_commands":["id"]}'; [ "$CODE" = 200 ] || fail "std-pw commands: $CODE $BODY"
 call POST /api/demipass/use "$AG" '{"name":"std-pw","action":"ssh_exec","target_host":"100.83.112.88","target_user":"root","command":"id","key_name":"forge-token"}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "key_name secret 'forge-token' is elevated" && ok "an elevated secret cannot ride in as key_name of a standard one" || fail "key_name: $CODE $BODY"
 # per-requester cap

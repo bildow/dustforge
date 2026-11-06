@@ -1274,6 +1274,7 @@ function renderFillRequests(){
   const el=document.getElementById('fill-requests');
   el.innerHTML=fillReqs.map(q=>'<div class="fill-req"><div>Fill <b>'+esc(q.name)+'</b>'+(q.username?' ('+esc(q.username)+')':'')+' into</div>'
     +'<div class="fr-origin">'+esc(q.origin)+'</div>'
+    +(q.new_origin?'<div style="color:var(--orange);margin-top:0.25rem"><b>New site for this login.</b> Approving also adds it for good — agents you let fill this login could then fill it here too. Deny if you don\'t recognise it.</div>':'')
     +(q.client_label?'<div style="color:var(--text3);margin-top:0.25rem">asked by '+esc(q.client_label)+'</div>':'')
     +'<div class="fr-row"><button class="btn-primary" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',true)">Approve</button>'
     +'<button class="btn-ghost" '+(fillBusy.has(q.id)?'disabled ':'')+'onclick="decideFill('+Number(q.id)+',false)">Deny</button></div></div>').join('')
@@ -1825,10 +1826,20 @@ function showDetail(name) {
   if(s.context_list&&s.context_list.length){
     const actionLabel = { http_header:'call APIs (as an auth header)', http_body:'post to APIs (in the body)', ssh_exec:'run SSH commands', document:'be handed over as a document', database:'connect to a database' };
     for(const c of s.context_list){
-      h += `<div style="display:flex;align-items:center;gap:0.5rem;font-size:0.75rem;padding:0.3rem 0;color:var(--text2)"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);flex-shrink:0"></span><span>${esc(actionLabel[c.action_type]||c.action_type)} <span style="color:var(--text3)">on ${esc(c.target_host_pattern||'any host')}</span></span></div>`;
+      const where = (c.action_type==='http_header'||c.action_type==='http_body') ? (c.target_url_pattern||'any allowed site') : (c.target_host_pattern||'any host');
+      h += `<div style="display:flex;align-items:center;gap:0.5rem;font-size:0.75rem;padding:0.3rem 0;color:var(--text2)"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent);flex-shrink:0"></span><span>${esc(actionLabel[c.action_type]||c.action_type)} <span style="color:var(--text3)">on ${esc(where==='*'?'any allowed host':where)}</span></span></div>`;
+      // SSH: only the commands the owner lists run (forced commands). Adding one needs the PIN; removing one doesn't.
+      if (c.action_type === 'ssh_exec' && c.id) {
+        const cmds = c.allowed_commands;
+        h += `<div style="margin:0 0 0.4rem 1rem;font-size:0.7rem">`;
+        if (cmds === null) h += `<div style="color:var(--orange)">any command (set before forced commands) <a href="#" style="color:var(--accent)" onclick="setCommands(${Number(c.id)},[],${jsArg(s.name)});return false">restrict</a></div>`;
+        else if (!cmds.length) h += `<div style="color:var(--text3)">no commands allowed yet — nothing runs</div>`;
+        else for (const cmd of cmds) h += `<div style="display:flex;justify-content:space-between;gap:0.4rem;padding:0.1rem 0"><code style="word-break:break-all">${esc(cmd)}</code><a href="#" style="color:var(--red)" onclick="setCommands(${Number(c.id)},${jsArg(JSON.stringify(cmds.filter(x=>x!==cmd)))},${jsArg(s.name)});return false">remove</a></div>`;
+        h += `<a href="#" style="color:var(--accent)" onclick="addCommand(${Number(c.id)},${jsArg(JSON.stringify(cmds||[]))},${jsArg(s.name)});return false">+ allow a command</a></div>`;
+      }
     }
   } else {
-    h += `<div style="font-size:0.72rem;color:var(--text3)">No scope defined yet — a default is created on first use.</div>`;
+    h += `<div style="font-size:0.72rem;color:var(--text3)">No scope yet — this secret can't be used until you add one.</div>`;
   }
   h += `</div>`;
 
@@ -2117,6 +2128,19 @@ async function apiGated(method, path, body, what){
   }
   if(status>=400) throw new Error(d.error||'failed');
   return d;
+}
+
+// SSH forced commands: an exact command, or "prefix *" (plain words after it). Adding is widening (PIN).
+async function setCommands(contextId, list, name){
+  if(typeof list==='string') list=JSON.parse(list);
+  try{ await apiGated('PATCH','/api/blindkey/context/'+contextId,{allowed_commands:list},'Change which commands '+name+' may run? Your PIN approves adding one.'); await loadVault(); showDetail(name); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+}
+async function addCommand(contextId, current, name){
+  const cmd=prompt('Allow which command? Exact, or end with " *" for plain arguments (e.g. "systemctl status *"; no "-options" or ".." in them). Start with "sudo " for a root command. End with " <stdin" if it may read input (e.g. "tee -a /srv/app.log <stdin").');
+  if(!cmd||!cmd.trim()) return;
+  const list=JSON.parse(current); if(!list.includes(cmd.trim())) list.push(cmd.trim());
+  await setCommands(contextId, list, name);
 }
 
 // Change a credential's security depth from the detail view. Raising it is free; lowering it first

@@ -58,6 +58,9 @@ const seal = (v) => { const iv = crypto.randomBytes(16), c = crypto.createCipher
 const add = db.prepare("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, status, ref_code) VALUES (?, ?, ?, ?, ?, ?)");
 add.run(id.did, "box", "password", seal(process.env.CUR), "active", "DP-PWD-box-0001");
 add.run(id.did, "nul", "password", seal("nulpw\u0000tail"), "active", "DP-PWD-nul-0001");
+// An explicit scope (no scope, no use — red team item 12); a legacy command list (NULL = any command).
+for (const ref of ["DP-PWD-box-0001", "DP-PWD-nul-0001"]) { const sid = db.prepare("SELECT id FROM blindkey_secrets WHERE ref_code = ?").get(ref).id;
+  db.prepare("INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, ?, ?, ?, ?, ?)").run(sid, "default", "ssh_exec", "*", "*", id.did); }
 db.prepare("INSERT INTO identity_transactions (did, amount_cents, type) VALUES (?, 1000, ?)").run(id.did, "credit");'
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 TOK=$(curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'Content-Type: application/json' -d '{"username":"owner","password":"ownerpass1","scope":"transact"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("token",""))')
@@ -135,6 +138,27 @@ C=$(huse '{"ref":"'$BOXREF'","action":"ssh_exec","target_host":"100.83.112.88","
 rm -f "$S/sudo.pw"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password"}')
 [ "$C" = 403 ] && grep -q "delegated or shared" "$S/use.json" && [ ! -e "$S/sudo.pw" ] && ok "while the secret is delegated, even the owner's sudo:'password' is refused (a holder could have planted a hook)" || fail "owner password while delegated: $C $(cat "$S/use.json")"
+# ── forced commands (red team items 2, 3): a new SSH entry runs nothing until its owner lists commands with the PIN ──
+call(){ local m=$1 p=$2 b=${3:-}; BODY=$(curl -s -o - -w '\n%{http_code}' -X "$m" "$API$p" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" ${b:+-d "$b"}); CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}; }
+call POST /api/identity/pin '{"pin":"4321","password":"ownerpass1"}'
+call POST /api/demipass/store '{"name":"fc","value":"fc-pass-1","secret_type":"password","username":"deploy","host":"100.83.112.88"}'
+FREF=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["ref"])' "$BODY")
+FSID=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT id FROM blindkey_secrets WHERE ref_code=?',(sys.argv[2],)).fetchone()[0])" "$DB_PATH" "$FREF")
+FCID=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.execute('SELECT id FROM blindkey_contexts WHERE secret_id=?',(int(sys.argv[2]),)).fetchone()[0])" "$DB_PATH" "$FSID")
+: >"$S/ssh.log"
+FC(){ use "{\"ref\":\"$FREF\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"command\":\"$1\"}"; }
+C=$(FC "id"); [ "$C" = 403 ] && grep -q "no commands are allowed" "$S/use.json" && [ ! -s "$S/ssh.log" ] && ok "a new SSH entry runs nothing (forced commands by default), ssh never started" || fail "fc default: $C $(cat "$S/use.json")"
+call PATCH /api/demipass/context/$FCID '{"allowed_commands":["uptime","systemctl status *"]}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "scope:$FSID" && ok "adding commands is widening → the owner's PIN" || fail "fc add no pin: $CODE $BODY"
+call POST /api/identity/gate/verify "{\"gate\":\"pin\",\"pin\":\"4321\",\"intent\":\"scope:$FSID\"}"
+call PATCH /api/demipass/context/$FCID '{"allowed_commands":["uptime","systemctl status *"]}'; [ "$CODE" = 200 ] && ok "with the PIN the owner lists uptime and 'systemctl status *'" || fail "fc add: $CODE $BODY"
+C=$(FC "uptime"); [ "$C" = 200 ] && grep -q -- "-- deploy@100.83.112.88 uptime$" "$S/ssh.log" && ok "a listed command runs" || fail "fc uptime: $C $(cat "$S/use.json")"
+C=$(FC "systemctl status dustforge"); [ "$C" = 200 ] && ok "a 'prefix *' entry allows plain words after the prefix" || fail "fc prefix: $C"
+: >"$S/ssh.log"
+for bad in "uptime; cat /etc/shadow" "systemctl status x;rm -rf /" "systemctl status a && id" "rm -rf /srv" "uptime > /tmp/x"; do
+  C=$(FC "$bad"); [ "$C" = 403 ] || { fail "fc bad '$bad': $C"; continue; }; done
+[ ! -s "$S/ssh.log" ] && ok "commands off the list (chained, redirected, other) → 403, ssh never started" || fail "fc bad ran: $(cat "$S/ssh.log")"
+call PATCH /api/demipass/context/$FCID '{"allowed_commands":["uptime"]}'; [ "$CODE" = 200 ] && ok "removing a command (narrowing) needs no PIN" || fail "fc narrow: $CODE $BODY"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"yes"}'); [ "$C" = 400 ] && ok "sudo must be true or 'password'" || fail "sudo type: $C"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"cat","sudo":"password","key_name":"k"}'); [ "$C" = 403 ] && ok "sudo:'password' with key_name refused" || fail "sudo key_name: $C"
 BIG=$(python3 -c 'print("x"*70000)'); C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"target_user\":\"deploy\",\"command\":\"cat\",\"stdin\":\"$BIG\"}"); [ "$C" = 400 ] && ok "stdin over 64 KiB refused" || fail "big stdin: $C"
