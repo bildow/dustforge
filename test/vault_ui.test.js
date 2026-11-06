@@ -1534,3 +1534,19 @@ test('the share picker lists only people paired in person', async () => {
   const opts = pg.el('sh-to').innerHTML;
   assert.match(opts, /kyle/); assert.doesNotMatch(opts, /k-y-l-e/);
 });
+
+test('a closed pairing scan does not leave the deposit scanner in pairing mode (#52 review)', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    return { json: { ok: true } };
+  } });
+  await settle();
+  pg.ctx.navigator.mediaDevices = { getUserMedia: async () => { throw new Error('no camera here'); } };
+  await pg.ctx.pairScan(); await settle();
+  assert.equal(pg.el('scan-title').textContent, 'Scan their pairing code');
+  pg.ctx.stopScan(); pg.ctx.closeModal();
+  await pg.ctx.startScan(); await settle();
+  assert.equal(pg.el('scan-title').textContent, 'Scan QR Deposit');
+  assert.equal(vm.runInContext('scanFor', pg.ctx), 'deposit');
+});

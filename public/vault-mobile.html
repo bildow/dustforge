@@ -2476,7 +2476,10 @@ function closePair(){
   const st=pairState; pairState=null; closeSheet('pair');
   if(st&&st.pair_id&&!st.you_confirmed&&['open','joined'].includes(st.status)) api('POST','/api/network/pair/'+st.pair_id+'/cancel',{}).catch(()=>{});
 }
+let pairBusy=false;
+function pairPollStart(){ if(pairTimer) clearInterval(pairTimer); pairTimer=setInterval(pairPoll,2000); }
 async function pairShow(){
+  if(pairBusy) return; pairBusy=true;   // a double tap starts one pairing, not two (each counts toward the 3 open)
   try{
     const r=await api('POST','/api/network/pair/start');
     await loadVendor('/vendor/qrcode-generator-1.4.4.js');
@@ -2484,20 +2487,15 @@ async function pairShow(){
     pairState={pair_id:r.pair_id,status:'open'};
     pairSet('<div style="background:#fff;padding:12px;border-radius:12px;display:inline-block">'+q.createSvgTag({cellSize:5,margin:2,scalable:false})+'</div>'
       +'<p style="font-size:0.8rem;color:var(--text3);margin-top:0.75rem">Let them scan this in their DemiPass app (Fleet → Pair in person → Scan their code). It works once, for 5 minutes.</p>','Waiting for them to scan…');
-    pairTimer=setInterval(pairPoll,2000);
+    pairPollStart();
   }catch(e){ if(!sessionEnded(e)) pairSet('',e.message,true); }
+  finally{ pairBusy=false; }
 }
-function pairScan(){
-  closeSheet('pair'); scanFor='pair';
-  document.getElementById('scan-title').textContent='Scan their pairing code';
-  document.getElementById('scan-hint').textContent='Point the camera at the QR on their screen.';
-  startScan();
-}
+function pairScan(){ closeSheet('pair'); startScan('pair'); }
 async function pairJoin(raw){
   openModal('pair'); pairSet('','Checking the code…');
-  try{ const r=await api('POST','/api/network/pair/join',{token:raw}); pairState=r; pairRender(); pairTimer=setInterval(pairPoll,2000); }
+  try{ const r=await api('POST','/api/network/pair/join',{token:raw}); pairState=r; pairRender(); pairPollStart(); }
   catch(e){ if(!sessionEnded(e)) pairSet('',e.message,true); }
-  finally{ scanFor='deposit'; document.getElementById('scan-title').textContent='Scan QR Deposit'; document.getElementById('scan-hint').textContent='Point camera at a DemiPass QR code from demipass.com/qr-deposit'; }
 }
 async function pairPoll(){
   if(!pairState||!pairState.pair_id) return;
@@ -2531,7 +2529,12 @@ async function pairMismatch(){
 
 // ── QR Scanner ──
 
-async function startScan() {
+async function startScan(mode) {
+  // The mode is set on every open, so a pairing scan that was closed never leaves the deposit scanner in pairing mode.
+  scanFor = mode === 'pair' ? 'pair' : 'deposit';
+  document.getElementById('scan-title').textContent = scanFor === 'pair' ? 'Scan their pairing code' : 'Scan QR Deposit';
+  document.getElementById('scan-hint').textContent = scanFor === 'pair' ? 'Point the camera at the QR on their screen.' : 'Point camera at a DemiPass QR code from demipass.com/qr-deposit';
+  document.getElementById('scan-msg').textContent = '';
   openModal('scan');
   const video = document.getElementById('scan-video');
   const msg = document.getElementById('scan-msg');

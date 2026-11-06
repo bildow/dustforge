@@ -1,7 +1,8 @@
 #!/bin/bash
 # QR pairing (red team item 6, queue 4): contacts confirmed in person; shares and secret transfers only between them.
 # server.js on a throwaway DB. Wallets: A (shows the QR), B (scans it), C (a third person), N (no PIN), G (an agent).
-#   - the QR token: 5-minute, one join; own code / wrong secret / second scanner refused; 5 wrong secrets cancel it
+#   - the QR token: 5-minute, one join, random 12-digit id; own code / wrong secret / second scanner refused; wrong
+#     codes count against the one presenting them (10 an hour), never against the pairing
 #   - both screens show the same 6-digit code naming this pairing and these two wallets
 #   - each side confirms with its PIN (intent pair:<id>); once a phone is linked, also its device key over "<other>|<code>"
 #   - both confirmed → a contact with verified_via='qr'; a contact made by name request cannot be shared with
@@ -84,12 +85,19 @@ pin "$A" 1111 "share:$SID"; call POST /api/demipass/shares "$A" '{"secret":"wifi
 [ "$CODE" = 200 ] || [ "$CODE" = 201 ] && ok "a share to the confirmed contact goes through" || fail "share confirmed: $CODE $BODY"
 call POST /api/network/pair/$P/cancel "$A" '{}'; [ "$CODE" = 409 ] && ok "a confirmed pairing cannot be cancelled (remove the contact instead)" || fail "cancel done: $CODE"
 
-# ── removal takes the confirmation away ──
-X "UPDATE network_peers SET status='removed' WHERE (did_a='$DA' AND did_b='$DB') OR (did_a='$DB' AND did_b='$DA')"
+# ── removal takes the confirmation away (through the real routes — #52 review) ──
+call POST /api/network/people/remove "$B" '{"username":"pa"}'; [ "$CODE" = 200 ] || fail "remove: $CODE $BODY"
 pin "$B" 2222 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$B"
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J pair_required)" = True ] && ok "a pending share is not taken once the contact is removed" || fail "accept removed: $CODE $BODY"
-X "UPDATE network_peers SET status='active' WHERE (did_a='$DA' AND did_b='$DB') OR (did_a='$DB' AND did_b='$DA')"
-pin "$B" 2222 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$B"; [ "$CODE" = 200 ] && ok "…and is taken between confirmed contacts" || fail "accept: $CODE $BODY"
+call POST /api/network/requests "$A" '{"to":"pb","as":"person"}'; R=$(echo "$BODY" | J request.id); call POST /api/network/requests/$R/accept "$B"
+[ "$CODE" = 200 ] || fail "re-add by name: $CODE $BODY"
+pin "$B" 2222 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$B"
+[ "$CODE" = 403 ] && [ "$(Q "SELECT COALESCE(verified_via,'none') FROM network_peers WHERE (did_a='$DA' AND did_b='$DB') OR (did_a='$DB' AND did_b='$DA')")" = none ] \
+  && ok "re-added by name request: a contact again, but not confirmed — no share rights until they pair again" || fail "re-add keeps confirmation: $CODE $BODY"
+pair_again(){ call POST /api/network/pair/start "$A"; local p=$(echo "$BODY" | J pair_id) t=$(echo "$BODY" | J token)
+  call POST /api/network/pair/join "$B" '{"token":"'$t'"}'; pin "$A" 1111 "pair:$p"; call POST /api/network/pair/$p/confirm "$A" '{}'; pin "$B" 2222 "pair:$p"; call POST /api/network/pair/$p/confirm "$B" '{}'; }
+pair_again; [ "$(echo "$BODY" | J connected)" = True ] || fail "pair again: $CODE $BODY"
+pin "$B" 2222 "share-accept:$SH"; call POST /api/demipass/shares/$SH/accept "$B"; [ "$CODE" = 200 ] && ok "…paired in person again, the share is taken" || fail "accept: $CODE $BODY"
 
 # ── mismatch, expiry, guessing ──
 call POST /api/network/pair/start "$C"; P2=$(echo "$BODY" | J pair_id); T2=$(echo "$BODY" | J token)
@@ -101,9 +109,14 @@ call POST /api/network/pair/start "$C"; P3=$(echo "$BODY" | J pair_id); T3=$(ech
 X "UPDATE contact_pairings SET expires_at='2000-01-01T00:00:00.000Z' WHERE id=$P3"
 pin "$C" 3333 "pair:$P3"; call POST /api/network/pair/$P3/confirm "$C" '{}'; [ "$CODE" = 409 ] && echo "$BODY" | grep -q expired && ok "an expired pairing cannot be confirmed" || fail "expired: $CODE $BODY"
 call POST /api/network/pair/start "$C"; P4=$(echo "$BODY" | J pair_id); T4=$(echo "$BODY" | J token)
-for i in 1 2 3 4 5; do call POST /api/network/pair/join "$B" '{"token":"'$P4'.BBBBBBBBBBBBBBBBBBBBB'$i'"}'; done
+[[ "$P4" =~ ^[1-9][0-9]{11}$ ]] && ok "pairing ids are random 12-digit numbers (not enumerable)" || fail "id shape: $P4"
+for i in 1 2 3 4 5 6 7 8 9 10; do call POST /api/network/pair/join "$B" '{"token":"'$P4'.BBBBBBBBBBBBBBBBBBBBB'$((i%10))'"}'; done
+[ "$(Q "SELECT status FROM contact_pairings WHERE id=$P4")" = open ] && ok "wrong codes from another wallet never cancel someone's pairing (#52 review)" || fail "victim cancelled: $(Q "SELECT status FROM contact_pairings WHERE id=$P4")"
 call POST /api/network/pair/join "$B" '{"token":"'$T4'"}'
-[ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM contact_pairings WHERE id=$P4")" = cancelled ] && ok "5 wrong secrets for one id cancel it (even the right one is refused after)" || fail "guessing: $CODE $(Q "SELECT status FROM contact_pairings WHERE id=$P4")"
+[ "$CODE" = 429 ] && ok "…the guesser is refused after 10 wrong codes in an hour (even with a right one)" || fail "guesser limit: $CODE $BODY"
+X "DELETE FROM contact_pairing_misses"
+call POST /api/network/pair/join "$B" '{"token":"'$T4'"}'; [ "$CODE" = 200 ] && ok "…and the owner's pairing still works for a real scan" || fail "after guessing: $CODE $BODY"
+call POST /api/network/pair/$P4/cancel "$C" '{}'
 for i in 1 2 3; do call POST /api/network/pair/start "$B"; done; call POST /api/network/pair/start "$B"
 [ "$CODE" = 429 ] && ok "at most 3 open pairings per wallet" || fail "open cap: $CODE"
 

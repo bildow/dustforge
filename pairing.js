@@ -11,13 +11,15 @@
 //   4. Both confirmed → the two wallets are contacts with verified_via = 'qr'. Shares and secret transfers go only to
 //      such contacts (secret_sharing.js); contacts made by name request still exist for DD, but carry no share rights.
 // People only: agents (fleet silicons), silicon/worker tokens and fleet-minted tokens cannot pair, and a wallet pairs
-// only after it has set a PIN. One QR is good for one join, 5 minutes; 5 wrong secrets for an id cancel it.
+// only after it has set a PIN. One QR is good for one join, 5 minutes. Pairing ids are random 12-digit numbers (the PIN
+// intent is pair:<id>); a wallet presenting 10 wrong codes in an hour is refused for the rest of it.
 
 const crypto = require('crypto');
 
 const TTL_SEC = 300;            // an open QR, and a joined pairing waiting for both confirmations
 const MAX_OPEN = 3;             // open or joined pairings one wallet may have started
-const MAX_WRONG = 5;            // wrong secrets presented for one pairing id before it is cancelled
+const MAX_WRONG_PER_HOUR = 10; // wrong pairing codes one wallet may present in an hour (per caller: nobody can cancel
+                                // someone else's pairing by guessing at it — #52 review)
 const TOKEN_RE = /^(\d{1,12})\.([A-Za-z0-9_-]{22})$/;
 
 module.exports = function registerPairing(deps) {
@@ -41,6 +43,8 @@ module.exports = function registerPairing(deps) {
     cancelled_by TEXT DEFAULT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_cp_initiator ON contact_pairings(initiator_did, status)');
+  db.exec(`CREATE TABLE IF NOT EXISTS contact_pairing_misses (did TEXT NOT NULL, at TEXT NOT NULL)`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_cpm_did ON contact_pairing_misses(did, at)');
   // network_peers is network_routes.js's table (registered first). A pair confirmed in person is marked on it.
   for (const c of ['verified_via TEXT DEFAULT NULL', 'verified_at TEXT DEFAULT NULL']) {
     try { db.exec('ALTER TABLE network_peers ADD COLUMN ' + c); } catch (_) {}
@@ -104,8 +108,14 @@ module.exports = function registerPairing(deps) {
     const open = db.prepare("SELECT COUNT(*) AS n FROM contact_pairings WHERE initiator_did = ? AND status IN ('open','joined')").get(p.wallet.did).n;
     if (open >= MAX_OPEN) return res.status(429).json({ error: `at most ${MAX_OPEN} pairings open at once — finish or cancel one` });
     const secret = crypto.randomBytes(16).toString('base64url');
-    const id = db.prepare('INSERT INTO contact_pairings (initiator_did, secret_hash, created_at, expires_at) VALUES (?, ?, ?, ?)')
-      .run(p.wallet.did, sha(secret), nowIso(), later(TTL_SEC)).lastInsertRowid;
+    // A random 12-digit id: not enumerable, and still a valid PIN intent (pair:<digits>).
+    let id = 0;
+    for (let i = 0; i < 8 && !id; i++) {
+      const cand = 100000000000 + crypto.randomInt(0, 899999999999);
+      try { db.prepare('INSERT INTO contact_pairings (id, initiator_did, secret_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(cand, p.wallet.did, sha(secret), nowIso(), later(TTL_SEC)); id = cand; }
+      catch (e) { if (!/UNIQUE|PRIMARY/.test(e.message)) throw e; }
+    }
+    if (!id) return res.status(503).json({ error: 'could not start a pairing; try again' });
     const token = `${id}.${secret}`;
     res.json({ ok: true, pair_id: id, token, qr: `https://demipass.com/pair#${token}`, expires_at: later(TTL_SEC),
                next: 'the other person scans this in their DemiPass app; then you both compare the 6-digit code and confirm' });
@@ -119,16 +129,17 @@ module.exports = function registerPairing(deps) {
     const m = raw.match(TOKEN_RE);
     if (!m) return res.status(400).json({ error: 'token: the code from the other person\'s DemiPass pairing QR' });
     expireOld();
+    // Wrong codes count against the one presenting them, never against the pairing (#52 review).
+    const hourAgo = new Date(Date.now() - 3600000).toISOString();
+    db.prepare('DELETE FROM contact_pairing_misses WHERE at < ?').run(hourAgo);
+    const misses = db.prepare('SELECT COUNT(*) AS n FROM contact_pairing_misses WHERE did = ? AND at >= ?').get(p.wallet.did, hourAgo).n;
+    if (misses >= MAX_WRONG_PER_HOUR) return res.status(429).json({ error: 'too many wrong pairing codes from this wallet — try again in an hour' });
     const row = db.prepare('SELECT * FROM contact_pairings WHERE id = ?').get(Number(m[1]));
-    if (!row) return res.status(404).json({ error: 'no such pairing — ask them to show a new code' });
-    const presented = Buffer.from(sha(m[2]), 'hex'), stored = Buffer.from(row.secret_hash, 'hex');
-    if (presented.length !== stored.length || !crypto.timingSafeEqual(presented, stored)) {
-      const wrong = db.prepare('UPDATE contact_pairings SET wrong_joins = wrong_joins + 1 WHERE id = ? RETURNING wrong_joins').get(row.id).wrong_joins;
-      if (wrong >= MAX_WRONG && ['open', 'joined'].includes(row.status)) {
-        db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = 'wrong-secrets' WHERE id = ? AND status IN ('open','joined')").run(nowIso(), row.id);
-        logSecurityEvent('pairing_guessed', 'critical', { caller_did: p.wallet.did, capability: 'pair', target: String(row.id), ip: req.ip });
-      }
-      return res.status(403).json({ error: 'that code does not match this pairing' });
+    const presented = Buffer.from(sha(m[2]), 'hex'), stored = row ? Buffer.from(row.secret_hash, 'hex') : Buffer.alloc(0);
+    if (!row || presented.length !== stored.length || !crypto.timingSafeEqual(presented, stored)) {
+      db.prepare('INSERT INTO contact_pairing_misses (did, at) VALUES (?, ?)').run(p.wallet.did, nowIso());
+      if (misses + 1 >= MAX_WRONG_PER_HOUR) logSecurityEvent('pairing_guessed', 'alert', { caller_did: p.wallet.did, capability: 'pair', target: String(m[1]), ip: req.ip });
+      return res.status(row ? 403 : 404).json({ error: row ? 'that code does not match this pairing' : 'no such pairing — ask them to show a new code' });
     }
     if (row.initiator_did === p.wallet.did) return res.status(400).json({ error: 'that is your own pairing code' });
     if (row.status !== 'open') return res.status(409).json({ error: row.status === 'joined' ? 'someone has already scanned this code — ask them to cancel it and show a new one' : `this pairing is ${row.status}` });
