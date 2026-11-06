@@ -1489,3 +1489,64 @@ test('423 locked from the server → the phone unlocks (biometric) and the appro
   assert.equal(d.ok, true); assert.equal(approves, 2);
   assert.equal(signs[0].kind, 'P'); assert.match(signs[0].message, /unlock:0/);
 });
+
+// ── Pair in person (QR, red team item 6) ──
+test('a scanned pairing URL joins the pairing and shows the other person and the 6-digit code', async () => {
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/network/pair/join') { assert.equal(b.token, 'https://demipass.com/pair#12.AAAAAAAAAAAAAAAAAAAAAA'); return { json: { ok: true, pair_id: 12, status: 'joined', role: 'scanned', other: 'kyle', code: '037654', you_confirmed: false, they_confirmed: false } }; }
+    return { json: { ok: true } };
+  } });
+  await settle();
+  await pg.ctx.handleScannedData('https://demipass.com/pair#12.AAAAAAAAAAAAAAAAAAAAAA');
+  await settle();
+  const body = pg.el('pair-body').innerHTML;
+  assert.match(body, /<b>kyle<\/b>/); assert.match(body, /037 654/); assert.match(body, /Same code — confirm/);
+  assert.ok(pg.shown('modal-pair'));
+  assert.ok(!pg.calls.some(c => c.path === '/api/demipass/store'), 'a pairing QR is never treated as a deposit');
+});
+
+test('confirming a pairing goes through the PIN/phone gate and ends on "paired"', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/network/pair/12/confirm') return { json: { ok: true, pair_id: 12, status: 'confirmed', role: 'scanned', other: 'kyle', code: '037654', you_confirmed: true, they_confirmed: true, connected: true } };
+    return { json: { ok: true } };
+  } });
+  await settle();
+  vm.runInContext("pairState={pair_id:12,status:'joined',role:'scanned',other:'kyle',code:'037654',you_confirmed:false,they_confirmed:false}", pg.ctx);
+  await pg.ctx.pairConfirm(); await settle();
+  assert.ok(pg.calls.some(c => c.method === 'POST' && c.path === '/api/network/pair/12/confirm'));
+  assert.match(pg.el('pair-msg').textContent, /Paired/);
+});
+
+test('the share picker lists only people paired in person', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/network') return { json: { ok: true, me: {}, people: [{ username: 'kyle', confirmed: true }, { username: 'k-y-l-e', confirmed: false }], agents: [], incoming: [], outgoing: [], topups: {} } };
+    return { json: { ok: true } };
+  } });
+  await settle();
+  vm.runInContext('netData=null', pg.ctx);
+  await pg.ctx.openShare('wifi', 'share');
+  const opts = pg.el('sh-to').innerHTML;
+  assert.match(opts, /kyle/); assert.doesNotMatch(opts, /k-y-l-e/);
+});
+
+test('a closed pairing scan does not leave the deposit scanner in pairing mode (#52 review)', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    return { json: { ok: true } };
+  } });
+  await settle();
+  pg.ctx.navigator.mediaDevices = { getUserMedia: async () => { throw new Error('no camera here'); } };
+  await pg.ctx.pairScan(); await settle();
+  assert.equal(pg.el('scan-title').textContent, 'Scan their pairing code');
+  pg.ctx.stopScan(); pg.ctx.closeModal();
+  await pg.ctx.startScan(); await settle();
+  assert.equal(pg.el('scan-title').textContent, 'Scan QR Deposit');
+  assert.equal(vm.runInContext('scanFor', pg.ctx), 'deposit');
+});

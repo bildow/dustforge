@@ -63,6 +63,10 @@ module.exports = function registerNetworkRoutes(deps) {
     removed_at TEXT DEFAULT NULL,
     UNIQUE(did_a, did_b)
   )`);
+  // Set by an in-person pairing (pairing.js, red team item 6); cleared when the contact is removed or re-added by name.
+  for (const c of ['verified_via TEXT DEFAULT NULL', 'verified_at TEXT DEFAULT NULL']) {
+    try { db.exec('ALTER TABLE network_peers ADD COLUMN ' + c); } catch (_) {}
+  }
   db.exec(`CREATE TABLE IF NOT EXISTS network_transfers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     from_did TEXT NOT NULL,
@@ -237,7 +241,8 @@ module.exports = function registerNetworkRoutes(deps) {
     const me = w.wallet.did;
     expireOld();
     const peers = db.prepare("SELECT * FROM network_peers WHERE (did_a = ? OR did_b = ?) AND status = 'active' ORDER BY id").all(me, me)
-      .map(p => { const did = p.did_a === me ? p.did_b : p.did_a; return { kind: 'person', did, username: walletName(did), since: p.created_at }; });
+      .map(p => { const did = p.did_a === me ? p.did_b : p.did_a; return { kind: 'person', did, username: walletName(did), since: p.created_at,
+               confirmed: Boolean(p.verified_via), confirmed_at: p.verified_at || null }; });   // confirmed = paired in person (pairing.js)
     const fleet = ownedFleet(me);
     const agents = fleet ? db.prepare("SELECT * FROM fleet_silicons WHERE fleet_id = ? AND status = 'active' ORDER BY handle").all(fleet.id)
       .map(s => ({ kind: 'agent', did: s.member_did, username: walletName(s.member_did), handle: s.handle, display_name: s.display_name,
@@ -369,7 +374,8 @@ module.exports = function registerNetworkRoutes(deps) {
         if (r.kind === 'person') {
           const [a, b] = pair(r.requester_did, r.target_did);
           db.prepare(`INSERT INTO network_peers (did_a, did_b, request_id) VALUES (?, ?, ?)
-                      ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', request_id = excluded.request_id, created_at = CURRENT_TIMESTAMP, removed_at = NULL`)
+                      ON CONFLICT(did_a, did_b) DO UPDATE SET status = 'active', request_id = excluded.request_id, created_at = CURRENT_TIMESTAMP, removed_at = NULL,
+                        verified_via = NULL, verified_at = NULL`)   // re-added by name: not confirmed in person (#52 review)
             .run(a, b, r.id);
           result = { kind: 'person', with: walletName(r.requester_did) };
           return;
@@ -417,7 +423,8 @@ module.exports = function registerNetworkRoutes(deps) {
     const other = findWallet((req.body || {}).did || (req.body || {}).username);
     if (!other) return res.status(404).json({ error: 'no wallet by that name' });
     const [a, b] = pair(w.wallet.did, other.did);
-    const n = db.prepare("UPDATE network_peers SET status = 'removed', removed_at = CURRENT_TIMESTAMP WHERE did_a = ? AND did_b = ? AND status = 'active'").run(a, b).changes;
+    // Removing a contact also removes its in-person confirmation: share rights come back only by pairing again (#52 review).
+    const n = db.prepare("UPDATE network_peers SET status = 'removed', removed_at = CURRENT_TIMESTAMP, verified_via = NULL, verified_at = NULL WHERE did_a = ? AND did_b = ? AND status = 'active'").run(a, b).changes;
     if (!n) return res.status(404).json({ error: 'not a contact' });
     res.json({ ok: true });
   });

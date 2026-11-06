@@ -59,6 +59,14 @@ module.exports = function registerSecretSharing(deps) {
     const [a, b] = x < y ? [x, y] : [y, x];
     return Boolean(db.prepare("SELECT 1 FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active'").get(a, b));
   }
+  // A contact confirmed in person: paired by QR with both screens' codes compared (pairing.js; red team item 6). Name
+  // lookup alone is phishable, so shares and transfers need this — a contact made by request carries no share rights.
+  function isConfirmedPeer(x, y) {
+    const [a, b] = x < y ? [x, y] : [y, x];
+    try { return Boolean(db.prepare("SELECT 1 FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active' AND verified_via IS NOT NULL").get(a, b)); }
+    catch (_) { return false; }   // no verified_via column yet: nobody is confirmed
+  }
+  const PAIR_HINT = 'meet them and pair in person: Fleet → Pair in person (QR) — you compare a 6-digit code on both screens';
   // `did` is a person `owner` may share with: a connection in the network that is not an agent.
   function isPersonPeer(owner, did) {
     return owner !== did && isPeer(owner, did) && !isAgentWallet(did);
@@ -174,6 +182,9 @@ module.exports = function registerSecretSharing(deps) {
     if (!isPeer(me.did, target.did)) {
       return res.status(403).json({ error: `you can share only with people you are connected to — add ${target.username} as a person in your network first (Fleet → +, "A person")` });
     }
+    if (!isConfirmedPeer(me.did, target.did)) {
+      return res.status(403).json({ error: `you can share only with contacts confirmed in person — ${PAIR_HINT}`, pair_required: true });
+    }
     const days = parseDays(expires_in_days, SHARE_DEFAULT_DAYS, SHARE_MAX_DAYS, 'expires_in_days', res); if (days === null) return;
     if (max_uses !== undefined && max_uses !== null && (!Number.isInteger(max_uses) || max_uses < 0 || max_uses > 1000000)) return res.status(400).json({ error: 'max_uses: 0 (no cap) to 1000000' });
     if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > 300)) return res.status(400).json({ error: 'note: at most 300 characters' });
@@ -232,6 +243,8 @@ module.exports = function registerSecretSharing(deps) {
     if (state !== 'offered') return res.status(409).json({ error: `this share is ${state}`, share: view(row, me.did) });
     const secret = db.prepare(`SELECT id FROM blindkey_secrets WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(row.secret_id, row.owner_did);
     if (!secret) return res.status(410).json({ error: 'the owner no longer has this secret' });
+    // An offer made before pairing existed (or to a contact since removed) is taken only between confirmed contacts.
+    if (!isConfirmedPeer(row.owner_did, me.did)) return res.status(403).json({ error: `this share can be taken only between contacts confirmed in person — ${PAIR_HINT}`, pair_required: true });
     // The recipient's PIN: an agent signed in as them (device login) cannot take on a share for them.
     if (!requirePin(me, `share-accept:${row.id}`, 'share-accept', res, { kind: 'share-accept', id: row.id, bind: String(row.secret_id), req })) return;
     const done = db.prepare(`UPDATE demipass_delegations SET status = 'active', offer_state = 'accepted', accepted_at = CURRENT_TIMESTAMP
@@ -373,6 +386,7 @@ module.exports = function registerSecretSharing(deps) {
     if (target.status !== 'active') return res.status(403).json({ error: `${target.username} is not active` });
     if (isAgentWallet(target.did)) return res.status(409).json({ error: `${target.username} is an agent — deposit into an agent's vault with POST /api/demipass/deposit` });
     if (!isPeer(me.did, target.did)) return res.status(403).json({ error: `you can transfer only to people you are connected to — add ${target.username} as a person in your network first` });
+    if (!isConfirmedPeer(me.did, target.did)) return res.status(403).json({ error: `you can transfer only to contacts confirmed in person — ${PAIR_HINT}`, pair_required: true });
     if (!['use', 'none'].includes(keep)) return res.status(400).json({ error: "keep: 'use' (you keep use-only access) or 'none'" });
     const days = parseDays(keep_days, KEEP_DEFAULT_DAYS, SHARE_MAX_DAYS, 'keep_days', res); if (days === null) return;
     // Mid-rotation the old value is still live for its grace period: finish (or cancel) the rotation first.
@@ -425,5 +439,5 @@ module.exports = function registerSecretSharing(deps) {
       note: keptId ? `${target.username} owns it now; you keep use-only access through share ${keptId}, which they can see and revoke` : `${target.username} owns it now; you have no access to it` });
   });
 
-  return { isPersonPeer, isAgentWallet, isPeer };
+  return { isPersonPeer, isAgentWallet, isPeer, isConfirmedPeer };
 };
