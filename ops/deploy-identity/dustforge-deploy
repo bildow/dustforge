@@ -2,30 +2,34 @@
 # /usr/local/sbin/dustforge-deploy — the only thing the dustforge-deploy user may run as root (sudoers), and the only
 # command its forced shell passes on. Installed 2026-11-05 on Aaron's order: RackNerd root is never the deploy
 # credential again.
-#   dustforge-deploy status            the live commit, the service state, the last backups
+#   dustforge-deploy status            the live commit, the service state, the last backups, the deploy history
 #   dustforge-deploy <40-hex sha>      back up the DB, fast-forward /opt/dustforge to <sha>, restart dustforge
-#   dustforge-deploy rollback <sha>    move back to <sha> (an ancestor of the live commit), restart; the DB is NOT
-#                                      restored — that stays an operator act (backups are listed by `status`)
+#   dustforge-deploy rollback          back to the commit this script deployed before the live one (code only; the DB
+#                                      is NOT restored — an operator act; backups are listed by `status`)
 # Refused: a commit not on origin/main, anything but a fast-forward, a changed working tree, a changed
-# package.json/package-lock.json (dependency installs run code as root: an operator act).
+# package.json/package-lock.json (dependency installs run code as root: an operator act). Rollback goes only to the
+# previous commit in this script's own root-only history — never to an arbitrary ancestor (which could bring back a
+# fixed root RCE; #46 review H1).
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
-REPO=${DUSTFORGE_DEPLOY_REPO_TEST:-/opt/dustforge}
-DB=$REPO/data/dustforge.db
-BK=${DUSTFORGE_DEPLOY_BACKUPS_TEST:-/opt/backups/dustforge-deploy}
-RESTART=${DUSTFORGE_DEPLOY_RESTART_TEST:-systemd-run}
 umask 077
+REPO=/opt/dustforge
+DB=$REPO/data/dustforge.db
+BK=/opt/backups/dustforge-deploy
+STATE=/var/lib/dustforge-deploy
+HIST=$STATE/history            # one line per deploy: <iso time> <from sha> <to sha> <deploy|rollback>
 g() { git -c safe.directory="$REPO" -C "$REPO" "$@"; }
 die() { echo "refused: $*" >&2; exit 3; }
 logger -t dustforge-deploy -- "invoked by ${SUDO_USER:-$USER}: $*" 2>/dev/null || true
+mkdir -p "$STATE"
 
 restart() {
-  if [ "$RESTART" = systemd-run ]; then
-    systemd-run --quiet --on-active=3 --unit="dustforge-deploy-restart-$(date -u +%s)" systemctl restart dustforge
-  else "$RESTART"; fi
+  local unit="dustforge-deploy-restart-$(date -u +%s)-$RANDOM"
+  systemd-run --quiet --collect --on-active=3 --unit="$unit" systemctl restart dustforge \
+    || { echo "WARNING: the restart could not be scheduled; the new code is merged but NOT running — an operator restarts dustforge" >&2; exit 4; }
 }
 backup() {
-  mkdir -p "$BK"
+  mkdir -p "$BK"; chmod 0700 "$BK"
   local f
   f="$BK/dustforge-$(date -u +%Y%m%dT%H%M%SZ)-$(g rev-parse --short=12 HEAD).db"
   sqlite3 "$DB" ".backup $f"
@@ -34,6 +38,8 @@ backup() {
   echo "backup $f"
 }
 clean_tree() { [ -z "$(g status --porcelain --untracked-files=no)" ] || die "tracked files changed on the server"; }
+deps_same() { g diff --quiet "$1" "$2" -- package.json package-lock.json; }
+record() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $1 $2 $3" >> "$HIST"; }
 
 case "${1:-}" in
   status)
@@ -41,31 +47,36 @@ case "${1:-}" in
     g log --oneline -1
     systemctl is-active dustforge 2>/dev/null || true
     { ls -1t "$BK"/dustforge-*.db 2>/dev/null || true; } | head -3
+    { tail -n 3 "$HIST" 2>/dev/null || true; }
     exit 0 ;;
   rollback)
-    [ $# -eq 2 ] && [[ "$2" =~ ^[0-9a-f]{40}$ ]] || die "usage: dustforge-deploy rollback <40-hex sha>"
-    to=$2
+    [ $# -eq 1 ] || die "usage: dustforge-deploy rollback (back to the commit deployed before the live one)"
+    live=$(g rev-parse HEAD)
+    # The last deploy (not rollback) that landed the live commit names where we came from.
+    to=$({ grep -E " [0-9a-f]{40} $live deploy\$" "$HIST" 2>/dev/null || true; } | tail -n 1 | awk '{print $2}')
+    [[ "$to" =~ ^[0-9a-f]{40}$ ]] || die "no recorded deploy of the live commit to roll back from; an operator rolls back"
     g merge-base --is-ancestor "$to" HEAD || die "$to is not an ancestor of the live commit"
     clean_tree
-    prev=$(g rev-parse HEAD)
-    g diff --quiet "$to" "$prev" -- package.json package-lock.json || die "dependencies differ; an operator rolls this back"
+    deps_same "$to" "$live" || die "dependencies differ; an operator rolls this back"
     backup
     g reset -q --keep "$to"
+    record "$live" "$to" rollback
     restart
-    echo "rolled back $prev -> $to; dustforge restarts in 3 s"
+    echo "rolled back $live -> $to; dustforge restarts in 3 s"
     exit 0 ;;
 esac
 
-[ $# -eq 1 ] && [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die "usage: dustforge-deploy <40-hex sha> | status | rollback <sha>"
+[ $# -eq 1 ] && [[ "$1" =~ ^[0-9a-f]{40}$ ]] || die "usage: dustforge-deploy <40-hex sha> | status | rollback"
 sha=$1
-g fetch -q origin main
-g merge-base --is-ancestor "$sha" origin/main || die "$sha is not on origin/main"
+g fetch -q origin "+refs/heads/main:refs/remotes/origin/main"
+g merge-base --is-ancestor "$sha" refs/remotes/origin/main || die "$sha is not on origin/main"
 prev=$(g rev-parse HEAD)
 [ "$prev" != "$sha" ] || { echo "already at $sha"; exit 0; }
 g merge-base --is-ancestor "$prev" "$sha" || die "not a fast-forward from $prev"
 clean_tree
-g diff --quiet "$prev" "$sha" -- package.json package-lock.json || die "dependencies changed; an operator installs them"
+deps_same "$prev" "$sha" || die "dependencies changed; an operator installs them"
 backup
 g merge -q --ff-only "$sha"
+record "$prev" "$sha" deploy
 restart
 echo "deployed $prev -> $sha; dustforge restarts in 3 s"
