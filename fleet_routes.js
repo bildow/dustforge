@@ -298,6 +298,8 @@ module.exports = function registerFleetRoutes(deps) {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle, { allowPending: true }); if (!s) return;
     if (s.joined_via === 'network' && (req.body || {}).contact_email !== undefined) return res.status(403).json({ error: `@${s.handle} joined through the network: its contact email is its own` });
+    // Turning on automatic refills to a network-joined agent would move DD to someone else's wallet on a token alone.
+    if (s.joined_via === 'network' && (req.body || {}).refill_enabled) return res.status(403).json({ error: `@${s.handle} joined through the network: send it DD with POST /api/network/transfers (PIN), not automatic refills` });
     try {
       const updated = fb.updateSiliconSettings(db, s, req.body || {});
       res.json({ ok: true, silicon: fb.siliconView(db, billing, updated, { fleet: a.fleet }) });
@@ -320,6 +322,9 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/refill', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    // An agent that joined through the network is someone else's wallet: DD goes to it as a network send, confirmed
+    // with the PIN (red team 16, #48 review: a token alone otherwise invites a wallet in and refills it).
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network: send it DD with POST /api/network/transfers (you confirm with your PIN)`, use: 'POST /api/network/transfers' });
     const amount = Number((req.body || {}).amount_cents || s.refill_amount_cents);
     if (!Number.isInteger(amount) || amount < 1 || amount > 10000000) return res.status(400).json({ error: 'amount_cents: integer 1-10000000' });
     const r = fb.thresholdRefill(db, billing, s, { force: true, amount, ledger });
@@ -353,6 +358,8 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/delegate', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
     const s = siliconOr404(res, a.fleet, req.params.handle); if (!s) return;
+    // Same rule as /api/blindkey/delegate (red team 15): an agent that joined through the network is an outside agent.
+    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network: delegate with POST /api/demipass/delegate, which asks for your PIN`, use: 'POST /api/demipass/delegate' });
     const { secret_name, ref, max_uses = 0, expires_in } = req.body || {};
     let secret = null;
     if (ref) secret = db.prepare("SELECT * FROM blindkey_secrets WHERE ref_code = ? AND did = ? AND status = 'active'").get(String(ref), a.did);

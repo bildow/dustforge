@@ -47,8 +47,17 @@ call POST /api/demipass/delegate "$AG" '{"secret_name":"svc","delegate_did":"'$D
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scope:'$SID'"}'
 call POST /api/demipass/delegate "$A" '{"secret_name":"svc","delegate_did":"'$DG'"}'
 [ "$CODE" = 200 ] && ok "15: …the owner, with the PIN, can" || fail "outside agent with pin: $CODE $BODY"
+# agent-f joined through the network: a wallet a token alone can invite in — outside (#48 review: laundering)
 call POST /api/demipass/delegate "$AG" '{"secret_name":"svc","delegate_did":"'$DF'"}'
-[ "$CODE" = 200 ] && ok "15: delegating to an agent of the owner's own fleet still works from the owner's session" || fail "own agent: $CODE $BODY"
+[ "$CODE" = 403 ] && ok "15: a network-joined agent of the owner's fleet is outside: token alone → 403 (PIN)" || fail "laundered agent: $CODE $BODY"
+SLUG=$(Q "SELECT slug FROM fleets WHERE owner_did='$(did owner-a)'")
+call POST /api/fleet/$SLUG/silicons/agent-f/delegate "$AG" '{"secret_name":"svc"}'; [ "$CODE" = 403 ] && ok "15: …nor through the fleet delegate route" || fail "fleet delegate laundered: $CODE $BODY"
+call POST /api/fleet/$SLUG/silicons/agent-f/refill "$AG" '{"amount_cents":500}'; [ "$CODE" = 403 ] && ok "16: …and no refill to it on a token alone" || fail "refill laundered: $CODE $BODY"
+call PATCH /api/fleet/$SLUG/silicons/agent-f "$AG" '{"refill_enabled":true,"refill_amount_cents":500,"refill_threshold_cents":100}'; [ "$CODE" = 403 ] && ok "16: …nor automatic refills switched on for it" || fail "auto refill laundered: $CODE $BODY"
+# an agent the fleet itself made (it holds that wallet's key) stays the owner's own
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET joined_via='owner' WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF"
+call POST /api/demipass/delegate "$AG" '{"secret_name":"svc","delegate_did":"'$DF'"}'
+[ "$CODE" = 200 ] && ok "15: delegating to an agent the owner's fleet made still works from the owner's session" || fail "own agent: $CODE $BODY"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET status='left' WHERE member_did=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$DF" 2>/dev/null
 call POST /api/demipass/store "$A" '{"name":"svc2","value":"svc2-token-zz96","secret_type":"api_key","host":"repo.dustroot.com"}'
 call POST /api/demipass/delegate "$AG" '{"secret_name":"svc2","delegate_did":"'$DF'"}'
@@ -58,6 +67,8 @@ call POST /api/demipass/delegate "$AG" '{"secret_name":"svc2","delegate_did":"'$
 B0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")
 call POST /api/wallet/transfer "$AG" '{"from_did":"'$(did owner-a)'","to_did":"'$(did owner-b)'","amount_cents":5000}'
 [ "$CODE" = 410 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$B0" ] && ok "16: /api/wallet/transfer is retired (410), no DD moved" || fail "wallet transfer: $CODE $BODY"
+call POST /api/wallet/transfer/secure "$AG" '{"from_did":"'$(did owner-a)'","to_did":"'$(did owner-b)'","amount_cents":5000}'
+[ "$CODE" = 410 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$B0" ] && ok "16: /api/wallet/transfer/secure is retired too" || fail "transfer secure: $CODE $BODY"
 
 ! grep -qE "svc-token-zz95|svc2-token-zz96" "$S/server.log" && ok "no value in the server log" || fail "value in log"
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails
