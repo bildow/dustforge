@@ -31,6 +31,13 @@ const MAX_LIST = 100;
 module.exports = function registerSecretSharing(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
           logSecurityEvent, blindkeyDecrypt, cleanLabel, REDEEMABLE_STATUS_SQL, resolveLatestBlindkeySecret, resolveGatePolicy } = deps;
+  // Decisions that give access away are signed by the owner's enrolled phone once there is one (red team item 4b).
+  function deviceRefusal(me, kind, id, bind, req, res) {
+    const dk = deps.devices && deps.devices();
+    const r = dk ? dk.approvalRefusal(me.auth, kind, id, bind, req.body) : null;
+    if (r) { res.status(r.status).json(r.body); return true; }
+    return false;
+  }
   const limiter = rateLimitFill || rateLimitStandard;
 
   const nowIso = () => new Date().toISOString();
@@ -81,14 +88,17 @@ module.exports = function registerSecretSharing(deps) {
   }
   // Every gate in `required` (the PIN at least) fresh for `intent`, single-use proofs spent once. Returns true when
   // proven; otherwise it has already answered.
-  function requireGates(me, required, intent, action, res) {
+  // Factors checked first, then (once a phone is linked) its device signature over this decision, then the factors
+  // spent — so a 428 for the signature never costs the PIN proof, and a signature never meets a missing PIN (#47 M2).
+  function requireGates(me, required, intent, action, res, device = null) {
     const missing = required.filter(g => !gateFresh(me.did, g, me.auth, intent));
     if (missing.length) { res.status(403).json(gateMissing(action, required, missing, intent)); return false; }
+    if (device && deviceRefusal(me, device.kind, device.id, device.bind, device.req, res)) return false;
     const refused = spendSingleUse(me.did, action, required, me.auth, intent);
     if (refused) { res.status(refused.status || 403).json(refused); return false; }
     return true;
   }
-  const requirePin = (me, intent, action, res) => requireGates(me, ['pin'], intent, action, res);
+  const requirePin = (me, intent, action, res, device = null) => requireGates(me, ['pin'], intent, action, res, device);
   // What the owner proves to open a reveal for someone else: the secret's own reveal policy (PIN, plus email/SMS
   // codes at higher depths) — never less than what revealing it to themselves would take.
   function ownerRevealGates(secret) {
@@ -179,7 +189,8 @@ module.exports = function registerSecretSharing(deps) {
     if (prior && ['active', 'offered'].includes(stateOf(prior))) {
       return res.status(409).json({ error: `${target.username} already has ${stateOf(prior) === 'active' ? 'this share' : 'this offer waiting'}`, share: view(prior, me.did) });
     }
-    if (!requirePin(me, `share:${secret.id}`, 'share', res)) return;
+    if (!requirePin(me, `share:${secret.id}`, 'share', res,
+      { kind: 'share', id: secret.id, bind: [to, context || '', max_uses || 0, expires_in_days || ''].join('|'), req })) return;
     const expiresAt = daysFromNow(days);
     const cleanNote = note ? cleanLabel(note, 300).trim() : '';
     let id;
@@ -222,7 +233,7 @@ module.exports = function registerSecretSharing(deps) {
     const secret = db.prepare(`SELECT id FROM blindkey_secrets WHERE id = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(row.secret_id, row.owner_did);
     if (!secret) return res.status(410).json({ error: 'the owner no longer has this secret' });
     // The recipient's PIN: an agent signed in as them (device login) cannot take on a share for them.
-    if (!requirePin(me, `share-accept:${row.id}`, 'share-accept', res)) return;
+    if (!requirePin(me, `share-accept:${row.id}`, 'share-accept', res, { kind: 'share-accept', id: row.id, bind: String(row.secret_id), req })) return;
     const done = db.prepare(`UPDATE demipass_delegations SET status = 'active', offer_state = 'accepted', accepted_at = CURRENT_TIMESTAMP
                              WHERE id = ? AND status = 'suspended' AND offer_state = 'offered'`).run(row.id).changes;
     if (done !== 1) return res.status(409).json({ error: 'this share changed meanwhile; reload' });
@@ -278,7 +289,9 @@ module.exports = function registerSecretSharing(deps) {
     if (!Number.isInteger(mins) || mins < 1 || mins > REVEAL_MAX_MINUTES) return res.status(400).json({ error: `minutes: 1 to ${REVEAL_MAX_MINUTES} (a reveal grant is always time-boxed)` });
     const gsecret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
     if (!gsecret || gsecret.did !== me.did) return res.status(410).json({ error: 'you no longer own this secret' });
-    if (!requireGates(me, ownerRevealGates(gsecret), `reveal-grant:${row.id}`, 'reveal-grant', res)) return;
+    // Letting someone SEE the value: signed by the phone too (#47 review H3).
+    if (!requireGates(me, ownerRevealGates(gsecret), `reveal-grant:${row.id}`, 'reveal-grant', res,
+      { kind: 'reveal-grant', id: row.id, bind: [n, mins].join('|'), req })) return;
     const until = new Date(Date.now() + mins * 60000).toISOString();
     db.prepare('UPDATE demipass_delegations SET reveal_allowed = 1, max_reveals = ?, reveals_used = 0, reveal_granted_at = CURRENT_TIMESTAMP, reveal_until = ? WHERE id = ?').run(n, until, row.id);
     event('share_reveal_granted', me.did, row.secret_id, { delegation_id: row.id, delegate_did: row.delegate_did, reveals: n, until });
@@ -374,7 +387,7 @@ module.exports = function registerSecretSharing(deps) {
       finalName = new_name.trim();
       if (!finalName || /_v\d+$/.test(finalName)) return res.status(400).json({ error: 'new_name: a plain name, not ending in _v<number>' });
     }
-    if (!requirePin(me, `transfer:${secret.id}`, 'transfer', res)) return;
+    if (!requirePin(me, `transfer:${secret.id}`, 'transfer', res, { kind: 'transfer', id: secret.id, bind: [to, keep, new_name || ''].join('|'), req })) return;
     // Checked after the PIN, so whether a name exists in their vault is never answered for free.
     if (nameFamilyTaken(target.did, finalName)) {
       return res.status(409).json({ error: `${target.username} already uses the name '${finalName}' — send new_name (the PIN is asked again)`, name_taken: true });

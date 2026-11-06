@@ -1380,3 +1380,112 @@ test('only the newest dashboard load writes the screen', async () => {
   assert.equal(pg.el('bal').textContent, 42);
   assert.equal(pg.el('vault-note').textContent, '', 'an older cut-off load leaves no false Offline note');
 });
+
+// ── dormancy lock + device keys (red team items 4b, 8) ─────────────────────────────────────────────────────────
+const fakePhone = (ctx, log) => ({
+  status: () => JSON.stringify({ ok: true, enrolled: true, device_id: 'phone-1' }),
+  sign: (id, kind, message) => { log.push({ kind, message }); setTimeout(() => ctx.DemiPassDeviceCb(id, JSON.stringify({ ok: true, signature: 'SIG-' + kind })), 0); },
+});
+
+test('idle past the lock time → locked on open; the phone\'s biometric unlocks (unlock:0), no PIN typed', async () => {
+  const signs = [];
+  const pg = page({ storage: { ...signedIn, dp_last_active: String(Date.now() - 10 * 60 * 1000) }, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/lock') return { json: { lock_after_sec: 300 } };
+    if (p === '/api/identity/lock/now' || p === '/api/identity/lock/ping') return { json: { ok: true } };
+    if (p === '/api/identity/device/challenge') return { json: { challenge_id: 5, message: 'demipass:gate:x:' + b.intent } };
+    if (p === '/api/identity/gate/verify') return { json: { ok: true } };
+    return { json: {} };
+  } });
+  let phoneAnswers = false;   // the phone holds its answer until the test has looked at the locked screen
+  const phone = fakePhone(pg.ctx, signs), sign = phone.sign;
+  phone.sign = (...a) => { const go = () => (phoneAnswers ? sign(...a) : setTimeout(go, 1)); go(); };
+  pg.ctx.DemiPassDevice = phone;
+  await settle(12);
+  assert.equal(pg.el('lock-screen').style.display, 'flex', 'opens locked after 10 idle minutes');
+  assert.equal(pg.appOpen(), false, 'vault hidden while locked');
+  assert.ok(pg.calls.some(c => c.path === '/api/identity/lock/now'), 'the server is told the session locked');
+  assert.equal(signs.length === 0 || signs[0].kind === 'P', true, 'the biometric prompt is up (presence key)');
+  phoneAnswers = true; await new Promise(r => setTimeout(r, 20)); await settle(8);
+  const v = pg.calls.find(c => c.path === '/api/identity/gate/verify');
+  assert.deepEqual([v.body.gate, v.body.intent, v.body.signature], ['device', 'unlock:0', 'SIG-P'], 'presence key signed unlock:0');
+  assert.equal(signs[0].kind, 'P');
+  assert.equal(pg.el('lock-screen').style.display, 'none'); assert.equal(pg.appOpen(), true, 'unlocked');
+});
+
+test('a fresh open within the lock time stays unlocked', async () => {
+  const pg = page({ storage: { ...signedIn, dp_last_active: String(Date.now() - 30 * 1000) }, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/lock') return { json: { lock_after_sec: 300 } };
+    return { json: { ok: true } };
+  } });
+  await settle(12);
+  assert.equal(pg.appOpen(), true);
+  assert.notEqual(pg.el('lock-screen').style.display, 'flex');
+});
+
+test('428 device_required on an approval → the linked phone signs it (D) and the call is retried with the signature', async () => {
+  const signs = []; let approves = 0;
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/device/challenge') { assert.deepEqual([b.purpose, b.intent, b.bind], ['approve', 'fill:9', 'https://login.example.com']); return { json: { challenge_id: 7, message: 'demipass:approve:x:fill:9:n:https://login.example.com' } }; }
+    if (p === '/api/blindkey/fill/9/approve') {
+      approves++;
+      if (!b || !b.device_signature) return { status: 428, json: { error: 'approve from your phone', device_required: true, challenge: { purpose: 'approve', intent: 'fill:9', bind: 'https://login.example.com' } } };
+      assert.deepEqual([b.device_challenge_id, b.device_signature], [7, 'SIG-D']);
+      return { json: { ok: true, status: 'approved' } };
+    }
+    return { json: { ok: true } };
+  } });
+  pg.ctx.DemiPassDevice = fakePhone(pg.ctx, signs);
+  await settle();
+  const d = await pg.ctx.apiGated('POST', '/api/blindkey/fill/9/approve', null, 'Fill?');
+  assert.equal(d.status, 'approved'); assert.equal(approves, 2); assert.equal(signs[0].kind, 'D');
+  assert.match(signs[0].message, /login\.example\.com$/, 'the phone signed text naming what is approved');
+});
+
+test('428 with no linked phone in this browser → a clear refusal, nothing signed', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/fill/9/approve') return { status: 428, json: { device_required: true, challenge: { purpose: 'approve', intent: 'fill:9', bind: '' } } };
+    return { json: { ok: true } };
+  } });
+  await settle();
+  await assert.rejects(pg.ctx.apiGated('POST', '/api/blindkey/fill/9/approve', null, 'Fill?'), /linked phone/);
+});
+
+test('locking closes an open approval sheet and refuses approvals until unlocked (#47 review H2)', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    return { json: { ok: true } };
+  } });
+  await settle();
+  pg.el('modal-approval').classList.add('show');
+  pg.ctx.lockNow(); await settle();
+  assert.equal(pg.shown('modal-approval'), false, 'approval sheet closed');
+  assert.equal(pg.el('lock-screen').style.display, 'flex');
+  await assert.rejects(pg.ctx.apiGated('POST', '/api/blindkey/approvals/1/approve', { code: '123456' }, 'x'), /locked/);
+  assert.ok(!pg.calls.some(c => c.path === '/api/blindkey/approvals/1/approve'), 'nothing sent while locked');
+});
+
+test('423 locked from the server → the phone unlocks (biometric) and the approval is retried', async () => {
+  const signs = []; let approves = 0;
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/device/challenge') return { json: { challenge_id: 3, message: 'demipass:' + b.purpose + ':' + b.intent } };
+    if (p === '/api/identity/gate/verify') return { json: { ok: true } };
+    if (p === '/api/blindkey/approvals/4/approve') { approves++; return approves === 1 ? { status: 423, json: { locked: true, error: 'unlock DemiPass on your phone first' } } : { json: { ok: true } }; }
+    return { json: { ok: true } };
+  } });
+  pg.ctx.DemiPassDevice = fakePhone(pg.ctx, signs);
+  await settle();
+  const d = await pg.ctx.apiGated('POST', '/api/blindkey/approvals/4/approve', { code: '1' }, 'Approve');
+  assert.equal(d.ok, true); assert.equal(approves, 2);
+  assert.equal(signs[0].kind, 'P'); assert.match(signs[0].message, /unlock:0/);
+});
