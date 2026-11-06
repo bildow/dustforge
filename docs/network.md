@@ -98,6 +98,20 @@ When both sides have confirmed, the pair is a contact with `verified_via = 'qr'`
 confirmation as well. Re-adding someone by name request makes them a contact again, but an unconfirmed one: a pending share offer cannot be accepted until the two pair again. Only people can pair: agent
 wallets, silicon/worker tokens and fleet-minted tokens are refused, and a wallet must have a PIN first.
 
+## Vouching — an introduction by someone both met in person
+
+C has paired in person (QR) with both A and B. C can introduce A and B so they become confirmed contacts without
+meeting, on C's word (red team item 6).
+
+| Step | Call | Notes |
+|---|---|---|
+| C vouches | `POST /api/network/vouch {a, b, note?}` | Takes C's PIN (intent `vouch:0`) and C's linked phone over `"<a>|<b>"`. C must have paired by QR with both: a contact confirmed by a vouch cannot vouch, so there are no chains. A and B must be people with a PIN, not already confirmed, and with no introduction already waiting. At most 10 open per voucher. Both are mailed. |
+| List | `GET /api/network/vouches` | Lists introductions you made or that name you. |
+| A and B accept | `POST /api/network/vouches/:id/accept` | Takes the PIN (intent `vouch:<id>`) and the linked phone over `"<voucher>|<other>"`. When both have accepted, the contact has `verified_via='vouch'` and `vouched_by=C`. The voucher is mailed. If C's own QR link to either person has ended, the introduction lapses (`withdrawn`). |
+| Decline / withdraw | `POST /api/network/vouches/:id/decline` | Either introduced person can decline; C can withdraw. No PIN. Introductions expire after 7 days. |
+
+`GET /api/network` shows each person's `confirmed_via` (`qr` or `vouch`) and `vouched_by`.
+
 ## Example: an agent asks to join a fleet
 
 ```
