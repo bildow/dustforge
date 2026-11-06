@@ -164,18 +164,66 @@ function emailWarmupGuard(req, res, next) {
       db.prepare('INSERT INTO email_warmup_daily (day, sent) VALUES (?, 0) ON CONFLICT(day) DO NOTHING').run(day);
       return db.prepare('UPDATE email_warmup_daily SET sent = sent + 1 WHERE day = ? AND sent < ?').run(day, limit).changes === 1;
     })();
-    if (!reserved) return res.status(429).json({ error: 'daily mail warmup cap reached', day, limit });
-    res.once('finish', () => {
-      if (res.statusCode >= 400) {
-        try { db.prepare('UPDATE email_warmup_daily SET sent = MAX(0, sent - 1) WHERE day = ?').run(day); }
-        catch (error) { console.error('[email] warmup reservation release failed:', error.message); }
-      }
-    });
+    if (!reserved) return res.status(429).json({ error: 'daily mail warmup cap reached', day, limit, remaining: 0 });
+    let released = false;
+    req.mailSlot = { release() {
+      if (released) return; released = true;
+      try { db.prepare('UPDATE email_warmup_daily SET sent = MAX(0, sent - 1) WHERE day = ?').run(day); }
+      catch (error) { console.error('[email] warmup reservation release failed:', error.message); }
+    } };
+    res.once('finish', () => { if (res.statusCode >= 400) req.mailSlot.release(); });
     next();
   } catch (error) {
     console.error('[email] warmup guard failed:', error.message);
     res.status(503).json({ error: 'mail warmup unavailable' });
   }
+}
+
+// What is left of today's mail allowance for this caller: Brain's own identity allowance, else the communal warmup
+// ramp, else unlimited (null). Sent on every mail call as X-Mail-Remaining (Aaron 2026-11-06).
+function mailRemaining(did, now = Date.now()) {
+  const bq = require('./brain_mail_quota');
+  if (did === bq.BRAIN_DID) return bq.brainRemaining(db, now);
+  const start = process.env.MAIL_WARMUP_START_UTC;
+  if (!start) return { scope: 'none', limit: null, remaining: null };
+  const startMs = Date.parse(start);
+  const initial = Number(process.env.MAIL_WARMUP_INITIAL_DAILY_LIMIT || 10), maximum = Number(process.env.MAIL_WARMUP_MAX_DAILY_LIMIT || 100);
+  if (!Number.isFinite(startMs) || !Number.isInteger(initial) || !Number.isInteger(maximum)) return { scope: 'warmup', limit: null, remaining: null };
+  const day = new Date(now).toISOString().slice(0, 10);
+  const limit = Math.min(maximum, initial * (2 ** Math.min(Math.max(0, Math.floor((now - startMs) / (7 * 86400000))), 30)));
+  let sent = 0;
+  try { const r = db.prepare('SELECT sent FROM email_warmup_daily WHERE day = ?').get(day); sent = r ? r.sent : 0; } catch (_) {}
+  return { scope: 'warmup', day, limit, remaining: Math.max(0, limit - sent) };
+}
+// On every mail call, whatever the answer: X-Mail-Remaining (and -Limit). A failed answer gives its slot back first,
+// so the count in the header is the one the next call will see.
+function mailHeaders(req, res, next) {
+  const json = res.json.bind(res);
+  res.json = (body) => {
+    try {
+      if (res.statusCode >= 400 && req.mailSlot) req.mailSlot.release();
+      const r = mailRemaining(req.identity && req.identity.did);
+      if (r.remaining !== null && r.remaining !== undefined) res.setHeader('X-Mail-Remaining', String(r.remaining));
+      if (r.limit !== null && r.limit !== undefined) res.setHeader('X-Mail-Limit', String(r.limit));
+    } catch (_) {}
+    return json(body);
+  };
+  next();
+}
+// The request is checked before any slot is reserved or any DD is charged: a malformed call costs nothing and is never
+// counted against the cap (Aaron 2026-11-06: the cap check and billing ran before validation).
+const EMAIL_ADDR_RE = /^[^\s@<>(),;:"\[\]]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+function validateEmailSend(req, res, next) {
+  const { to, subject, body, format = 'text', from } = req.body || {};
+  if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject, and body required' });
+  if (typeof to !== 'string' || typeof subject !== 'string' || typeof body !== 'string') return res.status(400).json({ error: 'to, subject and body must be strings' });
+  const rcpts = to.split(',').map(x => x.trim()).filter(Boolean);
+  if (!rcpts.length || rcpts.length > 10 || rcpts.some(a => !EMAIL_ADDR_RE.test(a))) return res.status(400).json({ error: 'to: 1–10 valid addresses, comma-separated' });
+  if (subject.length > 998 || /[\r\n]/.test(subject)) return res.status(400).json({ error: 'subject: one line, at most 998 characters' });
+  if (body.length > 90000) return res.status(400).json({ error: 'body: at most 90 000 characters' });
+  if (!['text', 'html'].includes(format)) return res.status(400).json({ error: "format: 'text' or 'html'" });
+  if (from !== undefined && (typeof from !== 'string' || from.length > 254)) return res.status(400).json({ error: 'from: an address string' });
+  next();
 }
 
 function safeSecretEqual(provided, expected) {
@@ -1841,9 +1889,10 @@ app.post('/api/billing/topup', (req, res) => {
   res.json(result);
 });
 
-app.post('/api/email/send', billing.billingMiddleware(db, 'email_send', { cost: 0 }), emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+// Order: authenticate (no charge) → headers → validate → reserve a cap slot → charge → send. A send the mail server
+// refuses is refunded (it never became mail) and its slot given back.
+app.post('/api/email/send', billing.billingMiddleware(db, 'email_send', { cost: 0 }), mailHeaders, validateEmailSend, emailWarmupGuard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
-  if (!to || !subject || !body) return res.status(400).json({ error: 'to, subject, and body required' });
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
     const t = createEmailTransport();
@@ -1857,12 +1906,18 @@ app.post('/api/email/send', billing.billingMiddleware(db, 'email_send', { cost: 
       if (local === un || local.endsWith('.' + un)) fromAddr = from;
     }
     const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
-    await t.sendMail({ from: fromAddr, to, subject, text: injectedBody });
-    console.log("[email] sent: " + fromAddr + " -> " + to);
-    res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code) });
+    const info = await t.sendMail({ from: fromAddr, to, subject, text: injectedBody });
+    console.log(`[email] sent: ${fromAddr} -> ${to} token=${req.billing.token_jti || '-'} msgid=${(info && info.messageId) || '-'}`);
+    res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code), message_id: (info && info.messageId) || null });
   } catch(e) {
-    console.error("[email] failed:", e.message);
-    res.status(502).json({ error: "delivery failed: " + e.message });
+    console.error(`[email] failed: token=${req.billing.token_jti || '-'} ${e.message}`);
+    // Refused by the mail server: it never became mail, so the charge comes back (same token id on the refund row).
+    let refunded = 0;
+    if (req.billing && req.billing.deducted > 0) {
+      const r = billing.creditBalance(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'email_send_refund', 'Refund: mail not accepted by the mail server', null, { tokenJti: req.billing.token_jti || null });
+      if (r && r.ok) refunded = req.billing.deducted;
+    }
+    res.status(502).json({ error: "delivery failed: " + e.message, refunded });
   }
 });
 
@@ -1920,9 +1975,14 @@ app.delete('/api/relay/remove', rateLimitStandard, billing.billingMiddleware(db,
 });
 
 // POST /api/relay/forward — trigger forwarding for a message (called internally or by silicon)
-app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+// Validated (and the rules looked up) before the charge: a call with nothing to forward costs nothing.
+app.post('/api/relay/forward', rateLimitStandard, billing.billingMiddleware(db, 'email_send', { cost: 0 }), mailHeaders, (req, res, next) => {
+  const { subject, body } = req.body || {};
+  if (!subject || !body || typeof subject !== 'string' || typeof body !== 'string') return res.status(400).json({ error: 'subject and body required' });
+  if (!db.prepare('SELECT 1 FROM forward_relays WHERE did = ? AND status = ?').get(req.identity.did, 'active')) return res.status(404).json({ error: 'no active forwarding rules' });
+  next();
+}, billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { subject, body, original_from } = req.body || {};
-  if (!subject || !body) return res.status(400).json({ error: 'subject and body required' });
 
   const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(req.identity.did);
   const rules = db.prepare('SELECT * FROM forward_relays WHERE did = ? AND status = ?').all(req.identity.did, 'active');
