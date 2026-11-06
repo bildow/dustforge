@@ -315,9 +315,14 @@ module.exports = function registerUseApprovals(deps) {
     // time); a critical one asks again every time (red team item 8).
     // Only with a linked phone: without one, the PIN still opens each request (#47 review M3).
     const coveredByUnlock = row.depth === 'elevated' && deviceKeys && deviceKeys.hasDevice(auth.did) && deviceKeys.unlockFresh(auth);
-    if (row.opened_session !== session && !coveredByUnlock) {
-      const intent = `approval-open:${row.id}`;
-      if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('approval-open', ['pin'], ['pin'], intent));
+    const needPin = row.opened_session !== session && !coveredByUnlock;
+    const intent = `approval-open:${row.id}`;
+    if (needPin && !gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('approval-open', ['pin'], ['pin'], intent));
+    // The code IS the approval (an agent redeems it): once a phone is linked, every fetch of it — the first open and
+    // each 5-s refresh — is signed by that phone, so a laptop with the PIN or a token copied off the phone gets no code
+    // (#47 re-review: approval-code bypass). Checked before the PIN proof is spent.
+    if (deviceKeys) { const r = deviceKeys.approvalRefusal(auth, 'approval-open', row.id, row.binding, req.body); if (r) return res.status(r.status).json(r.body); }
+    if (needPin) {
       const refused = spendSingleUse(auth.did, 'approval-open', ['pin'], auth, intent);
       if (refused) return res.status(refused.status || 403).json(refused);
     }

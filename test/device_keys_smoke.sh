@@ -50,6 +50,10 @@ for (const n of ["d", "p", "x"]) { const { privateKey, publicKey } = c.generateK
   fs.writeFileSync(process.argv[1] + "/" + n + ".pub", publicKey.export({ type: "spki", format: "der" }).toString("base64")); }' "$S"
 sig(){ node -e 'const c=require("crypto"),fs=require("fs"); process.stdout.write(c.sign("sha256", Buffer.from(process.argv[2]), fs.readFileSync(process.argv[1])).toString("base64"))' "$S/$1.pem" "$2"; }
 # challenge → signature, for a purpose/intent; sets CH (id) and SG (signature); extra = text appended after ":"
+# open an approval request as the phone would: the device key signs each fetch of the code (#47 code-bypass fix)
+dopen(){ local tok=$1 id=$2; local bind; bind=$(Q "SELECT binding FROM use_approvals WHERE id=$id")
+  chsign "$tok" d approve "approval-open:$id" "$bind"
+  call POST /api/demipass/approvals/$id/open "$tok" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'; }
 chsign(){ local tok=$1 key=$2 purpose=$3 intent=$4 extra=${5:-}
   if [ "$purpose" = approve ]; then call POST /api/identity/device/challenge "$tok" '{"purpose":"approve","intent":"'$intent'","bind":"'$extra'"}'; extra=""
   else call POST /api/identity/device/challenge "$tok" '{"purpose":"'$purpose'","intent":"'$intent'"}'; fi
@@ -74,22 +78,24 @@ call POST /api/demipass/store "$A" '{"name":"hook","value":"hook-token-zz90","se
 call POST /api/demipass/gate-policy "$A" '{"ref":"'$HK'","security_depth":"elevated"}'
 USE='{"ref":"'$HK'","params":{"url":"https://repo.dustroot.com/hook","method":"GET"}}'
 call POST /api/demipass/use "$AG" "$USE"; AP=$(echo "$BODY" | J approval_id); [ "$CODE" = 202 ] || fail "park: $CODE $BODY"
-pin "$A2" "approval-open:$AP"; call POST /api/demipass/approvals/$AP/open "$A2"; C2=$(echo "$BODY" | J code)
+pin "$A2" "approval-open:$AP"; call POST /api/demipass/approvals/$AP/open "$A2"
+[ "$CODE" = 423 ] && [ -z "$(echo "$BODY" | J code | grep -v None)" ] && ok "(a) a locked session gets no approval code (423)" || fail "a locked open: $CODE $BODY"
+pin "$A2" unlock:0; call POST /api/demipass/approvals/$AP/open "$A2"
+[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J code)" = None ] && ok "(a) unlocked but without the phone's device signature → no code (428): a laptop with the PIN or a copied token cannot read it out to an agent" || fail "a code bypass: $CODE $BODY"
+call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's/}$/,"approval_id":'$AP',"approval_code":"000000"}/')"; [ "$CODE" = 409 ] || [ "$CODE" = 403 ] || fail "a: unopened code redeem $CODE"
+dopen "$A2" $AP; C2=$(echo "$BODY" | J code); [ "$CODE" = 200 ] && [ -n "$C2" ] && ok "(a) the linked phone's signature fetches the code" || fail "a dopen: $CODE $BODY"
 call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'"}'
-[ "$CODE" = 423 ] && [ "$(echo "$BODY" | J locked)" = True ] && ok "(a) a locked session approves nothing (423), before any signature is spent (#47 H2)" || fail "a locked: $CODE $BODY"
-pin "$A2" unlock:0; C2=$(curl -s -X POST "$API/api/demipass/approvals/$AP/open" -H "Authorization: Bearer $A2" | J code)
-call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'"}'
-[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J device_required)" = True ] && ok "(a) unlocked, but no device signature → 428 device_required" || fail "a no sig: $CODE $BODY"
+[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J device_required)" = True ] && ok "(a) approving needs its own device signature too (428)" || fail "a no sig: $CODE $BODY"
 BIND=$(Q "SELECT binding FROM use_approvals WHERE id=$AP")
-chsign "$A2" x approve "approval:$AP" "$BIND"; C2=$(curl -s -X POST "$API/api/demipass/approvals/$AP/open" -H "Authorization: Bearer $A2" | J code)
+chsign "$A2" x approve "approval:$AP" "$BIND"
 call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
 [ "$CODE" = 403 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP")" = pending ] && ok "(a) a key that is not enrolled is refused, nothing approved" || fail "a foreign key: $CODE $BODY"
-chsign "$A2" d approve "approval:$AP" "$BIND"; C2=$(curl -s -X POST "$API/api/demipass/approvals/$AP/open" -H "Authorization: Bearer $A2" | J code)
+dopen "$A2" $AP; C2=$(echo "$BODY" | J code); chsign "$A2" d approve "approval:$AP" "$BIND"
 call POST /api/demipass/approvals/$AP/approve "$A2" '{"code":"'$C2'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP")" = approved ] && ok "(a) signed by the enrolled device key → approved" || fail "a signed: $CODE $BODY"
 call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's/}$/,"approval_id":'$AP'}/')"; [ "$CODE" = 200 ] && ok "(a) …and the agent's parked call runs once" || fail "a run: $CODE $BODY"
 call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's#/hook#/hookB#')"; APB=$(echo "$BODY" | J approval_id)
-pin "$A2" "approval-open:$APB"; CB=$(curl -s -X POST "$API/api/demipass/approvals/$APB/open" -H "Authorization: Bearer $A2" | J code)
+pin "$A2" "approval-open:$APB"; dopen "$A2" $APB; CB=$(echo "$BODY" | J code)
 chsign "$A2" d approve "approval:$APB" "$BIND"   # the phone was shown the OTHER request's binding
 call POST /api/demipass/approvals/$APB/approve "$A2" '{"code":"'$CB'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
 [ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$APB")" = pending ] && ok "(a) a signature over another decision's binding approves nothing (409)" || fail "a wrong bind: $CODE $BODY"
@@ -102,7 +108,8 @@ call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"approval-op
 chsign "$A" p gate "approval-open:$AP2"; GCH=$CH; GSG=$SG
 call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"approval-open:'$AP2'","challenge_id":'$GCH',"signature":"'$GSG'"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J via)" = biometric ] || fail "b verify: $CODE $BODY"
-call POST /api/demipass/approvals/$AP2/open "$A"; [ "$CODE" = 200 ] && ok "(b) the phone's biometric opens the request — no PIN typed" || fail "b open: $CODE $BODY"
+chsign "$A" p gate unlock:0; call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"unlock:0","challenge_id":'$CH',"signature":"'$SG'"}'
+dopen "$A" $AP2; [ "$CODE" = 200 ] && ok "(b) the phone's biometric opens the request — no PIN typed" || fail "b open: $CODE $BODY"
 call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"approval-open:'$AP2'","challenge_id":'$GCH',"signature":"'$GSG'"}'
 [ "$CODE" = 403 ] && ok "(b) a replayed challenge is refused" || fail "b replay: $CODE"
 chsign "$A" d gate "approval-open:$AP2"; call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"approval-open:'$AP2'","challenge_id":'$CH',"signature":"'$SG'"}'
@@ -113,7 +120,7 @@ call POST /api/demipass/use "$AG" "$(echo "$USE" | sed 's#/hook#/hook3#')"; AP3=
 call POST /api/identity/lock/now "$A2"
 call POST /api/demipass/approvals/$AP3/open "$A2"; [ "$CODE" = 403 ] && ok "(c) a locked session opens nothing without the PIN" || fail "c locked: $CODE"
 pin "$A2" unlock:0; call GET /api/identity/lock "$A2"; [ "$(echo "$BODY" | J unlocked)" = True ] || fail "c unlock state: $BODY"
-call POST /api/demipass/approvals/$AP3/open "$A2"; [ "$CODE" = 200 ] && ok "(c) after unlocking (PIN or biometric) an elevated request opens without another PIN" || fail "c elevated: $CODE $BODY"
+dopen "$A2" $AP3; [ "$CODE" = 200 ] && ok "(c) after unlocking (PIN or biometric) an elevated request opens without another PIN" || fail "c elevated: $CODE $BODY"
 call POST /api/demipass/store "$A" '{"name":"crit","value":"crit-token-zz91","secret_type":"api_key","host":"repo.dustroot.com"}'; CR=$(echo "$BODY" | J ref)
 call POST /api/demipass/gate-policy "$A" '{"ref":"'$CR'","security_depth":"critical"}'
 call POST /api/demipass/use "$AG" '{"ref":"'$CR'","params":{"url":"https://repo.dustroot.com/c","method":"GET"}}'; AP4=$(echo "$BODY" | J approval_id)
