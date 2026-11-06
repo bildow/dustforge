@@ -206,7 +206,16 @@ async function decide(decision, mode) {
       if (status >= 400 || !d.token) { msg('m-review', status === 404 ? 'No identity with that username.' : (d.error || 'Sign-in failed'), 'err'); return; }
       bearer = d.token; $('p').value = '';
     }
-    const { status, d } = await api('POST', '/api/identity/device/approve', { user_code: req.user_code, decision }, bearer);
+    let { status, d } = await api('POST', '/api/identity/device/approve', { user_code: req.user_code, decision }, bearer);
+    // A wallet with a linked phone approves new sessions from that phone only: its device key signs (red team item 4b).
+    if (status === 428 && d.device_required && d.challenge) {
+      if (!window.DemiPassDevice) { msg('m-review', 'Your wallet has a linked phone: approve this in the DemiPass app on that phone (open this page there).', 'err'); return; }
+      const ch = await api('POST', '/api/identity/device/challenge', { purpose: 'approve', intent: d.challenge.intent, bind: d.challenge.bind || '' }, bearer);
+      if (ch.status >= 400) { msg('m-review', ch.d.error || 'Could not get a challenge', 'err'); return; }
+      const sig = await new Promise((res) => { const id = 'dl' + Date.now(); window.DemiPassDeviceCb = (cid, json) => { if (cid === id) { try { res(JSON.parse(json)); } catch (_) { res({ ok: false }); } } }; try { window.DemiPassDevice.sign(id, 'D', ch.d.message, '', ''); } catch (_) { res({ ok: false, error: 'this phone is not linked' }); } });
+      if (!sig.ok) { msg('m-review', sig.error || 'This phone could not sign', 'err'); return; }
+      ({ status, d } = await api('POST', '/api/identity/device/approve', { user_code: req.user_code, decision, device_challenge_id: ch.d.challenge_id, device_signature: sig.signature }, bearer));
+    }
     if (status === 403 && mode === 'known') { msg('m-review', 'Your vault session cannot approve "' + req.scope + '" — sign in with your password to approve at that scope.', 'err'); useOther(); return; }
     if (status === 401 && mode === 'known') { msg('m-review', 'Your vault session has expired — sign in below.', 'err'); useOther(); return; }
     if (status >= 400) { msg('m-review', d.error || 'Request failed', 'err'); return; }

@@ -144,6 +144,15 @@
 </div>
 
 <!-- App -->
+<!-- Dormancy lock: the session stays signed in; the vault stays hidden until PIN or biometric (red team item 8) -->
+<div id="lock-screen" style="display:none;position:fixed;inset:0;z-index:50;background:var(--bg);flex-direction:column;align-items:center;justify-content:center;gap:0.9rem;padding:2rem;text-align:center">
+  <div style="font-size:2.2rem">🔒</div>
+  <div style="font-size:1rem;font-weight:600">DemiPass is locked</div>
+  <div style="font-size:0.78rem;color:var(--text3);max-width:18rem">You're still signed in. Unlock to see your vault — anything waiting for you will be there.</div>
+  <button id="lock-bio" class="btn-primary" onclick="unlockTry(false)" style="min-width:12rem">Unlock with fingerprint / face</button>
+  <button class="btn-ghost" onclick="unlockTry(true)" style="min-width:12rem">Use PIN</button>
+  <div id="lock-msg" style="font-size:0.75rem;color:var(--red);min-height:1rem"></div>
+</div>
 <div id="app" class="app" style="padding-top:env(safe-area-inset-top, 0px)">
   <div class="topbar" style="padding-top:2rem;background:var(--surface)">
     <div class="topbar-left">Demi<span>Pass</span></div>
@@ -334,6 +343,15 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked for every reveal; email/SMS codes stay fresh 5 minutes)</div>
         <div id="pin-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.4rem"></div>
         <button class="btn-ghost" onclick="openPinChange()" style="width:100%;text-align:left;padding:0.6rem">Change PIN</button>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Phones (approvals come from a linked phone; its fingerprint/face stands in for the PIN)</div>
+        <div id="devices" style="margin-top:0.3rem"></div>
+        <div id="device-out" style="font-size:0.72rem;color:var(--green);margin-top:0.25rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Lock after (idle)</div>
+        <select id="lock-after" onchange="setLockAfter(this.value)" style="width:100%;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem">
+          <option value="60">1 minute</option><option value="120">2 minutes</option><option value="300">5 minutes</option><option value="600">10 minutes</option>
+          <option value="900">15 minutes</option><option value="1800">30 minutes</option><option value="3600">1 hour</option>
+        </select>
+        <div style="font-size:0.68rem;color:var(--text3);margin-top:0.2rem">A shorter time needs nothing; a longer one asks for your PIN.</div>
       </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
@@ -915,7 +933,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();}
+  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -1077,10 +1095,14 @@ async function showApp(){
   if (!live()) return;
   if (!gs || typeof gs.pin_set !== 'boolean') { showPinCheckError(why||'unexpected reply from the server'); return; }
   if (gs.pin_set === false) { const set = await requirePinSetup(); if (!set || !live()) return; }
-  loginPw='';
 
+  const freshLogin=!!loginPw;
+  loginPw='';
   document.getElementById('app').style.display='block';
   vaultOpen=true;
+  // The last activity this phone recorded; none recorded (first start of this version) counts as now.
+  lockState.last=freshLogin?Date.now():(Number((()=>{try{return localStorage.getItem('dp_last_active')}catch(_){return 0}})())||Date.now());
+  loadLockSetting().then(()=>{ if(!freshLogin&&Date.now()-lockState.last>lockState.after*1000) lockNow(); else noteActive(true); });
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
@@ -1487,8 +1509,8 @@ async function approveApproval(){
   const m=document.getElementById('ap-msg');
   try{
     // Approve sends the code on the screen; if it rotated in between, fetch the new one and send that.
-    try{ await api('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code}); }
-    catch(e){ if(!/rotated/.test(e.message)) throw e; await refreshApproval(false); await api('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code}); }
+    try{ await apiGated('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code},'Approve this request'); }
+    catch(e){ if(!/rotated/.test(e.message)) throw e; await refreshApproval(false); await apiGated('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code},'Approve this request'); }
     m.textContent='Approved'; m.className='modal-msg ok';
     approvals=approvals.filter(a=>a.id!==apOpen.id); renderApprovals();
     setTimeout(()=>{ closeSheet('approval'); settleApproval(true); },600);
@@ -2089,6 +2111,8 @@ async function satisfyGate(gate, what, intent){
       if(!r) return false;
       await api('POST','/api/identity/gate/verify',{gate:'genesis',refraction:r});
     } else if(gate==='pin'){
+      // The linked phone's biometric first; the PIN when there is none, or it is cancelled.
+      try{ if(await deviceGate(intent, what)) return true; }catch(e){ if(sessionEnded(e)) throw e; }
       return await unlockWithPin(what, intent);
     } else if(gate==='fingerprint'){
       // Legacy server: a fingerprint gate needs a fingerprint-authed token; re-auth with password.
@@ -2104,6 +2128,101 @@ async function satisfyGate(gate, what, intent){
 
 // Call a gated endpoint. On a 403 listing missing gates, walk the user through
 // each factor and retry once. Returns the parsed JSON on success.
+// ── this phone's keys (DemiPass app 1.3+: window.DemiPassDevice; red team items 4b, 8) ───────────────────────────
+// D (device) signs approvals: once a phone is linked, approvals come from it. P (presence) signs after a biometric
+// or the phone's screen lock and stands in for the PIN. Nothing secret reaches this page: public keys, signatures.
+const dev={cbs:{},n:0,
+  st(){ try{ return globalThis.DemiPassDevice?JSON.parse(globalThis.DemiPassDevice.status()):{ok:false}; }catch(_){ return {ok:false}; } },
+  linked(){ const s=dev.st(); return !!(s.ok&&s.enrolled); },
+  call(fn,...args){ return new Promise(res=>{ const id='c'+(++dev.n); dev.cbs[id]=res;
+    try{ globalThis.DemiPassDevice[fn](id,...args); }catch(_){ delete dev.cbs[id]; res({ok:false,error:'this phone cannot sign'}); }
+    setTimeout(()=>{ if(dev.cbs[id]){ delete dev.cbs[id]; res({ok:false,error:'timed out'}); } },120000); }); }};
+globalThis.DemiPassDeviceCb=(id,json)=>{ const f=dev.cbs[id]; if(!f) return; delete dev.cbs[id]; try{ f(JSON.parse(json)); }catch(_){ f({ok:false}); } };
+// Biometric for a PIN intent: true when the server recorded the proof; false → fall back to the PIN.
+async function deviceGate(intent, what){
+  if(!dev.linked()||!intent) return false;
+  const ch=await api('POST','/api/identity/device/challenge',{purpose:'gate',intent});
+  const r=await dev.call('sign','P',ch.message,'DemiPass',String(what||'Confirm it\'s you').slice(0,110));
+  if(!r.ok) return false;
+  await api('POST','/api/identity/gate/verify',{gate:'device',intent,challenge_id:ch.challenge_id,signature:r.signature});
+  return true;
+}
+// The phone's device key signs this decision (what it is about — bind — is shown in the challenge text).
+async function deviceApprove(challenge){
+  if(!dev.linked()) throw new Error('Your wallet has a linked phone: approve this in the DemiPass app on that phone.');
+  const ch=await api('POST','/api/identity/device/challenge',{purpose:'approve',intent:challenge.intent,bind:challenge.bind||''});
+  const r=await dev.call('sign','D',ch.message,'','');
+  if(!r.ok) throw new Error(r.error||'this phone could not sign');
+  return {device_challenge_id:ch.challenge_id,device_signature:r.signature};
+}
+// ── dormancy lock (red team item 8): idle past the owner's lock time → the vault hides until PIN or biometric ────
+const lockState={after:300,last:Date.now(),locked:false,pingAt:0};
+function noteActive(force){
+  if(lockState.locked||!vaultOpen) return;
+  lockState.last=Date.now(); try{ localStorage.setItem('dp_last_active',String(lockState.last)); }catch(_){}
+  if(force||Date.now()-lockState.pingAt>60000){ lockState.pingAt=Date.now(); api('POST','/api/identity/lock/ping').catch(()=>{}); }
+}
+if(typeof document!=='undefined'&&document.addEventListener) ['pointerdown','keydown','touchstart','scroll'].forEach(ev=>document.addEventListener(ev,()=>noteActive(false),{passive:true,capture:true}));
+function idleCheck(){ if(vaultOpen&&!lockState.locked&&Date.now()-lockState.last>lockState.after*1000) lockNow(); }
+setInterval(idleCheck,5000);
+if(typeof document!=='undefined'&&document.addEventListener) document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') idleCheck(); });
+function lockNow(){
+  if(lockState.locked) return;
+  lockState.locked=true;
+  document.getElementById('app').style.display='none';
+  document.getElementById('lock-screen').style.display='flex';
+  document.getElementById('lock-bio').style.display=dev.linked()?'block':'none';
+  api('POST','/api/identity/lock/now').catch(()=>{});
+  if(dev.linked()) unlockTry(false);
+}
+async function unlockTry(usePin){
+  const m=document.getElementById('lock-msg'); m.textContent='';
+  try{
+    let ok=false;
+    if(!usePin){ try{ ok=await deviceGate('unlock:0','Unlock DemiPass'); }catch(e){ if(sessionEnded(e)) throw e; } }
+    if(!ok) ok=await unlockWithPin('Unlock DemiPass','unlock:0');
+    if(!ok){ m.textContent='Still locked.'; return; }
+    lockState.locked=false; document.getElementById('lock-screen').style.display='none'; document.getElementById('app').style.display='block';
+    noteActive(true); loadVault(); loadFillRequests(); loadApprovals();
+  }catch(e){ if(!sessionEnded(e)) m.textContent=e.message; }
+}
+async function loadLockSetting(){
+  try{ const r=await api('GET','/api/identity/lock'); lockState.after=Number(r.lock_after_sec)||300; const el=document.getElementById('lock-after'); if(el) el.value=String(lockState.after); }catch(_){}
+}
+async function setLockAfter(v){
+  try{ const r=await apiGated('PUT','/api/identity/lock',{lock_after_sec:Number(v)},'Lock less often? Your PIN confirms it.'); lockState.after=r.lock_after_sec; }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadLockSetting();
+}
+
+async function linkPhone(){
+  const out=document.getElementById('device-out');
+  try{
+    if(!globalThis.DemiPassDevice){ alert('Open this in the DemiPass app on your phone to link it.'); return; }
+    const ch=await api('POST','/api/identity/device/challenge',{purpose:'enrol',intent:'device-enrol:0'});
+    const r=await dev.call('enrol',ch.message);
+    if(!r.ok) throw new Error(r.error||'could not link this phone');
+    await apiGated('POST','/api/identity/device/enrol',{challenge_id:ch.challenge_id,device_id:r.device_id,label:r.label,key_d:r.key_d,key_p:r.key_p,sig_d:r.sig_d,sig_p:r.sig_p},'Link this phone for approvals? Your PIN confirms it.');
+    if(out) out.textContent='This phone is linked: approvals come from it, and your fingerprint/face can stand in for the PIN.';
+    loadDevices();
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+}
+async function unlinkPhone(id){
+  try{ await apiGated('DELETE','/api/identity/devices/'+encodeURIComponent(id),null,'Remove this phone? Your PIN confirms it.'); const s=dev.st(); if(s.ok&&s.device_id===id&&globalThis.DemiPassDevice) globalThis.DemiPassDevice.forget(); loadDevices(); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+}
+async function loadDevices(){
+  const el=document.getElementById('devices'); if(!el) return;
+  try{
+    const r=await api('GET','/api/identity/devices'); const me=dev.st();
+    el.innerHTML=(r.devices||[]).map(d=>'<div class="fill-req"><div><b>'+esc(d.label)+'</b>'+(me.ok&&me.device_id===d.device_id?' (this phone)':'')+'</div>'
+      +'<div style="color:var(--text3);font-size:0.75rem">linked '+esc(String(d.enrolled_at||'').slice(0,10))+(d.last_used_at?' · last used '+esc(String(d.last_used_at).slice(0,10)):'')+'</div>'
+      +'<div class="fr-row"><button class="btn-ghost" onclick="unlinkPhone('+esc(JSON.stringify(d.device_id))+')">Remove</button></div></div>').join('')
+      +(me.ok&&!me.enrolled?'<button class="btn-primary" onclick="linkPhone()">Use this phone for approvals</button>':'')
+      +((r.devices||[]).length?'':'<div style="color:var(--text3);font-size:0.75rem;margin-top:0.4rem">No phone linked: approvals are taken from any signed-in session with your PIN.</div>');
+  }catch(e){ if(!sessionEnded(e)) el.textContent=e.message; }
+}
+
 async function apiGated(method, path, body, what){
   if(!(await ensureSession())) throw new Error('session expired');
   const epoch=sessionEpoch; let renewed=false;
@@ -2119,12 +2238,17 @@ async function apiGated(method, path, body, what){
     return {status:r.status,d:d||{}};
   };
   let {status,d}=await call();
-  if(status===403 && Array.isArray(d.missing) && d.missing.length){
-    // Codes first, the PIN last: its proof opens only this action (d.intent), once, so it is typed right
-    // before the retry — never ahead of a code step that might still be cancelled.
-    const order=[...d.missing.filter(g=>g!=='pin'), ...d.missing.filter(g=>g==='pin')];
-    for(const g of order){ if(!await satisfyGate(g, what, d.intent)) throw new Error('cancelled — '+g+' not verified'); }
-    ({status,d}=await call());
+  for(let round=0; round<3; round++){
+    if(status===403 && Array.isArray(d.missing) && d.missing.length){
+      // Codes first, the PIN last: its proof opens only this action (d.intent), once, so it is typed right
+      // before the retry — never ahead of a code step that might still be cancelled.
+      const order=[...d.missing.filter(g=>g!=='pin'), ...d.missing.filter(g=>g==='pin')];
+      for(const g of order){ if(!await satisfyGate(g, what, d.intent)) throw new Error('cancelled — '+g+' not verified'); }
+      ({status,d}=await call());
+    } else if(status===428 && d.device_required && d.challenge){
+      body={...(body||{}),...(await deviceApprove(d.challenge))};   // the linked phone signs this decision
+      ({status,d}=await call());
+    } else break;
   }
   if(status>=400) throw new Error(d.error||'failed');
   return d;
