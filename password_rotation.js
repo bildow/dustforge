@@ -24,10 +24,13 @@ const LOCK_TTL_SEC = 180;
 const ROTATE_GRACE_MIN = 3 * 24 * 60;
 // A pending row is the sweep's only once it is older than any request the mail server could still be working on: the
 // PATCH times out at 10 s (setMailboxPasswordHash), so never before 15 s (#69 round-2 P3), whatever a test asks for.
-const SWEEP_AFTER_SEC = Math.max(15, Number(process.env.PW_ROTATE_SWEEP_AFTER_SEC || 120));
-const MAX_ATTEMPTS = Number(process.env.PW_ROTATE_MAX_ATTEMPTS || 288);    // ≈ 24 h of 5-minute sweeps
-const MAX_PENDING_SEC = Number(process.env.PW_ROTATE_MAX_PENDING_SEC || 2 * 86400);
-const SWEEP_EVERY_MS = Number(process.env.PW_ROTATE_SWEEP_MS || 5 * 60 * 1000);   // tests shorten both
+// Test knobs are read only under NODE_ENV=test: in production a stray .env line can neither stall the scan nor make every
+// pending row abandon on its first sweep (#69 round-3 review).
+const TEST_ENV = process.env.NODE_ENV === 'test' ? process.env : {};
+const SWEEP_AFTER_SEC = Math.max(15, Number(TEST_ENV.PW_ROTATE_SWEEP_AFTER_SEC || 120));
+const MAX_ATTEMPTS = Math.max(1, Number(TEST_ENV.PW_ROTATE_MAX_ATTEMPTS || 288));    // ≈ 24 h of 5-minute sweeps
+const MAX_PENDING_SEC = Number(TEST_ENV.PW_ROTATE_MAX_PENDING_SEC || 2 * 86400);
+const SWEEP_EVERY_MS = Number(TEST_ENV.PW_ROTATE_SWEEP_MS || 5 * 60 * 1000);   // tests shorten both
 // Exactly the hosts where THIS account's password is typed (#69 round-2 L-a): not every subdomain — repo.dustroot.com is
 // Forgejo, with accounts of its own.
 const TIED_HOSTS = new Set(['demipass.com', 'www.demipass.com', 'dustforge.com', 'www.dustforge.com', 'api.dustforge.com', 'mail.dustforge.com']);
@@ -278,7 +281,7 @@ module.exports = function registerPasswordRotation(deps) {
       }
 
       // (tests only: stretch the scan, to show a lock lost meanwhile stops the rotation)
-      if (Number(process.env.PW_ROTATE_SCAN_PAUSE_MS) > 0) await new Promise(r => setTimeout(r, Number(process.env.PW_ROTATE_SCAN_PAUSE_MS)));
+      if (Number(TEST_ENV.PW_ROTATE_SCAN_PAUSE_MS) > 0) await new Promise(r => setTimeout(r, Number(TEST_ENV.PW_ROTATE_SCAN_PAUSE_MS)));
       // 2. the pending row, before anything outside DemiPass changes — still holding the lock (the scan can be long)
       const fresh = crypto.randomBytes(24).toString('base64url');
       const newHash = await passwords.hashPassword(fresh);

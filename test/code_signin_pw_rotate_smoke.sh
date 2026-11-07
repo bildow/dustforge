@@ -14,7 +14,7 @@ W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-pwrot-smoke.XXXXXX)
 PORT=${PORT:-3811}; ST_PORT=${ST_PORT:-3812}; API=http://127.0.0.1:$PORT
 [ -d "$W/node_modules" ] || export NODE_PATH=${NODE_PATH:-/home/flimflam/project/dustforge/node_modules}
-export PW_ROTATE_SWEEP_MS=1000 PW_ROTATE_SWEEP_AFTER_SEC=1 PW_ROTATE_SCAN_PAUSE_MS=1500 IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
+export NODE_ENV=test PW_ROTATE_SWEEP_MS=1000 PW_ROTATE_SWEEP_AFTER_SEC=1 PW_ROTATE_SCAN_PAUSE_MS=1500 IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
   STALWART_HOST=127.0.0.1 STALWART_PORT=$ST_PORT SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9
 cd "$W"
 ACCT='acct-pass-Q9z!w'; MAILPW='mail-pass-7Kq#v'
