@@ -22,9 +22,15 @@ const crypto = require('crypto');
 
 const LOCK_TTL_SEC = 180;
 const ROTATE_GRACE_MIN = 3 * 24 * 60;
-const SWEEP_AFTER_SEC = Number(process.env.PW_ROTATE_SWEEP_AFTER_SEC || 120);   // a pending row older than this is the sweep's
+// A pending row is the sweep's only once it is older than any request the mail server could still be working on: the
+// PATCH times out at 10 s (setMailboxPasswordHash), so never before 15 s (#69 round-2 P3), whatever a test asks for.
+const SWEEP_AFTER_SEC = Math.max(15, Number(process.env.PW_ROTATE_SWEEP_AFTER_SEC || 120));
+const MAX_ATTEMPTS = Number(process.env.PW_ROTATE_MAX_ATTEMPTS || 288);    // ≈ 24 h of 5-minute sweeps
+const MAX_PENDING_SEC = Number(process.env.PW_ROTATE_MAX_PENDING_SEC || 2 * 86400);
 const SWEEP_EVERY_MS = Number(process.env.PW_ROTATE_SWEEP_MS || 5 * 60 * 1000);   // tests shorten both
-const TIED_HOSTS = /(^|\.)(demipass\.com|dustforge\.com|dustroot\.com|dustanvil\.com)$/i;
+// Exactly the hosts where THIS account's password is typed (#69 round-2 L-a): not every subdomain — repo.dustroot.com is
+// Forgejo, with accounts of its own.
+const TIED_HOSTS = new Set(['demipass.com', 'www.demipass.com', 'dustforge.com', 'www.dustforge.com', 'api.dustforge.com', 'mail.dustforge.com']);
 const TIED_PROVIDERS = new Set(['demipass', 'dustforge', 'stalwart']);
 const TIED_NAME = /^(dustforge|demipass|stalwart|account-password)-/i;
 
@@ -65,15 +71,25 @@ module.exports = function registerPasswordRotation(deps) {
   function release(did, holder) { try { db.prepare('DELETE FROM account_password_locks WHERE did = ? AND holder = ?').run(did, holder); } catch (_) {} }
   // A rotation still pending blocks other password changes too: its new password may already be the mailbox's.
   function pendingFor(did) { return db.prepare("SELECT id FROM account_password_rotations WHERE did = ? AND status = 'pending' LIMIT 1").get(did); }
+  // Rotation and reset also wait while a guardian recovery is part-way through completing: it may still put its prior
+  // mailbox secret back, which would undo either (#69 round-2 L-e).
+  function blockedFor(did) {
+    if (pendingFor(did)) return true;
+    try { return Boolean(db.prepare("SELECT 1 FROM account_holds WHERE did = ? AND kind = 'recovery' AND status = 'completing' LIMIT 1").get(did)); } catch (_) { return false; }
+  }
+  // Keep holding the lock through a long step; false when it was lost (expired and taken) — the caller stops (L-b).
+  function renew(did, holder, ttlSec = LOCK_TTL_SEC) {
+    return db.prepare('UPDATE account_password_locks SET expires_at = ? WHERE did = ? AND holder = ?')
+      .run(new Date(Date.now() + ttlSec * 1000).toISOString(), did, holder).changes === 1;
+  }
   const BUSY = { error: 'a password change on this account is still settling — try again in a few minutes', busy: true };
 
   // ── what counts as this account's own entry ───────────────────────────────────────────────────────────────────
   function tie(s, wallet) {
     let origins = []; try { origins = storedOrigins ? storedOrigins(s.fill_origins) : JSON.parse(s.fill_origins || '[]'); } catch (_) { origins = []; }
     const hostOf = (o) => { try { return new URL(o).hostname; } catch (_) { return ''; } };
-    if (origins.length && origins.every(o => TIED_HOSTS.test(hostOf(o)))) return 'fill origin';
-    const fu = String(s.fill_username || '').trim().toLowerCase();
-    if (fu && !origins.length && (fu === String(wallet.username || '').toLowerCase() || fu === String(wallet.email || '').toLowerCase())) return 'fill username';
+    if (origins.length && origins.every(o => TIED_HOSTS.has(hostOf(o).toLowerCase()))) return 'fill origin';
+    // A fill username alone ties nothing (the same username exists on other services): only with one of the rules here.
     if (!origins.length && TIED_PROVIDERS.has(String(s.provider || '').toLowerCase())) return 'provider';
     if (!origins.length && TIED_NAME.test(String(s.name || '').replace(/_v\d+$/, ''))) return 'name';
     return null;
@@ -81,7 +97,7 @@ module.exports = function registerPasswordRotation(deps) {
 
   // ── settling a rotation row (inline and from the sweep) ───────────────────────────────────────────────────────
   // `mailbox` = what the mail server holds now ({state, secret}). Returns {status:'done'|'failed'|'pending', report?}.
-  async function settle(row, mailbox) {
+  async function settle(row, mailbox, { fromSweep = false } = {}) {
     const plan = JSON.parse(row.plan || '{}');
     const fail = (why) => {
       db.prepare("UPDATE account_password_rotations SET status = 'failed', fresh_enc = NULL, settled_at = ?, report = ? WHERE id = ? AND status = 'pending'")
@@ -89,9 +105,20 @@ module.exports = function registerPasswordRotation(deps) {
       return { status: 'failed', why };
     };
     if (row.prior !== null && row.prior !== undefined) {
-      if (mailbox.state !== 'ok') { bump(row); return { status: 'pending' }; }
-      if (mailbox.secret === row.prior) return fail('the mail server kept the old password');
-      if (mailbox.secret !== row.new_hash) {
+      if (mailbox.state === 'absent') { /* the principal is gone: nothing left to split — the account follows */ }
+      else if (mailbox.state !== 'ok') { bump(row); return { status: 'pending' }; }
+      else if (mailbox.secret === row.prior) {
+        // The old secret is showing. Inline that proves nothing (a timed-out PATCH may still land): stay pending. The
+        // sweep, past every timeout, writes the old secret back once — so a PATCH arriving even later is overwritten
+        // in order, not after the decision — and only then calls it failed (#69 round-2 P3).
+        if (!fromSweep) { bump(row); return { status: 'pending' }; }
+        const put = await setMailboxPasswordHash(row.did, row.prior).catch(() => 'unknown');
+        if (put !== 'ok') { bump(row); return { status: 'pending' }; }
+        const again = await fetchStalwartSecret(plan.username).catch(() => ({ state: 'unreachable' }));
+        if (again.state !== 'ok' || again.secret !== row.prior) { bump(row); return { status: 'pending' }; }
+        return fail('the mail server kept the old password');
+      }
+      if (mailbox.state === 'ok' && mailbox.secret !== row.new_hash) {
         // Someone else changed the mailbox meanwhile (should not happen under the lock). DemiPass follows the account:
         // the mailbox gets the account's current hash, and this rotation ends.
         const cur = db.prepare('SELECT password_hash FROM identity_wallets WHERE did = ?').get(row.did) || {};
@@ -128,10 +155,12 @@ module.exports = function registerPasswordRotation(deps) {
             .run(row.did, name, 'Account + mailbox password, set by a blind rotation', blindkeyEncrypt(fresh), ref);
           report.stored_as = { name, ref };
         }
-        db.prepare("UPDATE account_password_rotations SET status = 'done', fresh_enc = NULL, settled_at = ?, report = ? WHERE id = ? AND status = 'pending'")
-          .run(nowIso(), JSON.stringify(report), row.id);
+        // Exactly this pending row becomes done, or nothing happened (two sweeps, or a sweep and the route) (L-d).
+        if (db.prepare("UPDATE account_password_rotations SET status = 'done', fresh_enc = NULL, settled_at = ?, report = ? WHERE id = ? AND status = 'pending'")
+          .run(nowIso(), JSON.stringify(report), row.id).changes !== 1) throw Object.assign(new Error('settled elsewhere'), { already: true });
       }).immediate();
     } catch (e) {
+      if (e.already) return { status: 'done-elsewhere' };
       // Nothing in DemiPass changed. Put the mailbox back — only if it still holds OUR new hash; if the account's
       // password changed meanwhile, the mailbox gets that one instead (#69 review M1).
       const now = row.prior === null ? { state: 'absent' } : await fetchStalwartSecret(plan.username).catch(() => ({ state: 'unreachable' }));
@@ -148,6 +177,30 @@ module.exports = function registerPasswordRotation(deps) {
     } finally { for (const id of taken) rotatingSecrets.delete(id); fresh = null; }
     return { status: 'done', report };
   }
+  // A row that never settles (the mail server gone for days) must not block every password change for ever (L-c). Its
+  // new password may be the mailbox's now, so it is not thrown away: it goes into the owner's vault, named for what it
+  // is, and the owner and the operator are told.
+  function abandon(row, plan) {
+    let fresh = null; try { fresh = blindkeyDecrypt(row.fresh_enc); } catch (_) {}
+    db.transaction(() => {
+      if (fresh) {
+        const name = `account-password-unconfirmed-${plan.username || 'wallet'}-${row.id}`.slice(0, 100);
+        db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code, category, provider)
+                    VALUES (?, ?, ?, 'password', ?, '{}', 'active', 1, ?, 'account', 'demipass')`)
+          .run(row.did, name, 'A blind rotation could not confirm whether the mail server took this password: it may be your mail password now', blindkeyEncrypt(fresh), generateRefCode('password', name));
+      }
+      db.prepare("UPDATE account_password_rotations SET status = 'abandoned', fresh_enc = NULL, settled_at = ?, report = ? WHERE id = ? AND status = 'pending'")
+        .run(nowIso(), JSON.stringify({ why: 'never settled', attempts: row.attempts }), row.id);
+    })();
+    fresh = null;
+    logSecurityEvent('password_rotate_abandoned', 'critical', { caller_did: row.did, capability: 'pw-rotate', context: { rotation: row.id, attempts: row.attempts } });
+    try {
+      const w = db.prepare('SELECT email, recovery_email FROM identity_wallets WHERE did = ?').get(row.did) || {};
+      const to = w.recovery_email || w.email;
+      if (to && sendMail) Promise.resolve(sendMail({ to, subject: 'DemiPass: a password rotation could not be confirmed',
+        text: 'A blind rotation of your account password could not be confirmed with the mail server. Your account password is unchanged; your mail password may be the new one, which is in your vault as account-password-unconfirmed-…\nContact DemiPass support if mail sign-in fails.\n' })).catch(() => {});
+    } catch (_) {}
+  }
   function bump(row) { try { db.prepare('UPDATE account_password_rotations SET attempts = attempts + 1 WHERE id = ?').run(row.id); } catch (_) {} }
 
   // The sweep: every pending row not being worked on right now is settled from what the mailbox holds.
@@ -157,9 +210,12 @@ module.exports = function registerPasswordRotation(deps) {
       const holder = 'sweep:' + row.id;
       if (!claim(row.did, holder)) continue;
       try {
-        const plan = JSON.parse(row.plan || '{}');
-        const mb = row.prior === null ? { state: 'absent' } : await fetchStalwartSecret(plan.username).catch(() => ({ state: 'unreachable' }));
-        const r = await settle(row, mb);
+        const cur = db.prepare("SELECT * FROM account_password_rotations WHERE id = ? AND status = 'pending'").get(row.id);   // re-read under the lock (L-d)
+        if (!cur) continue;
+        const plan = JSON.parse(cur.plan || '{}');
+        if (cur.attempts >= MAX_ATTEMPTS || Date.parse(cur.created_at) < Date.now() - MAX_PENDING_SEC * 1000) { abandon(cur, plan); continue; }
+        const mb = cur.prior === null ? { state: 'absent' } : await fetchStalwartSecret(plan.username).catch(() => ({ state: 'unreachable' }));
+        const r = await settle(cur, mb, { fromSweep: true });
         if (r.status !== 'pending') logSecurityEvent('password_rotate_settled_by_sweep', 'alert', { caller_did: row.did, capability: 'pw-rotate', context: { rotation: row.id, status: r.status } });
       } catch (e) { console.error('[pw-rotate] sweep:', e.message); }
       finally { release(row.did, holder); }
@@ -185,7 +241,7 @@ module.exports = function registerPasswordRotation(deps) {
     if (!gateFresh(did, 'pin', auth, intent)) return res.status(403).json(gateMissing('pw-rotate', ['pin'], ['pin'], intent));
     const dk = devices();
     if (dk) { const r = dk.approvalRefusal(auth, 'pw-rotate', 0, 'account-password', req.body); if (r) return res.status(r.status).json(r.body); }
-    if (pendingFor(did)) return res.status(409).json(BUSY);
+    if (blockedFor(did)) return res.status(409).json(BUSY);
     const holder = 'rotate:' + crypto.randomBytes(6).toString('hex');
     if (!claim(did, holder)) return res.status(409).json(BUSY);
     let rowId = null;
@@ -221,9 +277,12 @@ module.exports = function registerPasswordRotation(deps) {
         plan.moved.push({ id: s.id, ct: sha(s.encrypted_value), name: s.name, ref: s.ref_code || null, matched, tie: why });
       }
 
-      // 2. the pending row, before anything outside DemiPass changes
+      // (tests only: stretch the scan, to show a lock lost meanwhile stops the rotation)
+      if (Number(process.env.PW_ROTATE_SCAN_PAUSE_MS) > 0) await new Promise(r => setTimeout(r, Number(process.env.PW_ROTATE_SCAN_PAUSE_MS)));
+      // 2. the pending row, before anything outside DemiPass changes — still holding the lock (the scan can be long)
       const fresh = crypto.randomBytes(24).toString('base64url');
       const newHash = await passwords.hashPassword(fresh);
+      if (!renew(did, holder) || blockedFor(did)) return res.status(409).json({ ...BUSY, error: 'the rotation lost its lock while comparing your vault — nothing changed; try again' });
       rowId = Number(db.prepare(`INSERT INTO account_password_rotations (did, status, fresh_enc, prior, new_hash, old_hash, plan, created_at)
                                  VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)`).run(did, blindkeyEncrypt(fresh), prior, newHash, wallet.password_hash || null, JSON.stringify(plan), nowIso()).lastInsertRowid);
 
@@ -231,10 +290,18 @@ module.exports = function registerPasswordRotation(deps) {
       let mb = { state: 'absent' };
       if (prior !== null) {
         const st = await setMailboxPasswordHash(did, newHash).catch(() => 'unknown');
+        if (st === 'unreached') {
+          // Never connected: the mail server received nothing. Safe to end here.
+          db.prepare("UPDATE account_password_rotations SET status = 'failed', fresh_enc = NULL, settled_at = ?, report = ? WHERE id = ? AND status = 'pending'")
+            .run(nowIso(), JSON.stringify({ why: 'mail server unreachable' }), rowId);
+          return res.status(503).json({ error: 'the mail server cannot be reached — nothing changed; try again', retry: true });
+        }
         mb = st === 'ok' ? { state: 'ok', secret: newHash } : await fetchStalwartSecret(wallet.username).catch(() => ({ state: 'unreachable' }));
+        renew(did, holder);
       }
       const row = db.prepare('SELECT * FROM account_password_rotations WHERE id = ?').get(rowId);
       const r = await settle(row, mb);
+      if (r.status === 'done-elsewhere') return res.status(202).json({ ok: false, pending: false, rotation_id: rowId, error: 'this rotation was settled by the background check; see your vault' });
       if (r.status === 'failed') return res.status(503).json({ error: `not rotated: ${r.why} — nothing changed; try again`, retry: true });
       if (r.status === 'pending') {
         return res.status(202).json({ ok: false, pending: true, rotation_id: rowId,
@@ -266,5 +333,5 @@ module.exports = function registerPasswordRotation(deps) {
     } finally { release(did, holder); }
   });
 
-  return { claim, release, pendingFor, sweep, BUSY, tie };
+  return { claim, release, renew, pendingFor, blockedFor, sweep, BUSY, tie };
 };

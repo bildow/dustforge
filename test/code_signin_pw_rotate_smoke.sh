@@ -14,12 +14,13 @@ W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-pwrot-smoke.XXXXXX)
 PORT=${PORT:-3811}; ST_PORT=${ST_PORT:-3812}; API=http://127.0.0.1:$PORT
 [ -d "$W/node_modules" ] || export NODE_PATH=${NODE_PATH:-/home/flimflam/project/dustforge/node_modules}
-export PW_ROTATE_SWEEP_MS=1000 PW_ROTATE_SWEEP_AFTER_SEC=1 IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
+export PW_ROTATE_SWEEP_MS=1000 PW_ROTATE_SWEEP_AFTER_SEC=1 PW_ROTATE_SCAN_PAUSE_MS=1500 IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
   STALWART_HOST=127.0.0.1 STALWART_PORT=$ST_PORT SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9
 cd "$W"
 ACCT='acct-pass-Q9z!w'; MAILPW='mail-pass-7Kq#v'
 # Stalwart stub: principals in $S/stalwart.json. POST /__mode {"patch": "ok" | "fail" (500, nothing applied) |
-# "apply500" (applies, then answers 500) | "down" (applies the PATCH, then every request fails until "ok")}.
+# "apply500" (applies, then answers 500) | "down" (applies the PATCH, then every request fails until "ok") |
+# "slow" / "late" (the change lands, and is answered, after 3 s / 11.5 s)}.
 cat > "$S/stalwart.js" <<'EOF'
 const http = require('http'), fs = require('fs'); const f = process.argv[2]; let mode = 'ok';
 http.createServer((q, r) => { let b = ''; q.on('data', c => b += c); q.on('end', () => {
@@ -29,6 +30,10 @@ http.createServer((q, r) => { let b = ''; q.on('data', c => b += c); q.on('end',
   const name = decodeURIComponent(m[1]);
   if (mode === 'down-now') { r.writeHead(500); r.end('{}'); return; }
   if (q.method === 'GET') { r.writeHead(200, { 'content-type': 'application/json' }); r.end(JSON.stringify(st[name] ? { data: { secrets: [st[name]] } } : { error: 'notFound', item: name })); return; }
+  if (q.method === 'PATCH' && (mode === 'slow' || mode === 'late')) {   // the change lands after 3 s / 11.5 s (the client times out at 10 s)
+    const wait = mode === 'slow' ? 3000 : 11500; mode = 'ok';
+    setTimeout(() => { const st2 = JSON.parse(fs.readFileSync(f, 'utf8')); for (const o of JSON.parse(b)) if (o.field === 'secrets') st2[name] = o.value[0];
+      fs.writeFileSync(f, JSON.stringify(st2)); try { r.writeHead(200, { 'content-type': 'application/json' }); r.end('{"data":null}'); } catch (_) {} }, wait); return; }
   if (q.method === 'PATCH') { if (mode === 'fail') { r.writeHead(500); r.end('{}'); return; }
     const ops = JSON.parse(b); for (const o of ops) if (o.field === 'secrets') st[name] = o.value[0];
     fs.writeFileSync(f, JSON.stringify(st));
@@ -107,6 +112,8 @@ store name other-pw value 'unrelated-pw-55x'                         # an unrela
 store name elev-copy value "$ACCT" provider dustforge                # made elevated below
 storej "$OWN" "$(python3 -c 'import json,sys; print(json.dumps({"name":"gmail-login","value":sys.argv[1],"secret_type":"password","provider":"google","fill_origins":["https://accounts.google.com"]}))' "$ACCT")"   # a reused password, another service
 storej "$OWN" "$(python3 -c 'import json,sys; print(json.dumps({"name":"site-login","value":sys.argv[1],"secret_type":"password"}))' "$ACCT")"   # same value, nothing ties it
+storej "$OWN" "$(python3 -c 'import json,sys; print(json.dumps({"name":"forgejo-login","value":sys.argv[1],"secret_type":"password","fill_origins":["https://repo.dustroot.com"]}))' "$ACCT")"   # Forgejo has its own accounts (round-2 L-a)
+storej "$OWN" "$(python3 -c 'import json,sys; print(json.dumps({"name":"uname-only","value":sys.argv[1],"secret_type":"password","login":"owner"}))' "$ACCT")"   # a fill username alone ties nothing (L-a)
 X(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
 X "UPDATE blindkey_secrets SET security_depth='elevated' WHERE name='elev-copy'"
 REF_A=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='dustforge-acct'"); REF_M=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='stalwart-imap'")
@@ -148,11 +155,30 @@ rot; R1=$CODE; call POST /api/identity/reset-password "" "$(jb token lock-test-t
   && ok "while the account's password lock is held: rotate → 409 and reset → 409 (the link stays usable) (M1)" || fail "lock: rotate $R1 reset $CODE"
 X "DELETE FROM account_password_locks"; X "UPDATE password_reset_tokens SET used=1 WHERE token='lock-test-token-1'"
 
-# ── mail server refuses: nothing moves ──────────────────────────────────────────────────────────────────────────
-mode fail; rot
-[ "$CODE" = 503 ] && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" = "$OLDH" ] && [ "$(Q "SELECT name FROM blindkey_secrets WHERE ref_code='$REF_A'")" = dustforge-acct ] \
-  && [ "$(mbx)" = "{PLAIN}$MAILPW" ] && [ "$(Q "SELECT status || '/' || COALESCE(fresh_enc,'wiped') FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = failed/wiped ] \
-  && ok "the mail server refuses → 503; account, mailbox, vault unchanged; the pending row failed and its password wiped" || fail "mail fail: $CODE $BODY"
+# ── mail server refuses: nothing moves (never decided inline; the sweep writes the old secret back, then fails it) ──
+waitrow(){ for i in $(seq 1 ${2:-40}); do [ "$(Q "SELECT status FROM account_password_rotations WHERE id=$1")" = pending ] || break; sleep 1; done; Q "SELECT status FROM account_password_rotations WHERE id=$1"; }
+lastrow(){ Q "SELECT id FROM account_password_rotations ORDER BY id DESC LIMIT 1"; }
+mode fail; rot; FID=$(lastrow)
+[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J pending)" = True ] && ! echo "$BODY" | grep -q "nothing changed" && ok "the mail server refuses (500): held pending, not 'nothing changed' (round-2 P3)" || fail "fail inline: $CODE $BODY"
+mode ok; ST=$(waitrow "$FID")
+[ "$ST" = failed ] && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" = "$OLDH" ] && [ "$(Q "SELECT name FROM blindkey_secrets WHERE ref_code='$REF_A'")" = dustforge-acct ] \
+  && [ "$(mbx)" = "{PLAIN}$MAILPW" ] && [ "$(Q "SELECT COALESCE(fresh_enc,'wiped') FROM account_password_rotations WHERE id=$FID")" = wiped ] \
+  && ok "…the sweep (past every timeout) writes the old secret back and fails it: account, mailbox, vault unchanged, password wiped" || fail "fail sweep: $ST"
+
+LID=$(lastrow); MAILPW_H=$(mbx)
+# ── L-b: the lock lost during a long vault scan stops the rotation before anything changes ──────────────────────
+pin "$OWN" pw-rotate:0; dsign
+( call POST /api/identity/password/rotate-blind "$OWN" "$(printf '{"device_challenge_id":%s,"device_signature":"%s"}' "$DCH" "$DSG")"; echo "$CODE" > "$S/lb.code" ) &
+BG=$!; sleep 0.8; X "UPDATE account_password_locks SET holder='someone-else' WHERE did='$DID'"; wait $BG; X "DELETE FROM account_password_locks"
+[ "$(cat "$S/lb.code")" = 409 ] && [ "$(lastrow)" = "$LID" ] && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" = "$OLDH" ] && [ "$(mbx)" = "$MAILPW_H" ] \
+  && ok "a rotation whose lock was taken mid-scan stops: 409, no pending row, nothing changed (round-2 L-b)" || fail "L-b: $(cat "$S/lb.code") rows $(lastrow) vs $LID"
+
+# ── L-e: a guardian recovery part-way through completing blocks rotation and reset ──────────────────────────────
+X "INSERT INTO account_holds (id, did, kind, status, created_at, expires_at, payload, note) VALUES ('900000000001', '$DID', 'recovery', 'completing', datetime('now'), '2099-01-01T00:00:00Z', '{}', 'completing:2099-01-01T00:00:00Z')"
+X "INSERT INTO password_reset_tokens (did, username, token, expires_at) VALUES ('$DID', 'owner', 'le-test-token-1', '2099-01-01T00:00:00Z')"
+rot; R1=$CODE; call POST /api/identity/reset-password "" "$(jb token le-test-token-1 new_password reset-chosen-pw-2)"
+[ "$R1" = 409 ] && [ "$CODE" = 409 ] && ok "while a recovery is completing: rotate → 409, reset → 409 (round-2 L-e)" || fail "L-e: rotate $R1 reset $CODE"
+X "DELETE FROM account_holds WHERE id='900000000001'"; X "UPDATE password_reset_tokens SET used=1 WHERE token='le-test-token-1'"
 
 # ── the rotation ────────────────────────────────────────────────────────────────────────────────────────────────
 mode apply500; rot; R="$BODY"
@@ -164,13 +190,14 @@ NA=$(val "SELECT encrypted_value FROM blindkey_secrets WHERE ref_code='$REF_A'")
 [ "$(Q "SELECT name FROM blindkey_secrets WHERE ref_code='$REF_A'")" = dustforge-acct_v2 ] && [ "$(Q "SELECT name FROM blindkey_secrets WHERE ref_code='$REF_M'")" = stalwart-imap_v2 ] \
   && [ "$NA" = "$NM" ] && [ "$NA" != "$ACCT" ] && verifies "$NA" "$NEWH" && ok "this account's own entries (by provider, by name) hold the new password, refs kept (_v2)" || fail "moved secrets"
 [ "$(val "SELECT encrypted_value FROM blindkey_secrets WHERE name='gmail-login'")" = "$ACCT" ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE name LIKE 'gmail-login_v%' OR name LIKE 'site-login_v%'")" = 0 ] \
-  && [ "$(echo "$R" | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)["candidates"]))')" = "['gmail-login', 'site-login']" ] \
-  && ok "a reused password for another service (gmail-login) and an untied one are named as candidates, untouched (H1)" || fail "H1 candidates: $R"
+  && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE name LIKE 'forgejo-login_v%' OR name LIKE 'uname-only_v%'")" = 0 ] \
+  && [ "$(echo "$R" | python3 -c 'import json,sys; print(sorted(json.load(sys.stdin)["candidates"]))')" = "['forgejo-login', 'gmail-login', 'site-login', 'uname-only']" ] \
+  && ok "candidates, untouched: a reused password for another service, an untied one, a Forgejo (repo.dustroot.com) login, a username-only one (H1, L-a)" || fail "H1 candidates: $R"
 GR=$(Q "SELECT CAST((julianday(rotate_expires_at) - julianday('now')) AS INTEGER) FROM blindkey_secrets WHERE name='dustforge-acct'")
 [ "${GR:-0}" -ge 2 ] && ok "the moved entries' old values are kept for days (≈$((GR+1)) d), not a minute (H1)" || fail "grace: $GR"
 echo "$R" | grep -q -F -- "$NA" && fail "the reply carries the new password" || ok "the reply never carries the password"
 [ "$(val "SELECT encrypted_value FROM blindkey_secrets WHERE name='other-pw'")" = unrelated-pw-55x ] && ok "an unrelated password is untouched" || fail "other-pw changed"
-[ "$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print([x["name"] for x in d["skipped"]], sorted(d["still_hold_old_password"]))')" = "['elev-copy'] ['elev-copy', 'gmail-login', 'site-login']" ] \
+[ "$(echo "$R" | python3 -c 'import json,sys; d=json.load(sys.stdin); print([x["name"] for x in d["skipped"]], sorted(d["still_hold_old_password"]))')" = "['elev-copy'] ['elev-copy', 'forgejo-login', 'gmail-login', 'site-login', 'uname-only']" ] \
   && ok "the reply names what still holds the old password: candidates and the elevated copy (L3)" || fail "L3 report: $R"
 call POST /api/identity/auth-fingerprint "" "$(jb username owner password "$ACCT" scope transact)"; [ "$CODE" = 401 ] && ok "the old password no longer signs in" || fail "old pw: $CODE"
 call POST /api/identity/auth-fingerprint "" "$(jb username owner password "$NA" scope transact)"; [ "$CODE" = 200 ] && ok "the new one (from the vault) does" || fail "new pw: $CODE $BODY"
@@ -178,13 +205,25 @@ call GET /api/identity/devices "$OWN"; [ "$CODE" = 200 ] && ok "sessions kept by
 pin "$OWN" pw-rotate:0; call POST /api/identity/password/rotate-blind "$OWN" "$(printf '{"device_challenge_id":%s,"device_signature":"%s"}' "$DCH" "$DSG")"
 [ "$CODE" = 403 ] && ok "a device signature works once" || fail "sig replay: $CODE $BODY"
 
+# ── a PATCH that lands after the client gave up (11.5 s > the 10 s timeout) ─────────────────────────────────────
+LH0=$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")
+mode late; rot; LID=$(lastrow)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT status FROM account_password_rotations WHERE id=$LID")" = pending ] && ok "late PATCH: the timeout reads the old secret, stays pending (202) instead of failing (round-2 P3)" || fail "late inline: $CODE $BODY"
+ST=$(waitrow "$LID")
+[ "$ST" = done ] && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" = "$(mbx)" ] && [ "$(mbx)" != "$LH0" ] \
+  && verifies "$(val "SELECT encrypted_value FROM blindkey_secrets WHERE ref_code='$REF_A'")" "$(mbx)" \
+  && ok "…it lands at 11.5 s; the sweep sees it and settles: account + vault follow the mailbox (no password nobody has)" || fail "late settle: $ST"
+
+mode slow; rot; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J rotated)" = True ] && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" = "$(mbx)" ] \
+  && ok "a slow PATCH (3 s, inside the timeout) rotates inline" || fail "slow: $CODE $BODY"
+
 # ── M2: the mail server goes away mid-change → held pending, settled by the sweep ─────────────────────────────
 H2=$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")
 mode down; rot
 [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J pending)" = True ] && ! echo "$BODY" | grep -q "nothing changed" && [ "$(Q "SELECT status FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = pending ] \
   && [ -n "$(Q "SELECT fresh_enc FROM account_password_rotations ORDER BY id DESC LIMIT 1")" ] && ok "applied, then unreachable: 202 pending, never 'nothing changed'; the new password held encrypted (M2)" || fail "pending: $CODE $BODY"
 rot; [ "$CODE" = 409 ] && ok "another rotation waits while one is pending" || fail "second while pending: $CODE"
-mode ok; for i in $(seq 1 12); do [ "$(Q "SELECT status FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = pending ] || break; sleep 1; done
+mode ok; for i in $(seq 1 40); do [ "$(Q "SELECT status FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = pending ] || break; sleep 1; done
 [ "$(Q "SELECT status FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = done ] && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" = "$(mbx)" ] \
   && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" != "$H2" ] && [ -z "$(Q "SELECT COALESCE(fresh_enc,'') FROM account_password_rotations ORDER BY id DESC LIMIT 1")" ] \
   && verifies "$(val "SELECT encrypted_value FROM blindkey_secrets WHERE ref_code='$REF_A'")" "$(mbx)" \
@@ -195,10 +234,20 @@ node -e '
 const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH); const fs = require("fs");
 const st = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); st.owner = "$scrypt$ln=15,r=8,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g"; fs.writeFileSync(process.argv[1], JSON.stringify(st));
 db.prepare("INSERT INTO account_password_rotations (did, status, fresh_enc, prior, new_hash, old_hash, plan, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-  .run(process.argv[2], "pending", process.argv[3], "{PLAIN}whatever", st.owner, "$scrypt$not-the-current-one", JSON.stringify({ username: "owner", moved: [] }), "2026-01-01T00:00:00Z");' "$S/stalwart.json" "$DID" "$(Q "SELECT encrypted_value FROM blindkey_secrets WHERE name='other-pw'")"
-for i in $(seq 1 12); do [ "$(Q "SELECT status FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = pending ] || break; sleep 1; done
+  .run(process.argv[2], "pending", process.argv[3], "{PLAIN}whatever", st.owner, "$scrypt$not-the-current-one", JSON.stringify({ username: "owner", moved: [] }), new Date(Date.now() - 20000).toISOString());' "$S/stalwart.json" "$DID" "$(Q "SELECT encrypted_value FROM blindkey_secrets WHERE name='other-pw'")"
+for i in $(seq 1 40); do [ "$(Q "SELECT status FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = pending ] || break; sleep 1; done
 [ "$(Q "SELECT status FROM account_password_rotations ORDER BY id DESC LIMIT 1")" = failed ] && [ "$(mbx)" = "$CURH" ] && [ "$(Q "SELECT password_hash FROM identity_wallets WHERE did='$DID'")" = "$CURH" ] \
   && ok "a rotation overtaken by another change: the mailbox is set to the account's CURRENT hash, not the stale prior (M1)" || fail "rollback rule: $(Q "SELECT status || ' ' || COALESCE(report,'') FROM account_password_rotations ORDER BY id DESC LIMIT 1")"
+
+# ── L-c: a row that never settles ends (abandoned): its password kept in the vault, owner + operator told ─────
+node -e '
+const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
+db.prepare("INSERT INTO account_password_rotations (did, status, fresh_enc, prior, new_hash, old_hash, plan, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+  .run(process.argv[1], "pending", process.argv[2], "{PLAIN}whatever", "$scrypt$x", "$scrypt$y", JSON.stringify({ username: "owner", moved: [] }), "2020-01-01T00:00:00Z");' "$DID" "$(Q "SELECT encrypted_value FROM blindkey_secrets WHERE name='other-pw'")"
+AID=$(lastrow); ST=$(waitrow "$AID")
+[ "$ST" = abandoned ] && [ "$(val "SELECT encrypted_value FROM blindkey_secrets WHERE name='account-password-unconfirmed-owner-$AID'")" = unrelated-pw-55x ] \
+  && [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='password_rotate_abandoned' AND caller_did='$DID'")" = 1 ] && [ "$(Q "SELECT COALESCE(fresh_enc,'wiped') FROM account_password_rotations WHERE id=$AID")" = wiped ] \
+  && ok "a row pending past its maximum age is abandoned: password moved to the vault (unconfirmed), critical event, no longer blocking (round-2 L-c)" || fail "L-c: $ST"
 
 # ── L3: cut_sessions ────────────────────────────────────────────────────────────────────────────────────────────
 OWN2=$(login owner "$(val "SELECT encrypted_value FROM blindkey_secrets WHERE ref_code='$REF_A'")")

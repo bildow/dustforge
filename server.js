@@ -13027,7 +13027,7 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
   // One password change per account at a time (#69 review M1): a blind rotation in flight would otherwise be split from
   // this reset (account on one password, mailbox on another).
   const lockHolder = 'reset:' + resetRow.id;
-  if (passwordRotation.pendingFor(resetRow.did) || !passwordRotation.claim(resetRow.did, lockHolder)) {
+  if (passwordRotation.blockedFor(resetRow.did) || !passwordRotation.claim(resetRow.did, lockHolder)) {
     db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM password_reset_tokens WHERE did = ? AND id > ?)').run(resetRow.id, resetRow.did, resetRow.id);
     return res.status(409).json({ error: 'a password change on this account is still settling — try this link again in a few minutes' });
   }
