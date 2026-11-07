@@ -6,6 +6,9 @@
 #   (b) while a slow ssh call runs, other requests are answered at once
 #   (c) one use-token redeemed twice at the same time runs once: the second gets 410 "already in use"
 #   (d) two blind rotations of one secret at the same time: the second gets 409
+#   (e) #58 review H1: a client that disconnects mid-run does not free its token for a second run
+#   (f) #58 review M2: a scope with max_uses 1, two direct calls at once → one runs, one 403
+#   (g) #58 review: git_clone runs async; the token is never in git's argv; the clone directory is 0700
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-sshasync-smoke.XXXXXX)
@@ -22,7 +25,13 @@ if [ "$last" = "bash -s" ]; then PATH=$FAKE_DIR/remote:$PATH bash -s; else PATH=
 SH
 printf '#!/bin/bash\nS_=0\nwhile [ $# -gt 0 ] && [ "${1#-}" != "$1" ]; do case "$1" in --) shift; break;; -S) S_=1; shift;; *) shift;; esac; done\n[ $S_ = 1 ] && read -r pw\nsleep 2\nexec "$@"\n' >"$S/remote/sudo"
 printf '#!/bin/bash\ncat >>"$FAKE_DIR/chpasswd.in"\n' >"$S/remote/chpasswd"
-chmod +x "$S/bin/sshpass" "$S/remote/sudo" "$S/remote/chpasswd"
+cat >"$S/bin/git" <<'SH'
+#!/bin/bash
+echo "ARGV $*" >>"$FAKE_DIR/git.log"
+echo "ASKPASS $("$GIT_ASKPASS" 'Username for https://github.com: ')" >>"$FAKE_DIR/git.log"
+dest="${@: -1}"; echo "DESTMODE $(stat -c %a "$dest")" >>"$FAKE_DIR/git.log"; sleep 1; echo "Cloning into '$dest'..."
+SH
+chmod +x "$S/bin/sshpass" "$S/remote/sudo" "$S/remote/chpasswd" "$S/bin/git"
 export PATH="$S/bin:$PATH" FAKE_DIR=$S
 cd "$W"
 node server.js >"$S/server.log" 2>&1 & SRV=$!
@@ -41,6 +50,12 @@ const seal = (v) => { const iv = crypto.randomBytes(16), c = crypto.createCipher
 db.prepare("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, status, ref_code, account_username) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id.did, "box", "password", seal("boxpass-1"), "active", "DP-PWD-box-0001", "deploy");
 const sid = db.prepare("SELECT id FROM blindkey_secrets WHERE ref_code = ?").get("DP-PWD-box-0001").id;
 db.prepare("INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, ?, ?, ?, ?, ?)").run(sid, "default", "ssh_exec", "*", "*", id.did);
+db.prepare("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, status, ref_code) VALUES (?, ?, ?, ?, ?, ?)").run(id.did, "once", "password", seal("oncepass-1"), "active", "DP-PWD-once-0001");
+const oid = db.prepare("SELECT id FROM blindkey_secrets WHERE ref_code = ?").get("DP-PWD-once-0001").id;
+db.prepare("INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses) VALUES (?, ?, ?, ?, ?, ?, 1)").run(oid, "default", "ssh_exec", "*", "*", id.did);
+db.prepare("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, status, ref_code) VALUES (?, ?, ?, ?, ?, ?)").run(id.did, "gitkey", "api_key", seal("ghp_SECRETTOKEN123"), "active", "DP-API-gitkey-0001");
+const gid = db.prepare("SELECT id FROM blindkey_secrets WHERE ref_code = ?").get("DP-API-gitkey-0001").id;
+db.prepare("INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, ?, ?, ?, ?, ?)").run(gid, "mine", "git_clone", "https://github.com/bildow/*", null, id.did);
 db.prepare("INSERT INTO identity_transactions (did, amount_cents, type) VALUES (?, 100000, ?)").run(id.did, "credit");'
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 TOK=$(curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'Content-Type: application/json' -d '{"username":"owner","password":"ownerpass1","scope":"transact"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("token",""))')
@@ -77,4 +92,25 @@ sleep 0.5
 R2=$(rot '{"ref":"DP-PWD-box-0001","target_host":"100.83.112.88"}' r2)
 wait $P1; R1=$(cat "$S/r1.code")
 [ "$R1" = 200 ] && [ "$R2" = 409 ] && ok "(d) a second rotation of the same secret while one runs → 409; the first completes" || fail "(d) rotations: $R1 $(head -c 200 "$S/r1.json") / $R2 $(head -c 200 "$S/r2.json")"
+# (e) disconnect mid-run
+UT=$(curl -s -X POST "$API/api/blindkey/request-token" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"name":"box_v2","target_host":"100.83.112.88","action":"ssh_exec"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("use_token",""))')
+: >"$S/ssh.log"
+curl -s -o /dev/null -m 1 -X POST "$API/api/blindkey/use" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"use_token":"'$UT'","target_user":"deploy","command":"sleep 4"}'
+E2=$(use '{"use_token":"'$UT'","target_user":"deploy","command":"echo second"}' e2)
+runs=$(grep -c '^ARGV' "$S/ssh.log")
+[ "$E2" = 410 ] && [ "$runs" = 1 ] && ok "(e) the first client gone, its ssh still running: the token is still held (410), ssh ran once" || fail "(e) after disconnect: $E2 runs=$runs $(head -c 200 "$S/e2.json")"
+sleep 4
+# (f) max_uses 1, two direct calls at once
+: >"$S/ssh.log"
+use '{"name":"once","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"sleep 2"}' f1 >"$S/f1.code" & P1=$!
+sleep 0.5
+F2=$(use '{"name":"once","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo again"}' f2)
+wait $P1; F1=$(cat "$S/f1.code"); runs=$(grep -c '^ARGV' "$S/ssh.log")
+[ "$F1" = 200 ] && [ "$F2" = 403 ] && [ "$runs" = 1 ] && ok "(f) max_uses 1 and two calls at once: one runs, the other 403" || fail "(f) max_uses race: $F1 / $F2 runs=$runs $(head -c 200 "$S/f2.json")"
+# (g) git clone
+G=$(use '{"ref":"DP-API-gitkey-0001","action":"git_clone","params":{"repo_url":"https://github.com/bildow/demo"}}' g)
+if [ "$G" = 200 ] && grep -q '"cloned":true' "$S/g.json"; then
+  ! grep '^ARGV' "$S/git.log" | grep -q SECRETTOKEN && grep -q '^ASKPASS ghp_SECRETTOKEN123$' "$S/git.log" && grep -q '^DESTMODE 700$' "$S/git.log" \
+    && ok "(g) git_clone: token not in argv, given through GIT_ASKPASS; the clone directory is 0700" || fail "(g) git: $(cat "$S/git.log")"
+else fail "(g) git_clone: $G $(head -c 300 "$S/g.json")"; fi
 echo; [ $fails = 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }
