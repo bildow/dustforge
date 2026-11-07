@@ -122,7 +122,9 @@ module.exports = function registerRecovery(deps) {
     const snapshot = G.activeSet(w.did).map(r => r.guardian_did).filter(d => G.isActiveGuardian(w.did, d));
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     const label = String(b.label || 'new phone').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 60);
-    const h = holds().createHold(w.did, 'recovery', {}, { readyAt: null, expiresAt: isoIn(PENDING_TTL_SEC), why: `onto a new phone "${label}"` });
+    // The owner's mail is capped like the guardians' (#61 final L5); every start still shows on the owner's phones.
+    const startsToday = db.prepare('SELECT COUNT(*) AS n FROM recovery_starts WHERE did = ? AND at > ?').get(w.did, isoAgo(86400)).n;
+    const h = holds().createHold(w.did, 'recovery', {}, { readyAt: null, expiresAt: isoIn(PENDING_TTL_SEC), why: `onto a new phone "${label}"`, quiet: startsToday > GUARDIAN_MAILS_PER_DAY });
     savePayload(h.id, { device_id: b.device_id, label, key_d: b.key_d, key_p: b.key_p, code_hash: codeHash(h.id, code), misses: 0, guardians: snapshot, approvals: {}, start_ip: String(req.ip || '').slice(0, 64) });
     const mailsToday = db.prepare('SELECT COUNT(*) AS n FROM recovery_starts WHERE did = ? AND at > ?').get(w.did, isoAgo(86400)).n;
     if (mailsToday <= GUARDIAN_MAILS_PER_DAY) for (const g of snapshot) tellDid(g, `${w.username} asks you to help recover their wallet`, `${w.username} asks to get back into their DemiPass wallet on a new phone.\nApprove ONLY if ${w.username} told you the code themselves — in person, or on a call you started to a number you already had. Open the DemiPass app (Settings → Guardians).\nIf you did not hear from them, decline: it stops the recovery.\n`);
@@ -354,6 +356,7 @@ module.exports = function registerRecovery(deps) {
       if (!cur || cur.status !== 'completing' || cur.note !== claim) return res.status(409).json({ error: 'this recovery ended meanwhile' });
       const back = prior === null || await undoMailbox(h.did, prior);
       if (!back) {
+        logSecurityEvent('recovery_mailbox_unconfirmed', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id } });
         try { db.prepare('UPDATE identity_wallets SET password_hash = ?, password_must_change = 0 WHERE did = ?').run(newHash, h.did); } catch (_) {}
         try { deps.cutSessions(h.did); } catch (_) {}
       }
@@ -371,8 +374,8 @@ module.exports = function registerRecovery(deps) {
   }
   async function endStuck(h, p, why) {
     const back = await undoMailbox(h.did, p.mail_prior);
-    if (!back) { try { deps.cutSessions(h.did); } catch (_) {} }
-    db.prepare("UPDATE account_holds SET status = 'failed', note = ?, payload = '{}' WHERE id = ? AND status = 'completing'").run('ended: ' + why, h.id);
+    if (!back) { try { deps.cutSessions(h.did); } catch (_) {} logSecurityEvent('recovery_mailbox_unconfirmed', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id } }); }
+    db.prepare("UPDATE account_holds SET status = 'failed', note = ?, payload = '{}' WHERE id = ? AND status = 'completing' AND note = ?").run('ended: ' + why, h.id, h.note || '');
     logSecurityEvent('recovery_completion_failed', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id, why, mailbox_restored: back } });
     holds().tellOwner(h.did, 'a recovery of your wallet ended', `A recovery of your wallet that was part-way through ended: ${why}. ${back ? 'Your mail password is as before.' : 'Your mail password could not be confirmed as before: contact DemiPass support.'}\n`);
   }
@@ -449,7 +452,7 @@ module.exports = function registerRecovery(deps) {
       (out.delegations_suspended || out.scopes_suspended ? `${out.delegations_suspended} delegation(s) and ${out.scopes_suspended} scope(s) granted in the last 30 days are suspended until you re-enable them.\n` : '') +
       (contacts.length ? `People paired with you in person in the last 30 days: ${contacts.join(', ')} — check you know them.\n` : '') +
       (lost.length ? `These elevated/critical secrets were locked to your old phones and can no longer be opened: ${lost.join(', ')}. Rotate each at its source, then store the new value.\n` : '') +
-      'If this was not you, contact DemiPass support now.\n');
+      'Your mail password is the new one; any other app passwords on your mailbox were reset.\nIf this was not you, contact DemiPass support now.\n');
     for (const g of parse(h.payload).guardians || []) tellDid(g, `${nameOf(did)}'s wallet was recovered`, `The recovery of ${nameOf(did)}'s wallet that you were asked about has completed.\n`);
     return out;
   }

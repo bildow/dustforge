@@ -123,14 +123,14 @@ module.exports = function registerAccountHolds(deps) {
   function openHolds(did, kind) {
     return db.prepare(`SELECT * FROM account_holds WHERE did = ? AND ${OPEN}${kind ? ' AND kind = ?' : ''} ORDER BY created_at`).all(...(kind ? [did, kind] : [did]));
   }
-  function createHold(did, kind, payload, { delaySec = HOLD_DELAY_SEC, readyAt, expiresAt, why = '' } = {}) {
+  function createHold(did, kind, payload, { delaySec = HOLD_DELAY_SEC, readyAt, expiresAt, why = '', quiet = false } = {}) {
     if (!KINDS.has(kind)) throw new Error('unknown hold kind');
     const id = newHoldId(), t = nowIso();
     const ready = readyAt === undefined ? isoIn(delaySec) : readyAt;
     db.prepare('INSERT INTO account_holds (id, did, kind, status, created_at, ready_at, expires_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(id, did, kind, 'pending', t, ready, expiresAt || null, JSON.stringify(payload || {}));
     logSecurityEvent('account_hold_started', 'critical', { caller_did: did, capability: kind, context: { hold_id: id, ready_at: ready, why } });
-    tell(did, `${kind === 'recovery' ? 'someone is recovering your wallet' : 'a change to your account is waiting'} — cancel it from your phone if it was not you`,
+    if (!quiet) tell(did, `${kind === 'recovery' ? 'someone is recovering your wallet' : 'a change to your account is waiting'} — cancel it from your phone if it was not you`,
       `Started ${t}: ${WHAT[kind]}${why ? ` (${why})` : ''}.\n` +
       (ready ? `It takes effect at ${ready} unless it is canceled.\n` : '') +
       `If this was not you, open DemiPass on one of your phones and cancel it there (your fingerprint or screen lock confirms).\n`);
