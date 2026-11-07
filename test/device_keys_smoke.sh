@@ -180,9 +180,12 @@ G0=$(glogin); G=$(glogin); DG=$(Q "SELECT did FROM identity_wallets WHERE userna
 call POST /api/identity/pin "$G0" '{"pin":"4321","password":"hunter22"}'
 call POST /api/identity/device/enrol "$G" '{"check":true}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = twofa ] && [ "$(echo "$BODY" | J missing.1)" = pin ] && ok "(g) a fresh session is asked for an emailed code (or the password) and the PIN" || fail "g missing: $CODE $BODY"
+call POST /api/identity/request-2fa "" '{"did":"'$DG'"}'; call POST /api/identity/gate/verify "$G" '{"gate":"twofa","code":"'$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DG' ORDER BY id DESC LIMIT 1")'"}'
+[ "$CODE" = 403 ] && ok "(g) a sign-in code (asked for with no session) is no gate code" || fail "g login code as gate: $CODE $BODY"
 call POST /api/identity/request-2fa "$G" '{"did":"'$DG'"}'; call POST /api/identity/gate/verify "$G" '{"gate":"twofa","code":"'$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DG' ORDER BY id DESC LIMIT 1")'"}'
 [ "$CODE" = 200 ] || fail "g twofa: $CODE $BODY"
 call POST /api/identity/device/enrol "$G" '{"check":true}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = pin ] && ok "(g) the emailed code stands in for the password; the PIN is still needed" || fail "g pin left: $CODE $BODY"
+G2=$(glogin); call POST /api/identity/device/enrol "$G2" '{"check":true}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = twofa ] && ok "(g) the code counts for the session that verified it, not another" || fail "g other session: $CODE $BODY"
 pin "$G" device-enrol:0; call POST /api/identity/device/enrol "$G" '{"check":true}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J ready)" = True ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE did='$DG'")" = 0 ] && ok "(g) {check:true}: ready, and nothing linked" || fail "g check: $CODE $BODY"
 node -e '
@@ -193,6 +196,18 @@ for (const n of ["gd", "gp"]) { const { privateKey, publicKey } = c.generateKeyP
 call POST /api/identity/device/challenge "$G" '{"purpose":"enrol","intent":"device-enrol:0"}'; GCH=$(echo "$BODY" | J challenge_id); GM="$(echo "$BODY" | J message):phone-g001"
 call POST /api/identity/device/enrol "$G" "$(printf '{"challenge_id":%s,"device_id":"phone-g001","label":"Moto","key_d":"%s","key_p":"%s","sig_d":"%s","sig_p":"%s"}' "$GCH" "$(cat $S/gd.pub)" "$(cat $S/gp.pub)" "$(sig gd "$GM")" "$(sig gp "$GM")")"
 [ "$CODE" = 201 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-g001' AND revoked_at IS NULL")" = 2 ] && ok "(g) …the check left the PIN proof unspent: the phone links on it, with no password typed anywhere" || fail "g enrol: $CODE $BODY"
+# A forwarding rule made in the last 48 hours (a session token alone can make one) could carry the code elsewhere.
+G3=$(glogin); call POST /api/relay/create "$G3" '{"forward_to":"someone@example.org"}'; [ "$CODE" = 200 ] || fail "g relay: $CODE $BODY"
+call POST /api/identity/request-2fa "$G3" '{"did":"'$DG'"}'; call POST /api/identity/gate/verify "$G3" '{"gate":"twofa","code":"'$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DG' ORDER BY id DESC LIMIT 1")'"}'
+call POST /api/identity/device/enrol "$G3" '{"check":true}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = password ] && [ "$(echo "$BODY" | J or)" = None ] && ok "(g) a forwarding rule active under 48 h: an emailed code no longer counts, the password does (#63 H1)" || fail "g relay blocks code: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE forward_relays SET activated_at=NULL, created_at=datetime('now','-3 days')\"); c.commit()" "$DB_PATH"
+G4=$(glogin); call POST /api/identity/request-2fa "$G4" '{"did":"'$DG'"}'; call POST /api/identity/gate/verify "$G4" '{"gate":"twofa","code":"'$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DG' ORDER BY id DESC LIMIT 1")'"}'
+call POST /api/identity/device/enrol "$G4" '{"check":true}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = pin ] && ok "(g) a forwarding rule active for 48 h or more (the owner's own, long-standing; a legacy row with no activated_at): the emailed code counts" || fail "g old relay: $CODE $BODY"
+call DELETE /api/relay/remove "$G3" '{"id":'$(Q "SELECT id FROM forward_relays LIMIT 1")'}'; call POST /api/relay/create "$G3" '{"forward_to":"someone@example.org"}'
+call POST /api/identity/device/enrol "$G3" '{"check":true}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = password ] && ok "(g) …and re-activating an old rule counts as new (its 48 h start again)" || fail "g relay reactivate: $CODE $BODY"
 
 ! grep -qE "hook-token-zz90|crit-token-zz91" "$S/server.log" && ok "no value in the server log" || fail "value in log"
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails
