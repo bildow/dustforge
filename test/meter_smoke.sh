@@ -1,7 +1,8 @@
 #!/bin/bash
 # Smoke of the DemiPass meter (meter.js) through the real server, on a throwaway DB:
 #   - /api/meter/rates and /api/meter/key are public; the key is a did:key (Ed25519);
-#   - POST /api/meter/charge needs a transact token (none → 401, read scope → 403), bills units × rate (201), and the
+#   - POST /api/meter/charge needs the wallet's own transact token (none → 401; read scope, a fleet worker or a silicon
+#     token → 403), bills units × rate (201), and the
 #     receipt verifies OFFLINE from the issuer did:key alone;
 #   - the same receipt_sha256 again → 200 replayed, same charge_id, no second debit; other units → 409;
 #   - bad tenant/sku/units/hash → 400; too little DD → 402 with nothing recorded;
@@ -43,6 +44,12 @@ login(){ curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'content-type: 
 TOK=$(login bench transact); POOR=$(login poor transact); READ=$(login bench read)
 [ -n "$TOK" ] && [ "$TOK" != None ] && [ "$READ" != None ] || { echo "FAIL sign-in"; exit 1; }
 BAL(){ Q "SELECT balance_cents FROM identity_wallets WHERE username='$1'"; }
+# A worker token (wrk claim, its own spend cap in fleet_billing) and a silicon token (acts for its carbon) for bench.
+WRK=$(node -e '
+const identity = require("./identity"); const Database = require("better-sqlite3"); const crypto = require("crypto");
+const db = new Database(process.env.DB_PATH); const w = db.prepare("SELECT did, encrypted_private_key FROM identity_wallets WHERE username = ?").get("bench");
+db.prepare("INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)").run("meter-sil", "did:key:zMeterSil", w.did, crypto.createHash("sha256").update("silicon:meter-smoke").digest("hex"));
+process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: "transact", expiresIn: "1h", metadata: { wrk: "w-smoke", wname: "smoke", auth_method: "worker" } }));')
 H1=$(printf receipt-one | sha256sum | cut -d' ' -f1)
 
 CODE=$(curl -s -o "$S/rates" -w '%{http_code}' "$API/api/meter/rates")
@@ -54,6 +61,8 @@ C(){ CODE=$(curl -s -o "$S/out" -w '%{http_code}' -X POST "$API/api/meter/charge
 BODY='{"tenant":"eval-rig","sku":"provision","units":3,"receipt_sha256":"'$H1'"}'
 C "$BODY"; [ "$CODE" = 401 ] && ok "no token → 401" || fail "no token: $CODE"
 C "$BODY" "$READ"; [ "$CODE" = 403 ] && ok "read-scope token → 403" || fail "read scope: $CODE"
+C "$BODY" "$WRK"; [ "$CODE" = 403 ] && ok "a fleet worker token → 403 (its spend cap lives in fleet billing)" || fail "worker: $CODE $(cat "$S/out")"
+C "$BODY" "silicon:meter-smoke"; [ "$CODE" = 403 ] && ok "a silicon token → 403 (only a wallet's own token charges)" || fail "silicon: $CODE $(cat "$S/out")"
 B0=$(BAL bench)
 C "$BODY" "$TOK"; cp "$S/out" "$S/first"; CID=$(J charge_id < "$S/first")
 [ "$CODE" = 201 ] && [ "$(J dd < "$S/first")" = 30 ] && [ "$(BAL bench)" = $((B0 - 30)) ] && [ "$(J issuer < "$S/first")" = "$ISSUER" ] \

@@ -16,7 +16,13 @@
 // offline: Ed25519 over the UTF-8 bytes of `receipt`, public key from the issuer did:key (identity.didToPublicKey).
 // The signing key is derived (HKDF) from IDENTITY_MASTER_KEY with its own label, so it needs no new secret on the host
 // and is stable across restarts; it changes only if the master key does. Without the master key the meter refuses
-// (503) rather than issuing unsigned receipts.
+// (503) rather than issuing unsigned receipts. Rotating IDENTITY_MASTER_KEY therefore changes the issuer: receipts
+// signed before it still verify offline against the issuer did:key they name (record that did:key with the run), but
+// /api/meter/verify on this server checks only the current key.
+//
+// Only a wallet's own token can charge (as in network_routes.js): silicon tokens (silicon:…, which act for their
+// carbon) and fleet worker tokens (wrk claim, which have their own spend caps in fleet_billing.js) are refused, so a
+// charge always lands on the wallet that asked for it, attributed to its token.
 //
 // Prices live here, in code, so a change is a reviewed PR. Units are capped per call.
 
@@ -165,8 +171,20 @@ function createMeter({ db, billing, identity, masterKey }) {
 function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterKey = process.env.IDENTITY_MASTER_KEY }) {
   const rateLimit = require('express-rate-limit');
   const meter = createMeter({ db, billing, identity, masterKey });
-  const limit = rateLimit({ windowMs: 60 * 1000, max: 120, standardHeaders: true, legacyHeaders: false,
-    message: { error: 'Too many meter requests. Try again in a minute.' } });
+  // Charges and listings are counted per wallet (after auth), so hosts sharing an address don't share a budget and
+  // nobody can stall another caller's metering. The public verify route has its own per-address limiter.
+  const perWallet = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => 'did:' + req.meterAuth.did,
+    message: { error: 'Too many meter requests for this wallet. Try again in a minute.' } });
+  const perAddress = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false,
+    message: { error: 'Too many verify requests. Try again in a minute.' } });
+  function walletAuth(req, res, next) {
+    const auth = getBearerIdentity(req);
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (auth.silicon || (auth.decoded && auth.decoded.wrk)) return res.status(403).json({ error: "only a wallet's own token can use the meter" });
+    req.meterAuth = auth;
+    next();
+  }
 
   app.get('/api/meter/rates', (req, res) => res.json({ unit: 'DD', dd_usd: 0.001, max_units_per_call: MAX_UNITS, rates: METER_RATES }));
 
@@ -176,9 +194,8 @@ function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterK
     res.json({ ...info, verify: 'Ed25519 over the UTF-8 bytes of `receipt`; public key = did:key issuer (or public_key_spki, DER, base64url)' });
   });
 
-  app.post('/api/meter/charge', limit, (req, res) => {
-    const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  app.post('/api/meter/charge', walletAuth, perWallet, (req, res) => {
+    const auth = req.meterAuth;
     const b = req.body || {};
     const r = meter.charge({ did: auth.did, tokenJti: (auth.decoded && auth.decoded.jti) || null,
       tenant: b.tenant, sku: b.sku, units: b.units === undefined ? 1 : b.units, receipt_sha256: b.receipt_sha256 });
@@ -187,16 +204,15 @@ function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterK
     return res.status(r.replayed ? 200 : 201).json(rest);
   });
 
-  app.post('/api/meter/verify', limit, (req, res) => {
+  app.post('/api/meter/verify', perAddress, (req, res) => {
     const r = meter.verify(req.body || {});
     if (!r.ok) return res.status(r.status).json({ error: r.error });
     const { ok, ...rest } = r;
     res.json(rest);
   });
 
-  app.get('/api/meter/charges', limit, (req, res) => {
-    const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  app.get('/api/meter/charges', walletAuth, perWallet, (req, res) => {
+    const auth = req.meterAuth;
     res.json({ charges: meter.list(auth.did, { tenant: req.query.tenant, limit: req.query.limit }) });
   });
 
