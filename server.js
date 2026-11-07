@@ -1228,6 +1228,65 @@ app.post('/api/identity/verify', rateLimitStrict, (req, res) => {
   res.json({ ok: true, token, did, scope, email: wallet.email });
 });
 
+// ── Sign in with an emailed code (the app's "Email me a sign-in code") ───────────────────────────────────────────
+// By username, and never telling whether that username exists: the request always answers the same, and a wrong or
+// unknown pair is the same 401. Same 'login' code budget as /api/identity/request-2fa (#57: one live code, 5 guesses
+// per code, 5 codes an hour, 10 wrong a day). While a forwarding rule is under 48 hours old no code is sent (the mailbox
+// gets a notice instead) and a code from before it is refused: a fresh forward may be someone else's.
+// A code sign-in proves the mailbox, not the password: it records no password gate (the PIN, the phone and every
+// elevated approval still stand between it and anything that matters).
+const LOGIN_CODE_REPLY = { ok: true, expires_in: 600, note: 'If that account exists and has a mailbox, a 6-digit code is on its way. It expires in 10 minutes.' };
+app.post('/api/identity/login-code/request', rateLimitStrict, (req, res) => {
+  const username = String((req.body || {}).username || '').trim().toLowerCase();
+  if (!/^[a-z0-9._-]{1,64}$/.test(username)) return res.status(400).json({ error: 'username required' });
+  const wallet = db.prepare("SELECT did, username, email, status FROM identity_wallets WHERE username = ?").get(username);
+  res.json(LOGIN_CODE_REPLY);
+  if (!wallet || !wallet.email || (wallet.status && wallet.status !== 'active')) return;
+  try {
+    if (forwardFresh(wallet.did)) {
+      // One notice an hour: the request is unauthenticated, so it must not become a way to fill someone's inbox.
+      const told = db.prepare("SELECT 1 FROM demipass_security_events WHERE event_type = 'login_code_withheld' AND caller_did = ? AND created_at > ? LIMIT 1").get(wallet.did, sqlTime(3600 * 1000));
+      logSecurityEvent('login_code_withheld', 'warning', { caller_did: wallet.did, capability: 'login-code', ip: req.ip, error: 'forwarding rule under 48 h' });
+      if (!told) createEmailTransport().sendMail({ from: 'noreply@dustforge.com', to: wallet.email, subject: 'DemiPass: no sign-in code sent',
+        text: 'Someone asked for a DemiPass sign-in code for your account. None was sent: a mail forwarding rule on this account changed in the last 48 hours, so codes are paused until it is older. Sign in with your password, or wait.\n' }).catch(() => {});
+      return;
+    }
+    const issued = issueCode('identity_2fa_codes', wallet.did, 'login');
+    if (!issued.code) return;
+    createEmailTransport().sendMail({ from: 'noreply@dustforge.com', to: wallet.email, subject: 'Your DemiPass sign-in code',
+      text: `Your DemiPass sign-in code is ${issued.code}. It expires in 10 minutes.\n\nIf you did not ask for it, ignore this message: nothing happens without the code.` })
+      .catch(e => console.error(`[login-code] mail for ${wallet.username} failed: ${e.message}`));
+  } catch (e) { console.error('[login-code] request:', e.message); }
+});
+app.post('/api/identity/login-code/verify', rateLimitStrict, (req, res) => {
+  const b = req.body || {};
+  const username = String(b.username || '').trim().toLowerCase();
+  const code = String(b.code || '').trim();
+  const expiresIn = typeof b.expires_in === 'string' && /^\d+[smh]$/.test(b.expires_in) ? b.expires_in : '24h';
+  if (!/^[a-z0-9._-]{1,64}$/.test(username) || !/^\d{6}$/.test(code)) return res.status(400).json({ error: 'username and the 6-digit code' });
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username);
+  if (!wallet || (wallet.status && wallet.status !== 'active')) return res.status(401).json({ error: 'invalid code' });
+  const chk = checkCode('identity_2fa_codes', wallet.did, code, 'login');
+  // One answer for every failure (wrong, dead, paused, no such user): attempts left or a pause would say the username
+  // exists. The guess budgets still apply; the owner is mailed when code sign-in pauses.
+  if (!chk.row) return res.status(401).json({ error: 'invalid code' });
+  // The code is right, so the caller holds the mailbox's mail; it may still have arrived through a new forward.
+  if (forwardFresh(wallet.did)) {
+    db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE id = ?').run(chk.row.id);
+    logSecurityEvent('login_code_refused', 'alert', { caller_did: wallet.did, capability: 'login-code', ip: req.ip, error: 'forwarding rule under 48 h' });
+    return res.status(403).json({ error: 'a mail forwarding rule on this account changed in the last 48 hours, so emailed codes are paused; sign in with your password' });
+  }
+  db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE id = ?').run(chk.row.id);
+  const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, { scope: 'transact', expiresIn,
+    metadata: { email: wallet.email, username: wallet.username, auth_method: 'email_code', sid: newSessionId() } });
+  // As /api/identity/verify: the code is a fresh twofa proof for this session (never a password one).
+  recordGate(wallet.did, 'twofa', tokenClaims(token).sid);
+  const rf = issueRefreshToken(wallet.did, 'transact', token);
+  logSecurityEvent('login_code_signin', 'info', { caller_did: wallet.did, capability: 'login-code', ip: req.ip });
+  res.json({ ok: true, token, refresh_token: rf.refresh_token, refresh_expires_at: rf.refresh_expires_at, did: wallet.did, scope: 'transact',
+    email: wallet.email, auth_method: 'email_code', ...(wallet.password_must_change ? { password_must_change: true } : {}) });
+});
+
 // ── Gate verification surface (per-credential security depth, item 4/5) ──────
 
 // GET /api/identity/gate/status — which gates are currently fresh for the caller,
@@ -2175,6 +2234,13 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS forward_relays (
 // emailed code may be reaching someone new, so a phone link will not take a code as its second factor (device_keys.js).
 try { db.exec('ALTER TABLE forward_relays ADD COLUMN activated_at TEXT'); } catch (_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_fr_did ON forward_relays(did)"); } catch(e) {}
+// A forwarding rule that became active in the last 48 hours: mail to the wallet's mailbox may be reaching someone new, so
+// nothing that proves possession of that mailbox (a sign-in code, a reset link) is sent through it. Fails closed.
+function forwardFresh(did) {
+  try {
+    return Boolean(db.prepare("SELECT 1 FROM forward_relays WHERE did = ? AND julianday(COALESCE(activated_at, created_at)) > julianday('now', '-2 days') LIMIT 1").get(did));
+  } catch (_) { return true; }
+}
 
 // POST /api/relay/create — set up a forwarding rule
 app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
@@ -5666,12 +5732,21 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     if (!g.ok) return res.status(g.status || 403).json(g);
   }
 
+  const r = rotateSecretValue(ownerDid, existing, new_value, graceMins, req.ip);
+  return res.status(r.status).json(r.body);
+});
+
+// A new version of `existing` holding `newValue`: the ref moves to it, active contexts are copied, the old version
+// retires after `graceMins` (value erased). Shared by POST /api/blindkey/rotate and the blind account-password rotation.
+// Returns { status, body }.
+function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
+  const baseName = existing.name.replace(/_v\d+$/, '');
   const target = nextVersionName(ownerDid, existing.name.replace(/_v\d+$/, ''), existing.version);
-  if (target.conflict) return res.status(409).json({ error: target.conflict });
+  if (target.conflict) return { status: 409, body: { error: target.conflict } };
   const { name: newName, version: newVersion } = target;
 
   try {
-    const encrypted = blindkeyEncrypt(new_value);
+    const encrypted = blindkeyEncrypt(newValue);
     const rotateExpiresAt = new Date(Date.now() + graceMins * 60 * 1000).toISOString();
 
     // Create the new versioned secret — carry ALL identity/metadata so the new
@@ -5740,14 +5815,14 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
       let w = { ok: false, error: 'wrap failed' };
       try { w = cryptoDepth.wrapSecret(db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(newSecret.id)); } catch (e) { w = { ok: false, error: e.message }; }
       wrapped = Boolean(w.ok);
-      if (!w.ok) logSecurityEvent('rotation_not_wrapped', 'alert', { caller_did: ownerDid, target: newName, ip: req.ip, error: w.error });
+      if (!w.ok) logSecurityEvent('rotation_not_wrapped', 'alert', { caller_did: ownerDid, target: newName, ip, error: w.error });
     }
-    res.json({ ok: true, new_secret_id: newSecret.id, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins,
-      ...(wrapped !== undefined ? { wrapped, ...(wrapped ? {} : { wrap_note: 'the new version is NOT wrapped — the host can read it; link a phone (app 1.5+) and wrap it' }) } : {}) });
+    return { status: 200, body: { ok: true, new_secret_id: newSecret.id, new_name: newName, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins,
+      ...(wrapped !== undefined ? { wrapped, ...(wrapped ? {} : { wrap_note: 'the new version is NOT wrapped — the host can read it; link a phone (app 1.5+) and wrap it' }) } : {}) } };
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    return { status: 500, body: { error: e.message } };
   }
-});
+}
 
 // GET /api/blindkey/types — list supported secret types and actions
 app.get('/api/blindkey/types', (_req, res) => {
@@ -8481,9 +8556,15 @@ const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, g
   recovery: () => guardianRecovery });
 // Guardian recovery (red team item 9, step 3): start on a new phone, two guardians approve with the owner's code, 48 h,
 // any of the owner's phones cancels; completion re-keys the account (recovery.js).
+// Account password (password_rotation.js): one lock per account for every change of the account + mailbox password
+// (rotate-blind, reset-password, recovery completion), and the blind rotation itself.
+const passwordRotation = require('./password_rotation')({ app, db, rateLimitStrict, getBearerIdentity, gateSession, gateFresh, gateMissing,
+  spendSingleUse, logSecurityEvent, passwords, fetchStalwartSecret, setMailboxPasswordHash, blindkeyDecrypt, blindkeyEncrypt,
+  rotateSecretValue, rotatingSecrets: { has: (i) => rotatingSecrets.has(i), add: (i) => rotatingSecrets.add(i), delete: (i) => rotatingSecrets.delete(i) }, generateRefCode, cutSessions: (did) => cutSessions(did), devices: () => deviceKeys,
+  sendMail: (...a) => fleetRoutes.sendMail(...a), storedOrigins: (v) => browserFill.storedOrigins(v) });
 const guardianRecovery = require('./recovery')({ app, db, rateLimitStrict, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing,
   spendSingleUse, logSecurityEvent, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys, holds: () => accountHolds,
-  guardians: () => recoveryGuardians, cryptoDepth: () => cryptoDepth, cutSessions: (did) => cutSessions(did),
+  guardians: () => recoveryGuardians, cryptoDepth: () => cryptoDepth, cutSessions: (did) => cutSessions(did), pwLock: () => passwordRotation,
   hashPassword: (pw) => passwords.hashPassword(pw), setMailboxPassword: (did, hash) => setMailboxPasswordHash(did, hash),
   getMailboxSecret: (did) => { const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did); return w ? fetchStalwartSecret(w.username) : Promise.resolve({ state: 'unreachable' }); } });
 // Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
@@ -12971,6 +13052,15 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
   if (db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ? AND used = 0').run(resetRow.id).changes !== 1) {
     return res.status(400).json({ error: 'invalid or expired reset token' });
   }
+  // One password change per account at a time (#69 review M1): a blind rotation in flight would otherwise be split from
+  // this reset (account on one password, mailbox on another).
+  const lockHolder = 'reset:' + resetRow.id;
+  if (passwordRotation.blockedFor(resetRow.did) || !passwordRotation.claim(resetRow.did, lockHolder)) {
+    db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM password_reset_tokens WHERE did = ? AND id > ?)').run(resetRow.id, resetRow.did, resetRow.id);
+    return res.status(409).json({ error: 'a password change on this account is still settling — try this link again in a few minutes' });
+  }
+  res.on('finish', () => passwordRotation.release(resetRow.did, lockHolder));
+  res.on('close', () => passwordRotation.release(resetRow.did, lockHolder));
   // On failure the link goes back to live, unless a newer one has replaced it.
   const release = () => { try {
     db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM password_reset_tokens WHERE did = ? AND id > ?)')
@@ -13837,7 +13927,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|scan-descriptions|project-fund|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve):\d{1,12}$/;   // project-fund:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|scan-descriptions|project-fund|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate):\d{1,12}$/;   // project-fund:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
