@@ -39,7 +39,7 @@ const OWN_VALUE_ERROR = "the description (or note) contains this secret's own va
  */
 function sweepDescriptions(db, decrypt, did, { redactIds = null, now = Date.now() } = {}) {
   const cols = new Set(db.prepare("SELECT name FROM pragma_table_info('blindkey_secrets')").all().map(c => c.name));
-  const sel = ['id', 'name', 'ref_code', 'description', 'encrypted_value', ...['note', 'updated_at', 'created_at'].filter(c => cols.has(c))];
+  const sel = ['id', 'name', 'ref_code', 'description', 'encrypted_value', ...['note', 'updated_at', 'created_at', 'wrap_state'].filter(c => cols.has(c))];
   const rows = db.prepare(`SELECT ${sel.join(', ')} FROM blindkey_secrets WHERE did = ? AND status != 'deleted'`).all(did);
   const fields = ['description', ...(cols.has('note') ? ['note'] : [])];
   let needles = [];
@@ -48,8 +48,11 @@ function sweepDescriptions(db, decrypt, did, { redactIds = null, now = Date.now(
   const pick = redactIds ? new Set(redactIds.map(Number)) : null;
   try {
     for (const r of rows) {
-      let v; try { v = decrypt(r.encrypted_value); } catch (_) { unchecked++; continue; }
-      if (typeof v !== 'string') { unchecked++; continue; }
+      if (!r.encrypted_value) continue;   // a retired version: its value was erased
+      // Wrapped to the owner's phone (elevated/critical): this server cannot read it. Only these count as unchecked.
+      if (r.wrap_state === 'device' || String(r.encrypted_value).startsWith('dpwrap:')) { unchecked++; continue; }
+      let v; try { v = decrypt(r.encrypted_value); } catch (_) { continue; }
+      if (typeof v !== 'string') continue;
       if (v.length >= MIN_VAULT) needles.push({ name: r.name, forms: forms(v) });
     }
     // Longest first, so a value that contains another is cut whole.
@@ -66,8 +69,10 @@ function sweepDescriptions(db, decrypt, did, { redactIds = null, now = Date.now(
       if (!hit.length) continue;
       const changed = r.updated_at || r.created_at || null;
       const recent = changed ? (now - new Date(String(changed).replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(changed) ? '' : 'Z')).getTime()) < 7 * 86400000 : false;
+      // own: the row holds its OWN value (the 11-07 incident's shape). Only such rows start ticked: no write path lets
+      // a row take its own value into its description any more, so a planted list of guesses never starts ticked.
       found.push({ id: r.id, name: r.name, ref_code: r.ref_code, fields: hit, holds: [...holds], updated_at: changed,
-                   flagged: recent || holds.size >= 2 });
+                   own: holds.has(r.name), flagged: recent || holds.size >= 2 });
       if (pick && pick.has(r.id)) {
         for (const f of hit) {
           let out = r[f];

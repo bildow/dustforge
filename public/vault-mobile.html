@@ -2594,14 +2594,14 @@ async function checkDescriptions(){
     const un=r.unchecked?'<div style="color:var(--text3);margin-top:0.25rem">'+r.unchecked+' secret'+(r.unchecked===1?' is':'s are')+' wrapped to your phone: this server cannot read '+(r.unchecked===1?'it':'them')+', so '+(r.unchecked===1?'its value was':'their values were')+' not looked for.</div>':'';
     if(!r.found.length){ out.style.color='var(--green)'; out.innerHTML='No description or note holds a secret value this server can read.'+un; return; }
     out.style.color='var(--text)';
-    // Pick what to clean. A row changed in the last week, or holding several secrets' values, may be a planted list of
-    // guesses: cleaning it would show whoever planted it which guess was right. Those start unticked; delete them instead.
+    // Pick what to clean. Only a row holding its OWN value starts ticked. A row holding another secret's value may be a
+    // planted list of guesses: cleaning it would show whoever planted it which guess was right, so it starts unticked.
     let h='<div style="color:var(--red)">These hold a secret value:</div>';
     for(const f of r.found){
-      h+='<label style="display:flex;gap:0.4rem;align-items:flex-start;margin-top:0.3rem;font-size:0.72rem;color:var(--text)"><input type="checkbox" class="desc-pick" value="'+Number(f.id)+'"'+(f.flagged?'':' checked')+' style="width:auto;margin:0.15rem 0 0">'
+      h+='<label style="display:flex;gap:0.4rem;align-items:flex-start;margin-top:0.3rem;font-size:0.72rem;color:var(--text)"><input type="checkbox" class="desc-pick" value="'+Number(f.id)+'"'+(f.own?' checked':'')+' style="width:auto;margin:0.15rem 0 0">'
         +'<span><strong>'+esc(f.name)+'</strong> ('+esc(f.fields.join(' and '))+'): value of '+esc(f.holds_value_of.join(', '))
         +'<span style="color:var(--text3)"> · changed '+esc(f.updated_at||'?')+' UTC</span>'
-        +(f.flagged?'<div style="color:var(--red)">Changed recently or holds several values. If you did not write this, delete the secret rather than cleaning it.</div>':'')+'</span></label>';
+        +(!f.own?'<div style="color:var(--red)">Holds another secret\'s value'+(f.flagged?', and changed recently or holds several':'')+'. If you did not write this, delete the secret rather than cleaning it.</div>':'')+'</span></label>';
     }
     h+='<button class="btn-primary" onclick="redactDescriptions()" style="font-size:0.72rem;padding:0.3rem 0.6rem;margin-top:0.4rem">Remove the values from the ticked ones</button>'
       +'<div style="color:var(--text3);margin-top:0.25rem">Agents that listed your vault may have these values in their transcripts: rotate those secrets.</div>'+un;

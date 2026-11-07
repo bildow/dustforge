@@ -28,6 +28,8 @@ function mkdb() {
   ins.run('A', 'noted', 'DP-7', 'fine', 'old pw sharedpassword1', 'enc:notedvalue88', 'active', old);
   ins.run('A', 'planted', 'DP-8', 'guesses: sharedpassword1 imapvalue99 nope1234', null, 'enc:plantedvalue1', 'active', '2026-11-07 11:00:00');
   ins.run('A', 'wrapped', 'DP-4', 'mentions sharedpassword1', null, 'dpwrap:v1:xyz', 'active', old);
+  ins.run('A', 'retired', 'DP-9', 'old version', null, '', 'retired', old);          // erased value: not "unchecked"
+  ins.run('A', 'selfish', 'DP-10', 'Unified to selfvalue77 on 07-07', null, 'enc:selfvalue77', 'active', old);
   ins.run('A', 'gone', 'DP-5', 'whatever', null, 'enc:deletedvalue77', 'deleted', old);
   ins.run('B', 'other', 'DP-6', 'B quotes sharedpassword1', null, 'enc:bvalue123456', 'active', old);
   return db;
@@ -40,7 +42,10 @@ test('sweep: names what holds which values (descriptions and notes), counts unre
   const db = mkdb();
   const { found, unchecked } = g.sweepDescriptions(db, decrypt, 'A', { now: NOW });
   const by = Object.fromEntries(found.map(f => [f.name, f]));
-  assert.deepEqual(Object.keys(by).sort(), ['imap', 'noted', 'planted', 'wrapped']);
+  assert.deepEqual(Object.keys(by).sort(), ['imap', 'noted', 'planted', 'selfish', 'wrapped']);
+  assert.equal(by.selfish.own, true);              // its own value: the only kind that starts ticked
+  assert.equal(by.imap.own, false);
+  assert.equal(by.planted.own, false);
   assert.deepEqual(by.imap.holds.sort(), ['longer', 'shared']);
   assert.deepEqual(by.noted.fields, ['note']);
   assert.equal(by.planted.flagged, true);          // changed within 7 days and holds two secrets' values
@@ -58,7 +63,7 @@ test('sweep with redactIds: only the picked rows, longest value cut whole, notes
   assert.equal(desc(db, 'noted', 'note'), `old pw ${g.REDACTED}`);
   assert.match(desc(db, 'planted'), /sharedpassword1 imapvalue99/);   // not picked: left as it was (no oracle)
   assert.equal(desc(db, 'other'), 'B quotes sharedpassword1');
-  assert.deepEqual(g.sweepDescriptions(db, decrypt, 'A', { now: NOW }).found.map(f => f.name).sort(), ['planted', 'wrapped']);
+  assert.deepEqual(g.sweepDescriptions(db, decrypt, 'A', { now: NOW }).found.map(f => f.name).sort(), ['planted', 'selfish', 'wrapped']);
 });
 
 test('cutValue (rotation copies) and a trailing newline on the stored value', () => {

@@ -160,7 +160,7 @@ module.exports = function registerLeakScan(deps) {
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
       .run(redact ? 'description_redact' : 'description_check', auth.did, null, null, JSON.stringify({ found: found.length, redacted: done.map(f => f.name), unchecked }));
     res.json({ ok: true, unchecked, redacted: done.map(f => f.name),
-      found: found.map(f => ({ id: f.id, name: f.name, ref: f.ref_code, fields: f.fields, holds_value_of: f.holds, updated_at: f.updated_at, flagged: f.flagged })) });
+      found: found.map(f => ({ id: f.id, name: f.name, ref: f.ref_code, fields: f.fields, holds_value_of: f.holds, updated_at: f.updated_at, own: f.own, flagged: f.flagged })) });
   });
   // DELETE /api/blindkey/leak-scan/tokens/:id — revoke.
   // Revoking and denying are the owner's, in their own session (#45 review L3: an agent could revoke the deploy gate's
