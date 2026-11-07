@@ -1470,6 +1470,7 @@ app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
     }
   }
   const r = applyPinHash(auth.did, pinGate.hashPin(String(pin)), { unlinkWhy: wallet.pin_hash && viaPassword ? 'PIN reset with the account password' : null });
+  if (r.ok) accountHolds.closeOpen(auth.did, 'pin-reset', 'superseded: the PIN was set now');   // a waiting reset must not apply later
   if (!r.ok) return res.status(503).json({ error: wallet.pin_hash ? 'could not change the PIN; the current PIN still applies — try again' : 'could not save the PIN; try again', retry: true });
   logSecurityEvent(wallet.pin_hash ? 'pin_changed' : 'pin_set', 'warn', { caller_did: auth.did, ip: req.ip });
   res.json({ ok: true, pin_set: true, changed: Boolean(wallet.pin_hash), ...(r.unlinked ? { phones_unlinked: r.unlinked } : {}) });
@@ -12850,6 +12851,7 @@ app.post('/api/identity/set-recovery-email', rateLimitStrict, async (req, res) =
     }
   }
   accountHolds.setRecoveryEmail(auth.did, wallet.recovery_email, recovery_email);
+  accountHolds.closeOpen(auth.did, 'email', 'superseded: the recovery email was set now');
   logSecurityEvent('recovery_email_changed', 'warn', { caller_did: auth.did, ip: req.ip });
   if (String(wallet.recovery_email || '').toLowerCase() !== recovery_email.toLowerCase()) {
     for (const to of accountAddresses(wallet.email, wallet.recovery_email)) {

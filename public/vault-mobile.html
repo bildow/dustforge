@@ -121,6 +121,7 @@
   </div>
   <button onclick="login()">Sign in</button>
   <div id="auth-err" class="auth-err"></div>
+  <div id="auth-holds" style="max-width:320px;width:100%"></div>
   <a href="https://demipass.com/reset-password.html" style="display:block;text-align:center;margin-top:1rem;color:var(--text3);font-size:0.8rem;text-decoration:none">Forgot password?</a>
 </div>
 
@@ -344,6 +345,7 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked for every reveal; email/SMS codes stay fresh 5 minutes)</div>
         <div id="pin-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.4rem"></div>
         <button class="btn-ghost" onclick="openPinChange()" style="width:100%;text-align:left;padding:0.6rem">Change PIN</button>
+        <div id="holds-wrap" style="display:none;margin-top:0.9rem"><div style="font-size:0.8rem;color:var(--red)">Waiting changes to your wallet</div><div id="holds" style="margin-top:0.3rem"></div></div>
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Phones (approvals come from a linked phone; its fingerprint/face stands in for the PIN)</div>
         <div id="devices" style="margin-top:0.3rem"></div>
         <div id="device-out" style="font-size:0.72rem;color:var(--green);margin-top:0.25rem"></div>
@@ -708,7 +710,8 @@ async function ensureSession(){
   logout(); document.getElementById('auth-err').textContent='Session expired — please sign in again'; return false;
 }
 if(tk&&!isTokenExpired())showApp();
-else if(tk){ensureSession().then(ok=>{if(ok)showApp()},()=>{document.getElementById('auth-err').textContent='No connection — reopen to continue'})}
+else if(tk){ensureSession().then(ok=>{if(ok)showApp();else checkLoginHolds()},()=>{document.getElementById('auth-err').textContent='No connection — reopen to continue'})}
+else setTimeout(()=>{ try{ checkLoginHolds(); }catch(_){} },0);   // item 9: signed out, the linked phone still asks what is waiting
 async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&hadToken&&!(await ensureSession()))throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){const rr=hadToken&&!(opt&&opt.renewed)&&epoch===sessionEpoch?await renewSession():null;if(rr==='ok')return api(m,p,b,{...(opt||{}),renewed:true});if(rr==='offline')throw dropped(m);if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>null);if(epoch!==sessionEpoch)throw new Error('session ended');if(!d&&r.status<400)throw dropped(m);if(r.status>=400&&!d)throw Object.assign(new Error('failed'),{status:r.status});if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
 // A reply cut off by a network change: say so, and never show it as an empty vault or zero balance.
 function dropped(m){return Object.assign(new Error(!m||m==='GET'?'Connection dropped — retrying':'Connection dropped — check whether it went through before trying again'),{dropped:true})}
@@ -722,6 +725,7 @@ async function login(){
     e.textContent='Signing in...';e.style.color='var(--text3)';
     const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
     if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
+    if(a.password_must_change) alert('Change your account password now: someone who knew it started a PIN reset that you canceled. Use “Forgot password?” — the link goes to your recovery email.');
     tk=a.token;did=a.did||'';user=u;loginPw=p;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);if(a.refresh_token)localStorage.setItem('dp_refresh',a.refresh_token);else localStorage.removeItem('dp_refresh');localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
 
@@ -752,7 +756,8 @@ function logout(){
   updateStoreFields(); updateSiliconFields(); updateNetFields();   // the sheets' field sets follow their reset dropdowns
   secrets=[]; dashboardData=null; document.getElementById('vault-note').textContent=''; fleetSlug=null; fleetData=null; siliconHandle=null; panic=false;
   goPage('vault');
-  document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none'}
+  document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none';
+  setTimeout(()=>{ try{ checkLoginHolds(); }catch(_){} },0)}
 
 // ── Fleet tab ──────────────────────────────────────────────────────────────
 function dd(c){return (Number(c)||0).toLocaleString()}
@@ -955,7 +960,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();}
+  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();loadHolds();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -1132,7 +1137,10 @@ async function showApp(){
   await loadVault();
   loadSiliconAgents();
   loadFillRequests(); loadShares(); loadApprovals();
-  loadNetwork()}
+  loadNetwork();
+  // Item 9: a waiting change to the wallet shows in Settings; opened from the alert notification, go there.
+  if(location.hash==='#holds'){ goPage('settings'); loadDevices(); loadHolds(); } else loadHolds();
+}
 
 // ── Network: people, agents joining a fleet, sending DD ───────────────────
 // GET /api/network lists this wallet's contacts, its agents and the requests waiting either way. Incoming requests
@@ -1710,9 +1718,13 @@ async function savePinChange(){
   pinChangeBusy=epoch;
   try{
     m.textContent='Saving…';m.className='modal-msg';
-    await api('POST','/api/identity/pin', cur?{pin:a,current_pin:cur}:{pin:a,password:pw}, {timeoutMs:15000});
+    // Item 9: with a linked phone, a reset with the password waits 48 hours unless this phone confirms it now.
+    let body=cur?{pin:a,current_pin:cur}:{pin:a,password:pw};
+    if(!cur&&dev.linked()){ const p=await phoneProof('pin-reset:0','Reset your PIN now'); if(p) body={...body,...p}; }
+    const r=await api('POST','/api/identity/pin', body, {timeoutMs:15000});
     closeSheet('pin-change'); loadSmsStatus();
-    alert('PIN changed.');
+    if(r&&r.pending){ alert('Your PIN reset waits 48 hours (until '+fmtWhen(r.ready_at)+'): your phones are linked, and any of them can cancel it. To reset it now, do it in the DemiPass app on a linked phone.'); loadHolds(); }
+    else alert('PIN changed.'+(r&&r.phones_unlinked?' Every phone was unlinked: link this one again in Settings.':''));
   }catch(e){ if(sessionEnded(e)) return; m.textContent=isTimeout(e)?'No answer from the server — check Settings before trying again':e.message; m.className='modal-msg err'; }
   finally{ if(pinChangeBusy===epoch) pinChangeBusy=null; }
 }
@@ -2238,6 +2250,82 @@ async function deviceApprove(challenge){
   if(!r.ok) throw new Error(r.error||'this phone could not sign');
   return {device_challenge_id:ch.challenge_id,device_signature:r.signature};
 }
+// ── waiting changes (red team item 9) ─────────────────────────────────────────────────────────────────────────────
+// A PIN reset by password, a new phone, a phone removal or a recovery-email change waits 48 hours while a phone is
+// linked; a guardian recovery waits too. Any linked phone cancels one with its fingerprint/screen lock — without a
+// session (whoever is doing it may have signed this one out). Signed out, the phone asks with its device key.
+function fmtWhen(iso){ try{ const d=new Date(iso); return isNaN(d)?String(iso||''):d.toLocaleString([], {dateStyle:'medium',timeStyle:'short'}); }catch(_){ return String(iso||''); } }
+// A presence proof for a gate intent, for a body: {device_challenge_id, device_signature} or null (declined/failed).
+async function phoneProof(intent, what){
+  try{
+    const ch=await api('POST','/api/identity/device/challenge',{purpose:'gate',intent});
+    const r=await dev.call('sign','P',ch.message,'DemiPass',what);
+    return r.ok?{device_challenge_id:ch.challenge_id,device_signature:r.signature}:null;
+  }catch(_){ return null; }
+}
+async function holdsPost(path, body){
+  const r=await fetch(API+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok) throw Object.assign(new Error(d.error||'failed'),{status:r.status});
+  return d;
+}
+async function holdChallenge(purpose, holdId){
+  const st=dev.st(); if(!st.ok||!st.enrolled) throw new Error('Cancel it in the DemiPass app on one of your linked phones.');
+  return { st, ch: await holdsPost('/api/identity/holds/challenge',{purpose,device_id:st.device_id,hold_id:holdId||''}) };
+}
+async function cancelHold(id){
+  try{
+    const { st, ch }=await holdChallenge('cancel', id);
+    const r=await dev.call('sign','P',ch.message,'','');
+    if(!r.ok) throw new Error(r.error||'not confirmed');
+    await holdsPost('/api/identity/holds/'+encodeURIComponent(id)+'/cancel',{device_id:st.device_id,challenge:ch.challenge,signature:r.signature});
+    alert('Canceled. Nothing changed.');
+  }catch(e){ if(!/cancelled/.test(e.message)) alert(e.message); }
+  loadHolds(); checkLoginHolds();
+}
+async function letPhoneIn(id){
+  try{
+    const { st, ch }=await holdChallenge('enrol-approve', id);
+    const r=await dev.call('sign','P',ch.message,'','');
+    if(!r.ok) throw new Error(r.error||'not confirmed');
+    await holdsPost('/api/identity/holds/'+encodeURIComponent(id)+'/approve-enrol',{device_id:st.device_id,challenge:ch.challenge,signature:r.signature});
+    alert('The new phone is linked.');
+  }catch(e){ if(!/cancelled/.test(e.message)) alert(e.message+(e.status===404?' (only a phone linked for 48 hours or more can let a new one in)':'')); }
+  loadHolds(); loadDevices();
+}
+function holdCards(holds){
+  const onPhone=dev.linked();
+  return holds.map(h=>'<div class="fill-req" style="border-color:var(--red)"><div><b>'+esc(h.what||h.kind)+'</b></div>'
+    +(h.kind==='enrol'?'<div style="font-size:0.75rem">New phone “'+esc(h.label||'')+'” — code '+esc(h.fingerprint||'')+'</div>':'')
+    +(h.kind==='email'?'<div style="font-size:0.75rem">New recovery email: '+esc(h.recovery_email||'')+'</div>':'')
+    +(h.kind==='unlink'?'<div style="font-size:0.75rem">Phone: '+esc(h.label||h.device_id||'')+'</div>':'')
+    +'<div style="color:var(--text3);font-size:0.75rem">started '+esc(fmtWhen(h.created_at))+(h.ready_at?' · takes effect '+esc(fmtWhen(h.ready_at)):'')+'</div>'
+    +'<div class="fr-row">'+(onPhone?'<button class="btn-danger" onclick="cancelHold('+esc(JSON.stringify(h.id))+')">Cancel it</button>'
+      +(h.kind==='enrol'?' <button class="btn-ghost" onclick="letPhoneIn('+esc(JSON.stringify(h.id))+')">It is mine — let it in now</button>':'')
+      :'<span style="font-size:0.75rem;color:var(--text3)">Not you? Cancel it in the DemiPass app on a linked phone.</span>')+'</div></div>').join('');
+}
+async function loadHolds(){
+  const wrap=document.getElementById('holds-wrap'), el=document.getElementById('holds'); if(!wrap||!el||!tk) return;
+  try{
+    const r=await api('GET','/api/identity/holds');
+    const hs=r.holds||[]; wrap.style.display=hs.length?'block':'none'; el.innerHTML=holdCards(hs);
+    if(hs.length&&location.hash==='#holds') wrap.scrollIntoView({behavior:'smooth'});
+  }catch(e){ if(!sessionEnded(e)){ wrap.style.display='none'; } }
+}
+// Signed out: the linked phone asks with its device key (no session) and shows what is waiting, with Cancel.
+async function checkLoginHolds(){
+  const el=document.getElementById('auth-holds'); if(!el) return;
+  try{
+    const st=dev.st(); if(!st.ok||!st.enrolled){ el.innerHTML=''; return; }
+    const ch=await holdsPost('/api/identity/holds/challenge',{purpose:'alerts',device_id:st.device_id});
+    const s=await dev.call('sign','D',ch.message,'','');
+    if(!s.ok){ el.innerHTML=''; return; }
+    const r=await holdsPost('/api/identity/holds/alerts',{device_id:st.device_id,challenge:ch.challenge,signature:s.signature});
+    const hs=r.holds||[];
+    el.innerHTML=hs.length?'<div style="margin-top:1rem;font-size:0.85rem;color:var(--red)">Waiting changes to your wallet — cancel any that were not you:</div>'+holdCards(hs):'';
+  }catch(_){ el.innerHTML=''; }
+}
+
 // ── wrap key (red team item 1): elevated/critical secrets are wrapped to this phone; the host cannot read them ────
 let wrapFpCache=null, wrapInfo=null;
 async function myWrapFp(){
@@ -2372,8 +2460,16 @@ async function linkPhone(){
     const ch=await api('POST','/api/identity/device/challenge',{purpose:'enrol',intent:'device-enrol:0'});
     const r=await dev.call('enrol',ch.message);
     if(!r.ok) throw new Error(r.error||'could not link this phone');
-    try{ await apiGated('POST','/api/identity/device/enrol',{challenge_id:ch.challenge_id,device_id:r.device_id,label:r.label,key_d:r.key_d,key_p:r.key_p,sig_d:r.sig_d,sig_p:r.sig_p},'Link this phone for approvals? Your PIN and account password confirm it.'); }
+    let res;
+    try{ res=await apiGated('POST','/api/identity/device/enrol',{challenge_id:ch.challenge_id,device_id:r.device_id,label:r.label,key_d:r.key_d,key_p:r.key_p,sig_d:r.sig_d,sig_p:r.sig_p},'Link this phone for approvals? Your PIN and account password confirm it.'); }
     catch(e){ try{ globalThis.DemiPassDevice.abandonEnrol(); }catch(_){} throw e; }   // the working keys stay
+    // Item 9 (E1): another phone is already linked, so this one waits 48 hours — the new keys stay pending on this
+    // phone until the server lists it as linked (loadDevices commits it then), or an established phone lets it in.
+    if(res&&res.pending){
+      // The code is this phone's own: sha256 of its device key, computed here — not taken from the server's reply.
+      let code=''; try{ const h=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(r.key_d))); code=[...h].slice(0,8).map(b=>b.toString(16).padStart(2,'0')).join(''); }catch(_){}
+      if(out) out.textContent='This phone waits to be linked until '+fmtWhen(res.active_at)+' — or open DemiPass on a phone linked for 48 hours or more and let it in now, checking it shows this code: '+code+'.';
+      loadDevices(); return; }
     try{ globalThis.DemiPassDevice.commitEnrol(); }catch(_){}
     if(out) out.textContent='This phone is linked: approvals come from it, and your fingerprint/face can stand in for the PIN.';
     await ensureWrapKey();
@@ -2381,17 +2477,25 @@ async function linkPhone(){
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
 }
 async function unlinkPhone(id){
-  try{ await apiGated('DELETE','/api/identity/devices/'+encodeURIComponent(id),null,'Remove this phone? Your PIN confirms it.'); const s=dev.st(); if(s.ok&&s.device_id===id&&globalThis.DemiPassDevice) globalThis.DemiPassDevice.forget(); loadDevices(); }
+  try{ const r=await apiGated('DELETE','/api/identity/devices/'+encodeURIComponent(id),null,'Remove this phone? Your PIN confirms it.');
+    if(r&&r.pending){ alert('That phone is removed in 48 hours ('+fmtWhen(r.ready_at)+') unless a linked phone cancels it. To remove it now, confirm on the phone itself or on a phone linked for 48 hours or more.'); loadHolds(); loadDevices(); return; }
+    const s=dev.st(); if(s.ok&&s.device_id===id&&globalThis.DemiPassDevice) globalThis.DemiPassDevice.forget(); loadDevices(); }
   catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
 }
 async function loadDevices(){
   const el=document.getElementById('devices'); if(!el) return;
   try{
-    const r=await api('GET','/api/identity/devices'); const me=dev.st();
+    const r=await api('GET','/api/identity/devices'); let me=dev.st();
+    // A link of this phone that was waiting (E1): linked now → keep the new keys; no longer waiting → drop them.
+    if(me.ok&&me.pending_device_id){
+      if((r.devices||[]).some(d=>d.device_id===me.pending_device_id)){ try{ globalThis.DemiPassDevice.commitEnrol(); }catch(_){} me=dev.st(); }
+      else if(!(r.pending||[]).some(p=>p.device_id===me.pending_device_id)){ try{ globalThis.DemiPassDevice.abandonEnrol(); }catch(_){} me=dev.st(); }
+    }
     el.innerHTML=(r.devices||[]).map(d=>'<div class="fill-req"><div><b>'+esc(d.label)+'</b>'+(me.ok&&me.device_id===d.device_id?' (this phone)':'')+'</div>'
       +'<div style="color:var(--text3);font-size:0.75rem">linked '+esc(String(d.enrolled_at||'').slice(0,10))+(d.last_used_at?' · last used '+esc(String(d.last_used_at).slice(0,10)):'')+'</div>'
       +'<div class="fr-row"><button class="btn-ghost" onclick="unlinkPhone('+esc(JSON.stringify(d.device_id))+')">Remove</button></div></div>').join('')
-      +(me.ok&&!me.enrolled?'<button class="btn-primary" onclick="linkPhone()">Use this phone for approvals</button>':'')
+      +(r.pending||[]).map(p=>'<div class="fill-req"><div><b>'+esc(p.label||'phone')+'</b> — waiting to be linked'+(me.ok&&me.pending_device_id===p.device_id?' (this phone)':'')+'</div><div style="color:var(--text3);font-size:0.75rem">linked '+esc(fmtWhen(p.active_at))+' unless canceled (see Waiting changes)</div></div>').join('')
+      +(me.ok&&!me.enrolled&&!me.pending_device_id?'<button class="btn-primary" onclick="linkPhone()">Use this phone for approvals</button>':'')
       +((r.devices||[]).length?'':'<div style="color:var(--text3);font-size:0.75rem;margin-top:0.4rem">No phone linked: approvals are taken from any signed-in session with your PIN.</div>')
       +((r.devices||[]).length?'<div style="color:var(--text3);font-size:0.72rem;margin-top:0.4rem">Elevated and critical secrets are wrapped to your linked phone: the server cannot read them, only use them when you approve. If you lose every phone that holds them, they are gone.</div>':'');
     if(me.ok&&me.enrolled) ensureWrapKey();
@@ -2550,8 +2654,11 @@ async function setRecoveryEmail(){
   if(!email){msg.textContent='Enter an email';msg.style.color='var(--red)';return}
   if(!pwEl.value){msg.textContent='Enter your account password';msg.style.color='var(--red)';return}
   try{
-    const r=await api('POST','/api/identity/set-recovery-email',{recovery_email:email,password:pwEl.value});
+    let body={recovery_email:email,password:pwEl.value};
+    if(dev.linked()){ const p=await phoneProof('recovery-email:0','Change your recovery email now'); if(p) body={...body,...p}; }
+    const r=await api('POST','/api/identity/set-recovery-email',body);
     pwEl.value='';
+    if(r.pending){ msg.textContent='Saved in 48 hours ('+fmtWhen(r.ready_at)+') — your linked phones can cancel it. Confirm on a phone linked 48 h or more to change it now.'; msg.style.color='var(--text3)'; loadHolds(); return; }
     msg.textContent=r.ok?'Recovery email saved':(r.error||'failed');
     msg.style.color=r.ok?'var(--green)':'var(--red)';
   }catch(e){msg.textContent=e.message;msg.style.color='var(--red)'}

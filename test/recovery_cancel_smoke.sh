@@ -143,7 +143,7 @@ hch enrol-approve phone-aaaa1 "$HOLD"; call POST /api/identity/holds/$HOLD/appro
 [ "$CODE" = 404 ] && ok "C6 a phone linked < 48 h cannot approve a new one" || fail "C6 young approve: $CODE $BODY"
 X "UPDATE device_keys SET enrolled_at='$(iso -259200)' WHERE device_id='phone-aaaa1'"
 hch enrol-approve phone-aaaa1 "$HOLD"
-FP=$(Q "SELECT payload FROM account_holds WHERE id='$HOLD'" | python3 -c "import json,sys,hashlib; print(hashlib.sha256(json.load(sys.stdin)['key_d'].encode()).hexdigest()[:8])")
+FP=$(Q "SELECT payload FROM account_holds WHERE id='$HOLD'" | python3 -c "import json,sys,hashlib; print(hashlib.sha256(json.load(sys.stdin)['key_d'].encode()).hexdigest()[:16])")
 echo "$MSG" | grep -q ":$HOLD:$FP:pb:" && ok "C6 the approval names the new phone by its key fingerprint, not only its label (#59 M4)" || fail "C6 fp: $MSG / $FP"
 call POST /api/identity/holds/$HOLD/approve-enrol "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pap "$MSG")'"}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-bbbb1' AND revoked_at IS NULL")" = 2 ] && ok "C6 an established phone's presence links the new phone at once" || fail "C6 approve: $CODE $BODY"

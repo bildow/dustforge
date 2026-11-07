@@ -58,6 +58,7 @@ module.exports = function registerAccountHolds(deps) {
     expires_at TEXT NOT NULL,
     used_at TEXT
   )`);
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_hold_challenges_nonce ON hold_challenges(nonce)');
   // Guardians (step 2 fills it); here only for the last-phone guard.
   db.exec(`CREATE TABLE IF NOT EXISTS recovery_guardians (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,7 +145,13 @@ module.exports = function registerAccountHolds(deps) {
 
   // The first 8 hex of sha256(the new phone's device key): shown on the new phone and in the approval, so the owner
   // approves the phone in their hand and not another one with the same name (#59 review M4).
-  const keyPrint = (k) => k ? crypto.createHash('sha256').update(String(k)).digest('hex').slice(0, 8) : '';
+  // 16 hex (64 bits): a look-alike phone would take ~2^64 key generations (#59 re-review L2). The new phone computes it
+  // from its own key (the page hashes key_d the same way) — it does not take the server's word for it.
+  const keyPrint = (k) => k ? crypto.createHash('sha256').update(String(k)).digest('hex').slice(0, 16) : '';
+  // A label for a signed message: whole code points (an emoji is never cut in half), no lone surrogates, no ':' or
+  // controls — Node and Java must turn it into the same bytes (#59 re-review L3).
+  const msgLabel = (l) => Array.from(String(l || '')).slice(0, 60).join('')
+    .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '').replace(/[:\u0000-\u001f\u007f]/g, ' ');
 
   // ── session-less challenges ────────────────────────────────────────────────────────────────────────────────────
   function messageFor(ch) {
@@ -155,7 +162,7 @@ module.exports = function registerAccountHolds(deps) {
     if (ch.purpose === 'enrol-approve') {
       const h = db.prepare('SELECT payload FROM account_holds WHERE id = ?').get(ch.hold_id) || {};
       const p = parse(h.payload);
-      return `demipass:enrol-approve:${ch.did}:${ch.hold_id}:${keyPrint(p.key_d)}:${String(p.label || '').replace(/[:\u0000-\u001f]/g, ' ').slice(0, 60)}:${ch.nonce}`;
+      return `demipass:enrol-approve:${ch.did}:${ch.hold_id}:${keyPrint(p.key_d)}:${msgLabel(p.label)}:${ch.nonce}`;
     }
     return `demipass:alerts:${ch.did}:${ch.device_id}:${ch.nonce}`;
   }
@@ -331,8 +338,12 @@ module.exports = function registerAccountHolds(deps) {
   function dropDeviceHolds(did, why) {
     db.prepare(`UPDATE account_holds SET status = 'canceled', canceled_by = ?, canceled_at = ?, payload = '{}' WHERE did = ? AND kind IN ('enrol', 'unlink') AND ${OPEN}`).run(String(why).slice(0, 60), nowIso(), did);
   }
+  // A waiting change of this kind made moot by one applied now (with the phone): it must never apply later.
+  function closeOpen(did, kind, why) {
+    db.prepare(`UPDATE account_holds SET status = 'canceled', canceled_by = ?, canceled_at = ?, payload = '{}' WHERE did = ? AND kind = ? AND ${OPEN}`).run(String(why).slice(0, 60), nowIso(), did, kind);
+  }
   const guardiansActive = (did) => db.prepare("SELECT COUNT(*) AS n FROM recovery_guardians WHERE owner_did = ? AND status = 'active'").get(did).n > 0;
 
-  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, startRefusal, dropDeviceHolds, establishedKey, eligibleKey, setRecoveryEmail,
+  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, startRefusal, dropDeviceHolds, closeOpen, establishedKey, eligibleKey, setRecoveryEmail,
            HOLD_DELAY_SEC, ESTABLISHED_SEC, GRACE_SEC };
 };
