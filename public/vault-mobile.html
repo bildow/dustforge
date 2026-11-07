@@ -1589,7 +1589,7 @@ async function approveApproval(){
   const m=document.getElementById('ap-msg');
   try{
     // A wrapped secret (item 1): the phone unwraps its key for this request first (fingerprint/screen lock).
-    const extra=apOpen.unwrap?{unwrap:await phoneUnwrap(apOpen.unwrap,'Approve '+apOpen.name)}:{};
+    const extra=apOpen.unwrap?{unwrap:await phoneUnwrap(apOpen.unwrap)}:{};
     // Approve sends the code on the screen; if it rotated in between, fetch the new one and send that.
     try{ await apiGated('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code,...extra},'Approve this request'); }
     catch(e){ if(!/rotated/.test(e.message)) throw e; await refreshApproval(false); await apiGated('POST','/api/blindkey/approvals/'+apOpen.id+'/approve',{code:apOpen.code,...extra},'Approve this request'); }
@@ -2261,11 +2261,12 @@ async function ensureWrapKey(){
 }
 // The phone unwraps a secret's data key for one approval or one depth change: {unwrap} (the data key, re-encrypted to the
 // server's one-use key — it never reaches this page).
-async function phoneUnwrap(info, what){
+async function phoneUnwrap(info){
   if(!globalThis.DemiPassDevice) throw new Error('This secret is wrapped to your phone: do this in the DemiPass app on that phone.');
   const me=await myWrapFp(); const wrapped=(info.wraps||{})[me.fp];
   if(!wrapped) throw new Error('This secret is wrapped to another phone of yours: do this on that phone.');
-  const r=await dev.call('unwrap',wrapped,info.eph_pub,String(what||'').slice(0,100));
+  // The phone shows "<name> (<ref>)" in its own prompt and checks the wrap is for exactly that secret (#56 review H1).
+  const r=await dev.call('unwrap',wrapped,info.eph_pub,String(info.did||''),String(info.ref||''),String(info.name||''));
   if(!r.ok) throw new Error(r.error||'this phone could not unwrap it');
   return r.unwrap;
 }
@@ -2458,7 +2459,7 @@ async function setDepth(name, depth){
       const w=await api('GET','/api/blindkey/wrap').catch(()=>null);
       if(w&&(w.secrets||[]).some(x=>x.name===name&&x.wrapped)){
         const u=await api('POST','/api/blindkey/wrap/unwrap-session',{secret:name});
-        body.unwrap_session=u.unwrap_session; body.unwrap=await phoneUnwrap(u,'Let the server read '+name+' again');
+        body.unwrap_session=u.unwrap_session; body.unwrap=await phoneUnwrap(u);
       }
     }
     const r=await apiGated('POST','/api/demipass/gate-policy',body,'Lowering the protection on '+name+' needs your PIN first.');

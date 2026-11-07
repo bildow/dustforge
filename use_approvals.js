@@ -214,6 +214,11 @@ module.exports = function registerUseApprovals(deps) {
   // `peek`: report whether an approved request is there without spending it (reveal checks the PIN in between).
   function gate(secret, caller, use, body = {}, { peek = false } = {}) {
     if (depthOf(secret) === 'standard') return { ok: true };
+    // A wrapped secret (item 1) is never revealed by the host — not the owner's reveal, not a share's emergency reveal:
+    // refused before a request (and its one-use key) exists (#56 review L1).
+    if ((use.kind || 'use') === 'reveal' && cryptoDepth && cryptoDepth.isWrapped(secret)) {
+      return { status: 409, body: { error: 'this secret is wrapped to its owner\'s phone, so the server cannot reveal it — the owner lowers it to standard first (the phone unwraps it)', wrapped: true } };
+    }
     const amb = ambiguity(use.params);
     if (amb) return { status: 400, body: { error: amb } };
     expireOld();

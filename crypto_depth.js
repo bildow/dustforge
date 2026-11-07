@@ -51,19 +51,26 @@ module.exports = function registerCryptoDepth(deps) {
   const nowIso = () => new Date().toISOString();
   const fpOf = (spkiB64) => crypto.createHash('sha256').update(Buffer.from(spkiB64, 'base64')).digest('hex');
   const isWrapped = (secret) => Boolean(secret && secret.wrap_state === 'device');
+  // What a wrap is FOR, sealed inside it with the data key: the phone shows "<name> (<ref>)" in its own prompt and,
+  // after decrypting, refuses unless the wrap names that same secret — so a host serving a doctored page cannot get
+  // secret B unwrapped under a prompt for secret A (#56 review H1).
+  const bindingOf = (did, ref, name) => crypto.createHash('sha256').update(`dp-wrap:v1|${did}|${ref}|${name}`).digest();
 
   // ── one-use keys, in memory only ────────────────────────────────────────────────────────────────────────────────
   const eph = new Map();   // tag → { priv: KeyObject, pub: base64 SPKI, exp }
   function sweep() { const t = Date.now(); for (const [k, v] of eph) if (v.exp <= t) eph.delete(k); }
   const sweeper = setInterval(sweep, 60000); if (sweeper.unref) sweeper.unref();
-  function ephemeralFor(tag) {
+  // Generated off the event loop (#56 review M3: RSA-2048 keygen blocked every other request).
+  const genRsa = () => new Promise((ok, no) => crypto.generateKeyPair('rsa', { modulusLength: 2048 }, (e, pub, priv) => (e ? no(e) : ok({ pub, priv }))));
+  async function ephemeralFor(tag) {
     sweep();
     const have = eph.get(tag); if (have) return have.pub;
-    const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const { pub: publicKey, priv: privateKey } = await genRsa();
     const pub = publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
-    eph.set(tag, { priv: privateKey, pub, exp: Date.now() + EPHEMERAL_TTL_MS });
-    return pub;
+    if (!eph.has(tag)) eph.set(tag, { priv: privateKey, pub, exp: Date.now() + EPHEMERAL_TTL_MS });
+    return eph.get(tag).pub;
   }
+  const openSessions = (did) => { sweep(); let n = 0; for (const k of eph.keys()) if (k.startsWith(`s:${did}:`)) n++; return n; };
   const hasEphemeral = (tag) => { sweep(); return eph.has(tag); };
   function dropEphemeral(tag) { eph.delete(tag); }
 
@@ -90,7 +97,9 @@ module.exports = function registerCryptoDepth(deps) {
       const c = crypto.createCipheriv('aes-256-gcm', dek, iv);
       const ct = Buffer.concat([c.update(value, 'utf8'), c.final()]);
       const blob = ['v1', iv.toString('base64'), c.getAuthTag().toString('base64'), ct.toString('base64')].join(':');
-      const wraps = keys.map(k => ({ fp: k.fp, dek: crypto.publicEncrypt({ key: Buffer.from(k.public_key, 'base64'), format: 'der', type: 'spki', ...OAEP }, dek).toString('base64') }));
+      const sealedKey = Buffer.concat([dek, bindingOf(secret.did, secret.ref_code, secret.name)]);
+      const wraps = keys.map(k => ({ fp: k.fp, dek: crypto.publicEncrypt({ key: Buffer.from(k.public_key, 'base64'), format: 'der', type: 'spki', ...OAEP }, sealedKey).toString('base64') }));
+      sealedKey.fill(0);
       db.transaction(() => {
         const n = db.prepare("UPDATE blindkey_secrets SET wrapped_value = ?, wrap_state = 'device', encrypted_value = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND wrap_state IS NULL").run(blob, MARKER, secret.id).changes;
         if (n !== 1) throw new Error('the secret changed meanwhile');
@@ -98,6 +107,9 @@ module.exports = function registerCryptoDepth(deps) {
         for (const w of wraps) ins.run(secret.id, w.fp, w.dek, nowIso());
       })();
     } finally { dek.fill(0); value = null; }
+    // The pre-wrap host-key ciphertext must not linger in the WAL (#56 review L2). Backups made before wrapping still
+    // hold it: wrapping protects from this point on (docs/trust-model.md).
+    try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (_) {}
     logSecurityEvent('secret_wrapped', 'info', { caller_did: secret.did, capability: 'wrap', target: secret.name, context: { phones: keys.length } });
     return { ok: true, wrapped_for: keys.length };
   }
@@ -133,12 +145,13 @@ module.exports = function registerCryptoDepth(deps) {
   // ── hooks for use_approvals.js ──────────────────────────────────────────────────────────────────────────────────
   function onRequestCreated(row, secret) {
     if (!isWrapped(secret)) return;
-    db.prepare('UPDATE use_approvals SET eph_pub = ? WHERE id = ?').run(ephemeralFor('a:' + row.id), row.id);
+    ephemeralFor('a:' + row.id).then(pub => db.prepare('UPDATE use_approvals SET eph_pub = ? WHERE id = ?').run(pub, row.id))
+      .catch(e => console.error('[crypto-depth] one-use key:', e.message));
   }
   // What the owner's phone needs to approve: the one-use key and the wraps (it uses the one for its own wrap key).
   function approvalView(row, secret) {
     if (!isWrapped(secret) || row.status !== 'pending' || !row.eph_pub) return null;
-    return { eph_pub: row.eph_pub, wraps: wrapsOf(secret.id), live: hasEphemeral('a:' + row.id) };
+    return { eph_pub: row.eph_pub, wraps: wrapsOf(secret.id), live: hasEphemeral('a:' + row.id), did: secret.did, ref: secret.ref_code, name: secret.name };
   }
   // On Approve: a wrapped secret needs the phone's unwrap with it. Returns null or { status, body }.
   function approveRefusal(row, secret, body) {
@@ -211,12 +224,16 @@ module.exports = function registerCryptoDepth(deps) {
 
   // POST /api/blindkey/wrap/unwrap-session {secret} — the owner's phone asks to unwrap one (to lower its depth): a
   // one-use key for it, and the wraps. Then the depth change carries {unwrap_session, unwrap}.
-  app.post('/api/blindkey/wrap/unwrap-session', rateLimitStandard, (req, res) => {
+  app.post('/api/blindkey/wrap/unwrap-session', rateLimitStandard, async (req, res) => {
     const auth = ownerAuth(req, res); if (!auth) return;
     const s = ownSecret(auth.did, (req.body || {}).secret);
     if (!s || !isWrapped(s)) return res.status(404).json({ error: 'no wrapped secret by that name' });
+    if (openSessions(auth.did) >= 3) return res.status(429).json({ error: 'at most 3 unwrap sessions open at once — finish or wait for one (15 min)' });
     const sid = crypto.randomBytes(12).toString('hex');
-    res.json({ ok: true, unwrap_session: sid, eph_pub: ephemeralFor(`s:${auth.did}:${s.id}:${sid}`), wraps: wrapsOf(s.id) });
+    try {
+      const pub = await ephemeralFor(`s:${auth.did}:${s.id}:${sid}`);
+      res.json({ ok: true, unwrap_session: sid, eph_pub: pub, wraps: wrapsOf(s.id), did: s.did, ref: s.ref_code, name: s.name });
+    } catch (e) { res.status(503).json({ error: 'could not start an unwrap session; try again' }); }
   });
   // The value of a wrapped secret, for the owner lowering it (gate-policy calls this). Throws {status} on failure.
   function unwrapForOwner(did, secret, body) {
@@ -233,6 +250,6 @@ module.exports = function registerCryptoDepth(deps) {
     logSecurityEvent('secret_unwrapped', 'warn', { caller_did: secret.did, capability: 'unwrap', target: secret.name });
   }
 
-  return { MARKER, isWrapped, wrapSecret, plaintextFor, onRequestCreated, approvalView, approveRefusal, storeUnwrap, dropEphemeral,
+  return { MARKER, bindingOf, isWrapped, wrapSecret, plaintextFor, onRequestCreated, approvalView, approveRefusal, storeUnwrap, dropEphemeral,
            unwrapForOwner, unwrapToHost, activeWrapKeys, _hasEphemeral: hasEphemeral };
 };

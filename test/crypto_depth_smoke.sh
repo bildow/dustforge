@@ -49,9 +49,13 @@ fs.writeFileSync(process.argv[1] + "/w.pem", w.privateKey.export({ type: "pkcs8"
 fs.writeFileSync(process.argv[1] + "/w.pub", w.publicKey.export({ type: "spki", format: "der" }).toString("base64"));' "$S"
 sig(){ node -e 'const c=require("crypto"),fs=require("fs"); process.stdout.write(c.sign("sha256", Buffer.from(process.argv[2]), fs.readFileSync(process.argv[1])).toString("base64"))' "$S/$1.pem" "$2"; }
 # what the phone's Keystore does on Approve: unwrap the data key with W, re-encrypt it to the request's one-use key
+# what the phone does (DemiPassDevice.unwrap): open the wrap with W → data key || binding; refuse unless the binding names
+# the secret its own prompt shows (did, ref, name); re-encrypt only the data key to the request's one-use key
 rewrap(){ node -e 'const c=require("crypto"),fs=require("fs"); const o={padding:c.constants.RSA_PKCS1_OAEP_PADDING,oaepHash:"sha1"};
-  const dek=c.privateDecrypt({key:fs.readFileSync(process.argv[1]),...o},Buffer.from(process.argv[2],"base64"));
-  process.stdout.write(c.publicEncrypt({key:Buffer.from(process.argv[3],"base64"),format:"der",type:"spki",...o},dek).toString("base64"))' "$S/w.pem" "$1" "$2"; }
+  const sealed=c.privateDecrypt({key:fs.readFileSync(process.argv[1]),...o},Buffer.from(process.argv[2],"base64"));
+  const want=c.createHash("sha256").update("dp-wrap:v1|"+process.argv[4]+"|"+process.argv[5]+"|"+process.argv[6]).digest();
+  if (sealed.length!==64 || !c.timingSafeEqual(sealed.subarray(32),want)) { process.stdout.write("REFUSED"); process.exit(0); }
+  process.stdout.write(c.publicEncrypt({key:Buffer.from(process.argv[3],"base64"),format:"der",type:"spki",...o},sealed.subarray(0,32)).toString("base64"))' "$S/w.pem" "$1" "$2" "$3" "$4" "$5"; }
 devsign(){ local tok=$1 intent=$2 bind=$3   # → CH SG
   call POST /api/identity/device/challenge "$tok" "$(python3 -c 'import json,sys; print(json.dumps({"purpose":"approve","intent":sys.argv[1],"bind":sys.argv[2]}))' "$intent" "$bind")"
   CH=$(echo "$BODY" | J challenge_id); SG=$(sig d "$(echo "$BODY" | J message)"); }
@@ -92,6 +96,7 @@ HS=$(snap); [ -n "$HS" ] && ! grep -qaF -- "$V" "$HS" && ok "a heap snapshot of 
 # ── an agent's use: approval with the phone's unwrap ──
 USE='{"ref":"'$REF'","params":{"url":"https://repo.dustroot.com/api/v1/user","method":"GET"}}'
 call POST /api/demipass/use "$AG" "$USE"; AP=$(echo "$BODY" | J approval_id)
+for i in $(seq 1 20); do [ -n "$(Q "SELECT COALESCE(eph_pub,'') FROM use_approvals WHERE id=$AP")" ] && break; sleep 0.2; done   # made off the event loop
 [ "$CODE" = 202 ] && [ -n "$(Q "SELECT eph_pub FROM use_approvals WHERE id=$AP")" ] && ok "the agent's /use parks; the request has a one-use key (private half in memory only)" || fail "park: $CODE $BODY"
 call GET /api/demipass/approvals "$A"; UN=$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x for x in d["incoming"] if x["id"]=='$AP'][0]; print(json.dumps(a.get("unwrap")))')
 EPH=$(echo "$UN" | J eph_pub); WD=$(echo "$UN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["wraps"]["'$FP'"])')
@@ -103,7 +108,13 @@ call POST /api/demipass/use "$AG" "${USE%\}},\"approval_id\":$AP,\"approval_code
 [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J wrapped)" = True ] && ok "a code read aloud cannot open a wrapped secret (only the phone's Approve can)" || fail "code path: $CODE $BODY"
 devsign "$A" "approval:$AP" "$BIND"; call POST /api/demipass/approvals/$AP/approve "$A" '{"code":"'$CODEV'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
 [ "$CODE" = 428 ] && [ "$(echo "$BODY" | J unwrap_required)" = True ] && ok "approving without the phone's unwrap → 428 (a session or a device signature alone opens nothing)" || fail "no unwrap: $CODE $BODY"
-UW=$(rewrap "$WD" "$EPH")
+UW=$(rewrap "$WD" "$EPH" "$DA" "$REF" vaultroot)
+# a doctored page (a compromised host) hands the phone another secret's wrap under this request's name: the phone refuses
+call POST /api/demipass/store "$A" '{"name":"other-secret","value":"other-value-zz7781","secret_type":"api_key"}'
+call POST /api/demipass/gate-policy "$A" '{"name":"other-secret","security_depth":"critical"}'
+OREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='other-secret'"); OWD=$(Q "SELECT wrapped_dek FROM secret_wraps w JOIN blindkey_secrets s ON s.id=w.secret_id WHERE s.name='other-secret'")
+[ "$(rewrap "$OWD" "$EPH" "$DA" "$REF" vaultroot)" = REFUSED ] && [ "$(rewrap "$OWD" "$EPH" "$DA" "$OREF" other-secret)" != REFUSED ] \
+  && ok "the phone opens a wrap only for the secret its own prompt names (a doctored page cannot swap in another secret)" || fail "binding"
 devsign "$A" "approval:$AP" "$BIND"; call POST /api/demipass/approvals/$AP/approve "$A" '{"code":"'$CODEV'","device_challenge_id":'$CH',"device_signature":"'$SG'","unwrap":"'$UW'"}'
 [ "$CODE" = 200 ] && ok "the phone approves with its unwrap (the data key re-encrypted to this request's one-use key)" || fail "approve: $CODE $BODY"
 : > "$S/up.auth"
@@ -128,10 +139,22 @@ tfa(){ call POST /api/identity/request-2fa "$A" '{"did":"'$DA'"}'; call POST /ap
 tfa; pin "$A" "gate-policy:$SID"; call POST /api/demipass/gate-policy "$A" '{"name":"vaultroot","security_depth":"standard"}'
 [ "$CODE" = 428 ] && [ "$(echo "$BODY" | J unwrap_required)" = True ] && ok "lowering to standard needs the phone's unwrap" || fail "lower no unwrap: $CODE $BODY"
 call POST /api/demipass/wrap/unwrap-session "$A" '{"secret":"vaultroot"}'; US=$(echo "$BODY" | J unwrap_session); EPH3=$(echo "$BODY" | J eph_pub)
-WD3=$(echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["wraps"]["'$FP'"])'); UW3=$(rewrap "$WD3" "$EPH3")
+WD3=$(echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["wraps"]["'$FP'"])'); UW3=$(rewrap "$WD3" "$EPH3" "$DA" "$REF" vaultroot)
 tfa; pin "$A" "gate-policy:$SID"; call POST /api/demipass/gate-policy "$A" '{"name":"vaultroot","security_depth":"standard","unwrap_session":"'$US'","unwrap":"'$UW3'"}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT COALESCE(wrap_state,'none') FROM blindkey_secrets WHERE id=$SID")" = none ] && [ "$(Q "SELECT COUNT(*) FROM secret_wraps WHERE secret_id=$SID")" = 0 ] && ok "with the phone's unwrap it is lowered: host-readable again, wraps gone" || fail "lower: $CODE $BODY"
 pin "$A" "reveal:$SID"; call POST /api/demipass/reveal "$A" '{"name":"vaultroot"}'
 [ "$CODE" = 200 ] && echo "$BODY" | grep -qF -- "$V" && ok "…and reveal returns the same value (nothing lost through the round trip)" || fail "reveal after lower: $CODE"
+
+# ── rotation of a wrapped secret: the new version is wrapped for its (moved) ref; session cap ──
+call POST /api/demipass/store "$A" '{"name":"rotme","value":"rot-value-one-zz55","secret_type":"api_key"}'
+call POST /api/demipass/gate-policy "$A" '{"name":"rotme","security_depth":"elevated"}'
+RID=$(Q "SELECT id FROM blindkey_secrets WHERE name='rotme'"); RREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$RID")
+tfa; pin "$A" "rotate:$RID"; call POST /api/demipass/rotate "$A" '{"name":"rotme","new_value":"rot-value-two-zz66","grace_period_minutes":5}'
+NID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$RREF'"); NNAME=$(Q "SELECT name FROM blindkey_secrets WHERE id=$NID")
+NWD=$(Q "SELECT wrapped_dek FROM secret_wraps WHERE secret_id=$NID")
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J wrapped)" = True ] && [ "$(Q "SELECT wrap_state FROM blindkey_secrets WHERE id=$NID")" = device ] && [ "$(rewrap "$NWD" "$EPH3" "$DA" "$RREF" "$NNAME")" != REFUSED ] \
+  && ok "rotating a wrapped secret wraps the new version, sealed for the ref it now holds" || fail "rotate wrapped: $CODE $BODY"
+for i in 1 2 3 4; do call POST /api/demipass/wrap/unwrap-session "$A" '{"secret":"other-secret"}'; done
+[ "$CODE" = 429 ] && ok "at most 3 unwrap sessions open per owner (one-use keys are made off the event loop)" || fail "session cap: $CODE"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails failure(s)"; exit $fails

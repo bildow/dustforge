@@ -1408,7 +1408,7 @@ app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
 
   // Item 1: elevated/critical secrets are wrapped to the owner's phone; leaving those depths re-exposes the value to the
   // host, which only the phone can do (it unwraps: unwrap_session + unwrap in this body).
-  const targetDepth = security_depth !== undefined ? security_depth : 'custom';
+  const targetDepth = gate_policy !== undefined ? 'custom' : security_depth;   // the branch actually taken (#56 L3)
   const wantWrapped = ['elevated', 'critical'].includes(targetDepth);
   const unwrapNeeded = cryptoDepth.isWrapped(secret) && !wantWrapped;
   const takeUnwrap = () => {
@@ -1422,6 +1422,13 @@ app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
       const w = cryptoDepth.wrapSecret(fresh);
       reply.wrapped = Boolean(w.ok);
       if (!w.ok) reply.wrap_note = w.error;
+      // An older version still in its rotation grace holds a value the provider still accepts: wrap it too (#56 M2).
+      if (w.ok) {
+        const base = String(secret.name).replace(/_v\d+$/, '');
+        for (const sib of db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND id != ? AND status = 'rotating' AND (name = ? OR name LIKE ?) AND wrap_state IS NULL").all(ownerDid, secret.id, base, base + '_v%')) {
+          try { cryptoDepth.wrapSecret(sib); } catch (_) {}
+        }
+      }
     }
   };
   // A credential may only ask for factors this account can prove; anything else would lock it for good.
@@ -5417,6 +5424,10 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
   ).get(ownerDid, baseName, baseName + '_v%');
 
   if (!existing) return res.status(404).json({ error: 'no active secret found with that name' });
+  // A wrapped secret's new version must be wrappable too, or rotating would quietly hand the host a readable value (#56 M1).
+  if (cryptoDepth.isWrapped(existing) && !cryptoDepth.activeWrapKeys(ownerDid).length) {
+    return res.status(409).json({ error: 'this secret is wrapped to a phone, and no linked phone has a wrap key now — link one (app 1.5+) before rotating it', wrapped: true });
+  }
 
   // Per-credential gate policy for rotate (admin/service operator bypasses).
   if (actor.mode !== 'admin') {
@@ -5445,9 +5456,6 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
            existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null);
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
-    if (['elevated', 'critical'].includes(existing.security_depth)) {   // item 1: the new value is wrapped like the old
-      try { cryptoDepth.wrapSecret(db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(newSecret.id)); } catch (e) { console.error('[rotate] wrap:', e.message); }
-    }
 
     // The ref code is the STABLE handle agents hold — it must follow the live
     // version. Move it old→new (old row keeps working by name until retired).
@@ -5494,7 +5502,17 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
       JSON.stringify({ old_name: existing.name, new_name: newName, new_secret_id: newSecret.id, new_version: newVersion, grace_period_minutes: graceMins, contexts_transferred: contextsTransferred })
     );
 
-    res.json({ ok: true, new_secret_id: newSecret.id, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins });
+    // Item 1: an elevated/critical new version is wrapped like the old — after the ref has moved to it (the wrap seals
+    // the ref and name it is for). If it cannot be (no linked phone with a wrap key), the answer says so, loudly.
+    let wrapped;
+    if (['elevated', 'critical'].includes(existing.security_depth)) {
+      let w = { ok: false, error: 'wrap failed' };
+      try { w = cryptoDepth.wrapSecret(db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(newSecret.id)); } catch (e) { w = { ok: false, error: e.message }; }
+      wrapped = Boolean(w.ok);
+      if (!w.ok) logSecurityEvent('rotation_not_wrapped', 'alert', { caller_did: ownerDid, target: newName, ip: req.ip, error: w.error });
+    }
+    res.json({ ok: true, new_secret_id: newSecret.id, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins,
+      ...(wrapped !== undefined ? { wrapped, ...(wrapped ? {} : { wrap_note: 'the new version is NOT wrapped — the host can read it; link a phone (app 1.5+) and wrap it' }) } : {}) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

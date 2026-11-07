@@ -19,7 +19,14 @@ standard-depth secret** — and no wrapped elevated/critical one. This is the pr
   - Root on the host during an approved use can still see that one use. Root can never see the others.
   - A code read aloud cannot open a wrapped secret, the host cannot reveal it, and it cannot be transferred. Lowering
     it back to standard needs the phone, and re-exposes the value to the host.
-  - **Losing every phone that holds its wrap loses the secret.**
+  - **Losing every phone that holds its wrap loses the secret.** Removing a phone in the app leaves its wraps in place,
+    and they open again only if that same phone (its Keystore key) links again. A secret wrapped while two phones were
+    linked opens on either one. New wraps go only to phones linked at that moment.
+  - Each wrap seals which secret it is for (owner, ref, name). The phone's own prompt names that secret, and the phone
+    refuses a wrap for any other. So a host serving a doctored page cannot get a different secret unwrapped under your
+    fingerprint.
+  - Wrapping protects from that moment on. Backups taken before a secret was wrapped still hold its host-key copy, until
+    they age out. Rotate a secret after wrapping it if older backups matter.
   - Without a phone wrap key, elevated and critical secrets are still protected by approval only, and the host can
     read them; raising one says so.
 - What use-only does and does not stop: an agent never receives the value, and it can only point the proxy at the
