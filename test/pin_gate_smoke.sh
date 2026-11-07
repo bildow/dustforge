@@ -188,7 +188,7 @@ call POST /api/blindkey/gate-policy "$TK2" '{"name":"sightless","security_depth"
 call POST /api/identity/gate/verify "$TK" '{"gate":"twofa","code":"000000"}'; [ "$CODE" = 403 ] && ok "wrong email code → 403 (never 401: the vault would sign out)" || fail "wrong twofa: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK" '{"gate":"password","password":"wrong"}'; [ "$CODE" = 403 ] && ok "wrong password gate → 403" || fail "wrong pw gate: $CODE $BODY"
 call POST /api/identity/phone "$TK" '{"phone":"+15551234567","password":"wrong"}'; [ "$CODE" = 403 ] && ok "phone rebind with a wrong password → 403" || fail "wrong pw phone: $CODE $BODY"
-SQL "INSERT INTO identity_2fa_codes (did, code, expires_at) SELECT did, '424242', datetime('now', '+10 minutes') FROM identity_wallets WHERE username='pintester'"   # the emailed code
+SQL "INSERT INTO identity_2fa_codes (did, code, expires_at, purpose) SELECT did, '424242', datetime('now', '+10 minutes'), 'gate' FROM identity_wallets WHERE username='pintester'"   # the emailed code
 call POST /api/identity/gate/verify "$TK" '{"gate":"twofa","code":"424242"}'; [ "$CODE" = 200 ] && ok "email code verified in A" || fail "twofa: $CODE $BODY"
 call POST /api/blindkey/gate-policy "$TK" '{"name":"sightless","security_depth":"standard"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J effective.reveal)" = "['pin']" ] && ok "with pin + twofa fresh → lowered to standard" || fail "downgrade proven: $CODE $BODY"
@@ -224,7 +224,7 @@ PY
 
 # ── storage faults close, never open (the re-audit's injected-trigger controls) ───────────────────────
 call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$RI")"; [ "$CODE" = 200 ] && ok "fault controls: A holds a proof" || fail "pre-fault verify: $CODE $BODY"
-SQL "INSERT INTO identity_2fa_codes (did, code, expires_at) SELECT did, '535353', datetime('now', '+10 minutes') FROM identity_wallets WHERE username='pintester'"
+SQL "INSERT INTO identity_2fa_codes (did, code, expires_at, purpose) SELECT did, '535353', datetime('now', '+10 minutes'), 'gate' FROM identity_wallets WHERE username='pintester'"
 call POST /api/identity/gate/verify "$TK" '{"gate":"twofa","code":"535353"}'; [ "$CODE" = 200 ] || fail "twofa for the fault control: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK" "$(PINB 2468 "$PI")"; [ "$CODE" = 200 ] || fail "policy proof for the fault control: $CODE $BODY"
 SQL "CREATE TRIGGER deny_delete BEFORE DELETE ON gate_verifications BEGIN SELECT RAISE(ABORT, 'injected proof deletion failure'); END"

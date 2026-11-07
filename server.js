@@ -622,6 +622,16 @@ try { db.exec('ALTER TABLE issued_tokens ADD COLUMN sid TEXT'); } catch (_) {}
 function newSessionId() { return 's' + require('crypto').randomBytes(12).toString('hex'); }
 function tokenClaims(token) { try { return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString()) || {}; } catch (_) { return {}; } }
 
+// Each emailed/texted code takes at most CODE_MAX_FAILURES wrong guesses, then it is dead; a new code kills the older
+// ones; a wallet gets at most CODE_ISSUE_PER_HOUR codes an hour (2026-11-07: the codes had no limit at all — any number
+// of live codes, unlimited guesses, no rate limiter: a transact token for any DID by guessing).
+// Two budgets (#57 review M3): 'login' codes are asked for without a session (anyone who knows a DID can ask), 'gate'
+// codes by the signed-in owner (vault twofa gate, SMS). Asking for one kind never kills or uses up the other, so
+// strangers cannot lock the owner out of the in-app gate. Each kind also has a 24 h wrong-guess budget per wallet across
+// all its codes (#57 review H1): past it, that kind is paused for the day and the owner is mailed once.
+const CODE_MAX_FAILURES = 5;
+const CODE_ISSUE_PER_HOUR = { login: 5, gate: 10 };
+const CODE_FAILURES_PER_DAY = { login: 10, gate: 20 };
 db.exec(`CREATE TABLE IF NOT EXISTS identity_2fa_codes (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
@@ -1077,15 +1087,76 @@ async function doOnboard(e) {
 </script></body></html>`);
 });
 
-app.post('/api/identity/request-2fa', (req, res) => {
-  const { did } = req.body || {};
-  if (!did) return res.status(400).json({ error: 'did required' });
-  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
-  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+// One live code per wallet, table and purpose: issuing a new one kills the older ones of that purpose only. null past
+// the hourly cap or the day's wrong-guess budget.
+const sqlTime = (ms) => new Date(Date.now() - ms).toISOString().replace('T', ' ').slice(0, 19);
+function codeFailuresToday(did, purpose) {
+  return db.prepare('SELECT COUNT(*) AS n FROM code_failures WHERE did = ? AND purpose = ? AND at > ?').get(did, purpose, sqlTime(86400 * 1000)).n;
+}
+function codePaused(did, purpose) { return codeFailuresToday(did, purpose) >= CODE_FAILURES_PER_DAY[purpose]; }
+function issueCode(table, did, purpose) {
+  if (codePaused(did, purpose)) return { paused: true };
+  if (db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE did = ? AND COALESCE(purpose, 'login') = ? AND created_at > ?`).get(did, purpose, sqlTime(3600 * 1000)).n >= CODE_ISSUE_PER_HOUR[purpose]) return { capped: true };
   const code = dustforge.generate2FACode();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-  db.prepare('INSERT INTO identity_2fa_codes (did, code, expires_at) VALUES (?, ?, ?)').run(did, code, expiresAt);
-  console.log(`[2fa] ${wallet.username}: ${code} (expires ${expiresAt})`);
+  db.transaction(() => {
+    db.prepare(`UPDATE ${table} SET used = 1 WHERE did = ? AND used = 0 AND COALESCE(purpose, 'login') = ?`).run(did, purpose);
+    db.prepare(`INSERT INTO ${table} (did, code, expires_at, purpose) VALUES (?, ?, ?, ?)`).run(did, code, expiresAt, purpose);
+  })();
+  return { code, expiresAt };
+}
+const issueRefusal = (r, purpose) => r.paused
+  ? { status: 429, body: { error: `too many wrong codes today — ${purpose === 'login' ? 'code sign-in' : 'code verification'} is paused for 24 hours; use your password${purpose === 'gate' ? ', PIN or phone' : ''}` } }
+  : { status: 429, body: { error: `at most ${CODE_ISSUE_PER_HOUR[purpose]} codes an hour — use the latest one you received` } };
+// The wallet's live code of this purpose if `code` matches it. A wrong guess counts against that code (the
+// CODE_MAX_FAILURES-th kills it) and against the wallet's day budget for the purpose (the last one pauses it and mails
+// the owner once). Returns { row } or { status, error, attempts_left }.
+function checkCode(table, did, code, purpose) {
+  if (codePaused(did, purpose)) return { status: 429, error: 'too many wrong codes today — paused for 24 hours' };
+  // julianday reads both forms stored here (ISO with T/Z from the routes, SQLite datetime from older rows); comparing the
+  // raw text (as before) let an ISO expiry outlive the day it was set.
+  const row = db.prepare(`SELECT * FROM ${table} WHERE did = ? AND used = 0 AND COALESCE(purpose, 'login') = ? AND julianday(expires_at) > julianday('now') ORDER BY id DESC LIMIT 1`).get(did, purpose);
+  if (!row) return { status: 0, error: 'no live code: ask for a new one' };
+  const a = Buffer.from(String(row.code)), b = Buffer.from(String(code ?? ''));
+  if (a.length === b.length && crypto.timingSafeEqual(a, b)) return { row };
+  let failures = 0, paused = false;
+  db.transaction(() => {
+    db.prepare(`UPDATE ${table} SET failures = COALESCE(failures, 0) + 1 WHERE id = ?`).run(row.id);
+    failures = db.prepare(`SELECT failures FROM ${table} WHERE id = ?`).get(row.id).failures;
+    if (failures >= CODE_MAX_FAILURES) db.prepare(`UPDATE ${table} SET used = 1 WHERE id = ?`).run(row.id);
+    db.prepare('INSERT INTO code_failures (did, purpose, at) VALUES (?, ?, CURRENT_TIMESTAMP)').run(did, purpose);
+    paused = codeFailuresToday(did, purpose) === CODE_FAILURES_PER_DAY[purpose];
+  }).immediate();
+  // One pause mail per wallet and purpose a day, however the rolling window is walked (#57 re-review L2).
+  if (paused && db.prepare("SELECT 1 FROM demipass_security_events WHERE event_type = 'code_guessing_paused' AND caller_did = ? AND context_json LIKE ? AND created_at > ? LIMIT 1")
+      .get(did, `%"purpose":"${purpose}"%`, sqlTime(86400 * 1000))) paused = false;
+  if (paused) {
+    logSecurityEvent('code_guessing_paused', 'critical', { caller_did: did, context: { purpose } });
+    const w = db.prepare('SELECT email FROM identity_wallets WHERE did = ?').get(did);
+    if (w && w.email) createEmailTransport().sendMail({ from: 'noreply@dustforge.com', to: w.email, subject: 'DemiPass: wrong codes for your account — code sign-in paused',
+      text: `Someone entered ${CODE_FAILURES_PER_DAY[purpose]} wrong ${purpose === 'login' ? 'sign-in' : 'verification'} codes for your account in the last 24 hours. ${purpose === 'login' ? 'Signing in with an emailed code' : 'Code verification'} is paused for 24 hours; your password${purpose === 'gate' ? ', PIN and phone' : ''} still work.\nIf this was not you, nothing was opened — but consider changing your password.\n` }).catch(() => {});
+  }
+  return { status: 0, error: failures >= CODE_MAX_FAILURES ? 'too many wrong codes: this code is dead — ask for a new one' : 'invalid code', attempts_left: Math.max(0, CODE_MAX_FAILURES - failures) };
+}
+
+app.post('/api/identity/request-2fa', rateLimitStrict, (req, res) => {
+  const { did } = req.body || {};
+  if (!did || typeof did !== 'string') return res.status(400).json({ error: 'did required' });
+  const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
+  if (!wallet) return res.status(404).json({ error: 'identity not found' });
+  // Nobody could receive it: issue nothing (#57 review H2).
+  if (!wallet.email) return res.status(409).json({ error: 'no email on file for this wallet: sign in with your password' });
+  // The signed-in owner asking (the vault's twofa gate) gets a 'gate' code; anyone else a 'login' code.
+  // A bearer that is present must be valid (#57 re-review L3: a stale session must not quietly get a login code), and
+  // codes are the owner's: a silicon bearer gets none (L1).
+  const bearer = req.headers.authorization ? getBearerIdentity(req) : null;
+  if (bearer && !bearer.ok) return res.status(bearer.status || 401).json({ error: bearer.error || 'session expired' });
+  if (bearer && bearer.silicon) return res.status(403).json({ error: 'emailed codes are for the owner, not for silicon agents' });
+  const purpose = bearer && bearer.did === did ? 'gate' : 'login';
+  const issued = issueCode('identity_2fa_codes', did, purpose);
+  if (!issued.code) { const r = issueRefusal(issued, purpose); return res.status(r.status).json(r.body); }
+  const { code, expiresAt } = issued;
+  console.log(`[2fa] code issued for ${wallet.username} (expires ${expiresAt})`);
   if (wallet.email) {
     const t = createEmailTransport();
     t.sendMail({
@@ -1099,9 +1170,9 @@ app.post('/api/identity/request-2fa', (req, res) => {
   res.json({ ok: true, expires_in: 600, emailed: Boolean(wallet.email) });
 });
 
-app.post('/api/identity/verify', (req, res) => {
+app.post('/api/identity/verify', rateLimitStrict, (req, res) => {
   const { did, code, scope = 'read', expires_in = '24h' } = req.body || {};
-  if (!did || !code) return res.status(400).json({ error: 'did and code required' });
+  if (!did || !code || typeof did !== 'string' || typeof code !== 'string') return res.status(400).json({ error: 'did and code required' });
   // Issuance policy: scope must be canonical, and a 2FA code alone (single
   // factor — email possession) cannot mint elevated scopes.
   if (!identity.ISSUABLE_SCOPES.includes(scope)) {
@@ -1115,8 +1186,9 @@ app.post('/api/identity/verify', (req, res) => {
   }
   const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
   if (!wallet) return res.status(404).json({ error: 'identity not found' });
-  const validCode = db.prepare(`SELECT * FROM identity_2fa_codes WHERE did = ? AND code = ? AND used = 0 AND expires_at > datetime('now') ORDER BY id DESC LIMIT 1`).get(did, code);
-  if (!validCode) return res.status(401).json({ error: 'invalid or expired 2FA code' });
+  const chk = checkCode('identity_2fa_codes', did, code, 'login');
+  if (!chk.row) return res.status(chk.status || 401).json({ error: chk.error, ...(chk.attempts_left !== undefined ? { attempts_left: chk.attempts_left } : {}) });
+  const validCode = chk.row;
   db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE id = ?').run(validCode.id);
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, did, { scope, expiresIn: expires_in, metadata: { email: wallet.email, username: wallet.username } });
   // Passing 2FA is also a fresh 'twofa' gate for the session this token opens.
@@ -1181,10 +1253,13 @@ app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => 
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
   const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
   if (!wallet || !wallet.phone) return res.status(400).json({ error: 'no phone on file — set one via POST /api/identity/phone', phone_set: false });
-  const code = dustforge.generate2FACode();
-  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-  db.prepare('INSERT INTO identity_sms_codes (did, code, expires_at) VALUES (?, ?, ?)').run(auth.did, code, expiresAt);
-  console.log(`[sms] ${wallet.username}: ${code} (expires ${expiresAt})`);
+  // Not set up: nothing to send, so no code and no budget spent (#57 review L8).
+  if (!smsConfigured()) return res.status(503).json({ error: 'SMS is not set up on this server', sms_configured: false,
+    note: 'SMS gate is built and ready; set SW_SPACE/SW_PROJECT/SW_TOKEN/SW_PHONE on the dustforge service to activate.' });
+  const issued = issueCode('identity_sms_codes', auth.did, 'gate');
+  if (!issued.code) { const r = issueRefusal(issued, 'gate'); return res.status(r.status).json(r.body); }
+  const { code, expiresAt } = issued;
+  console.log(`[sms] code issued for ${wallet.username} (expires ${expiresAt})`);
   const sent = await sendSMS(wallet.phone, `Your DemiPass verification code is ${code}. Expires in 10 minutes.`);
   if (!sent.ok && !sent.configured) {
     return res.status(503).json({ error: sent.error, sms_configured: false,
@@ -1216,8 +1291,9 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     const { code } = req.body || {};
     if (!code) return res.status(400).json({ error: 'code required' });
     const table = gate === 'twofa' ? 'identity_2fa_codes' : 'identity_sms_codes';
-    const row = db.prepare(`SELECT * FROM ${table} WHERE did = ? AND code = ? AND used = 0 AND expires_at > datetime('now') ORDER BY id DESC LIMIT 1`).get(did, String(code));
-    if (!row) return res.status(403).json({ error: `invalid or expired ${gate} code` });
+    const chk = checkCode(table, did, String(code), 'gate');
+    if (!chk.row) return res.status(chk.status || 403).json({ error: `${gate}: ${chk.error}`, ...(chk.attempts_left !== undefined ? { attempts_left: chk.attempts_left } : {}) });
+    const row = chk.row;
     // The code is burned and the proof stored together, or neither (the code stays usable for a retry).
     try {
       db.transaction(() => {
@@ -13497,6 +13573,12 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS identity_sms_codes (
   expires_at TEXT NOT NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
+for (const t of ['identity_2fa_codes', 'identity_sms_codes']) {
+  try { db.exec(`ALTER TABLE ${t} ADD COLUMN failures INTEGER DEFAULT 0`); } catch (_) {}
+  try { db.exec(`ALTER TABLE ${t} ADD COLUMN purpose TEXT DEFAULT 'login'`); } catch (_) {}
+}
+db.exec('CREATE TABLE IF NOT EXISTS code_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL, purpose TEXT NOT NULL, at TEXT NOT NULL)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_code_failures ON code_failures(did, purpose, at)');
 try { db.exec(`CREATE TABLE IF NOT EXISTS gate_verifications (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   did TEXT NOT NULL,
