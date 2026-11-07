@@ -164,6 +164,11 @@ function initSchema(db) {
     db.exec(`INSERT OR IGNORE INTO wallet_creators (did, owner_did, fleet_id, recorded_at)
       SELECT s.member_did, f.owner_did, s.fleet_id, datetime('now') FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
       WHERE s.created_by_fleet = 1 ORDER BY s.id`);
+    // Also from provenance: a fleet-provisioned wallet whose created row was deleted before this table existed (it
+    // re-joined another fleet earlier) is recorded from its account_created entry (#68 round-4 review).
+    db.exec(`INSERT OR IGNORE INTO wallet_creators (did, owner_did, fleet_id, recorded_at)
+      SELECT t.did, f.owner_did, f.id, datetime('now') FROM identity_transactions t JOIN fleets f ON t.description = 'Fleet-provisioned by ' || f.slug
+      WHERE t.type = 'account_created' AND t.provenance = 'fleet_provisioned' ORDER BY t.id`);
     for (const [name, when, row] of [['wc_ins', 'AFTER INSERT', 'NEW'], ['wc_upd', 'AFTER UPDATE OF created_by_fleet, fleet_id', 'NEW'], ['wc_del', 'BEFORE DELETE', 'OLD']]) {
       db.exec(`CREATE TRIGGER IF NOT EXISTS ${name} ${when} ON fleet_silicons WHEN ${row}.created_by_fleet = 1 BEGIN
         INSERT OR IGNORE INTO wallet_creators (did, owner_did, fleet_id, recorded_at)
