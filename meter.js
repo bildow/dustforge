@@ -178,6 +178,9 @@ function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterK
     message: { error: 'Too many meter requests for this wallet. Try again in a minute.' } });
   const perAddress = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false,
     message: { error: 'Too many verify requests. Try again in a minute.' } });
+  // In front of auth, so requests with a bad token are also counted (there is no global limiter).
+  const preAuth = rateLimit({ windowMs: 60 * 1000, max: 240, standardHeaders: false, legacyHeaders: false,
+    message: { error: 'Too many meter requests from this address. Try again in a minute.' } });
   function walletAuth(req, res, next) {
     const auth = getBearerIdentity(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
@@ -194,7 +197,7 @@ function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterK
     res.json({ ...info, verify: 'Ed25519 over the UTF-8 bytes of `receipt`; public key = did:key issuer (or public_key_spki, DER, base64url)' });
   });
 
-  app.post('/api/meter/charge', walletAuth, perWallet, (req, res) => {
+  app.post('/api/meter/charge', preAuth, walletAuth, perWallet, (req, res) => {
     const auth = req.meterAuth;
     const b = req.body || {};
     const r = meter.charge({ did: auth.did, tokenJti: (auth.decoded && auth.decoded.jti) || null,
@@ -211,7 +214,7 @@ function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterK
     res.json(rest);
   });
 
-  app.get('/api/meter/charges', walletAuth, perWallet, (req, res) => {
+  app.get('/api/meter/charges', preAuth, walletAuth, perWallet, (req, res) => {
     const auth = req.meterAuth;
     res.json({ charges: meter.list(auth.did, { tenant: req.query.tenant, limit: req.query.limit }) });
   });
