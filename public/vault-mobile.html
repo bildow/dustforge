@@ -371,6 +371,11 @@
       </div>
       <div class="section-title" style="padding:0.75rem 0;margin-top:1rem">Actions</div>
       <div style="display:flex;flex-direction:column;gap:0.5rem">
+        <!-- In the DemiPass app only: its version and a manual update check (app 1.9+; older builds check when opened) -->
+        <div id="app-update" style="display:none">
+          <button class="btn-ghost" id="app-update-btn" onclick="checkAppUpdate()" style="width:100%;text-align:left;padding:0.8rem">Check for updates</button>
+          <div id="app-update-out" style="font-size:0.72rem;color:var(--text3);margin-top:0.25rem"></div>
+        </div>
         <button class="btn-ghost" onclick="verifyChain()" style="width:100%;text-align:left;padding:0.8rem">Verify chain integrity</button>
         <button class="btn-ghost" onclick="loadLedgerSummary()" style="width:100%;text-align:left;padding:0.8rem">Ledger summary</button>
         <button class="btn-ghost" onclick="runDoctor()" style="width:100%;text-align:left;padding:0.8rem">Run diagnostics (doctor)</button>
@@ -964,7 +969,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();loadHolds();loadGuardians();}
+  if(n.dataset.page==='settings'){initAppUpdate();loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();loadHolds();loadGuardians();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -2256,6 +2261,25 @@ async function deviceApprove(challenge){
   const r=await dev.call('sign','D',ch.message,'','');
   if(!r.ok) throw new Error(r.error||'this phone could not sign');
   return {device_challenge_id:ch.challenge_id,device_signature:r.signature};
+}
+// ── app updates (Settings → Check for updates; DemiPass app 1.9+ has checkForUpdates, older builds check when opened) ──
+function initAppUpdate(){
+  const box=document.getElementById('app-update'); if(!box||!globalThis.DemiPassDevice) return;
+  const s=dev.st(), out=document.getElementById('app-update-out'), btn=document.getElementById('app-update-btn');
+  box.style.display='';
+  const v=s.app_version?'DemiPass app '+s.app_version:'This DemiPass app';
+  if(s.update_check&&typeof globalThis.DemiPassDevice.checkForUpdates==='function'){ btn.style.display=''; out.textContent=v+'. It also checks by itself when it opens.'; }
+  else { btn.style.display='none'; out.textContent=v+' checks for updates each time it opens: close DemiPass and open it again to check now.'; }
+}
+async function checkAppUpdate(){
+  const out=document.getElementById('app-update-out'), btn=document.getElementById('app-update-btn');
+  btn.disabled=true; out.style.color='var(--text3)'; out.textContent='Checking…';
+  const r=await dev.call('checkForUpdates');
+  btn.disabled=false;
+  if(r.ok&&r.state==='up_to_date'){ out.style.color='var(--green)'; out.textContent='Up to date ('+r.detail+').'; }
+  else if(r.ok&&r.state==='available'){ out.style.color='var(--text)'; out.textContent='DemiPass '+r.detail+' is available: tap Update in the box that opened. The app closes while it installs, and a notification says when it is done; tap it to open DemiPass again.'; }
+  else if(r.ok&&r.state==='busy'){ out.textContent='A check is already running. Try again in a moment.'; }
+  else { out.style.color='var(--red)'; out.textContent='Could not check: '+(r.detail||r.error||'unknown error')+'.'; }
 }
 // ── waiting changes (red team item 9) ─────────────────────────────────────────────────────────────────────────────
 // A PIN reset by password, a new phone, a phone removal or a recovery-email change waits 48 hours while a phone is
