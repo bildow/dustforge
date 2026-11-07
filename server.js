@@ -1924,9 +1924,21 @@ app.get('/api/identity/balance', rateLimitStandard, (req, res) => {
   res.json({ did: wallet.did, balance_cents: wallet.balance_cents, status: wallet.status });
 });
 
-app.get('/api/identity/transactions', (req, res) => {
+// A wallet's full ledger: every amount, counterparty description and token id. It answered anyone who knew a DID, with
+// no token at all, while /balance next to it is private. Now: the owner, the fleet that owns this agent (carbon), or
+// the admin key — never 'public' (a ledger says far more than a balance). The caller's own view is also /api/identity/ledger.
+app.get('/api/identity/transactions', rateLimitStandard, (req, res) => {
   const { did } = req.query;
   if (!did) return res.status(400).json({ error: 'did required' });
+  const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
+  let callerDid = null;
+  const bearer = (req.headers.authorization || '').startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
+  if (bearer) {
+    const v = identity.verifyTokenStandalone(bearer);
+    if (v.valid && !billing.checkTokenRevocation(db, v.decoded).revoked) callerDid = v.decoded.sub;
+  }
+  const allowed = isAdmin || (callerDid && (callerDid === did || fleetLink(callerDid, did) === 'carbon'));
+  if (!allowed) return res.status(403).json({ error: 'transactions are private: only the wallet itself, the fleet that owns this agent, or an admin' });
   const limit = Math.min(100, Number(req.query.limit) || 20);
   res.json(db.prepare('SELECT * FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT ?').all(did, limit));
 });
