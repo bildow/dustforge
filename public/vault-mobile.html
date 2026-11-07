@@ -155,7 +155,12 @@
   <button id="lock-bio" class="btn-primary" onclick="unlockTry(false)" style="min-width:12rem">Unlock with fingerprint / face</button>
   <button class="btn-ghost" onclick="unlockTry(true)" style="min-width:12rem">Use PIN</button>
   <div id="lock-msg" style="font-size:0.75rem;color:var(--red);min-height:1rem"></div>
+  <!-- Forgot the PIN, or it is locked after too many tries: sign out and sign in with the password (a password sign-in
+       opens unlocked; Settings → Change PIN then resets it). Without this a locked PIN had no way out (#73 review). -->
+  <button class="btn-ghost" onclick="logout()" style="min-width:12rem;font-size:0.75rem;margin-top:0.6rem">Forgot your PIN? Sign out and sign in with your password</button>
 </div>
+<!-- Covers the vault while the app is in the background, so the last frame shown on return is never vault content. -->
+<div id="privacy-cover" style="display:none;position:fixed;inset:0;z-index:110;background:var(--bg)"></div>
 <div id="app" class="app" style="padding-top:env(safe-area-inset-top, 0px)">
   <div class="topbar" style="padding-top:2rem;background:var(--surface)">
     <div class="topbar-left">Demi<span>Pass</span></div>
@@ -668,6 +673,7 @@ function isTokenExpired(){const t=localStorage.getItem('dp_token_at');if(!t)retu
 let tk=localStorage.getItem('dp_token')||'',did=localStorage.getItem('dp_did')||'',user=localStorage.getItem('dp_user')||'';
 let secrets=[],panic=false;
 let loginPw='';   // the password just typed at sign-in; consumed by the mandatory PIN setup, never stored
+let signedInHere=false;   // signed in with the password on THIS page load: the one start that opens without the lock
 let sessionEpoch=0;   // bumped by logout(); an in-flight showApp() from the previous session stops at its next step
 let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this wallet, and the ones being decided
 let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
@@ -724,6 +730,34 @@ async function ensureSession(){
   if(r==='offline'){ if(left>0) return true; throw new Error('connection error — try again'); }
   logout(); document.getElementById('auth-err').textContent='Session expired — please sign in again'; return false;
 }
+// ── A newer page on the server reaches an open app (Aaron 2026-11-07: "the app was holding the old page") ─────────
+// The app stays resident for days with this page in memory, so a deploy reached it only after a force-stop. At page
+// start, on every return to the foreground and whenever the vault locks, ask the server (HEAD, no-store) for its
+// Last-Modified; when it is newer than this copy's, load it again with ?v=<stamp> so no cache can answer. Never in the
+// middle of something (a sheet open, a PIN or code step running): the next return or lock picks it up. Once per stamp
+// (sessionStorage), so a cache that still answers old cannot loop. A reload is a cold start: it opens locked.
+let flowDepth=0;   // apiGated steps in progress (a code from the mail app, the PIN): no reload under them
+function midFlow(){
+  if(flowDepth>0||pinUnlockDone||pinSetupDone) return true;
+  return [...document.querySelectorAll('.modal-bg')].some(m=>m.classList&&m.classList.contains('show'));
+}
+async function reloadIfStale(){
+  try{
+    // Unlocked: not in the middle of anything. Locked: lockNow closed the sheets, but an unlock (PIN or phone) or a
+    // code step may be running: those wait too.
+    if(lockState.locked ? (flowDepth>0||!!pinUnlockDone) : midFlow()) return false;
+    if(typeof fetch!=='function'||!document.lastModified) return false;
+    const r=await fetch(location.pathname,{method:'HEAD',cache:'no-store'});
+    const theirs=Date.parse(r.headers.get('last-modified')||''), mine=Date.parse(document.lastModified);
+    if(!(theirs>0&&mine>0&&theirs>mine+1000)) return false;
+    const key='dp_page_reload';
+    try{ if(sessionStorage.getItem(key)===String(theirs)) return false; sessionStorage.setItem(key,String(theirs)); }catch(_){}
+    location.replace(location.pathname+'?v='+theirs+location.hash);
+    return true;
+  }catch(_){ return false; }
+}
+reloadIfStale();
+if(typeof document!=='undefined'&&document.addEventListener) document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') reloadIfStale(); });
 if(tk&&!isTokenExpired())showApp();
 else if(tk){ensureSession().then(ok=>{if(ok)showApp();else checkLoginHolds()},()=>{document.getElementById('auth-err').textContent='No connection — reopen to continue'})}
 else setTimeout(()=>{ try{ checkLoginHolds(); if(recState()) renderRecover(); }catch(_){} },0);   // item 9: signed out, the linked phone still asks what is waiting; a recovery in progress resumes
@@ -741,7 +775,7 @@ async function login(){
     const a=await api('POST','/api/identity/auth-fingerprint',{username:u,password:p,scope:'transact',expires_in:'24h'});
     if(!a.token){e.textContent=a.error||'Login failed — no token received';e.style.color='var(--red)';return}
     if(a.password_must_change) alert('Change your account password now: someone who knew it started a PIN reset that you canceled. Use “Forgot password?” — the link goes to your recovery email.');
-    tk=a.token;did=a.did||'';user=u;loginPw=p;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);if(a.refresh_token)localStorage.setItem('dp_refresh',a.refresh_token);else localStorage.removeItem('dp_refresh');localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
+    tk=a.token;did=a.did||'';user=u;loginPw=p;signedInHere=true;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);if(a.refresh_token)localStorage.setItem('dp_refresh',a.refresh_token);else localStorage.removeItem('dp_refresh');localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
 
 // Device login approval: hand off to /device.html on this same origin, which reuses this
@@ -756,7 +790,9 @@ function logout(){
     if(rf) fetch(API+'/api/identity/refresh/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:rf})}).catch(()=>{});
     for(const k of ['dp_token','dp_did','dp_user','dp_token_at','dp_refresh']) localStorage.removeItem(k);
   }
-  sessionEpoch++; tk='';did='';user='';loginPw='';vaultOpen=false; renewing=null;
+  sessionEpoch++; tk='';did='';user='';loginPw='';signedInHere=false;vaultOpen=false; renewing=null;
+  // A session that ends while locked leaves no lock screen over the sign-in (#73 review): the next sign-in starts clean.
+  lockState.locked=false; for(const i of ['lock-screen','privacy-cover']){const e=document.getElementById(i);if(e)e.style.display='none'}
   closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
   for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass','wizard-pw','recovery-pw']){const e=document.getElementById(i);if(e)e.value=''}
   const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; pinSentFor=null; pinOpenAttempts=[]; if(s)s(false); if(u)u(false);
@@ -1155,7 +1191,7 @@ async function showApp(){
   if (!gs || typeof gs.pin_set !== 'boolean') { showPinCheckError(why||'unexpected reply from the server'); return; }
   if (gs.pin_set === false) { const set = await requirePinSetup(); if (!set || !live()) return; }
 
-  const freshLogin=!!loginPw;
+  const freshLogin=signedInHere||!!loginPw;   // the PIN setup may already have used up loginPw
   loginPw='';
   vaultOpen=true;
   // The last activity this phone recorded; none recorded (first start of this version) counts as now. The vault
@@ -1163,8 +1199,13 @@ async function showApp(){
   lockState.last=freshLogin?Date.now():(Number((()=>{try{return localStorage.getItem('dp_last_active')}catch(_){return 0}})())||Date.now());
   await loadLockSetting();
   if (!live()) return;
-  if(!freshLogin&&Date.now()-lockState.last>lockState.after*1000) lockNow();
+  // Item 8 (Aaron 2026-11-07: "after force-stop and relaunch, the app opened with everything visible and asked for
+  // nothing"): a start of this page with a stored session is a cold start, and a cold start is always locked. "Lock
+  // after" is only the grace period for coming back from the background (idleCheck on visibilitychange); only a fresh
+  // sign-in with the password, just now, opens without the PIN.
+  if(startsLocked(freshLogin)) lockNow();
   else { document.getElementById('app').style.display='block'; noteActive(true); }
+  signedInHere=false;   // used once: a later showApp on this page (retry, wizard) is a start like any other
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
@@ -1647,7 +1688,7 @@ async function denyApproval(id){
 }
 
 // Could not learn whether a PIN exists: stay closed, offer retry or sign out.
-function showPinCheckError(why){
+function showPinCheckError(why){ signedInHere=false;   // a retry later is a start like any other (#73 re-review)
   vaultOpen=false;
   document.getElementById('app').style.display='none';
   document.getElementById('pin-error-why').textContent=why||'';
@@ -2373,6 +2414,7 @@ function holdCards(holds){
       :'<span style="font-size:0.75rem;color:var(--text3)">Not you? Cancel it in the DemiPass app on a linked phone.</span>')+'</div></div>').join('');
 }
 async function loadHolds(){
+  if(lockState.locked) return;   // nothing fetched or changed behind the lock (#73 review)
   const wrap=document.getElementById('holds-wrap'), el=document.getElementById('holds'); if(!wrap||!el||!tk) return;
   try{
     const r=await api('GET','/api/identity/holds');
@@ -2534,6 +2576,8 @@ async function phoneUnwrap(info){
   return r.unwrap;
 }
 // ── dormancy lock (red team item 8): idle past the owner's lock time → the vault hides until PIN or biometric ────
+// Whether this start of the page opens locked: every start but a password sign-in just now (item 8, 2026-11-07).
+function startsLocked(freshLogin){ return !freshLogin; }
 function noteActive(force){
   if(lockState.locked||!vaultOpen) return;
   lockState.last=Date.now(); try{ localStorage.setItem('dp_last_active',String(lockState.last)); }catch(_){}
@@ -2542,10 +2586,18 @@ function noteActive(force){
 if(typeof document!=='undefined'&&document.addEventListener) ['pointerdown','keydown','touchstart','scroll'].forEach(ev=>document.addEventListener(ev,()=>noteActive(false),{passive:true,capture:true}));
 function idleCheck(){ if(vaultOpen&&!lockState.locked&&Date.now()-lockState.last>lockState.after*1000) lockNow(); }
 setInterval(idleCheck,5000);
-if(typeof document!=='undefined'&&document.addEventListener) document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') idleCheck(); });
+// Going to the background covers the vault at once; coming back past the grace period locks before the cover lifts,
+// so neither the Recents frame nor the first frame on return shows vault content (#73 review).
+if(typeof document!=='undefined'&&document.addEventListener) document.addEventListener('visibilitychange',()=>{
+  const cover=document.getElementById('privacy-cover');
+  if(document.visibilityState==='hidden'){ if(vaultOpen&&cover) cover.style.display='block'; return; }
+  idleCheck();
+  if(cover) cover.style.display='none';
+});
 function lockNow(){
   if(lockState.locked) return;
   lockState.locked=true;
+  reloadIfStale();   // nothing is open behind a lock: the moment to pick up a newer page
   try{ closeApproval(); }catch(_){} try{ closeModal(); }catch(_){}   // no sheet stays up over a locked vault (#47 H2)
   document.getElementById('app').style.display='none';
   document.getElementById('lock-screen').style.display='flex';
@@ -2557,11 +2609,13 @@ async function unlockTry(usePin){
   const m=document.getElementById('lock-msg'); m.textContent='';
   try{
     let ok=false;
-    if(!usePin){ try{ ok=await deviceGate('unlock:0','Unlock DemiPass'); }catch(e){ if(sessionEnded(e)) throw e; } }
+    // A fingerprint prompt open is a step in progress: no page reload under it (#73 re-review).
+    if(!usePin){ flowDepth++; try{ ok=await deviceGate('unlock:0','Unlock DemiPass'); }catch(e){ if(sessionEnded(e)) throw e; } finally{ flowDepth--; } }
     if(!ok) ok=await unlockWithPin('Unlock DemiPass','unlock:0');
     if(!ok){ m.textContent='Still locked.'; return; }
     lockState.locked=false; document.getElementById('lock-screen').style.display='none'; document.getElementById('app').style.display='block';
     noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadNetwork();
+    loadHolds(); if(location.hash==='#holds') loadDevices();   // opened from an alert: what it was about, once unlocked
   }catch(e){ if(!sessionEnded(e)) m.textContent=e.message; }
 }
 // ── Leak scanner (red team item 5): something acting for you asks for scan tokens; you approve here ───────────────
@@ -2732,6 +2786,7 @@ async function unlinkPhone(id){
   catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
 }
 async function loadDevices(){
+  if(lockState.locked) return;   // nothing fetched or changed behind the lock (#73 review)
   const el=document.getElementById('devices'); if(!el) return;
   try{
     const r=await api('GET','/api/identity/devices'); let me=dev.st();
@@ -2753,6 +2808,10 @@ async function loadDevices(){
 }
 
 async function apiGated(method, path, body, what){
+  flowDepth++;
+  try{ return await apiGatedInner(method, path, body, what); } finally { flowDepth--; }
+}
+async function apiGatedInner(method, path, body, what){
   if(lockState.locked) throw new Error('cancelled — DemiPass is locked');
   if(!(await ensureSession())) throw new Error('session expired');
   const epoch=sessionEpoch; let renewed=false;
@@ -2939,6 +2998,7 @@ async function runDoctor(){
 }
 
 async function loadSiliconAgents(){
+  if(lockState.locked) return;   // nothing fetched or changed behind the lock (#73 review)
   try{
     const d=await api('GET','/api/demipass/silicon/agents');
     const el=document.getElementById('silicon-agents');
