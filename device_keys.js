@@ -252,9 +252,11 @@ module.exports = function registerDeviceKeys(deps) {
     // established phone (linked ≥ 48 h) approves it with its presence key. Otherwise password + PIN alone would make an
     // attacker's phone count at once: it could remove the owner's phones and cancel the owner's recoveries.
     if (H && hasDevice(auth.did)) {
+      const stop = H.startRefusal(auth.did, 'enrol');
+      if (stop) return res.status(stop.status).json(stop.body);
       const h = H.createHold(auth.did, 'enrol', { device_id, label: lbl, key_d, key_p }, { why: lbl });
       logSecurityEvent('device_enrol_pending', 'warn', { caller_did: auth.did, capability: 'device', target: lbl, ip: req.ip, context: { device_id, hold_id: h.id } });
-      return res.status(202).json({ ok: true, pending: true, device_id, label: lbl, hold_id: h.id, active_at: h.ready_at,
+      return res.status(202).json({ ok: true, pending: true, device_id, label: lbl, hold_id: h.id, active_at: h.ready_at, fingerprint: H.view(h).fingerprint,
         note: 'this phone is linked in 48 hours unless it is canceled — or at once if you approve it on a phone already linked for 48 hours or more (DemiPass → Settings)' });
     }
     const r = activateEnrolment(auth.did, { device_id, label: lbl, key_d, key_p });
@@ -314,11 +316,29 @@ module.exports = function registerDeviceKeys(deps) {
       const others = db.prepare('SELECT COUNT(DISTINCT device_id) AS n FROM device_keys WHERE did = ? AND revoked_at IS NULL AND device_id != ?').get(auth.did, target).n;
       if (!others) return res.status(409).json({ error: 'this is your last linked phone and you have recovery guardians: remove the guardians first (it takes 48 hours), or link another phone' });
     }
+    if (!db.prepare('SELECT 1 FROM device_keys WHERE did = ? AND device_id = ? AND revoked_at IS NULL').get(auth.did, target)) return res.status(404).json({ error: 'device not found' });
+    // #59 review H1: at once only with a presence signature from the phone itself or from a phone linked ≥ 48 hours.
+    // With the password (and PIN) alone it waits 48 hours, cancelable from any linked phone — otherwise password + PIN
+    // would strip every phone, and then R0, E1 and E2 would all act at once.
+    const bySelf = bio && bio.device_id === target;
+    const byEstablished = bio && bio.device_id && db.prepare('SELECT 1 FROM device_keys WHERE did = ? AND device_id = ? AND revoked_at IS NULL AND enrolled_at <= ?')
+      .get(auth.did, bio.device_id, new Date(Date.now() - 48 * 3600 * 1000).toISOString());
+    if (H && !bySelf && !byEstablished) {
+      const stop = H.startRefusal(auth.did, 'unlink');
+      if (stop) return res.status(stop.status).json(stop.body);
+      if (H.openHolds(auth.did, 'unlink').some(h => { try { return JSON.parse(h.payload).device_id === target; } catch (_) { return false; } })) return res.status(409).json({ error: 'that phone is already being removed' });
+      const refusedP = spendSingleUse(auth.did, 'device-revoke', ['pin'], auth, intent);
+      if (refusedP) return res.status(refusedP.status || 403).json(refusedP);
+      const lbl = (db.prepare('SELECT label FROM device_keys WHERE did = ? AND device_id = ? LIMIT 1').get(auth.did, target) || {}).label || '';
+      const h = H.createHold(auth.did, 'unlink', { device_id: target, label: lbl }, { why: lbl });
+      return res.status(202).json({ ok: true, pending: true, hold_id: h.id, ready_at: h.ready_at,
+        note: 'removed in 48 hours unless canceled from a linked phone — or remove it at once by confirming on the phone itself or on a phone linked for 48 hours or more' });
+    }
     const refused = spendSingleUse(auth.did, 'device-revoke', ['pin'], auth, intent);
     if (refused) return res.status(refused.status || 403).json(refused);
     if (bio) db.prepare('UPDATE device_gate_proofs SET used = 1 WHERE id = ?').run(bio.id);
-    const n = db.prepare('UPDATE device_keys SET revoked_at = ?, revoked_via = ? WHERE did = ? AND device_id = ? AND revoked_at IS NULL').run(nowIso(), bio ? 'device' : 'password', auth.did, target).changes;
-    if (!n) return res.status(404).json({ error: 'device not found' });
+    const r = revokeOne(auth.did, target, bio ? 'device' : 'password');
+    if (!r.ok) return res.status(r.status || 404).json({ error: r.error });
     logSecurityEvent('device_revoked', 'warn', { caller_did: auth.did, capability: 'device', target: String(req.params.device_id), ip: req.ip });
     notifyOwner(auth.did, 'A device was removed from your DemiPass wallet.');
     res.json({ ok: true, revoked: true });
@@ -364,8 +384,18 @@ module.exports = function registerDeviceKeys(deps) {
   }
 
   // A PIN reset with the account password (recovery) unlinks every phone: whoever reset it starts clean.
+  // One phone removed (the DELETE route, or a due 'unlink' hold). The last phone stays while guardians are set.
+  function revokeOne(did, deviceId, via) {
+    const H = holds();
+    if (H && H.guardiansActive(did) && !db.prepare('SELECT 1 FROM device_keys WHERE did = ? AND revoked_at IS NULL AND device_id != ? LIMIT 1').get(did, deviceId)) {
+      return { ok: false, status: 409, error: 'the last linked phone stays while recovery guardians are set' };
+    }
+    const n = db.prepare('UPDATE device_keys SET revoked_at = ?, revoked_via = ? WHERE did = ? AND device_id = ? AND revoked_at IS NULL').run(nowIso(), via, did, String(deviceId)).changes;
+    return n ? { ok: true } : { ok: false, status: 404, error: 'device not found' };
+  }
   function revokeAll(did, why, via = 'reset') {
     const n = db.prepare('UPDATE device_keys SET revoked_at = ?, revoked_via = ? WHERE did = ? AND revoked_at IS NULL').run(nowIso(), via, did).changes;
+    const H = holds(); if (H) H.dropDeviceHolds(did, why);
     db.prepare('DELETE FROM session_unlocks WHERE did = ?').run(did);
     if (n) { logSecurityEvent('devices_revoked', 'warn', { caller_did: did, capability: 'device', context: { why } }); notifyOwner(did, 'Every phone was removed from your DemiPass wallet (' + why + '). Link yours again in Settings.'); }
     return n;
@@ -383,6 +413,6 @@ module.exports = function registerDeviceKeys(deps) {
     return k;
   }
   return { approvalRefusal, unlockFresh, markUnlocked, verifyDeviceGate, hasDevice, lockAfter, messageFor, revokeAll,
-           verifySig, verifyPresence, activateEnrolment,
+           verifySig, verifyPresence, activateEnrolment, revokeOne,
            LOCK_DEFAULT, LOCK_MIN, LOCK_MAX };
 };

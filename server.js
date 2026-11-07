@@ -1459,6 +1459,8 @@ app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
     const phone = b.device_challenge_id && b.device_signature ? deviceKeys.verifyPresence(auth, b.device_challenge_id, b.device_signature, 'pin-reset:0') : null;
     if (!phone) {
       if (b.device_challenge_id) return res.status(403).json({ error: 'not signed by a linked phone of yours' });
+      const stop = accountHolds.startRefusal(auth.did, 'pin-reset');
+      if (stop) return res.status(stop.status).json(stop.body);
       const refused = accountHolds.pinResetRefusal(auth.did);
       if (refused) return res.status(refused.status).json(refused.body);
       const h = accountHolds.createHold(auth.did, 'pin-reset', { pin_hash: pinGate.hashPin(String(pin)) }, { why: 'with the account password' });
@@ -8395,7 +8397,7 @@ const secretSharing = require('./secret_sharing')({
 // Account holds (red team item 9): PIN reset by password, a new phone, a recovery-email change and guardian recovery
 // wait 48 hours while a phone is linked, cancelable from any eligible phone without a session (account_holds.js).
 const accountHolds = require('./account_holds')({
-  app, db, rateLimitStrict, logSecurityEvent, cleanLabel, getBearerIdentity, sendMail: fleetRoutes.sendMail,
+  app, db, rateLimitStrict, rateLimitStandard, logSecurityEvent, cleanLabel, getBearerIdentity, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
 });
@@ -12838,6 +12840,8 @@ app.post('/api/identity/set-recovery-email', rateLimitStrict, async (req, res) =
     const phone = b.device_challenge_id && b.device_signature ? deviceKeys.verifyPresence(auth, b.device_challenge_id, b.device_signature, 'recovery-email:0', accountHolds.ESTABLISHED_SEC) : null;
     if (!phone) {
       if (b.device_challenge_id) return res.status(403).json({ error: 'not signed by a phone of yours linked for 48 hours or more' });
+      const stop = accountHolds.startRefusal(auth.did, 'email');
+      if (stop) return res.status(stop.status).json(stop.body);
       if (accountHolds.openHolds(auth.did, 'email').length) return res.status(409).json({ error: 'a recovery-email change is already waiting' });
       const h = accountHolds.createHold(auth.did, 'email', { recovery_email }, { why: recovery_email });
       return res.status(202).json({ ok: true, pending: true, hold_id: h.id, ready_at: h.ready_at,

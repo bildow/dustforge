@@ -50,7 +50,7 @@ for c in "device_keys revoked_via" "device_gate_proofs device_id" "identity_wall
 [ "$(Q "SELECT COUNT(*) FROM device_gate_proofs WHERE device_id IS NULL")" -ge 1 ] && ok "old biometric proofs keep working rows (device_id NULL)" || fail "old proofs"
 A=$(login); call POST /api/identity/pin "$A" '{"pin":"5555","password":"hunter22"}'; HR=$(echo "$BODY" | J hold_id)
 [ "$CODE" = 202 ] && ok "the phone linked under the old code counts: a PIN reset by password now waits" || fail "R0 on migrated: $CODE $BODY"
-call POST /api/identity/holds/challenge "" '{"purpose":"cancel","device_id":"phone-old01","hold_id":"'$HR'"}'; CH=$(echo "$BODY" | J challenge_id); MSG=$(echo "$BODY" | J message)
-call POST /api/identity/holds/$HR/cancel "" '{"device_id":"phone-old01","challenge_id":'$CH',"signature":"'$(sig p "$MSG")'"}'
+call POST /api/identity/holds/challenge "" '{"purpose":"cancel","device_id":"phone-old01","hold_id":"'$HR'"}'; CH=$(echo "$BODY" | J challenge); MSG=$(echo "$BODY" | J message)
+call POST /api/identity/holds/$HR/cancel "" '{"device_id":"phone-old01","challenge":"'$CH'","signature":"'$(sig p "$MSG")'"}'
 [ "$CODE" = 200 ] && ok "…and that old phone cancels it without a session" || fail "cancel on migrated: $CODE $BODY"
 echo; [ $fails = 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

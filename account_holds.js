@@ -9,6 +9,7 @@
 //   email      E2  a recovery-email change (immediate instead with an established phone's presence signature)
 //   recovery   guardian recovery (step 3) — the cancel path is here and tested first
 //   guardians  a change of the guardian set (step 2)
+//   unlink     a phone removed without an established phone's presence (password + PIN) — #59 review H1
 //
 // Eligible phone (one rule for every cancel and for alerts): enrolled to the account and active at some moment from
 // (hold start − 7 days) until now; a phone removed with a phone's presence signature (revoked_via = 'device') gets no
@@ -22,7 +23,8 @@ const GRACE_SEC = 7 * 24 * 3600;           // a phone removed this long before a
 const ESTABLISHED_SEC = 48 * 3600;         // a phone this old may approve a new one / change the recovery email at once
 const CHALLENGE_TTL_SEC = 60;
 const PIN_RESET_PER_WEEK = 3;
-const KINDS = new Set(['pin-reset', 'enrol', 'email', 'recovery', 'guardians']);
+const KINDS = new Set(['pin-reset', 'enrol', 'email', 'recovery', 'guardians', 'unlink']);
+const ENROL_OPEN_MAX = 3;                  // phones waiting to be linked at once (#59 review L3)
 const PURPOSES = { cancel: 'P', alerts: 'D', 'enrol-approve': 'P' };
 
 module.exports = function registerAccountHolds(deps) {
@@ -98,6 +100,7 @@ module.exports = function registerAccountHolds(deps) {
     email: 'a change of your recovery email',
     recovery: 'a recovery of your wallet onto a new phone, by your guardians',
     guardians: 'a change of your recovery guardians',
+    unlink: 'a phone being removed from your wallet with the account password',
   };
 
   // ── eligibility ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -135,8 +138,13 @@ module.exports = function registerAccountHolds(deps) {
   const view = (h) => {
     const p = parse(h.payload);
     return { id: h.id, kind: h.kind, status: h.status, created_at: h.created_at, ready_at: h.ready_at, expires_at: h.expires_at,
-             what: WHAT[h.kind], ...(h.kind === 'enrol' ? { label: p.label } : {}), ...(h.kind === 'email' ? { recovery_email: p.recovery_email } : {}) };
+             what: WHAT[h.kind], ...(h.kind === 'enrol' ? { label: p.label, fingerprint: keyPrint(p.key_d) } : {}),
+             ...(h.kind === 'email' ? { recovery_email: p.recovery_email } : {}), ...(h.kind === 'unlink' ? { device_id: p.device_id, label: p.label } : {}) };
   };
+
+  // The first 8 hex of sha256(the new phone's device key): shown on the new phone and in the approval, so the owner
+  // approves the phone in their hand and not another one with the same name (#59 review M4).
+  const keyPrint = (k) => k ? crypto.createHash('sha256').update(String(k)).digest('hex').slice(0, 8) : '';
 
   // ── session-less challenges ────────────────────────────────────────────────────────────────────────────────────
   function messageFor(ch) {
@@ -146,18 +154,22 @@ module.exports = function registerAccountHolds(deps) {
     }
     if (ch.purpose === 'enrol-approve') {
       const h = db.prepare('SELECT payload FROM account_holds WHERE id = ?').get(ch.hold_id) || {};
-      return `demipass:enrol-approve:${ch.did}:${ch.hold_id}:${String(parse(h.payload).label || '').replace(/:/g, ' ')}:${ch.nonce}`;
+      const p = parse(h.payload);
+      return `demipass:enrol-approve:${ch.did}:${ch.hold_id}:${keyPrint(p.key_d)}:${String(p.label || '').replace(/[:\u0000-\u001f]/g, ' ').slice(0, 60)}:${ch.nonce}`;
     }
     return `demipass:alerts:${ch.did}:${ch.device_id}:${ch.nonce}`;
   }
   const NOT_HERE = { status: 404, body: { error: 'not available from this phone' } };   // one answer for every refusal (L1)
-  function takeChallenge(id, purpose, deviceId, holdId) {
-    const ch = db.prepare('SELECT * FROM hold_challenges WHERE id = ?').get(Number(id) || 0);
+  // A challenge is found by its nonce (random, given only to the asker) — never by a counter someone could walk — and
+  // spent only once its signature verifies (spendChallenge): junk posts cannot burn the owner's cancel (#59 review H2).
+  function findChallenge(nonce, purpose, deviceId, holdId) {
+    if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(nonce)) return null;
+    const ch = db.prepare('SELECT * FROM hold_challenges WHERE nonce = ?').get(nonce);
     if (!ch || ch.purpose !== purpose || ch.device_id !== String(deviceId || '') || ch.hold_id !== String(holdId || '')) return null;
     if (ch.used_at || Date.parse(ch.expires_at) < Date.now()) return null;
-    if (db.prepare('UPDATE hold_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL').run(nowIso(), ch.id).changes !== 1) return null;
     return ch;
   }
+  const spendChallenge = (ch) => db.prepare('UPDATE hold_challenges SET used_at = ? WHERE id = ? AND used_at IS NULL').run(nowIso(), ch.id).changes === 1;
 
   // POST /api/identity/holds/challenge {purpose: 'cancel'|'alerts'|'enrol-approve', device_id, hold_id?}
   app.post('/api/identity/holds/challenge', rateLimitStrict, (req, res) => {
@@ -175,16 +187,16 @@ module.exports = function registerAccountHolds(deps) {
     const id = Number(db.prepare('INSERT INTO hold_challenges (did, device_id, purpose, hold_id, nonce, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(key.did, device_id, purpose, purpose === 'alerts' ? '' : holdId, nonce, nowIso(), isoIn(CHALLENGE_TTL_SEC)).lastInsertRowid);
     const ch = db.prepare('SELECT * FROM hold_challenges WHERE id = ?').get(id);
-    res.json({ ok: true, challenge_id: id, message: messageFor(ch), sign_with: PURPOSES[purpose], expires_at: ch.expires_at });
+    res.json({ ok: true, challenge: nonce, message: messageFor(ch), sign_with: PURPOSES[purpose], expires_at: ch.expires_at });
   });
 
   // POST /api/identity/holds/alerts {device_id, challenge_id, signature} — D. What is waiting on this phone's account.
   app.post('/api/identity/holds/alerts', rateLimitStrict, (req, res) => {
-    const { device_id, challenge_id, signature } = req.body || {};
-    const ch = takeChallenge(challenge_id, 'alerts', device_id, '');
+    const { device_id, challenge, signature } = req.body || {};
+    const ch = findChallenge(challenge, 'alerts', device_id, '');
     if (!ch) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     const key = eligibleKey(ch.did, device_id, 'D', isoAgo(GRACE_SEC));
-    if (!key || !verify(key, messageFor(ch), signature)) return res.status(NOT_HERE.status).json(NOT_HERE.body);
+    if (!key || !verify(key, messageFor(ch), signature) || !spendChallenge(ch)) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     sweep();
     const holds = openHolds(ch.did).filter(h => eligibleKey(ch.did, device_id, 'P', holdSince(h)));
     res.json({ ok: true, holds: holds.map(view) });
@@ -193,15 +205,15 @@ module.exports = function registerAccountHolds(deps) {
   // POST /api/identity/holds/:id/cancel {device_id, challenge_id, signature} — P of an eligible phone. No session.
   app.post('/api/identity/holds/:id/cancel', rateLimitStrict, (req, res) => {
     const holdId = String(req.params.id);
-    const { device_id, challenge_id, signature } = req.body || {};
-    const ch = takeChallenge(challenge_id, 'cancel', device_id, holdId);
+    const { device_id, challenge, signature } = req.body || {};
+    const ch = findChallenge(challenge, 'cancel', device_id, holdId);
     if (!ch) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     let done = null;
     db.transaction(() => {
       const h = db.prepare(`SELECT * FROM account_holds WHERE id = ? AND did = ? AND ${OPEN}`).get(holdId, ch.did);
       if (!h) return;
       const key = eligibleKey(h.did, device_id, 'P', holdSince(h));
-      if (!key || !verify(key, messageFor(ch), signature)) return;
+      if (!key || !verify(key, messageFor(ch), signature) || !spendChallenge(ch)) return;
       if (db.prepare(`UPDATE account_holds SET status = 'canceled', canceled_by = ?, canceled_at = ?, payload = '{}' WHERE id = ? AND ${OPEN}`)
         .run(device_id, nowIso(), h.id).changes === 1) done = h;
     }).immediate();
@@ -230,11 +242,11 @@ module.exports = function registerAccountHolds(deps) {
   // (linked ≥ 48 h, not removed) of the same account: the waiting phone is linked now (E1).
   app.post('/api/identity/holds/:id/approve-enrol', rateLimitStrict, (req, res) => {
     const holdId = String(req.params.id);
-    const { device_id, challenge_id, signature } = req.body || {};
-    const ch = takeChallenge(challenge_id, 'enrol-approve', device_id, holdId);
+    const { device_id, challenge, signature } = req.body || {};
+    const ch = findChallenge(challenge, 'enrol-approve', device_id, holdId);
     if (!ch) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     const key = establishedKey(ch.did, device_id, 'P');
-    if (!key || !verify(key, messageFor(ch), signature)) return res.status(NOT_HERE.status).json(NOT_HERE.body);
+    if (!key || !verify(key, messageFor(ch), signature) || !spendChallenge(ch)) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     const h = db.prepare(`SELECT * FROM account_holds WHERE id = ? AND did = ? AND kind = 'enrol' AND ${OPEN}`).get(holdId, ch.did);
     if (!h) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     const r = applyHold(h, `approved by phone ${device_id}`);
@@ -243,7 +255,7 @@ module.exports = function registerAccountHolds(deps) {
   });
 
   // GET /api/identity/holds — the signed-in owner's open holds (the app's cards). Agents see none.
-  app.get('/api/identity/holds', (req, res) => {
+  app.get('/api/identity/holds', deps.rateLimitStandard, (req, res) => {
     const auth = deps.getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     if (auth.silicon) return res.json({ ok: true, holds: [] });
     sweep();
@@ -260,9 +272,13 @@ module.exports = function registerAccountHolds(deps) {
         const cur = db.prepare(`SELECT * FROM account_holds WHERE id = ? AND ${OPEN}`).get(h.id);
         if (!cur) { result = { ok: false, error: 'no longer waiting' }; return; }
         if (h.kind === 'pin-reset') {
-          deps.applyPinReset(h.did, p.pin_hash, 'PIN reset with the account password (after 48 h)');
+          const r = deps.applyPinReset(h.did, p.pin_hash, 'PIN reset with the account password (after 48 h)');
+          if (!r || !r.ok) throw new Error('the PIN could not be set');
         } else if (h.kind === 'enrol') {
           const r = devices().activateEnrolment(h.did, p);
+          if (!r.ok) throw Object.assign(new Error(r.error), { soft: true });
+        } else if (h.kind === 'unlink') {
+          const r = devices().revokeOne(h.did, p.device_id, 'password');
           if (!r.ok) throw Object.assign(new Error(r.error), { soft: true });
         } else if (h.kind === 'email') {
           const w = db.prepare('SELECT recovery_email FROM identity_wallets WHERE did = ?').get(h.did);
@@ -287,7 +303,7 @@ module.exports = function registerAccountHolds(deps) {
   }
   function sweep() {
     const t = nowIso();
-    for (const h of db.prepare(`SELECT * FROM account_holds WHERE status = 'pending' AND kind IN ('pin-reset', 'enrol', 'email') AND ready_at IS NOT NULL AND ready_at <= ?`).all(t)) applyHold(h, 'after 48 h, not canceled');
+    for (const h of db.prepare(`SELECT * FROM account_holds WHERE status = 'pending' AND kind IN ('pin-reset', 'enrol', 'email', 'unlink') AND ready_at IS NOT NULL AND ready_at <= ?`).all(t)) applyHold(h, 'after 48 h, not canceled');
     db.prepare(`UPDATE account_holds SET status = 'expired', payload = '{}' WHERE ${OPEN} AND expires_at IS NOT NULL AND expires_at <= ?`).run(t);
   }
   const timer = setInterval(() => { try { sweep(); } catch (e) { console.error('[holds] sweep:', e.message); } }, Number(process.env.HOLD_SWEEP_MS) || 30000);
@@ -302,8 +318,21 @@ module.exports = function registerAccountHolds(deps) {
     if (n >= PIN_RESET_PER_WEEK) return { status: 429, body: { error: `at most ${PIN_RESET_PER_WEEK} PIN resets a week` } };
     return null;
   }
+  // Refusal for starting a waiting change: after a canceled PIN reset the password is known to someone else, so until
+  // it is changed nothing more starts from it (#59 review M1); and a few waiting phones at most (L3).
+  function startRefusal(did, kind) {
+    const w = db.prepare('SELECT password_must_change FROM identity_wallets WHERE did = ?').get(did);
+    if (w && w.password_must_change) return { status: 403, body: { error: 'change your account password first (Forgot password → the link in your mail): a PIN reset you canceled was started with it', password_must_change: true } };
+    if (kind === 'enrol' && openHolds(did, 'enrol').length >= ENROL_OPEN_MAX) return { status: 429, body: { error: `at most ${ENROL_OPEN_MAX} phones can wait to be linked at once` } };
+    if (kind === 'unlink' && openHolds(did, 'unlink').length >= 3) return { status: 429, body: { error: 'too many phone removals waiting' } };
+    return null;
+  }
+  // When every phone is unlinked (a reset, a recovery), phones waiting to be linked and removals waiting go too (#59 M3).
+  function dropDeviceHolds(did, why) {
+    db.prepare(`UPDATE account_holds SET status = 'canceled', canceled_by = ?, canceled_at = ?, payload = '{}' WHERE did = ? AND kind IN ('enrol', 'unlink') AND ${OPEN}`).run(String(why).slice(0, 60), nowIso(), did);
+  }
   const guardiansActive = (did) => db.prepare("SELECT COUNT(*) AS n FROM recovery_guardians WHERE owner_did = ? AND status = 'active'").get(did).n > 0;
 
-  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, establishedKey, eligibleKey, setRecoveryEmail,
+  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, startRefusal, dropDeviceHolds, establishedKey, eligibleKey, setRecoveryEmail,
            HOLD_DELAY_SEC, ESTABLISHED_SEC, GRACE_SEC };
 };

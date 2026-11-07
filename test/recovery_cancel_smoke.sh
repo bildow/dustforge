@@ -41,7 +41,8 @@ print(v)' "$1"; }
 Q(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute(sys.argv[2]).fetchone(); print(r[0] if r else '')" "$DB_PATH" "$1"; }
 X(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
 call(){ local m=$1 p=$2 t=$3 b=${4:-}
-  BODY=$(curl -s -o - -w '\n%{http_code}' -X "$m" "$API$p" -H 'Content-Type: application/json' ${t:+-H "Authorization: Bearer $t"} ${b:+-d "$b"})
+  # each call from its own client address (trust proxy 1): the strict limiter is per IP, and this test makes many calls
+  BODY=$(curl -s -o - -w '\n%{http_code}' -X "$m" "$API$p" -H 'Content-Type: application/json' -H "X-Forwarded-For: 10.$((RANDOM%250)).$((RANDOM%250)).$((RANDOM%250+1))" ${t:+-H "Authorization: Bearer $t"} ${b:+-d "$b"})
   CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}; }
 login(){ call POST /api/identity/auth-fingerprint "" '{"username":"'${1:-owner-a}'","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
 pin(){ call POST /api/identity/gate/verify "$1" '{"gate":"pin","pin":"'${3:-4321}'","intent":"'$2'"}'; [ "$CODE" = 200 ] || fail "pin $2: $CODE $BODY"; }
@@ -63,8 +64,8 @@ seedphone(){ local rv=NULL rvia=NULL; [ -n "${5:-}" ] && rv="'$5'"; [ -n "${6:-}
 # a seeded hold: <id> <did> <kind> <status> <created_at>
 seedhold(){ X "INSERT INTO account_holds (id, did, kind, status, created_at, ready_at, payload) VALUES ('$1', '$2', '$3', '$4', '$5', '$(iso 172800)', '{}')"; }
 # session-less: hch <purpose> <device_id> [hold] → CH, MSG ; cancel <hold> <device_id> <keyfile>
-hch(){ call POST /api/identity/holds/challenge "" '{"purpose":"'$1'","device_id":"'$2'","hold_id":"'${3:-}'"}'; CH=$(echo "$BODY" | J challenge_id); MSG=$(echo "$BODY" | J message); }
-cancel(){ hch cancel "$2" "$1"; [ "$CODE" = 200 ] || return 0; call POST /api/identity/holds/$1/cancel "" '{"device_id":"'$2'","challenge_id":'$CH',"signature":"'$(sig $3 "$MSG")'"}'; }
+hch(){ call POST /api/identity/holds/challenge "" '{"purpose":"'$1'","device_id":"'$2'","hold_id":"'${3:-}'"}'; CH=$(echo "$BODY" | J challenge); MSG=$(echo "$BODY" | J message); }
+cancel(){ hch cancel "$2" "$1"; [ "$CODE" = 200 ] || return 0; call POST /api/identity/holds/$1/cancel "" '{"device_id":"'$2'","challenge":"'$CH'","signature":"'$(sig $3 "$MSG")'"}'; }
 NOT='{"error":"not available from this phone"}'
 # session gate challenge signed by a key: gch <token> <key> <intent>
 gch(){ call POST /api/identity/device/challenge "$1" '{"purpose":"gate","intent":"'$3'"}'; GCH=$(echo "$BODY" | J challenge_id); GSG=$(sig $2 "$(echo "$BODY" | J message)"); }
@@ -88,12 +89,17 @@ cancel 100000000001 phone-aaaa1 pap; [ "$CODE" = 404 ] && [ "$(Q "SELECT status 
 # ── C2 ──
 START=$(iso -3600); seedhold 100000000002 "$DID_A" recovery pending "$START"
 call POST /api/identity/holds/100000000002/cancel "$A" '{}'; [ "$CODE" = 404 ] && [ "$BODY" = "$NOT" ] && ok "C2 a session alone cancels nothing (same answer)" || fail "C2 session: $CODE $BODY"
-hch cancel phone-aaaa1 100000000002; call POST /api/identity/holds/100000000002/cancel "" '{"device_id":"phone-aaaa1","challenge_id":'$CH',"signature":"'$(sig pad "$MSG")'"}'
+seedhold 100000000009 "$DID_A" recovery pending "$(iso 0)"
+hch cancel phone-aaaa1 100000000009; call POST /api/identity/holds/100000000009/cancel "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pad "$MSG")'"}'
 [ "$CODE" = 404 ] && [ "$BODY" = "$NOT" ] && ok "C2 the device key D (no presence) cancels nothing" || fail "C2 D: $CODE $BODY"
-call POST /api/identity/holds/100000000002/cancel "" '{"device_id":"phone-aaaa1","challenge_id":'$CH',"signature":"'$(sig pap "$MSG")'"}'
-[ "$CODE" = 404 ] && ok "C2 a used challenge cannot be replayed, even with the right key" || fail "C2 replay: $CODE"
-hch cancel phone-aaaa1 100000000002; X "UPDATE hold_challenges SET expires_at='$(iso -1)' WHERE id=$CH"
-call POST /api/identity/holds/100000000002/cancel "" '{"device_id":"phone-aaaa1","challenge_id":'$CH',"signature":"'$(sig pap "$MSG")'"}'
+for i in 1 2 3; do call POST /api/identity/holds/100000000009/cancel "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"AAAA"}'; done
+call POST /api/identity/holds/100000000009/cancel "" '{"device_id":"phone-aaaa1","challenge_id":1,"signature":"AAAA"}'
+call POST /api/identity/holds/100000000009/cancel "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pap "$MSG")'"}'
+[ "$CODE" = 200 ] && ok "C2 junk signatures do not spend the owner's challenge: the real cancel still lands (#59 H2)" || fail "C2 junk spent it: $CODE $BODY"
+call POST /api/identity/holds/100000000002/cancel "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pap "$MSG")'"}'
+[ "$CODE" = 404 ] && ok "C2 a spent challenge cannot be replayed, not even on another hold" || fail "C2 replay: $CODE"
+hch cancel phone-aaaa1 100000000002; X "UPDATE hold_challenges SET expires_at='$(iso -1)' WHERE nonce='$CH'"
+call POST /api/identity/holds/100000000002/cancel "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pap "$MSG")'"}'
 [ "$CODE" = 404 ] && ok "C2 an expired challenge is refused" || fail "C2 expired: $CODE"
 hch cancel phone-xxxx1 100000000002; [ "$CODE" = 404 ] && [ "$BODY" = "$NOT" ] && ok "C2 another account's phone gets no challenge for this hold (same answer)" || fail "C2 other account: $CODE $BODY"
 seedphone pr8 "$DID_A" phone-rev8d "$(iso -2592000)" "$(iso $((-3600-8*86400)))" password
@@ -110,11 +116,11 @@ cancel 100000000003 phone-revaft prap; [ "$CODE" = 200 ] && ok "C2 a phone remov
 
 # ── C9 alerts ──
 seedhold 100000000004 "$DID_A" recovery pending "$(iso 0)"
-hch alerts phone-aaaa1; call POST /api/identity/holds/alerts "" '{"device_id":"phone-aaaa1","challenge_id":'$CH',"signature":"'$(sig pad "$MSG")'"}'
+hch alerts phone-aaaa1; call POST /api/identity/holds/alerts "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pad "$MSG")'"}'
 [ "$CODE" = 200 ] && echo "$BODY" | grep -q '"id":"100000000004"' && ok "C9 a D-signed, session-less alerts call lists the waiting recovery" || fail "C9 alerts: $CODE $BODY"
-hch alerts phone-aaaa1; call POST /api/identity/holds/alerts "" '{"device_id":"phone-aaaa1","challenge_id":'$CH',"signature":"'$(sig pap "$MSG")'"}'
+hch alerts phone-aaaa1; call POST /api/identity/holds/alerts "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pap "$MSG")'"}'
 [ "$CODE" = 404 ] && ok "C9 alerts need D (a P signature is not accepted there)" || fail "C9 alerts P: $CODE"
-hch alerts phone-xxxx1; call POST /api/identity/holds/alerts "" '{"device_id":"phone-xxxx1","challenge_id":'$CH',"signature":"'$(sig pxd "$MSG")'"}'
+hch alerts phone-xxxx1; call POST /api/identity/holds/alerts "" '{"device_id":"phone-xxxx1","challenge":"'$CH'","signature":"'$(sig pxd "$MSG")'"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J holds)" = "[]" ] && ok "C9 another account's phone sees none of this account's holds" || fail "C9 other: $CODE $BODY"
 cancel 100000000004 phone-aaaa1 pap
 
@@ -133,25 +139,40 @@ enrol_pending(){ call POST /api/identity/device/challenge "$A" '{"purpose":"enro
   call POST /api/identity/device/enrol "$A" '{"challenge_id":'$ECH',"device_id":"'$1'","label":"'$2'","key_d":"'$(cat $S/${2}d.pub)'","key_p":"'$(cat $S/${2}p.pub)'","sig_d":"'$(sig ${2}d "$EM")'","sig_p":"'$(sig ${2}p "$EM")'"}'
   HOLD=$(echo "$BODY" | J hold_id); }
 enrol_pending phone-bbbb1 pb
-hch enrol-approve phone-aaaa1 "$HOLD"; call POST /api/identity/holds/$HOLD/approve-enrol "" '{"device_id":"phone-aaaa1","challenge_id":'$CH',"signature":"'$(sig pap "$MSG")'"}'
+hch enrol-approve phone-aaaa1 "$HOLD"; call POST /api/identity/holds/$HOLD/approve-enrol "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pap "$MSG")'"}'
 [ "$CODE" = 404 ] && ok "C6 a phone linked < 48 h cannot approve a new one" || fail "C6 young approve: $CODE $BODY"
 X "UPDATE device_keys SET enrolled_at='$(iso -259200)' WHERE device_id='phone-aaaa1'"
-hch enrol-approve phone-aaaa1 "$HOLD"; call POST /api/identity/holds/$HOLD/approve-enrol "" '{"device_id":"phone-aaaa1","challenge_id":'$CH',"signature":"'$(sig pap "$MSG")'"}'
+hch enrol-approve phone-aaaa1 "$HOLD"
+FP=$(Q "SELECT payload FROM account_holds WHERE id='$HOLD'" | python3 -c "import json,sys,hashlib; print(hashlib.sha256(json.load(sys.stdin)['key_d'].encode()).hexdigest()[:8])")
+echo "$MSG" | grep -q ":$HOLD:$FP:pb:" && ok "C6 the approval names the new phone by its key fingerprint, not only its label (#59 M4)" || fail "C6 fp: $MSG / $FP"
+call POST /api/identity/holds/$HOLD/approve-enrol "" '{"device_id":"phone-aaaa1","challenge":"'$CH'","signature":"'$(sig pap "$MSG")'"}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-bbbb1' AND revoked_at IS NULL")" = 2 ] && ok "C6 an established phone's presence links the new phone at once" || fail "C6 approve: $CODE $BODY"
 enrol_pending phone-cccc2 pc2; X "UPDATE account_holds SET ready_at='$(iso -1)' WHERE id='$HOLD'"; sleep 2
 [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-cccc2' AND revoked_at IS NULL")" = 2 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$HOLD'")" = completed ] && ok "C6 uncanceled at 48 h, the waiting phone is linked" || fail "C6 due: $(Q "SELECT status||' '||COALESCE(note,'') FROM account_holds WHERE id='$HOLD'")"
 
-# ── C4 young phone, last phone ──
-call POST /api/identity/device/challenge "$A" '{"purpose":"gate","intent":"device-revoke:0"}'; RM=$(echo "$BODY" | J message); RCH=$(echo "$BODY" | J challenge_id)
-call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"device-revoke:0","challenge_id":'$RCH',"signature":"'$(sig pbp "$RM")'"}'
-pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-aaaa1 "$A"
+# ── C4 young phone, removal by password waits, last phone ──
+bio(){ call POST /api/identity/device/challenge "$A" '{"purpose":"gate","intent":"device-revoke:0"}'; local m c; m=$(echo "$BODY" | J message); c=$(echo "$BODY" | J challenge_id)
+  call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"device-revoke:0","challenge_id":'$c',"signature":"'$(sig $1 "$m")'"}'; }
+bio pbp; pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-aaaa1 "$A"
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "48 hours" && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-aaaa1' AND revoked_at IS NULL")" = 2 ] && ok "C4 a phone linked < 48 h cannot remove another (H3)" || fail "C4 young revoke: $CODE $BODY"
+X "UPDATE device_gate_proofs SET used = 1"
+pin "$A" device-revoke:0; pw "$A"; call DELETE /api/identity/devices/phone-cccc2 "$A"; HU=$(echo "$BODY" | J hold_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-cccc2' AND revoked_at IS NULL")" = 2 ] && ok "C4 removing a phone with password + PIN alone waits 48 h (202), the phone stays (#59 H1)" || fail "C4 pw removal: $CODE $BODY"
+pin "$A" device-revoke:0; pw "$A"; call DELETE /api/identity/devices/phone-bbbb1 "$A"; HU2=$(echo "$BODY" | J hold_id)
+pin "$A" device-revoke:0; pw "$A"; call DELETE /api/identity/devices/phone-aaaa1 "$A"; HU3=$(echo "$BODY" | J hold_id)
+enrol_pending phone-dddd9 pd
+{ [ "$CODE" = 202 ] || [ "$CODE" = 409 ]; } && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-dddd9'")" = 0 ] && ok "C4 with every phone's removal waiting, a new phone is not linked: password + PIN cannot strip the phones and link their own at once" || fail "C4 strip+link: $CODE $BODY"
+[ "$CODE" = 202 ] && cancel "$HOLD" phone-aaaa1 pap
+for h in $HU2 $HU3; do cancel "$h" phone-aaaa1 pap; [ "$CODE" = 200 ] || fail "C4 cancel unlink $h: $CODE $BODY"; done
+[ "$(Q "SELECT COUNT(DISTINCT device_id) FROM device_keys WHERE did='$DID_A' AND revoked_at IS NULL")" = 3 ] && ok "C4 removals canceled from the phone: all phones stay" || fail "C4 after cancel"
+X "UPDATE account_holds SET ready_at='$(iso -1)' WHERE id='$HU'"; sleep 2
+[ "$(Q "SELECT revoked_via FROM device_keys WHERE device_id='phone-cccc2' LIMIT 1")" = password ] && ok "C4 uncanceled at 48 h the removal applies (revoked_via password)" || fail "C4 due unlink: $(Q "SELECT status||' '||COALESCE(note,'') FROM account_holds WHERE id='$HU'")"
+bio pap; pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-bbbb1 "$A"
+[ "$CODE" = 200 ] && [ "$(Q "SELECT revoked_via FROM device_keys WHERE device_id='phone-bbbb1' LIMIT 1")" = device ] && ok "C4 an established phone's presence removes another at once (revoked_via device)" || fail "C4 bio removal: $CODE $BODY"
 X "INSERT INTO recovery_guardians (owner_did, guardian_did, status, invited_at) VALUES ('$DID_A', '$DID_B', 'active', '$(iso 0)')"
-for d in phone-bbbb1 phone-cccc2; do pin "$A" device-revoke:0; pw "$A"; call DELETE /api/identity/devices/$d "$A"; [ "$CODE" = 200 ] || fail "C4 revoke $d: $CODE $BODY"; done
-[ "$(Q "SELECT revoked_via FROM device_keys WHERE device_id='phone-bbbb1' LIMIT 1")" = device ] && [ "$(Q "SELECT revoked_via FROM device_keys WHERE device_id='phone-cccc2' LIMIT 1")" = password ] && ok "C4 how a phone was removed is recorded (with a phone's presence → device; password → password)" || fail "C4 via: $(Q "SELECT group_concat(device_id||'='||COALESCE(revoked_via,'-')) FROM device_keys WHERE kind='D'")"
-pin "$A" device-revoke:0; pw "$A"; call DELETE /api/identity/devices/phone-aaaa1 "$A"
-[ "$CODE" = 409 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-aaaa1' AND revoked_at IS NULL")" = 2 ] && ok "C4 with guardians set, the last phone cannot be removed" || fail "C4 last phone: $CODE $BODY"
-X "DELETE FROM recovery_guardians"
+bio pap; pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-aaaa1 "$A"
+[ "$CODE" = 409 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-aaaa1' AND revoked_at IS NULL")" = 2 ] && ok "C4 with guardians set, the last phone cannot be removed (even by itself)" || fail "C4 last phone: $CODE $BODY"
+X "DELETE FROM recovery_guardians"; X "UPDATE device_gate_proofs SET used = 1"
 
 # ── C7 E2 ──
 call POST /api/identity/set-recovery-email "$A" '{"recovery_email":"new-addr@example.com","password":"hunter22"}'; HE=$(echo "$BODY" | J hold_id)
@@ -173,9 +194,15 @@ call GET /api/identity/holds "$A2"
 call POST /api/identity/auth-fingerprint "" '{"username":"owner-a","password":"hunter22","scope":"transact","expires_in":"1h"}'
 [ "$(echo "$BODY" | J password_must_change)" = True ] && ok "C5 the next sign-in says the password must change" || fail "C5 login flag: $BODY"
 A=$(echo "$BODY" | J token)
+call POST /api/identity/pin "$A" '{"pin":"6666","password":"hunter22"}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J password_must_change)" = True ] && ok "C5 until the password changes, nothing more starts from it (#59 M1)" || fail "C5 must-change: $CODE $BODY"
+call POST /api/identity/set-recovery-email "$A" '{"recovery_email":"x2@example.com","password":"hunter22"}'; [ "$CODE" = 403 ] || fail "C5 must-change email: $CODE"
+X "UPDATE identity_wallets SET password_must_change = 0 WHERE username='owner-a'"   # (the reset-password route clears it)
+enrol_pending phone-dddd8 pd; HE1=$HOLD
 call POST /api/identity/pin "$A" '{"pin":"6666","password":"hunter22"}'; HR=$(echo "$BODY" | J hold_id)
 X "UPDATE account_holds SET ready_at='$(iso -1)' WHERE id='$HR'"; sleep 2
 [ "$(Q "SELECT status FROM account_holds WHERE id='$HR'")" = completed ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE did='$DID_A' AND revoked_at IS NULL")" = 0 ] && ok "C5 uncanceled at 48 h it applies and unlinks every phone" || fail "C5 due: $(Q "SELECT status||' '||COALESCE(note,'') FROM account_holds WHERE id='$HR'")"
+[ "$(Q "SELECT status FROM account_holds WHERE id='$HE1'")" = canceled ] && ok "C5 a phone waiting to be linked goes with the reset (#59 M3)" || fail "C5 enrol hold after reset: $(Q "SELECT status FROM account_holds WHERE id='$HE1'")"
 A=$(login); pin "$A" unlock:0 6666
 # a phone again (first: at once), then password + presence resets at once
 call POST /api/identity/device/challenge "$A" '{"purpose":"enrol","intent":"device-enrol:0"}'; ECH=$(echo "$BODY" | J challenge_id); EM="$(echo "$BODY" | J message):phone-dddd1"
