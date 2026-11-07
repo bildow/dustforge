@@ -1878,6 +1878,7 @@ function fleetLink(a, b) {
     `SELECT 1 FROM fleets f WHERE f.owner_did = @owner AND f.owner_did != @member AND (
          EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.fleet_id = f.id AND s.member_did = @member AND s.status = 'active')
          OR (EXISTS (SELECT 1 FROM fleet_members m WHERE m.fleet_id = f.id AND m.member_did = @member)
+             AND NOT EXISTS (SELECT 1 FROM fleet_silicons s2 WHERE s2.fleet_id = f.id AND s2.member_did = @member)
              AND EXISTS (SELECT 1 FROM identity_transactions t WHERE t.did = @member AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
                          AND t.description IN ('Fleet-provisioned by ' || f.slug, 'Fleet bulk-provisioned by ' || f.slug)))) LIMIT 1`
   ).get({ owner: a, member: b });
@@ -1886,6 +1887,7 @@ function fleetLink(a, b) {
     `SELECT 1 FROM fleets f WHERE f.owner_did = @owner AND f.owner_did != @member AND (
          EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.fleet_id = f.id AND s.member_did = @member AND s.status = 'active')
          OR (EXISTS (SELECT 1 FROM fleet_members m WHERE m.fleet_id = f.id AND m.member_did = @member)
+             AND NOT EXISTS (SELECT 1 FROM fleet_silicons s2 WHERE s2.fleet_id = f.id AND s2.member_did = @member)
              AND EXISTS (SELECT 1 FROM identity_transactions t WHERE t.did = @member AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
                          AND t.description IN ('Fleet-provisioned by ' || f.slug, 'Fleet bulk-provisioned by ' || f.slug)))) LIMIT 1`
   ).get({ owner: b, member: a });
