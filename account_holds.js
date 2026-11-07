@@ -278,7 +278,7 @@ module.exports = function registerAccountHolds(deps) {
     const auth = deps.getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     if (auth.silicon) return res.json({ ok: true, holds: [] });
     sweep();
-    res.json({ ok: true, holds: openHolds(auth.did).map(view) });
+    res.json({ ok: true, holds: openHolds(auth.did).map(view), notices: notices(auth.did) });
   });
 
   // ── applying a due hold ────────────────────────────────────────────────────────────────────────────────────────

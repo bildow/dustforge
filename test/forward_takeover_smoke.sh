@@ -58,13 +58,17 @@ jb(){ python3 -c 'import json,sys; print(json.dumps(dict(zip(sys.argv[1::2], sys
 node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3"); const pw = require("./passwords");
 (async () => { const db = new Database(process.env.DB_PATH);
-for (const [u, rec] of [["victim", ""], ["withrec", "withrec-owner@example.org"], ["owner", "owner-rec@example.org"]]) {
+for (const [u, rec] of [["victim", ""], ["withrec", "withrec-owner@example.org"], ["owner", "owner-rec@example.org"], ["person", ""]]) {
   const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash, recovery_email) VALUES (?, ?, ?, ?, 100000, ?, ?)").run(id.did, u, u + "@dustforge.com", enc, await pw.hashPassword("pass-" + u + "-9!"), rec);
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 100000, ?, ?, 100000)").run(id.did, "topup", "smoke"); } })();'
 sleep 1
 login(){ call POST /api/identity/auth-fingerprint "" "$(jb username "$1" password "pass-$1-9!" scope transact expires_in 2h)"; echo "$BODY" | J token; }
-V=$(login victim); R=$(login withrec); O=$(login owner)
+# victim is a fleet agent of owner (no PIN, no recovery email, no phone: the token path, item 6a's clock); person is a
+# person with none of those (#70 review L4).
+X "INSERT INTO fleets (owner_did, name, slug) VALUES ((SELECT did FROM identity_wallets WHERE username='owner'), 'Owner agents', 'owner-agents')"
+X "INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet, joined_via) VALUES ((SELECT id FROM fleets WHERE slug='owner-agents'), (SELECT did FROM identity_wallets WHERE username='victim'), 'victim', 'sil_fwd1', 'active', 1, 'owner')"
+V=$(login victim); R=$(login withrec); O=$(login owner); P=$(login person)
 VD=$(Q "SELECT did FROM identity_wallets WHERE username='victim'"); OD=$(Q "SELECT did FROM identity_wallets WHERE username='owner'")
 age(){ X "UPDATE forward_relays SET activated_at=datetime('now','-3 days'), created_at=datetime('now','-3 days') WHERE did=(SELECT did FROM identity_wallets WHERE username='$1')"; }
 resets(){ Q "SELECT COUNT(*) FROM password_reset_tokens WHERE did=(SELECT did FROM identity_wallets WHERE username='$1')"; }
@@ -74,13 +78,17 @@ call POST /api/identity/forgot-password "" '{"username":"victim"}'; sleep 0.3; L
 [ -n "$LINK1" ] && [ "$(Q "SELECT sent_to FROM password_reset_tokens WHERE token='$LINK1'")" = mailbox ] && ok "a reset link records where it went (mailbox)" || fail "sent_to"
 call POST /api/identity/request-2fa "" "$(jb did "$VD")"; LC=$(Q "SELECT code FROM identity_2fa_codes WHERE did='$VD' AND purpose='login' AND used=0")
 call POST /api/relay/create "$V" '{"forward_to":"attacker@example.net"}'
-[ "$CODE" = 200 ] && ok "a session token turns on a forward on a wallet with no PIN (an agent-style wallet)" || fail "relay create: $CODE $BODY"
+[ "$CODE" = 200 ] && ok "a session token turns on a forward on a fleet agent's wallet (no PIN: the token path)" || fail "relay create: $CODE $BODY"
+sleep 1.5; grep -q "an agent turned on mail forwarding" "$S/mail.log" && grep -q "owner-rec@example.org" "$S/mail.log" && ok "…and its fleet owner is mailed (L4)" || fail "fleet owner notice"
 [ "$(Q "SELECT used FROM password_reset_tokens WHERE token='$LINK1'")" = 1 ] && [ "$(Q "SELECT COUNT(*) FROM identity_2fa_codes WHERE did='$VD' AND purpose='login' AND used=0")" = 0 ] \
   && ok "turning a rule on kills the live mailbox reset link and sign-in code" || fail "kill on activate"
 call POST /api/identity/reset-password "" "$(jb token "$LINK1" new_password brandnew-pass-1)"; [ "$CODE" = 400 ] && ok "…so that link no longer resets" || fail "old link: $CODE $BODY"
 N=$(resets victim); call POST /api/identity/forgot-password "" '{"username":"victim"}'; sleep 0.3
 [ "$CODE" = 200 ] && [ "$(resets victim)" = "$N" ] && ok "under a forward < 48 h and no recovery email: no reset link (same reply)" || fail "withheld: $CODE $(resets victim) vs $N"
-call POST /api/identity/request-2fa "" "$(jb did "$VD")"; [ "$CODE" = 409 ] && ok "request-2fa: no sign-in code under a fresh forward" || fail "request-2fa: $CODE $BODY"
+NC=$(Q "SELECT COUNT(*) FROM identity_2fa_codes WHERE did='$VD'")
+call POST /api/identity/request-2fa "" "$(jb did "$VD")"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J emailed)" = True ] && [ "$(Q "SELECT COUNT(*) FROM identity_2fa_codes WHERE did='$VD'")" = "$NC" ] \
+  && ok "request-2fa (no session): the ordinary reply, and no code exists or is sent under a fresh forward (L5)" || fail "request-2fa: $CODE $BODY"
 X "INSERT INTO identity_2fa_codes (did, code, expires_at, purpose) VALUES ('$VD', '424242', datetime('now','+10 minutes'), 'login')"
 call POST /api/identity/verify "" "$(jb did "$VD" code 424242 scope transact)"; [ "$CODE" = 403 ] && ok "verify: a right code is refused under a fresh forward" || fail "verify: $CODE $BODY"
 call POST /api/identity/login-code/request "" '{"username":"victim"}'; [ "$(Q "SELECT COUNT(*) FROM identity_2fa_codes WHERE did='$VD' AND used=0")" = 0 ] && ok "login-code: none issued either" || fail "login-code issued"
@@ -98,6 +106,9 @@ call POST /api/identity/reset-password "" "$(jb token "$LINK2" new_password bran
 call POST /api/identity/request-2fa "" "$(jb did "$VD")"
 [ -n "$LINK2" ] && [ "$A1" = 200 ] && [ "$CODE" = 200 ] && ok "once the rule is 48 h old, reset links and codes work again" || fail "aged: link=$LINK2 reset=$A1 code=$CODE"
 
+call POST /api/relay/create "$P" '{"forward_to":"p-fwd@example.org"}'
+[ "$CODE" = 409 ] && [ "$(echo "$BODY" | J need)" = recovery_email_or_phone ] && ok "a person with no recovery email and no phone cannot turn a forward on (L4)" || fail "L4: $CODE $BODY"
+
 # ── 6b ──
 call POST /api/identity/pin "$O" "$(jb pin 4321 password pass-owner-9!)"; [ "$CODE" = 200 ] || fail "pin set: $CODE"
 call POST /api/relay/create "$O" '{"forward_to":"owner-fwd@example.org"}'
@@ -106,8 +117,15 @@ AGT=$(node -e 'const identity=require("./identity"),Database=require("better-sql
 process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key,w.did,{scope:"transact",expiresIn:"1h",metadata:{auth_method:"fleet_owner_mint",fleet:"x"}}))')
 call POST /api/relay/create "$AGT" '{"forward_to":"owner-fwd@example.org"}'; [ "$CODE" = 403 ] && ok "an agent token cannot turn one on for that wallet" || fail "agent: $CODE"
 : > "$S/mail.log"
+X "INSERT INTO identity_2fa_codes (did, code, expires_at, purpose) VALUES ('$OD', '515151', datetime('now','+10 minutes'), 'gate')"
 call POST /api/identity/gate/verify "$O" '{"gate":"pin","pin":"4321","intent":"forward:0"}'
 call POST /api/relay/create "$O" '{"forward_to":"owner-fwd@example.org"}'; [ "$CODE" = 200 ] && ok "with the PIN it turns on" || fail "with pin: $CODE $BODY"
+[ "$(Q "SELECT used FROM identity_2fa_codes WHERE code='515151'")" = 1 ] && ok "turning it on kills the live gate code too (M4)" || fail "gate code alive"
+call POST /api/identity/request-2fa "$O" "$(jb did "$OD")"; G1=$CODE
+X "INSERT INTO identity_2fa_codes (did, code, expires_at, purpose) VALUES ('$OD', '525252', datetime('now','+10 minutes'), 'gate')"
+call POST /api/identity/gate/verify "$O" '{"gate":"twofa","code":"525252"}'
+[ "$G1" = 409 ] && [ "$CODE" = 409 ] && ok "the owner's own gate code: not sent, and not accepted, under a fresh forward (M4)" || fail "M4 gate: request $G1 verify $CODE $BODY"
+call GET /api/identity/holds "$O"; [ "$(echo "$BODY" | J notices.0.forward_to)" = owner-fwd@example.org ] && ok "the vault page's signed-in holds call carries the notice too (M3)" || fail "holds notices: $BODY"
 call POST /api/relay/create "$O" '{"forward_to":"owner-fwd@example.org","label":"gmail"}'; [ "$CODE" = 200 ] && ok "re-saving an active rule needs no PIN (nothing new is copied)" || fail "resave: $CODE $BODY"
 sleep 1.5
 grep -q "owner-rec@example.org" "$S/mail.log" && grep -q "forwarding" "$S/mail.log" && ok "the owner is mailed at the recovery address (outside the rule)" || fail "notice mail: $(grep -c ===== "$S/mail.log" 2>/dev/null) mails"

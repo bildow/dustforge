@@ -94,6 +94,7 @@ call POST /api/identity/login-code/verify "" "$(jb username owner code "$LC")"; 
 # forwarding rule under 48 h
 call POST /api/identity/login-code/request "" '{"username":"owner"}'; sleep 0.5
 LC2=$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DID' AND purpose='login' AND used=0 ORDER BY id DESC LIMIT 1")
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE identity_wallets SET recovery_email = 'rec-csp@example.org' WHERE recovery_email IS NULL OR recovery_email = ''\"); c.commit()" "$DB_PATH"   # turning a forward on needs a recovery address (#70 L4)
 call POST /api/relay/create "$OWN" '{"forward_to":"someone@example.com"}'; [ "$CODE" = 200 ] || fail "relay create: $CODE $BODY"
 call POST /api/identity/login-code/verify "" "$(jb username owner code "$LC2")"
 { [ "$CODE" = 401 ] || { [ "$CODE" = 403 ] && echo "$BODY" | grep -q forwarding; }; } && ok "a code issued before a new forwarding rule is refused (the rule kills it: item 6a)" || fail "fresh forward verify: $CODE $BODY"

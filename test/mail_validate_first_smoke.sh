@@ -78,6 +78,7 @@ call POST /api/email/send "$T" '{"to":"","subject":"x","body":"b"}'
 call POST /api/relay/forward "$T" '{"subject":"s","body":"b"}'
 [ "$CODE" = 404 ] && [ "$(bal)" = "$B2" ] && ok "/relay/forward with no rules → 404 before any charge" || fail "relay: $CODE bal $(bal)"
 # /relay/forward: each forward takes a slot and its own charge (cap is used up here, so: refused, nothing charged)
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE identity_wallets SET recovery_email = 'rec-mvf@example.org' WHERE recovery_email IS NULL OR recovery_email = ''\"); c.commit()" "$DB_PATH"   # turning a forward on needs a recovery address (#70 L4)
 call POST /api/relay/create "$T" '{"forward_to":"fwd1@example.com"}'; call POST /api/relay/create "$T" '{"forward_to":"fwd2@example.com","filter_from":"x"}'
 sleep 1   # the owner's "forwarding turned on" notices (item 6b) are mailed asynchronously; count after them
 B3=$(bal); D0=$(grep -c DELIVERED "$S/smtp.log")

@@ -1185,8 +1185,14 @@ app.post('/api/identity/request-2fa', rateLimitStrict, (req, res) => {
   if (bearer && !bearer.ok) return res.status(bearer.status || 401).json({ error: bearer.error || 'session expired' });
   if (bearer && bearer.silicon) return res.status(403).json({ error: 'emailed codes are for the owner, not for silicon agents' });
   const purpose = bearer && bearer.did === did ? 'gate' : 'login';
-  // Item 6a: a sign-in code is not sent through a forwarding rule under 48 h old.
-  if (purpose === 'login' && forwardFresh(did)) return res.status(409).json({ error: 'a mail forwarding rule on this account changed in the last 48 hours, so emailed sign-in codes are paused; sign in with your password' });
+  // Item 6a: no code goes through a forwarding rule under 48 h old. A sign-in code asked for without a session gets the
+  // ordinary reply and nothing is sent (#70 review L5: a distinct answer would tell a stranger about the rule); the
+  // signed-in owner's own gate code is refused in words (#70 review M4).
+  if (forwardFresh(did)) {
+    logSecurityEvent('code_withheld_fresh_forward', 'warning', { caller_did: did, capability: purpose === 'login' ? 'login-code' : 'gate-code', ip: req.ip });
+    if (purpose === 'login') return res.json({ ok: true, expires_in: 600, emailed: true });
+    return res.status(409).json({ error: 'a mail forwarding rule on this account changed in the last 48 hours, so emailed codes are paused — use your PIN, phone or password', forward_fresh: true });
+  }
   const issued = issueCode('identity_2fa_codes', did, purpose);
   if (!issued.code) { const r = issueRefusal(issued, purpose); return res.status(r.status).json(r.body); }
   const { code, expiresAt } = issued;
@@ -1388,6 +1394,8 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
     const { code } = req.body || {};
     if (!code) return res.status(400).json({ error: 'code required' });
     const table = gate === 'twofa' ? 'identity_2fa_codes' : 'identity_sms_codes';
+    // Item 6a / #70 review M4: an emailed gate code proves nothing while a forwarding rule is under 48 h old.
+    if (gate === 'twofa' && forwardFresh(did)) return res.status(409).json({ error: 'a mail forwarding rule on this account changed in the last 48 hours, so emailed codes are paused — use your PIN, phone or password', forward_fresh: true });
     const chk = checkCode(table, did, String(code), 'gate');
     if (!chk.row) return res.status(chk.status || 403).json({ error: `${gate}: ${chk.error}`, ...(chk.attempts_left !== undefined ? { attempts_left: chk.attempts_left } : {}) });
     const row = chk.row;
@@ -2238,7 +2246,14 @@ app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, '
   const prev = db.prepare('SELECT status FROM forward_relays WHERE did = ? AND forward_to = ? AND filter_from = ?').get(did, forward_to, filter_from);
   const activates = !prev || prev.status !== 'active';
   if (activates) {
-    const w = db.prepare('SELECT pin_hash FROM identity_wallets WHERE did = ?').get(did) || {};
+    const w = db.prepare('SELECT pin_hash, recovery_email FROM identity_wallets WHERE did = ?').get(did) || {};
+    // #70 review L4: a person with neither a recovery email nor a linked phone would hear of a stranger's rule only in
+    // the mailbox it copies — and after 48 hours its reset links flow through it. Not until one of them exists.
+    // A fleet's agent wallet keeps the token path; its fleet owner is told instead.
+    const agent = Boolean(db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND status = 'active'").get(did));
+    if (!agent && !String(w.recovery_email || '').trim() && !(deviceKeys && deviceKeys.hasDevice(did))) {
+      return res.status(409).json({ error: 'add a recovery email (or link your phone) before turning on mail forwarding: it is where you would hear that a rule was added', need: 'recovery_email_or_phone' });
+    }
     if (w.pin_hash) {
       const auth = getBearerIdentity(req);
       const intent = 'forward:0';
@@ -2254,13 +2269,18 @@ app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, '
       if (activates) {
         // Item 6a: whatever proved the mailbox before this rule is dead: live reset links that went to it, live sign-in codes.
         db.prepare("UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0 AND COALESCE(sent_to, 'mailbox') != 'recovery'").run(did);
-        db.prepare("UPDATE identity_2fa_codes SET used = 1 WHERE did = ? AND used = 0 AND COALESCE(purpose, 'login') = 'login'").run(did);
+        db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE did = ? AND used = 0').run(did);   // login AND gate codes (#70 review M4)
       }
     })();
     if (activates) {
       logSecurityEvent('forward_rule_activated', 'alert', { caller_did: did, capability: 'forward', ip: req.ip, context: { forward_to, filter_from } });
       // Item 6b: told where the rule cannot reach — the recovery address (and any replaced in the last 7 days), plus
       // the mailbox; the linked phone's alerts call lists it for 48 hours (account_holds.js).
+      // An agent wallet's fleet owner hears of it too.
+      try {
+        const fo = db.prepare("SELECT f.owner_did FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id WHERE s.member_did = ? AND s.status = 'active' LIMIT 1").get(did);
+        if (fo && fo.owner_did) accountHolds.tellOwner(fo.owner_did, 'an agent turned on mail forwarding', `Your agent ${(db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did) || {}).username || did} now forwards its mailbox to ${forward_to}. If you did not expect this, remove it.\n`);
+      } catch (_) {}
       try { accountHolds.tellOwner(did, 'mail forwarding was turned on',
         `A forwarding rule now copies mail from your DemiPass mailbox to ${forward_to}${filter_from && filter_from !== '*' ? ` (mail from ${filter_from})` : ''}.\n` +
         'For 48 hours, sign-in codes and reset links are not sent through it.\nIf this was not you: open DemiPass, Dustforge tab, remove it, then rotate your password.\n'); } catch (_) {}
