@@ -8401,6 +8401,7 @@ const accountHolds = require('./account_holds')({
   app, db, rateLimitStrict, rateLimitStandard, logSecurityEvent, cleanLabel, getBearerIdentity, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
+  guardians: () => recoveryGuardians,
 });
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({
@@ -8408,6 +8409,9 @@ const deviceKeys = require('./device_keys')({
   logSecurityEvent, cleanLabel, sendMail: fleetRoutes.sendMail, recordGate, pinIntentOk: (s) => PIN_INTENT_RE.test(s),
   holds: () => accountHolds,
 });
+// Recovery guardians (red team item 9, step 2): 3 people paired in person, each accepting with PIN + phone.
+const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
+  logSecurityEvent, devices: () => deviceKeys, holds: () => accountHolds, sendMail: (...a) => fleetRoutes.sendMail(...a) });
 // Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
 require('./leak_scan')({ app, db, express, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, blindkeyDecrypt, blindkeyEncrypt, cleanLabel, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys });
@@ -13756,7 +13760,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
