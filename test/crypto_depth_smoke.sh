@@ -154,7 +154,18 @@ NID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$RREF'"); NNAME=$(Q "SE
 NWD=$(Q "SELECT wrapped_dek FROM secret_wraps WHERE secret_id=$NID")
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J wrapped)" = True ] && [ "$(Q "SELECT wrap_state FROM blindkey_secrets WHERE id=$NID")" = device ] && [ "$(rewrap "$NWD" "$EPH3" "$DA" "$RREF" "$NNAME")" != REFUSED ] \
   && ok "rotating a wrapped secret wraps the new version, sealed for the ref it now holds" || fail "rotate wrapped: $CODE $BODY"
-for i in 1 2 3 4; do call POST /api/demipass/wrap/unwrap-session "$A" '{"secret":"other-secret"}'; done
-[ "$CODE" = 429 ] && ok "at most 3 unwrap sessions open per owner (one-use keys are made off the event loop)" || fail "session cap: $CODE"
+( for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code}\n' -X POST "$API/api/demipass/wrap/unwrap-session" -H 'Content-Type: application/json' -H "Authorization: Bearer $A" -d '{"secret":"other-secret"}' & done; wait ) > "$S/burst"
+[ "$(grep -c '^200$' "$S/burst")" = 3 ] && ok "a burst of 12 unwrap sessions gets exactly 3 (slots reserved before the keys are made, off the event loop)" || fail "burst: $(sort "$S/burst" | uniq -c | tr '\n' ' ')"
+# names the phone can show are wrapped; the server and phone validators agree (a long name; a non-ASCII name → empty slug)
+LONG=$(python3 -c 'print("n"*64)')
+call POST /api/demipass/store "$A" '{"name":"'$LONG'","value":"long-name-value-zz12","secret_type":"api_key"}'
+call POST /api/demipass/gate-policy "$A" '{"name":"'$LONG'","security_depth":"elevated"}'
+[ "$(echo "$BODY" | J wrapped)" = True ] && ok "a 64-character name (the store maximum) is wrapped — the phone accepts up to 100 (other routes allow names that long)" || fail "long name: $BODY"
+call POST /api/demipass/store "$A" '{"name":"密码钥匙","value":"cjk-name-value-zz13","secret_type":"api_key"}'
+call POST /api/demipass/gate-policy "$A" '{"name":"密码钥匙","security_depth":"elevated"}'; CJK_REF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='密码钥匙'")
+[ "$(echo "$BODY" | J wrapped)" = True ] && [[ "$CJK_REF" =~ ^DP-[A-Z]+--[0-9a-f]{8}$ ]] && ok "a non-ASCII name (empty ref slug $CJK_REF) is wrapped — the phone accepts an empty slug" || fail "cjk: $CJK_REF $BODY"
+node -e 'const r=/^DP-[A-Z]{2,6}-[A-Za-z0-9]{0,16}-[0-9a-f]{8}$/, n=/^[^\u0000-\u001f\u007f-\u009f]{1,100}$/u; process.exit(r.test(process.argv[1]) && n.test(process.argv[2]) && !n.test("x".repeat(101)) && !n.test("a\nb") ? 0 : 1)' "$CJK_REF" "$LONG" \
+  && grep -q 'DP-\[A-Z\]{2,6}-\[A-Za-z0-9\]{0,16}-\[0-9a-f\]{8}' /home/flimflam/project/demipass-android/app/src/main/java/com/dustforge/demipass/DeviceBridge.java \
+  && ok "the phone's REF/NAME patterns are the server's (checked against the app source)" || fail "validators drift"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails failure(s)"; exit $fails

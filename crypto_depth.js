@@ -54,6 +54,12 @@ module.exports = function registerCryptoDepth(deps) {
   // What a wrap is FOR, sealed inside it with the data key: the phone shows "<name> (<ref>)" in its own prompt and,
   // after decrypting, refuses unless the wrap names that same secret — so a host serving a doctored page cannot get
   // secret B unwrapped under a prompt for secret A (#56 review H1).
+  // What the phone accepts as the secret its prompt names (DeviceBridge REF/NAME/DID — keep the two identical). A secret
+  // the phone would refuse is never wrapped: it could never be opened again (#56 re-review).
+  const PHONE_REF = /^DP-[A-Z]{2,6}-[A-Za-z0-9]{0,16}-[0-9a-f]{8}$/;
+  const PHONE_NAME = /^[^\u0000-\u001f\u007f-\u009f]{1,100}$/u;
+  const PHONE_DID = /^did:key:[A-Za-z0-9_-]{20,120}$/;
+  const phoneCanOpen = (secret) => PHONE_REF.test(String(secret.ref_code || '')) && PHONE_NAME.test(String(secret.name || '')) && PHONE_DID.test(String(secret.did || ''));
   const bindingOf = (did, ref, name) => crypto.createHash('sha256').update(`dp-wrap:v1|${did}|${ref}|${name}`).digest();
 
   // ── one-use keys, in memory only ────────────────────────────────────────────────────────────────────────────────
@@ -62,16 +68,21 @@ module.exports = function registerCryptoDepth(deps) {
   const sweeper = setInterval(sweep, 60000); if (sweeper.unref) sweeper.unref();
   // Generated off the event loop (#56 review M3: RSA-2048 keygen blocked every other request).
   const genRsa = () => new Promise((ok, no) => crypto.generateKeyPair('rsa', { modulusLength: 2048 }, (e, pub, priv) => (e ? no(e) : ok({ pub, priv }))));
+  // The slot is taken synchronously (a placeholder), so a burst cannot get past a cap while keys are being made.
   async function ephemeralFor(tag) {
     sweep();
-    const have = eph.get(tag); if (have) return have.pub;
-    const { pub: publicKey, priv: privateKey } = await genRsa();
-    const pub = publicKey.export({ type: 'spki', format: 'der' }).toString('base64');
-    if (!eph.has(tag)) eph.set(tag, { priv: privateKey, pub, exp: Date.now() + EPHEMERAL_TTL_MS });
-    return eph.get(tag).pub;
+    const have = eph.get(tag);
+    if (have) return have.pending ? have.pending : have.pub;
+    const entry = { priv: null, pub: null, exp: Date.now() + EPHEMERAL_TTL_MS };
+    entry.pending = genRsa().then(({ pub: publicKey, priv: privateKey }) => {
+      entry.priv = privateKey; entry.pub = publicKey.export({ type: 'spki', format: 'der' }).toString('base64'); entry.pending = null;
+      return entry.pub;
+    }).catch(e => { if (eph.get(tag) === entry) eph.delete(tag); throw e; });
+    eph.set(tag, entry);
+    return entry.pending;
   }
   const openSessions = (did) => { sweep(); let n = 0; for (const k of eph.keys()) if (k.startsWith(`s:${did}:`)) n++; return n; };
-  const hasEphemeral = (tag) => { sweep(); return eph.has(tag); };
+  const hasEphemeral = (tag) => { sweep(); const e = eph.get(tag); return Boolean(e && e.priv); };
   function dropEphemeral(tag) { eph.delete(tag); }
 
   // The owner's wrap keys on phones that are linked now (an active device key D on the same device).
@@ -88,6 +99,7 @@ module.exports = function registerCryptoDepth(deps) {
   // Wrap one secret to the owner's phones. { ok, wrapped_for } or { ok:false, error }.
   function wrapSecret(secret) {
     if (isWrapped(secret)) return { ok: true, already: true, wrapped_for: Object.keys(wrapsOf(secret.id)).length };
+    if (!phoneCanOpen(secret)) return { ok: false, error: 'this secret\'s name or ref is one the phone cannot show in its prompt, so it is not wrapped (it would be unopenable) — it stays approval-only' };
     const keys = activeWrapKeys(secret.did);
     if (!keys.length) return { ok: false, error: 'no linked phone with a wrap key (DemiPass app 1.5+): this secret is protected by approval only, and the host can still read it' };
     let value;
@@ -117,7 +129,7 @@ module.exports = function registerCryptoDepth(deps) {
   // The data key, re-encrypted by the phone to the one-use key `tag` → the value. One use: the key is dropped.
   function recover(secret, tag, rewrappedB64) {
     const e = eph.get(tag);
-    if (!e) throw Object.assign(new Error('the one-use key for this approval is gone (server restart or expiry) — ask again'), { status: 409 });
+    if (!e || !e.priv) throw Object.assign(new Error('the one-use key for this approval is gone (server restart or expiry) — ask again'), { status: 409 });
     eph.delete(tag);
     let dek;
     try { dek = crypto.privateDecrypt({ key: e.priv, ...OAEP }, Buffer.from(String(rewrappedB64 || ''), 'base64')); }
@@ -250,6 +262,6 @@ module.exports = function registerCryptoDepth(deps) {
     logSecurityEvent('secret_unwrapped', 'warn', { caller_did: secret.did, capability: 'unwrap', target: secret.name });
   }
 
-  return { MARKER, bindingOf, isWrapped, wrapSecret, plaintextFor, onRequestCreated, approvalView, approveRefusal, storeUnwrap, dropEphemeral,
+  return { MARKER, bindingOf, phoneCanOpen, isWrapped, wrapSecret, plaintextFor, onRequestCreated, approvalView, approveRefusal, storeUnwrap, dropEphemeral,
            unwrapForOwner, unwrapToHost, activeWrapKeys, _hasEphemeral: hasEphemeral };
 };
