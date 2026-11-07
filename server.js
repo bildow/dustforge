@@ -1426,7 +1426,7 @@ app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
       if (w.ok) {
         const base = String(secret.name).replace(/_v\d+$/, '');
         for (const sib of db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND id != ? AND status = 'rotating' AND (name = ? OR name LIKE ?) AND wrap_state IS NULL").all(ownerDid, secret.id, base, base + '_v%')) {
-          try { cryptoDepth.wrapSecret(sib); } catch (_) {}
+          try { const r = cryptoDepth.wrapSecret(sib, { inGrace: true }); if (!r.ok) logSecurityEvent('rotation_grace_not_wrapped', 'alert', { caller_did: ownerDid, target: sib.name, error: r.error }); } catch (_) {}
         }
       }
     }

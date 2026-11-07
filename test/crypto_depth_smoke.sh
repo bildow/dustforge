@@ -168,4 +168,13 @@ node -e 'const r=/^DP-[A-Z]{2,6}-[A-Za-z0-9]{0,16}-[0-9a-f]{8}$/, n=/^[^\u0000-\
   && grep -q 'DP-\[A-Z\]{2,6}-\[A-Za-z0-9\]{0,16}-\[0-9a-f\]{8}' /home/flimflam/project/demipass-android/app/src/main/java/com/dustforge/demipass/DeviceBridge.java \
   && ok "the phone's REF/NAME patterns are the server's (checked against the app source)" || fail "validators drift"
 
+# raising a secret whose older version is still in rotation grace wraps that version too (its ref moved; host loses it)
+call POST /api/demipass/store "$A" '{"name":"graced","value":"graced-old-value-zz21","secret_type":"api_key"}'
+GID=$(Q "SELECT id FROM blindkey_secrets WHERE name='graced'")
+call POST /api/demipass/rotate "$A" '{"name":"graced","new_value":"graced-new-value-zz22","grace_period_minutes":43200}'
+GNEW=$(Q "SELECT name FROM blindkey_secrets WHERE name LIKE 'graced_v%' AND status='active'")
+call POST /api/demipass/gate-policy "$A" '{"name":"'$GNEW'","security_depth":"elevated"}'
+[ "$(Q "SELECT status||'|'||COALESCE(wrap_state,'host')||'|'||encrypted_value FROM blindkey_secrets WHERE id=$GID")" = "rotating|device|dpwrap:v1" ] \
+  && ok "the older version in its rotation grace is wrapped too (no host copy left of a value the provider still accepts)" || fail "grace sibling: $(Q "SELECT status||'|'||COALESCE(wrap_state,'host') FROM blindkey_secrets WHERE id=$GID")"
+
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails failure(s)"; exit $fails

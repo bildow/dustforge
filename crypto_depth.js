@@ -97,9 +97,11 @@ module.exports = function registerCryptoDepth(deps) {
   }
 
   // Wrap one secret to the owner's phones. { ok, wrapped_for } or { ok:false, error }.
-  function wrapSecret(secret) {
+  // { inGrace: true } — an older version in its rotation grace (its ref moved to the new one): wrapped so the host
+  // loses it, though no phone will open it (unusable either way; fails closed) — #56 re-review.
+  function wrapSecret(secret, { inGrace = false } = {}) {
     if (isWrapped(secret)) return { ok: true, already: true, wrapped_for: Object.keys(wrapsOf(secret.id)).length };
-    if (!phoneCanOpen(secret)) return { ok: false, error: 'this secret\'s name or ref is one the phone cannot show in its prompt, so it is not wrapped (it would be unopenable) — it stays approval-only' };
+    if (!inGrace && !phoneCanOpen(secret)) return { ok: false, error: 'this secret\'s name or ref is one the phone cannot show in its prompt, so it is not wrapped (it would be unopenable) — it stays approval-only' };
     const keys = activeWrapKeys(secret.did);
     if (!keys.length) return { ok: false, error: 'no linked phone with a wrap key (DemiPass app 1.5+): this secret is protected by approval only, and the host can still read it' };
     let value;
