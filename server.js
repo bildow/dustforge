@@ -4788,12 +4788,13 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
 // (#58 review H1). Status handling is unchanged ('used' on success).
 try { db.exec('ALTER TABLE blindkey_use_tokens ADD COLUMN executing_until TEXT'); } catch (_) {}
 const USE_CLAIM_SEC = 300;
+// Returns the claim (its expiry stamp) or null; a release clears only this request's own claim (#58 re-review L1).
 function claimUseToken(id) {
-  const now = new Date().toISOString();
+  const now = new Date().toISOString(), until = new Date(Date.now() + USE_CLAIM_SEC * 1000).toISOString();
   return db.prepare("UPDATE blindkey_use_tokens SET executing_until = ? WHERE id = ? AND status = 'valid' AND (executing_until IS NULL OR executing_until < ?)")
-    .run(new Date(Date.now() + USE_CLAIM_SEC * 1000).toISOString(), id, now).changes === 1;
+    .run(until, id, now).changes === 1 ? { id, until } : null;
 }
-function releaseUseToken(id) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ?').run(id); } catch (_) {} }
+function releaseUseToken(c) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ? AND executing_until = ?').run(c.id, c.until); } catch (_) {} }
 app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
   try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); }
 });
@@ -4866,8 +4867,9 @@ async function useRoute(req, res) {
     // But claim it for this request (2026-11-07): ssh_exec no longer blocks the process (HTTP actions never did), so
     // without a claim two redemptions of one token could both execute. The claim is held in this (single) process until
     // the call ends; the token's status moves as before ('used' on success, unchanged otherwise).
-    if (!claimUseToken(tokenRow.id)) return res.status(410).json({ error: 'use-token already in use' });
-    req._useClaim = tokenRow.id;
+    const claim = claimUseToken(tokenRow.id);
+    if (!claim) return res.status(410).json({ error: 'use-token already in use' });
+    req._useClaim = claim;
 
     // Execute using the token's pre-validated context
     const action = tokenRow.action_type;
@@ -5079,7 +5081,7 @@ async function useRoute(req, res) {
           const askpass = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'dp-askpass-')), 'askpass.sh');
           fs.writeFileSync(askpass, '#!/bin/sh\ncase "$1" in Username*) printf \'%s\' "$DP_GIT_SECRET" ;; *) printf \'\' ;; esac\n', { mode: 0o700 });
           // Use array form to avoid shell interpretation entirely
-          const cloneArgs = ['-c', 'credential.helper=', 'clone', '--depth', '1'];
+          const cloneArgs = ['-c', 'credential.helper=', '-c', 'http.followRedirects=false', 'clone', '--depth', '1'];
           if (branch) { cloneArgs.push('-b', branch); }
           cloneArgs.push(repo_url, dest_dir);
 
@@ -12297,8 +12299,16 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const fresh = db.prepare("SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND status = 'active'").get(secret.id, ownerDid);
     const again = fresh ? nextVersionName(ownerDid, baseName, fresh.version) : null;
     if (!fresh || !again || again.conflict || again.name !== target.name) {
-      try { await sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 }); } catch (_) {}
-      return res.status(409).json({ error: 'the secret changed while it was being rotated (rotated, removed or moved); the host was set back to the previous password', old_ref: ref });
+      let back = false;
+      try { back = (await sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 })).includes('ROLLED_BACK'); } catch (_) {}
+      if (back) return res.status(409).json({ error: 'the secret changed while it was being rotated (rotated, removed or moved); the host was set back to the previous password', old_ref: ref });
+      // The host could not be set back: it now runs on a password nothing stored. Keep it, under its own name, so the
+      // owner is not locked out (#58 re-review L2).
+      const keepName = `${baseName}_unsaved_rotation_${Date.now()}`, keepRef = generateRefCode('password', keepName);
+      db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, status, version, ref_code, account_username)
+                  VALUES (?, ?, ?, 'password', ?, 'active', 1, ?, ?)`).run(ownerDid, keepName, `password ${sshUser}@${target_host} was left on after a blind rotation collided and could not be rolled back`, blindkeyEncrypt(newPassword), keepRef, sshUser);
+      logSecurityEvent('rotation_unsaved_kept', 'critical', { caller_did: ownerDid, capability: 'rotate_blind', target: target_host, ip: req.ip, context: { kept_ref: keepRef } });
+      return res.status(409).json({ error: 'the secret changed while it was being rotated, and the host could not be set back: the password the host now uses is stored as ' + keepRef, kept_ref: keepRef });
     }
     const { name: newName, version: newVersion } = target;
     const encrypted = blindkeyEncrypt(newPassword);
