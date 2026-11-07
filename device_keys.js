@@ -235,7 +235,7 @@ module.exports = function registerDeviceKeys(deps) {
     // A mail-forwarding rule that became active in the last 48 hours may have carried the code to someone else (a
     // session token alone can make one): then only the password counts (#63 review H1). Active or not — removing the
     // rule after the code went out must not clear it (#63 re-review H1).
-    let newRelay = false;
+    let newRelay = true;   // fails closed: if the rules cannot be read, only the password counts
     try { newRelay = !!db.prepare("SELECT 1 FROM forward_relays WHERE did = ? AND julianday(COALESCE(activated_at, created_at)) > julianday('now', '-2 days') LIMIT 1").get(auth.did); } catch (_) {}
     const secondOk = gateFresh(auth.did, 'password', auth) || (!newRelay && gateFresh(auth.did, 'twofa', auth));
     const second = newRelay ? 'password' : 'twofa';
