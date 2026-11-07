@@ -86,8 +86,11 @@ module.exports = function registerGuardians(deps) {
     const mine = db.prepare("SELECT id, guardian_did, status, change_id, invited_at, accepted_at FROM recovery_guardians WHERE owner_did = ? AND status IN ('invited', 'accepted', 'active') ORDER BY id").all(auth.did);
     const theirs = db.prepare("SELECT id, owner_did, status, change_id, invited_at FROM recovery_guardians WHERE guardian_did = ? AND status IN ('invited', 'accepted', 'active') ORDER BY id").all(auth.did);
     const change = holds().openHolds(auth.did, 'guardians')[0];
-    res.json({ ok: true, active: activeSet(auth.did).length === SET_SIZE,
-      guardians: mine.map(r => ({ id: r.id, name: nameOf(r.guardian_did), status: r.status, pending_change: Boolean(r.change_id), invited_at: r.invited_at, accepted_at: r.accepted_at })),
+    // "active" means recovery would work now: three active guardians, each still eligible (paired, a person, a phone).
+    const set = activeSet(auth.did);
+    res.json({ ok: true, active: set.length === SET_SIZE && set.every(r => !ineligible(auth.did, r.guardian_did)),
+      guardians: mine.map(r => ({ id: r.id, name: nameOf(r.guardian_did), status: r.status, pending_change: Boolean(r.change_id), invited_at: r.invited_at, accepted_at: r.accepted_at,
+        ...(r.status === 'active' ? { eligible: !ineligible(auth.did, r.guardian_did) } : {}) })),
       change: change ? holds().view(change) : null,
       guarding: theirs.map(r => ({ id: r.id, owner: nameOf(r.owner_did), status: r.status, intent: `guardian-accept:${r.id}` })) });
   });
@@ -101,7 +104,8 @@ module.exports = function registerGuardians(deps) {
     if (!Array.isArray(list) || (list.length !== SET_SIZE && list.length !== 0)) return res.status(400).json({ error: `guardians: exactly ${SET_SIZE} people (or [] to remove them)` });
     if (!devices().hasDevice(owner)) return res.status(409).json({ error: 'link your phone first: guardians are set from it, and any of your phones can stop a recovery' });
     const dids = list.map(x => resolve(owner, x));
-    if (new Set(dids.map(String)).size !== dids.length) return res.status(400).json({ error: 'three different people' });
+    const known = dids.filter(Boolean);   // unknown names fall through to the one "not paired" answer (#60 re-review L3)
+    if (new Set(known).size !== known.length) return res.status(400).json({ error: 'three different people' });
     for (let i = 0; i < dids.length; i++) { const why = ineligible(owner, dids[i]); if (why) return res.status(409).json({ error: `${String(list[i]).slice(0, 60)}: ${why}` }); }
     const active = activeSet(owner);
     if (!active.length && !dids.length) return res.status(409).json({ error: 'you have no guardians to remove' });
