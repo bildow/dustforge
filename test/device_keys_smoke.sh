@@ -208,6 +208,11 @@ call POST /api/identity/device/enrol "$G4" '{"check":true}'
 call DELETE /api/relay/remove "$G3" '{"id":'$(Q "SELECT id FROM forward_relays LIMIT 1")'}'; call POST /api/relay/create "$G3" '{"forward_to":"someone@example.org"}'
 call POST /api/identity/device/enrol "$G3" '{"check":true}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = password ] && ok "(g) …and re-activating an old rule counts as new (its 48 h start again)" || fail "g relay reactivate: $CODE $BODY"
+# create → code → remove → link: the removed rule still counts (#63 re-review H1)
+G5=$(glogin); call POST /api/identity/request-2fa "$G5" '{"did":"'$DG'"}'; TC=$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DG' ORDER BY id DESC LIMIT 1")
+call DELETE /api/relay/remove "$G5" '{"id":'$(Q "SELECT id FROM forward_relays LIMIT 1")'}'; [ "$(Q "SELECT status FROM forward_relays LIMIT 1")" = inactive ] || fail "g remove: $CODE $BODY"
+call POST /api/identity/gate/verify "$G5" '{"gate":"twofa","code":"'$TC'"}'; call POST /api/identity/device/enrol "$G5" '{"check":true}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = password ] && ok "(g) …and removing the rule after the code went out does not clear it" || fail "g relay removed: $CODE $BODY"
 
 ! grep -qE "hook-token-zz90|crit-token-zz91" "$S/server.log" && ok "no value in the server log" || fail "value in log"
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails

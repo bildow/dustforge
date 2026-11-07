@@ -232,15 +232,16 @@ module.exports = function registerDeviceKeys(deps) {
     // account password OR an emailed code (to the wallet's own mailbox, which only the password opens), so an owner who
     // never types a vault value links a phone from the phone alone. Each stays fresh 5 minutes in this session.
     const intent = 'device-enrol:0';
-    // A mail-forwarding rule that became active in the last 48 hours may be carrying the code to someone else (a
-    // session token alone can make one): then only the password counts (#63 review H1).
+    // A mail-forwarding rule that became active in the last 48 hours may have carried the code to someone else (a
+    // session token alone can make one): then only the password counts (#63 review H1). Active or not — removing the
+    // rule after the code went out must not clear it (#63 re-review H1).
     let newRelay = false;
-    try { newRelay = !!db.prepare("SELECT 1 FROM forward_relays WHERE did = ? AND status = 'active' AND julianday(COALESCE(activated_at, created_at)) > julianday('now', '-2 days') LIMIT 1").get(auth.did); } catch (_) {}
+    try { newRelay = !!db.prepare("SELECT 1 FROM forward_relays WHERE did = ? AND julianday(COALESCE(activated_at, created_at)) > julianday('now', '-2 days') LIMIT 1").get(auth.did); } catch (_) {}
     const secondOk = gateFresh(auth.did, 'password', auth) || (!newRelay && gateFresh(auth.did, 'twofa', auth));
     const second = newRelay ? 'password' : 'twofa';
     const missing = [...(secondOk ? [] : [second]), ...(gateFresh(auth.did, 'pin', auth, intent) ? [] : ['pin'])];
     if (missing.length) return res.status(403).json({ ...gateMissing('device-enrol', [second, 'pin'], missing, intent),
-      ...(newRelay ? { note: 'a mail-forwarding rule became active in the last 48 hours, so an emailed code does not count: the account password, then the PIN' }
+      ...(newRelay ? { note: 'a mail-forwarding rule was made or turned on in the last 48 hours, so an emailed code does not count: the account password, then the PIN' }
                    : { or: { twofa: 'password' }, note: 'an emailed code (or the account password), then the PIN' }) });
     // {check:true}: the factors are fresh and nothing in the way — the app makes its keys and links within the PIN's
     // minute. Nothing is spent.
