@@ -8413,6 +8413,8 @@ require('./pairing')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh,
   devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a) });
 // Browser extension install page (public/extension.html): the Chrome waitlist while the store listing is pending.
 require('./extension_routes')({ app, db });
+// Meter: priced, Ed25519-signed charges for service calls that are not a /use (eval rig provisioning; meter.js).
+require('./meter').registerRoutes({ app, db, billing, identity, getBearerIdentity });
 // Person-to-person shares and ownership transfer (docs/sharing.md).
 const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
