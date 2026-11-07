@@ -41,7 +41,7 @@ const SLUG_RE = /^[a-z][a-z0-9-]{1,30}$/;
 const ACTION_RE = /^[a-z][a-z0-9_.-]{0,40}$/;
 const IDEM_RE = /^[A-Za-z0-9._:-]{8,100}$/;
 const DEPTHS = ['standard', 'elevated', 'critical'];
-const RESERVED_SLUGS = new Set(['demipass', 'dustforge', 'admin', 'meter', 'services', 'api']);
+const RESERVED_SLUGS = new Set(['demipass', 'dustforge', 'admin', 'meter', 'services', 'api', 'charges', 'delegations', 'consents', 'consent', 'token', 'verify', 'charge', 'register', 'receipts', 'delegate']);
 const MAX_COST_DD = 100000;            // one call, before margin ($100)
 const TOKEN_TTL_MAX_SEC = 24 * 3600;
 const TOKEN_CAP_DEFAULT_DD = 500;
@@ -166,9 +166,14 @@ module.exports = function registerServiceTenants(deps) {
   const fleetOwnerOf = (did) => (db.prepare(`SELECT f.owner_did FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
       WHERE s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'
       AND f.status = 'active' LIMIT 1`).get(did) || {}).owner_did || null;
-  // The person who answers for a wallet: an agent's fleet owner (for an agent its fleet created), a person themselves;
-  // an agent with no creating fleet has nobody → null (refused).
-  const personFor = (did) => isAgentWallet(did) ? fleetOwnerOf(did) : did;
+  // The person who answers for a wallet: for a wallet a fleet created, that fleet's owner WHATEVER its row's status now
+  // (a created agent that left or was removed is still not a person: #68 re-review N1, the fleetExitRefusal rule); an
+  // agent no fleet created has nobody → null (refused); anyone else answers for themselves.
+  const creatorOf = (did) => (db.prepare(`SELECT f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+      WHERE s.member_did = ? AND s.created_by_fleet = 1 ORDER BY s.id DESC LIMIT 1`).get(did) || {}).owner_did || null;
+  const personFor = (did) => creatorOf(did) || (isAgentWallet(did) ? null : did);
+  // A consent counts only while the person who approved it still answers for the wallet.
+  const liveConsent = (did, tenant) => { const c = consentOf(did, tenant); return c && c.approved_by === personFor(did) ? c : null; };
   const jsonList = (s) => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } };
   function actionView(a) {
     return { action: a.action, scope: a.scope, depth: a.depth, open: Boolean(a.open), measured_cost_dd: a.measured_cost_dd,
@@ -282,7 +287,7 @@ module.exports = function registerServiceTenants(deps) {
     let approval = null;
     if (action.depth !== 'standard') {
       // The approval is a person's: an agent acting on its own account has nobody to approve for it.
-      if (who.via === 'own' && isAgentWallet(d.sub)) {
+      if (who.via === 'own' && personFor(d.sub) !== d.sub) {
         return { status: 403, body: { ok: false, error: `'${action.action}' is ${action.depth}: an agent needs its fleet owner's delegation of '${action.scope}' (POST /api/services/delegate), whose phone approves each call`, depth: action.depth } };
       }
       const call = b.call && typeof b.call === 'object' && !Array.isArray(b.call) ? b.call : {};
@@ -344,7 +349,7 @@ module.exports = function registerServiceTenants(deps) {
     const dead = revoked({ jti: v.token_jti, sub: v.did, iat: v.iat, src_auth: v.src_auth, fleet: v.fleet, parent_jti: v.parent_jti });
     if (dead) return { status: 401, body: { error: dead } };
     if (v.did === tenant.service_did) return { status: 400, body: { error: 'a tenant does not charge itself' } };
-    const consent = consentOf(v.did, tenant);
+    const consent = liveConsent(v.did, tenant);
     if (!consent) return { status: 402, body: { error: `the caller has no standing consent to pay ${tenant.slug}`, consent_required: true } };
     const barrel = barrelRefusal(v.did, dd);
     if (barrel) return { status: barrel.statusCode || 403, body: barrel.body || { error: barrel.message } };
@@ -532,6 +537,10 @@ module.exports = function registerServiceTenants(deps) {
     if (!Number.isInteger(cap) || cap < 1 || cap > CONSENT_CAP_MAX_DD) return res.status(400).json({ error: `daily_cap_dd: 1-${CONSENT_CAP_MAX_DD} (the most ${t.slug} can charge this wallet in 24 h)` });
     const approver = personFor(auth.did);
     if (!approver) return res.status(403).json({ error: 'an agent no fleet created has no person to consent for it' });
+    // A wallet consenting for itself: the barrel tier applies to what the consent lets out in a day, not only per
+    // charge (re-review L). An agent's consent is its creator's to approve, with the creator's PIN and phone.
+    const barrel = approver === auth.did ? barrelRefusal(auth.did, cap) : null;
+    if (barrel) return res.status(barrel.statusCode || 403).json(barrel.body || { error: barrel.message });
     const g = personApproval('svc:demipass:consent', `let a wallet pay ${t.slug}`, approver, 'elevated', { did: auth.did, label: '' }, 'consent', 'demipass',
       { service: t.slug, wallet: auth.did, daily_cap_dd: cap }, b, null);
     if (!g.ok) return res.status(g.status).json(g.body);
@@ -563,7 +572,7 @@ module.exports = function registerServiceTenants(deps) {
     const t = tenantBySlug(b.service);
     if (!t) return res.status(404).json({ error: 'service: no such service (GET /api/services)' });
     if (auth.did === t.service_did) return res.status(400).json({ error: 'a tenant does not call itself' });
-    const consent = consentOf(auth.did, t);
+    const consent = liveConsent(auth.did, t);
     if (!consent) return res.status(403).json({ error: `consent to pay ${t.slug} first: POST /api/services/consent {service, daily_cap_dd} (approved in the DemiPass app)`, consent_required: true });
     const m = /^(\d+)(m|h)$/.exec(String(b.ttl || '1h'));
     if (!m) return res.status(400).json({ error: 'ttl: e.g. 15m, 1h, 24h' });

@@ -255,6 +255,10 @@ approve "$OWN" "$W1"; call PUT /api/services/fleetgate/actions "$FG" "$(jbody ac
 call POST /api/services/token "$AG" '{"service":"conduit"}'; ACT2=$(echo "$BODY" | J token)
 call DELETE /api/fleet/owner-agents/silicons/agent "$OWN"; [ "$CODE" = 200 ] || fail "remove agent: $CODE $BODY"
 V "$CD" "$(jbody token "$ACT2" action post)"; [ "$CODE" = 401 ] && ok "removed from the fleet: its service tokens die with its fleet tokens" || fail "fleet cut: $CODE $BODY"
+AGS=$(login agent); call POST /api/identity/pin "$AGS" '{"pin":"1111","password":"hunter22"}'
+call POST /api/services/consent "$AGS" '{"service":"conduit","daily_cap_dd":400}'; N1=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$N1")" = "$(did owner)" ] \
+  && ok "a created agent that left still answers to its creator: it cannot approve its own consent (N1)" || fail "N1: $CODE $BODY approver=$(Q "SELECT owner_did FROM use_approvals WHERE id=$N1")"
 
 # ── listings ────────────────────────────────────────────────────────────────────────────────────────────────────
 call GET /api/services/charges "$EXT"; [ "$(echo "$BODY" | J paid.0.token_id)" = "$TID3" ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["paid"]))')" = 3 ] \

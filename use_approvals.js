@@ -394,7 +394,10 @@ module.exports = function registerUseApprovals(deps) {
   function gateService(subject, caller, use, body = {}) {
     if (!/^svc:[a-z0-9-]+:[a-z0-9_.-]+$/.test(String(subject.key || ''))) return { status: 500, body: { error: 'bad service key' } };
     const pseudo = { id: 0, did: subject.approverDid, name: subject.name, security_depth: subject.depth, service_key: subject.key, wrap_state: null };
-    return gate(pseudo, caller, { kind: 'service', action: use.action, targetHost: use.targetHost, targetUrl: '', params: use.params || {}, delegationId: use.delegationId }, body);
+    // The approver is part of what is approved: a request made while one person answered for the caller never redeems
+    // after someone else does (#68 re-review).
+    return gate(pseudo, caller, { kind: 'service', action: use.action, targetHost: use.targetHost, targetUrl: '',
+      params: { ...(use.params || {}), approver_did: subject.approverDid }, delegationId: use.delegationId }, body);
   }
 
   return { gate, gateService, depthOf, bindingOf, _codeAt: codeAt, STEP_SEC, TTL_SEC };
