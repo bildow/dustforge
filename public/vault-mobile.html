@@ -786,9 +786,12 @@ async function rotatePasswordBlind(){
   o.style.color='var(--text3)';o.textContent='Rotating…';
   try{
     const d=await apiGated('POST','/api/identity/password/rotate-blind',{},'Rotate your account password');
+    if(d.pending){ o.style.color='var(--orange)'; o.textContent='Waiting on the mail server: '+(d.error||'the change settles within minutes')+' Nothing is lost.'; return; }
+    if(!d.rotated){ o.style.color='var(--red)'; o.textContent='Not rotated: '+(d.error||'unknown'); return; }
     const moved=(d.secrets_moved||[]).map(x=>x.name).join(', ');
     o.style.color='var(--green)';
-    o.textContent='Rotated ✓ Mail password: '+d.mailbox+'. '+(moved?'Now in: '+moved+'.':d.stored_as?'Stored as '+d.stored_as.name+'.':'')+((d.skipped||[]).length?' Not changed: '+d.skipped.map(x=>x.name+' ('+x.why+')').join('; ')+'.':'')+' '+(d.sessions||'');
+    o.textContent='Rotated ✓ Mail password: '+d.mailbox+'. '+(moved?'Now in: '+moved+'.':d.stored_as?'Stored as '+d.stored_as.name+'.':'')
+      +((d.still_hold_old_password||[]).length?' Still the OLD password (left as they were — change them yourself if they are other services): '+d.still_hold_old_password.join(', ')+'.':'')+' '+(d.sessions||'');
   }catch(e){ if(sessionEnded(e)) return; o.style.color='var(--red)';o.textContent='Not rotated: '+e.message; }
 }
 

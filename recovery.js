@@ -294,7 +294,16 @@ module.exports = function registerRecovery(deps) {
     res.json({ ok: true, challenge: nonce, message: completeMessage(h.did, h.id, nonce), ready_at: h.ready_at });
   });
 
+  // One password change per account at a time (account_password_locks, #69 review M1): completion changes the account
+  // and mailbox password.
   app.post('/api/identity/recovery/:id/complete', rateLimitStrict, async (req, res) => {
+    const hh = getReq(req.params.id);
+    const L = deps.pwLock ? deps.pwLock() : null;
+    const holder = 'recovery:' + String(req.params.id);
+    if (hh && L && (L.pendingFor(hh.did) || !L.claim(hh.did, holder))) return res.status(409).json(L.BUSY);
+    try { return await completeRecovery(req, res); } finally { if (hh && L) L.release(hh.did, holder); }
+  });
+  async function completeRecovery(req, res) {
     const b = req.body || {};
     const h = getReq(req.params.id);
     const c = findChallenge(b.challenge, 'complete');
@@ -366,7 +375,7 @@ module.exports = function registerRecovery(deps) {
       return res.status(500).json({ error: 'the recovery could not finish' + (back ? ' — nothing changed' : ' — contact support') });
     }
     res.json({ ok: true, completed: true, device_id: p.device_id, next: 'set a new PIN (with the new password); your wallet is on this phone now', ...report });
-  });
+  }
   // Put the mailbox back on the secret it had before this completion. true when confirmed.
   async function undoMailbox(did, prior) {
     if (prior === null || prior === undefined) return true;

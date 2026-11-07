@@ -1287,125 +1287,6 @@ app.post('/api/identity/login-code/verify', rateLimitStrict, (req, res) => {
     email: wallet.email, auth_method: 'email_code', ...(wallet.password_must_change ? { password_must_change: true } : {}) });
 });
 
-// ── Blind account-password rotation ──────────────────────────────────────────────────────────────────────────────
-// The owner, in their own session, with the PIN (pw-rotate:0) and, once a phone is linked, that phone's signature.
-// The server makes a random password nobody sees and sets it as the account password AND the mailbox password (they
-// are never left split: the mailbox's prior secret is read first and put back on any failure, as in recovery.js).
-// Then, blind: every active standard-depth password secret of the owner whose value is the OLD account password or the
-// OLD mailbox password gets a new version holding the new one (ref kept), so the vault entries that held it follow.
-// If none did, the new password is stored as a new secret, so it is never known to nobody. Sessions are kept.
-const pwRotating = new Set();
-app.post('/api/identity/password/rotate-blind', rateLimitStrict, async (req, res) => {
-  const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-  if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint' || auth.decoded.auth_method === 'worker'))) {
-    logSecurityEvent('password_rotate_denied', 'critical', { caller_did: auth.did, capability: 'pw-rotate', ip: req.ip, error: 'agent token' });
-    return res.status(403).json({ error: 'only the owner, in their own session, rotates the account password' });
-  }
-  if (!gateSession(auth)) return res.status(403).json({ error: 'sign in again' });
-  const did = auth.did, intent = 'pw-rotate:0';
-  if (!gateFresh(did, 'pin', auth, intent)) return res.status(403).json(gateMissing('pw-rotate', ['pin'], ['pin'], intent));
-  // The linked phone signs this decision (before the PIN proof is spent).
-  if (deviceKeys) { const r = deviceKeys.approvalRefusal(auth, 'pw-rotate', 0, 'account-password', req.body); if (r) return res.status(r.status).json(r.body); }
-  if (pwRotating.has(did)) return res.status(409).json({ error: 'a rotation is already running' });
-  const refused = spendSingleUse(did, 'pw-rotate', ['pin'], auth, intent);
-  if (refused) return res.status(refused.status || 403).json(refused);
-  pwRotating.add(did);
-  try {
-    const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
-    if (!wallet) return res.status(404).json({ error: 'identity not found' });
-    const m = wallet.username ? await fetchStalwartSecret(wallet.username) : { state: 'absent' };
-    if (m.state === 'unreachable') return res.status(503).json({ error: 'the mail server cannot be reached — nothing changed; try again', retry: true });
-    const prior = m.state === 'ok' ? m.secret : null;
-
-    // Which vault entries hold the old password (account's or mailbox's) — decided before anything changes.
-    const rows = db.prepare(`SELECT * FROM blindkey_secrets WHERE did = ? AND status = 'active'
-      AND (ref_code LIKE 'DP-PWD-%' OR secret_type IN ('password', 'passphrase'))`).all(did);
-    const moved = [], skipped = [];
-    for (const s of rows) {
-      const depth = s.security_depth === 'elevated' || s.security_depth === 'critical' ? s.security_depth : 'standard';
-      if (s.wrap_state === 'device') { skipped.push({ name: s.name, ref: s.ref_code || null, why: 'wrapped to your phone: the server cannot read it to compare' }); continue; }
-      if (s.frozen) { skipped.push({ name: s.name, ref: s.ref_code || null, why: 'frozen' }); continue; }
-      let v; try { v = blindkeyDecrypt(s.encrypted_value); } catch (_) { continue; }
-      if (typeof v !== 'string' || !v || v.length > 512) continue;
-      const acct = wallet.password_hash ? (await passwords.verifyPassword(v, wallet.password_hash)).ok === true : false;
-      const mail = prior ? (await passwords.verifyPassword(v, prior, { stalwart: true })).ok === true : false;
-      v = null;
-      if (!acct && !mail) continue;
-      if (depth !== 'standard') { skipped.push({ name: s.name, ref: s.ref_code || null, why: `${depth}: holds the old password, but is rotated only through its own approval` }); continue; }
-      moved.push({ row: s, matched: acct && mail ? 'account+mailbox' : acct ? 'account' : 'mailbox' });
-    }
-
-    const fresh = require('crypto').randomBytes(24).toString('base64url');
-    const newHash = await passwords.hashPassword(fresh);
-    const mailState = prior === null ? 'none' : await setMailboxPasswordHash(did, newHash).catch(() => 'unknown');
-    let mailConfirmed = false;
-    if (prior !== null && mailState !== 'ok') {
-      // What does the mailbox hold now? Unchanged → nothing happened; ours → it took (go on); otherwise put it back.
-      const now = wallet.username ? await fetchStalwartSecret(wallet.username) : { state: 'unreachable' };
-      const took = now.state === 'ok' && now.secret === newHash; mailConfirmed = took;
-      const back = !took && (mailState === 'unreached' || (now.state === 'ok' && now.secret === prior) || (await setMailboxPasswordHash(did, prior).catch(() => 'unknown')) === 'ok');
-      if (!took) {
-        if (back) return res.status(503).json({ error: 'the mail password could not be set — nothing changed; try again', retry: true });
-        // The mailbox may hold the new password and cannot be confirmed back: DemiPass follows it (never split).
-        logSecurityEvent('password_rotate_mailbox_unconfirmed', 'critical', { caller_did: did, capability: 'pw-rotate' });
-      }
-    }
-    const report = { secrets_moved: [], stored_as: null };
-    try {
-      db.transaction(() => {
-        if (db.prepare("UPDATE identity_wallets SET password_hash = ?, password_must_change = 0 WHERE did = ? AND COALESCE(password_hash, '') = ?")
-          .run(newHash, did, wallet.password_hash || '').changes !== 1) throw new Error('the account password changed meanwhile');
-        for (const x of moved) {
-          const r = rotateSecretValue(did, x.row, fresh, 1, req.ip);
-          if (r.status !== 200) throw new Error(`could not rotate ${x.row.name}: ${r.body.error}`);
-          report.secrets_moved.push({ name: x.row.name, new_name: r.body.new_name, ref: x.row.ref_code || null, matched: x.matched });
-        }
-        if (!moved.length) {
-          const name = `account-password-${wallet.username || 'wallet'}`.slice(0, 100);
-          const ref = generateRefCode('password', name);
-          const prev = db.prepare("SELECT 1 FROM blindkey_secrets WHERE did = ? AND name = ?").get(did, name);
-          const finalName = prev ? `${name}-${Date.now()}`.slice(0, 100) : name;
-          db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code, category)
-                      VALUES (?, ?, ?, 'password', ?, '{}', 'active', 1, ?, 'account')`)
-            .run(did, finalName, 'Account + mailbox password, set by a blind rotation', blindkeyEncrypt(fresh), ref);
-          report.stored_as = { name: finalName, ref };
-        }
-      })();
-    } catch (e) {
-      // Nothing in DemiPass changed: put the mailbox back. If that cannot be confirmed, DemiPass follows the mailbox.
-      const back = prior === null || (await setMailboxPasswordHash(did, prior).catch(() => 'unknown')) === 'ok';
-      if (!back) {
-        logSecurityEvent('password_rotate_mailbox_unconfirmed', 'critical', { caller_did: did, capability: 'pw-rotate', context: { error: String(e.message).slice(0, 120) } });
-        try { db.prepare('UPDATE identity_wallets SET password_hash = ? WHERE did = ?').run(newHash, did); } catch (_) {}
-        try {
-          const name = `account-password-${wallet.username || 'wallet'}-${Date.now()}`.slice(0, 100);
-          db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code, category)
-                      VALUES (?, ?, ?, 'password', ?, '{}', 'active', 1, ?, 'account')`).run(did, name, 'Account + mailbox password (rotation recovery)', blindkeyEncrypt(fresh), generateRefCode('password', name));
-        } catch (_) {}
-      }
-      return res.status(500).json({ error: 'the rotation could not finish: ' + e.message + (back ? ' — nothing changed' : ' — the new password is in your vault as account-password-…') });
-    }
-    logSecurityEvent('account_password_rotated', 'info', { caller_did: did, capability: 'pw-rotate', ip: req.ip, context: { moved: report.secrets_moved.map(x => x.name), mailbox: mailState } });
-    try {
-      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, detail) VALUES (?, ?, ?, ?)')
-        .run('account_password_rotated', did, null, JSON.stringify({ moved: report.secrets_moved.map(x => x.ref || x.name), stored_as: report.stored_as && report.stored_as.ref, mailbox: mailState }));
-    } catch (_) {}
-    const to = wallet.recovery_email || wallet.email;
-    if (to) try { fleetRoutes.sendMail({ to, subject: 'DemiPass: your account password was rotated',
-      text: 'Your DemiPass account password (and mail password) was just replaced with a new random one that nobody has seen. It is in your vault' +
-        (report.secrets_moved.length ? ': ' + report.secrets_moved.map(x => x.name).join(', ') : report.stored_as ? ': ' + report.stored_as.name : '') +
-        '.\nSign in with an emailed code or your phone. If this was not you, contact DemiPass support now.\n' }); } catch (_) {}
-    res.json({ ok: true, rotated: true, mailbox: mailState === 'none' ? 'no mailbox' : mailState === 'ok' || mailConfirmed ? 'changed' : 'unconfirmed (DemiPass follows it)',
-      secrets_moved: report.secrets_moved, ...(report.stored_as ? { stored_as: report.stored_as } : {}), skipped,
-      sessions: 'kept: you and your agents stay signed in. Sign out everywhere if the old password may have been used.',
-      sign_in: 'with an emailed code, or your linked phone; the password itself is only in your vault' });
-  } catch (e) {
-    console.error('[pw-rotate]', e.message);
-    if (!res.headersSent) res.status(500).json({ error: 'the rotation failed: ' + e.message });
-  } finally { pwRotating.delete(did); }
-});
-
 // ── Gate verification surface (per-credential security depth, item 4/5) ──────
 
 // GET /api/identity/gate/status — which gates are currently fresh for the caller,
@@ -8647,9 +8528,15 @@ const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, g
   recovery: () => guardianRecovery });
 // Guardian recovery (red team item 9, step 3): start on a new phone, two guardians approve with the owner's code, 48 h,
 // any of the owner's phones cancels; completion re-keys the account (recovery.js).
+// Account password (password_rotation.js): one lock per account for every change of the account + mailbox password
+// (rotate-blind, reset-password, recovery completion), and the blind rotation itself.
+const passwordRotation = require('./password_rotation')({ app, db, rateLimitStrict, getBearerIdentity, gateSession, gateFresh, gateMissing,
+  spendSingleUse, logSecurityEvent, passwords, fetchStalwartSecret, setMailboxPasswordHash, blindkeyDecrypt, blindkeyEncrypt,
+  rotateSecretValue, rotatingSecrets: { has: (i) => rotatingSecrets.has(i), add: (i) => rotatingSecrets.add(i), delete: (i) => rotatingSecrets.delete(i) }, generateRefCode, cutSessions: (did) => cutSessions(did), devices: () => deviceKeys,
+  sendMail: (...a) => fleetRoutes.sendMail(...a), storedOrigins: (v) => browserFill.storedOrigins(v) });
 const guardianRecovery = require('./recovery')({ app, db, rateLimitStrict, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing,
   spendSingleUse, logSecurityEvent, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys, holds: () => accountHolds,
-  guardians: () => recoveryGuardians, cryptoDepth: () => cryptoDepth, cutSessions: (did) => cutSessions(did),
+  guardians: () => recoveryGuardians, cryptoDepth: () => cryptoDepth, cutSessions: (did) => cutSessions(did), pwLock: () => passwordRotation,
   hashPassword: (pw) => passwords.hashPassword(pw), setMailboxPassword: (did, hash) => setMailboxPasswordHash(did, hash),
   getMailboxSecret: (did) => { const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did); return w ? fetchStalwartSecret(w.username) : Promise.resolve({ state: 'unreachable' }); } });
 // Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
@@ -13137,6 +13024,15 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
   if (db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ? AND used = 0').run(resetRow.id).changes !== 1) {
     return res.status(400).json({ error: 'invalid or expired reset token' });
   }
+  // One password change per account at a time (#69 review M1): a blind rotation in flight would otherwise be split from
+  // this reset (account on one password, mailbox on another).
+  const lockHolder = 'reset:' + resetRow.id;
+  if (passwordRotation.pendingFor(resetRow.did) || !passwordRotation.claim(resetRow.did, lockHolder)) {
+    db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM password_reset_tokens WHERE did = ? AND id > ?)').run(resetRow.id, resetRow.did, resetRow.id);
+    return res.status(409).json({ error: 'a password change on this account is still settling — try this link again in a few minutes' });
+  }
+  res.on('finish', () => passwordRotation.release(resetRow.did, lockHolder));
+  res.on('close', () => passwordRotation.release(resetRow.did, lockHolder));
   // On failure the link goes back to live, unless a newer one has replaced it.
   const release = () => { try {
     db.prepare('UPDATE password_reset_tokens SET used = 0 WHERE id = ? AND NOT EXISTS (SELECT 1 FROM password_reset_tokens WHERE did = ? AND id > ?)')
