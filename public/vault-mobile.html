@@ -122,6 +122,8 @@
   <button onclick="login()">Sign in</button>
   <div id="auth-err" class="auth-err"></div>
   <div id="auth-holds" style="max-width:320px;width:100%"></div>
+  <a href="#" onclick="openRecover();return false" style="display:block;text-align:center;margin-top:0.6rem;color:var(--text3);font-size:0.8rem;text-decoration:none">Lost your phones? Recover with your guardians</a>
+  <div id="recover-box" style="display:none;max-width:320px;width:100%;margin-top:0.8rem"></div>
   <a href="https://demipass.com/reset-password.html" style="display:block;text-align:center;margin-top:1rem;color:var(--text3);font-size:0.8rem;text-decoration:none">Forgot password?</a>
 </div>
 
@@ -345,6 +347,8 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked for every reveal; email/SMS codes stay fresh 5 minutes)</div>
         <div id="pin-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.4rem"></div>
         <button class="btn-ghost" onclick="openPinChange()" style="width:100%;text-align:left;padding:0.6rem">Change PIN</button>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Recovery guardians (three people you paired with in person; two of them can let you back in if you lose every phone)</div>
+        <div id="guardians-box" style="margin-top:0.3rem;font-size:0.8rem"></div>
         <div id="holds-wrap" style="display:none;margin-top:0.9rem"><div style="font-size:0.8rem;color:var(--red)">Waiting changes to your wallet</div><div id="holds" style="margin-top:0.3rem"></div></div>
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Phones (approvals come from a linked phone; its fingerprint/face stands in for the PIN)</div>
         <div id="devices" style="margin-top:0.3rem"></div>
@@ -711,7 +715,7 @@ async function ensureSession(){
 }
 if(tk&&!isTokenExpired())showApp();
 else if(tk){ensureSession().then(ok=>{if(ok)showApp();else checkLoginHolds()},()=>{document.getElementById('auth-err').textContent='No connection — reopen to continue'})}
-else setTimeout(()=>{ try{ checkLoginHolds(); }catch(_){} },0);   // item 9: signed out, the linked phone still asks what is waiting
+else setTimeout(()=>{ try{ checkLoginHolds(); if(recState()) renderRecover(); }catch(_){} },0);   // item 9: signed out, the linked phone still asks what is waiting; a recovery in progress resumes
 async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&hadToken&&!(await ensureSession()))throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){const rr=hadToken&&!(opt&&opt.renewed)&&epoch===sessionEpoch?await renewSession():null;if(rr==='ok')return api(m,p,b,{...(opt||{}),renewed:true});if(rr==='offline')throw dropped(m);if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>null);if(epoch!==sessionEpoch)throw new Error('session ended');if(!d&&r.status<400)throw dropped(m);if(r.status>=400&&!d)throw Object.assign(new Error('failed'),{status:r.status});if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
 // A reply cut off by a network change: say so, and never show it as an empty vault or zero balance.
 function dropped(m){return Object.assign(new Error(!m||m==='GET'?'Connection dropped — retrying':'Connection dropped — check whether it went through before trying again'),{dropped:true})}
@@ -960,7 +964,7 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();loadHolds();}
+  if(n.dataset.page==='settings'){loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();loadHolds();loadGuardians();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -2324,6 +2328,113 @@ async function checkLoginHolds(){
     const hs=r.holds||[];
     el.innerHTML=hs.length?'<div style="margin-top:1rem;font-size:0.85rem;color:var(--red)">Waiting changes to your wallet — cancel any that were not you:</div>'+holdCards(hs):'';
   }catch(_){ el.innerHTML=''; }
+}
+
+// ── recovery guardians and guardian recovery (red team item 9) ───────────────────────────────────────────────────
+async function loadGuardians(){
+  const el=document.getElementById('guardians-box'); if(!el||!tk) return;
+  try{
+    const [g,a]=await Promise.all([api('GET','/api/identity/guardians'),api('GET','/api/identity/recovery/asks').catch(()=>({asks:[]}))]);
+    const mine=(g.guardians||[]).filter(x=>x.status!=='removed');
+    let h='';
+    for(const r of (a.asks||[])) h+='<div class="fill-req" style="border-color:var(--red)"><div><b>@'+esc(r.owner)+'</b> asks to recover their wallet onto a new phone (code on it: '+esc(r.new_phone&&r.new_phone.code||'')+')</div>'
+      +'<div style="font-size:0.75rem;color:var(--text3)">Approve only if '+esc(r.owner)+' told you the 6-digit code themselves — in person, or on a call you started.'+(r.ready_at?' Completes '+esc(fmtWhen(r.ready_at))+' unless canceled.':'')+'</div>'
+      +'<div class="fr-row">'+(r.i_approved?'<button class="btn-ghost" onclick="recoveryAct('+esc(JSON.stringify(r.id))+',\'withdraw\')">Withdraw my approval</button>'
+        :'<input id="rc-'+esc(r.id)+'" inputmode="numeric" maxlength="6" placeholder="code" style="width:6rem"> <button class="btn-primary" onclick="recoveryApprove('+esc(JSON.stringify(r.id))+')">Approve</button>')
+      +' <button class="btn-danger" onclick="recoveryAct('+esc(JSON.stringify(r.id))+',\'decline\')">Decline — stop it</button></div></div>';
+    for(const r of (g.guarding||[])) h+='<div class="fill-req"><div>'+(r.status==='invited'?'<b>@'+esc(r.owner)+'</b> asks you to be a recovery guardian':'You are a recovery guardian of <b>@'+esc(r.owner)+'</b>')+'</div><div class="fr-row">'
+      +(r.status==='invited'?'<button class="btn-primary" onclick="guardianAct('+r.id+',\'accept\')">Accept</button> <button class="btn-ghost" onclick="guardianAct('+r.id+',\'decline\')">Decline</button>'
+        :r.status==='active'?'<button class="btn-ghost" onclick="guardianAct('+r.id+',\'leave\')">Stop being their guardian</button>':'<span style="font-size:0.75rem;color:var(--text3)">accepted</span>')+'</div></div>';
+    h+='<div style="margin-top:0.3rem">'+(mine.length?mine.map(x=>'@'+esc(x.name)+' — '+esc(x.status==='active'?(x.eligible===false?'active, but cannot help (not paired in person or no phone)':'active'):x.status)+(x.pending_change?' (in the waiting change)':'')).join('<br>'):'No guardians yet.')+'</div>'
+      +(g.active?'<div style="color:var(--green);font-size:0.75rem">Recovery by guardians is on.</div>':'')
+      +(g.change?'<div style="font-size:0.75rem;color:var(--text3)">A change of your guardians takes effect '+esc(fmtWhen(g.change.ready_at))+' (see Waiting changes).</div>':'')
+      +'<div class="fr-row" style="margin-top:0.3rem"><input id="g-names" placeholder="three usernames, comma-separated" style="flex:1"> <button class="btn-ghost" onclick="setGuardians()">'+(mine.length?'Change':'Name them')+'</button></div>';
+    el.innerHTML=h;
+  }catch(e){ if(!sessionEnded(e)) el.textContent=e.message; }
+}
+async function setGuardians(){
+  const raw=(document.getElementById('g-names').value||'').trim();
+  const names=raw?raw.split(/[\s,]+/).filter(Boolean):[];
+  if(names.length!==3&&!(names.length===0&&confirm('Remove all your guardians? It takes 48 hours.'))) { if(names.length!==0) alert('Name exactly three people you paired with in person.'); return; }
+  try{ const r=await apiGated('POST','/api/identity/guardians',{guardians:names},'Set your recovery guardians? Your PIN and phone confirm it.');
+    alert(r.pending?'Your guardians change in 48 hours ('+fmtWhen(r.ready_at)+'), once the new ones accept. Any of your phones can cancel it.':'Invited: '+(r.invited||[]).join(', ')+'. Recovery is on when all three accept.'); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadGuardians(); loadHolds();
+}
+async function guardianAct(id, what){
+  try{
+    if(what==='leave'&&!confirm('Stop being their guardian? They will be told.')) return;
+    await apiGated('POST','/api/identity/guardians/'+encodeURIComponent(id)+'/'+what,{},what==='accept'?'Become their recovery guardian? Your PIN and phone confirm it.':'');
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadGuardians();
+}
+async function recoveryApprove(id){
+  const code=(document.getElementById('rc-'+id)||{}).value||'';
+  if(!/^\d{6}$/.test(code.trim())){ alert('Type the 6 digits they told you.'); return; }
+  try{ const r=await apiGated('POST','/api/identity/recovery/'+encodeURIComponent(id)+'/approve',{code:code.trim()},'Approve this recovery? Your PIN and phone confirm it.');
+    alert(r.status==='quorum'?'Approved. Two guardians have approved: it can complete '+fmtWhen(r.ready_at)+' unless their phones cancel it.':'Approved.'); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadGuardians();
+}
+async function recoveryAct(id, what){
+  try{ if(what==='decline'&&!confirm('Stop this recovery? It is canceled for everyone.')) return;
+    await apiGated('POST','/api/identity/recovery/'+encodeURIComponent(id)+'/'+what,{},what==='decline'?'Stop this recovery? Your PIN confirms it.':''); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  loadGuardians();
+}
+// The recovering phone (signed out). The request lives on in this phone's storage while guardians approve (days).
+function recState(){ try{ return JSON.parse(localStorage.getItem('dp_recovery')||'null'); }catch(_){ return null; } }
+async function openRecover(){
+  const box=document.getElementById('recover-box'); box.style.display='block';
+  if(!globalThis.DemiPassDevice){ box.innerHTML='<div style="font-size:0.8rem">Open this in the DemiPass app on your new phone: the recovery is tied to that phone\'s keys.</div>'; return; }
+  const st=recState(); if(st&&st.id) return renderRecover();
+  box.innerHTML='<div style="font-size:0.8rem;margin-bottom:0.4rem">Your guardians must hear the code from you. Elevated and critical secrets locked to your old phones cannot be recovered.</div>'
+    +'<input id="rec-user" placeholder="Your username" style="width:100%"><button onclick="startRecover()" style="margin-top:0.4rem">Start recovery on this phone</button><div id="rec-msg" class="auth-err"></div>';
+}
+async function startRecover(){
+  const acct=(document.getElementById('rec-user').value||'').trim().toLowerCase(), m=document.getElementById('rec-msg');
+  if(!acct){ m.textContent='Your username'; return; }
+  try{
+    const ch=await holdsPost('/api/identity/recovery/challenge',{account:acct});
+    const k=await dev.call('recoveryKeys',ch.message);
+    if(!k.ok) throw new Error(k.error||'could not make keys');
+    const r=await holdsPost('/api/identity/recovery/start',{account:acct,challenge:ch.challenge,device_id:k.device_id,label:k.label,key_d:k.key_d,key_p:k.key_p,sig_d:k.sig_d,sig_p:k.sig_p});
+    localStorage.setItem('dp_recovery',JSON.stringify({id:r.request_id,account:acct,code:r.code,fp:r.fingerprint,device_id:k.device_id}));
+    renderRecover();
+  }catch(e){ m.textContent=e.message; try{ globalThis.DemiPassDevice.abandonRecovery(); }catch(_){} }
+}
+async function renderRecover(){
+  const box=document.getElementById('recover-box'), st=recState(); if(!box||!st) return;
+  box.style.display='block';
+  let s=null; try{ const r=await fetch(API+'/api/identity/recovery/status?id='+encodeURIComponent(st.id)); s=await r.json(); }catch(_){}
+  if(!s||!s.ok||['canceled','expired','failed'].includes(s.status)){
+    try{ globalThis.DemiPassDevice.abandonRecovery(); }catch(_){} localStorage.removeItem('dp_recovery');
+    box.innerHTML='<div style="font-size:0.8rem;color:var(--red)">This recovery is over ('+esc((s&&s.status)||'not found')+'). Nothing changed. You can start again.</div>'; return;
+  }
+  const ready=s.status==='quorum'&&s.ready_at&&Date.parse(s.ready_at)<=Date.now();
+  box.innerHTML='<div style="font-size:0.85rem">Recovering <b>@'+esc(st.account)+'</b>. Tell each guardian this code yourself:</div>'
+    +'<div style="font-size:1.6rem;letter-spacing:0.3rem;text-align:center;margin:0.4rem 0"><b>'+esc(st.code)+'</b></div>'
+    +'<div style="font-size:0.75rem;color:var(--text3)">This phone\'s key code (they see it too): '+esc(st.fp)+'</div>'
+    +'<div style="font-size:0.8rem;margin-top:0.4rem">'+esc(String(s.approvals))+' of '+esc(String(s.needed))+' guardians approved.'+(s.ready_at?' You can finish '+esc(fmtWhen(s.ready_at))+'.':'')+'</div>'
+    +(ready?'<input id="rec-pw" type="password" placeholder="New password (8+)" style="width:100%;margin-top:0.4rem"><input id="rec-pw2" type="password" placeholder="Again" style="width:100%"><button onclick="finishRecover()">Finish — this phone becomes your wallet\'s phone</button>'
+      :'<button class="btn-ghost" onclick="renderRecover()" style="margin-top:0.4rem">Check again</button>')
+    +'<div id="rec-msg" class="auth-err"></div>';
+}
+async function finishRecover(){
+  const st=recState(), m=document.getElementById('rec-msg'), pw=document.getElementById('rec-pw').value, pw2=document.getElementById('rec-pw2').value;
+  if(pw.length<8||pw!==pw2){ m.textContent=pw!==pw2?'The two passwords differ':'At least 8 characters'; return; }
+  try{
+    const ch=await holdsPost('/api/identity/recovery/'+encodeURIComponent(st.id)+'/complete-challenge',{device_id:st.device_id});
+    const k=await dev.call('recoverySign',ch.message);
+    if(!k.ok) throw new Error(k.error||'not confirmed');
+    await holdsPost('/api/identity/recovery/'+encodeURIComponent(st.id)+'/complete',{device_id:st.device_id,challenge:ch.challenge,sig_d:k.sig_d,sig_p:k.sig_p,new_password:pw});
+    try{ globalThis.DemiPassDevice.commitRecovery(); }catch(_){}
+    localStorage.removeItem('dp_recovery');
+    document.getElementById('recover-box').style.display='none';
+    document.getElementById('auth-user').value=st.account; document.getElementById('auth-pass').value=pw;
+    alert('Your wallet is on this phone now. Sign in with the new password, then set a new PIN.');
+    login();
+  }catch(e){ m.textContent=e.message; }
 }
 
 // ── wrap key (red team item 1): elevated/critical secrets are wrapped to this phone; the host cannot read them ────
