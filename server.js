@@ -1867,21 +1867,28 @@ app.get('/api/identity/ssn/codebook', (_req, res) => {
 // Membership means a fleet_silicons row in status 'active': every way into it takes the member's consent (claim,
 // member_token or admin link, provisioning, network accept). fleet_members is NOT used: POST /api/fleet/:slug/invite
 // writes any DID there with no consent, so trusting it let anyone make a fleet, "invite" a stranger and read their
-// balance and ledger (#72 review).
+// balance and ledger (#72 review). Wallets the legacy /provision routes created sit only in fleet_members; they count
+// for the fleet that provisioned them (its server-written account_created entry names that fleet), which no invite can fake.
 //   fleetLink(a,b) => 'carbon'  if a OWNS a fleet that b is a member of
 //                     'silicon' if b OWNS a fleet that a is a member of
 //                     null      otherwise
 function fleetLink(a, b) {
   if (!a || !b || a === b) return null;
   const aOwnsBIn = db.prepare(
-    `SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
-       WHERE f.owner_did = ? AND s.member_did = ? AND s.status = 'active' AND s.member_did != f.owner_did LIMIT 1`
-  ).get(a, b);
+    `SELECT 1 FROM fleets f WHERE f.owner_did = @owner AND f.owner_did != @member AND (
+         EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.fleet_id = f.id AND s.member_did = @member AND s.status = 'active')
+         OR (EXISTS (SELECT 1 FROM fleet_members m WHERE m.fleet_id = f.id AND m.member_did = @member)
+             AND EXISTS (SELECT 1 FROM identity_transactions t WHERE t.did = @member AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
+                         AND t.description IN ('Fleet-provisioned by ' || f.slug, 'Fleet bulk-provisioned by ' || f.slug)))) LIMIT 1`
+  ).get({ owner: a, member: b });
   if (aOwnsBIn) return 'carbon';
   const bOwnsAIn = db.prepare(
-    `SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
-       WHERE f.owner_did = ? AND s.member_did = ? AND s.status = 'active' AND s.member_did != f.owner_did LIMIT 1`
-  ).get(b, a);
+    `SELECT 1 FROM fleets f WHERE f.owner_did = @owner AND f.owner_did != @member AND (
+         EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.fleet_id = f.id AND s.member_did = @member AND s.status = 'active')
+         OR (EXISTS (SELECT 1 FROM fleet_members m WHERE m.fleet_id = f.id AND m.member_did = @member)
+             AND EXISTS (SELECT 1 FROM identity_transactions t WHERE t.did = @member AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
+                         AND t.description IN ('Fleet-provisioned by ' || f.slug, 'Fleet bulk-provisioned by ' || f.slug)))) LIMIT 1`
+  ).get({ owner: b, member: a });
   if (bOwnsAIn) return 'silicon';
   return null;
 }
