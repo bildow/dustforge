@@ -1,6 +1,6 @@
 # Credential & Token Inventory
 
-Last updated: 2026-04-14
+Last updated: 2026-11-07 (values removed: they live only in DemiPass; this table records where, never what)
 
 ## Production Secrets
 
@@ -11,32 +11,32 @@ Last updated: 2026-04-14
 | PLATFORM_SECRET | Generated at runtime (random) | Regenerates on restart | Not persisted — tokens invalidated on restart |
 | STRIPE_SECRET_KEY | civitasvox /app/.env | Stripe dashboard | Not backed up |
 | STRIPE_WEBHOOK_SECRET | civitasvox /app/.env | Stripe dashboard | Not backed up |
-| OPENROUTER_API_KEY | civitasvox /app/.env | OpenRouter dashboard | Key: sk-or-v1-b3f4... (Aaron's) |
-| CONDUIT_CARBON_TOKEN | civitasvox /app/.env | Manual | lxom4qW_... |
+| OPENROUTER_API_KEY | civitasvox /app/.env | OpenRouter dashboard | Key: vault (Aaron's) |
+| CONDUIT_CARBON_TOKEN | civitasvox /app/.env | Manual | vault |
 
 ## Access Tokens
 
 | Token | Type | Expires | Notes |
 |-------|------|---------|-------|
 | npm (dustforge-agent-sdk) | Granular access | 2026-07-07 | Published as gnomishplumber |
-| GitHub PAT | Classic | Unknown | ghp_HsP... (used for git push) |
+| GitHub PAT | Classic | Unknown | vault (used for git push) |
 | Codex CLI OAuth | ChatGPT Plus | ~10 days (auto-refresh) | Stored in brain /root/.codex/auth.json |
 
 ## Platform Tokens (new)
 
 | Account | Token | Label |
 |---------|-------|-------|
-| 1 (Civitasvox) | 96815f...d67e | aaron-primary |
-| 2 (Fat Tacos) | 89356...c737 | fat-tacos-test |
+| 1 (Civitasvox) | vault | aaron-primary |
+| 2 (Fat Tacos) | vault | fat-tacos-test |
 
 ## Infrastructure Access
 
 | Host | Method | Credential |
 |------|--------|-----------|
-| RackNerd (192.3.84.103) | SSH root | zl46bv... |
-| RackNerd panel | Web | vmuser296962 / 5CcEA... |
-| Kyle machines (k1, ky7) | SSH claude | subwayeatfresh |
-| Phasewhip | SSH claude | subwayeatfresh |
+| RackNerd (192.3.84.103) | SSH root | vault (see the DemiPass ref list) |
+| RackNerd panel | Web | vault (see the DemiPass ref list) |
+| Kyle machines (k1, ky7) | SSH claude | vault (see the DemiPass ref list) |
+| Phasewhip | SSH claude | vault (see the DemiPass ref list) |
 
 ## Critical Risks
 

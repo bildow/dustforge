@@ -14,7 +14,7 @@ const LORI_AUTH_KEY = process.env.LORI_AUTH_KEY || '';
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
 const LLM_MODEL = process.env.LLM_MODEL || 'deepseek/deepseek-v3.2';
 const CONDUCTOR_URL = process.env.CONDUCTOR_URL || 'http://10.225.75.95:8001';
-const CONDUCTOR_TOKEN = process.env.CONDUCTOR_TOKEN || 'a8c2f5d3e7b1940682fe5c3a7d2e8b6f4c9a1d3e7f2b5c8';
+const CONDUCTOR_TOKEN = process.env.CONDUCTOR_TOKEN || '';
 const startTime = Date.now();
 
 // Auth middleware — all mutation routes require either Conduit token or LORI_AUTH_KEY
