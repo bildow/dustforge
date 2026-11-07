@@ -101,9 +101,35 @@ function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } 
   // break has always logged in without it. A NUL or a line break inside is refused.
   if (typeof password === 'string') password = password.replace(/\r?\n$/, '');
   if (typeof password !== 'string' || /[\0\r\n]/.test(password)) refuse('this stored password cannot be used for ssh (it holds a NUL or a line break)');
-  return require('child_process').execFileSync('sshpass',
-    ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '--', `${user}@${host}`, remoteCommand],
-    { timeout, encoding: 'utf8', maxBuffer: 1024 * 1024, env: { ...process.env, SSHPASS: password }, input });
+  // Asynchronous (2026-11-07). execFileSync froze the whole API for up to `timeout` on every ssh call, and a remote
+  // command that called this API back (the deploy leak gate's scan, a scan-token claim) deadlocked until the kill.
+  // Resolves with stdout; rejects with { stdout, stderr, status } as execFileSync threw (status 255 is ssh's own).
+  return new Promise((resolve, reject) => {
+    const child = require('child_process').spawn('sshpass',
+      ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '--', `${user}@${host}`, remoteCommand],
+      { env: { ...process.env, SSHPASS: password }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const MAX = 1024 * 1024, out = [], err = [];
+    let outLen = 0, errLen = 0, why = null, settled = false, hard = null;
+    // SIGTERM, then SIGKILL 5 s later; and the promise settles by then whatever the child does (#58 review L1).
+    const stop = (reason) => {
+      if (why) return; why = reason;
+      try { child.kill('SIGTERM'); } catch (_) {}
+      hard = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} finish(null); }, 5000);
+    };
+    const timer = setTimeout(() => stop('timed out'), timeout);
+    child.stdout.on('data', d => { outLen += d.length; if (outLen > MAX) stop('output over 1 MiB'); else out.push(d); });
+    child.stderr.on('data', d => { errLen += d.length; if (errLen <= MAX) err.push(d); });
+    function finish(code) {
+      if (settled) return; settled = true; clearTimeout(timer); if (hard) clearTimeout(hard);
+      const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8') + (why ? `\n[${why}]` : '');
+      if (code === 0 && !why) return resolve(stdout);
+      reject(Object.assign(new Error(why || `exit ${code}`), { stdout, stderr, status: code || 1 }));
+    }
+    child.on('error', e => { if (!settled) { settled = true; clearTimeout(timer); if (hard) clearTimeout(hard); reject(Object.assign(new Error(e.message), { stdout: '', stderr: e.message, status: 1 })); } });
+    child.on('close', (code) => finish(code));
+    child.stdin.on('error', () => {});   // the remote side may close stdin early
+    child.stdin.end(input === undefined ? undefined : input);
+  });
 }
 
 const pinGate = require('./pin_gate');   // vault PIN: hash/verify/lockout helpers for the 'pin' gate
@@ -4756,7 +4782,23 @@ app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddle
 //   2. direct mode: { name, action, params, context } — validates context inline (backward compatible)
 //   3. one-call mode: { ref | name of a shared secret, action, params, context? } — issues a use-token through
 //      request-token (same delegation, context, gate, velocity and worker checks) and redeems it at once
+// One redemption of a use-token at a time (2026-11-07): ssh_exec no longer blocks the process (HTTP actions never did),
+// so two redemptions of one token could both execute. The claim is a column (survives several workers, expires if
+// the process dies) taken before anything runs and released when the handler ends — not when the client goes away
+// (#58 review H1). Status handling is unchanged ('used' on success).
+try { db.exec('ALTER TABLE blindkey_use_tokens ADD COLUMN executing_until TEXT'); } catch (_) {}
+const USE_CLAIM_SEC = 300;
+// Returns the claim (its expiry stamp) or null; a release clears only this request's own claim (#58 re-review L1).
+function claimUseToken(id) {
+  const now = new Date().toISOString(), until = new Date(Date.now() + USE_CLAIM_SEC * 1000).toISOString();
+  return db.prepare("UPDATE blindkey_use_tokens SET executing_until = ? WHERE id = ? AND status = 'valid' AND (executing_until IS NULL OR executing_until < ?)")
+    .run(until, id, now).changes === 1 ? { id, until } : null;
+}
+function releaseUseToken(c) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ? AND executing_until = ?').run(c.id, c.until); } catch (_) {} }
 app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
+  try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); }
+});
+async function useRoute(req, res) {
   let { use_token } = req.body || {};
 
   const b = req.body || {};
@@ -4822,6 +4864,12 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
     // DO NOT burn the token yet — wait until the action succeeds.
     // Burning before execution means transient failures consume tokens and delegation quota.
+    // But claim it for this request (2026-11-07): ssh_exec no longer blocks the process (HTTP actions never did), so
+    // without a claim two redemptions of one token could both execute. The claim is held in this (single) process until
+    // the call ends; the token's status moves as before ('used' on success, unchanged otherwise).
+    const claim = claimUseToken(tokenRow.id);
+    if (!claim) return res.status(410).json({ error: 'use-token already in use' });
+    req._useClaim = claim;
 
     // Execute using the token's pre-validated context
     const action = tokenRow.action_type;
@@ -4946,7 +4994,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
             const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
             egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
             if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
-            const output = sshRun(effectiveUser, target_host, password, remote, { input });
+            const output = await sshRun(effectiveUser, target_host, password, remote, { input });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
@@ -5027,25 +5075,28 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           if (branch && !/^[a-zA-Z0-9._\/-]+$/.test(branch)) {
             return res.status(400).json({ error: 'branch contains disallowed characters' });
           }
-          const dest_dir = '/tmp/demipass-clone-' + crypto.randomBytes(4).toString('hex');
-
-          // Inject token into HTTPS URL
-          const authedUrl = repo_url.replace('https://', `https://${decryptedValue}@`);
+          // A private directory (0700), and the token never in git's argv (visible in ps) or in .git/config: git asks
+          // for the username through GIT_ASKPASS, a 0700 helper that prints it from this child's environment (#58 review).
+          const dest_dir = fs.mkdtempSync('/tmp/demipass-clone-');
+          const askpass = path.join(fs.mkdtempSync(path.join(require('os').tmpdir(), 'dp-askpass-')), 'askpass.sh');
+          fs.writeFileSync(askpass, '#!/bin/sh\ncase "$1" in Username*) printf \'%s\' "$DP_GIT_SECRET" ;; *) printf \'\' ;; esac\n', { mode: 0o700 });
           // Use array form to avoid shell interpretation entirely
-          const cloneArgs = ['clone', '--depth', '1'];
+          const cloneArgs = ['-c', 'credential.helper=', '-c', 'http.followRedirects=false', 'clone', '--depth', '1'];
           if (branch) { cloneArgs.push('-b', branch); }
-          cloneArgs.push(authedUrl, dest_dir);
+          cloneArgs.push(repo_url, dest_dir);
 
           try {
-            // FIX #3: use execFileSync (no shell) to prevent injection
-            const { execFileSync } = require('child_process');
             egressLog(req, secret, 'git_clone', repo_url);   // written before the connection: the outbound log (the URL cloned)
-            const cloneOutput = execFileSync('git', cloneArgs, { timeout: 60000, encoding: 'utf8', maxBuffer: 1024 * 1024 });
+            const { stdout: cloneOutput } = await require('util').promisify(require('child_process').execFile)('git', cloneArgs,
+              { timeout: 60000, killSignal: 'SIGKILL', encoding: 'utf8', maxBuffer: 1024 * 1024,
+                env: { ...process.env, GIT_ASKPASS: askpass, GIT_TERMINAL_PROMPT: '0', DP_GIT_SECRET: decryptedValue } });
             const redacted = cloneOutput.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
             result = { cloned: true, dest_dir, stdout: redacted };
           } catch (cloneErr) {
             const redact = (s) => s.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
-            result = { cloned: false, stderr: redact((cloneErr.stderr || '').toString()), exit_code: cloneErr.status || 1 };
+            result = { cloned: false, stderr: redact((cloneErr.stderr || '').toString()), exit_code: typeof cloneErr.code === 'number' ? cloneErr.code : 1 };
+          } finally {
+            try { fs.rmSync(path.dirname(askpass), { recursive: true, force: true }); } catch (_) {}
           }
           break;
         }
@@ -5261,9 +5312,18 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
 
   // Usage stats move once the action has run (or reached the upstream), never for a call refused on the way —
   // a malformed call must not use up a capped scope (#43 re-review N7).
+  // The scope's use is reserved before anything runs (#58 review M2: with ssh yielding, N concurrent calls would all
+  // pass the max_uses check), and given back if the call never reaches the action.
+  let reservedCtx = null, counted = false;
+  if (ctxCheck.context_id) {
+    if (db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ? AND (COALESCE(max_uses, 0) <= 0 OR use_count < max_uses)').run(ctxCheck.context_id).changes !== 1) {
+      return res.status(403).json({ error: 'this scope has no uses left' });
+    }
+    reservedCtx = ctxCheck.context_id;
+  }
   const countUse = () => {
     db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
-    if (ctxCheck.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(ctxCheck.context_id);
+    counted = true;
   };
 
   // Execute the action with the secret injected
@@ -5394,7 +5454,7 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
           const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
           egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
           if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
-          const output = sshRun(target_user, target_host, password, remote, { input });
+          const output = await sshRun(target_user, target_host, password, remote, { input });
 
           // Redact any echo of credentials in the output
           const redactedOutput = output
@@ -5424,8 +5484,10 @@ app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, '
     if (e.code === 'upstream_too_large') { countUse(); return res.status(413).json(e.body); }
     if (e.code === 'upstream_redirect') { countUse(); return res.status(502).json(e.body); }   // the request went out
     res.status(500).json({ error: `action failed: ${e.message}` });
+  } finally {
+    if (reservedCtx && !counted) db.prepare('UPDATE blindkey_contexts SET use_count = MAX(use_count - 1, 0) WHERE id = ?').run(reservedCtx);
   }
-});
+}
 
 // DELETE /api/blindkey/revoke — deactivate a secret
 app.delete('/api/blindkey/revoke', rateLimitStandard, (req, res) => {
@@ -5437,6 +5499,10 @@ app.delete('/api/blindkey/revoke', rateLimitStandard, (req, res) => {
   if (actor.mode === 'admin') {
     ownerDid = did || (username ? db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username)?.did : null);
     if (!ownerDid) return res.status(400).json({ error: 'did or username required when using admin access' });
+  }
+  // A blind rotation of this secret is in flight (#58 review M1): wait for it.
+  if (db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND (name = ? OR ref_code = ?)').all(ownerDid, String(name || ''), '').some(r => rotatingSecrets.has(r.id))) {
+    return res.status(409).json({ error: 'this secret is being rotated right now — try again in a minute' });
   }
   const result = db.prepare(`UPDATE blindkey_secrets SET status = ?, ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?`)
     .run('revoked', ownerDid, name);
@@ -5456,6 +5522,10 @@ app.delete('/api/blindkey/delete', rateLimitStandard, (req, res) => {
   if (actor.mode === 'admin') {
     ownerDid = did || (username ? db.prepare('SELECT did FROM identity_wallets WHERE username = ?').get(username)?.did : null);
     if (!ownerDid) return res.status(400).json({ error: 'did or username required when using admin access' });
+  }
+  // A blind rotation of this secret is in flight (#58 review M1): wait for it.
+  if (db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND (name = ? OR ref_code = ?)').all(ownerDid, String(name || ''), String(ref || '')).some(r => rotatingSecrets.has(r.id))) {
+    return res.status(409).json({ error: 'this secret is being rotated right now — try again in a minute' });
   }
   // Per-credential gate policy for delete (admin/service operator bypasses).
   if (actor.mode !== 'admin') {
@@ -5500,6 +5570,7 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
   ).get(ownerDid, baseName, baseName + '_v%');
 
   if (!existing) return res.status(404).json({ error: 'no active secret found with that name' });
+  if (rotatingSecrets.has(existing.id)) return res.status(409).json({ error: 'this secret is being rotated right now — try again in a minute' });
   // A wrapped secret's new version must be wrappable too, or rotating would quietly hand the host a readable value (#56 M1).
   if (cryptoDepth.isWrapped(existing) && !cryptoDepth.activeWrapKeys(ownerDid).length) {
     return res.status(409).json({ error: 'this secret is wrapped to a phone, and no linked phone has a wrap key now — link one (app 1.5+) before rotating it', wrapped: true });
@@ -6217,7 +6288,7 @@ async function handleRowenDeliver(req, res) {
         try {
           // No local shell: see sshRun.
           egressLog(egressReq, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
-          const output = sshRun(target_user, target_host, decryptedValue, command);
+          const output = await sshRun(target_user, target_host, decryptedValue, command);
           const redactedOutput = output.replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
           result = { stdout: redactedOutput, exit_code: 0 };
         } catch (sshErr) {
@@ -12107,6 +12178,7 @@ app.get('/api/debug/route-break-check', (_req, res) => res.json({ alive: true, s
 // ============================================================
 // Blind Rotation (moved before cruise — route registration issue after cruise)
 // ============================================================
+const rotatingSecrets = new Set();   // secret ids with a blind rotation in flight
 app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
@@ -12188,9 +12260,13 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     + 'echo ' + sq(sudoPassword) + ' | sudo -S bash -c ' + sq('echo ' + sq(sshUser + ':' + password) + ' | chpasswd') + ' 2>/dev/null\n'
     + 'echo ' + done + '\n';
 
+  // One rotation of a secret at a time: ssh no longer blocks the process, so a second call would otherwise change the
+  // host password under the first one (2026-11-07).
+  if (rotatingSecrets.has(secret.id)) return res.status(409).json({ error: 'this secret is being rotated right now — wait for that to finish' });
+  rotatingSecrets.add(secret.id);
   try {
     egressLog(req, secret, 'rotate_blind', target_host);   // written before the connection: the outbound log
-    const result = sshRun(sshUser, target_host, currentPassword, 'bash -s', { input: chpasswdScript(currentPassword, newPassword, 'ROTATED') });
+    const result = await sshRun(sshUser, target_host, currentPassword, 'bash -s', { input: chpasswdScript(currentPassword, newPassword, 'ROTATED') });
 
     if (!result.includes('ROTATED')) {
       return res.status(500).json({ error: 'password change did not confirm success. Old password is still active.' });
@@ -12199,7 +12275,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     // VERIFICATION: SSH in with the NEW password to confirm it actually works
     let verified = false;
     try {
-      const verifyResult = sshRun(sshUser, target_host, newPassword, 'echo VERIFIED', { timeout: 15000 });
+      const verifyResult = await sshRun(sshUser, target_host, newPassword, 'echo VERIFIED', { timeout: 15000 });
       verified = verifyResult.includes('VERIFIED');
     } catch(_) {}
 
@@ -12207,7 +12283,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
       // ROLLBACK: new password didn't work. Revert to old password.
       try {
         // Try with new password first (in case chpasswd partially worked)
-        sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 });
+        await sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 });
       } catch(_) {}
 
       return res.status(500).json({
@@ -12217,6 +12293,23 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
       });
     }
 
+    // Re-read now that the host has changed (#58 review M1): while ssh ran, the secret may have been rotated, revoked,
+    // deleted or moved to another owner. Then the host goes back to the password the vault holds and nothing is stored.
+    // From here to the response nothing awaits, so the rows below are written from this re-read state.
+    const fresh = db.prepare("SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND status = 'active'").get(secret.id, ownerDid);
+    const again = fresh ? nextVersionName(ownerDid, baseName, fresh.version) : null;
+    if (!fresh || !again || again.conflict || again.name !== target.name) {
+      let back = false;
+      try { back = (await sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 })).includes('ROLLED_BACK'); } catch (_) {}
+      if (back) return res.status(409).json({ error: 'the secret changed while it was being rotated (rotated, removed or moved); the host was set back to the previous password', old_ref: ref });
+      // The host could not be set back: it now runs on a password nothing stored. Keep it, under its own name, so the
+      // owner is not locked out (#58 re-review L2).
+      const keepName = `${baseName}_unsaved_rotation_${Date.now()}`, keepRef = generateRefCode('password', keepName);
+      db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, status, version, ref_code, account_username)
+                  VALUES (?, ?, ?, 'password', ?, 'active', 1, ?, ?)`).run(ownerDid, keepName, `password ${sshUser}@${target_host} was left on after a blind rotation collided and could not be rolled back`, blindkeyEncrypt(newPassword), keepRef, sshUser);
+      logSecurityEvent('rotation_unsaved_kept', 'critical', { caller_did: ownerDid, capability: 'rotate_blind', target: target_host, ip: req.ip, context: { kept_ref: keepRef } });
+      return res.status(409).json({ error: 'the secret changed while it was being rotated, and the host could not be set back: the password the host now uses is stored as ' + keepRef, kept_ref: keepRef });
+    }
     const { name: newName, version: newVersion } = target;
     const encrypted = blindkeyEncrypt(newPassword);
 
@@ -12258,6 +12351,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: 'rotation failed: ' + String(e.message || e).split('\n')[0] });
+  } finally {
+    rotatingSecrets.delete(secret.id);
   }
 });
 
