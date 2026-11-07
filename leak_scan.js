@@ -142,6 +142,22 @@ module.exports = function registerLeakScan(deps) {
     if (spent) return res.status(spent.status || 403).json(spent);
     res.json({ ok: true, id, token_label: h.token_label, created_at: h.created_at, found: JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk })) });
   });
+  // POST /api/blindkey/leak-scan/descriptions {redact} — which of my descriptions hold one of my vault values (by name,
+  // never the value), and with redact: true, cut those values out of them. The owner's own session with the PIN
+  // (intent scan-descriptions:<0|1>): an oracle over the owner's values, like the scan itself (secret_text_guard.js).
+  app.post('/api/blindkey/leak-scan/descriptions', rateLimitStandard, (req, res) => {
+    const auth = personAuth(req, res); if (!auth) return;
+    const redact = (req.body || {}).redact === true;
+    const intent = `scan-descriptions:${redact ? 1 : 0}`;
+    if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('scan-descriptions', ['pin'], ['pin'], intent));
+    const spent = spendSingleUse(auth.did, 'scan-descriptions', ['pin'], auth, intent);
+    if (spent) return res.status(spent.status || 403).json(spent);
+    const found = require('./secret_text_guard').sweepDescriptions(db, blindkeyDecrypt, auth.did, { redact });
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+      .run(redact ? 'description_redact' : 'description_check', auth.did, null, null, JSON.stringify({ found: found.length, names: found.map(f => f.name) }));
+    res.json({ ok: true, redacted: redact && found.length > 0,
+      found: found.map(f => ({ name: f.name, ref: f.ref_code, holds_value_of: f.holds })) });
+  });
   // DELETE /api/blindkey/leak-scan/tokens/:id — revoke.
   // Revoking and denying are the owner's, in their own session (#45 review L3: an agent could revoke the deploy gate's
   // token and stop every deploy).
