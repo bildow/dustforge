@@ -108,6 +108,17 @@ call POST /api/identity/request-2fa "" "$(jb did "$VD")"
 
 call POST /api/relay/create "$P" '{"forward_to":"p-fwd@example.org"}'
 [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J need)" = recovery_email_or_phone ] && ok "a person with no recovery email and no phone cannot turn a forward on (L4)" || fail "L4: $CODE $BODY"
+# #70 round-2 M: membership is not "agent". A person linked INTO a fleet (created_by_fleet 0) is still a person here.
+X "INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet, joined_via) VALUES ((SELECT id FROM fleets WHERE slug='owner-agents'), (SELECT did FROM identity_wallets WHERE username='person'), 'linkedperson', 'sil_fwd2', 'active', 0, 'owner')"
+call POST /api/relay/create "$P" '{"forward_to":"p-fwd@example.org"}'
+[ "$CODE" = 409 ] && ok "a person merely linked into a fleet is not an agent: still refused without a recovery address (round-2 M)" || fail "linked person: $CODE $BODY"
+X "DELETE FROM fleet_silicons WHERE silicon_id='sil_fwd2'"
+# …and an agent's device login is no consent to be linked into a fleet
+DEVTOK=$(node -e 'const identity=require("./identity"),Database=require("better-sqlite3");const db=new Database(process.env.DB_PATH);const w=db.prepare("SELECT did,encrypted_private_key FROM identity_wallets WHERE username=?").get("person");
+process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key,w.did,{scope:"transact",expiresIn:"1h",metadata:{auth_method:"device",agent_label:"some-pane",sid:"sdev9"}}))')
+call POST /api/fleet/owner-agents/silicons "$O" "$(jb handle person2 member_token "$DEVTOK")"
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "device-login" && [ "$(Q "SELECT COUNT(*) FROM fleet_silicons WHERE member_did=(SELECT did FROM identity_wallets WHERE username='person')")" = 0 ] \
+  && ok "a device-flow (agent) token is refused as member_token consent for a fleet link (round-2 M)" || fail "device member_token: $CODE $BODY"
 
 # ── 6b ──
 call POST /api/identity/pin "$O" "$(jb pin 4321 password pass-owner-9!)"; [ "$CODE" = 200 ] || fail "pin set: $CODE"

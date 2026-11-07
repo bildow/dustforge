@@ -2250,7 +2250,10 @@ app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, '
     // #70 review L4: a person with neither a recovery email nor a linked phone would hear of a stranger's rule only in
     // the mailbox it copies — and after 48 hours its reset links flow through it. Not until one of them exists.
     // A fleet's agent wallet keeps the token path; its fleet owner is told instead.
-    const agent = Boolean(db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND status = 'active'").get(did));
+    // An agent here is a wallet a fleet CREATED (its owner holds its password): fleet membership alone can be had by
+    // linking a person's wallet in (#70 round-2 M).
+    const creator = fleetBilling.creatorOf(db, did);
+    const agent = Boolean(creator);
     if (!agent && !String(w.recovery_email || '').trim() && !(deviceKeys && deviceKeys.hasDevice(did))) {
       return res.status(409).json({ error: 'add a recovery email (or link your phone) before turning on mail forwarding: it is where you would hear that a rule was added', need: 'recovery_email_or_phone' });
     }
@@ -2278,7 +2281,7 @@ app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, '
       // the mailbox; the linked phone's alerts call lists it for 48 hours (account_holds.js).
       // An agent wallet's fleet owner hears of it too.
       try {
-        const fo = db.prepare("SELECT f.owner_did FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id WHERE s.member_did = ? AND s.status = 'active' LIMIT 1").get(did);
+        const fo = fleetBilling.creatorOf(db, did);
         if (fo && fo.owner_did) accountHolds.tellOwner(fo.owner_did, 'an agent turned on mail forwarding', `Your agent ${(db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did) || {}).username || did} now forwards its mailbox to ${forward_to}. If you did not expect this, remove it.\n`);
       } catch (_) {}
       try { accountHolds.tellOwner(did, 'mail forwarding was turned on',
