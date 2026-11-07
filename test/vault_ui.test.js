@@ -1696,3 +1696,55 @@ test('a PIN reset with the password on a linked phone asks the phone first; decl
   assert.equal(sent.length, 1); assert.equal(sent[0].device_challenge_id, undefined, 'declined on the phone: sent without a phone proof');
   assert.match(alerted, /waits 48 hours/); assert.doesNotMatch(alerted, /^PIN changed/);
 });
+
+// ── Guardian recovery (red team item 9, step 3) ──
+test('a guardian sees the recovery ask (owner escaped) and Approve sends the typed code through the PIN/phone gate', async () => {
+  const sent = [];
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/guardians') return { json: { ok: true, active: false, guardians: [], guarding: [{ id: 4, owner: 'kyle', status: 'active' }] } };
+    if (p === '/api/identity/recovery/asks') return { json: { ok: true, asks: [{ id: '123456789012', owner: '<b>kyle</b>', status: 'pending', new_phone: { fingerprint: 'aabbccddeeff0011' }, i_approved: false }] } };
+    if (p.endsWith('/approve')) { sent.push(b); return { json: { ok: true, status: 'pending' } }; }
+    return { json: { ok: true } };
+  } });
+  await settle(); await pg.ctx.loadGuardians(); await settle();
+  const h = pg.el('guardians-box').innerHTML;
+  assert.match(h, /asks to recover their wallet/); assert.match(h, /aabbccddeeff0011/); assert.doesNotMatch(h, /<b>kyle<\/b> asks/, 'the owner name is escaped');
+  assert.match(h, /told you the 6-digit code themselves/); assert.match(h, /Decline — stop it/);
+  pg.el('rc-123456789012').value = '482913';
+  await pg.ctx.recoveryApprove('123456789012'); await settle();
+  assert.equal(sent.length, 1); assert.equal(sent[0].code, '482913');
+});
+
+test('the recovering phone: start makes recovery keys, shows the code; finish signs with them, commits them, signs in', async () => {
+  const calls = [];
+  const store = {};
+  const pg = page({ storage: store, routes: async (p, b) => {
+    calls.push(p);
+    if (p === '/api/identity/recovery/challenge') return { json: { ok: true, challenge: 'C'.repeat(32), message: 'demipass:recovery-start:aaron:' + 'C'.repeat(32) } };
+    if (p === '/api/identity/recovery/start') return { status: 202, json: { ok: true, request_id: '123456789012', code: '482913', fingerprint: '0011223344556677' } };
+    if (p.startsWith('/api/identity/recovery/status')) return { json: { ok: true, status: 'quorum', approvals: 2, needed: 2, ready_at: '2020-01-01T00:00:00Z' } };
+    if (p.endsWith('/complete-challenge')) return { json: { ok: true, challenge: 'D'.repeat(32), message: 'demipass:recovery-complete:did:key:zX:123456789012:' + 'D'.repeat(32) } };
+    if (p.endsWith('/complete')) return { json: { ok: true, completed: true } };
+    if (p === '/api/identity/auth-fingerprint') return { json: { ok: true, token: 'new.token', did: 'did:key:zX' } };
+    return { json: {} };
+  } });
+  const bridged = [];
+  pg.ctx.DemiPassDevice = {
+    status: () => JSON.stringify({ ok: true, enrolled: false }),
+    recoveryKeys: (id, msg) => { bridged.push(['keys', msg]); setTimeout(() => pg.ctx.DemiPassDeviceCb(id, JSON.stringify({ ok: true, device_id: 'newdevice01', key_d: 'KD', key_p: 'KP', sig_d: 'SD', sig_p: 'SP', label: 'Pixel' })), 0); },
+    recoverySign: (id, msg) => { bridged.push(['sign', msg]); setTimeout(() => pg.ctx.DemiPassDeviceCb(id, JSON.stringify({ ok: true, sig_d: 'SD2', sig_p: 'SP2' })), 0); },
+    commitRecovery: () => { bridged.push(['commit']); return '{"ok":true}'; }, abandonRecovery: () => '{"ok":true}',
+  };
+  await pg.ctx.openRecover(); await settle();
+  pg.el('rec-user').value = 'Aaron';
+  await pg.ctx.startRecover(); await settle();
+  assert.equal(bridged[0][0], 'keys'); assert.match(bridged[0][1], /^demipass:recovery-start:aaron:/);
+  assert.match(pg.el('recover-box').innerHTML, /482913/); assert.match(pg.el('recover-box').innerHTML, /Finish/);
+  pg.el('rec-pw').value = 'newpassword1'; pg.el('rec-pw2').value = 'newpassword1';
+  await pg.ctx.finishRecover(); await settle();
+  assert.deepEqual(bridged.map(x => x[0]), ['keys', 'sign', 'commit']);
+  assert.ok(calls.includes('/api/identity/recovery/123456789012/complete'));
+  assert.equal(pg.ctx.localStorage.getItem('dp_recovery'), null, 'the finished recovery is forgotten');
+});

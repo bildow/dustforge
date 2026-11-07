@@ -265,5 +265,7 @@ module.exports = function registerCryptoDepth(deps) {
   }
 
   return { MARKER, bindingOf, phoneCanOpen, isWrapped, wrapSecret, plaintextFor, onRequestCreated, approvalView, approveRefusal, storeUnwrap, dropEphemeral,
-           unwrapForOwner, unwrapToHost, activeWrapKeys, _hasEphemeral: hasEphemeral };
+           unwrapForOwner, unwrapToHost, activeWrapKeys, _hasEphemeral: hasEphemeral,
+           // Item 9: a completed recovery drops the owner's open unwrap sessions (their one-use keys go with them).
+           dropOwnerSessions: (did) => { for (const k of [...eph.keys()]) if (k.startsWith(`s:${did}:`)) eph.delete(k); } };
 };

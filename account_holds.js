@@ -123,14 +123,14 @@ module.exports = function registerAccountHolds(deps) {
   function openHolds(did, kind) {
     return db.prepare(`SELECT * FROM account_holds WHERE did = ? AND ${OPEN}${kind ? ' AND kind = ?' : ''} ORDER BY created_at`).all(...(kind ? [did, kind] : [did]));
   }
-  function createHold(did, kind, payload, { delaySec = HOLD_DELAY_SEC, readyAt, expiresAt, why = '' } = {}) {
+  function createHold(did, kind, payload, { delaySec = HOLD_DELAY_SEC, readyAt, expiresAt, why = '', quiet = false } = {}) {
     if (!KINDS.has(kind)) throw new Error('unknown hold kind');
     const id = newHoldId(), t = nowIso();
     const ready = readyAt === undefined ? isoIn(delaySec) : readyAt;
     db.prepare('INSERT INTO account_holds (id, did, kind, status, created_at, ready_at, expires_at, payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(id, did, kind, 'pending', t, ready, expiresAt || null, JSON.stringify(payload || {}));
     logSecurityEvent('account_hold_started', 'critical', { caller_did: did, capability: kind, context: { hold_id: id, ready_at: ready, why } });
-    tell(did, `${kind === 'recovery' ? 'someone is recovering your wallet' : 'a change to your account is waiting'} — cancel it from your phone if it was not you`,
+    if (!quiet) tell(did, `${kind === 'recovery' ? 'someone is recovering your wallet' : 'a change to your account is waiting'} — cancel it from your phone if it was not you`,
       `Started ${t}: ${WHAT[kind]}${why ? ` (${why})` : ''}.\n` +
       (ready ? `It takes effect at ${ready} unless it is canceled.\n` : '') +
       `If this was not you, open DemiPass on one of your phones and cancel it there (your fingerprint or screen lock confirms).\n`);
@@ -242,7 +242,7 @@ module.exports = function registerAccountHolds(deps) {
     tell(h.did, `canceled: ${h.kind === 'recovery' ? 'the recovery of your wallet' : WHAT[h.kind]}`,
       `It was canceled from one of your phones at ${nowIso()}. Nothing changed.\n` +
       (h.kind === 'pin-reset' ? 'Whoever started it knows your account password: every session was signed out, and you must choose a new password at your next sign-in.\n' : ''));
-    if (h.kind === 'recovery' && deps.onRecoveryCanceled) { try { deps.onRecoveryCanceled(h); } catch (_) {} }
+    if (h.kind === 'recovery' && deps.recovery) { try { deps.recovery().onCanceled(h); } catch (_) {} }
     if (h.kind === 'guardians' && deps.guardians) { try { deps.guardians().dropChange(h); } catch (_) {} }
   }
 
@@ -349,6 +349,6 @@ module.exports = function registerAccountHolds(deps) {
   }
   const guardiansActive = (did) => db.prepare("SELECT COUNT(*) AS n FROM recovery_guardians WHERE owner_did = ? AND status = 'active'").get(did).n > 0;
 
-  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, startRefusal, dropDeviceHolds, closeOpen, establishedKey, eligibleKey, setRecoveryEmail,
+  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, startRefusal, dropDeviceHolds, closeOpen, tellOwner: tell, establishedKey, eligibleKey, setRecoveryEmail,
            HOLD_DELAY_SEC, ESTABLISHED_SEC, GRACE_SEC };
 };

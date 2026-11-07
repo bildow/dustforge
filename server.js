@@ -1620,6 +1620,28 @@ app.post('/api/identity/tokens/revoke', rateLimitStandard, (req, res) => {
 // jti), refresh tokens (else a refresh mints a live token again) and device
 // logins approved but not yet claimed (else a claim mints fresh ones).
 // silicon: agent tokens and worker rows are the caller's call.
+// Set the wallet's mailbox (Stalwart) password to an already-salted hash. Resolves 'ok'; 'unreached' when the request
+// never reached Stalwart (both sides keep the old password); 'unknown' when it may or may not have taken (the caller
+// clears the local hash so Stalwart decides). Used by guardian recovery (item 9) to fail closed.
+function setMailboxPasswordHash(did, hash) {
+  return new Promise((resolve) => {
+    const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did);
+    if (!w) return resolve('unreached');
+    const http = require('http');
+    const body = JSON.stringify([{ action: 'set', field: 'secrets', value: [hash] }]);
+    let connected = false, done = false;
+    const end = (v) => { if (!done) { done = true; resolve(v); } };
+    const r = http.request({ hostname: process.env.STALWART_HOST || '100.83.112.88', port: Number(process.env.STALWART_PORT || 8080),
+      path: '/api/principal/' + encodeURIComponent(w.username), method: 'PATCH',
+      headers: { Authorization: 'Basic ' + Buffer.from('admin:' + (process.env.STALWART_PASS || '')).toString('base64'), 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      (pr) => { pr.resume(); pr.on('end', () => end(pr.statusCode < 300 ? 'ok' : 'unknown')); });
+    r.setTimeout(10000, () => r.destroy(new Error('stalwart timeout')));
+    r.on('socket', (sock) => { if (!sock.connecting) connected = true; else sock.once('connect', () => { connected = true; }); });
+    r.on('error', () => end(connected ? 'unknown' : 'unreached'));
+    r.write(body); r.end();
+  });
+}
+
 function cutSessions(did) {
   const now = Math.floor(Date.now() / 1000);
   db.prepare('INSERT INTO token_revocations (did, revoke_before) VALUES (?, ?) ON CONFLICT(did) DO UPDATE SET revoke_before = excluded.revoke_before').run(did, now);
@@ -8402,7 +8424,7 @@ const accountHolds = require('./account_holds')({
   app, db, rateLimitStrict, rateLimitStandard, logSecurityEvent, cleanLabel, getBearerIdentity, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
-  guardians: () => recoveryGuardians,
+  guardians: () => recoveryGuardians, recovery: () => guardianRecovery,
 });
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({
@@ -8412,7 +8434,15 @@ const deviceKeys = require('./device_keys')({
 });
 // Recovery guardians (red team item 9, step 2): 3 people paired in person, each accepting with PIN + phone.
 const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
-  logSecurityEvent, devices: () => deviceKeys, holds: () => accountHolds, sendMail: (...a) => fleetRoutes.sendMail(...a) });
+  logSecurityEvent, devices: () => deviceKeys, holds: () => accountHolds, sendMail: (...a) => fleetRoutes.sendMail(...a),
+  recovery: () => guardianRecovery });
+// Guardian recovery (red team item 9, step 3): start on a new phone, two guardians approve with the owner's code, 48 h,
+// any of the owner's phones cancels; completion re-keys the account (recovery.js).
+const guardianRecovery = require('./recovery')({ app, db, rateLimitStrict, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing,
+  spendSingleUse, logSecurityEvent, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys, holds: () => accountHolds,
+  guardians: () => recoveryGuardians, cryptoDepth: () => cryptoDepth, cutSessions: (did) => cutSessions(did),
+  hashPassword: (pw) => passwords.hashPassword(pw), setMailboxPassword: (did, hash) => setMailboxPasswordHash(did, hash),
+  getMailboxSecret: (did) => { const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did); return w ? fetchStalwartSecret(w.username) : Promise.resolve({ state: 'unreachable' }); } });
 // Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
 require('./leak_scan')({ app, db, express, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, blindkeyDecrypt, blindkeyEncrypt, cleanLabel, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys });
@@ -13761,7 +13791,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
