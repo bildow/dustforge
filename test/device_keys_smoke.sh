@@ -10,6 +10,8 @@
 #   (d) 5 wrong PINs in a session end that session (its token 401, its refresh token dead); other sessions live
 #   (e) the dormancy setting: 60–3600 s, shortening free, lengthening takes the PIN
 #   (f) a revoked device's signatures are refused at once
+#   (g) a phone links with an emailed code instead of the password; {check:true} says the factors are ready, spends
+#       nothing, and links nothing
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-device-smoke.XXXXXX)
@@ -67,7 +69,7 @@ chsign "$A" d enrol device-enrol:0 phone-0001; CHD=$CH; SGD=$SG; SGP=$(sig p "$(
 ENROL(){ printf '{"challenge_id":%s,"device_id":"phone-0001","label":"Pixel","key_d":"%s","key_p":"%s","sig_d":"%s","sig_p":"%s"}' "$CHD" "$(cat $S/d.pub)" "$(cat $S/p.pub)" "$SGD" "$SGP"; }
 call POST /api/identity/device/enrol "$A" "$(ENROL)"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = device-enrol:0 ] && ok "enrolling a phone takes the PIN" || fail "enrol no pin: $CODE $BODY"
 pin "$A" device-enrol:0; call POST /api/identity/device/enrol "$A" "$(ENROL)"
-[ "$CODE" = 403 ] && echo "$BODY" | grep -q password && ok "…and the account password: knowing the PIN alone plants no device (#47 H1)" || fail "enrol no password: $CODE $BODY"
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = twofa ] && [ "$(echo "$BODY" | J or.twofa)" = password ] && ok "…and a second factor, an emailed code or the password: knowing the PIN alone plants no device (#47 H1)" || fail "enrol no second factor: $CODE $BODY"
 call POST /api/identity/gate/verify "$A" '{"gate":"password","password":"hunter22"}'; call POST /api/identity/device/enrol "$A" "$(ENROL)"
 [ "$CODE" = 201 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-0001' AND revoked_at IS NULL")" = 2 ] && ok "a phone enrols two keys (device D, presence P), each signing the challenge" || fail "enrol: $CODE $BODY"
 pin "$A" device-enrol:0; call POST /api/identity/device/enrol "$A" "$(ENROL)"; { [ "$CODE" = 403 ] || [ "$CODE" = 409 ]; } && ok "an enrol challenge works once, and an active device id cannot be enrolled over" || fail "enrol replay: $CODE"
@@ -167,6 +169,30 @@ call GET /api/identity/lock "$B1"; C1=$CODE; call GET /api/identity/lock "$B0"; 
 [ "$C1" = 401 ] && [ "$C0" = 401 ] && ok "(d) the 5th wrong PIN ends the session: the refreshed token AND the one it came from (#47 M1)" || fail "d session: B1 $C1 B0 $C0"
 call POST /api/identity/refresh "" '{"refresh_token":"'$R1'"}'; [ "$CODE" = 401 ] && ok "(d) …and its refresh chain is dead" || fail "d refresh: $CODE $BODY"
 call GET /api/identity/lock "$A"; [ "$CODE" = 200 ] && ok "(d) other sessions keep going" || fail "d others: $CODE"
+
+# ── (g) linking with an emailed code, no password (the owner never types a vault value) ──
+node -e '
+const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
+const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
+db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 100000, ?)").run(id.did, "owner-g", "owner-g@dustforge.com", enc, process.argv[1]);' "$H"
+glogin(){ call POST /api/identity/auth-fingerprint "" '{"username":"owner-g","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
+G0=$(glogin); G=$(glogin); DG=$(Q "SELECT did FROM identity_wallets WHERE username='owner-g'")
+call POST /api/identity/pin "$G0" '{"pin":"4321","password":"hunter22"}'
+call POST /api/identity/device/enrol "$G" '{"check":true}'
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = twofa ] && [ "$(echo "$BODY" | J missing.1)" = pin ] && ok "(g) a fresh session is asked for an emailed code (or the password) and the PIN" || fail "g missing: $CODE $BODY"
+call POST /api/identity/request-2fa "$G" '{"did":"'$DG'"}'; call POST /api/identity/gate/verify "$G" '{"gate":"twofa","code":"'$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DG' ORDER BY id DESC LIMIT 1")'"}'
+[ "$CODE" = 200 ] || fail "g twofa: $CODE $BODY"
+call POST /api/identity/device/enrol "$G" '{"check":true}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J missing.0)" = pin ] && ok "(g) the emailed code stands in for the password; the PIN is still needed" || fail "g pin left: $CODE $BODY"
+pin "$G" device-enrol:0; call POST /api/identity/device/enrol "$G" '{"check":true}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J ready)" = True ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE did='$DG'")" = 0 ] && ok "(g) {check:true}: ready, and nothing linked" || fail "g check: $CODE $BODY"
+node -e '
+const c = require("crypto"), fs = require("fs");
+for (const n of ["gd", "gp"]) { const { privateKey, publicKey } = c.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  fs.writeFileSync(process.argv[1] + "/" + n + ".pem", privateKey.export({ type: "pkcs8", format: "pem" }));
+  fs.writeFileSync(process.argv[1] + "/" + n + ".pub", publicKey.export({ type: "spki", format: "der" }).toString("base64")); }' "$S"
+call POST /api/identity/device/challenge "$G" '{"purpose":"enrol","intent":"device-enrol:0"}'; GCH=$(echo "$BODY" | J challenge_id); GM="$(echo "$BODY" | J message):phone-g001"
+call POST /api/identity/device/enrol "$G" "$(printf '{"challenge_id":%s,"device_id":"phone-g001","label":"Moto","key_d":"%s","key_p":"%s","sig_d":"%s","sig_p":"%s"}' "$GCH" "$(cat $S/gd.pub)" "$(cat $S/gp.pub)" "$(sig gd "$GM")" "$(sig gp "$GM")")"
+[ "$CODE" = 201 ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-g001' AND revoked_at IS NULL")" = 2 ] && ok "(g) …the check left the PIN proof unspent: the phone links on it, with no password typed anywhere" || fail "g enrol: $CODE $BODY"
 
 ! grep -qE "hook-token-zz90|crit-token-zz91" "$S/server.log" && ok "no value in the server log" || fail "value in log"
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails
