@@ -8461,8 +8461,8 @@ const useApprovals = require('./use_approvals')({
   logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail, deviceKeys, cryptoDepth,
 });
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
-require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, gateSession,
-  logSecurityEvent, rateLimitStandard, approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY });
+require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
+  approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });
 // Who a /use caller is, for an approval request: the DID, and a label the owner recognises.
 function approvalCaller(req) {
   const d = (req.identity && req.identity.decoded) || {};
@@ -13799,7 +13799,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|svc-delegate|svc-depth):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

@@ -1,18 +1,17 @@
 #!/bin/bash
 # End-to-end smoke of service tenants (service_tenants.js, docs/service-tenants.md) through the real server, throwaway DB.
-# People: owner (PIN, has a fleet), ext (an outside wallet), poor (5 DD). Silicons of owner's fleet: fg (FLEETGATE's
-# wallet), cd (Conduit's), agent. A silicon of another fleet: stranger.
+# People (PINs): owner (has a fleet), otherowner (another fleet), ext (an outside wallet), poor (5 DD). Silicons of owner's
+# fleet: fg (FLEETGATE's wallet), cd (Conduit's), agent. A silicon of otherowner's fleet: stranger.
 #   - legacy: a use_approvals table from before this change (no service_key) keeps its rows and gains the column;
-#   - registration: a silicon registers itself (owner = its fleet owner); the owner registers its silicon; refusals;
-#   - prices: cost + the platform margin, public; weakening a gate takes the owner's PIN;
-#   - service tokens: audience-locked; refused by every ordinary DemiPass route; wrong tenant → 401;
-#   - verify: wallet, token id, scope, depth, via — never the username or email;
-#   - charge: only after verify; debit + credit together, both rows carry the token; 201 → replay 200 → conflict 409;
-#     402 when the wallet can't cover it (nothing written); per-token cap; revoked token → 401; receipt verifies offline;
-#   - delegation: owner → own silicon (no PIN), → another fleet's silicon (PIN), agents can't delegate; the delegate's
-#     elevated call waits on the owner's approval (PIN-opened, approved, spent once); the tenant sees a pairwise
-#     principal, never the owner; revoke ends it; an agent alone can't take an elevated action;
-#   - charges list: payer and tenant views carry the token id.
+#   - registration, consent to pay, and weakening a gate each wait on a person's approval in the app (PIN to open):
+#     a token alone asks, never grants (#68 review H1, M3);
+#   - prices: cost + margin, public; service tokens: audience-locked, refused by every other DemiPass route;
+#   - verify: wallet, token id, scope, depth, via — never a username or email, not even in a 202 (M1);
+#   - charge: only for an action verified on that token (M2); debit + credit together, both rows carry the token;
+#     replay/conflict; 402 for no consent, no money, token cap, daily cap; the receipt verifies offline, only as a
+#     service receipt;
+#   - delegation: only to your own fleet's agents (H2); the delegate's elevated call waits on the owner, bound to that
+#     authority; pairwise principal; revoke, parent-token revoke and fleet removal end access (M4).
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-svc-smoke.XXXXXX)
@@ -83,18 +82,31 @@ process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.
 OWN=$(login owner); EXT=$(login ext); POOR=$(login poor); EXTR=$(login ext read)
 FG=$(mint fg owner-agents); CD=$(mint cd owner-agents); AG=$(mint agent owner-agents); STR=$(mint stranger other-agents)
 [ "$OWN" != None ] && [ "$EXT" != None ] || { echo "FAIL sign-in"; exit 1; }
-call POST /api/identity/pin "$OWN" '{"pin":"4321","password":"hunter22"}'; [ "$CODE" = 200 ] || fail "owner pin: $CODE $BODY"
+OTH=$(login otherowner)
+for t in "$OWN" "$OTH" "$EXT" "$POOR"; do call POST /api/identity/pin "$t" '{"pin":"4321","password":"hunter22"}'; [ "$CODE" = 200 ] || fail "pin set: $CODE $BODY"; done
 pin(){ call POST /api/identity/gate/verify "$1" "$(jbody gate pin pin "$2" intent "$3")"; [ "$CODE" = 200 ] || fail "pin $3: $CODE $BODY"; }
 
-# ── registration ────────────────────────────────────────────────────────────────────────────────────────────────
+# Approve request $2 as person token $1 (PIN 4321): open with the PIN, approve with the screen's code.
+approve(){ pin "$1" 4321 "approval-open:$2"; call POST /api/demipass/approvals/$2/open "$1"; local k; k=$(echo "$BODY" | J code)
+  call POST /api/demipass/approvals/$2/approve "$1" "$(jbody code "$k")"; [ "$CODE" = 200 ] || fail "approve $2: $CODE $BODY"; }
+# Ask (202 → approval id), approve as $3, repeat with approval_id. $1 path, $2 token, $3 approver token, $4 body JSON.
+asked(){ call POST "$1" "$2" "$4"; AQ=$(echo "$BODY" | J approval_id); [ "$CODE" = 202 ] || return 1
+  approve "$3" "$AQ"; call POST "$1" "$2" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$4" "$AQ")"; }
+noname(){ ! echo "$BODY" | grep -q -E '"owner"|"ext"|"otherowner"|@dustforge.com|'"$(did owner)"; }
+
+# ── registration (approved on the owner's phone) ────────────────────────────────────────────────────────────────
 call POST /api/services/register "$EXT" "$(jbody slug fleetgate service_did "$(did fg)")"; [ "$CODE" = 403 ] && ok "a stranger cannot register someone else's wallet as a tenant" || fail "ext register fg: $CODE $BODY"
-call POST /api/services/register "$FG" '{"slug":"fleetgate","name":"FLEETGATE"}'
-[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J owner_is_you)" = False ] && [ "$(Q "SELECT owner_did FROM service_tenants WHERE slug='fleetgate'")" = "$(did owner)" ] \
-  && ok "a silicon registers itself; its fleet owner owns the tenant" || fail "fg register: $CODE $BODY"
+call POST /api/services/register "$FG" '{"slug":"fleetgate","name":"FLEETGATE"}'; R1=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$R1")" = "$(did owner)" ] && [ "$(Q "SELECT COUNT(*) FROM service_tenants")" = 0 ] && noname \
+  && ok "a silicon asking to register itself waits on its fleet owner's approval (202, nothing registered, no name in the reply)" || fail "fg register ask: $CODE $BODY"
+call POST /api/services/register "$FG" "$(jbody slug fleetgate name FLEETGATE approval_id "$R1")"; [ "$CODE" = 202 ] && ok "…repeating before approval: still pending" || fail "fg early: $CODE"
+approve "$OWN" "$R1"; call POST /api/services/register "$FG" "$(jbody slug fleetgate name FLEETGATE approval_id "$R1")"
+[ "$CODE" = 201 ] && [ "$(Q "SELECT owner_did FROM service_tenants WHERE slug='fleetgate'")" = "$(did owner)" ] && ok "approved: FLEETGATE registered, owned by the fleet owner" || fail "fg register: $CODE $BODY"
 call POST /api/services/register "$AG" "$(jbody slug conduit service_did "$(did cd)")"; [ "$CODE" = 403 ] && ok "an agent token cannot register another silicon" || fail "agent register cd: $CODE $BODY"
-call POST /api/services/register "$OWN" "$(jbody slug conduit name Conduit service_did "$(did cd)")"
-[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J owner_is_you)" = True ] && ok "the owner registers its own silicon as Conduit" || fail "owner register cd: $CODE $BODY"
+asked /api/services/register "$OWN" "$OWN" "$(jbody slug conduit name Conduit service_did "$(did cd)")"
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J owner_is_you)" = True ] && ok "the owner registers its own silicon as Conduit (own approval)" || fail "owner register cd: $CODE $BODY"
 call POST /api/services/register "$OWN" "$(jbody slug conduit service_did "$(did agent)")"; [ "$CODE" = 409 ] && ok "a taken slug → 409" || fail "dup slug: $CODE"
+call POST /api/services/register "$EXT" '{"slug":"demipass"}'; [ "$CODE" = 400 ] && ok "reserved slugs are refused" || fail "reserved: $CODE"
 
 # ── prices ──────────────────────────────────────────────────────────────────────────────────────────────────────
 FGA='{"actions":[{"action":"submit","scope":"submit","measured_cost_dd":20},{"action":"review","scope":"submit","measured_cost_dd":100,"max_cost_dd":300},{"action":"sign-charter","scope":"charter","measured_cost_dd":5,"depth":"elevated","open":false},{"action":"broadcast","scope":"broadcast","measured_cost_dd":5,"depth":"elevated"}]}'
@@ -105,8 +117,22 @@ call GET /api/services/fleetgate ""
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J margin_pct)" = 20 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; a={x["action"]:x for x in json.load(sys.stdin)["actions"]}; print(a["submit"]["price_dd"], a["review"]["max_price_dd"])')" = "24 360" ] \
   && ok "public price list: measured cost + 20% margin (submit 20 → 24; review max 300 → 360)" || fail "price list: $CODE $BODY"
 
+# ── consent to pay (approved by the person who answers for the wallet) ─────────────────────────────────────────
+call POST /api/services/token "$EXT" '{"service":"fleetgate"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J consent_required)" = True ] && ok "no service token without consent to pay that service" || fail "mint w/o consent: $CODE $BODY"
+call POST /api/services/consent "$AG" '{"service":"fleetgate","daily_cap_dd":5000}'; AGC=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$AGC")" = "$(did owner)" ] && [ "$(Q "SELECT COUNT(*) FROM service_consents")" = 0 ] \
+  && ok "an agent's consent to pay waits on its fleet owner (a token alone grants nothing)" || fail "agent consent ask: $CODE $BODY"
+call POST /api/services/consent "$OWN" '{"service":"fleetgate","daily_cap_dd":100000}'; OC=$(echo "$BODY" | J approval_id)
+call POST /api/services/consent "$OWN" "$(jbody service fleetgate daily_cap_dd 100000 approval_id "$OC")"
+[ "$CODE" = 202 ] && [ "$(Q "SELECT COUNT(*) FROM service_consents WHERE payer_did='$(did owner)'")" = 0 ] && ok "a person's own token can ask but not grant (the PIN/phone approves)" || fail "owner consent unapproved: $CODE"
+asked /api/services/consent "$EXT" "$EXT" '{"service":"fleetgate","daily_cap_dd":1000}'; [ "$CODE" = 201 ] && ok "ext consents to pay FLEETGATE up to 1000 DD/day (own approval)" || fail "ext consent: $CODE $BODY"
+asked /api/services/consent "$POOR" "$POOR" '{"service":"fleetgate","daily_cap_dd":1000}'; [ "$CODE" = 201 ] || fail "poor consent: $CODE $BODY"
+approve "$OWN" "$AGC"; call POST /api/services/consent "$AG" "$(jbody service fleetgate daily_cap_dd 5000 approval_id "$AGC")"; [ "$CODE" = 201 ] && ok "the owner approves its agent's consent" || fail "agent consent: $CODE $BODY"
+asked /api/services/consent "$AG" "$OWN" '{"service":"conduit","daily_cap_dd":500}'; [ "$CODE" = 201 ] || fail "agent conduit consent: $CODE $BODY"
+
 # ── service tokens ──────────────────────────────────────────────────────────────────────────────────────────────
 call POST /api/services/token "$EXTR" '{"service":"fleetgate"}'; [ "$CODE" = 403 ] && ok "a read-scope token mints no service token" || fail "read mint: $CODE"
+call POST /api/services/token "$EXT" '{"service":"fleetgate","cap_dd":1001}'; [ "$CODE" = 400 ] && ok "a token's cap cannot exceed the daily consent" || fail "cap>consent: $CODE"
 call POST /api/services/token "$EXT" '{"service":"fleetgate"}'; ST=$(echo "$BODY" | J token); TID=$(echo "$BODY" | J token_id)
 [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J audience)" = svc:fleetgate ] && [ "$(echo "$BODY" | J cap_dd)" = 500 ] && ok "ext mints a fleetgate service token (aud svc:fleetgate, cap 500 DD)" || fail "mint: $CODE $BODY"
 bad=0; for p in /api/meter/charges /api/services/charges /api/blindkey/menu /api/blindkey/approvals; do call GET $p "$ST"; [ "$CODE" = 401 ] || { bad=1; echo "  $p → $CODE"; }; done
@@ -120,15 +146,18 @@ V "$CD" "$(jbody token "$ST" action post)"; [ "$CODE" = 401 ] && ok "another ten
 V "$FG" "$(jbody token "$ST" action submit)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J wallet)" = "$(did ext)" ] && [ "$(echo "$BODY" | J token_id)" = "$TID" ] && [ "$(echo "$BODY" | J depth)" = standard ] \
   && [ "$(echo "$BODY" | J via)" = own ] && [ "$(echo "$BODY" | J scope)" = transact ] && ok "verify: wallet, token id, scope, depth, via=own" || fail "verify: $CODE $BODY"
-echo "$BODY" | grep -q -E '"ext"|ext@|dustforge.com' && fail "verify leaks the username/email: $BODY" || ok "verify carries no username or email"
+noname && ok "verify carries no username or email" || fail "verify leaks a name: $BODY"
 V "$FG" "$(jbody token "$ST" action sign-charter)"; [ "$CODE" = 403 ] && ok "a closed scope (charter) is refused to an outside wallet" || fail "closed scope: $CODE $BODY"
 
 # ── charge ──────────────────────────────────────────────────────────────────────────────────────────────────────
 C(){ call POST /api/services/charge "$1" "$2"; }
 call POST /api/services/token "$EXT" '{"service":"fleetgate"}'; ST2=$(echo "$BODY" | J token); TID2=$(echo "$BODY" | J token_id)
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID2" idempotency_key k-unverified-1)"; [ "$CODE" = 403 ] && ok "no charge on a token the tenant never verified" || fail "unverified charge: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 300 token_id "$TID" idempotency_key k-notverified-review)"; A1=$CODE
+C "$FG" "$(jbody action sign-charter cost_dd 5 token_id "$TID" idempotency_key k-notverified-sign)"
+[ "$A1" = 403 ] && [ "$CODE" = 403 ] && ok "a charge only for an action verified on that token (review, sign-charter → 403)" || fail "unverified action: $A1 $CODE"
 E0=$(bal ext); F0=$(bal fg)
-C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" idempotency_key pr-submit-0001)"; cp <(echo "$BODY") "$S/first"; CID=$(echo "$BODY" | J charge_id)
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" idempotency_key pr-submit-0001)"; echo "$BODY" > "$S/first"; CID=$(echo "$BODY" | J charge_id)
 [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J dd)" = 24 ] && [ "$(bal ext)" = $((E0 - 24)) ] && [ "$(bal fg)" = $((F0 + 24)) ] \
   && ok "charge: 20 + 20% = 24 DD, ext −24, FLEETGATE +24 (201 $CID)" || fail "charge: $CODE $BODY"
 [ "$(Q "SELECT COUNT(*) FROM identity_transactions WHERE token_jti='$TID' AND type IN ('service_transfer_out','service_transfer_in')")" = 2 ] \
@@ -137,17 +166,25 @@ node -e '
 const crypto = require("crypto"); const identity = require("./identity");
 const r = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")); const rc = JSON.parse(r.receipt);
 const pub = crypto.createPublicKey({ key: identity.didToPublicKey(rc.issuer), format: "der", type: "spki" });
-process.exit(crypto.verify(null, Buffer.from(r.receipt, "utf8"), pub, Buffer.from(r.sig, "base64url")) && rc.token_id === process.argv[2] ? 0 : 1);' "$S/first" "$TID" \
-  && ok "the receipt verifies offline from its issuer did:key and names the token" || fail "offline receipt"
-call POST /api/services/receipts/verify "" "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps({"receipt":r["receipt"],"sig":r["sig"]}))' "$S/first")"
-[ "$(echo "$BODY" | J on_record)" = True ] && ok "receipts/verify: valid and on record" || fail "receipts/verify: $BODY"
+const ok = crypto.verify(null, Buffer.from("dustforge-service-charge:v1\n" + r.receipt, "utf8"), pub, Buffer.from(r.sig, "base64url"));
+const bare = crypto.verify(null, Buffer.from(r.receipt, "utf8"), pub, Buffer.from(r.sig, "base64url"));
+process.exit(ok && !bare && rc.token_id === process.argv[2] ? 0 : 1);' "$S/first" "$TID" \
+  && ok "the receipt verifies offline from its issuer did:key (domain-separated) and names the token" || fail "offline receipt"
+VB=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps({"receipt":r["receipt"],"sig":r["sig"]}))' "$S/first")
+call POST /api/services/receipts/verify "" "$VB"; A1=$(echo "$BODY" | J on_record)
+call POST /api/meter/verify "" "$VB"; [ "$A1" = True ] && [ "$(echo "$BODY" | J valid)" = False ] && ok "receipts/verify: on record; the meter's verify refuses it (no cross-type receipts)" || fail "receipt domains: $A1 $BODY"
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" idempotency_key pr-submit-0001)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && [ "$(bal ext)" = $((E0 - 24)) ] && ok "a retry (same key) → 200 replayed, no second debit" || fail "replay: $CODE $BODY"
 C "$FG" "$(jbody action submit cost_dd 19 token_id "$TID" idempotency_key pr-submit-0001)"; [ "$CODE" = 409 ] && ok "same key, other cost → 409" || fail "409: $CODE"
+V "$FG" "$(jbody token "$ST" action review)"
 C "$FG" "$(jbody action review cost_dd 301 token_id "$TID" idempotency_key pr-review-0001)"; [ "$CODE" = 400 ] && ok "cost above the action's max_cost_dd → 400" || fail "max cost: $CODE"
 C "$FG" "$(jbody action review cost_dd 250 token_id "$TID" idempotency_key pr-review-0001)"; [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J dd)" = 300 ] && ok "a variable-cost review: 250 measured → 300 billed" || fail "review: $CODE $BODY"
 C "$FG" "$(jbody action review cost_dd 200 token_id "$TID" idempotency_key pr-review-0002)"
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J cap_exceeded)" = True ] && ok "the token's spend cap (500 DD) → 402 cap_exceeded" || fail "cap: $CODE $BODY"
+call POST /api/services/token "$EXT" '{"service":"fleetgate","cap_dd":1000}'; ST3=$(echo "$BODY" | J token); TID3=$(echo "$BODY" | J token_id)
+V "$FG" "$(jbody token "$ST3" action review)"; C "$FG" "$(jbody action review cost_dd 300 token_id "$TID3" idempotency_key pr-review-0003)"; A1=$CODE
+C "$FG" "$(jbody action review cost_dd 300 token_id "$TID3" idempotency_key pr-review-0004)"
+[ "$A1" = 201 ] && [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J daily_cap_exceeded)" = True ] && ok "the daily consent (1000 DD) → 402 daily_cap_exceeded (324 + 360 + 360 > 1000)" || fail "daily cap: $A1 $CODE $BODY"
 call POST /api/services/token "$POOR" '{"service":"fleetgate"}'; PT=$(echo "$BODY" | J token); PTID=$(echo "$BODY" | J token_id)
 V "$FG" "$(jbody token "$PT" action submit)"; C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" idempotency_key poor-0001)"
 [ "$CODE" = 402 ] && [ "$(bal poor)" = 5 ] && [ "$(Q "SELECT COUNT(*) FROM service_charges WHERE token_jti='$PTID'")" = 0 ] && ok "too little DD → 402 for the caller, nothing written" || fail "402: $CODE $BODY"
@@ -155,61 +192,74 @@ V "$FG" "$(jbody token "$ST2" action submit)"
 call POST /api/services/token/revoke "$EXT" "$(jbody token_id "$TID2")"; [ "$CODE" = 200 ] || fail "revoke: $CODE $BODY"
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID2" idempotency_key after-revoke-1)"; A1=$CODE
 V "$FG" "$(jbody token "$ST2" action submit)"; [ "$A1" = 401 ] && [ "$CODE" = 401 ] && ok "a revoked service token: verify and charge → 401" || fail "revoked: $A1 $CODE"
+EXT2=$(login ext); asked /api/services/consent "$EXT2" "$EXT2" '{"service":"conduit","daily_cap_dd":100}' >/dev/null
+call POST /api/services/token "$EXT2" '{"service":"conduit"}'; ECT=$(echo "$BODY" | J token)
+EJ=$(python3 -c 'import json,base64,sys; p=sys.argv[1].split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["jti"])' "$EXT2")
+call POST /api/identity/tokens/revoke "$EXT2" "$(jbody jti "$EJ")"; [ "$CODE" = 200 ] || fail "parent revoke: $CODE $BODY"
+V "$CD" "$(jbody token "$ECT" action post)"; [ "$CODE" = 401 ] && ok "revoking the token that minted it kills the service token" || fail "parent revoke: $CODE $BODY"
 
 # ── delegation and depth ────────────────────────────────────────────────────────────────────────────────────────
-call POST /api/services/token "$AG" '{"service":"fleetgate"}'; AT=$(echo "$BODY" | J token)
-[ "$CODE" = 201 ] || fail "agent mint: $CODE $BODY"
+call POST /api/services/token "$AG" '{"service":"fleetgate"}'; AT=$(echo "$BODY" | J token); [ "$CODE" = 201 ] || fail "agent mint: $CODE $BODY"
 V "$FG" "$(jbody token "$AT" action sign-charter)"; [ "$CODE" = 403 ] && ok "an agent without a delegation cannot sign" || fail "agent closed: $CODE"
 V "$FG" "$(jbody token "$AT" action broadcast)"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q delegation && ok "an agent on its own account cannot take an elevated action (nobody to approve)" || fail "agent own elevated: $CODE $BODY"
 call POST /api/services/delegate "$AG" "$(jbody service fleetgate scope charter delegate_did "$(did stranger)")"; [ "$CODE" = 403 ] && ok "agents do not hand on a scope" || fail "agent delegate: $CODE"
+call POST /api/services/delegate "$OTH" "$(jbody service fleetgate scope broadcast delegate_did "$(did agent)")"; [ "$CODE" = 403 ] && ok "a stranger cannot push a scope onto someone else's agent (H2)" || fail "stranger push: $CODE $BODY"
+call POST /api/services/delegate "$OWN" "$(jbody service fleetgate scope submit delegate_did "$(did stranger)")"; [ "$CODE" = 403 ] && ok "…nor the owner onto another fleet's agent" || fail "owner → stranger: $CODE"
 call POST /api/services/delegate "$EXT" "$(jbody service fleetgate scope charter delegate_did "$(did agent)")"; [ "$CODE" = 403 ] && ok "a closed scope is delegated by the tenant owner only" || fail "ext delegate closed: $CODE"
 call POST /api/services/delegate "$OWN" "$(jbody service fleetgate scope charter delegate_did "$(did agent)")"; DG=$(echo "$BODY" | J delegation_id)
-[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J use_only)" = True ] && ok "owner → own silicon: charter delegated, use-only, no PIN" || fail "delegate: $CODE $BODY"
-call POST /api/services/delegate "$OWN" "$(jbody service fleetgate scope submit delegate_did "$(did stranger)")"
-[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "svc-delegate:$(Q "SELECT id FROM service_tenants WHERE slug='fleetgate'")" ] && ok "→ another fleet's silicon takes the PIN" || fail "stranger no pin: $CODE $BODY"
-pin "$OWN" 4321 "svc-delegate:$(Q "SELECT id FROM service_tenants WHERE slug='fleetgate'")"
-call POST /api/services/delegate "$OWN" "$(jbody service fleetgate scope submit delegate_did "$(did stranger)")"; [ "$CODE" = 201 ] && ok "…and with the PIN it is granted" || fail "stranger pin: $CODE $BODY"
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J use_only)" = True ] && ok "owner → own silicon: charter delegated, use-only" || fail "delegate: $CODE $BODY"
 CALL='{"charter":"release-controller","digest":"27df94c7d0d1"}'
 V "$FG" "$(jbody token "$AT" action sign-charter call "$CALL")"; AP=$(echo "$BODY" | J approval_id)
-[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = approval_pending ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$AP")" = "$(did owner)" ] \
-  && [ "$(Q "SELECT service_key FROM use_approvals WHERE id=$AP")" = svc:fleetgate:sign-charter ] && ok "the delegate's elevated call parks on the OWNER's approval (202, request $AP)" || fail "elevated: $CODE $BODY"
-call GET /api/demipass/approvals "$OWN"; [ "$(echo "$BODY" | J incoming.0.secret.name)" = "fleetgate · sign-charter" ] && ok "the owner's app lists it as 'fleetgate · sign-charter'" || fail "owner list: $BODY"
-call POST /api/demipass/approvals/$AP/open "$AG"; [ "$CODE" = 403 ] || [ "$CODE" = 404 ] && ok "the agent cannot open its own request" || fail "agent open: $CODE"
-pin "$OWN" 4321 "approval-open:$AP"; call POST /api/demipass/approvals/$AP/open "$OWN"; K=$(echo "$BODY" | J code)
-call POST /api/demipass/approvals/$AP/approve "$OWN" "$(jbody code "$K")"; [ "$CODE" = 200 ] && ok "the owner opens it with the PIN and approves" || fail "approve: $CODE $BODY"
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$AP")" = "$(did owner)" ] && [ "$(Q "SELECT service_key FROM use_approvals WHERE id=$AP")" = svc:fleetgate:sign-charter ] \
+  && ok "the delegate's elevated call parks on the OWNER's approval (202, request $AP)" || fail "elevated: $CODE $BODY"
+noname && [ "$(echo "$BODY" | J owner)" = None ] && ok "the 202 a tenant sees names nobody (M1)" || fail "202 leaks: $BODY"
+call GET /api/demipass/approvals "$OWN"; echo "$BODY" | grep -q "fleetgate · sign-charter" && ok "the owner's app lists it as 'fleetgate · sign-charter'" || fail "owner list: $BODY"
+call POST /api/demipass/approvals/$AP/open "$AG"; { [ "$CODE" = 403 ] || [ "$CODE" = 404 ]; } && ok "the agent cannot open its own request" || fail "agent open: $CODE"
+approve "$OWN" "$AP"
 V "$FG" "$(jbody token "$AT" action sign-charter call '{"charter":"release-controller","digest":"000000000000"}' approval_id "$AP")"; [ "$CODE" = 409 ] && ok "the approval binds the exact call (another digest → 409)" || fail "binding: $CODE $BODY"
 V "$FG" "$(jbody token "$AT" action sign-charter call "$CALL" approval_id "$AP")"
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J via)" = delegation ] && [ "$(echo "$BODY" | J depth)" = elevated ] && [[ "$(echo "$BODY" | J principal)" == pp_* ]] \
-  && ! echo "$BODY" | grep -q "$(did owner)" && ok "approved: verify passes via delegation, a pairwise principal, never the owner's DID" || fail "approved verify: $CODE $BODY"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J via)" = delegation ] && [ "$(echo "$BODY" | J depth)" = elevated ] && [[ "$(echo "$BODY" | J principal)" == pp_* ]] && noname \
+  && ok "approved: verify passes via delegation, a pairwise principal, never the owner" || fail "approved verify: $CODE $BODY"
 V "$FG" "$(jbody token "$AT" action sign-charter call "$CALL" approval_id "$AP")"; [ "$CODE" = 410 ] && ok "one call per approval (again → 410)" || fail "reuse: $CODE"
+V "$FG" "$(jbody token "$AT" action sign-charter call "$CALL")"; AP2=$(echo "$BODY" | J approval_id); approve "$OWN" "$AP2"
+call POST /api/services/delegate "$OWN" "$(jbody service fleetgate scope charter delegate_did "$(did agent)")"
+V "$FG" "$(jbody token "$AT" action sign-charter call "$CALL" approval_id "$AP2")"; [ "$CODE" = 409 ] && ok "an approval given under one delegation does not redeem under another (bound to the authority)" || fail "authority binding: $CODE $BODY"
 call POST /api/services/token "$AG" '{"service":"conduit"}'; ACT=$(echo "$BODY" | J token)
-P1=$(echo "$BODY" | J token_id)
 call POST /api/services/delegate "$OWN" "$(jbody service conduit scope post delegate_did "$(did agent)")"
 V "$CD" "$(jbody token "$ACT" action post)"; PR1=$(echo "$BODY" | J principal)
-V "$FG" "$(jbody token "$AT" action submit)"
 call POST /api/services/delegate "$OWN" "$(jbody service fleetgate scope submit delegate_did "$(did agent)")"
 V "$FG" "$(jbody token "$AT" action submit)"; PR2=$(echo "$BODY" | J principal)
 [[ "$PR1" == pp_* ]] && [[ "$PR2" == pp_* ]] && [ "$PR1" != "$PR2" ] && ok "the principal is pairwise: the same owner looks different at Conduit and FLEETGATE" || fail "pairwise: $PR1 $PR2"
-call POST /api/services/delegations/$DG/revoke "$AG"; [ "$CODE" = 404 ] && ok "the delegate cannot revoke (or see) the owner's delegation" || fail "agent revoke: $CODE"
-call POST /api/services/delegations/$DG/revoke "$OWN"; [ "$CODE" = 200 ] || fail "revoke deleg: $CODE"
+DG2=$(Q "SELECT id FROM service_delegations WHERE scope='charter' AND status='active'")
+call POST /api/services/delegations/$DG2/revoke "$AG"; [ "$CODE" = 404 ] && ok "the delegate cannot revoke (or see) the owner's delegation" || fail "agent revoke: $CODE"
+call POST /api/services/delegations/$DG2/revoke "$OWN"; [ "$CODE" = 200 ] || fail "revoke deleg: $CODE"
 V "$FG" "$(jbody token "$AT" action sign-charter call "$CALL")"; [ "$CODE" = 403 ] && ok "after revoke the agent's charter calls are refused" || fail "after revoke: $CODE $BODY"
-call POST /api/services/token "$EXT" '{"service":"fleetgate"}'; ET3=$(echo "$BODY" | J token)
-V "$FG" "$(jbody token "$ET3" action broadcast call '{"to":"all"}')"; EP=$(echo "$BODY" | J approval_id)
-[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$EP")" = "$(did ext)" ] && ok "a person on their own account: the elevated call waits on their own phone" || fail "person own elevated: $CODE $BODY"
+call POST /api/services/token "$EXT" '{"service":"fleetgate"}'; ET4=$(echo "$BODY" | J token)
+V "$FG" "$(jbody token "$ET4" action broadcast call '{"to":"all"}')"; EP=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$EP")" = "$(did ext)" ] && noname && ok "a person on their own account: the elevated call waits on their own phone, unnamed" || fail "person own elevated: $CODE $BODY"
 
-# ── weakening a gate ────────────────────────────────────────────────────────────────────────────────────────────
-call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"sign-charter","scope":"charter","measured_cost_dd":5,"depth":"standard"}]}'
-[ "$CODE" = 403 ] && ok "the tenant wallet cannot lower a depth" || fail "fg lower: $CODE $BODY"
-TIDF=$(Q "SELECT id FROM service_tenants WHERE slug='fleetgate'")
-call PUT /api/services/fleetgate/actions "$OWN" '{"actions":[{"action":"sign-charter","scope":"charter","measured_cost_dd":5,"depth":"standard"}]}'
-[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "svc-depth:$TIDF" ] && ok "the owner lowering it is asked for the PIN" || fail "owner lower no pin: $CODE $BODY"
-call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"sign-charter","scope":"charter","measured_cost_dd":6}]}'
-[ "$CODE" = 200 ] && [ "$(Q "SELECT depth FROM service_actions WHERE action='sign-charter'")" = elevated ] && ok "a price change keeps the depth (no PIN needed)" || fail "price keep depth: $CODE $BODY"
+# ── weakening a gate (the owner approves exactly that change) ───────────────────────────────────────────────────
+call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"sign-charter","measured_cost_dd":6}]}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT depth || '/' || scope || '/' || open FROM service_actions WHERE action='sign-charter'")" = elevated/charter/0 ] && ok "a price change keeps depth, scope and closedness" || fail "price keep: $CODE $BODY"
+call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"sign-charter","measured_cost_dd":5,"depth":"standard"}]}'; W1=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$W1")" = "$(did owner)" ] && ok "the tenant lowering a depth waits on the owner's approval" || fail "lower: $CODE $BODY"
+call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"sign-charter","retired":true}]}'
+call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"sign-charter","scope":"charter","measured_cost_dd":5,"depth":"standard","open":true}]}'
+[ "$CODE" = 202 ] && [ "$(Q "SELECT depth || '/' || status FROM service_actions WHERE action='sign-charter'")" = elevated/retired ] && ok "retire + re-add weaker is caught (M3)" || fail "retire trick: $CODE $BODY"
+call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"merge-now","scope":"submit","measured_cost_dd":1}]}'
+[ "$CODE" = 202 ] && ok "adding an action to a delegated scope waits on the owner (it widens the delegation)" || fail "widen: $CODE $BODY"
+approve "$OWN" "$W1"; call PUT /api/services/fleetgate/actions "$FG" "$(jbody actions '[{"action":"sign-charter","measured_cost_dd":5,"depth":"standard"}]' approval_id "$W1")"
+[ "$CODE" = 200 ] && [ "$(Q "SELECT depth FROM service_actions WHERE action='sign-charter'")" = standard ] && ok "approved: exactly that change applies" || fail "approved lower: $CODE $BODY"
+
+# ── fleet removal ends an agent's service access (M4) ──────────────────────────────────────────────────────────
+call POST /api/services/token "$AG" '{"service":"conduit"}'; ACT2=$(echo "$BODY" | J token)
+call DELETE /api/fleet/owner-agents/silicons/agent "$OWN"; [ "$CODE" = 200 ] || fail "remove agent: $CODE $BODY"
+V "$CD" "$(jbody token "$ACT2" action post)"; [ "$CODE" = 401 ] && ok "removed from the fleet: its service tokens die with its fleet tokens" || fail "fleet cut: $CODE $BODY"
 
 # ── listings ────────────────────────────────────────────────────────────────────────────────────────────────────
-call GET /api/services/charges "$EXT"; [ "$(echo "$BODY" | J paid.0.token_id)" = "$TID" ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["paid"]))')" = 2 ] \
-  && ok "ext's charges: 2, each with its token id" || fail "ext charges: $BODY"
-call GET /api/services/charges "$FG"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["received"]))')" = 2 ] && ok "FLEETGATE sees what it received" || fail "fg received: $BODY"
+call GET /api/services/charges "$EXT"; [ "$(echo "$BODY" | J paid.0.token_id)" = "$TID3" ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["paid"]))')" = 3 ] \
+  && ok "ext's charges: 3, each with its token id" || fail "ext charges: $BODY"
+call GET /api/services/charges "$FG"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["received"]))')" = 3 ] && ok "FLEETGATE sees what it received" || fail "fg received: $BODY"
 call GET /api/services/charges "$POOR"; [ "$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["paid"]), "received" in d)')" = "0 False" ] && ok "…and nobody else does" || fail "poor charges: $BODY"
 grep -q "$ST" "$S/server.log" && fail "a service token reached the server log" || ok "no token in the server log"
 

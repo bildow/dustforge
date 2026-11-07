@@ -8,53 +8,51 @@
 //   tenant side (Bearer = the tenant wallet's own token)
 //     POST /api/services/verify   {token, action, call?, approval_id?, approval_code?}
 //          → {wallet, token_id, scope, depth, via, principal?, price, cap_dd, spent_dd, expires_at}
-//            Never the human: no username, email or owner DID. A delegated call carries a pairwise principal id
-//            (stable per tenant, different at every tenant). Elevated actions answer 202 approval_pending first.
-//     POST /api/services/charge   {action, cost_dd, token_id, idempotency_key}
-//          → debits the caller, credits the tenant, atomically; 402 when the caller cannot cover it (pass it on).
-//     PUT  /api/services/:slug/actions  {actions:[{action, scope, measured_cost_dd, max_cost_dd?, depth?, open?}]}
+//     POST /api/services/charge   {action, cost_dd, token_id, idempotency_key}   (an action this token was verified for)
+//     PUT  /api/services/:slug/actions  {actions:[…]}   weakening a gate waits on the tenant owner's approval
 //   caller side (Bearer = the caller's own token)
+//     POST /api/services/consent  {service, daily_cap_dd}   paying a service at all: approved on a phone (below)
 //     POST /api/services/token    {service, ttl?, scopes?, cap_dd?}  → a service token for that tenant
 //     POST /api/services/token/revoke {token_id}
-//     POST /api/services/delegate {service, scope, delegate_did, expires_in?}   use-only, agents only
-//     POST /api/services/delegations/:id/revoke
-//     GET  /api/services/delegations, GET /api/services/charges
-//   public
-//     GET  /api/services, GET /api/services/:slug  (actions with cost, margin, price)
-//     POST /api/services/receipts/verify {receipt, sig}
-//   registration
-//     POST /api/services/register {slug, name, service_did?}
+//     POST /api/services/delegate {service, scope, delegate_did, expires_in?}   use-only, to your own fleet's agents
+//     POST /api/services/delegations/:id/revoke, POST /api/services/consents/:id/revoke
+//     GET  /api/services/delegations, /consents, /charges
+//   public: GET /api/services, GET /api/services/:slug, POST /api/services/receipts/verify
+//   registration: POST /api/services/register {slug, name, service_did?}   approved on the owner's phone
 //
-// Price: the tenant declares each action's measured cost; DemiPass adds the platform margin (SERVICE_MARGIN_PCT, in
-// code so a change is a reviewed PR). A charge posts this call's cost (≤ the action's max_cost_dd) and bills
-// cost + margin. Every charge row carries the caller's token id, like mail and /use do.
-// Depth: an action is standard, elevated or critical, set by the tenant. Elevated and critical actions take an
-// approval on the phone of the person whose authority is used (the delegating owner, or the caller itself when it
-// acts on its own account), through the same approval requests elevated secrets use (use_approvals.js). Lowering an
-// action's depth takes the tenant owner, in their own session, with the PIN.
+// Money (#68 review H1): a charge moves DD out of the caller's wallet, so paying a tenant needs a standing CONSENT for
+// that tenant with a daily cap, approved like an elevated secret's use (the request waits in the DemiPass app; PIN to
+// open; the linked phone signs the decision). A person approves their own; a fleet-created agent's consent is its fleet
+// owner's to approve. A token alone (stolen, or an agent holding its owner's device login) can ask, never grant.
+// Charges are bounded by the token's cap_dd, the consent's daily cap, the action's max_cost_dd + margin, and the
+// barrel tier for amounts over 1000 DD (transferBarrelRefusal, as for transfers).
+// Depth: an action is standard, elevated or critical. Elevated and critical actions take an approval on the phone of
+// the person whose authority the call uses, bound to that authority (approver + delegation) and to the exact call.
 
 const crypto = require('crypto');
 
-// Platform margin over a tenant's measured cost. Aaron's order left the number blank; 20 is a placeholder pending
-// his figure — change it here (one line, reviewed PR). Charges record the margin they used.
+// Margin over a tenant's measured cost, credited to the tenant with the cost (the tenant's price = cost + margin).
+// Aaron's order left the figure blank; 20 is a placeholder pending his number — change it here (one line, reviewed
+// PR). Charges record the margin they used.
 const SERVICE_MARGIN_PCT = 20;
 const SVC_ISS = 'demipass-svc';
+const RECEIPT_DOMAIN = 'dustforge-service-charge:v1\n';   // signed bytes = domain + receipt: never valid as a meter receipt
 const SLUG_RE = /^[a-z][a-z0-9-]{1,30}$/;
 const ACTION_RE = /^[a-z][a-z0-9_.-]{0,40}$/;
 const IDEM_RE = /^[A-Za-z0-9._:-]{8,100}$/;
 const DEPTHS = ['standard', 'elevated', 'critical'];
+const RESERVED_SLUGS = new Set(['demipass', 'dustforge', 'admin', 'meter', 'services', 'api']);
 const MAX_COST_DD = 100000;            // one call, before margin ($100)
-const TOKEN_TTL_DEFAULT_SEC = 3600;
 const TOKEN_TTL_MAX_SEC = 24 * 3600;
 const TOKEN_CAP_DEFAULT_DD = 500;
-const TOKEN_CAP_MAX_DD = 1000000;
+const CONSENT_CAP_MAX_DD = 100000;     // a day, per tenant ($100)
 const RECEIPT_VERSION = 1;
 
 const priceOf = (costDd, marginPct = SERVICE_MARGIN_PCT) => costDd + Math.ceil(costDd * marginPct / 100);
 
 module.exports = function registerServiceTenants(deps) {
-  const { app, db, identity, billing, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, gateSession,
-          logSecurityEvent, rateLimitStandard, approvals, masterKey } = deps;
+  const { app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard, approvals, masterKey } = deps;
+  const barrelRefusal = deps.transferBarrelRefusal || (() => null);
   const ledger = deps.ledger || (() => { try { return require('./dd_ledger'); } catch (_) { return null; } })();
 
   // ── schema ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -63,9 +61,10 @@ module.exports = function registerServiceTenants(deps) {
     slug TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     service_did TEXT NOT NULL UNIQUE,     -- the tenant's wallet: authenticates its calls, receives its charges
-    owner_did TEXT NOT NULL,              -- the person who controls it (holds its closed scopes; lowers depth)
+    owner_did TEXT NOT NULL,              -- the person who controls it (holds its closed scopes, approves weakening)
     status TEXT NOT NULL DEFAULT 'active',
     created_by TEXT NOT NULL,
+    approval_id INTEGER,
     created_at TEXT NOT NULL
   )`);
   db.exec(`CREATE TABLE IF NOT EXISTS service_actions (
@@ -81,14 +80,15 @@ module.exports = function registerServiceTenants(deps) {
     updated_at TEXT NOT NULL,
     UNIQUE (tenant_id, action)
   )`);
-  // A tenant may charge only a token it has verified (and only while that token lives): no charging wallets that never
-  // called it. One row per (tenant, token).
+  // A tenant may charge only a token it verified, only for an action it verified, while that token lives.
   db.exec(`CREATE TABLE IF NOT EXISTS service_verifications (
     tenant_id INTEGER NOT NULL,
     token_jti TEXT NOT NULL,
     did TEXT NOT NULL,
     iat INTEGER, exp INTEGER NOT NULL,
-    auth_method TEXT, fleet TEXT,
+    src_auth TEXT, fleet TEXT, parent_jti TEXT,
+    svc_scopes TEXT,                      -- JSON list, or NULL (all)
+    actions TEXT NOT NULL DEFAULT '[]',   -- JSON list of actions verified on this token
     cap_dd INTEGER NOT NULL,
     delegation_id INTEGER,
     first_at TEXT NOT NULL, last_at TEXT NOT NULL,
@@ -112,7 +112,7 @@ module.exports = function registerServiceTenants(deps) {
     created_at TEXT NOT NULL,
     UNIQUE (tenant_id, idempotency_key)
   )`);
-  db.exec('CREATE INDEX IF NOT EXISTS idx_svc_charges_payer ON service_charges(payer_did, id)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_svc_charges_payer ON service_charges(payer_did, tenant_id, created_at)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_svc_charges_token ON service_charges(token_jti)');
   db.exec(`CREATE TABLE IF NOT EXISTS service_delegations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,10 +126,22 @@ module.exports = function registerServiceTenants(deps) {
     revoked_at TEXT
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_svc_deleg_delegate ON service_delegations(delegate_did, tenant_id, scope, status)');
+  db.exec(`CREATE TABLE IF NOT EXISTS service_consents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    payer_did TEXT NOT NULL,
+    tenant_id INTEGER NOT NULL,
+    daily_cap_dd INTEGER NOT NULL,
+    approved_by TEXT NOT NULL,
+    approval_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL,
+    revoked_at TEXT
+  )`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_svc_consent ON service_consents(payer_did, tenant_id, status)');
 
   // ── keys ───────────────────────────────────────────────────────────────────────────────────────────────────────
-  // Receipts are signed by the meter's key (same issuer did:key as /api/meter receipts), pairwise principals by an
-  // HMAC key of their own. Both derive from IDENTITY_MASTER_KEY; without it nothing is signed or charged (503).
+  // Receipts are signed by the meter's key (same issuer did:key), over RECEIPT_DOMAIN + receipt, so neither kind
+  // verifies as the other. Pairwise principals use an HMAC key of their own. Without the master key: 503.
   const meterKey = require('./meter').deriveSigningKey(masterKey);
   const issuer = meterKey ? identity.publicKeyToDID(meterKey.publicKeyDer) : null;
   const pairwiseKey = masterKey ? Buffer.from(crypto.hkdfSync('sha256', Buffer.from(String(masterKey)), Buffer.from('dustforge-services'),
@@ -144,6 +156,7 @@ module.exports = function registerServiceTenants(deps) {
   const tenantBySlug = (slug) => db.prepare("SELECT * FROM service_tenants WHERE slug = ? AND status = 'active'").get(String(slug || ''));
   const tenantByDid = (did) => db.prepare("SELECT * FROM service_tenants WHERE service_did = ? AND status = 'active'").get(did);
   const actionOf = (tenant, action) => db.prepare("SELECT * FROM service_actions WHERE tenant_id = ? AND action = ? AND status = 'active'").get(tenant.id, String(action || ''));
+  const anyActionOf = (tenant, action) => db.prepare('SELECT * FROM service_actions WHERE tenant_id = ? AND action = ?').get(tenant.id, String(action || ''));
   const scopesOf = (tenant) => db.prepare("SELECT DISTINCT scope FROM service_actions WHERE tenant_id = ? AND status = 'active'").all(tenant.id).map(r => r.scope);
   const isAgentWallet = (did) => Boolean(db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND status = 'active'").get(did));
   // A silicon the owner's own fleet created (consented, owned outright): same test as /api/blindkey/delegate.
@@ -151,7 +164,12 @@ module.exports = function registerServiceTenants(deps) {
       WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1
       AND COALESCE(s.joined_via, 'owner') != 'network'`).get(ownerDid, did));
   const fleetOwnerOf = (did) => (db.prepare(`SELECT f.owner_did FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
-      WHERE s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND f.status = 'active' LIMIT 1`).get(did) || {}).owner_did || null;
+      WHERE s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'
+      AND f.status = 'active' LIMIT 1`).get(did) || {}).owner_did || null;
+  // The person who answers for a wallet: an agent's fleet owner (for an agent its fleet created), a person themselves;
+  // an agent with no creating fleet has nobody → null (refused).
+  const personFor = (did) => isAgentWallet(did) ? fleetOwnerOf(did) : did;
+  const jsonList = (s) => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } };
   function actionView(a) {
     return { action: a.action, scope: a.scope, depth: a.depth, open: Boolean(a.open), measured_cost_dd: a.measured_cost_dd,
       max_cost_dd: a.max_cost_dd, margin_pct: SERVICE_MARGIN_PCT, price_dd: priceOf(a.measured_cost_dd), max_price_dd: priceOf(a.max_cost_dd) };
@@ -163,6 +181,19 @@ module.exports = function registerServiceTenants(deps) {
   }
   function event(type, actor, detail) {
     try { db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(type, actor, null, 'service', JSON.stringify(detail)); } catch (_) {}
+  }
+
+  // A person's approval through use_approvals (the DemiPass app's approvals list; PIN to open; the phone signs).
+  // The reply a caller (or a tenant) sees never names the approver (#68 review M1).
+  function personApproval(key, name, approverDid, depth, caller, action, target, params, body, delegationId) {
+    const g = approvals.gateService({ key, name, approverDid, depth }, caller, { action, targetHost: target, params, delegationId }, body || {});
+    if (g.ok) return { ok: true, approval_id: g.approval_id };
+    const b = { ...(g.body || {}) };
+    delete b.owner;
+    if (g.status === 202) {
+      b.next = 'Park this call. The person whose authority it uses approves it in their DemiPass app; then make the same call once more with approval_id. Do not retry in a loop.';
+    }
+    return { ok: false, status: g.status, body: b };
   }
 
   // The bearer as a wallet's OWN token (standard civitasvox JWT). Old `silicon:` tokens act as their carbon and worker
@@ -182,10 +213,13 @@ module.exports = function registerServiceTenants(deps) {
     if (!tenant) { res.status(403).json({ error: 'this token is not a registered service tenant\'s wallet' }); return null; }
     return { auth, tenant };
   }
+  const consentOf = (did, tenant) => db.prepare("SELECT * FROM service_consents WHERE payer_did = ? AND tenant_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1").get(did, tenant.id);
+  const spentToday = (did, tenant) => db.prepare("SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE payer_did = ? AND tenant_id = ? AND created_at > ?")
+    .get(did, tenant.id, new Date(Date.now() - 86400000).toISOString()).s;
 
   // ── service tokens ─────────────────────────────────────────────────────────────────────────────────────────────
-  // Same Ed25519 signature as every DemiPass token (the wallet's key), different issuer and an audience. Checked here
-  // only; identity.verifyToken refuses the issuer everywhere else.
+  // Same Ed25519 signature as every DemiPass token (the wallet's key), another issuer and an audience. Checked here
+  // only. It dies with the token that minted it, with its session (sid), and with a fleet cut (#68 review M4).
   function verifyServiceToken(token, tenant) {
     if (typeof token !== 'string' || token.length > 4096) return { ok: false, status: 400, error: 'token: the caller\'s service token (string)' };
     const parts = token.split('.');
@@ -203,20 +237,31 @@ module.exports = function registerServiceTenants(deps) {
     if (decoded.aud !== 'svc:' + tenant.slug) return { ok: false, status: 401, error: 'this token is for another service' };
     if (!Number.isInteger(decoded.exp) || decoded.exp <= nowSec()) return { ok: false, status: 401, error: 'token expired' };
     if (!decoded.jti) return { ok: false, status: 401, error: 'token has no id' };
-    const dead = billing.checkTokenRevocation(db, decoded);
-    if (dead.revoked) return { ok: false, status: 401, error: dead.reason };
+    const dead = revoked({ jti: decoded.jti, sub: decoded.sub, iat: decoded.iat, src_auth: decoded.src_auth, fleet: decoded.fleet, parent_jti: decoded.minted_by_jti });
+    if (dead) return { ok: false, status: 401, error: dead };
     const w = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(decoded.sub);
     if (!w || w.status !== 'active') return { ok: false, status: 403, error: 'wallet not active' };
     return { ok: true, decoded };
   }
+  function revoked({ jti, sub, iat, src_auth, fleet, parent_jti }) {
+    const r = billing.checkTokenRevocation(db, { jti, sub, iat, auth_method: src_auth || 'service_token', ...(fleet ? { fleet } : {}) });
+    if (r.revoked) return r.reason;
+    if (parent_jti) {
+      const p = db.prepare('SELECT revoked FROM issued_tokens WHERE jti = ?').get(parent_jti);
+      if (p && p.revoked) return 'token revoked: the token that minted it was revoked';
+    }
+    return null;
+  }
 
-  // ── authority: own account, or a delegation of the action's scope ──────────────────────────────────────────────
+  // ── authority: own account, or a live delegation of the action's scope ────────────────────────────────────────
+  // A delegation counts only while its owner still holds the scope and the delegate is still an agent the owner's
+  // fleet created (#68 review H2, M4: a stranger cannot push one onto someone else's agent; removal ends it).
   function authority(tenant, action, did, svcScopes) {
     if (Array.isArray(svcScopes) && !svcScopes.includes(action.scope)) return { ok: false, error: `this token does not carry the '${action.scope}' scope` };
-    const d = db.prepare(`SELECT * FROM service_delegations WHERE tenant_id = ? AND scope = ? AND delegate_did = ? AND status = 'active'
-        AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC LIMIT 1`).get(tenant.id, action.scope, did, nowIso());
-    // A delegation counts only while its owner still holds the scope (a closed scope: still the tenant owner).
-    if (d && (action.open || d.owner_did === tenant.owner_did)) return { ok: true, via: 'delegation', delegation: d, approver: d.owner_did };
+    const ds = db.prepare(`SELECT * FROM service_delegations WHERE tenant_id = ? AND scope = ? AND delegate_did = ? AND status = 'active'
+        AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC`).all(tenant.id, action.scope, did, nowIso());
+    const d = ds.find(x => ownAgent(x.owner_did, did) && (action.open || x.owner_did === tenant.owner_did));
+    if (d) return { ok: true, via: 'delegation', delegation: d, approver: d.owner_did };
     if (action.open || did === tenant.owner_did) return { ok: true, via: 'own', delegation: null, approver: did };
     return { ok: false, error: `the '${action.scope}' scope at ${tenant.slug} is held by its owner; ask them to delegate it` };
   }
@@ -238,23 +283,26 @@ module.exports = function registerServiceTenants(deps) {
     if (action.depth !== 'standard') {
       // The approval is a person's: an agent acting on its own account has nobody to approve for it.
       if (who.via === 'own' && isAgentWallet(d.sub)) {
-        return { status: 403, body: { ok: false, error: `'${action.action}' is ${action.depth}: an agent needs a person's delegation of '${action.scope}' (POST /api/services/delegate), whose phone approves each call`, depth: action.depth } };
+        return { status: 403, body: { ok: false, error: `'${action.action}' is ${action.depth}: an agent needs its fleet owner's delegation of '${action.scope}' (POST /api/services/delegate), whose phone approves each call`, depth: action.depth } };
       }
       const call = b.call && typeof b.call === 'object' && !Array.isArray(b.call) ? b.call : {};
-      const g = approvals.gateService({
-        key: `svc:${tenant.slug}:${action.action}`, name: `${tenant.slug} · ${action.action}`, approverDid: who.approver, depth: action.depth,
-      }, { did: d.sub, label: d.agent_label || d.username || '' }, { action: action.action, targetHost: tenant.slug, params: call,
-        delegationId: who.delegation ? who.delegation.id : null }, b);
+      // The approval binds the exact call AND the authority it was given under (approver + delegation; #68 review H2).
+      const g = personApproval(`svc:${tenant.slug}:${action.action}`, `${tenant.slug} · ${action.action}`, who.approver, action.depth,
+        { did: d.sub, label: d.username || '' }, action.action, tenant.slug,
+        { ...call, authority: { approver_principal: principalId(tenant, who.approver), delegation_id: who.delegation ? who.delegation.id : null } },
+        b, who.delegation ? who.delegation.id : null);
       if (!g.ok) return { status: g.status, body: { ...g.body, depth: action.depth } };
       approval = g.approval_id;
     }
-    const cap = Number.isInteger(d.cap_dd) && d.cap_dd > 0 ? Math.min(d.cap_dd, TOKEN_CAP_MAX_DD) : TOKEN_CAP_DEFAULT_DD;
+    const cap = Number.isInteger(d.cap_dd) && d.cap_dd > 0 ? d.cap_dd : TOKEN_CAP_DEFAULT_DD;
     const at = nowIso();
-    db.prepare(`INSERT INTO service_verifications (tenant_id, token_jti, did, iat, exp, auth_method, fleet, cap_dd, delegation_id, first_at, last_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tenant_id, token_jti) DO UPDATE SET last_at = excluded.last_at, delegation_id = excluded.delegation_id`)
-      .run(tenant.id, d.jti, d.sub, d.iat || null, d.exp, d.auth_method || null, d.fleet ? String(d.fleet) : null, cap,
-           who.delegation ? who.delegation.id : null, at, at);
+    const prior = db.prepare('SELECT actions FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, d.jti);
+    const actions = [...new Set([...jsonList(prior && prior.actions), action.action])];
+    db.prepare(`INSERT INTO service_verifications (tenant_id, token_jti, did, iat, exp, src_auth, fleet, parent_jti, svc_scopes, actions, cap_dd, delegation_id, first_at, last_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tenant_id, token_jti) DO UPDATE SET last_at = excluded.last_at, actions = excluded.actions, delegation_id = excluded.delegation_id`)
+      .run(tenant.id, d.jti, d.sub, d.iat || null, d.exp, d.src_auth || null, d.fleet ? String(d.fleet) : null, d.minted_by_jti || null,
+           Array.isArray(d.svc_scopes) ? JSON.stringify(d.svc_scopes) : null, JSON.stringify(actions), cap, who.delegation ? who.delegation.id : null, at, at);
     const spent = db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ?').get(d.jti, tenant.id).s;
     return { status: 200, body: {
       ok: true, wallet: d.sub, token_id: d.jti, scope, service_scopes: Array.isArray(d.svc_scopes) ? d.svc_scopes : null,
@@ -266,7 +314,7 @@ module.exports = function registerServiceTenants(deps) {
   }
 
   // ── charge ─────────────────────────────────────────────────────────────────────────────────────────────────────
-  function charge(tenant, body, tenantJti) {
+  function charge(tenant, body) {
     if (!meterKey) return { status: 503, body: { error: 'signing key unavailable' } };
     const b = body || {};
     if (b.service !== undefined && b.service !== tenant.slug) return { status: 403, body: { error: `this token is ${tenant.slug}'s; it charges only for ${tenant.slug}` } };
@@ -287,14 +335,25 @@ module.exports = function registerServiceTenants(deps) {
     }
     const v = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, b.token_id);
     if (!v) return { status: 403, body: { error: 'verify this token first (POST /api/services/verify): a tenant charges only callers it verified' } };
+    // Only for an action this token was verified for (an elevated one: only after its approval passed), within the
+    // token's scopes (#68 review M2).
+    if (!jsonList(v.actions).includes(action.action)) return { status: 403, body: { error: `this token was not verified for '${action.action}'; verify it for that action first` } };
+    const scopes = v.svc_scopes ? jsonList(v.svc_scopes) : null;
+    if (scopes && !scopes.includes(action.scope)) return { status: 403, body: { error: `this token does not carry the '${action.scope}' scope` } };
     if (v.exp <= nowSec()) return { status: 401, body: { error: 'the caller\'s token has expired; charge within its life' } };
-    const dead = billing.checkTokenRevocation(db, { jti: v.token_jti, sub: v.did, iat: v.iat, auth_method: v.auth_method, fleet: v.fleet });
-    if (dead.revoked) return { status: 401, body: { error: dead.reason } };
+    const dead = revoked({ jti: v.token_jti, sub: v.did, iat: v.iat, src_auth: v.src_auth, fleet: v.fleet, parent_jti: v.parent_jti });
+    if (dead) return { status: 401, body: { error: dead } };
     if (v.did === tenant.service_did) return { status: 400, body: { error: 'a tenant does not charge itself' } };
+    const consent = consentOf(v.did, tenant);
+    if (!consent) return { status: 402, body: { error: `the caller has no standing consent to pay ${tenant.slug}`, consent_required: true } };
+    const barrel = barrelRefusal(v.did, dd);
+    if (barrel) return { status: barrel.statusCode || 403, body: barrel.body || { error: barrel.message } };
 
     const run = db.transaction(() => {
       const spent = db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ?').get(v.token_jti, tenant.id).s;
-      if (spent + dd > v.cap_dd) { const e = new Error('cap'); e.cap = { spent, cap: v.cap_dd }; throw e; }
+      if (spent + dd > v.cap_dd) { const e = new Error('cap'); e.cap = { kind: 'token', spent, cap: v.cap_dd }; throw e; }
+      const today = spentToday(v.did, tenant);
+      if (today + dd > consent.daily_cap_dd) { const e = new Error('cap'); e.cap = { kind: 'daily', spent: today, cap: consent.daily_cap_dd }; throw e; }
       const charge_id = 'sc_' + crypto.randomBytes(12).toString('hex');
       const at = nowIso();
       const what = `service ${tenant.slug}/${action.action} cost ${cost} + ${SERVICE_MARGIN_PCT}% ${charge_id}`;
@@ -307,7 +366,7 @@ module.exports = function registerServiceTenants(deps) {
       const receipt = JSON.stringify({ v: RECEIPT_VERSION, type: 'dustforge_service_charge', charge_id, issuer, service: tenant.slug,
         payer: v.did, payee: tenant.service_did, action: action.action, cost_dd: cost, margin_pct: SERVICE_MARGIN_PCT, dd,
         token_id: v.token_jti, idempotency_key: b.idempotency_key, at });
-      const sig = crypto.sign(null, Buffer.from(receipt, 'utf8'), meterKey.privateKey).toString('base64url');
+      const sig = crypto.sign(null, Buffer.from(RECEIPT_DOMAIN + receipt, 'utf8'), meterKey.privateKey).toString('base64url');
       db.prepare(`INSERT INTO service_charges (charge_id, tenant_id, payer_did, payee_did, action, cost_dd, margin_pct, dd, token_jti, delegation_id,
                   idempotency_key, receipt, sig, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
         .run(charge_id, tenant.id, v.did, tenant.service_did, action.action, cost, SERVICE_MARGIN_PCT, dd, v.token_jti, v.delegation_id,
@@ -317,12 +376,14 @@ module.exports = function registerServiceTenants(deps) {
     let out;
     try { out = run.immediate(); }
     catch (e) {
-      if (e.cap) return { status: 402, body: { error: `this charge would pass the caller token's spend cap (${e.cap.spent} + ${dd} > ${e.cap.cap} DD); the caller mints a token with a higher cap_dd`, required_dd: dd, cap_dd: e.cap.cap, spent_dd: e.cap.spent, cap_exceeded: true } };
+      if (e.cap && e.cap.kind === 'token') return { status: 402, body: { error: `this charge would pass the caller token's spend cap (${e.cap.spent} + ${dd} > ${e.cap.cap} DD); the caller mints a token with a higher cap_dd`, required_dd: dd, cap_dd: e.cap.cap, spent_dd: e.cap.spent, cap_exceeded: true } };
+      if (e.cap) return { status: 402, body: { error: `this charge would pass the caller's daily consent for ${tenant.slug} (${e.cap.spent} + ${dd} > ${e.cap.cap} DD in 24 h)`, required_dd: dd, daily_cap_dd: e.cap.cap, spent_today_dd: e.cap.spent, daily_cap_exceeded: true } };
       if (e.debit) {
         const insufficient = /insufficient/.test(e.debit.error || '');
         return { status: insufficient ? 402 : 403, body: { error: insufficient ? 'the caller\'s wallet cannot cover this call' : e.debit.error, required_dd: dd,
           ...(insufficient ? { balance_dd: e.debit.balance_cents, top_up: 'https://demipass.com/app' } : {}) } };
       }
+      if (/UNIQUE/.test(e.message || '')) return { status: 409, body: { error: 'a concurrent charge used this idempotency_key; retry to get it' } };
       throw e;
     }
     try { if (ledger) ledger.recordTransfer(db, v.did, tenant.service_did, dd); } catch (_) {}
@@ -331,7 +392,7 @@ module.exports = function registerServiceTenants(deps) {
   }
   function chargeView(r, replayed) {
     return { ok: true, replayed, charge_id: r.charge_id, action: r.action, cost_dd: r.cost_dd, margin_pct: r.margin_pct, dd: r.dd,
-      token_id: r.token_jti, at: r.created_at, receipt: r.receipt, sig: r.sig, issuer };
+      token_id: r.token_jti, at: r.created_at, receipt: r.receipt, sig: r.sig, signed: 'Ed25519 over "' + RECEIPT_DOMAIN.trim() + '\\n" + receipt', issuer };
   }
 
   // ── routes ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -346,7 +407,6 @@ module.exports = function registerServiceTenants(deps) {
     const cols = 'c.charge_id, t.slug AS service, c.action, c.cost_dd, c.margin_pct, c.dd, c.token_jti AS token_id, c.delegation_id, c.created_at';
     const paid = db.prepare(`SELECT ${cols} FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.payer_did = ? ORDER BY c.id DESC LIMIT ?`).all(auth.did, n);
     const tenant = tenantByDid(auth.did);
-    // A tenant sees what it was paid and by which token, never who holds the wallet beyond its DID.
     const received = tenant ? db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? ORDER BY c.id DESC LIMIT ?`).all(tenant.id, n) : [];
     res.json({ ok: true, paid, ...(tenant ? { received } : {}) });
   });
@@ -357,24 +417,31 @@ module.exports = function registerServiceTenants(deps) {
     res.json({ ok: true, granted: db.prepare(q + ' WHERE d.owner_did = ? ORDER BY d.id DESC LIMIT 200').all(auth.did),
       held: db.prepare(q + " WHERE d.delegate_did = ? AND d.status = 'active' ORDER BY d.id DESC LIMIT 200").all(auth.did) });
   });
+  app.get('/api/services/consents', lim, (req, res) => {
+    const auth = walletAuth(req, res, { minScope: 'read' }); if (!auth) return;
+    const q = `SELECT c.id, t.slug AS service, c.payer_did, c.daily_cap_dd, c.status, c.created_at, c.revoked_at FROM service_consents c JOIN service_tenants t ON t.id = c.tenant_id`;
+    res.json({ ok: true, mine: db.prepare(q + ' WHERE c.payer_did = ? ORDER BY c.id DESC LIMIT 100').all(auth.did),
+      approved_by_me: db.prepare(q + ' WHERE c.approved_by = ? AND c.payer_did != ? ORDER BY c.id DESC LIMIT 100').all(auth.did, auth.did) });
+  });
   app.get('/api/services/:slug', lim, (req, res) => {
     const t = tenantBySlug(req.params.slug);
     if (!t) return res.status(404).json({ error: 'no such service' });
     res.json(tenantView(t));
   });
 
-  // Registration. The service wallet itself (it then belongs to its fleet's owner, or to itself when it is nobody's
-  // silicon), or a person naming one of their own fleet's silicons. One tenant per wallet.
+  // Registration (#68 review H1): approved on the owner's phone. The service wallet itself asks (its fleet owner
+  // approves), or a person names themselves or a silicon their own fleet created (they approve). One tenant per wallet.
   app.post('/api/services/register', lim, (req, res) => {
     const auth = walletAuth(req, res); if (!auth) return;
     const b = req.body || {};
     const slug = String(b.slug || '').trim().toLowerCase();
-    if (!SLUG_RE.test(slug)) return res.status(400).json({ error: 'slug: 2-31 of [a-z0-9-], starting with a letter' });
+    if (!SLUG_RE.test(slug) || RESERVED_SLUGS.has(slug)) return res.status(400).json({ error: 'slug: 2-31 of [a-z0-9-], starting with a letter, not reserved' });
     const name = String(b.name || slug).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 80);
     const serviceDid = b.service_did ? String(b.service_did) : auth.did;
     let ownerDid;
     if (serviceDid === auth.did) {
-      ownerDid = fleetOwnerOf(auth.did) || auth.did;
+      ownerDid = personFor(auth.did);
+      if (!ownerDid) return res.status(403).json({ error: 'an agent no fleet created has no person to approve it as a service' });
     } else {
       if (isAgentToken(auth)) return res.status(403).json({ error: 'a person registers one of their silicons from their own session' });
       if (!ownAgent(auth.did, serviceDid)) return res.status(403).json({ error: 'service_did must be you or a silicon your own fleet created' });
@@ -383,74 +450,121 @@ module.exports = function registerServiceTenants(deps) {
     if (!db.prepare('SELECT 1 FROM identity_wallets WHERE did = ?').get(serviceDid)) return res.status(404).json({ error: 'service_did: no such wallet' });
     if (db.prepare('SELECT 1 FROM service_tenants WHERE slug = ?').get(slug)) return res.status(409).json({ error: 'that slug is taken' });
     if (db.prepare('SELECT 1 FROM service_tenants WHERE service_did = ?').get(serviceDid)) return res.status(409).json({ error: 'that wallet is already a tenant' });
-    db.prepare('INSERT INTO service_tenants (slug, name, service_did, owner_did, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(slug, name, serviceDid, ownerDid, auth.did, nowIso());
-    event('service_registered', auth.did, { slug, service_did: serviceDid, owner_did: ownerDid });
+    const g = personApproval('svc:demipass:register', `register service ${slug}`, ownerDid, 'elevated', { did: auth.did, label: name }, 'register', 'demipass',
+      { slug, name, service_did: serviceDid, owner: 'you' }, b, null);
+    if (!g.ok) return res.status(g.status).json(g.body);
+    try {
+      db.prepare('INSERT INTO service_tenants (slug, name, service_did, owner_did, created_by, approval_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+        .run(slug, name, serviceDid, ownerDid, auth.did, g.approval_id, nowIso());
+    } catch (e) { return res.status(409).json({ error: 'that slug or wallet was registered meanwhile' }); }
+    event('service_registered', auth.did, { slug, service_did: serviceDid, owner_did: ownerDid, approval_id: g.approval_id });
     logSecurityEvent('service_registered', 'info', { caller_did: auth.did, capability: 'service-register', target: slug, context: { service_did: serviceDid } });
     res.status(201).json({ ok: true, ...tenantView(tenantBySlug(slug)), owner_is_you: ownerDid === auth.did });
   });
 
-  // The tenant's price list. The tenant wallet or its owner. Lowering a depth (elevated → standard, say) removes a
-  // person's approval from every call: the owner, in their own session, with the PIN.
+  // The tenant's price list. The tenant wallet or its owner. Anything that weakens a gate — a lower depth, a closed
+  // action opened, a gated action moved to another scope, an action added to (or moved into) a scope someone holds by
+  // delegation — waits on the tenant owner's approval of exactly that change (#68 review M3).
   app.put('/api/services/:slug/actions', lim, (req, res) => {
     const auth = walletAuth(req, res); if (!auth) return;
     const t = tenantBySlug(req.params.slug);
     if (!t) return res.status(404).json({ error: 'no such service' });
-    const asOwner = auth.did === t.owner_did && !isAgentToken(auth);
-    if (auth.did !== t.service_did && !asOwner) return res.status(403).json({ error: 'the tenant wallet or its owner sets prices' });
-    const list = (req.body || {}).actions;
+    if (auth.did !== t.service_did && auth.did !== t.owner_did) return res.status(403).json({ error: 'the tenant wallet or its owner sets prices' });
+    const body = req.body || {};
+    const list = body.actions;
     if (!Array.isArray(list) || !list.length || list.length > 50) return res.status(400).json({ error: 'actions: 1-50 entries' });
     const rows = [];
     for (const a of list) {
       if (!a || typeof a !== 'object') return res.status(400).json({ error: 'each action is an object' });
-      const action = String(a.action || ''), scope = String(a.scope || a.action || '');
-      if (!ACTION_RE.test(action) || !ACTION_RE.test(scope)) return res.status(400).json({ error: `action/scope '${action}': 1-41 of [a-z0-9_.-]` });
+      const action = String(a.action || '');
+      if (!ACTION_RE.test(action)) return res.status(400).json({ error: `action '${action}': 1-41 of [a-z0-9_.-]` });
+      const cur = anyActionOf(t, action);
+      const scope = a.scope !== undefined ? String(a.scope) : (cur ? cur.scope : action);   // omitted: keep the current scope
+      if (!ACTION_RE.test(scope)) return res.status(400).json({ error: `scope '${scope}': 1-41 of [a-z0-9_.-]` });
       if (a.retired === true) { rows.push({ action, retired: true }); continue; }
       const cost = a.measured_cost_dd, max = a.max_cost_dd === undefined ? cost : a.max_cost_dd;
       if (!Number.isInteger(cost) || cost < 1 || cost > MAX_COST_DD) return res.status(400).json({ error: `${action}: measured_cost_dd 1-${MAX_COST_DD}` });
       if (!Number.isInteger(max) || max < cost || max > MAX_COST_DD) return res.status(400).json({ error: `${action}: max_cost_dd from measured_cost_dd to ${MAX_COST_DD}` });
-      const depth = a.depth === undefined ? null : String(a.depth);
-      if (depth !== null && !DEPTHS.includes(depth)) return res.status(400).json({ error: `${action}: depth is one of ${DEPTHS.join(', ')}` });
-      rows.push({ action, scope, cost, max, depth, open: a.open === undefined ? null : Boolean(a.open) });
+      const depth = a.depth === undefined ? (cur ? cur.depth : 'standard') : String(a.depth);
+      if (!DEPTHS.includes(depth)) return res.status(400).json({ error: `${action}: depth is one of ${DEPTHS.join(', ')}` });
+      const open = a.open === undefined ? (cur ? cur.open : 1) : (a.open ? 1 : 0);
+      rows.push({ action, scope, cost, max, depth, open });
     }
-    // Anything that weakens a gate: a lower depth, or a closed action opened to every wallet.
+    const delegated = (scope) => Boolean(db.prepare("SELECT 1 FROM service_delegations WHERE tenant_id = ? AND scope = ? AND status = 'active' LIMIT 1").get(t.id, scope));
+    // Compared with the row whatever its status: retiring and re-adding is no way around this.
     const weakens = rows.filter(r => {
-      const cur = actionOf(t, r.action); if (!cur || r.retired) return false;
-      return (r.depth !== null && DEPTHS.indexOf(r.depth) < DEPTHS.indexOf(cur.depth)) || (r.open === true && !cur.open) || (r.scope !== cur.scope && cur.depth !== 'standard');
+      if (r.retired) return false;
+      const cur = anyActionOf(t, r.action);
+      if (!cur) return delegated(r.scope);
+      return DEPTHS.indexOf(r.depth) < DEPTHS.indexOf(cur.depth) || (r.open && !cur.open)
+        || (r.scope !== cur.scope && (cur.depth !== 'standard' || !cur.open || delegated(r.scope)));
     });
     if (weakens.length) {
-      if (!asOwner) return res.status(403).json({ error: `lowering a depth or opening a closed action (${weakens.map(r => r.action).join(', ')}) takes the owner, in their own session, with the PIN` });
-      const intent = `svc-depth:${t.id}`;
-      if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('svc-depth', ['pin'], ['pin'], intent));
-      const refused = spendSingleUse(auth.did, 'svc-depth', ['pin'], auth, intent);
-      if (refused) return res.status(refused.status || 403).json(refused);
+      const g = personApproval(`svc:demipass:weaken`, `weaken ${t.slug} actions`, t.owner_did, 'elevated', { did: auth.did, label: t.slug }, 'weaken', t.slug,
+        { service: t.slug, changes: weakens.map(r => ({ action: r.action, scope: r.scope, depth: r.depth, open: Boolean(r.open) })) }, body, null);
+      if (!g.ok) return res.status(g.status).json({ ...g.body, weakens: weakens.map(r => r.action) });
     }
     const at = nowIso();
     db.transaction(() => {
       for (const r of rows) {
         if (r.retired) { db.prepare("UPDATE service_actions SET status = 'retired', updated_at = ? WHERE tenant_id = ? AND action = ?").run(at, t.id, r.action); continue; }
-        const cur = db.prepare('SELECT * FROM service_actions WHERE tenant_id = ? AND action = ?').get(t.id, r.action);
-        const depth = r.depth !== null ? r.depth : (cur ? cur.depth : 'standard');
-        const open = r.open !== null ? (r.open ? 1 : 0) : (cur ? cur.open : 1);
         db.prepare(`INSERT INTO service_actions (tenant_id, action, scope, measured_cost_dd, max_cost_dd, depth, open, status, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
                     ON CONFLICT(tenant_id, action) DO UPDATE SET scope = excluded.scope, measured_cost_dd = excluded.measured_cost_dd,
                       max_cost_dd = excluded.max_cost_dd, depth = excluded.depth, open = excluded.open, status = 'active', updated_at = excluded.updated_at`)
-          .run(t.id, r.action, r.scope, r.cost, r.max, depth, open, at);
+          .run(t.id, r.action, r.scope, r.cost, r.max, r.depth, r.open, at);
       }
     })();
     event('service_actions_set', auth.did, { service: t.slug, actions: rows.map(r => r.action), weakened: weakens.map(r => r.action) });
     res.json({ ok: true, ...tenantView(t) });
   });
 
-  // A caller mints a token for one tenant. Its own token (agents' fleet-minted ones included: that is how a silicon
-  // signs in), transact scope. The new token lives at most as long as the one minting it.
+  // Consent to pay a service (#68 review H1): {service, daily_cap_dd}. The person who answers for the wallet approves
+  // it in their app (themselves; an agent's fleet owner). Repeat the call with approval_id once approved. A new consent
+  // replaces the old one; the payer or the approver revokes it.
+  app.post('/api/services/consent', lim, (req, res) => {
+    const auth = walletAuth(req, res); if (!auth) return;
+    const b = req.body || {};
+    const t = tenantBySlug(b.service);
+    if (!t) return res.status(404).json({ error: 'service: no such service' });
+    if (auth.did === t.service_did) return res.status(400).json({ error: 'a tenant does not pay itself' });
+    const cap = b.daily_cap_dd;
+    if (!Number.isInteger(cap) || cap < 1 || cap > CONSENT_CAP_MAX_DD) return res.status(400).json({ error: `daily_cap_dd: 1-${CONSENT_CAP_MAX_DD} (the most ${t.slug} can charge this wallet in 24 h)` });
+    const approver = personFor(auth.did);
+    if (!approver) return res.status(403).json({ error: 'an agent no fleet created has no person to consent for it' });
+    const g = personApproval('svc:demipass:consent', `let a wallet pay ${t.slug}`, approver, 'elevated', { did: auth.did, label: '' }, 'consent', 'demipass',
+      { service: t.slug, wallet: auth.did, daily_cap_dd: cap }, b, null);
+    if (!g.ok) return res.status(g.status).json(g.body);
+    const at = nowIso();
+    const id = db.transaction(() => {
+      db.prepare("UPDATE service_consents SET status = 'replaced', revoked_at = ? WHERE payer_did = ? AND tenant_id = ? AND status = 'active'").run(at, auth.did, t.id);
+      return Number(db.prepare('INSERT INTO service_consents (payer_did, tenant_id, daily_cap_dd, approved_by, approval_id, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(auth.did, t.id, cap, approver, g.approval_id, at).lastInsertRowid);
+    })();
+    event('service_consent', auth.did, { consent_id: id, service: t.slug, daily_cap_dd: cap, approval_id: g.approval_id });
+    res.status(201).json({ ok: true, consent_id: id, service: t.slug, daily_cap_dd: cap });
+  });
+  app.post('/api/services/consents/:id/revoke', lim, (req, res) => {
+    const auth = walletAuth(req, res, { minScope: 'read' }); if (!auth) return;
+    const id = Number(req.params.id);
+    const c = Number.isInteger(id) && id > 0 ? db.prepare("SELECT * FROM service_consents WHERE id = ? AND (payer_did = ? OR approved_by = ?)").get(id, auth.did, auth.did) : null;
+    if (!c) return res.status(404).json({ error: 'no consent of yours with that id' });
+    if (c.status !== 'active') return res.status(409).json({ error: `already ${c.status}` });
+    db.prepare("UPDATE service_consents SET status = 'revoked', revoked_at = ? WHERE id = ? AND status = 'active'").run(nowIso(), id);
+    event('service_consent_revoked', auth.did, { consent_id: id });
+    res.json({ ok: true, revoked: true, consent_id: id });
+  });
+
+  // A caller mints a token for one tenant it has consent to pay. Its own token (agents' fleet-minted ones included),
+  // transact scope. The new token lives at most as long as the one minting it, and dies with it.
   app.post('/api/services/token', lim, (req, res) => {
     const auth = walletAuth(req, res); if (!auth) return;
     const b = req.body || {};
     const t = tenantBySlug(b.service);
     if (!t) return res.status(404).json({ error: 'service: no such service (GET /api/services)' });
     if (auth.did === t.service_did) return res.status(400).json({ error: 'a tenant does not call itself' });
+    const consent = consentOf(auth.did, t);
+    if (!consent) return res.status(403).json({ error: `consent to pay ${t.slug} first: POST /api/services/consent {service, daily_cap_dd} (approved in the DemiPass app)`, consent_required: true });
     const m = /^(\d+)(m|h)$/.exec(String(b.ttl || '1h'));
     if (!m) return res.status(400).json({ error: 'ttl: e.g. 15m, 1h, 24h' });
     let ttl = Number(m[1]) * (m[2] === 'h' ? 3600 : 60);
@@ -461,12 +575,14 @@ module.exports = function registerServiceTenants(deps) {
       const known = scopesOf(t);
       if (!Array.isArray(scopes) || !scopes.length || scopes.length > 20 || scopes.some(s => !known.includes(s))) return res.status(400).json({ error: `scopes: a list from ${known.join(', ') || '(none yet)'}` });
     }
-    const cap = b.cap_dd === undefined ? TOKEN_CAP_DEFAULT_DD : b.cap_dd;
-    if (!Number.isInteger(cap) || cap < 1 || cap > TOKEN_CAP_MAX_DD) return res.status(400).json({ error: `cap_dd: 1-${TOKEN_CAP_MAX_DD} (the most this token can be charged)` });
+    const cap = b.cap_dd === undefined ? Math.min(TOKEN_CAP_DEFAULT_DD, consent.daily_cap_dd) : b.cap_dd;
+    if (!Number.isInteger(cap) || cap < 1 || cap > consent.daily_cap_dd) return res.status(400).json({ error: `cap_dd: 1-${consent.daily_cap_dd} (your daily consent for ${t.slug})` });
     const w = db.prepare('SELECT encrypted_private_key, did, status FROM identity_wallets WHERE did = ?').get(auth.did);
     if (!w || w.status !== 'active' || !w.encrypted_private_key) return res.status(403).json({ error: 'wallet not active' });
-    const meta = { iss: SVC_ISS, aud: 'svc:' + t.slug, auth_method: 'service_token', cap_dd: cap, minted_by_jti: (auth.decoded && auth.decoded.jti) || null,
-      ...(scopes ? { svc_scopes: scopes } : {}), ...(auth.decoded && auth.decoded.fleet ? { fleet: auth.decoded.fleet, src_auth: auth.decoded.auth_method } : {}) };
+    const dec = auth.decoded || {};
+    const meta = { iss: SVC_ISS, aud: 'svc:' + t.slug, auth_method: 'service_token', cap_dd: cap, minted_by_jti: dec.jti || null,
+      ...(dec.sid ? { sid: dec.sid } : {}), ...(dec.auth_method ? { src_auth: dec.auth_method } : {}), ...(dec.fleet ? { fleet: dec.fleet } : {}),
+      ...(scopes ? { svc_scopes: scopes } : {}) };
     let token;
     try { token = identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: 'transact', expiresIn: `${ttl}s`, metadata: meta }); }
     catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
@@ -477,7 +593,6 @@ module.exports = function registerServiceTenants(deps) {
       use: `send it to ${t.name} as Authorization: Bearer <token>; it opens nothing at DemiPass itself` });
   });
 
-  // Revoke one of my service tokens (or a fleet owner revokes it for their silicon: use the silicon's revoke-all).
   app.post('/api/services/token/revoke', lim, (req, res) => {
     const auth = walletAuth(req, res, { minScope: 'read' }); if (!auth) return;
     const id = String((req.body || {}).token_id || '');
@@ -488,11 +603,9 @@ module.exports = function registerServiceTenants(deps) {
     res.json({ ok: true, revoked: true, token_id: id });
   });
 
-  // Delegation of a service scope, use-only: the delegate calls the tenant's actions in that scope with ITS OWN service
-  // token (and pays from its own wallet); the tenant sees the delegation and a pairwise principal, never the owner.
-  // Same rules as secret delegation (/api/blindkey/delegate): a person's own session, never an agent token (so agents
-  // never hand a scope on); delegates are agents; an agent the owner's fleet did not create takes the PIN. Depth comes
-  // with the scope: the delegate's elevated calls wait on the owner's approval.
+  // Delegation of a service scope, use-only, to an agent the person's own fleet created (#68 review H2: nobody pushes a
+  // scope onto someone else's agent). A person's own session, never an agent token, so agents never hand a scope on.
+  // The delegate calls with its own service token and pays from its own wallet; depth comes with the scope.
   app.post('/api/services/delegate', lim, (req, res) => {
     const auth = walletAuth(req, res); if (!auth) return;
     if (isAgentToken(auth)) {
@@ -505,19 +618,11 @@ module.exports = function registerServiceTenants(deps) {
     const scope = String(b.scope || '');
     const acts = db.prepare("SELECT * FROM service_actions WHERE tenant_id = ? AND scope = ? AND status = 'active'").all(t.id, scope);
     if (!acts.length) return res.status(404).json({ error: `no scope '${scope}' at ${t.slug} (${scopesOf(t).join(', ')})` });
-    // A closed scope (any of its actions closed) is the tenant owner's to hand on; an open one, anybody's.
     if (acts.some(a => !a.open) && auth.did !== t.owner_did) return res.status(403).json({ error: `'${scope}' at ${t.slug} is held by its owner only` });
     const delegate = String(b.delegate_did || '');
     if (!db.prepare('SELECT 1 FROM identity_wallets WHERE did = ?').get(delegate)) return res.status(404).json({ error: 'delegate_did: no such wallet' });
-    if (delegate === auth.did) return res.status(400).json({ error: 'you hold it already' });
     if (delegate === t.service_did) return res.status(400).json({ error: 'not to the tenant itself' });
-    if (!isAgentWallet(delegate)) return res.status(403).json({ error: 'a service scope goes to an agent (a silicon in a fleet)' });
-    if (!ownAgent(auth.did, delegate)) {
-      const intent = `svc-delegate:${t.id}`;
-      if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('svc-delegate', ['pin'], ['pin'], intent));
-      const refused = spendSingleUse(auth.did, 'svc-delegate', ['pin'], auth, intent);
-      if (refused) return res.status(refused.status || 403).json(refused);
-    }
+    if (!ownAgent(auth.did, delegate)) return res.status(403).json({ error: 'a service scope goes to an agent your own fleet created' });
     const expiresAt = Number.isInteger(b.expires_in) && b.expires_in > 0 ? new Date(Date.now() + Math.min(b.expires_in, 365 * 86400) * 1000).toISOString() : null;
     const at = nowIso();
     const id = db.transaction(() => {
@@ -531,7 +636,6 @@ module.exports = function registerServiceTenants(deps) {
       depth: Object.fromEntries(acts.map(a => [a.action, a.depth])) });
   });
 
-  // Revoke a delegation: its owner (any token of theirs, agents included: taking access away is always allowed).
   app.post('/api/services/delegations/:id/revoke', lim, (req, res) => {
     const auth = walletAuth(req, res, { minScope: 'read' }); if (!auth) return;
     const id = Number(req.params.id);
@@ -550,7 +654,7 @@ module.exports = function registerServiceTenants(deps) {
   });
   app.post('/api/services/charge', lim, (req, res) => {
     const a = tenantAuth(req, res); if (!a) return;
-    const r = charge(a.tenant, req.body, a.auth.decoded && a.auth.decoded.jti);
+    const r = charge(a.tenant, req.body);
     res.status(r.status).json(r.body);
   });
 
@@ -559,7 +663,7 @@ module.exports = function registerServiceTenants(deps) {
     if (!meterKey) return res.status(503).json({ error: 'signing key unavailable' });
     if (typeof receipt !== 'string' || typeof sig !== 'string' || receipt.length > 4096 || sig.length > 200) return res.status(400).json({ error: 'receipt (string) and sig' });
     let ok = false;
-    try { ok = crypto.verify(null, Buffer.from(receipt, 'utf8'), crypto.createPublicKey({ key: meterKey.publicKeyDer, format: 'der', type: 'spki' }), Buffer.from(sig, 'base64url')); } catch (_) {}
+    try { ok = crypto.verify(null, Buffer.from(RECEIPT_DOMAIN + receipt, 'utf8'), crypto.createPublicKey({ key: meterKey.publicKeyDer, format: 'der', type: 'spki' }), Buffer.from(sig, 'base64url')); } catch (_) {}
     if (!ok) return res.json({ valid: false, error: 'signature does not verify against this server\'s key' });
     let p; try { p = JSON.parse(receipt); } catch (_) { return res.json({ valid: false, error: 'not JSON' }); }
     const row = db.prepare('SELECT receipt FROM service_charges WHERE charge_id = ?').get(p.charge_id);
@@ -572,3 +676,4 @@ module.exports = function registerServiceTenants(deps) {
 module.exports.SERVICE_MARGIN_PCT = SERVICE_MARGIN_PCT;
 module.exports.priceOf = priceOf;
 module.exports.SVC_ISS = SVC_ISS;
+module.exports.RECEIPT_DOMAIN = RECEIPT_DOMAIN;
