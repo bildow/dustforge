@@ -2188,10 +2188,13 @@ async function storeSecret(){
   }}
 
 // Satisfy one security gate interactively. Returns true on success.
-async function satisfyGate(gate, what, intent){
+async function satisfyGate(gate, what, intent, alt){
   try {
     if(gate==='twofa'){
-      await api('POST','/api/identity/request-2fa',{did});
+      // A wallet with no mailbox on file confirms with its password instead — only where the server said it takes
+      // either (alt.twofa === 'password', a phone link); anywhere else the code is the gate.
+      const sent=await api('POST','/api/identity/request-2fa',{did}).catch(e=>({_err:e.message}));
+      if(sent&&sent._err){ if(!(alt&&alt.twofa==='password'&&/no email on file/.test(sent._err))) throw new Error(sent._err); return await satisfyGate('password', what, intent); }
       const code=prompt('A 6-digit code was emailed to you. Enter it:');
       if(!code) return false;
       await api('POST','/api/identity/gate/verify',{gate:'twofa',code:code.trim()});
@@ -2564,28 +2567,52 @@ async function setLockAfter(v){
   loadLockSetting();
 }
 
+// Linking is the phone's own job, start to end, and it always ends in words on this screen: linked (the server lists
+// this phone), waiting 48 hours, or "Not linked" with the step and the reason. Nothing is swallowed, cancels included.
+// Order: the emailed code (or password) and the PIN first, then the keys and the link inside the PIN's one minute
+// (the server's link challenge also lives a minute — fetching a code in between used to outlive it).
+let linkBusy=false;
 async function linkPhone(){
   const out=document.getElementById('device-out');
+  const say=(t,bad)=>{ if(out){ out.textContent=t; out.style.color=bad?'var(--red)':'var(--green)'; } };
+  if(linkBusy){ say('Linking is already under way on this screen.'); return; }
+  linkBusy=true; let step='starting'; let made=null;
   try{
-    if(!globalThis.DemiPassDevice){ alert('Open this in the DemiPass app on your phone to link it.'); return; }
+    if(!globalThis.DemiPassDevice) throw new Error('this page is not open in the DemiPass app (1.3 or newer), which holds the phone\'s keys');
+    step='confirming it is you'; say('Linking this phone — step 1 of 3: confirm it is you (a code we email you, then your PIN)…');
+    await apiGated('POST','/api/identity/device/enrol',{check:true},'Link this phone for approvals? Your PIN confirms it.');
+    step='making this phone\'s keys'; say('Linking this phone — step 2 of 3: confirm with your fingerprint, face or screen lock…');
     const ch=await api('POST','/api/identity/device/challenge',{purpose:'enrol',intent:'device-enrol:0'});
     const r=await dev.call('enrol',ch.message);
-    if(!r.ok) throw new Error(r.error||'could not link this phone');
-    let res;
-    try{ res=await apiGated('POST','/api/identity/device/enrol',{challenge_id:ch.challenge_id,device_id:r.device_id,label:r.label,key_d:r.key_d,key_p:r.key_p,sig_d:r.sig_d,sig_p:r.sig_p},'Link this phone for approvals? Your PIN and account password confirm it.'); }
-    catch(e){ try{ globalThis.DemiPassDevice.abandonEnrol(); }catch(_){} throw e; }   // the working keys stay
+    if(!r.ok) throw new Error(r.error==='cancelled'?'the fingerprint / screen-lock prompt was closed or did not finish':(r.error||'this phone could not make its keys'));
+    made=r;
+    step='registering it with the server'; say('Linking this phone — step 3 of 3: registering it…');
+    const res=await apiGated('POST','/api/identity/device/enrol',{challenge_id:ch.challenge_id,device_id:r.device_id,label:r.label,key_d:r.key_d,key_p:r.key_p,sig_d:r.sig_d,sig_p:r.sig_p},'Link this phone for approvals? Your PIN confirms it.');
     // Item 9 (E1): another phone is already linked, so this one waits 48 hours — the new keys stay pending on this
     // phone until the server lists it as linked (loadDevices commits it then), or an established phone lets it in.
     if(res&&res.pending){
       // The code is this phone's own: sha256 of its device key, computed here — not taken from the server's reply.
       let code=''; try{ const h=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(r.key_d))); code=[...h].slice(0,8).map(b=>b.toString(16).padStart(2,'0')).join(''); }catch(_){}
-      if(out) out.textContent='This phone waits to be linked until '+fmtWhen(res.active_at)+' — or open DemiPass on a phone linked for 48 hours or more and let it in now, checking it shows this code: '+code+'.';
+      made=null;
+      say('Registered, waiting: this phone is linked '+fmtWhen(res.active_at)+' — or open DemiPass on a phone linked for 48 hours or more and let it in now, checking it shows this code: '+code+'.');
       loadDevices(); return; }
+    // The server accepted the keys: from here this phone IS linked, whatever the check below says.
     try{ globalThis.DemiPassDevice.commitEnrol(); }catch(_){}
-    if(out) out.textContent='This phone is linked: approvals come from it, and your fingerprint/face can stand in for the PIN.';
+    made=null;
+    let listed=null; try{ const list=await api('GET','/api/identity/devices'); listed=(list.devices||[]).some(d=>d.device_id===r.device_id); }catch(e){ if(sessionEnded(e)) throw e; }
+    if(listed===false){ say('The server accepted this phone but does not list it — reopen Settings; if it is still missing, remove any stray phone below and link again.',true); loadDevices(); return; }
+    say(listed?('Linked ✓ '+(res&&res.label?res.label+' ':'')+'is your approval phone: the server lists it, and your fingerprint/face can stand in for the PIN.')
+              :'Linked ✓ — the server accepted this phone (this screen could not re-check the list just now; reopen Settings to see it).');
     await ensureWrapKey();
     loadDevices();
-  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  }catch(e){
+    if(made){ try{ globalThis.DemiPassDevice.abandonEnrol(); }catch(_){} }   // the working keys stay
+    const m=String((e&&e.message)||e||'unknown error');
+    const g=/^cancelled — (\w+) not verified$/.exec(m);
+    const why=g?(gateName(g[1])+' was not confirmed'):m.replace(/^cancelled — /,'');
+    say('Not linked (while '+step+'): '+why+'. Nothing was linked — tap "Use this phone for approvals" to try again.',true);
+    if(!sessionEnded(e)) loadDevices();
+  }finally{ linkBusy=false; }
 }
 async function unlinkPhone(id){
   try{ const r=await apiGated('DELETE','/api/identity/devices/'+encodeURIComponent(id),null,'Remove this phone? Your PIN confirms it.');
@@ -2634,7 +2661,7 @@ async function apiGated(method, path, body, what){
       // Codes first, the PIN last: its proof opens only this action (d.intent), once, so it is typed right
       // before the retry — never ahead of a code step that might still be cancelled.
       const order=[...d.missing.filter(g=>g!=='pin'), ...d.missing.filter(g=>g==='pin')];
-      for(const g of order){ if(!await satisfyGate(g, what, d.intent)) throw new Error('cancelled — '+g+' not verified'); }
+      for(const g of order){ if(!await satisfyGate(g, what, d.intent, d.or)) throw new Error('cancelled — '+g+' not verified'); }
       ({status,d}=await call());
     } else if(status===423 && d.locked){
       // The linked phone approves only while unlocked: biometric (or the PIN), then try again.

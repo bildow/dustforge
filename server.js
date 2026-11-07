@@ -2137,6 +2137,9 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS forward_relays (
   created_at TEXT DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(did, forward_to, filter_from)
 )`); } catch(e) {}
+// When a rule last became active (a re-create reactivates an old row in place): a rule younger than 48 hours means an
+// emailed code may be reaching someone new, so a phone link will not take a code as its second factor (device_keys.js).
+try { db.exec('ALTER TABLE forward_relays ADD COLUMN activated_at TEXT'); } catch (_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_fr_did ON forward_relays(did)"); } catch(e) {}
 
 // POST /api/relay/create — set up a forwarding rule
@@ -2152,7 +2155,7 @@ app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, '
   if (count >= 5) return res.status(400).json({ error: 'maximum 5 active forwarding rules' });
 
   try {
-    db.prepare('INSERT INTO forward_relays (did, forward_to, filter_from, label) VALUES (?, ?, ?, ?) ON CONFLICT(did, forward_to, filter_from) DO UPDATE SET status = ?, label = ?, forwarded_count = 0')
+    db.prepare("INSERT INTO forward_relays (did, forward_to, filter_from, label, activated_at) VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(did, forward_to, filter_from) DO UPDATE SET status = ?, label = ?, forwarded_count = 0, activated_at = CASE WHEN forward_relays.status = 'active' THEN forward_relays.activated_at ELSE datetime('now') END")
       .run(req.identity.did, forward_to, filter_from, label || '', 'active', label || '');
     res.json({ ok: true, forward_to, filter_from, label: label || '', note: 'Forwarding active. Each forwarded email costs 10 DD (1¢).' });
   } catch (e) {

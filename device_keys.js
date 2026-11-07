@@ -228,13 +228,32 @@ module.exports = function registerDeviceKeys(deps) {
   app.post('/api/identity/device/enrol', rateLimitStandard, (req, res) => {
     const auth = personAuth(req, res); if (!auth) return;
     const { challenge_id, device_id, label, key_d, key_p, sig_d, sig_p } = req.body || {};
+    // The PIN and a second factor: knowing the PIN once must not plant a device (#47 review H1). The second factor is the
+    // account password OR an emailed code (to the wallet's own mailbox, which only the password opens), so an owner who
+    // never types a vault value links a phone from the phone alone. Each stays fresh 5 minutes in this session.
+    const intent = 'device-enrol:0';
+    // A mail-forwarding rule that became active in the last 48 hours may have carried the code to someone else (a
+    // session token alone can make one): then only the password counts (#63 review H1). Active or not — removing the
+    // rule after the code went out must not clear it (#63 re-review H1).
+    let newRelay = true;   // fails closed: if the rules cannot be read, only the password counts
+    try { newRelay = !!db.prepare("SELECT 1 FROM forward_relays WHERE did = ? AND julianday(COALESCE(activated_at, created_at)) > julianday('now', '-2 days') LIMIT 1").get(auth.did); } catch (_) {}
+    const secondOk = gateFresh(auth.did, 'password', auth) || (!newRelay && gateFresh(auth.did, 'twofa', auth));
+    const second = newRelay ? 'password' : 'twofa';
+    const missing = [...(secondOk ? [] : [second]), ...(gateFresh(auth.did, 'pin', auth, intent) ? [] : ['pin'])];
+    if (missing.length) return res.status(403).json({ ...gateMissing('device-enrol', [second, 'pin'], missing, intent),
+      ...(newRelay ? { note: 'a mail-forwarding rule was made or turned on in the last 48 hours, so an emailed code does not count: the account password, then the PIN' }
+                   : { or: { twofa: 'password' }, note: 'an emailed code (or the account password), then the PIN' }) });
+    // {check:true}: the factors are fresh and nothing in the way — the app makes its keys and links within the PIN's
+    // minute. Nothing is spent.
+    if ((req.body || {}).check === true) {
+      const n = db.prepare('SELECT COUNT(DISTINCT device_id) AS n FROM device_keys WHERE did = ? AND revoked_at IS NULL').get(auth.did).n;
+      if (n >= MAX_DEVICES) return res.status(409).json({ error: `at most ${MAX_DEVICES} devices — remove one first` });
+      const Hc = holds();
+      if (Hc && hasDevice(auth.did)) { const stop = Hc.startRefusal(auth.did, 'enrol'); if (stop) return res.status(stop.status).json(stop.body); }
+      return res.json({ ok: true, ready: true });
+    }
     if (typeof device_id !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(device_id)) return res.status(400).json({ error: 'device_id: 8–64 of A-Z a-z 0-9 _ -' });
     if (!parsePublicKey(key_d) || !parsePublicKey(key_p) || key_d === key_p) return res.status(400).json({ error: 'key_d and key_p: two different P-256 public keys (SPKI, base64)' });
-    // The PIN and the account password: knowing the PIN once must not plant a device (#47 review H1). Agents never hold
-    // the password; the owner typed it at sign-in on the phone.
-    const intent = 'device-enrol:0';
-    const missing = ['password', 'pin'].filter(g => !gateFresh(auth.did, g, auth, g === 'pin' ? intent : null));
-    if (missing.length) return res.status(403).json(gateMissing('device-enrol', ['password', 'pin'], missing, intent));
     const live = db.prepare('SELECT COUNT(DISTINCT device_id) AS n FROM device_keys WHERE did = ? AND revoked_at IS NULL').get(auth.did).n;
     if (db.prepare('SELECT 1 FROM device_keys WHERE device_id = ? LIMIT 1').get(device_id)) return res.status(409).json({ error: 'that device id is already known — the app makes a new one for each link' });
     if (live >= MAX_DEVICES) return res.status(409).json({ error: `at most ${MAX_DEVICES} devices — remove one first` });
