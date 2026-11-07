@@ -2266,7 +2266,7 @@ async function phoneProof(intent, what){
 async function holdsPost(path, body){
   const r=await fetch(API+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   const d=await r.json().catch(()=>({}));
-  if(!r.ok) throw Object.assign(new Error(d.error||'failed'),{status:r.status});
+  if(!(r.status>=200&&r.status<300)) throw Object.assign(new Error(d.error||'failed'),{status:r.status});
   return d;
 }
 async function holdChallenge(purpose, holdId){
@@ -2281,7 +2281,7 @@ async function cancelHold(id){
     await holdsPost('/api/identity/holds/'+encodeURIComponent(id)+'/cancel',{device_id:st.device_id,challenge:ch.challenge,signature:r.signature});
     alert('Canceled. Nothing changed.');
   }catch(e){ if(!/cancelled/.test(e.message)) alert(e.message); }
-  loadHolds(); checkLoginHolds();
+  if(tk) loadHolds(); else checkLoginHolds();
 }
 async function letPhoneIn(id){
   try{
