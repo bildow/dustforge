@@ -2572,6 +2572,21 @@ async function setLockAfter(v){
 // Order: the emailed code (or password) and the PIN first, then the keys and the link inside the PIN's one minute
 // (the server's link challenge also lives a minute — fetching a code in between used to outlive it).
 let linkBusy=false;
+// No screen lock, no presence key: Android refuses a key that needs "confirm it's you" on a phone without a PIN, pattern
+// or password (1.7.0 said only "could not create keys: InvalidAlgorithmParameterException"). The app (1.8+) reports
+// secure_lock up front and can open the lock settings itself.
+// The raw keystore error means "no lock" only from app 1.7.0 (no secure_lock field); 1.8+ says it in words itself,
+// and on Android 9/10 the same error can mean "no fingerprint" (#64 review).
+const NO_LOCK_RE=/no screen lock/, RAW_KEY_ERR=/could not create keys: (InvalidAlgorithmParameter|IllegalState)Exception/;
+function noLock(why){ return NO_LOCK_RE.test(why)||(RAW_KEY_ERR.test(why)&&dev.st().secure_lock===undefined); }
+function openLockSettings(){
+  try{ if(globalThis.DemiPassDevice&&typeof globalThis.DemiPassDevice.openLockSettings==='function'){ globalThis.DemiPassDevice.openLockSettings(); return; } }catch(_){}
+  alert('Open Android Settings → Security → Screen lock, set a PIN, pattern or password, then come back and tap "Use this phone for approvals".');
+}
+function lockHint(el){
+  if(!el) return; const b=document.createElement('button'); b.className='btn-ghost'; b.style.marginTop='0.4rem'; b.textContent='Set a screen lock'; b.onclick=openLockSettings;
+  el.appendChild(document.createElement('br')); el.appendChild(b);
+}
 async function linkPhone(){
   const out=document.getElementById('device-out');
   const say=(t,bad)=>{ if(out){ out.textContent=t; out.style.color=bad?'var(--red)':'var(--green)'; } };
@@ -2579,6 +2594,7 @@ async function linkPhone(){
   linkBusy=true; let step='starting'; let made=null;
   try{
     if(!globalThis.DemiPassDevice) throw new Error('this page is not open in the DemiPass app (1.3 or newer), which holds the phone\'s keys');
+    if(dev.st().secure_lock===false) throw new Error('this phone has no screen lock');
     step='confirming it is you'; say('Linking this phone — step 1 of 3: confirm it is you (a code we email you, then your PIN)…');
     await apiGated('POST','/api/identity/device/enrol',{check:true},'Link this phone for approvals? Your PIN confirms it.');
     step='making this phone\'s keys'; say('Linking this phone — step 2 of 3: confirm with your fingerprint, face or screen lock…');
@@ -2610,7 +2626,8 @@ async function linkPhone(){
     const m=String((e&&e.message)||e||'unknown error');
     const g=/^cancelled — (\w+) not verified$/.exec(m);
     const why=g?(gateName(g[1])+' was not confirmed'):m.replace(/^cancelled — /,'');
-    say('Not linked (while '+step+'): '+why+'. Nothing was linked — tap "Use this phone for approvals" to try again.',true);
+    if(noLock(why)){ say('Not linked: this phone has no screen lock, and DemiPass needs one — its fingerprint or screen lock is what confirms each approval. Set a PIN, pattern or password (a fingerprint too, if you like), then tap "Use this phone for approvals" again. Nothing was linked.',true); lockHint(out); }
+    else say('Not linked (while '+step+'): '+why+'. Nothing was linked — tap "Use this phone for approvals" to try again.',true);
     if(!sessionEnded(e)) loadDevices();
   }finally{ linkBusy=false; }
 }
@@ -2634,6 +2651,7 @@ async function loadDevices(){
       +'<div class="fr-row"><button class="btn-ghost" onclick="unlinkPhone('+esc(JSON.stringify(d.device_id))+')">Remove</button></div></div>').join('')
       +(r.pending||[]).map(p=>'<div class="fill-req"><div><b>'+esc(p.label||'phone')+'</b> — waiting to be linked'+(me.ok&&me.pending_device_id===p.device_id?' (this phone)':'')+'</div><div style="color:var(--text3);font-size:0.75rem">linked '+esc(fmtWhen(p.active_at))+' unless canceled (see Waiting changes)</div></div>').join('')
       +(me.ok&&!me.enrolled&&!me.pending_device_id?'<button class="btn-primary" onclick="linkPhone()">Use this phone for approvals</button>':'')
+      +(me.ok&&!me.enrolled&&me.secure_lock===false?'<div style="color:var(--red);font-size:0.75rem;margin-top:0.4rem">This phone has no screen lock. DemiPass needs one to link it: set a PIN, pattern or password first. <button class="btn-ghost" onclick="openLockSettings()">Set a screen lock</button></div>':'')
       +((r.devices||[]).length?'':'<div style="color:var(--text3);font-size:0.75rem;margin-top:0.4rem">No phone linked: approvals are taken from any signed-in session with your PIN.</div>')
       +((r.devices||[]).length?'<div style="color:var(--text3);font-size:0.72rem;margin-top:0.4rem">Elevated and critical secrets are wrapped to your linked phone: the server cannot read them, only use them when you approve. If you lose every phone that holds them, they are gone.</div>':'');
     if(me.ok&&me.enrolled) ensureWrapKey();
