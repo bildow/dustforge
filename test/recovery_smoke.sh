@@ -13,8 +13,10 @@ cd "$W"
 # fake Stalwart: logs each PATCH; $S/stalwart.fail holds how many of the next PATCHes answer 500
 node -e 'const fs=require("fs"); require("http").createServer((q, r) => { let b=""; q.on("data", c => b += c); q.on("end", () => {
   const f = process.argv[2] + "/stalwart.fail"; let n = 0; try { n = +fs.readFileSync(f, "utf8"); } catch (_) {}
+  if (q.method === "GET") { r.writeHead(200); return r.end(JSON.stringify({ data: { secrets: ["PRIOR-SECRET"] } })); }
   if (n > 0) fs.writeFileSync(f, String(n - 1));
-  fs.appendFileSync(process.argv[2] + "/stalwart.log", q.method + " " + q.url + " " + (n > 0 ? 500 : 200) + "\n"); r.writeHead(n > 0 ? 500 : 200); r.end("{}"); }); }).listen(+process.argv[1], "127.0.0.1");' $STP "$S" & STW=$!
+  let v = ""; try { v = JSON.parse(b)[0].value[0]; } catch (_) {}
+  fs.appendFileSync(process.argv[2] + "/stalwart.log", q.method + " " + q.url + " " + (n > 0 ? 500 : 200) + " " + (v === "PRIOR-SECRET" ? "prior" : "new") + "\n"); r.writeHead(n > 0 ? 500 : 200); r.end("{}"); }); }).listen(+process.argv[1], "127.0.0.1");' $STP "$S" & STW=$!
 (exec node server.js >"$S/server.log" 2>&1) & SRV=$!
 trap 'kill $SRV $STW 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$S"' EXIT
 for i in $(seq 1 60); do curl -s -o /dev/null "$API/api/health" && break; sleep 0.5; done
@@ -22,11 +24,14 @@ kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -5 "$S/server.log"; exit
 sleep 1
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
+(async () => {
 const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
-const pinGate = require("./pin_gate");
+const pinGate = require("./pin_gate"), passwords = require("./passwords");
+const ph = await passwords.hashPassword("hunter22");   // a current salted hash: sign-in never asks the (fake) mail server
 for (const u of ["owner", "lonely", "g1", "g2", "g3", "g4"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash, pin_hash, pin_set_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)")
-    .run(id.did, u, u + "@dustforge.com", enc, process.argv[1], pinGate.hashPin("4321"), "2026-01-01 00:00:00.000"); }' "$H"
+    .run(id.did, u, u + "@dustforge.com", enc, ph, pinGate.hashPin("4321"), "2026-01-01 00:00:00.000"); }
+})()'
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 J(){ python3 -c 'import json,sys; d=json.load(sys.stdin); v=d
 for k in sys.argv[1].split("."):
@@ -112,6 +117,9 @@ start owner pd; RD=$RID; CD=$CODE6; gapprove g1 $RD $CD; gapprove g3 $RD $CD; du
 ownercancel $RD; [ "$CODE" = 200 ] || fail "C3 cancel: $CODE $BODY"
 complete $RD pd; { [ "$CODE" = 404 ] || [ "$CODE" = 409 ]; } && [ "$(Q "SELECT status FROM account_holds WHERE id='$RD'")" = canceled ] && ok "C3 canceled after the 48 h but before completing: completion refused" || fail "C3 complete after cancel: $CODE $BODY"
 
+# ── #61 re-review M4: junk starts neither block nor displace a real request ──
+for i in 1 2 3 4 5 6; do start owner pj$i; [ "$CODE" = 202 ] || fail "M4 junk $i: $CODE $BODY"; done
+[ "$(Q "SELECT status FROM account_holds WHERE id='$RB'")" = quorum ] && ok "M4 six unapproved starts later the real (approved) request is untouched" || fail "M4 displaced: $(Q "SELECT status FROM account_holds WHERE id='$RB'")"
 # ── M2: a guardian whose account just linked a phone cannot approve ──
 start owner pe; RE=$RID; CE=$CODE6
 X "UPDATE device_keys SET enrolled_at='$(iso -86400)' WHERE device_id='phone-g3'"
@@ -120,7 +128,7 @@ X "UPDATE device_keys SET enrolled_at='$(iso -864000)' WHERE device_id='phone-g3
 
 # ── R1: complete ──
 due $RB; echo 1 >"$S/stalwart.fail"; complete $RB pb
-[ "$CODE" = 503 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$RB'")" = quorum ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-owner' AND revoked_at IS NULL")" = 2 ] && [ "$(grep -c PATCH "$S/stalwart.log")" = 2 ] \
+[ "$CODE" = 503 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$RB'")" = quorum ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-owner' AND revoked_at IS NULL")" = 2 ] && [ "$(grep -c PATCH "$S/stalwart.log")" = 2 ] && tail -1 "$S/stalwart.log" | grep -q " prior$" \
   && ok "R1 the mail server answered unclearly: the mailbox was put back (2nd PATCH), nothing changed (503), still ready and cancelable" || fail "R1 stalwart fail: $CODE $BODY $(cat "$S/stalwart.log")"
 echo 2 >"$S/stalwart.fail"; complete $RB pb
 [ "$CODE" = 503 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$RB'")" = completing ] && ok "R1 neither the change nor the undo confirmed: it stays completing (no cancel can split it)" || fail "R1 stuck: $CODE $(Q "SELECT status FROM account_holds WHERE id='$RB'")"

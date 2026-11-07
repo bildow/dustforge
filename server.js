@@ -8441,7 +8441,8 @@ const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, g
 const guardianRecovery = require('./recovery')({ app, db, rateLimitStrict, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing,
   spendSingleUse, logSecurityEvent, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys, holds: () => accountHolds,
   guardians: () => recoveryGuardians, cryptoDepth: () => cryptoDepth, cutSessions: (did) => cutSessions(did),
-  hashPassword: (pw) => passwords.hashPassword(pw), setMailboxPassword: (did, hash) => setMailboxPasswordHash(did, hash) });
+  hashPassword: (pw) => passwords.hashPassword(pw), setMailboxPassword: (did, hash) => setMailboxPasswordHash(did, hash),
+  getMailboxSecret: (did) => { const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did); return w ? fetchStalwartSecret(w.username) : Promise.resolve({ state: 'unreachable' }); } });
 // Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
 require('./leak_scan')({ app, db, express, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, blindkeyDecrypt, blindkeyEncrypt, cleanLabel, sendMail: (...a) => fleetRoutes.sendMail(...a), devices: () => deviceKeys });

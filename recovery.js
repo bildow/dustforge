@@ -107,17 +107,14 @@ module.exports = function registerRecovery(deps) {
     if (!w || w.status !== 'active') return res.status(404).json({ error: 'no such account' });
     if (db.prepare('SELECT 1 FROM device_keys WHERE device_id = ? LIMIT 1').get(b.device_id)) return res.status(409).json({ error: 'that device id is already known — the app makes a new one each time' });
     if (!spend(c)) return res.status(403).json({ error: 'start challenge already used' });
-    // Limits (design H4): several open at once (each bound to its own key and code), so junk starts never block a
-    // real one; only starts a guardian approved count toward the weekly limit; and a global daily cap.
+    // Limits (design H4): several open at once (each bound to its own key and code); a per-IP daily cap; only starts a
+    // guardian approved count toward the per-account and weekly limits.
     const ip = String(req.ip || '').slice(0, 64);
     if (db.prepare('SELECT COUNT(*) AS n FROM recovery_starts WHERE ip = ? AND at > ?').get(ip, isoAgo(86400)).n >= STARTS_PER_IP_PER_DAY) return res.status(429).json({ error: 'try again tomorrow' });
-    // Junk starts never block a real one (#61 review M2): at the cap, the oldest request no guardian approved gives way.
-    const openRows = db.prepare(`SELECT * FROM account_holds WHERE did = ? AND kind = 'recovery' AND ${OPEN} ORDER BY created_at`).all(w.did);
-    if (openRows.length >= OPEN_PER_ACCOUNT) {
-      const junk = openRows.find(h => !Object.keys(parse(h.payload).approvals || {}).length);
-      if (!junk) return res.status(429).json({ error: 'too many recoveries are waiting for this account' });
-      db.prepare(`UPDATE account_holds SET status = 'canceled', canceled_by = 'replaced by a newer request', canceled_at = ?, payload = '{}' WHERE id = ? AND ${OPEN}`).run(nowIso(), junk.id);
-    }
+    // Junk starts never block a real one, and never displace it (#61 re-review M4): unapproved requests are bounded by
+    // the per-IP daily cap only; the per-account cap counts requests a guardian has approved.
+    const approvedOpen = db.prepare(`SELECT COUNT(*) AS n FROM account_holds WHERE did = ? AND kind = 'recovery' AND ${OPEN} AND note = 'approved'`).get(w.did).n;
+    if (approvedOpen >= OPEN_PER_ACCOUNT) return res.status(429).json({ error: 'too many recoveries are waiting for this account' });
     const approvedWeek = db.prepare("SELECT COUNT(*) AS n FROM account_holds WHERE did = ? AND kind = 'recovery' AND note = 'approved' AND created_at > ?").get(w.did, isoAgo(7 * 86400)).n;
     if (approvedWeek >= APPROVED_STARTS_PER_WEEK) return res.status(429).json({ error: 'too many recoveries this week for this account' });
     db.prepare('INSERT INTO recovery_starts (ip, did, at) VALUES (?, ?, ?)').run(ip, w.did, nowIso());
@@ -306,31 +303,41 @@ module.exports = function registerRecovery(deps) {
       return res.status(403).json({ error: 'not signed by the new phone of this recovery' });
     }
     if (typeof b.new_password !== 'string' || b.new_password.length < 8 || b.new_password.length > 128) return res.status(400).json({ error: 'new_password: 8–128 characters' });
-    // A completion that got stuck (the mail server's answer was unknown and could not be undone) is retried only from
-    // this same phone, after a pause (#61 review H1).
+    // A completion that got stuck (the mail server's answer was unclear and the undo could not be confirmed) is retried
+    // only from this same phone, after a pause (#61 review H1).
     const stuck = h.status === 'completing' && Date.parse(String(h.note || '').replace(/^completing:/, '')) < Date.now() - 60000;
     if (h.status !== 'quorum' && !stuck) return res.status(409).json({ error: h.status === 'completing' ? 'completing — try again in a minute' : 'two guardians have not approved it' });
     if (!h.ready_at || Date.parse(h.ready_at) > Date.now()) return res.status(409).json({ error: 'the 48 hours are not over', ready_at: h.ready_at });
-    if (standingApprovals(h).length < QUORUM) { if (h.status === 'quorum') recount(h); return res.status(409).json({ error: 'fewer than two guardians still stand behind it' }); }
+    // A stuck one past its window, or no longer backed by two guardians, ends here: mailbox put back, failed (#61 re-review L1/L2).
+    if (stuck && (Date.parse(h.expires_at || 0) < Date.now() || standingApprovals(h).length < QUORUM)) {
+      await endStuck(h, p, Date.parse(h.expires_at || 0) < Date.now() ? 'its completion window passed' : 'fewer than two guardians still stand behind it');
+      return res.status(409).json({ error: 'this recovery has ended; nothing changed' });
+    }
+    if (standingApprovals(h).length < QUORUM) { recount(h); return res.status(409).json({ error: 'fewer than two guardians still stand behind it' }); }
     // Everything finish() needs is checked before the mail server is touched (#61 review H1).
     if (db.prepare('SELECT 1 FROM device_keys WHERE device_id = ? LIMIT 1').get(p.device_id)) return res.status(409).json({ error: 'this phone is already linked to a wallet — recover from a phone that is not' });
-    const w = db.prepare('SELECT password_hash FROM identity_wallets WHERE did = ?').get(h.did);
-    if (!w) return res.status(404).json({ error: 'not ready to complete from this phone' });
+    // The mailbox's own current secret, to put back exactly on any undo (#61 re-review M1) — read before anything changes.
+    let prior = p.mail_prior;
+    if (!stuck) {
+      const m = await deps.getMailboxSecret(h.did);
+      if (m.state === 'unreachable') return res.status(503).json({ error: 'the mail server cannot be reached — nothing changed; try again', retry: true });
+      prior = m.state === 'ok' ? m.secret : null;   // 'absent': no mailbox to change
+    }
     if (!spend(c)) return res.status(404).json({ error: 'not ready to complete from this phone' });
-    // Claimed: a cancel cannot land while the mail server is being changed, so the mailbox is never left on a password
-    // of a recovery that then got canceled. (Until this point the owner's phones can still cancel.)
-    if (db.prepare(`UPDATE account_holds SET status = 'completing', note = ? WHERE id = ? AND status = ?`).run('completing:' + nowIso(), h.id, h.status).changes !== 1) return res.status(409).json({ error: 'this recovery ended meanwhile' });
+    // Claimed, compare-and-swap on status AND note (#61 re-review M3: two retries of a stuck one cannot both claim it).
+    // Until this point the owner's phones can still cancel; a claimed request cannot be canceled, so the mailbox is
+    // never left on a password of a recovery that then got canceled.
+    const claim = 'completing:' + nowIso();
+    const pNext = { ...p, mail_prior: prior };
+    if (db.prepare('UPDATE account_holds SET status = ?, note = ?, payload = ? WHERE id = ? AND status = ? AND COALESCE(note, \'\') = ?')
+      .run('completing', claim, JSON.stringify(pNext), h.id, h.status, h.note || '').changes !== 1) return res.status(409).json({ error: 'this recovery ended meanwhile' });
     let newHash;
     try { newHash = await deps.hashPassword(b.new_password); } catch (_) { newHash = null; }
-    const mail = newHash ? await deps.setMailboxPassword(h.did, newHash).catch(() => 'unknown') : 'unreached';
+    const mail = !newHash ? 'unreached' : prior === null ? 'ok' : await deps.setMailboxPassword(h.did, newHash).catch(() => 'unknown');
     if (mail !== 'ok') {
-      // Not reached: nothing changed anywhere. Unknown: put the mailbox back on the password DemiPass holds; if that
-      // works, nothing changed either. Only if the undo cannot be confirmed does it stay 'completing' (retryable from
-      // this phone; the owner is told and the sweep keeps telling).
-      let back = mail === 'unreached';
-      if (!back && w.password_hash) back = (await deps.setMailboxPassword(h.did, w.password_hash).catch(() => 'unknown')) === 'ok';
+      const back = mail === 'unreached' || await undoMailbox(h.did, prior);
       if (back) {
-        db.prepare("UPDATE account_holds SET status = 'quorum', note = 'approved' WHERE id = ? AND status = 'completing'").run(h.id);
+        db.prepare("UPDATE account_holds SET status = 'quorum', note = 'approved' WHERE id = ? AND status = 'completing' AND note = ?").run(h.id, claim);
         return res.status(503).json({ error: 'the mail password could not be set — nothing changed; try again', retry: true });
       }
       logSecurityEvent('recovery_completion_stuck', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id } });
@@ -338,18 +345,37 @@ module.exports = function registerRecovery(deps) {
       return res.status(503).json({ error: 'the mail server did not answer clearly — try again in a minute from this phone', retry: true });
     }
     let report;
-    try { report = finish(h, p, newHash); }
+    try { report = finish(h, pNext, newHash); }
     catch (e) {
-      // The mailbox already has the new password: keep DemiPass on the same one (never split), sign everything out.
+      // #61 re-review M2: put the mailbox back first; only if that cannot be confirmed does DemiPass follow the mailbox
+      // (never split). Nothing is written when the request is no longer this claim's.
       console.error('[recovery] completion failed after the mailbox password changed:', e.message);
-      try { db.prepare('UPDATE identity_wallets SET password_hash = ?, password_must_change = 0 WHERE did = ?').run(newHash, h.did); } catch (_) {}
-      try { deps.cutSessions(h.did); } catch (_) {}
-      db.prepare("UPDATE account_holds SET status = 'failed', note = ? WHERE id = ? AND status = 'completing'").run(String(e.message).slice(0, 200), h.id);
-      logSecurityEvent('recovery_completion_failed', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id, error: String(e.message).slice(0, 120) } });
-      return res.status(500).json({ error: 'the recovery could not finish — the new password is set; contact support' });
+      const cur = getReq(h.id);
+      if (!cur || cur.status !== 'completing' || cur.note !== claim) return res.status(409).json({ error: 'this recovery ended meanwhile' });
+      const back = prior === null || await undoMailbox(h.did, prior);
+      if (!back) {
+        try { db.prepare('UPDATE identity_wallets SET password_hash = ?, password_must_change = 0 WHERE did = ?').run(newHash, h.did); } catch (_) {}
+        try { deps.cutSessions(h.did); } catch (_) {}
+      }
+      db.prepare("UPDATE account_holds SET status = 'failed', note = ?, payload = '{}' WHERE id = ? AND status = 'completing' AND note = ?").run(String(e.message).slice(0, 200), h.id, claim);
+      logSecurityEvent('recovery_completion_failed', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id, mailbox_restored: back, error: String(e.message).slice(0, 120) } });
+      holds().tellOwner(h.did, 'a recovery of your wallet did not complete', back ? `It stopped (${e.message}). Nothing changed.\n` : `It stopped (${e.message}) after your mail password changed; every session was signed out. Contact DemiPass support.\n`);
+      return res.status(500).json({ error: 'the recovery could not finish' + (back ? ' — nothing changed' : ' — contact support') });
     }
     res.json({ ok: true, completed: true, device_id: p.device_id, next: 'set a new PIN (with the new password); your wallet is on this phone now', ...report });
   });
+  // Put the mailbox back on the secret it had before this completion. true when confirmed.
+  async function undoMailbox(did, prior) {
+    if (prior === null || prior === undefined) return true;
+    return (await deps.setMailboxPassword(did, prior).catch(() => 'unknown')) === 'ok';
+  }
+  async function endStuck(h, p, why) {
+    const back = await undoMailbox(h.did, p.mail_prior);
+    if (!back) { try { deps.cutSessions(h.did); } catch (_) {} }
+    db.prepare("UPDATE account_holds SET status = 'failed', note = ?, payload = '{}' WHERE id = ? AND status = 'completing'").run('ended: ' + why, h.id);
+    logSecurityEvent('recovery_completion_failed', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id, why, mailbox_restored: back } });
+    holds().tellOwner(h.did, 'a recovery of your wallet ended', `A recovery of your wallet that was part-way through ended: ${why}. ${back ? 'Your mail password is as before.' : 'Your mail password could not be confirmed as before: contact DemiPass support.'}\n`);
+  }
 
   // Stuck completions are told about (owner + a critical event) until the new phone retries.
   const stuckTimer = setInterval(() => {
