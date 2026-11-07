@@ -142,6 +142,26 @@ module.exports = function registerLeakScan(deps) {
     if (spent) return res.status(spent.status || 403).json(spent);
     res.json({ ok: true, id, token_label: h.token_label, created_at: h.created_at, found: JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk })) });
   });
+  // POST /api/blindkey/leak-scan/descriptions {redact_ids?} — which of my descriptions and notes hold one of my vault
+  // values (by name, never the value), and with redact_ids (rows picked from a check), cut the values out of those. The owner's own session with the PIN
+  // (intent scan-descriptions:<0|1>): an oracle over the owner's values, like the scan itself (secret_text_guard.js).
+  app.post('/api/blindkey/leak-scan/descriptions', rateLimitStandard, (req, res) => {
+    const auth = personAuth(req, res); if (!auth) return;
+    // Redact only the rows the owner picked from a check (#71 review M1): never "everything found".
+    const ids = (req.body || {}).redact_ids;
+    const redact = Array.isArray(ids) && ids.length > 0;
+    if (ids !== undefined && (!Array.isArray(ids) || ids.length > 500 || !ids.every(x => Number.isInteger(x) && x > 0))) return res.status(400).json({ error: 'redact_ids: up to 500 secret ids from a check' });
+    const intent = `scan-descriptions:${redact ? 1 : 0}`;
+    if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('scan-descriptions', ['pin'], ['pin'], intent));
+    const spent = spendSingleUse(auth.did, 'scan-descriptions', ['pin'], auth, intent);
+    if (spent) return res.status(spent.status || 403).json(spent);
+    const { found, unchecked } = require('./secret_text_guard').sweepDescriptions(db, blindkeyDecrypt, auth.did, { redactIds: redact ? ids : null });
+    const done = redact ? found.filter(f => ids.includes(f.id)) : [];
+    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+      .run(redact ? 'description_redact' : 'description_check', auth.did, null, null, JSON.stringify({ found: found.length, redacted: done.map(f => f.name), unchecked }));
+    res.json({ ok: true, unchecked, redacted: done.map(f => f.name),
+      found: found.map(f => ({ id: f.id, name: f.name, ref: f.ref_code, fields: f.fields, holds_value_of: f.holds, updated_at: f.updated_at, own: f.own, flagged: f.flagged })) });
+  });
   // DELETE /api/blindkey/leak-scan/tokens/:id — revoke.
   // Revoking and denying are the owner's, in their own session (#45 review L3: an agent could revoke the deploy gate's
   // token and stop every deploy).

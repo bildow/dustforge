@@ -425,6 +425,39 @@ module.exports = function registerFleetRoutes(deps) {
     res.json({ ok: true, project: req.params.project, bill_mode });
   });
 
+  // ── Fund a project wallet ─────────────────────────────────────────────────
+  // Aaron 2026-11-07: "a wallet I can see and can't fund." The owner moves DD from their own wallet into a project's
+  // cost-center wallet (e.g. bench for the eval rig). Money leaves the owner's wallet: the owner's PIN every time
+  // (intent project-fund:<project row id>, one use), and only the owner's own token (no worker token).
+  app.post('/api/fleet/:slug/projects/:project/fund', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
+    if (a.decoded && a.decoded.wrk) return res.status(403).json({ error: "only the owner's own token can fund a project" });
+    const p = db.prepare('SELECT id, project, wallet_did FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(a.fleet.id, req.params.project);
+    if (!p) return res.status(404).json({ error: 'project not found on this fleet board' });
+    if (!p.wallet_did) return res.status(409).json({ error: `project ${p.project} has no wallet of its own` });
+    if (p.wallet_did === a.did) return res.status(409).json({ error: `project ${p.project} bills your own wallet: there is nothing to move` });
+    if (!db.prepare('SELECT 1 FROM identity_wallets WHERE did = ?').get(p.wallet_did)) return res.status(409).json({ error: `project ${p.project}'s wallet does not exist` });
+    const amount = Number((req.body || {}).amount_cents);
+    if (!Number.isInteger(amount) || amount < 1 || amount > 10000000) return res.status(400).json({ error: 'amount_cents: integer 1-10000000' });
+    const intent = `project-fund:${p.id}`;
+    const auth = getBearerIdentity(req);
+    if (!auth.ok || !gateFresh(a.did, 'pin', auth, intent)) {
+      return res.status(403).json({ ...gateMissing('project-fund', ['pin'], ['pin'], intent), error: `moving DD into project ${p.project} takes your PIN` });
+    }
+    const refused = spendSingleUse(a.did, 'project-fund', ['pin'], auth, intent);
+    if (refused) return res.status(refused.status || 403).json(refused);
+    try {
+      const r = fb.transferRefill(db, billing, { fromDid: a.did, toDid: p.wallet_did, amount,
+        // No "to" in it: transferRefill turns the first one into "from" for the receiving side's row.
+        description: `Project funding for ${p.project}: ${amount} DD (fleet ${a.fleet.slug})`, ledger });
+      log(`funded project ${p.project} with ${amount} DD from ${a.did} (fleet ${a.fleet.slug})`);
+      res.json({ ok: true, project: p.project, amount_cents: amount, from_balance_after: r.from_balance_after,
+                 wallet_balance_cents: billing.getDerivedBalance(db, p.wallet_did) });
+    } catch (e) {
+      res.status(e.statusCode || 500).json({ error: (e.body && e.body.error) || e.message, ...(e.statusCode === 402 && e.body ? { balance_cents: e.body.balance_cents, required: amount } : {}) });
+    }
+  });
+
   // ── Attribution report + manual scheduler run ─────────────────────────────
   app.get('/api/fleet/:slug/attribution', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'] }); if (!a) return;

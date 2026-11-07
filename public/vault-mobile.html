@@ -356,6 +356,8 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Leak scanner tokens (pane start, deploy gate, CI)</div>
         <div id="scan-tokens" style="margin-top:0.3rem;font-size:0.75rem"></div>
         <div style="font-size:0.68rem;color:var(--text3);margin-top:0.2rem">A token only asks “is one of my values in this text?”. The first leak it finds revokes it.</div>
+        <button class="btn-ghost" onclick="checkDescriptions()" style="width:100%;text-align:left;padding:0.6rem;margin-top:0.4rem">Check descriptions for secret values</button>
+        <div id="desc-check-out" style="font-size:0.72rem;margin-top:0.25rem"></div>
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Lock after (idle)</div>
         <select id="lock-after" onchange="setLockAfter(this.value)" style="width:100%;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.8rem">
           <option value="60">1 minute</option><option value="120">2 minutes</option><option value="300">5 minutes</option><option value="600">10 minutes</option>
@@ -829,11 +831,16 @@ async function loadFleet(){
     // Projects
     if(d.projects&&d.projects.length){
       h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Projects (cost centers)</span></div>';
-      for(const p of d.projects){
+      for(const [pi,p] of d.projects.entries()){
         h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.45rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">';
         h+='<div><strong>'+esc(p.project)+'</strong><div style="font-size:0.65rem;color:var(--text3)">'+p.operators.length+' operator'+(p.operators.length===1?'':'s')+' · wallet '+dd(p.wallet_balance_cents)+' DD</div></div>';
         h+='<select onchange="setBillMode('+jsArg(p.project)+',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
         h+='</div>';
+        // Fund the project's own wallet from mine (PIN). Not shown when the project bills my wallet directly.
+        if(p.wallet_did&&p.wallet_did!==did){
+          const fid='pf-'+pi;   // by row: two project names can clean to the same id (#71 review L5)
+          h+='<div style="display:flex;gap:0.4rem;align-items:center;padding:0.35rem 0 0.5rem;border-bottom:1px solid rgba(39,68,95,0.25)"><input type="number" inputmode="numeric" id="'+fid+'" min="1" placeholder="DD" style="width:6rem;margin:0;padding:0.35rem;font-size:0.75rem"><button class="btn-ghost" onclick="fundProject('+jsArg(p.project)+','+jsArg(fid)+')" style="font-size:0.72rem;padding:0.35rem 0.6rem">Add DD from my wallet</button></div>';
+        }
       }
     }
     // Attribution
@@ -865,6 +872,15 @@ async function saveOwnerRefill(){
     await api('PUT','/api/fleet/'+encodeURIComponent(fleetSlug)+'/owner-refill',{cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:'operator_grant'});
     loadFleet();
   }catch(e){alert(e.message)}
+}
+// Move DD from my wallet into a project's cost-center wallet (POST …/projects/:project/fund). The PIN approves each one.
+async function fundProject(project, inputId){
+  const el=document.getElementById(inputId); const a=Number(el&&el.value||0);
+  if(!Number.isInteger(a)||a<1){ alert('Enter a whole number of DD'); return; }
+  try{
+    const r=await apiGated('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(project)+'/fund',{amount_cents:a},'Move '+dd(a)+' DD from your wallet into project '+project+'? Your PIN approves it.');
+    alert('Project '+project+' now holds '+dd(r.wallet_balance_cents)+' DD.'); loadFleet();
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
 }
 async function setBillMode(project,mode){try{await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(project),{bill_mode:mode})}catch(e){alert(e.message);loadFleet()}}
 async function revokeWorkLink(id){if(!confirm('Revoke work link #'+id+'?'))return;try{await api('POST','/api/work-links/'+id+'/revoke');siliconHandle?openSilicon(siliconHandle):loadFleet()}catch(e){alert(e.message)}}
@@ -904,6 +920,7 @@ async function openSilicon(handle){
     h+='<div style="display:flex;gap:0.4rem;align-items:center;flex-wrap:wrap;margin-top:0.4rem;font-size:0.78rem"><input type="checkbox" id="sil-set-enabled" '+(s.refill.enabled?'checked':'')+' style="width:auto;margin:0"><span>when below</span><input type="number" id="sil-set-threshold" value="'+s.refill.threshold_cents+'" min="0" style="width:5rem;margin:0;padding:0.3rem"><span>DD add</span><input type="number" id="sil-set-amount" value="'+s.refill.amount_cents+'" min="0" style="width:5rem;margin:0;padding:0.3rem"><span>DD from</span>';
     h+='<select id="sil-set-source" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.72rem;margin:0"><option value="owner"'+(s.refill.source==='owner'?' selected':'')+'>my wallet</option><option value="fleet"'+(s.refill.source==='fleet'?' selected':'')+'>fleet wallet</option></select>';
     h+='<button class="btn-primary" onclick="saveSiliconSettings()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Save</button></div>';
+    if(s.refill.enabled&&s.refill.confirmed===false) h+='<div style="font-size:0.72rem;color:var(--red);margin-top:0.35rem">Not running yet: @'+esc(s.handle)+' is a wallet your fleet did not create, so automatic refills start only once you confirm the rule. Tap Save and enter your PIN.</div>';
     h+='<div style="font-size:0.66rem;color:var(--text3);margin-top:0.35rem">'+(s.refill.last_refill_at?'last refill '+esc(s.refill.last_refill_at)+' UTC':'never refilled')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</div>';
     h+='</div>';
     // token
@@ -953,8 +970,10 @@ async function openSilicon(handle){
   }catch(e){if(!sessionEnded(e))el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 function closeSilicon(){siliconHandle=null;goPage('fleet');loadFleet()}
-async function saveSiliconSettings(){try{await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle),{refill_enabled:document.getElementById('sil-set-enabled').checked,refill_threshold_cents:Number(document.getElementById('sil-set-threshold').value||0),refill_amount_cents:Number(document.getElementById('sil-set-amount').value||0),refill_source:document.getElementById('sil-set-source').value});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
-async function refillNow(){const a=Number(document.getElementById('sil-refill-now').value||0);if(!(a>0))return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/refill',{amount_cents:a});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
+// A wallet the fleet did not create (linked or joined through the network) is someone's own: refilling it, and arming
+// its auto-refill, take the owner's PIN. apiGated asks for it (number pad, or the linked phone) and retries once.
+async function saveSiliconSettings(){try{await apiGated('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle),{refill_enabled:document.getElementById('sil-set-enabled').checked,refill_threshold_cents:Number(document.getElementById('sil-set-threshold').value||0),refill_amount_cents:Number(document.getElementById('sil-set-amount').value||0),refill_source:document.getElementById('sil-set-source').value},'Save the auto-refill rule for @'+siliconHandle+'? Your PIN confirms it.');openSilicon(siliconHandle)}catch(e){if(!/cancelled/.test(e.message)&&!sessionEnded(e))alert(e.message)}}
+async function refillNow(){const a=Number(document.getElementById('sil-refill-now').value||0);if(!(a>0))return;try{await apiGated('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/refill',{amount_cents:a},'Send '+dd(a)+' DD to @'+siliconHandle+'? Your PIN approves this refill.');openSilicon(siliconHandle)}catch(e){if(!/cancelled/.test(e.message)&&!sessionEnded(e))alert(e.message)}}
 async function mintSiliconToken(){if(!confirm('Mint a 30-day transact token for @'+siliconHandle+'? It is shown once.'))return;try{const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/token',{scope:'transact',expires_in:'30d'});document.getElementById('sil-token-out').style.display='block';document.getElementById('sil-token-text').value=r.token}catch(e){if(!sessionEnded(e))alert(e.message)}}
 async function delegateToSilicon(){const v=document.getElementById('sil-delegate-name').value.trim();if(!v)return;try{await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/delegate',v.startsWith('DP-')?{ref:v}:{secret_name:v});openSilicon(siliconHandle)}catch(e){alert(e.message)}}
 async function revokeDelegation(id){if(!confirm('Revoke this delegation?'))return;try{await api('DELETE','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle)+'/delegations/'+id);openSilicon(siliconHandle)}catch(e){alert(e.message)}}
@@ -2565,6 +2584,39 @@ async function scanDecide(id, ok){
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
   finally{ scanBusy.delete(id); }
   loadScanRequests(); loadScanTokens();
+}
+// Descriptions are shown to agents in every list and search, so a value written into one leaks to every pane that
+// lists the vault. Find them (names only) and cut the values out; each step takes the PIN.
+async function checkDescriptions(){
+  const out=document.getElementById('desc-check-out'); out.style.color='var(--text3)'; out.textContent='Checking…';
+  try{
+    const r=await apiGated('POST','/api/blindkey/leak-scan/descriptions',{},'Check your descriptions and notes for secret values? Your PIN approves it.');
+    const un=r.unchecked?'<div style="color:var(--text3);margin-top:0.25rem">'+r.unchecked+' secret'+(r.unchecked===1?' is':'s are')+' wrapped to your phone: this server cannot read '+(r.unchecked===1?'it':'them')+', so '+(r.unchecked===1?'its value was':'their values were')+' not looked for.</div>':'';
+    if(!r.found.length){ out.style.color='var(--green)'; out.innerHTML='No description or note holds a secret value this server can read.'+un; return; }
+    out.style.color='var(--text)';
+    // Pick what to clean. Only a row holding its OWN value starts ticked. A row holding another secret's value may be a
+    // planted list of guesses: cleaning it would show whoever planted it which guess was right, so it starts unticked.
+    let h='<div style="color:var(--red)">These hold a secret value:</div>';
+    for(const f of r.found){
+      h+='<label style="display:flex;gap:0.4rem;align-items:flex-start;margin-top:0.3rem;font-size:0.72rem;color:var(--text)"><input type="checkbox" class="desc-pick" value="'+Number(f.id)+'"'+(f.own?' checked':'')+' style="width:auto;margin:0.15rem 0 0">'
+        +'<span><strong>'+esc(f.name)+'</strong> ('+esc(f.fields.join(' and '))+'): value of '+esc(f.holds_value_of.join(', '))
+        +'<span style="color:var(--text3)"> · changed '+esc(f.updated_at||'?')+' UTC</span>'
+        +(!f.own?'<div style="color:var(--red)">Holds another secret\'s value'+(f.flagged?', and changed recently or holds several':'')+'. If you did not write this, delete the secret rather than cleaning it.</div>':'')+'</span></label>';
+    }
+    h+='<button class="btn-primary" onclick="redactDescriptions()" style="font-size:0.72rem;padding:0.3rem 0.6rem;margin-top:0.4rem">Remove the values from the ticked ones</button>'
+      +'<div style="color:var(--text3);margin-top:0.25rem">Agents that listed your vault may have these values in their transcripts: rotate those secrets.</div>'+un;
+    out.innerHTML=h;
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ out.style.color='var(--red)'; out.textContent=e.message; } else out.textContent=''; }
+}
+async function redactDescriptions(){
+  const out=document.getElementById('desc-check-out');
+  const ids=[...document.querySelectorAll('.desc-pick:checked')].map(x=>Number(x.value)).filter(n=>n>0);
+  if(!ids.length){ alert('Tick the ones to clean first'); return; }
+  try{
+    const r=await apiGated('POST','/api/blindkey/leak-scan/descriptions',{redact_ids:ids},'Cut the secret values out of '+ids.length+' description'+(ids.length===1?'':'s')+'? Your PIN approves it.');
+    out.style.color='var(--green)'; out.textContent=r.redacted.length?('Removed from '+r.redacted.join(', ')+'.'):'Nothing left to remove.';
+    loadVault();
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ out.style.color='var(--red)'; out.textContent=e.message; } }
 }
 async function loadScanTokens(){
   const el=document.getElementById('scan-tokens'); if(!el) return;

@@ -8,6 +8,12 @@ const Database = require('better-sqlite3');
 const identity = require('./identity');
 const dustforge = require('./dustforge');
 const billing = require('./billing');
+const secretTextGuard = require('./secret_text_guard');   // keeps secret values out of descriptions
+// A rotation copies the description to the new version: never with the old value in it (#71 review L2). A value this
+// server cannot read (wrapped to a phone) leaves the description as it was.
+function descriptionWithout(description, encryptedValue) {
+  try { return secretTextGuard.cutValue(description, blindkeyDecrypt(encryptedValue)); } catch (_) { return description; }
+}
 const mailRecipientCap = require('./mail_recipient_cap');
 const hexPayload = require('./hex-payload');
 const conversion = require('./conversion');
@@ -3602,6 +3608,7 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
   if (typeof name !== 'string' || typeof value !== 'string') return res.status(400).json({ error: 'name and value: strings' });
   if (description !== undefined && description !== null && typeof description !== 'string') return res.status(400).json({ error: 'description: must be a string' });
+  if (secretTextGuard.valueInText(value, description, note)) return res.status(400).json({ error: secretTextGuard.OWN_VALUE_ERROR, field: 'description' });
   // The account the credential signs in as (an SSH user, a panel login): ssh_exec uses it when the caller names no user.
   let accountUsername = null;
   if (username !== undefined && username !== null && username !== '') {
@@ -5647,7 +5654,7 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
                                     provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
                                     security_depth, gate_policy, fill_origins, fill_username)
       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
-    `).run(ownerDid, newName, existing.description, existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
+    `).run(ownerDid, newName, descriptionWithout(existing.description, existing.encrypted_value), existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
            existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days,
            existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null);
 
@@ -5760,6 +5767,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
     if (body.target_silicon.startsWith('did:')) target_did = body.target_silicon; else target_username = body.target_silicon;
   }
   if ((!target_did && !target_username) || !name || !value) return res.status(400).json({ error: 'target_did, target_username or target_silicon, plus name and value required' });
+  if (secretTextGuard.valueInText(value, description)) return res.status(400).json({ error: secretTextGuard.OWN_VALUE_ERROR, field: 'description' });
   if (target_did && typeof target_did !== 'string') return res.status(400).json({ error: 'target_did: must be a string' });
   if (target_username && typeof target_username !== 'string') return res.status(400).json({ error: 'target_username: must be a string' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
@@ -5866,6 +5874,7 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
       }
       if (s.name.length > 64) { errors.push({ index: i, error: 'name must be 64 chars or less' }); continue; }
       if (s.value.length > 10000) { errors.push({ index: i, error: 'value must be 10000 chars or less' }); continue; }
+      if (secretTextGuard.valueInText(s.value, s.description)) { errors.push({ index: i, error: secretTextGuard.OWN_VALUE_ERROR }); continue; }
 
       const targetWallet = db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(s.target_did);
       if (!targetWallet) { errors.push({ index: i, error: 'target_did not found' }); continue; }
@@ -6088,6 +6097,7 @@ function handleRowenIngest(req, res) {
 
   const { depositor_type, depositor_id, target_did, name, value, secret_type, description, contexts } = req.body || {};
   if (!target_did || !name || !value) return res.status(400).json({ error: 'target_did, name, and value required' });
+  if (secretTextGuard.valueInText(value, description)) return res.status(400).json({ error: secretTextGuard.OWN_VALUE_ERROR, field: 'description' });
   if (typeof target_did !== 'string') return res.status(400).json({ error: 'target_did: must be a string' });
   if (typeof name !== 'string') return res.status(400).json({ error: 'name: must be a string' });
   if (typeof value !== 'string') return res.status(400).json({ error: 'value: must be a string' });
@@ -12391,7 +12401,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
                                               provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
                                               security_depth, gate_policy, fill_origins, fill_username, account_username)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)`)
-      .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
+      .run(ownerDid, newName, descriptionWithout(secret.description || '', secret.encrypted_value) + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
            secret.provider || '', secret.ownership || 'sole', secret.rotatable ?? 1, secret.category, secret.labels, secret.rotation_interval_days,
            secret.security_depth, secret.gate_policy, secret.fill_origins ?? null, secret.fill_username ?? null,
            sshUser);   // the account this password now belongs to: kept, so the next rotation is bound to it
@@ -13796,7 +13806,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|scan-descriptions|project-fund|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve):\d{1,12}$/;   // project-fund:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

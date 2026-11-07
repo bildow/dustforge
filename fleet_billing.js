@@ -448,7 +448,10 @@ function siliconView(db, billing, s, { fleet } = {}) {
     refill: { enabled: !!s.refill_enabled, threshold_cents: s.refill_threshold_cents, amount_cents: s.refill_amount_cents,
               source: s.refill_source, last_refill_at: s.last_refill_at, last_error: s.last_refill_error || '',
               daily_cap_cents: s.refill_daily_cap_cents || 0, auto_last_24h_cents: autoRefilledLast24h(db, s.member_did),
-              alert_email: s.refill_alert_email || '' },
+              alert_email: s.refill_alert_email || '',
+              // A wallet the fleet did not create refills automatically only once its owner confirmed the rule with
+              // the PIN (thresholdRefill); the card says so instead of failing silently.
+              owned: ownedOutright(s), confirmed: ownedOutright(s) || !!Number(s.refill_confirmed) },
     token: tokenStatus(db, s.member_did),
     fleet: fleet ? { slug: fleet.slug, name: fleet.name } : undefined,
     status: s.status, created_at: s.created_at, joined_via: s.joined_via || 'owner',
