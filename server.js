@@ -1127,6 +1127,9 @@ function checkCode(table, did, code, purpose) {
     db.prepare('INSERT INTO code_failures (did, purpose, at) VALUES (?, ?, CURRENT_TIMESTAMP)').run(did, purpose);
     paused = codeFailuresToday(did, purpose) === CODE_FAILURES_PER_DAY[purpose];
   }).immediate();
+  // One pause mail per wallet and purpose a day, however the rolling window is walked (#57 re-review L2).
+  if (paused && db.prepare("SELECT 1 FROM demipass_security_events WHERE event_type = 'code_guessing_paused' AND caller_did = ? AND context_json LIKE ? AND created_at > ? LIMIT 1")
+      .get(did, `%"purpose":"${purpose}"%`, sqlTime(86400 * 1000))) paused = false;
   if (paused) {
     logSecurityEvent('code_guessing_paused', 'critical', { caller_did: did, context: { purpose } });
     const w = db.prepare('SELECT email FROM identity_wallets WHERE did = ?').get(did);
@@ -1144,8 +1147,12 @@ app.post('/api/identity/request-2fa', rateLimitStrict, (req, res) => {
   // Nobody could receive it: issue nothing (#57 review H2).
   if (!wallet.email) return res.status(409).json({ error: 'no email on file for this wallet: sign in with your password' });
   // The signed-in owner asking (the vault's twofa gate) gets a 'gate' code; anyone else a 'login' code.
+  // A bearer that is present must be valid (#57 re-review L3: a stale session must not quietly get a login code), and
+  // codes are the owner's: a silicon bearer gets none (L1).
   const bearer = req.headers.authorization ? getBearerIdentity(req) : null;
-  const purpose = bearer && bearer.ok && !bearer.silicon && bearer.did === did ? 'gate' : 'login';
+  if (bearer && !bearer.ok) return res.status(bearer.status || 401).json({ error: bearer.error || 'session expired' });
+  if (bearer && bearer.silicon) return res.status(403).json({ error: 'emailed codes are for the owner, not for silicon agents' });
+  const purpose = bearer && bearer.did === did ? 'gate' : 'login';
   const issued = issueCode('identity_2fa_codes', did, purpose);
   if (!issued.code) { const r = issueRefusal(issued, purpose); return res.status(r.status).json(r.body); }
   const { code, expiresAt } = issued;
