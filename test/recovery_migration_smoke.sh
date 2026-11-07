@@ -47,7 +47,7 @@ kill $SRV; wait $SRV 2>/dev/null
 boot "$W"
 for c in "device_keys revoked_via" "device_gate_proofs device_id" "identity_wallets password_must_change" "blindkey_use_tokens executing_until" "recovery_guardians change_id"; do set -- $c
   [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('$1') WHERE name='$2'")" = 1 ] || fail "column $1.$2 missing"; done
-[ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('account_holds','hold_challenges','recovery_guardians','recovery_email_history')")" = 4 ] && ok "new code on the old DB: columns and tables added" || fail "tables"
+[ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('account_holds','hold_challenges','recovery_guardians','recovery_email_history','recovery_challenges')")" = 5 ] && ok "new code on the old DB: columns and tables added" || fail "tables"
 [ "$(Q "SELECT COUNT(*) FROM device_gate_proofs WHERE device_id IS NULL")" -ge 1 ] && ok "old biometric proofs keep working rows (device_id NULL)" || fail "old proofs"
 A=$(login); call POST /api/identity/pin "$A" '{"pin":"5555","password":"hunter22"}'; HR=$(echo "$BODY" | J hold_id)
 [ "$CODE" = 202 ] && ok "the phone linked under the old code counts: a PIN reset by password now waits" || fail "R0 on migrated: $CODE $BODY"

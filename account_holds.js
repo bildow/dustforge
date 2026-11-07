@@ -242,7 +242,7 @@ module.exports = function registerAccountHolds(deps) {
     tell(h.did, `canceled: ${h.kind === 'recovery' ? 'the recovery of your wallet' : WHAT[h.kind]}`,
       `It was canceled from one of your phones at ${nowIso()}. Nothing changed.\n` +
       (h.kind === 'pin-reset' ? 'Whoever started it knows your account password: every session was signed out, and you must choose a new password at your next sign-in.\n' : ''));
-    if (h.kind === 'recovery' && deps.onRecoveryCanceled) { try { deps.onRecoveryCanceled(h); } catch (_) {} }
+    if (h.kind === 'recovery' && deps.recovery) { try { deps.recovery().onCanceled(h); } catch (_) {} }
     if (h.kind === 'guardians' && deps.guardians) { try { deps.guardians().dropChange(h); } catch (_) {} }
   }
 
@@ -349,6 +349,6 @@ module.exports = function registerAccountHolds(deps) {
   }
   const guardiansActive = (did) => db.prepare("SELECT COUNT(*) AS n FROM recovery_guardians WHERE owner_did = ? AND status = 'active'").get(did).n > 0;
 
-  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, startRefusal, dropDeviceHolds, closeOpen, establishedKey, eligibleKey, setRecoveryEmail,
+  return { createHold, openHolds, view, sweep, pinResetRefusal, guardiansActive, startRefusal, dropDeviceHolds, closeOpen, tellOwner: tell, establishedKey, eligibleKey, setRecoveryEmail,
            HOLD_DELAY_SEC, ESTABLISHED_SEC, GRACE_SEC };
 };

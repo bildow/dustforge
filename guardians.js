@@ -190,7 +190,7 @@ module.exports = function registerGuardians(deps) {
     const n = db.prepare("UPDATE recovery_guardians SET status = 'removed', removed_at = ?, why = ? WHERE owner_did = ? AND guardian_did = ? AND status IN ('invited', 'accepted', 'active')").run(nowIso(), why, owner, guardian).changes;
     if (!n) return 0;
     logSecurityEvent('guardian_left', 'warn', { caller_did: owner, capability: 'guardians', context: { guardian: nameOf(guardian), why } });
-    if (deps.onGuardianLeft) { try { deps.onGuardianLeft(owner, guardian); } catch (_) {} }
+    if (deps.recovery) { try { deps.recovery().withdrawApproval(owner, guardian); } catch (_) {} }   // their approvals go too (design L3)
     tell(owner, `${nameOf(guardian)} is no longer your recovery guardian`, 'Recovery by guardians is unavailable until you name a replacement (Settings → Guardians; it takes 48 hours).\n');
     return n;
   }
