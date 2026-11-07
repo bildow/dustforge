@@ -17,7 +17,7 @@ const tick = () => new Promise(r => setTimeout(r, 0));
 const settle = async (n = 6) => { for (let i = 0; i < n; i++) await tick(); };
 
 // A page instance: fake document (elements materialise on first lookup), localStorage, fetch router.
-function page({ storage = {}, routes, abortable = false } = {}) {
+function page({ storage = {}, routes, abortable = false, coldLock = false } = {}) {
   const els = new Map();
   const el = (id) => {
     if (!els.has(id)) {
@@ -61,7 +61,11 @@ function page({ storage = {}, routes, abortable = false } = {}) {
   };
   if (abortable) ctx.AbortController = AbortController;   // an older WebView: AbortController, no AbortSignal.timeout
   vm.createContext(ctx);
-  vm.runInContext(script, ctx, { filename: 'vault-mobile.inline.js' });
+  // Most tests start from a stored session and are about what comes after the lock: they open as if unlocked. The lock
+  // tests pass coldLock: true and get the page's own rule (every start with a stored session is locked).
+  const script2 = coldLock ? script : script.replace('function startsLocked(freshLogin){ return !freshLogin; }', 'function startsLocked(freshLogin){ return false; }');
+  if (!coldLock && script2 === script) throw new Error('startsLocked not found in the page script');
+  vm.runInContext(script2, ctx, { filename: 'vault-mobile.inline.js' });
   // Vault contents are not under test here (the real loader stays reachable for the rendering test).
   ctx.__realLoadVault = ctx.loadVault;
   ctx.loadVault = async () => { ctx.__loads = (ctx.__loads || 0) + 1; };
@@ -1389,7 +1393,7 @@ const fakePhone = (ctx, log) => ({
 
 test('idle past the lock time → locked on open; the phone\'s biometric unlocks (unlock:0), no PIN typed', async () => {
   const signs = [];
-  const pg = page({ storage: { ...signedIn, dp_last_active: String(Date.now() - 10 * 60 * 1000) }, routes: async (p, b) => {
+  const pg = page({ coldLock: true, storage: { ...signedIn, dp_last_active: String(Date.now() - 10 * 60 * 1000) }, routes: async (p, b) => {
     if (p.startsWith('/api/identity/trust')) return { json: trustOk };
     if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
     if (p === '/api/identity/lock') return { json: { lock_after_sec: 300 } };
@@ -1414,16 +1418,35 @@ test('idle past the lock time → locked on open; the phone\'s biometric unlocks
   assert.equal(pg.el('lock-screen').style.display, 'none'); assert.equal(pg.appOpen(), true, 'unlocked');
 });
 
-test('a fresh open within the lock time stays unlocked', async () => {
-  const pg = page({ storage: { ...signedIn, dp_last_active: String(Date.now() - 30 * 1000) }, routes: async (p) => {
+test('item 8: a cold start with a stored session is locked even 30 s after the last activity (force-stop + relaunch)', async () => {
+  const pg = page({ coldLock: true, storage: { ...signedIn, dp_last_active: String(Date.now() - 30 * 1000) }, routes: async (p) => {
     if (p.startsWith('/api/identity/trust')) return { json: trustOk };
     if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
     if (p === '/api/identity/lock') return { json: { lock_after_sec: 300 } };
     return { json: { ok: true } };
   } });
   await settle(12);
-  assert.equal(pg.appOpen(), true);
-  assert.notEqual(pg.el('lock-screen').style.display, 'flex');
+  assert.equal(pg.appOpen(), false, 'nothing rendered');
+  assert.equal(pg.el('lock-screen').style.display, 'flex', 'locked on a cold start');
+  assert.ok(pg.calls.some(c => c.path === '/api/identity/lock/now'), 'the server is told');
+});
+
+test('item 8: a password sign-in on this page opens unlocked; coming back within the lock time stays open, past it locks', async () => {
+  const pg = page({ coldLock: true, routes: async (p) => {
+    if (p === '/api/identity/auth-fingerprint') return { json: { token: 'fixture.token.b', did: 'did:key:zFixture' } };
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/lock') return { json: { lock_after_sec: 300 } };
+    return { json: { ok: true } };
+  } });
+  pg.el('auth-user').value = 'fixture'; pg.el('auth-pass').value = 'hunter22';
+  await pg.ctx.login(); await settle(12);
+  assert.equal(pg.appOpen(), true, 'a fresh sign-in is not locked');
+  pg.ctx.idleCheck(); assert.equal(pg.appOpen(), true, 'within the grace period');
+  pg.store.set('dp_last_active', String(Date.now() - 10 * 60 * 1000));
+  // As if the app sat in the background past the lock time: the last activity is old.
+  vm.runInContext('lockState.last = Date.now() - 10 * 60 * 1000; idleCheck();', pg.ctx);
+  assert.equal(pg.el('lock-screen').style.display, 'flex', 'locked on return past the grace period');
 });
 
 test('428 device_required on an approval → the linked phone signs it (D) and the call is retried with the signature', async () => {
@@ -1747,4 +1770,50 @@ test('the recovering phone: start makes recovery keys, shows the code; finish si
   assert.deepEqual(bridged.map(x => x[0]), ['keys', 'sign', 'commit']);
   assert.ok(calls.includes('/api/identity/recovery/123456789012/complete'));
   assert.equal(pg.ctx.localStorage.getItem('dp_recovery'), null, 'the finished recovery is forgotten');
+});
+
+test('a newer page on the server: reload with ?v=<stamp> on return, never in the middle of a step, once per stamp', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    return { json: { ok: true } };
+  } });
+  await settle(12);
+  const replaced = [];
+  let serverLm = 'Sat, 07 Nov 2026 20:23:44 GMT';
+  pg.ctx.document.lastModified = new Date('2026-11-07T20:23:44Z').toString();
+  Object.assign(pg.ctx.location, { pathname: '/vault-mobile.html', hash: '', replace: u => replaced.push(u) });
+  const realFetch = pg.ctx.fetch;
+  pg.ctx.fetch = async (url, o = {}) => (o.method === 'HEAD' ? { status: 200, headers: { get: k => (k === 'last-modified' ? serverLm : null) } } : realFetch(url, o));
+  const store = new Map(); pg.ctx.sessionStorage = { getItem: k => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) };
+
+  assert.equal(await pg.ctx.reloadIfStale(), false, 'same page: nothing');
+  serverLm = 'Sat, 07 Nov 2026 21:00:00 GMT';
+  pg.el('modal-pin-change').classList.add('show');
+  assert.equal(await pg.ctx.reloadIfStale(), false, 'a sheet is open: wait');
+  pg.el('modal-pin-change').classList.remove('show');
+  assert.equal(await pg.ctx.reloadIfStale(), true, 'newer and idle: reload');
+  assert.deepEqual(replaced, ['/vault-mobile.html?v=' + Date.parse(serverLm)]);
+  assert.equal(await pg.ctx.reloadIfStale(), false, 'once per stamp: a cache that still answers old cannot loop');
+  // Locked: nothing is open behind the lock, so even with a sheet flag it reloads (next stamp).
+  serverLm = 'Sat, 07 Nov 2026 22:00:00 GMT';
+  pg.el('modal-pin-change').classList.add('show');
+  vm.runInContext('lockState.locked = true;', pg.ctx);
+  assert.equal(await pg.ctx.reloadIfStale(), true, 'locked: reload');
+});
+
+test('a PIN step in progress blocks the reload until it settles', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    return { json: { ok: true } };
+  } });
+  await settle(12);
+  pg.ctx.document.lastModified = new Date('2026-11-07T20:00:00Z').toString();
+  Object.assign(pg.ctx.location, { pathname: '/vault-mobile.html', hash: '', replace: () => {} });
+  const realFetch = pg.ctx.fetch;
+  pg.ctx.fetch = async (url, o = {}) => (o.method === 'HEAD' ? { status: 200, headers: { get: () => 'Sat, 07 Nov 2026 21:00:00 GMT' } } : realFetch(url, o));
+  pg.ctx.unlockWithPin('Do the thing', 'refill:1');   // a PIN sheet waits for the owner
+  await settle();
+  assert.equal(await pg.ctx.reloadIfStale(), false, 'PIN sheet pending');
 });
