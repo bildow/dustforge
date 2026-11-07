@@ -160,7 +160,7 @@
   <button class="btn-ghost" onclick="logout()" style="min-width:12rem;font-size:0.75rem;margin-top:0.6rem">Forgot your PIN? Sign out and sign in with your password</button>
 </div>
 <!-- Covers the vault while the app is in the background, so the last frame shown on return is never vault content. -->
-<div id="privacy-cover" style="display:none;position:fixed;inset:0;z-index:94;background:var(--bg)"></div>
+<div id="privacy-cover" style="display:none;position:fixed;inset:0;z-index:110;background:var(--bg)"></div>
 <div id="app" class="app" style="padding-top:env(safe-area-inset-top, 0px)">
   <div class="topbar" style="padding-top:2rem;background:var(--surface)">
     <div class="topbar-left">Demi<span>Pass</span></div>
@@ -1688,7 +1688,7 @@ async function denyApproval(id){
 }
 
 // Could not learn whether a PIN exists: stay closed, offer retry or sign out.
-function showPinCheckError(why){
+function showPinCheckError(why){ signedInHere=false;   // a retry later is a start like any other (#73 re-review)
   vaultOpen=false;
   document.getElementById('app').style.display='none';
   document.getElementById('pin-error-why').textContent=why||'';
@@ -2609,7 +2609,8 @@ async function unlockTry(usePin){
   const m=document.getElementById('lock-msg'); m.textContent='';
   try{
     let ok=false;
-    if(!usePin){ try{ ok=await deviceGate('unlock:0','Unlock DemiPass'); }catch(e){ if(sessionEnded(e)) throw e; } }
+    // A fingerprint prompt open is a step in progress: no page reload under it (#73 re-review).
+    if(!usePin){ flowDepth++; try{ ok=await deviceGate('unlock:0','Unlock DemiPass'); }catch(e){ if(sessionEnded(e)) throw e; } finally{ flowDepth--; } }
     if(!ok) ok=await unlockWithPin('Unlock DemiPass','unlock:0');
     if(!ok){ m.textContent='Still locked.'; return; }
     lockState.locked=false; document.getElementById('lock-screen').style.display='none'; document.getElementById('app').style.display='block';
