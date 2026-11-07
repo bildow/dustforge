@@ -88,6 +88,7 @@ SEND "reject-me@example.com"
 [ "$CODE" = 502 ] && [ "$(cnt "$MD" reject-me@example.com)" = 0 ] && [ "$RR" = 5 ] && [ "$(bal mailer)" = "$B2" ] && ok "a send the mail server refuses → 502, refunded, and it does not count against the recipient (header back to 5)" || fail "refused: $CODE cnt $(cnt "$MD" reject-me@example.com) rr=$RR"
 
 # ── /api/relay/forward ──
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE identity_wallets SET recovery_email = 'rec-mrc@example.org' WHERE recovery_email IS NULL OR recovery_email = ''\"); c.commit()" "$DB_PATH"   # turning a forward on needs a recovery address (#70 L4)
 call POST /api/relay/create "$T" '{"forward_to":"aaronx@gmail.com"}'; [ "$CODE" = 200 ] || fail "relay create: $CODE $BODY"
 call POST /api/relay/create "$T" '{"forward_to":"fresh@example.com"}'
 call POST /api/relay/create "$T" '{"forward_to":"aaronx@gmail.com(c1)"}'
