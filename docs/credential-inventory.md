@@ -12,7 +12,7 @@ Last updated: 2026-11-07 (values removed: they live only in DemiPass; this table
 | STRIPE_SECRET_KEY | civitasvox /app/.env | Stripe dashboard | Not backed up |
 | STRIPE_WEBHOOK_SECRET | civitasvox /app/.env | Stripe dashboard | Not backed up |
 | OPENROUTER_API_KEY | civitasvox /app/.env | OpenRouter dashboard | Key: vault (Aaron's) |
-| CONDUIT_CARBON_TOKEN | civitasvox /app/.env | Manual | lxom4qW_... |
+| CONDUIT_CARBON_TOKEN | civitasvox /app/.env | Manual | vault |
 
 ## Access Tokens
 
