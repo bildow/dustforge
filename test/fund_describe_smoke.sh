@@ -92,14 +92,34 @@ PIN "scan-descriptions:0"; call POST /api/blindkey/leak-scan/descriptions "$A" '
   && ok "check: imap's description holds the value of shared, named, the value never printed" || fail "check: $CODE"
 [ -n "$(Q "SELECT id FROM blindkey_secrets WHERE name='imap' AND instr(description, '$(cat "$S/v2")') > 0")" ] && ok "…a check alone changes nothing" || fail "check changed data"
 call GET /api/demipass/list "$A"; grep -qF "$(cat "$S/v2")" <<<"$BODY" && ok "(before: list carries the value in imap's description)" || fail "fixture: list did not carry it"
-PIN "scan-descriptions:1"; call POST /api/blindkey/leak-scan/descriptions "$A" '{"redact":true}'
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J redacted)" = True ] && ok "redact with the PIN" || fail "redact: $CODE $BODY"
+IMAP_ID=$(Q "SELECT id FROM blindkey_secrets WHERE name='imap'")
+call POST /api/blindkey/leak-scan/descriptions "$A" '{"redact_ids":["x"]}'; [ "$CODE" = 400 ] && ok "redact_ids must be ids" || fail "bad ids: $CODE"
+PIN "scan-descriptions:1"; call POST /api/blindkey/leak-scan/descriptions "$A" '{"redact_ids":['$IMAP_ID']}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J redacted.0)" = imap ] && ok "redact the picked row with the PIN" || fail "redact: $CODE $BODY"
 call GET /api/demipass/list "$A"
 ! grep -qF "$(cat "$S/v2")" <<<"$BODY" && grep -q 'Unified to \[secret value removed\] 2026-07-07' <<<"$BODY" \
   && ok "after: list no longer carries the value; the rest of the description is kept" || fail "after redact: $(grep -o '"description":"[^"]*"' <<<"$BODY" | head -3)"
 PIN "scan-descriptions:0"; call POST /api/blindkey/leak-scan/descriptions "$A" '{}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["found"]))')" = 0 ] && ok "a second check finds nothing" || fail "recheck: $BODY"
-call POST /api/blindkey/leak-scan/descriptions "$X" '{"redact":true}'; [ "$CODE" = 403 ] && ok "another wallet needs its own PIN (and only sees its own)" || fail "other: $CODE"
+call POST /api/blindkey/leak-scan/descriptions "$X" '{"redact_ids":['$IMAP_ID']}'; [ "$CODE" = 403 ] && ok "another wallet needs its own PIN (and only sees its own)" || fail "other: $CODE"
+# A note holding another value is found too; an unpicked row is left alone.
+call POST /api/demipass/store "$A" "$(mk noted V1 'fine' 'the other one is V2')"; [ "$CODE" = 200 ] || fail "store noted: $CODE $BODY"
+PIN "scan-descriptions:0"; call POST /api/blindkey/leak-scan/descriptions "$A" '{}'
+[ "$(echo "$BODY" | J found.0.name)" = noted ] && [ "$(echo "$BODY" | J found.0.fields.0)" = note ] && ok "a note holding another secret's value is found" || fail "note: $BODY"
+NOTED_ID=$(echo "$BODY" | J found.0.id)
+PIN "scan-descriptions:1"; call POST /api/blindkey/leak-scan/descriptions "$A" '{"redact_ids":['$NOTED_ID']}'
+[ -z "$(Q "SELECT id FROM blindkey_secrets WHERE name='noted' AND instr(note, '$(cat "$S/v2")') > 0")" ] && ok "…and cut out of the note" || fail "note redact"
+# Rotating copies the description without the old value.
+call POST /api/demipass/store "$A" "$(mk rot V2 'rot' '')"; [ "$CODE" = 200 ] || fail "store rot: $CODE"
+python3 - "$DB_PATH" "$S/v2" <<'PY'
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); v=open(sys.argv[2]).read().strip()
+c.execute("UPDATE blindkey_secrets SET description=? WHERE name='rot'", ("was "+v+" before",)); c.commit()
+PY
+python3 -c 'import secrets;print("v3-" + secrets.token_urlsafe(14))' > "$S/v3"
+call POST /api/demipass/rotate "$A" "$(python3 -c 'import json,sys; print(json.dumps({"name":"rot","new_value":open(sys.argv[1]).read().strip()}))' "$S/v3")"
+NEWD=$(Q "SELECT description FROM blindkey_secrets WHERE name LIKE 'rot%' AND status='active' ORDER BY id DESC LIMIT 1")
+[ "$CODE" = 200 ] && ! grep -qF "$(cat "$S/v2")" <<<"$NEWD" && grep -q 'secret value removed' <<<"$NEWD" && ok "a rotation copies the description without the old value" || fail "rotate: $CODE $BODY / $NEWD"
 
 [ $fails -gt 0 ] && { echo "--- server.log"; grep -i -m5 "error" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))

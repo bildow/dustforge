@@ -831,14 +831,14 @@ async function loadFleet(){
     // Projects
     if(d.projects&&d.projects.length){
       h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Projects (cost centers)</span></div>';
-      for(const p of d.projects){
+      for(const [pi,p] of d.projects.entries()){
         h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.45rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">';
         h+='<div><strong>'+esc(p.project)+'</strong><div style="font-size:0.65rem;color:var(--text3)">'+p.operators.length+' operator'+(p.operators.length===1?'':'s')+' · wallet '+dd(p.wallet_balance_cents)+' DD</div></div>';
         h+='<select onchange="setBillMode('+jsArg(p.project)+',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
         h+='</div>';
         // Fund the project's own wallet from mine (PIN). Not shown when the project bills my wallet directly.
         if(p.wallet_did&&p.wallet_did!==did){
-          const fid='pf-'+String(p.project).replace(/[^A-Za-z0-9_-]/g,'_');
+          const fid='pf-'+pi;   // by row: two project names can clean to the same id (#71 review L5)
           h+='<div style="display:flex;gap:0.4rem;align-items:center;padding:0.35rem 0 0.5rem;border-bottom:1px solid rgba(39,68,95,0.25)"><input type="number" inputmode="numeric" id="'+fid+'" min="1" placeholder="DD" style="width:6rem;margin:0;padding:0.35rem;font-size:0.75rem"><button class="btn-ghost" onclick="fundProject('+jsArg(p.project)+','+jsArg(fid)+')" style="font-size:0.72rem;padding:0.35rem 0.6rem">Add DD from my wallet</button></div>';
         }
       }
@@ -2590,20 +2590,31 @@ async function scanDecide(id, ok){
 async function checkDescriptions(){
   const out=document.getElementById('desc-check-out'); out.style.color='var(--text3)'; out.textContent='Checking…';
   try{
-    const r=await apiGated('POST','/api/blindkey/leak-scan/descriptions',{redact:false},'Check your descriptions for secret values? Your PIN approves it.');
-    if(!r.found.length){ out.style.color='var(--green)'; out.textContent='No description holds a secret value.'; return; }
-    out.style.color='var(--red)';
-    out.innerHTML=esc(r.found.length+' description'+(r.found.length===1?'':'s')+' hold'+(r.found.length===1?'s':'')+' a secret value: ')
-      +r.found.map(f=>'<strong>'+esc(f.name)+'</strong> (value of '+esc(f.holds_value_of.join(', '))+')').join(', ')
-      +'. <button class="btn-primary" onclick="redactDescriptions()" style="font-size:0.72rem;padding:0.3rem 0.6rem;margin-top:0.3rem">Remove the values</button>'
-      +'<div style="color:var(--text3);margin-top:0.25rem">Agents that listed your vault may have them in their transcripts: rotate those secrets.</div>';
+    const r=await apiGated('POST','/api/blindkey/leak-scan/descriptions',{},'Check your descriptions and notes for secret values? Your PIN approves it.');
+    const un=r.unchecked?'<div style="color:var(--text3);margin-top:0.25rem">'+r.unchecked+' secret'+(r.unchecked===1?' is':'s are')+' wrapped to your phone: this server cannot read '+(r.unchecked===1?'it':'them')+', so '+(r.unchecked===1?'its value was':'their values were')+' not looked for.</div>':'';
+    if(!r.found.length){ out.style.color='var(--green)'; out.innerHTML='No description or note holds a secret value this server can read.'+un; return; }
+    out.style.color='var(--text)';
+    // Pick what to clean. A row changed in the last week, or holding several secrets' values, may be a planted list of
+    // guesses: cleaning it would show whoever planted it which guess was right. Those start unticked; delete them instead.
+    let h='<div style="color:var(--red)">These hold a secret value:</div>';
+    for(const f of r.found){
+      h+='<label style="display:flex;gap:0.4rem;align-items:flex-start;margin-top:0.3rem;font-size:0.72rem;color:var(--text)"><input type="checkbox" class="desc-pick" value="'+Number(f.id)+'"'+(f.flagged?'':' checked')+' style="width:auto;margin:0.15rem 0 0">'
+        +'<span><strong>'+esc(f.name)+'</strong> ('+esc(f.fields.join(' and '))+'): value of '+esc(f.holds_value_of.join(', '))
+        +'<span style="color:var(--text3)"> · changed '+esc(f.updated_at||'?')+' UTC</span>'
+        +(f.flagged?'<div style="color:var(--red)">Changed recently or holds several values. If you did not write this, delete the secret rather than cleaning it.</div>':'')+'</span></label>';
+    }
+    h+='<button class="btn-primary" onclick="redactDescriptions()" style="font-size:0.72rem;padding:0.3rem 0.6rem;margin-top:0.4rem">Remove the values from the ticked ones</button>'
+      +'<div style="color:var(--text3);margin-top:0.25rem">Agents that listed your vault may have these values in their transcripts: rotate those secrets.</div>'+un;
+    out.innerHTML=h;
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ out.style.color='var(--red)'; out.textContent=e.message; } else out.textContent=''; }
 }
 async function redactDescriptions(){
   const out=document.getElementById('desc-check-out');
+  const ids=[...document.querySelectorAll('.desc-pick:checked')].map(x=>Number(x.value)).filter(n=>n>0);
+  if(!ids.length){ alert('Tick the ones to clean first'); return; }
   try{
-    const r=await apiGated('POST','/api/blindkey/leak-scan/descriptions',{redact:true},'Cut the secret values out of those descriptions? Your PIN approves it.');
-    out.style.color='var(--green)'; out.textContent=r.redacted?('Removed from '+r.found.map(f=>f.name).join(', ')+'.'):'Nothing left to remove.';
+    const r=await apiGated('POST','/api/blindkey/leak-scan/descriptions',{redact_ids:ids},'Cut the secret values out of '+ids.length+' description'+(ids.length===1?'':'s')+'? Your PIN approves it.');
+    out.style.color='var(--green)'; out.textContent=r.redacted.length?('Removed from '+r.redacted.join(', ')+'.'):'Nothing left to remove.';
     loadVault();
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ out.style.color='var(--red)'; out.textContent=e.message; } }
 }

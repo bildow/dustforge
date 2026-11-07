@@ -9,6 +9,11 @@ const identity = require('./identity');
 const dustforge = require('./dustforge');
 const billing = require('./billing');
 const secretTextGuard = require('./secret_text_guard');   // keeps secret values out of descriptions
+// A rotation copies the description to the new version: never with the old value in it (#71 review L2). A value this
+// server cannot read (wrapped to a phone) leaves the description as it was.
+function descriptionWithout(description, encryptedValue) {
+  try { return secretTextGuard.cutValue(description, blindkeyDecrypt(encryptedValue)); } catch (_) { return description; }
+}
 const mailRecipientCap = require('./mail_recipient_cap');
 const hexPayload = require('./hex-payload');
 const conversion = require('./conversion');
@@ -5649,7 +5654,7 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
                                     provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
                                     security_depth, gate_policy, fill_origins, fill_username)
       VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
-    `).run(ownerDid, newName, existing.description, existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
+    `).run(ownerDid, newName, descriptionWithout(existing.description, existing.encrypted_value), existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
            existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days,
            existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null);
 
@@ -12396,7 +12401,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
                                               provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
                                               security_depth, gate_policy, fill_origins, fill_username, account_username)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)`)
-      .run(ownerDid, newName, (secret.description || '') + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
+      .run(ownerDid, newName, descriptionWithout(secret.description || '', secret.encrypted_value) + ' (rotated ' + new Date().toISOString().slice(0, 10) + ')', 'password', encrypted, secret.metadata || '{}', 'active', newVersion, newRefCode,
            secret.provider || '', secret.ownership || 'sole', secret.rotatable ?? 1, secret.category, secret.labels, secret.rotation_interval_days,
            secret.security_depth, secret.gate_policy, secret.fill_origins ?? null, secret.fill_username ?? null,
            sshUser);   // the account this password now belongs to: kept, so the next rotation is bound to it
