@@ -65,6 +65,9 @@ module.exports = function registerUseApprovals(deps) {
   try { db.exec("ALTER TABLE use_approvals ADD COLUMN bound_call TEXT DEFAULT ''"); } catch (_) {}
   // Item 1 (crypto_depth.js): a wrapped secret's one-use public key, and the phone's unwrap between Approve and use.
   for (const c of ['eph_pub TEXT DEFAULT NULL', 'unwrap_blob TEXT DEFAULT NULL']) { try { db.exec('ALTER TABLE use_approvals ADD COLUMN ' + c); } catch (_) {} }
+  // Service tenants (service_tenants.js): an elevated service action is approved like an elevated secret's use. Its row
+  // has secret_id 0 and service_key 'svc:<tenant>:<action>' (no secret exists; /use never matches it: secret ids are > 0).
+  try { db.exec('ALTER TABLE use_approvals ADD COLUMN service_key TEXT DEFAULT NULL'); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_owner ON use_approvals(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_requester ON use_approvals(requester_did, status)');
 
@@ -112,6 +115,7 @@ module.exports = function registerUseApprovals(deps) {
   // A one-line headline for the card. The owner approves the full bound call (`call`, shown as JSON), never this alone.
   function summaryOf({ kind, action, targetHost, targetUrl, params }) {
     if (kind === 'reveal') return 'reveal the value';
+    if (kind === 'service') return cleanLabel(`${targetHost || ''}: ${action}`, 120);
     const p = params || {};
     const cmd = (p.params && p.params.command) || p.command || '';
     const what = action === 'ssh_exec' ? `ssh ${targetHost || ''}: ${JSON.stringify(String(cmd)).slice(1, -1)}` : `${action} ${targetUrl || targetHost || ''}`;
@@ -138,10 +142,10 @@ module.exports = function registerUseApprovals(deps) {
   }
   function view(row, me) {
     const owner = row.owner_did === me;
-    const s = db.prepare('SELECT name, ref_code FROM blindkey_secrets WHERE id = ?').get(row.secret_id) || {};
+    const s = row.service_key ? { name: String(row.service_key).replace(/^svc:/, '').replace(':', ' · ') } : (db.prepare('SELECT name, ref_code FROM blindkey_secrets WHERE id = ?').get(row.secret_id) || {});
     return {
       id: row.id, kind: row.kind, status: row.status, depth: row.depth,
-      secret: { name: s.name || null, ref: s.ref_code || null },
+      secret: { name: s.name || null, ref: s.ref_code || null }, ...(row.service_key ? { service: row.service_key } : {}),
       owner: usernameOf(row.owner_did), requester: usernameOf(row.requester_did), requester_label: row.requester_label || null,
       purpose: row.purpose || '', summary: row.summary || '',
       ...(owner ? { call: row.bound_call ? JSON.parse(row.bound_call) : null, binding: row.binding } : {}),   // binding: what the phone signs
@@ -192,9 +196,9 @@ module.exports = function registerUseApprovals(deps) {
     const pending = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending'").get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
     const id = Number(db.prepare(`INSERT INTO use_approvals (kind, secret_id, owner_did, requester_did, requester_label, delegation_id, depth, purpose, summary,
-                                  binding, code_key, created_at, expires_at, bound_call) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+                                  binding, code_key, created_at, expires_at, bound_call, service_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),
-           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(TTL_SEC), callJson).lastInsertRowid);
+           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
     // Item 1: a wrapped secret's request gets a one-use key (private half in memory only) the phone unwraps to.
     if (cryptoDepth) cryptoDepth.onRequestCreated({ id }, secret);
     const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id);
@@ -223,13 +227,13 @@ module.exports = function registerUseApprovals(deps) {
     if (amb) return { status: 400, body: { error: amb } };
     expireOld();
     const kind = use.kind || 'use';
-    const binding = bindingOf({ secretId: secret.id, kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params });
+    const binding = bindingOf({ secretId: secret.service_key || secret.id, kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params });
     const aid = body.approval_id;
     if (aid !== undefined && aid !== null && aid !== '') {
       const id = Number(aid);
       const row = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id) : null;
       // The same refusal for a missing, foreign or differently-bound request: nothing about other requests leaks.
-      if (!row || row.requester_did !== caller.did || row.secret_id !== secret.id || row.kind !== kind) return { status: 404, body: { error: 'approval request not found for this caller and secret' } };
+      if (!row || row.requester_did !== caller.did || row.secret_id !== secret.id || (row.service_key || null) !== (secret.service_key || null) || row.kind !== kind) return { status: 404, body: { error: 'approval request not found for this caller and secret' } };
       if (row.binding !== binding) return { status: 409, body: { error: 'this approval was for a different call (action, target or parameters); make the approved call exactly, or ask anew without approval_id', approval_id: row.id } };
       if (row.status === 'approved') {
         if (peek) return { ok: true, approval_id: row.id, peeked: true };
@@ -265,8 +269,8 @@ module.exports = function registerUseApprovals(deps) {
       return { status: 410, body: { error: `this approval request is ${row.status}`, approval_id: row.id } };
     }
     // No approval named: the same caller asking for the same call while one waits gets that one back, not a new one.
-    const same = db.prepare("SELECT * FROM use_approvals WHERE requester_did = ? AND secret_id = ? AND binding = ? AND status IN ('pending', 'approved') ORDER BY id DESC LIMIT 1")
-      .get(caller.did, secret.id, binding);
+    const same = db.prepare("SELECT * FROM use_approvals WHERE requester_did = ? AND secret_id = ? AND COALESCE(service_key, '') = ? AND binding = ? AND status IN ('pending', 'approved') ORDER BY id DESC LIMIT 1")
+      .get(caller.did, secret.id, secret.service_key || '', binding);
     if (same) return { status: 202, body: pendingReply(same, caller.did, { already_pending: true, ...(same.status === 'approved' ? { approved: true } : {}) }) };
     const made = createRequest({ secret, kind, requesterDid: caller.did, label: caller.label, delegationId: use.delegationId, purpose: body.purpose,
       binding, call: boundCall({ kind, action: use.action, targetHost: use.targetHost, targetUrl: use.targetUrl, params: use.params }),
@@ -385,5 +389,16 @@ module.exports = function registerUseApprovals(deps) {
     res.json({ ok: true, approval: view(db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(row.id), auth.did) });
   });
 
-  return { gate, depthOf, bindingOf, _codeAt: codeAt, STEP_SEC, TTL_SEC };
+  // An elevated/critical service action (service_tenants.js): the same request, code and phone approval as a secret's
+  // use, approved by `approverDid` (the person whose authority the call uses). `subject` = {key, name, approverDid, depth}.
+  function gateService(subject, caller, use, body = {}) {
+    if (!/^svc:[a-z0-9-]+:[a-z0-9_.-]+$/.test(String(subject.key || ''))) return { status: 500, body: { error: 'bad service key' } };
+    const pseudo = { id: 0, did: subject.approverDid, name: subject.name, security_depth: subject.depth, service_key: subject.key, wrap_state: null };
+    // The approver is part of what is approved: a request made while one person answered for the caller never redeems
+    // after someone else does (#68 re-review).
+    return gate(pseudo, caller, { kind: 'service', action: use.action, targetHost: use.targetHost, targetUrl: '',
+      params: { ...(use.params || {}), approver_did: subject.approverDid }, delegationId: use.delegationId }, body);
+  }
+
+  return { gate, gateService, depthOf, bindingOf, _codeAt: codeAt, STEP_SEC, TTL_SEC };
 };

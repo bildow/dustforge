@@ -8470,6 +8470,9 @@ const useApprovals = require('./use_approvals')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail, deviceKeys, cryptoDepth,
 });
+// Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
+require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
+  approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });
 // Who a /use caller is, for an approval request: the DID, and a label the owner recognises.
 function approvalCaller(req) {
   const d = (req.identity && req.identity.decoded) || {};

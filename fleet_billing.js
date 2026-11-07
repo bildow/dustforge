@@ -155,6 +155,26 @@ function initSchema(db) {
       SELECT 1 FROM identity_transactions t JOIN fleets f ON f.id = fleet_silicons.fleet_id
       WHERE t.did = fleet_silicons.member_did AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
         AND t.description = 'Fleet-provisioned by ' || f.slug)`); } catch (_) {}
+  // Who created a wallet, for good (#68 review: clearStaleSiliconRows deletes a wallet's removed rows when it joins
+  // another fleet, which erased the created_by_fleet row fleetExitRefusal and the service consents rely on). The first
+  // fleet to create a wallet holds its password; that never changes, so the first record stays (INSERT OR IGNORE),
+  // written by triggers on every path that marks or deletes a created row, and backfilled from today's rows.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS wallet_creators (did TEXT PRIMARY KEY, owner_did TEXT NOT NULL, fleet_id INTEGER NOT NULL, recorded_at TEXT NOT NULL)`);
+    db.exec(`INSERT OR IGNORE INTO wallet_creators (did, owner_did, fleet_id, recorded_at)
+      SELECT s.member_did, f.owner_did, s.fleet_id, datetime('now') FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+      WHERE s.created_by_fleet = 1 ORDER BY s.id`);
+    // Also from provenance: a fleet-provisioned wallet whose created row was deleted before this table existed (it
+    // re-joined another fleet earlier) is recorded from its account_created entry (#68 round-4 review).
+    db.exec(`INSERT OR IGNORE INTO wallet_creators (did, owner_did, fleet_id, recorded_at)
+      SELECT t.did, f.owner_did, f.id, datetime('now') FROM identity_transactions t JOIN fleets f ON t.description = 'Fleet-provisioned by ' || f.slug
+      WHERE t.type = 'account_created' AND t.provenance = 'fleet_provisioned' ORDER BY t.id`);
+    for (const [name, when, row] of [['wc_ins', 'AFTER INSERT', 'NEW'], ['wc_upd', 'AFTER UPDATE OF created_by_fleet, fleet_id', 'NEW'], ['wc_del', 'BEFORE DELETE', 'OLD']]) {
+      db.exec(`CREATE TRIGGER IF NOT EXISTS ${name} ${when} ON fleet_silicons WHEN ${row}.created_by_fleet = 1 BEGIN
+        INSERT OR IGNORE INTO wallet_creators (did, owner_did, fleet_id, recorded_at)
+          SELECT ${row}.member_did, f.owner_did, ${row}.fleet_id, datetime('now') FROM fleets f WHERE f.id = ${row}.fleet_id; END`);
+    }
+  } catch (e) { console.error('[fleet] wallet_creators:', e.message); }
   // Threshold refills may be capped per rolling 24 h (0 = no cap). When a silicon is below its threshold and the
   // refill can't run (cap reached, or the source is short), refill_alert_email is told, once per 24 h.
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_daily_cap_cents INTEGER DEFAULT 0`); } catch (_) {}
@@ -518,11 +538,17 @@ function autoRefilledLast24h(db, did, now = Date.now()) {
 // A wallet its fleet created moves DD only inside that fleet: to its owner or another agent the fleet created. It has no
 // PIN and its owner mints its tokens, so DD leaving it is the owner's DD leaving on a token alone (#48 review: network
 // sends, escrow). Returns the refusal text, or null when the move is allowed.
+// The fleet that created a wallet and its owner, for good: wallet_creators first (it survives row deletion), else today's
+// rows. → {fleet_id, owner_did} | null
+function creatorOf(db, did) {
+  try { const w = db.prepare('SELECT fleet_id, owner_did FROM wallet_creators WHERE did = ?').get(did); if (w) return w; } catch (_) {}
+  return db.prepare(`SELECT s.fleet_id, f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+      WHERE s.member_did = ? AND s.created_by_fleet = 1 ORDER BY s.id DESC LIMIT 1`).get(did) || null;
+}
 function fleetExitRefusal(db, fromDid, toDid) {
   // Whatever its row's status now: leaving or being removed does not free a wallet a fleet created (its creator holds
   // its password) — its DD can go back to that owner and nowhere else (#48 review: leave-fleet was an exit).
-  const own = db.prepare(`SELECT s.fleet_id, f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
-      WHERE s.member_did = ? AND s.created_by_fleet = 1 ORDER BY s.id DESC LIMIT 1`).get(fromDid);
+  const own = creatorOf(db, fromDid);
   if (!own || !toDid || toDid === own.owner_did) return null;
   if (db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1").get(own.fleet_id, toDid)) return null;
   return 'an agent your fleet created moves DD only to its owner or another agent the fleet created';
@@ -1001,7 +1027,7 @@ function tokenWarningEmail({ silicon, token }) {
 }
 
 module.exports = {
-  ownedOutright, fleetExitRefusal, endOwnerDelegations,
+  ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
