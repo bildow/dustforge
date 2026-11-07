@@ -427,6 +427,8 @@ module.exports = function registerSecretSharing(deps) {
     const secret = ownSecret(me.did, pick);
     if (!secret) return res.status(404).json({ error: 'secret: name or ref of one of your active secrets' });
     if (secret.frozen) return res.status(423).json({ error: 'unfreeze the secret before transferring it', frozen: true });
+    // Item 1: a wrapped secret opens only with this owner's phone; it would arrive unreadable. Lower it first.
+    if (secret.wrap_state === 'device') return res.status(409).json({ error: 'this secret is wrapped to your phone — lower its depth to standard (your phone unwraps it) before transferring it', wrapped: true });
     const target = findWallet(to);
     if (!target) return res.status(404).json({ error: 'to: no wallet with that username, email or DID' });
     if (target.did === me.did) return res.status(400).json({ error: 'that is you' });
@@ -492,6 +494,7 @@ module.exports = function registerSecretSharing(deps) {
     const secret = db.prepare("SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND status = 'active'").get(t.secret_id, t.from_did);
     if (!secret) return 'the secret is no longer in the sender\'s vault (deleted, rotated or moved)';
     if (secret.frozen) return 'the secret is frozen';
+    if (secret.wrap_state === 'device') return 'the secret was wrapped to the sender\'s phone meanwhile';
     if (db.prepare("SELECT 1 FROM blindkey_secrets WHERE did = ? AND (name = ? OR name LIKE ?) AND status = 'rotating'").get(t.from_did, baseName(secret.name), baseName(secret.name) + '_v%')) return 'the secret is being rotated';
     const from = walletOf(t.from_did), to = walletOf(t.to_did);
     if (from.status !== 'active') return 'the sender\'s account is not active';

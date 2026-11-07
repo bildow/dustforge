@@ -35,7 +35,8 @@ const DENY_COOLDOWN_SEC = 10 * 60;  // after the owner denies a requester, it ma
 
 module.exports = function registerUseApprovals(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
-          logSecurityEvent, cleanLabel, billing, sendMail, deviceKeys } = deps;
+          logSecurityEvent, cleanLabel, billing, sendMail, deviceKeys, cryptoDepth } = deps;
+  const secretOf = (id) => db.prepare('SELECT id, name, did, wrap_state, wrapped_value, security_depth FROM blindkey_secrets WHERE id = ?').get(id);
   const limiter = rateLimitFill || rateLimitStandard;
 
   db.exec(`CREATE TABLE IF NOT EXISTS use_approvals (
@@ -62,6 +63,8 @@ module.exports = function registerUseApprovals(deps) {
     bound_call TEXT DEFAULT ''
   )`);
   try { db.exec("ALTER TABLE use_approvals ADD COLUMN bound_call TEXT DEFAULT ''"); } catch (_) {}
+  // Item 1 (crypto_depth.js): a wrapped secret's one-use public key, and the phone's unwrap between Approve and use.
+  for (const c of ['eph_pub TEXT DEFAULT NULL', 'unwrap_blob TEXT DEFAULT NULL']) { try { db.exec('ALTER TABLE use_approvals ADD COLUMN ' + c); } catch (_) {} }
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_owner ON use_approvals(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_requester ON use_approvals(requester_did, status)');
 
@@ -131,7 +134,7 @@ module.exports = function registerUseApprovals(deps) {
 
   // ── lifecycle ──────────────────────────────────────────────────────────────────────────────────────────────────
   function expireOld() {
-    db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ? WHERE status IN ('pending', 'approved') AND expires_at <= ?").run(nowIso(), nowIso());
+    db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ?, unwrap_blob = NULL WHERE status IN ('pending', 'approved') AND expires_at <= ?").run(nowIso(), nowIso());
   }
   function view(row, me) {
     const owner = row.owner_did === me;
@@ -144,6 +147,7 @@ module.exports = function registerUseApprovals(deps) {
       ...(owner ? { call: row.bound_call ? JSON.parse(row.bound_call) : null, binding: row.binding } : {}),   // binding: what the phone signs
       created_at: row.created_at, expires_at: row.expires_at,
       ...(owner ? { opened: Boolean(row.opened_at), needs_pin_to_open: true } : {}),
+      ...(owner && cryptoDepth && row.eph_pub ? (() => { const u = cryptoDepth.approvalView(row, secretOf(row.secret_id)); return u ? { unwrap: u } : {}; })() : {}),
       ...(row.approved_at ? { approved_at: row.approved_at, approved_via: row.approved_via } : {}),
       ...(row.used_at ? { used_at: row.used_at } : {}), ...(row.wrong_codes ? { wrong_codes: row.wrong_codes } : {}),
     };
@@ -191,6 +195,8 @@ module.exports = function registerUseApprovals(deps) {
                                   binding, code_key, created_at, expires_at, bound_call) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),
            summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(TTL_SEC), callJson).lastInsertRowid);
+    // Item 1: a wrapped secret's request gets a one-use key (private half in memory only) the phone unwraps to.
+    if (cryptoDepth) cryptoDepth.onRequestCreated({ id }, secret);
     const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id);
     event('approval_requested', requesterDid, secret.id, { approval_id: id, kind, owner_did: secret.did, depth: row.depth, summary });
     logSecurityEvent('approval_requested', 'info', { caller_did: requesterDid, capability: kind, target: secret.name, context: { approval_id: id, owner_did: secret.did } });
@@ -208,6 +214,11 @@ module.exports = function registerUseApprovals(deps) {
   // `peek`: report whether an approved request is there without spending it (reveal checks the PIN in between).
   function gate(secret, caller, use, body = {}, { peek = false } = {}) {
     if (depthOf(secret) === 'standard') return { ok: true };
+    // A wrapped secret (item 1) is never revealed by the host — not the owner's reveal, not a share's emergency reveal:
+    // refused before a request (and its one-use key) exists (#56 review L1).
+    if ((use.kind || 'use') === 'reveal' && cryptoDepth && cryptoDepth.isWrapped(secret)) {
+      return { status: 409, body: { error: 'this secret is wrapped to its owner\'s phone, so the server cannot reveal it — the owner lowers it to standard first (the phone unwraps it)', wrapped: true } };
+    }
     const amb = ambiguity(use.params);
     if (amb) return { status: 400, body: { error: amb } };
     expireOld();
@@ -231,6 +242,7 @@ module.exports = function registerUseApprovals(deps) {
         const code = body.approval_code;
         if (code === undefined || code === null || code === '') return { status: 202, body: pendingReply(row, caller.did, { already_pending: true }) };
         if (!row.opened_at) return { status: 409, body: { error: 'the owner has not opened this request yet — no code exists for it', approval_id: row.id } };
+        if (cryptoDepth && cryptoDepth.isWrapped(secret)) return { status: 409, body: { error: 'this secret is wrapped to its owner\'s phone: a code cannot open it — the owner taps Approve in the app on that phone', approval_id: row.id, wrapped: true } };
         if (codeMatches(row, String(code))) {
           if (peek) return { ok: true, approval_id: row.id, peeked: true };
           const took = db.prepare("UPDATE use_approvals SET status = 'used', approved_at = ?, approved_via = 'code', used_at = ?, decided_at = ? WHERE id = ? AND status = 'pending'")
@@ -349,6 +361,10 @@ module.exports = function registerUseApprovals(deps) {
     // Bound to the phone (red team item 4b): once the owner has a device enrolled, its device key signs this decision
     // (the request id and the exact call's binding); a session token alone approves nothing.
     if (deviceKeys) { const r = deviceKeys.approvalRefusal(auth, 'approval', row.id, row.binding, req.body); if (r) return res.status(r.status).json(r.body); }
+    // Item 1: a wrapped secret's approval carries the phone's unwrap (the data key, re-encrypted to the one-use key).
+    const sec = secretOf(row.secret_id);
+    if (cryptoDepth) { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
+    if (cryptoDepth && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
       .run(nowIso(), nowIso(), later(TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'this request was decided meanwhile' });
@@ -362,7 +378,8 @@ module.exports = function registerUseApprovals(deps) {
     const auth = ownerAuth(req, res); if (!auth) return;
     const row = ownRow(req, res, auth); if (!row) return;
     if (!['pending', 'approved'].includes(row.status)) return res.status(409).json({ error: `this request is ${row.status}` });
-    db.prepare("UPDATE use_approvals SET status = 'denied', decided_at = ? WHERE id = ? AND status IN ('pending', 'approved')").run(nowIso(), row.id);
+    db.prepare("UPDATE use_approvals SET status = 'denied', decided_at = ?, unwrap_blob = NULL WHERE id = ? AND status IN ('pending', 'approved')").run(nowIso(), row.id);
+    if (cryptoDepth) cryptoDepth.dropEphemeral('a:' + row.id);
     event('approval_denied', auth.did, row.secret_id, { approval_id: row.id, requester_did: row.requester_did });
     logSecurityEvent('approval_denied', 'info', { caller_did: auth.did, capability: row.kind, context: { approval_id: row.id, requester_did: row.requester_did } });
     res.json({ ok: true, approval: view(db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(row.id), auth.did) });
