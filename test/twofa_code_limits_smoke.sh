@@ -8,6 +8,10 @@
 #   (d) an expired code is refused
 #   (e) the gate/verify twofa path has the same guess limit
 #   (f) the right code still mints a token; no code appears in the server log
+#   (g) #57 review: 'login' codes (asked without a session) and 'gate' codes (the signed-in owner) are separate — a
+#       stranger asking for login codes neither kills nor uses up the owner's gate code
+#   (h) 10 wrong login codes in a day pause code sign-in for the wallet (429, a critical event), across codes
+#   (i) a wallet without email gets no code (409)
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-2fa-smoke.XXXXXX)
@@ -35,7 +39,7 @@ X(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(s
 call(){ local m=$1 p=$2 t=$3 b=${4:-}
   BODY=$(curl -s -o - -w '\n%{http_code}' -X "$m" "$API$p" -H 'Content-Type: application/json' ${t:+-H "Authorization: Bearer $t"} ${b:+-d "$b"})
   CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}; }
-latest(){ Q "SELECT code FROM identity_2fa_codes WHERE did='$DID' ORDER BY id DESC LIMIT 1"; }
+latest(){ Q "SELECT code FROM identity_2fa_codes WHERE did='$DID' AND purpose='${1:-login}' ORDER BY id DESC LIMIT 1"; }
 wrong(){ local c=$1; [ "$c" = 111111 ] && echo 222222 || echo 111111; }
 verify(){ call POST /api/identity/verify "" '{"did":"'$DID'","code":"'$1'","scope":"transact"}'; }
 
@@ -62,16 +66,32 @@ call POST /api/identity/request-2fa "" '{"did":"'$DID'"}'; [ "$CODE" = 429 ] && 
 # (d) an expired code is refused (and expiry is compared as ISO time)
 C=$(latest); X "UPDATE identity_2fa_codes SET expires_at = '$(date -u -d '-1 minute' +%Y-%m-%dT%H:%M:%S.000Z)' WHERE code = '$C' AND did = '$DID'"
 verify "$C"; [ "$CODE" = 401 ] && ok "(d) an expired code is refused" || fail "(d) expired: $CODE $BODY"
-# (e) gate/verify twofa: same guess limit (move the hourly window back to issue more)
-X "UPDATE identity_2fa_codes SET created_at = datetime('now', '-2 hours') WHERE did = '$DID'"
-call POST /api/identity/request-2fa "" '{"did":"'$DID'"}'; C=$(latest); WC=$(wrong "$C")
+# (e) gate/verify twofa: same guess limit, on gate codes (asked for with the owner's session)
+call POST /api/identity/request-2fa "$TK" '{"did":"'$DID'"}'; [ "$CODE" = 200 ] || fail "(e) gate code: $CODE $BODY"
+C=$(latest gate); WC=$(wrong "$C")
 for i in 1 2 3 4 5; do call POST /api/identity/gate/verify "$TK" '{"gate":"twofa","code":"'$WC'"}'; done
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J attempts_left)" = 0 ] || fail "(e) 5th wrong gate code: $CODE $BODY"
 call POST /api/identity/gate/verify "$TK" '{"gate":"twofa","code":"'$C'"}'
 [ "$CODE" = 403 ] && ok "(e) gate twofa: 5 wrong codes kill it" || fail "(e) right gate code after 5 misses: $CODE $BODY"
-call POST /api/identity/request-2fa "" '{"did":"'$DID'"}'; C=$(latest)
-call POST /api/identity/gate/verify "$TK" '{"gate":"twofa","code":"'$C'"}'
-[ "$CODE" = 200 ] && ok "(e) gate twofa: the right code still verifies" || fail "(e) right gate code: $CODE $BODY"
+# (g) a stranger's login requests leave the owner's gate code alone (login cap is already used up: 429)
+call POST /api/identity/request-2fa "$TK" '{"did":"'$DID'"}'; G=$(latest gate)
+call POST /api/identity/request-2fa "" '{"did":"'$DID'"}'; [ "$CODE" = 429 ] || fail "(g) login cap: $CODE $BODY"
+X "UPDATE identity_2fa_codes SET created_at = datetime('now', '-2 hours') WHERE did = '$DID' AND purpose = 'login'"
+call POST /api/identity/request-2fa "" '{"did":"'$DID'"}'; [ "$CODE" = 200 ] || fail "(g) login issue: $CODE $BODY"
+verify 000001; verify 000002
+call POST /api/identity/gate/verify "$TK" '{"gate":"twofa","code":"'$G'"}'
+[ "$CODE" = 200 ] && ok "(g) login codes and wrong login guesses leave the owner's gate code working" || fail "(g) gate after login traffic: $CODE $BODY"
+# (h) the day budget for login guesses: 10 wrong across codes pause it (7 counted so far: 4+1 in (b), 2 in (g), 1 in (a))
+C=$(latest login)
+verify 000003; verify 000004
+[ "$CODE" = 401 ] || fail "(h) 10th wrong: $CODE $BODY"
+verify "$C"; [ "$CODE" = 429 ] && ok "(h) 10 wrong login codes in a day pause code sign-in (even the right code: 429)" || fail "(h) after budget: $CODE $BODY"
+call POST /api/identity/request-2fa "" '{"did":"'$DID'"}'; [ "$CODE" = 429 ] && ok "(h) and no new login code is issued" || fail "(h) issue after budget: $CODE $BODY"
+[ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='code_guessing_paused'")" = 1 ] && ok "(h) one critical event (and one mail)" || fail "(h) event count"
+call POST /api/identity/request-2fa "$TK" '{"did":"'$DID'"}'; [ "$CODE" = 200 ] && ok "(h) the owner's gate codes still work while login is paused" || fail "(h) gate issue: $CODE $BODY"
+# (i) no email → no code
+X "UPDATE identity_wallets SET email = '' WHERE did = '$DID'"
+call POST /api/identity/request-2fa "" '{"did":"'$DID'"}'; [ "$CODE" = 409 ] && ok "(i) a wallet without email gets no code (409)" || fail "(i) no email: $CODE $BODY"
 # (f) no code in the log
 codes=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(' '.join(r[0] for r in c.execute('SELECT code FROM identity_2fa_codes')))" "$DB_PATH")
 leaked=0; for c in $codes; do grep -q "$c" "$S/server.log" && leaked=1; done
