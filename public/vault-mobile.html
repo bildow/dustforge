@@ -577,9 +577,10 @@
   <div class="modal-sheet">
     <h3>Set your vault PIN</h3>
     <div style="font-size:0.8rem;color:var(--text3)">Every secret reveal asks for this PIN, every time. 4 to 8 digits, known only to you. You cannot use the vault until one is set.</div>
+    <!-- Password first (when asked for), then the two PIN fields together, so the number pad stays up between them. -->
+    <div id="pin-setup-pw-row"><label>Account password (confirms it is you)</label><input type="password" id="pin-setup-pw" autocomplete="current-password" onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('pin-new').focus()}"></div>
     <label>New PIN</label><input type="password" id="pin-new" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits">
     <label>Repeat PIN</label><input type="password" id="pin-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="same digits again" onkeydown="if(event.key==='Enter')savePinSetup()">
-    <div id="pin-setup-pw-row"><label>Account password (confirms it is you)</label><input type="password" id="pin-setup-pw" autocomplete="current-password" onkeydown="if(event.key==='Enter')savePinSetup()"></div>
     <div id="pin-setup-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="logout()">Sign out</button><button class="btn-primary" onclick="savePinSetup()">Save PIN</button></div>
   </div>
@@ -587,10 +588,13 @@
 <div id="modal-pin-change" class="modal-bg" onclick="if(event.target===this)closeModal()">
   <div class="modal-sheet">
     <h3>Change your vault PIN</h3>
-    <label>Current PIN</label><input type="password" id="pin-cur" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="leave empty if forgotten">
-    <label>Account password (only if the current PIN is forgotten)</label><input type="password" id="pin-change-pw" autocomplete="current-password">
+    <!-- The PIN fields sit together so the number pad stays up from one to the next (its Next key used to land on the
+         password field and bring up the letter keyboard). The password field appears only for a forgotten PIN. -->
+    <div id="pin-change-pw-row" style="display:none"><label>Account password (your current PIN is forgotten)</label><input type="password" id="pin-change-pw" autocomplete="current-password"></div>
+    <div id="pin-cur-row"><label>Current PIN</label><input type="password" id="pin-cur" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits"></div>
     <label>New PIN</label><input type="password" id="pin-change-new" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" placeholder="4 to 8 digits">
     <label>Repeat new PIN</label><input type="password" id="pin-change-confirm" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" onkeydown="if(event.key==='Enter')savePinChange()">
+    <button class="btn-ghost" id="pin-forgot-btn" onclick="pinChangeForgot(true)" style="margin-top:0.5rem;font-size:0.75rem">Forgot your current PIN?</button>
     <div id="pin-change-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Cancel</button><button class="btn-primary" onclick="savePinChange()">Save</button></div>
   </div>
@@ -1640,7 +1644,7 @@ function requirePinSetup(){
     document.getElementById('pin-setup-pw-row').style.display=loginPw?'none':'block';
     for(const i of ['pin-new','pin-confirm','pin-setup-pw']) document.getElementById(i).value='';
     const m=document.getElementById('pin-setup-msg'); m.textContent=''; m.className='modal-msg';
-    openModal('pin-setup'); setTimeout(()=>document.getElementById('pin-new').focus(),80);
+    openModal('pin-setup'); setTimeout(()=>document.getElementById(loginPw?'pin-new':'pin-setup-pw').focus(),80);
   });
 }
 async function savePinSetup(){
@@ -1648,9 +1652,11 @@ async function savePinSetup(){
   const pw=loginPw||document.getElementById('pin-setup-pw').value;
   const mine=pinSetupDone;   // the one setup flow this save belongs to; never settles any other
   if(!mine||pinSaveBusy===mine) return;   // no setup open, or this one's save is already in flight
-  if(!PIN_OK.test(a)){m.textContent='Use 4 to 8 digits';m.className='modal-msg err';return}
-  if(a!==b){m.textContent='The two PINs differ';m.className='modal-msg err';return}
-  if(!pw){m.textContent='Enter your account password';m.className='modal-msg err';return}
+  // A mistake puts the cursor back in the field to fix, so the number pad comes straight back up.
+  const back=id=>setTimeout(()=>document.getElementById(id).focus(),0);
+  if(!PIN_OK.test(a)){m.textContent='Use 4 to 8 digits';m.className='modal-msg err';back('pin-new');return}
+  if(a!==b){m.textContent='The two PINs differ';m.className='modal-msg err';document.getElementById('pin-confirm').value='';back('pin-confirm');return}
+  if(!pw){m.textContent='Enter your account password';m.className='modal-msg err';back('pin-setup-pw');return}
   pinSaveBusy=mine;
   try{
     m.textContent='Saving…';m.className='modal-msg';
@@ -1714,14 +1720,26 @@ async function submitPin(){
 function openPinChange(){
   for(const i of ['pin-cur','pin-change-pw','pin-change-new','pin-change-confirm']) document.getElementById(i).value='';
   const m=document.getElementById('pin-change-msg'); m.textContent=''; m.className='modal-msg';
+  pinChangeForgot(false, true);
   openModal('pin-change'); setTimeout(()=>document.getElementById('pin-cur').focus(),80);
+}
+// Forgotten PIN: the account password takes the current PIN's place (above the new PIN, so the pad stays up after it).
+function pinChangeForgot(on, quiet){
+  document.getElementById('pin-cur-row').style.display=on?'none':'';
+  document.getElementById('pin-change-pw-row').style.display=on?'':'none';
+  document.getElementById('pin-forgot-btn').textContent=on?'I know my current PIN':'Forgot your current PIN?';
+  document.getElementById('pin-forgot-btn').onclick=()=>pinChangeForgot(!on);
+  document.getElementById(on?'pin-cur':'pin-change-pw').value='';
+  if(!quiet) setTimeout(()=>document.getElementById(on?'pin-change-pw':'pin-cur').focus(),50);
 }
 async function savePinChange(){
   const cur=document.getElementById('pin-cur').value, pw=document.getElementById('pin-change-pw').value;
   const a=document.getElementById('pin-change-new').value, b=document.getElementById('pin-change-confirm').value, m=document.getElementById('pin-change-msg');
-  if(!PIN_OK.test(a)){m.textContent='New PIN: 4 to 8 digits';m.className='modal-msg err';return}
-  if(a!==b){m.textContent='The two new PINs differ';m.className='modal-msg err';return}
-  if(!cur&&!pw){m.textContent='Enter your current PIN, or your password if you forgot it';m.className='modal-msg err';return}
+  // A mistake puts the cursor back in the field to fix, so the number pad comes straight back up.
+  const back=id=>setTimeout(()=>document.getElementById(id).focus(),0);
+  if(!PIN_OK.test(a)){m.textContent='New PIN: 4 to 8 digits';m.className='modal-msg err';back('pin-change-new');return}
+  if(a!==b){m.textContent='The two new PINs differ';m.className='modal-msg err';document.getElementById('pin-change-confirm').value='';back('pin-change-confirm');return}
+  if(!cur&&!pw){m.textContent='Enter your current PIN, or tap "Forgot your current PIN?" to use your password';m.className='modal-msg err';back(document.getElementById('pin-change-pw-row').style.display==='none'?'pin-cur':'pin-change-pw');return}
   const epoch=sessionEpoch;
   if(pinChangeBusy===epoch){ m.textContent='A PIN change is still being saved — one moment'; m.className='modal-msg'; return; }
   pinChangeBusy=epoch;
