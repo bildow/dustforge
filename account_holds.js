@@ -243,6 +243,7 @@ module.exports = function registerAccountHolds(deps) {
       `It was canceled from one of your phones at ${nowIso()}. Nothing changed.\n` +
       (h.kind === 'pin-reset' ? 'Whoever started it knows your account password: every session was signed out, and you must choose a new password at your next sign-in.\n' : ''));
     if (h.kind === 'recovery' && deps.onRecoveryCanceled) { try { deps.onRecoveryCanceled(h); } catch (_) {} }
+    if (h.kind === 'guardians' && deps.guardians) { try { deps.guardians().dropChange(h); } catch (_) {} }
   }
 
   // POST /api/identity/holds/:id/approve-enrol {device_id, challenge_id, signature} — P of an established phone
@@ -287,6 +288,8 @@ module.exports = function registerAccountHolds(deps) {
         } else if (h.kind === 'unlink') {
           const r = devices().revokeOne(h.did, p.device_id, 'password');
           if (!r.ok) throw Object.assign(new Error(r.error), { soft: true });
+        } else if (h.kind === 'guardians') {
+          deps.guardians().applyChange(h, p);
         } else if (h.kind === 'email') {
           const w = db.prepare('SELECT recovery_email FROM identity_wallets WHERE did = ?').get(h.did);
           setRecoveryEmail(h.did, w && w.recovery_email, p.recovery_email);
@@ -296,7 +299,9 @@ module.exports = function registerAccountHolds(deps) {
       }).immediate();
     } catch (e) {
       db.prepare("UPDATE account_holds SET status = 'failed', note = ?, payload = '{}' WHERE id = ? AND status IN ('pending', 'quorum')").run(String(e.message).slice(0, 200), h.id);
+      if (h.kind === 'guardians') { try { deps.guardians().dropChange(h); } catch (_) {} }
       result = { ok: false, error: e.message };
+      tell(h.did, `not done: ${WHAT[h.kind]}`, `It did not take effect: ${e.message}. Nothing changed.\n`);
     }
     if (result.ok) {
       logSecurityEvent('account_hold_applied', 'critical', { caller_did: h.did, capability: h.kind, context: { hold_id: h.id, how } });
@@ -310,7 +315,7 @@ module.exports = function registerAccountHolds(deps) {
   }
   function sweep() {
     const t = nowIso();
-    for (const h of db.prepare(`SELECT * FROM account_holds WHERE status = 'pending' AND kind IN ('pin-reset', 'enrol', 'email', 'unlink') AND ready_at IS NOT NULL AND ready_at <= ?`).all(t)) applyHold(h, 'after 48 h, not canceled');
+    for (const h of db.prepare(`SELECT * FROM account_holds WHERE status = 'pending' AND kind IN ('pin-reset', 'enrol', 'email', 'unlink', 'guardians') AND ready_at IS NOT NULL AND ready_at <= ?`).all(t)) applyHold(h, 'after 48 h, not canceled');
     db.prepare(`UPDATE account_holds SET status = 'expired', payload = '{}' WHERE ${OPEN} AND expires_at IS NOT NULL AND expires_at <= ?`).run(t);
   }
   const timer = setInterval(() => { try { sweep(); } catch (e) { console.error('[holds] sweep:', e.message); } }, Number(process.env.HOLD_SWEEP_MS) || 30000);

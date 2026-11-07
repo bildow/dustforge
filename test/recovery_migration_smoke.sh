@@ -10,7 +10,8 @@ PORT=${PORT:-3861}; API=http://127.0.0.1:$PORT
 [ -d "$W/node_modules" ] || export NODE_PATH=${NODE_PATH:-/home/flimflam/project/dustforge/node_modules}
 export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT HOLD_SWEEP_MS=500 \
   STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9
-BASE=${BASE_REF:-$(git -C "$W" merge-base HEAD origin/main)}
+# The main before item 9 (#58 merged, bf5f75f): its DB has none of the item 9 tables or columns.
+BASE=${BASE_REF:-bf5f75f}
 mkdir -p "$S/old"; git -C "$W" archive "$BASE" | tar -x -C "$S/old"
 SRV=; trap 'kill $SRV 2>/dev/null; rm -rf "$S"' EXIT
 boot(){ (cd "$1" && exec node server.js >>"$S/server.log" 2>&1) & SRV=$!; for i in $(seq 1 60); do curl -s -o /dev/null "$API/api/health" && break; sleep 0.5; done; sleep 1; }
@@ -44,7 +45,7 @@ call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"unlock:0","
 [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('device_keys') WHERE name='revoked_via'")" = 0 ] && ok "old schema has no revoked_via (a real legacy DB)" || fail "not legacy"
 kill $SRV; wait $SRV 2>/dev/null
 boot "$W"
-for c in "device_keys revoked_via" "device_gate_proofs device_id" "identity_wallets password_must_change" "blindkey_use_tokens executing_until"; do set -- $c
+for c in "device_keys revoked_via" "device_gate_proofs device_id" "identity_wallets password_must_change" "blindkey_use_tokens executing_until" "recovery_guardians change_id"; do set -- $c
   [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('$1') WHERE name='$2'")" = 1 ] || fail "column $1.$2 missing"; done
 [ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('account_holds','hold_challenges','recovery_guardians','recovery_email_history')")" = 4 ] && ok "new code on the old DB: columns and tables added" || fail "tables"
 [ "$(Q "SELECT COUNT(*) FROM device_gate_proofs WHERE device_id IS NULL")" -ge 1 ] && ok "old biometric proofs keep working rows (device_id NULL)" || fail "old proofs"

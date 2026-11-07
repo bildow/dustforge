@@ -423,6 +423,9 @@ module.exports = function registerNetworkRoutes(deps) {
     const w = walletAuth(req, res); if (!w) return;
     const other = findWallet((req.body || {}).did || (req.body || {}).username);
     if (!other) return res.status(404).json({ error: 'no wallet by that name' });
+    // Recovery guardians (item 9): an owner cannot drop a guardian this way; a guardian removing the owner leaves.
+    const G = deps.guardians && deps.guardians();
+    if (G) { const stop = G.contactRemoval(w.wallet.did, other.did); if (stop) return res.status(stop.status).json(stop.body); }
     const [a, b] = pair(w.wallet.did, other.did);
     // Removing a contact also removes its in-person confirmation: share rights come back only by pairing again (#52 review).
     const n = db.prepare("UPDATE network_peers SET status = 'removed', removed_at = CURRENT_TIMESTAMP, verified_via = NULL, verified_at = NULL, vouched_by = NULL WHERE did_a = ? AND did_b = ? AND status = 'active'").run(a, b).changes;
