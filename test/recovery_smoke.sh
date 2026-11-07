@@ -10,9 +10,11 @@ PORT=${PORT:-3881}; STP=${STP:-3882}; API=http://127.0.0.1:$PORT
 export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT HOLD_SWEEP_MS=500 \
   STALWART_HOST=127.0.0.1 STALWART_PORT=$STP SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9
 cd "$W"
-# fake Stalwart: logs each PATCH; answers 500 while $S/stalwart.fail exists
+# fake Stalwart: logs each PATCH; $S/stalwart.fail holds how many of the next PATCHes answer 500
 node -e 'const fs=require("fs"); require("http").createServer((q, r) => { let b=""; q.on("data", c => b += c); q.on("end", () => {
-  fs.appendFileSync(process.argv[2] + "/stalwart.log", q.method + " " + q.url + "\n"); r.writeHead(fs.existsSync(process.argv[2] + "/stalwart.fail") ? 500 : 200); r.end("{}"); }); }).listen(+process.argv[1], "127.0.0.1");' $STP "$S" & STW=$!
+  const f = process.argv[2] + "/stalwart.fail"; let n = 0; try { n = +fs.readFileSync(f, "utf8"); } catch (_) {}
+  if (n > 0) fs.writeFileSync(f, String(n - 1));
+  fs.appendFileSync(process.argv[2] + "/stalwart.log", q.method + " " + q.url + " " + (n > 0 ? 500 : 200) + "\n"); r.writeHead(n > 0 ? 500 : 200); r.end("{}"); }); }).listen(+process.argv[1], "127.0.0.1");' $STP "$S" & STW=$!
 (exec node server.js >"$S/server.log" 2>&1) & SRV=$!
 trap 'kill $SRV $STW 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$S"' EXIT
 for i in $(seq 1 60); do curl -s -o /dev/null "$API/api/health" && break; sleep 0.5; done
@@ -117,9 +119,15 @@ gapprove g3 $RE $CE; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "7 days" && ok 
 X "UPDATE device_keys SET enrolled_at='$(iso -864000)' WHERE device_id='phone-g3'"
 
 # ── R1: complete ──
-due $RB; touch "$S/stalwart.fail"; complete $RB pb
-[ "$CODE" = 503 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$RB'")" = quorum ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-owner' AND revoked_at IS NULL")" = 2 ] && ok "R1 the mail password could not be set: nothing changed (503), still ready" || fail "R1 stalwart fail: $CODE $BODY"
-rm -f "$S/stalwart.fail"; complete $RB pb
+due $RB; echo 1 >"$S/stalwart.fail"; complete $RB pb
+[ "$CODE" = 503 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$RB'")" = quorum ] && [ "$(Q "SELECT COUNT(*) FROM device_keys WHERE device_id='phone-owner' AND revoked_at IS NULL")" = 2 ] && [ "$(grep -c PATCH "$S/stalwart.log")" = 2 ] \
+  && ok "R1 the mail server answered unclearly: the mailbox was put back (2nd PATCH), nothing changed (503), still ready and cancelable" || fail "R1 stalwart fail: $CODE $BODY $(cat "$S/stalwart.log")"
+echo 2 >"$S/stalwart.fail"; complete $RB pb
+[ "$CODE" = 503 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$RB'")" = completing ] && ok "R1 neither the change nor the undo confirmed: it stays completing (no cancel can split it)" || fail "R1 stuck: $CODE $(Q "SELECT status FROM account_holds WHERE id='$RB'")"
+ownercancel $RB; [ "$CODE" = 404 ] && ok "R1 …a cancel cannot land on it now" || fail "R1 cancel on completing: $CODE"
+complete $RB pb; [ "$CODE" = 409 ] && ok "R1 …and a retry right away waits a minute" || fail "R1 early retry: $CODE $BODY"
+X "UPDATE account_holds SET note='completing:$(iso -120)' WHERE id='$RB'"
+complete $RB pb
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J completed)" = True ] && ok "R1 two approvals and 48 h later, the new phone completes it" || fail "R1 complete: $CODE $BODY"
 echo "$BODY" | grep -q '"wrapped_lost":\["root-pw"\]' && ok "R8 the wrapped secret is reported lost, by name only" || fail "R8 lost: $BODY"
 grep -q "PATCH /api/principal/owner" "$S/stalwart.log" && ok "R1 the mailbox password was set first" || fail "R1 stalwart log"

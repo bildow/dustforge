@@ -2337,7 +2337,7 @@ async function loadGuardians(){
     const [g,a]=await Promise.all([api('GET','/api/identity/guardians'),api('GET','/api/identity/recovery/asks').catch(()=>({asks:[]}))]);
     const mine=(g.guardians||[]).filter(x=>x.status!=='removed');
     let h='';
-    for(const r of (a.asks||[])) h+='<div class="fill-req" style="border-color:var(--red)"><div><b>@'+esc(r.owner)+'</b> asks to recover their wallet onto a new phone (code on it: '+esc(r.new_phone&&r.new_phone.code||'')+')</div>'
+    for(const r of (a.asks||[])) h+='<div class="fill-req" style="border-color:var(--red)"><div><b>@'+esc(r.owner)+'</b> asks to recover their wallet onto a new phone (its key code: '+esc(r.new_phone&&r.new_phone.fingerprint||'')+' — they see the same on it)</div>'
       +'<div style="font-size:0.75rem;color:var(--text3)">Approve only if '+esc(r.owner)+' told you the 6-digit code themselves — in person, or on a call you started.'+(r.ready_at?' Completes '+esc(fmtWhen(r.ready_at))+' unless canceled.':'')+'</div>'
       +'<div class="fr-row">'+(r.i_approved?'<button class="btn-ghost" onclick="recoveryAct('+esc(JSON.stringify(r.id))+',\'withdraw\')">Withdraw my approval</button>'
         :'<input id="rc-'+esc(r.id)+'" inputmode="numeric" maxlength="6" placeholder="code" style="width:6rem"> <button class="btn-primary" onclick="recoveryApprove('+esc(JSON.stringify(r.id))+')">Approve</button>')

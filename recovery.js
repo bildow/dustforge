@@ -25,7 +25,9 @@ const COMPLETE_WINDOW_SEC = 7 * 24 * 3600;  // after ready_at
 const MAX_CODE_MISSES = 3;
 const OPEN_PER_ACCOUNT = 5;
 const APPROVED_STARTS_PER_WEEK = 3;
-const GLOBAL_STARTS_PER_DAY = 500;
+const STARTS_PER_IP_PER_DAY = 20;
+const GUARDIAN_MAILS_PER_DAY = 3;        // per account: more starts in a day are shown in the app, not mailed (#61 M2)
+const STUCK_COMPLETING_SEC = 600;
 const CHALLENGE_TTL_SEC = 120;
 
 module.exports = function registerRecovery(deps) {
@@ -42,6 +44,8 @@ module.exports = function registerRecovery(deps) {
     expires_at TEXT NOT NULL,
     used_at TEXT
   )`);
+  db.exec('CREATE TABLE IF NOT EXISTS recovery_starts (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT NOT NULL, did TEXT NOT NULL, at TEXT NOT NULL)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_recovery_starts ON recovery_starts(ip, at)');
 
   const nowIso = () => new Date().toISOString();
   const isoIn = (sec) => new Date(Date.now() + sec * 1000).toISOString();
@@ -50,7 +54,9 @@ module.exports = function registerRecovery(deps) {
   const parse = (s) => { try { return JSON.parse(s || '{}'); } catch (_) { return {}; } };
   const nameOf = (did) => { const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did); return w ? w.username : null; };
   const keyPrint = (k) => crypto.createHash('sha256').update(String(k)).digest('hex').slice(0, 16);
-  const codeHash = (id, code) => crypto.createHash('sha256').update(`${id}:${code}`).digest('hex');
+  // Keyed (#61 review L6): a copy of the database alone does not give the code back.
+  const codeKey = crypto.createHash('sha256').update('dp-recovery-code|' + (process.env.IDENTITY_MASTER_KEY || '')).digest();
+  const codeHash = (id, code) => crypto.createHmac('sha256', codeKey).update(`${id}:${code}`).digest('hex');
   const OPEN = "status IN ('pending', 'quorum')";
   function tellDid(did, subject, text) {
     try { const w = db.prepare('SELECT email FROM identity_wallets WHERE did = ?').get(did); if (w && w.email && sendMail) Promise.resolve(sendMail({ to: w.email, subject: 'DemiPass: ' + subject, text })).catch(() => {}); } catch (_) {}
@@ -103,19 +109,26 @@ module.exports = function registerRecovery(deps) {
     if (!spend(c)) return res.status(403).json({ error: 'start challenge already used' });
     // Limits (design H4): several open at once (each bound to its own key and code), so junk starts never block a
     // real one; only starts a guardian approved count toward the weekly limit; and a global daily cap.
-    const open = db.prepare(`SELECT COUNT(*) AS n FROM account_holds WHERE did = ? AND kind = 'recovery' AND ${OPEN}`).get(w.did).n;
-    if (open >= OPEN_PER_ACCOUNT) return res.status(429).json({ error: 'too many recoveries are waiting for this account' });
-    const approvedWeek = db.prepare("SELECT payload, status, note FROM account_holds WHERE did = ? AND kind = 'recovery' AND created_at > ?").all(w.did, isoAgo(7 * 86400))
-      .filter(h => h.note === 'approved' || Object.keys(parse(h.payload).approvals || {}).length).length;
+    const ip = String(req.ip || '').slice(0, 64);
+    if (db.prepare('SELECT COUNT(*) AS n FROM recovery_starts WHERE ip = ? AND at > ?').get(ip, isoAgo(86400)).n >= STARTS_PER_IP_PER_DAY) return res.status(429).json({ error: 'try again tomorrow' });
+    // Junk starts never block a real one (#61 review M2): at the cap, the oldest request no guardian approved gives way.
+    const openRows = db.prepare(`SELECT * FROM account_holds WHERE did = ? AND kind = 'recovery' AND ${OPEN} ORDER BY created_at`).all(w.did);
+    if (openRows.length >= OPEN_PER_ACCOUNT) {
+      const junk = openRows.find(h => !Object.keys(parse(h.payload).approvals || {}).length);
+      if (!junk) return res.status(429).json({ error: 'too many recoveries are waiting for this account' });
+      db.prepare(`UPDATE account_holds SET status = 'canceled', canceled_by = 'replaced by a newer request', canceled_at = ?, payload = '{}' WHERE id = ? AND ${OPEN}`).run(nowIso(), junk.id);
+    }
+    const approvedWeek = db.prepare("SELECT COUNT(*) AS n FROM account_holds WHERE did = ? AND kind = 'recovery' AND note = 'approved' AND created_at > ?").get(w.did, isoAgo(7 * 86400)).n;
     if (approvedWeek >= APPROVED_STARTS_PER_WEEK) return res.status(429).json({ error: 'too many recoveries this week for this account' });
-    if (db.prepare("SELECT COUNT(*) AS n FROM account_holds WHERE kind = 'recovery' AND created_at > ?").get(isoAgo(86400)).n >= GLOBAL_STARTS_PER_DAY) return res.status(429).json({ error: 'try again later' });
+    db.prepare('INSERT INTO recovery_starts (ip, did, at) VALUES (?, ?, ?)').run(ip, w.did, nowIso());
     const G = guardians();
     const snapshot = G.activeSet(w.did).map(r => r.guardian_did).filter(d => G.isActiveGuardian(w.did, d));
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     const label = String(b.label || 'new phone').replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 60);
     const h = holds().createHold(w.did, 'recovery', {}, { readyAt: null, expiresAt: isoIn(PENDING_TTL_SEC), why: `onto a new phone "${label}"` });
     savePayload(h.id, { device_id: b.device_id, label, key_d: b.key_d, key_p: b.key_p, code_hash: codeHash(h.id, code), misses: 0, guardians: snapshot, approvals: {}, start_ip: String(req.ip || '').slice(0, 64) });
-    for (const g of snapshot) tellDid(g, `${w.username} asks you to help recover their wallet`, `${w.username} asks to get back into their DemiPass wallet on a new phone.\nApprove ONLY if ${w.username} told you the code themselves — in person, or on a call you started to a number you already had. Open the DemiPass app (Settings → Guardians).\nIf you did not hear from them, decline: it stops the recovery.\n`);
+    const mailsToday = db.prepare('SELECT COUNT(*) AS n FROM recovery_starts WHERE did = ? AND at > ?').get(w.did, isoAgo(86400)).n;
+    if (mailsToday <= GUARDIAN_MAILS_PER_DAY) for (const g of snapshot) tellDid(g, `${w.username} asks you to help recover their wallet`, `${w.username} asks to get back into their DemiPass wallet on a new phone.\nApprove ONLY if ${w.username} told you the code themselves — in person, or on a call you started to a number you already had. Open the DemiPass app (Settings → Guardians).\nIf you did not hear from them, decline: it stops the recovery.\n`);
     logSecurityEvent('recovery_started', 'critical', { caller_did: w.did, capability: 'recovery', ip: req.ip, context: { hold_id: h.id, guardians: snapshot.length } });
     // The same answer whether or not the account has guardians (L1): the starter cannot tell.
     res.status(202).json({ ok: true, request_id: h.id, code, fingerprint: keyPrint(b.key_d), expires_at: h.expires_at,
@@ -144,21 +157,32 @@ module.exports = function registerRecovery(deps) {
     return (p.guardians || []).includes(did) && guardians().isActiveGuardian(h.did, did);
   }
   // Design M2: a guardian's own account recently changed is not the shortcut to someone else's wallet.
+  // Did the guardian's own account change after `since` (a phone linked, a password reset, a recovery-email change)?
+  function guardianChangedSince(did, since) {
+    const t = Date.parse(since);
+    const newest = db.prepare('SELECT MAX(enrolled_at) AS at FROM device_keys WHERE did = ? AND revoked_at IS NULL').get(did);
+    if (newest && newest.at && Date.parse(newest.at) > t) return true;
+    if (db.prepare("SELECT 1 FROM demipass_security_events WHERE caller_did = ? AND event_type IN ('password_reset', 'recovery_email_changed', 'devices_revoked', 'device_enrolled') AND created_at > ? LIMIT 1").get(did, new Date(t).toISOString().replace('T', ' ').slice(0, 19))) return true;
+    return Boolean(db.prepare('SELECT 1 FROM recovery_email_history WHERE did = ? AND replaced_at > ? LIMIT 1').get(did, new Date(t).toISOString()));
+  }
   function guardianTooFresh(did, startedAt) {
     const newest = db.prepare('SELECT MAX(enrolled_at) AS at FROM device_keys WHERE did = ? AND revoked_at IS NULL').get(did);
     if (newest && newest.at && (Date.parse(newest.at) > Date.now() - 7 * 86400 * 1000 || Date.parse(newest.at) > Date.parse(startedAt))) return 'a phone was linked to your wallet in the last 7 days';
     const ev = db.prepare("SELECT event_type FROM demipass_security_events WHERE caller_did = ? AND event_type IN ('password_reset', 'recovery_email_changed', 'devices_revoked', 'device_enrolled') AND created_at > ? LIMIT 1").get(did, sqlAgo(7 * 86400));
     if (ev) return 'your own account changed in the last 7 days (' + ev.event_type.replace(/_/g, ' ') + ')';
+    if (db.prepare('SELECT 1 FROM recovery_email_history WHERE did = ? AND replaced_at > ? LIMIT 1').get(did, isoAgo(7 * 86400))) return 'your recovery email changed in the last 7 days';
     return null;
   }
   const validApprovals = (h) => Object.keys(parse(h.payload).approvals || {}).filter(g => mineToDecide(h, g));
+  // At completion (#61 review L3): also not changed since they approved.
+  const standingApprovals = (h) => { const ap = parse(h.payload).approvals || {}; return Object.keys(ap).filter(g => mineToDecide(h, g) && !guardianChangedSince(g, ap[g].at)); };
   // Recount after a change: quorum starts the clock; falling below it stops the clock.
   function recount(h) {
     const cur = getReq(h.id); if (!cur || !['pending', 'quorum'].includes(cur.status)) return cur;
     const n = validApprovals(cur).length;
     if (n >= QUORUM && cur.status === 'pending') {
       const ready = isoIn(DELAY_SEC);
-      db.prepare("UPDATE account_holds SET status = 'quorum', ready_at = ?, expires_at = ?, note = 'approved' WHERE id = ? AND status = 'pending'").run(ready, new Date(Date.parse(ready) + COMPLETE_WINDOW_SEC * 1000).toISOString(), cur.id);
+      db.prepare("UPDATE account_holds SET status = 'quorum', ready_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'").run(ready, new Date(Date.parse(ready) + COMPLETE_WINDOW_SEC * 1000).toISOString(), cur.id);
       logSecurityEvent('recovery_quorum', 'critical', { caller_did: cur.did, capability: 'recovery', context: { hold_id: cur.id, ready_at: ready } });
       holds().tellOwner(cur.did, 'two guardians approved a recovery of your wallet — cancel it from your phone if it was not you',
         `Two of your guardians approved a recovery of your wallet onto a new phone. It can complete at ${ready} unless one of your phones cancels it.\nIf this was not you: open DemiPass on a linked phone now and cancel it.\n`);
@@ -174,7 +198,7 @@ module.exports = function registerRecovery(deps) {
     const rows = db.prepare(`SELECT * FROM account_holds WHERE kind = 'recovery' AND ${OPEN} AND payload LIKE ?`).all(`%${auth.did}%`)
       .filter(h => mineToDecide(h, auth.did));
     res.json({ ok: true, asks: rows.map(h => { const p = parse(h.payload); return {
-      id: h.id, owner: nameOf(h.did), status: h.status, started_at: h.created_at, ready_at: h.ready_at, new_phone: { label: p.label, code: keyPrint(p.key_d) },
+      id: h.id, owner: nameOf(h.did), status: h.status, started_at: h.created_at, ready_at: h.ready_at, new_phone: { label: p.label, fingerprint: keyPrint(p.key_d) },
       i_approved: Boolean((p.approvals || {})[auth.did]), intent: `recovery-approve:${h.id}` }; }) });
   });
 
@@ -219,6 +243,7 @@ module.exports = function registerRecovery(deps) {
         const cur = getReq(h.id);
         if (!cur || !['pending', 'quorum'].includes(cur.status)) throw Object.assign(new Error('this recovery ended meanwhile'), { statusCode: 409 });
         const q = parse(cur.payload); q.approvals = q.approvals || {}; q.approvals[auth.did] = { at: nowIso() }; savePayload(cur.id, q);
+        db.prepare("UPDATE account_holds SET note = 'approved' WHERE id = ?").run(cur.id);   // counts toward the weekly limit, even if canceled later (#61 L1)
       }).immediate();
     } catch (e) { return res.status(e.statusCode || 500).json(e.body || { error: e.message }); }
     logSecurityEvent('recovery_approved_by_guardian', 'critical', { caller_did: h.did, capability: 'recovery', ip: req.ip, context: { hold_id: h.id, guardian: nameOf(auth.did) } });
@@ -265,7 +290,7 @@ module.exports = function registerRecovery(deps) {
   // ── completion (the new phone) ─────────────────────────────────────────────────────────────────────────────────
   app.post('/api/identity/recovery/:id/complete-challenge', rateLimitStrict, (req, res) => {
     const h = getReq(req.params.id);
-    if (!h || h.status !== 'quorum' || parse(h.payload).device_id !== String((req.body || {}).device_id || '')) return res.status(404).json({ error: 'not ready to complete from this phone' });
+    if (!h || !['quorum', 'completing'].includes(h.status) || parse(h.payload).device_id !== String((req.body || {}).device_id || '')) return res.status(404).json({ error: 'not ready to complete from this phone' });
     const nonce = newChallenge('complete', '', h.id);
     res.json({ ok: true, challenge: nonce, message: completeMessage(h.did, h.id, nonce), ready_at: h.ready_at });
   });
@@ -281,30 +306,61 @@ module.exports = function registerRecovery(deps) {
       return res.status(403).json({ error: 'not signed by the new phone of this recovery' });
     }
     if (typeof b.new_password !== 'string' || b.new_password.length < 8 || b.new_password.length > 128) return res.status(400).json({ error: 'new_password: 8–128 characters' });
-    if (h.status !== 'quorum' || !h.ready_at) return res.status(409).json({ error: 'two guardians have not approved it' });
-    if (Date.parse(h.ready_at) > Date.now()) return res.status(409).json({ error: 'the 48 hours are not over', ready_at: h.ready_at });
-    if (validApprovals(h).length < QUORUM) { recount(h); return res.status(409).json({ error: 'fewer than two guardians still stand behind it' }); }
+    // A completion that got stuck (the mail server's answer was unknown and could not be undone) is retried only from
+    // this same phone, after a pause (#61 review H1).
+    const stuck = h.status === 'completing' && Date.parse(String(h.note || '').replace(/^completing:/, '')) < Date.now() - 60000;
+    if (h.status !== 'quorum' && !stuck) return res.status(409).json({ error: h.status === 'completing' ? 'completing — try again in a minute' : 'two guardians have not approved it' });
+    if (!h.ready_at || Date.parse(h.ready_at) > Date.now()) return res.status(409).json({ error: 'the 48 hours are not over', ready_at: h.ready_at });
+    if (standingApprovals(h).length < QUORUM) { if (h.status === 'quorum') recount(h); return res.status(409).json({ error: 'fewer than two guardians still stand behind it' }); }
+    // Everything finish() needs is checked before the mail server is touched (#61 review H1).
+    if (db.prepare('SELECT 1 FROM device_keys WHERE device_id = ? LIMIT 1').get(p.device_id)) return res.status(409).json({ error: 'this phone is already linked to a wallet — recover from a phone that is not' });
+    const w = db.prepare('SELECT password_hash FROM identity_wallets WHERE did = ?').get(h.did);
+    if (!w) return res.status(404).json({ error: 'not ready to complete from this phone' });
     if (!spend(c)) return res.status(404).json({ error: 'not ready to complete from this phone' });
-    // Claimed for completion: from here no cancel can land (the 48 hours are over), so the mailbox password is never
-    // changed for a recovery that then gets canceled.
-    if (db.prepare("UPDATE account_holds SET status = 'completing' WHERE id = ? AND status = 'quorum'").run(h.id).changes !== 1) return res.status(409).json({ error: 'this recovery ended meanwhile' });
+    // Claimed: a cancel cannot land while the mail server is being changed, so the mailbox is never left on a password
+    // of a recovery that then got canceled. (Until this point the owner's phones can still cancel.)
+    if (db.prepare(`UPDATE account_holds SET status = 'completing', note = ? WHERE id = ? AND status = ?`).run('completing:' + nowIso(), h.id, h.status).changes !== 1) return res.status(409).json({ error: 'this recovery ended meanwhile' });
     let newHash;
     try { newHash = await deps.hashPassword(b.new_password); } catch (_) { newHash = null; }
     const mail = newHash ? await deps.setMailboxPassword(h.did, newHash).catch(() => 'unknown') : 'unreached';
     if (mail !== 'ok') {
-      db.prepare("UPDATE account_holds SET status = 'quorum' WHERE id = ? AND status = 'completing'").run(h.id);
-      if (mail === 'unknown') { try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(h.did); } catch (_) {} }
-      return res.status(503).json({ error: 'the mail password could not be set — nothing else changed; try again', retry: true });
+      // Not reached: nothing changed anywhere. Unknown: put the mailbox back on the password DemiPass holds; if that
+      // works, nothing changed either. Only if the undo cannot be confirmed does it stay 'completing' (retryable from
+      // this phone; the owner is told and the sweep keeps telling).
+      let back = mail === 'unreached';
+      if (!back && w.password_hash) back = (await deps.setMailboxPassword(h.did, w.password_hash).catch(() => 'unknown')) === 'ok';
+      if (back) {
+        db.prepare("UPDATE account_holds SET status = 'quorum', note = 'approved' WHERE id = ? AND status = 'completing'").run(h.id);
+        return res.status(503).json({ error: 'the mail password could not be set — nothing changed; try again', retry: true });
+      }
+      logSecurityEvent('recovery_completion_stuck', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id } });
+      holds().tellOwner(h.did, 'a recovery of your wallet is part-way through', 'A guardian-approved recovery of your wallet started completing, but the mail server did not answer clearly. It will finish when the new phone retries. If this is not you, contact DemiPass support now.\n');
+      return res.status(503).json({ error: 'the mail server did not answer clearly — try again in a minute from this phone', retry: true });
     }
     let report;
     try { report = finish(h, p, newHash); }
     catch (e) {
+      // The mailbox already has the new password: keep DemiPass on the same one (never split), sign everything out.
       console.error('[recovery] completion failed after the mailbox password changed:', e.message);
+      try { db.prepare('UPDATE identity_wallets SET password_hash = ?, password_must_change = 0 WHERE did = ?').run(newHash, h.did); } catch (_) {}
+      try { deps.cutSessions(h.did); } catch (_) {}
       db.prepare("UPDATE account_holds SET status = 'failed', note = ? WHERE id = ? AND status = 'completing'").run(String(e.message).slice(0, 200), h.id);
-      return res.status(500).json({ error: 'the recovery could not finish — contact support' });
+      logSecurityEvent('recovery_completion_failed', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id, error: String(e.message).slice(0, 120) } });
+      return res.status(500).json({ error: 'the recovery could not finish — the new password is set; contact support' });
     }
     res.json({ ok: true, completed: true, device_id: p.device_id, next: 'set a new PIN (with the new password); your wallet is on this phone now', ...report });
   });
+
+  // Stuck completions are told about (owner + a critical event) until the new phone retries.
+  const stuckTimer = setInterval(() => {
+    try {
+      for (const h of db.prepare("SELECT * FROM account_holds WHERE kind = 'recovery' AND status = 'completing'").all()) {
+        const since = Date.parse(String(h.note || '').replace(/^completing:/, ''));
+        if (since && since < Date.now() - STUCK_COMPLETING_SEC * 1000) logSecurityEvent('recovery_completion_stuck', 'critical', { caller_did: h.did, capability: 'recovery', context: { hold_id: h.id } });
+      }
+    } catch (_) {}
+  }, 3600 * 1000);
+  if (stuckTimer.unref) stuckTimer.unref();
 
   // Design H5: everything in one transaction, after the mailbox password changed.
   function finish(h, p, newHash) {
@@ -313,6 +369,7 @@ module.exports = function registerRecovery(deps) {
     db.transaction(() => {
       const cur = getReq(h.id);
       if (!cur || cur.status !== 'completing') throw new Error('state changed');
+      if (standingApprovals({ ...cur, payload: JSON.stringify(p) }).length < QUORUM) throw new Error('fewer than two guardians still stand behind it');
       // 1. every earlier phone and its wraps; phones waiting to be linked or removed
       D.revokeAll(did, 'social recovery', 'recovery');
       // 2. every session, refresh chain, device-flow code
@@ -321,7 +378,7 @@ module.exports = function registerRecovery(deps) {
       out.agents_cut = db.prepare("SELECT agent_name FROM silicon_agents WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").all(did).map(r => r.agent_name);
       db.prepare("UPDATE silicon_agents SET status = 'revoked' WHERE carbon_did = ? AND status = 'active' AND created_at > datetime('now', '-30 days')").run(did);
       // 4. delegations and scopes granted in the last 30 days are suspended (the owner re-enables them one by one)
-      out.delegations_suspended = db.prepare("UPDATE demipass_delegations SET status = 'suspended' WHERE owner_did = ? AND status = 'active' AND COALESCE(offer_state, '') = '' AND granted_at > datetime('now', '-30 days')").run(did).changes;
+      out.delegations_suspended = db.prepare("UPDATE demipass_delegations SET status = 'suspended' WHERE owner_did = ? AND status = 'active' AND COALESCE(offer_state, '') IN ('', 'accepted') AND granted_at > datetime('now', '-30 days')").run(did).changes;
       out.scopes_suspended = db.prepare("UPDATE blindkey_contexts SET status = 'suspended' WHERE status = 'active' AND created_at > datetime('now', '-30 days') AND secret_id IN (SELECT id FROM blindkey_secrets WHERE did = ?)").run(did).changes;
       // 5. everything waiting: approvals, transfers, share offers, other holds; unwrap sessions
       db.prepare("UPDATE use_approvals SET status = 'cancelled', decided_at = ?, unwrap_blob = NULL WHERE owner_did = ? AND status IN ('pending', 'approved')").run(t, did);
@@ -330,6 +387,17 @@ module.exports = function registerRecovery(deps) {
       for (const k of ['pin-reset', 'enrol', 'email', 'unlink', 'guardians']) H.closeOpen(did, k, 'social recovery completed');
       db.prepare(`UPDATE account_holds SET status = 'canceled', canceled_by = 'another recovery completed', canceled_at = ?, payload = '{}' WHERE did = ? AND kind = 'recovery' AND id != ? AND ${OPEN}`).run(t, did, h.id);
       if (CD && CD.dropOwnerSessions) CD.dropOwnerSessions(did);
+      // #61 review M1: outstanding reset links and codes (a link mailed before would undo the mailbox change), fills,
+      // grant and access requests, and leak-scan tokens (an oracle on vault values) of the last 30 days
+      db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0').run(did);
+      for (const tb of ['identity_2fa_codes', 'identity_sms_codes']) { try { db.prepare(`UPDATE ${tb} SET used = 1 WHERE did = ? AND used = 0`).run(did); } catch (_) {} }
+      try { db.prepare("UPDATE blindkey_fill_requests SET status = 'denied' WHERE did = ? AND status IN ('pending', 'approved')").run(did); } catch (_) {}
+      try { db.prepare("UPDATE silicon_grant_requests SET status = 'denied' WHERE did = ? AND status = 'pending'").run(did); } catch (_) {}
+      try { db.prepare("UPDATE demipass_access_requests SET status = 'denied' WHERE owner_did = ? AND status = 'pending'").run(did); } catch (_) {}
+      try {
+        out.scan_tokens_revoked = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'social recovery' WHERE owner_did = ? AND revoked_at IS NULL AND created_at > ?").run(t, did, isoAgo(30 * 86400)).changes;
+        db.prepare("UPDATE leak_scan_token_requests SET status = 'denied', sealed = NULL WHERE owner_did = ? AND status IN ('pending', 'approved')").run(did);
+      } catch (_) {}
       // 6. a recovery email changed in the last 30 days goes back to the one before
       const firstChange = db.prepare('SELECT email FROM recovery_email_history WHERE did = ? AND replaced_at > ? ORDER BY replaced_at ASC LIMIT 1').get(did, isoAgo(30 * 86400));
       if (firstChange) { db.prepare('UPDATE identity_wallets SET recovery_email = ? WHERE did = ?').run(firstChange.email, did); out.recovery_email_restored = true; }
@@ -349,6 +417,9 @@ module.exports = function registerRecovery(deps) {
     holds().tellOwner(did, 'your wallet was recovered onto a new phone',
       `Your wallet was recovered onto a new phone ("${p.label}") with the approval of two of your guardians. Every earlier phone and session was signed out.\n` +
       (out.agents_cut.length ? `Agents registered in the last 30 days were cut: ${out.agents_cut.join(', ')}.\n` : '') +
+      (() => { const a = db.prepare("SELECT agent_name FROM silicon_agents WHERE carbon_did = ? AND status = 'active'").all(did).map(r => r.agent_name);
+               let wk = []; try { wk = db.prepare("SELECT name FROM fleet_workers WHERE parent_did = ? AND status = 'active'").all(did).map(r => r.name); } catch (_) {}
+               return (a.length ? `These agents still have access — revoke any you do not recognise: ${a.join(', ')}.\n` : '') + (wk.length ? `These workers still have access: ${wk.join(', ')}.\n` : ''); })() +
       (out.delegations_suspended || out.scopes_suspended ? `${out.delegations_suspended} delegation(s) and ${out.scopes_suspended} scope(s) granted in the last 30 days are suspended until you re-enable them.\n` : '') +
       (contacts.length ? `People paired with you in person in the last 30 days: ${contacts.join(', ')} — check you know them.\n` : '') +
       (lost.length ? `These elevated/critical secrets were locked to your old phones and can no longer be opened: ${lost.join(', ')}. Rotate each at its source, then store the new value.\n` : '') +

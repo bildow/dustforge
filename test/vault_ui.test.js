@@ -1704,7 +1704,7 @@ test('a guardian sees the recovery ask (owner escaped) and Approve sends the typ
     if (p.startsWith('/api/identity/trust')) return { json: trustOk };
     if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
     if (p === '/api/identity/guardians') return { json: { ok: true, active: false, guardians: [], guarding: [{ id: 4, owner: 'kyle', status: 'active' }] } };
-    if (p === '/api/identity/recovery/asks') return { json: { ok: true, asks: [{ id: '123456789012', owner: '<b>kyle</b>', status: 'pending', new_phone: { code: 'aabbccddeeff0011' }, i_approved: false }] } };
+    if (p === '/api/identity/recovery/asks') return { json: { ok: true, asks: [{ id: '123456789012', owner: '<b>kyle</b>', status: 'pending', new_phone: { fingerprint: 'aabbccddeeff0011' }, i_approved: false }] } };
     if (p.endsWith('/approve')) { sent.push(b); return { json: { ok: true, status: 'pending' } }; }
     return { json: { ok: true } };
   } });
