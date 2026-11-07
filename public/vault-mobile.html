@@ -155,7 +155,12 @@
   <button id="lock-bio" class="btn-primary" onclick="unlockTry(false)" style="min-width:12rem">Unlock with fingerprint / face</button>
   <button class="btn-ghost" onclick="unlockTry(true)" style="min-width:12rem">Use PIN</button>
   <div id="lock-msg" style="font-size:0.75rem;color:var(--red);min-height:1rem"></div>
+  <!-- Forgot the PIN, or it is locked after too many tries: sign out and sign in with the password (a password sign-in
+       opens unlocked; Settings → Change PIN then resets it). Without this a locked PIN had no way out (#73 review). -->
+  <button class="btn-ghost" onclick="logout()" style="min-width:12rem;font-size:0.75rem;margin-top:0.6rem">Forgot your PIN? Sign out and sign in with your password</button>
 </div>
+<!-- Covers the vault while the app is in the background, so the last frame shown on return is never vault content. -->
+<div id="privacy-cover" style="display:none;position:fixed;inset:0;z-index:94;background:var(--bg)"></div>
 <div id="app" class="app" style="padding-top:env(safe-area-inset-top, 0px)">
   <div class="topbar" style="padding-top:2rem;background:var(--surface)">
     <div class="topbar-left">Demi<span>Pass</span></div>
@@ -738,7 +743,9 @@ function midFlow(){
 }
 async function reloadIfStale(){
   try{
-    if(!lockState.locked&&midFlow()) return false;
+    // Unlocked: not in the middle of anything. Locked: lockNow closed the sheets, but an unlock (PIN or phone) or a
+    // code step may be running: those wait too.
+    if(lockState.locked ? (flowDepth>0||!!pinUnlockDone) : midFlow()) return false;
     if(typeof fetch!=='function'||!document.lastModified) return false;
     const r=await fetch(location.pathname,{method:'HEAD',cache:'no-store'});
     const theirs=Date.parse(r.headers.get('last-modified')||''), mine=Date.parse(document.lastModified);
@@ -784,6 +791,8 @@ function logout(){
     for(const k of ['dp_token','dp_did','dp_user','dp_token_at','dp_refresh']) localStorage.removeItem(k);
   }
   sessionEpoch++; tk='';did='';user='';loginPw='';signedInHere=false;vaultOpen=false; renewing=null;
+  // A session that ends while locked leaves no lock screen over the sign-in (#73 review): the next sign-in starts clean.
+  lockState.locked=false; for(const i of ['lock-screen','privacy-cover']){const e=document.getElementById(i);if(e)e.style.display='none'}
   closeAllSheets(); stopScan();   // every sheet, the blocking PIN ones too, and the camera
   for(const i of ['pin-new','pin-confirm','pin-setup-pw','pin-unlock','pin-cur','pin-change-pw','pin-change-new','pin-change-confirm','auth-pass','wizard-pw','recovery-pw']){const e=document.getElementById(i);if(e)e.value=''}
   const s=pinSetupDone,u=pinUnlockDone; pinSetupDone=pinUnlockDone=null; pinUnlockIntent=null; pinSentFor=null; pinOpenAttempts=[]; if(s)s(false); if(u)u(false);
@@ -1196,6 +1205,7 @@ async function showApp(){
   // sign-in with the password, just now, opens without the PIN.
   if(startsLocked(freshLogin)) lockNow();
   else { document.getElementById('app').style.display='block'; noteActive(true); }
+  signedInHere=false;   // used once: a later showApp on this page (retry, wizard) is a start like any other
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
@@ -2404,6 +2414,7 @@ function holdCards(holds){
       :'<span style="font-size:0.75rem;color:var(--text3)">Not you? Cancel it in the DemiPass app on a linked phone.</span>')+'</div></div>').join('');
 }
 async function loadHolds(){
+  if(lockState.locked) return;   // nothing fetched or changed behind the lock (#73 review)
   const wrap=document.getElementById('holds-wrap'), el=document.getElementById('holds'); if(!wrap||!el||!tk) return;
   try{
     const r=await api('GET','/api/identity/holds');
@@ -2575,7 +2586,14 @@ function noteActive(force){
 if(typeof document!=='undefined'&&document.addEventListener) ['pointerdown','keydown','touchstart','scroll'].forEach(ev=>document.addEventListener(ev,()=>noteActive(false),{passive:true,capture:true}));
 function idleCheck(){ if(vaultOpen&&!lockState.locked&&Date.now()-lockState.last>lockState.after*1000) lockNow(); }
 setInterval(idleCheck,5000);
-if(typeof document!=='undefined'&&document.addEventListener) document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') idleCheck(); });
+// Going to the background covers the vault at once; coming back past the grace period locks before the cover lifts,
+// so neither the Recents frame nor the first frame on return shows vault content (#73 review).
+if(typeof document!=='undefined'&&document.addEventListener) document.addEventListener('visibilitychange',()=>{
+  const cover=document.getElementById('privacy-cover');
+  if(document.visibilityState==='hidden'){ if(vaultOpen&&cover) cover.style.display='block'; return; }
+  idleCheck();
+  if(cover) cover.style.display='none';
+});
 function lockNow(){
   if(lockState.locked) return;
   lockState.locked=true;
@@ -2596,6 +2614,7 @@ async function unlockTry(usePin){
     if(!ok){ m.textContent='Still locked.'; return; }
     lockState.locked=false; document.getElementById('lock-screen').style.display='none'; document.getElementById('app').style.display='block';
     noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadNetwork();
+    loadHolds(); if(location.hash==='#holds') loadDevices();   // opened from an alert: what it was about, once unlocked
   }catch(e){ if(!sessionEnded(e)) m.textContent=e.message; }
 }
 // ── Leak scanner (red team item 5): something acting for you asks for scan tokens; you approve here ───────────────
@@ -2766,6 +2785,7 @@ async function unlinkPhone(id){
   catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
 }
 async function loadDevices(){
+  if(lockState.locked) return;   // nothing fetched or changed behind the lock (#73 review)
   const el=document.getElementById('devices'); if(!el) return;
   try{
     const r=await api('GET','/api/identity/devices'); let me=dev.st();
@@ -2977,6 +2997,7 @@ async function runDoctor(){
 }
 
 async function loadSiliconAgents(){
+  if(lockState.locked) return;   // nothing fetched or changed behind the lock (#73 review)
   try{
     const d=await api('GET','/api/demipass/silicon/agents');
     const el=document.getElementById('silicon-agents');

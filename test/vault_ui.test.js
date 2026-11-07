@@ -72,7 +72,8 @@ function page({ storage = {}, routes, abortable = false, coldLock = false } = {}
   ctx.loadSiliconAgents = () => {};
   ctx.loadSmsStatus = async () => {};
   const key = k => { for (const f of listeners.keydown || []) f({ key: k }); };
-  return { ctx, el, calls, store, intervals, qsa, key, timers, shown: id => el(id).classList.contains('show'), appOpen: () => el('app').style.display === 'block', authOpen: () => el('auth').style.display === 'flex' };
+  const fire = type => { for (const f of listeners[type] || []) f({}); };
+  return { ctx, el, calls, store, intervals, qsa, key, timers, fire, shown: id => el(id).classList.contains('show'), appOpen: () => el('app').style.display === 'block', authOpen: () => el('auth').style.display === 'flex' };
 }
 const signedIn = { dp_token: 'fixture.token.a', dp_did: 'did:key:zFixture', dp_user: 'fixture', dp_token_at: String(Date.now()) };
 const trustOk = { recovery_email: 'fixture@example.invalid' };
@@ -1816,4 +1817,42 @@ test('a PIN step in progress blocks the reload until it settles', async () => {
   pg.ctx.unlockWithPin('Do the thing', 'refill:1');   // a PIN sheet waits for the owner
   await settle();
   assert.equal(await pg.ctx.reloadIfStale(), false, 'PIN sheet pending');
+});
+
+test('item 8 (#73 review): the lock screen signs out to the password; a session ending while locked leaves no lock behind', async () => {
+  const pg = page({ coldLock: true, storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/lock') return { json: { lock_after_sec: 300 } };
+    return { json: { ok: true } };
+  } });
+  await settle(12);
+  assert.equal(pg.el('lock-screen').style.display, 'flex');
+  pg.ctx.logout(); await settle();
+  assert.equal(pg.el('lock-screen').style.display, 'none', 'no lock screen over the sign-in');
+  assert.equal(pg.authOpen(), true, 'sign-in shown');
+  assert.equal(vm.runInContext('lockState.locked', pg.ctx), false);
+});
+
+test('item 8 (#73 review): background covers the vault; back within the grace period uncovers, past it locks first', async () => {
+  let vis = 'visible';
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/lock') return { json: { lock_after_sec: 300 } };
+    return { json: { ok: true } };
+  } });
+  Object.defineProperty(pg.ctx.document, 'visibilityState', { get: () => vis, configurable: true });
+  await settle(12);
+  assert.equal(pg.appOpen(), true);
+  vis = 'hidden'; pg.fire('visibilitychange');
+  assert.equal(pg.el('privacy-cover').style.display, 'block', 'covered in the background');
+  vis = 'visible'; pg.fire('visibilitychange');
+  assert.equal(pg.el('privacy-cover').style.display, 'none', 'back within the grace period: uncovered');
+  assert.notEqual(pg.el('lock-screen').style.display, 'flex', '…and not locked');
+  vis = 'hidden'; pg.fire('visibilitychange');
+  vm.runInContext('lockState.last = Date.now() - 10 * 60 * 1000;', pg.ctx);   // away past "Lock after"
+  vis = 'visible'; pg.fire('visibilitychange');
+  assert.equal(pg.el('lock-screen').style.display, 'flex', 'past the grace period: locked');
+  assert.equal(pg.appOpen(), false, 'vault hidden behind the lock');
 });
