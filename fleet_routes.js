@@ -188,8 +188,11 @@ module.exports = function registerFleetRoutes(deps) {
           if (!v.valid || v.decoded.sub !== wallet.did) return res.status(403).json({ error: 'member_token does not belong to that identity' });
           if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(403).json({ error: 'member_token is revoked' });
           // Consent comes from the wallet itself, not from a token some fleet owner minted for it.
-          if (v.decoded.auth_method === 'fleet_owner_mint' || v.decoded.auth_method === 'worker' || v.decoded.wrk) {
-            return res.status(403).json({ error: 'member_token must be the wallet\'s own sign-in token, not a fleet-minted or worker one' });
+          // An agent's device login (auth_method device, an agent_label) is not the wallet consenting either (#70 round-2):
+          // it would let any agent signed in as a person link that person into a fleet.
+          if (v.decoded.auth_method === 'fleet_owner_mint' || v.decoded.auth_method === 'worker' || v.decoded.wrk
+              || v.decoded.auth_method === 'device' || v.decoded.agent_label || v.decoded.agent_name) {
+            return res.status(403).json({ error: 'member_token must be the wallet\'s own sign-in token, not a fleet-minted, worker or agent device-login one' });
           }
           proof = 'member_token';
         } else if (isAdminReq(req)) proof = 'admin';

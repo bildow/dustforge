@@ -1678,6 +1678,18 @@ test('signed out, the linked phone asks with D (no session) and shows what waits
   assert.match(pg.el('auth-holds').innerHTML, /a recovery of your wallet by your guardians/); assert.match(pg.el('auth-holds').innerHTML, /Cancel it/);
 });
 
+test('signed out, a new mail forwarding rule shows on the sign-in screen from the alerts call (item 6b, #70 M3), escaped', async () => {
+  const pg = page({ storage: {}, routes: async (p) => {
+    if (p === '/api/identity/holds/challenge') return { json: { ok: true, challenge: 'A'.repeat(32), message: 'demipass:alerts:did:key:zX:phone-1:' + 'A'.repeat(32) } };
+    if (p === '/api/identity/holds/alerts') return { json: { ok: true, holds: [], notices: [{ kind: 'forward', rule_id: 3, forward_to: 'x<img src=y>@evil.example', filter_from: '*', since: '2026-11-07 12:00:00' }] } };
+    return { json: {} };
+  } });
+  pg.ctx.DemiPassDevice = fakePhone(pg.ctx, []);
+  await pg.ctx.checkLoginHolds(); await settle();
+  const h = pg.el('auth-holds').innerHTML;
+  assert.match(h, /Mail forwarding turned on/); assert.match(h, /x&lt;img src=y&gt;@evil\.example/); assert.doesNotMatch(h, /<img/);
+});
+
 test('a PIN reset with the password on a linked phone asks the phone first; declined → it waits (202) and says until when', async () => {
   const sent = []; let alerted = '';
   const pg = page({ storage: signedIn, routes: async (p, b) => {

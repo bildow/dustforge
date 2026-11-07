@@ -1143,7 +1143,7 @@ async function addForward(){
   const to = prompt('Forward your @dustforge.com mail to which address?\n(e.g. you@gmail.com)');
   if(!to) return;
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to.trim())){ alert('That doesn\'t look like an email address.'); return; }
-  try { const r = await api('POST','/api/relay/create',{forward_to:to.trim()}); loadDustforge(); }
+  try { const r = await apiGated('POST','/api/relay/create',{forward_to:to.trim()},'Turn on mail forwarding'); loadDustforge(); }
   catch(e){ alert('Could not add forwarding: '+e.message); }
 }
 async function removeForward(id){
@@ -2412,6 +2412,12 @@ async function letPhoneIn(id){
   }catch(e){ if(!/cancelled/.test(e.message)) alert(e.message+(e.status===404?' (only a phone linked for 48 hours or more can let a new one in)':'')); }
   loadHolds(); loadDevices();
 }
+// Item 6b: a mail forwarding rule turned on in the last 48 hours (codes and reset links do not go through it meanwhile).
+function noticeCards(ns){
+  return (ns||[]).map(n=>'<div class="fill-req" style="border-color:var(--orange)"><div><b>Mail forwarding turned on</b></div>'
+    +'<div style="font-size:0.75rem">Your DemiPass mail is copied to '+esc(n.forward_to||'')+(n.filter_from&&n.filter_from!=='*'?' (mail from '+esc(n.filter_from)+')':'')+' since '+esc(fmtWhen(n.since))+'.</div>'
+    +'<div style="color:var(--text3);font-size:0.75rem">Not you? Sign in and remove it in the Dustforge tab, then rotate your password. For 48 hours no sign-in code or reset link goes through it.</div></div>').join('');
+}
 function holdCards(holds){
   const onPhone=dev.linked();
   return holds.map(h=>'<div class="fill-req" style="border-color:var(--red)"><div><b>'+esc(h.what||h.kind)+'</b></div>'
@@ -2427,7 +2433,7 @@ async function loadHolds(){
   const wrap=document.getElementById('holds-wrap'), el=document.getElementById('holds'); if(!wrap||!el||!tk) return;
   try{
     const r=await api('GET','/api/identity/holds');
-    const hs=r.holds||[]; wrap.style.display=hs.length?'block':'none'; el.innerHTML=holdCards(hs);
+    const hs=r.holds||[], ns=r.notices||[]; wrap.style.display=(hs.length||ns.length)?'block':'none'; el.innerHTML=holdCards(hs)+noticeCards(ns);
     if(hs.length&&location.hash==='#holds') wrap.scrollIntoView({behavior:'smooth'});
   }catch(e){ if(!sessionEnded(e)){ wrap.style.display='none'; } }
 }
@@ -2441,7 +2447,7 @@ async function checkLoginHolds(){
     if(!s.ok){ el.innerHTML=''; return; }
     const r=await holdsPost('/api/identity/holds/alerts',{device_id:st.device_id,challenge:ch.challenge,signature:s.signature});
     const hs=r.holds||[];
-    el.innerHTML=hs.length?'<div style="margin-top:1rem;font-size:0.85rem;color:var(--red)">Waiting changes to your wallet — cancel any that were not you:</div>'+holdCards(hs):'';
+    el.innerHTML=(hs.length?'<div style="margin-top:1rem;font-size:0.85rem;color:var(--red)">Waiting changes to your wallet — cancel any that were not you:</div>'+holdCards(hs):'')+noticeCards(r.notices);
   }catch(_){ el.innerHTML=''; }
 }
 
