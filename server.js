@@ -1450,26 +1450,50 @@ app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
     if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
     if (!okPw) return res.status(403).json({ error: 'invalid password' });
   }
-  // The new PIN replaces the old one everywhere at once: proofs earned with the old PIN (any session) die with
-  // it. If they cannot be removed, the PIN does not change either (gateFresh also rejects proofs older than
-  // pin_set_at, so even a surviving row would be dead).
+  const viaPassword = !(current_pin !== undefined && current_pin !== null && current_pin !== '');
+  // R0 (red team item 9): while a phone is linked, a PIN reset with the password waits 48 hours, cancelable from any
+  // linked phone — or applies at once with a presence signature from one of them (intent pin-reset:0; it works while
+  // the PIN is locked). Otherwise mail access → password reset → PIN reset would unlink the owner's phones at once.
+  if (wallet.pin_hash && viaPassword && deviceKeys.hasDevice(auth.did)) {
+    const b = req.body || {};
+    const phone = b.device_challenge_id && b.device_signature ? deviceKeys.verifyPresence(auth, b.device_challenge_id, b.device_signature, 'pin-reset:0') : null;
+    if (!phone) {
+      if (b.device_challenge_id) return res.status(403).json({ error: 'not signed by a linked phone of yours' });
+      const stop = accountHolds.startRefusal(auth.did, 'pin-reset');
+      if (stop) return res.status(stop.status).json(stop.body);
+      const refused = accountHolds.pinResetRefusal(auth.did);
+      if (refused) return res.status(refused.status).json(refused.body);
+      const h = accountHolds.createHold(auth.did, 'pin-reset', { pin_hash: pinGate.hashPin(String(pin)) }, { why: 'with the account password' });
+      return res.status(202).json({ ok: true, pending: true, hold_id: h.id, ready_at: h.ready_at,
+        note: 'your phones are linked: a PIN reset with the password takes 48 hours and can be canceled from any of them. If you have your phone, confirm on it instead (it applies at once), or change the PIN with your current PIN.',
+        confirm_on_phone: { purpose: 'gate', intent: 'pin-reset:0' } });
+    }
+  }
+  const r = applyPinHash(auth.did, pinGate.hashPin(String(pin)), { unlinkWhy: wallet.pin_hash && viaPassword ? 'PIN reset with the account password' : null });
+  if (r.ok) accountHolds.closeOpen(auth.did, 'pin-reset', 'superseded: the PIN was set now');   // a waiting reset must not apply later
+  if (!r.ok) return res.status(503).json({ error: wallet.pin_hash ? 'could not change the PIN; the current PIN still applies — try again' : 'could not save the PIN; try again', retry: true });
+  logSecurityEvent(wallet.pin_hash ? 'pin_changed' : 'pin_set', 'warn', { caller_did: auth.did, ip: req.ip });
+  res.json({ ok: true, pin_set: true, changed: Boolean(wallet.pin_hash), ...(r.unlinked ? { phones_unlinked: r.unlinked } : {}) });
+});
+
+// Set a wallet's PIN hash. The new PIN replaces the old one everywhere at once: proofs earned with the old PIN (any
+// session) die with it; if they cannot be removed, the PIN does not change either (gateFresh also rejects proofs older
+// than pin_set_at). unlinkWhy: a PIN reset with the account password (the recovery path) unlinks every phone, so whoever
+// had only the PIN cannot keep a planted device through it (#47 review H1); a change with the current PIN keeps them.
+function applyPinHash(did, pinHash, { unlinkWhy = null } = {}) {
   try {
     db.transaction(() => {
       db.prepare(`UPDATE identity_wallets SET pin_hash = ?, pin_failures = 0, pin_locked_until = NULL, pin_lock_count = 0, pin_set_at = ${GATE_NOW}, updated_at = CURRENT_TIMESTAMP WHERE did = ?`)
-        .run(pinGate.hashPin(String(pin)), auth.did);
-      invalidatePinProofs(auth.did);
+        .run(pinHash, did);
+      invalidatePinProofs(did);
     })();
   } catch (e) {
     console.error('[pin] change not applied:', e.message);
-    return res.status(503).json({ error: wallet.pin_hash ? 'could not change the PIN; the current PIN still applies — try again' : 'could not save the PIN; try again', retry: true });
+    return { ok: false };
   }
-  logSecurityEvent(wallet.pin_hash ? 'pin_changed' : 'pin_set', 'warn', { caller_did: auth.did, ip: req.ip });
-  // A PIN reset with the account password (the recovery path) unlinks every phone: whoever had only the PIN cannot keep
-  // a planted device through it (#47 review H1). A change with the current PIN keeps them.
-  const viaPassword = !(current_pin !== undefined && current_pin !== null && current_pin !== '');
-  const unlinked = wallet.pin_hash && viaPassword ? deviceKeys.revokeAll(auth.did, 'PIN reset with the account password') : 0;
-  res.json({ ok: true, pin_set: true, changed: Boolean(wallet.pin_hash), ...(unlinked ? { phones_unlinked: unlinked } : {}) });
-});
+  const unlinked = unlinkWhy ? deviceKeys.revokeAll(did, unlinkWhy) : 0;
+  return { ok: true, unlinked };
+}
 
 // POST /api/demipass/secrets/gate-policy — set a secret's security depth.
 //   { name|ref, security_depth:'standard'|'elevated'|'critical' }  OR
@@ -6931,7 +6955,8 @@ app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddlew
   });
   // REFRESH: issue alongside access token so agents never hit the hour-25 wall
   const _rf = issueRefreshToken(wallet.did, scope, token);
-  res.json({ ok: true, token, refresh_token: _rf.refresh_token, refresh_expires_at: _rf.refresh_expires_at, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash });
+  res.json({ ok: true, token, refresh_token: _rf.refresh_token, refresh_expires_at: _rf.refresh_expires_at, did: wallet.did, scope, email: wallet.email, auth_method: 'fingerprint', fingerprint_hash: fingerprintHash,
+             ...(wallet.password_must_change ? { password_must_change: true } : {}) });
 });
 
 // POST /api/identity/request-account — silicon requests account, carbon gets payment link
@@ -8370,10 +8395,18 @@ const secretSharing = require('./secret_sharing')({
   devices: () => deviceKeys,       // registered just below
   sendMail: fleetRoutes.sendMail,  // pending transfers: both sides are mailed at start and end (red team item 6)
 });
+// Account holds (red team item 9): PIN reset by password, a new phone, a recovery-email change and guardian recovery
+// wait 48 hours while a phone is linked, cancelable from any eligible phone without a session (account_holds.js).
+const accountHolds = require('./account_holds')({
+  app, db, rateLimitStrict, rateLimitStandard, logSecurityEvent, cleanLabel, getBearerIdentity, sendMail: fleetRoutes.sendMail,
+  devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
+  applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
+});
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({
   app, db, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, cleanLabel, sendMail: fleetRoutes.sendMail, recordGate, pinIntentOk: (s) => PIN_INTENT_RE.test(s),
+  holds: () => accountHolds,
 });
 // Leak scanner: is any of my vault values in this text? Answered where the values are; never returns one (red team item 5).
 require('./leak_scan')({ app, db, express, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
@@ -12800,7 +12833,25 @@ app.post('/api/identity/set-recovery-email', rateLimitStrict, async (req, res) =
   if (okPw === null) return res.status(503).json({ error: 'password verification temporarily unavailable' });
   if (!okPw) return res.status(403).json({ error: 'invalid password' });
 
-  db.prepare('UPDATE identity_wallets SET recovery_email = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(recovery_email, auth.did);
+  // E2 (red team item 9): the recovery email is where password resets go. While a phone is linked, a change waits 48
+  // hours, cancelable from any linked phone — or applies at once with a presence signature from a phone linked at
+  // least 48 hours (intent recovery-email:0).
+  if (deviceKeys.hasDevice(auth.did) && String(wallet.recovery_email || '').toLowerCase() !== recovery_email.toLowerCase()) {
+    const b = req.body || {};
+    const phone = b.device_challenge_id && b.device_signature ? deviceKeys.verifyPresence(auth, b.device_challenge_id, b.device_signature, 'recovery-email:0', accountHolds.ESTABLISHED_SEC) : null;
+    if (!phone) {
+      if (b.device_challenge_id) return res.status(403).json({ error: 'not signed by a phone of yours linked for 48 hours or more' });
+      const stop = accountHolds.startRefusal(auth.did, 'email');
+      if (stop) return res.status(stop.status).json(stop.body);
+      if (accountHolds.openHolds(auth.did, 'email').length) return res.status(409).json({ error: 'a recovery-email change is already waiting' });
+      const h = accountHolds.createHold(auth.did, 'email', { recovery_email }, { why: recovery_email });
+      return res.status(202).json({ ok: true, pending: true, hold_id: h.id, ready_at: h.ready_at,
+        note: 'your phones are linked: a recovery-email change takes 48 hours and can be canceled from any of them, or confirm it on a phone linked for 48 hours or more (it applies at once)',
+        confirm_on_phone: { purpose: 'gate', intent: 'recovery-email:0' } });
+    }
+  }
+  accountHolds.setRecoveryEmail(auth.did, wallet.recovery_email, recovery_email);
+  accountHolds.closeOpen(auth.did, 'email', 'superseded: the recovery email was set now');
   logSecurityEvent('recovery_email_changed', 'warn', { caller_did: auth.did, ip: req.ip });
   if (String(wallet.recovery_email || '').toLowerCase() !== recovery_email.toLowerCase()) {
     for (const to of accountAddresses(wallet.email, wallet.recovery_email)) {
@@ -12879,7 +12930,7 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
         // The local verifier follows Stalwart at once and on its own: if it kept the old hash, the old password
         // would still sign in. Should even that write fail, clearing it hands the decision back to Stalwart.
         try {
-          db.prepare('UPDATE identity_wallets SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(newHash, resetRow.did);
+          db.prepare('UPDATE identity_wallets SET password_hash = ?, password_must_change = 0, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(newHash, resetRow.did);
         } catch (e) {
           console.error(`[password-reset] ${resetWallet.username}: could not store the new hash: ${e.message}`);
           try { db.prepare('UPDATE identity_wallets SET password_hash = NULL WHERE did = ?').run(resetRow.did); } catch (_) {}
@@ -13705,7 +13756,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|wrap-key|pin-reset|recovery-email):\d{1,12}$/;   // share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

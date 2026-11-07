@@ -145,7 +145,10 @@ call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 403 ] || fail "f 
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM gate_verifications WHERE gate_type='password'\"); c.commit()" "$DB_PATH"   # the enrolment's password proof has lapsed
 pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-0001 "$A"
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q password && ok "(f) removing a phone takes more than the PIN (password or a linked phone's biometric)" || fail "f pin only: $CODE $BODY"
-call POST /api/identity/gate/verify "$A" '{"gate":"password","password":"hunter22"}'; call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 200 ] || fail "f revoke: $CODE $BODY"
+call POST /api/identity/gate/verify "$A" '{"gate":"password","password":"hunter22"}'; call DELETE /api/identity/devices/phone-0001 "$A"
+[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J pending)" = True ] && ok "(f) with the password (no phone) the removal waits 48 h, cancelable from the phone (item 9 #59 H1)" || fail "f pw revoke: $CODE $BODY"
+chsign "$A" p gate "device-revoke:0"; call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"device-revoke:0","challenge_id":'$CH',"signature":"'$SG'"}'
+pin "$A" device-revoke:0; call DELETE /api/identity/devices/phone-0001 "$A"; [ "$CODE" = 200 ] && ok "(f) the phone's own biometric removes it at once" || fail "f revoke: $CODE $BODY"
 chsign "$A" p gate "reveal:1"; call POST /api/identity/gate/verify "$A" '{"gate":"device","intent":"reveal:1","challenge_id":'$CH',"signature":"'$SG'"}'
 [ "$CODE" = 403 ] && ok "(f) a revoked phone's biometric is refused at once" || fail "f revoked P: $CODE"
 

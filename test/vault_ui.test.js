@@ -1625,3 +1625,74 @@ test('a scan-token request shows its labels (escaped) and Approve goes through t
   await pg.ctx.scanDecide(3, true); await settle();
   assert.equal(approved, 3);
 });
+
+// ── Waiting changes to the wallet (red team item 9) ──
+test('waiting changes are listed; on the linked phone Cancel signs with P and posts the challenge nonce, no session', async () => {
+  const signs = [], posts = [];
+  const pg = page({ storage: signedIn, routes: async (p, b, o) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/holds') return { json: { ok: true, holds: [
+      { id: '123456789012', kind: 'pin-reset', status: 'pending', created_at: '2026-11-07T01:00:00Z', ready_at: '2026-11-09T01:00:00Z', what: 'a PIN reset with your account password' },
+      { id: '210987654321', kind: 'enrol', status: 'pending', created_at: '2026-11-07T01:00:00Z', ready_at: '2026-11-09T01:00:00Z', what: 'a new phone', label: '<img src=x onerror=alert(1)>', fingerprint: '0123456789abcdef' } ] } };
+    if (p === '/api/identity/holds/challenge') { posts.push({ p, b, auth: (o.headers || {}).Authorization || null }); return { json: { ok: true, challenge: 'N'.repeat(32), message: 'demipass:recovery-cancel:did:key:zX:pin-reset:' + b.hold_id + ':' + 'N'.repeat(32) } }; }
+    if (p.endsWith('/cancel')) { posts.push({ p, b, auth: (o.headers || {}).Authorization || null }); return { json: { ok: true } }; }
+    return { json: { ok: true } };
+  } });
+  pg.ctx.DemiPassDevice = fakePhone(pg.ctx, signs);
+  await settle();
+  await pg.ctx.loadHolds(); await settle();
+  const h = pg.el('holds').innerHTML;
+  assert.equal(pg.el('holds-wrap').style.display, 'block');
+  assert.match(h, /a PIN reset with your account password/); assert.match(h, /Cancel it/); assert.match(h, /let it in now/);
+  assert.match(h, /code 0123456789abcdef/); assert.doesNotMatch(h, /<img src=x/, 'the new phone\'s label is escaped');
+  await pg.ctx.cancelHold('123456789012'); await settle();
+  assert.equal(signs.length, 1); assert.equal(signs[0].kind, 'P', 'a cancel is signed by the presence key');
+  const cancel = posts.find(x => x.p === '/api/identity/holds/123456789012/cancel');
+  assert.ok(cancel, 'the cancel route was called');
+  assert.equal(cancel.b.challenge, 'N'.repeat(32)); assert.equal(cancel.b.device_id, 'phone-1'); assert.equal(cancel.b.signature, 'SIG-P');
+  assert.equal(cancel.auth, null, 'the cancel carries no session (it must work when the session was ended)');
+});
+
+test('in a browser without the app, waiting changes say to cancel on a linked phone (no Cancel button)', async () => {
+  const pg = page({ storage: signedIn, routes: async (p) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/holds') return { json: { ok: true, holds: [{ id: '123456789012', kind: 'recovery', status: 'pending', created_at: 'x', what: 'a recovery of your wallet' }] } };
+    return { json: { ok: true } };
+  } });
+  await settle(); await pg.ctx.loadHolds(); await settle();
+  assert.match(pg.el('holds').innerHTML, /Cancel it in the DemiPass app on a linked phone/); assert.doesNotMatch(pg.el('holds').innerHTML, /cancelHold\(/);
+});
+
+test('signed out, the linked phone asks with D (no session) and shows what waits on the sign-in screen', async () => {
+  const signs = [];
+  const pg = page({ storage: {}, routes: async (p, b) => {
+    if (p === '/api/identity/holds/challenge') return { json: { ok: true, challenge: 'A'.repeat(32), message: 'demipass:alerts:did:key:zX:phone-1:' + 'A'.repeat(32) } };
+    if (p === '/api/identity/holds/alerts') return { json: { ok: true, holds: [{ id: '123456789012', kind: 'recovery', status: 'pending', created_at: 'x', what: 'a recovery of your wallet by your guardians' }] } };
+    return { json: {} };
+  } });
+  pg.ctx.DemiPassDevice = fakePhone(pg.ctx, signs);
+  await pg.ctx.checkLoginHolds(); await settle();
+  assert.equal(signs[0].kind, 'D', 'the alerts check is signed by the device key (no prompt)');
+  assert.match(pg.el('auth-holds').innerHTML, /a recovery of your wallet by your guardians/); assert.match(pg.el('auth-holds').innerHTML, /Cancel it/);
+});
+
+test('a PIN reset with the password on a linked phone asks the phone first; declined → it waits (202) and says until when', async () => {
+  const sent = []; let alerted = '';
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/identity/device/challenge') return { json: { challenge_id: 9, message: 'demipass:gate:x:pin-reset:0' } };
+    if (p === '/api/identity/pin') { sent.push(b); return { status: 202, json: { ok: true, pending: true, hold_id: '123456789012', ready_at: '2026-11-09T01:00:00Z' } }; }
+    return { json: { ok: true, holds: [] } };
+  } });
+  pg.ctx.DemiPassDevice = { status: () => JSON.stringify({ ok: true, enrolled: true, device_id: 'phone-1' }),
+    sign: (id) => setTimeout(() => pg.ctx.DemiPassDeviceCb(id, JSON.stringify({ ok: false, error: 'cancelled' })), 0) };
+  pg.ctx.alert = (m) => { alerted = String(m); };
+  await settle();
+  pg.el('pin-cur').value = ''; pg.el('pin-change-pw').value = 'hunter22'; pg.el('pin-change-new').value = '5555'; pg.el('pin-change-confirm').value = '5555';
+  await pg.ctx.savePinChange(); await settle();
+  assert.equal(sent.length, 1); assert.equal(sent[0].device_challenge_id, undefined, 'declined on the phone: sent without a phone proof');
+  assert.match(alerted, /waits 48 hours/); assert.doesNotMatch(alerted, /^PIN changed/);
+});
