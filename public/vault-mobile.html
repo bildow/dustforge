@@ -120,6 +120,11 @@
     <span onclick="togglePassVis()" style="position:absolute;right:0.8rem;top:50%;transform:translateY(-50%);cursor:pointer;font-size:1.1rem;color:var(--text3);user-select:none" id="pass-eye">👁</span>
   </div>
   <button onclick="login()">Sign in</button>
+  <a href="#" id="code-link" onclick="requestLoginCode();return false" style="display:block;text-align:center;margin-top:0.6rem;color:var(--accent);font-size:0.85rem;text-decoration:none">Email me a sign-in code instead</a>
+  <div id="code-box" style="display:none;max-width:320px;width:100%;margin-top:0.5rem">
+    <input type="text" id="auth-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="6-digit code from your email" style="width:100%">
+    <button onclick="loginWithCode()" style="width:100%;margin-top:0.4rem">Sign in with the code</button>
+  </div>
   <div id="auth-err" class="auth-err"></div>
   <div id="auth-holds" style="max-width:320px;width:100%"></div>
   <a href="#" onclick="openRecover();return false" style="display:block;text-align:center;margin-top:0.6rem;color:var(--text3);font-size:0.8rem;text-decoration:none">Lost your phones? Recover with your guardians</a>
@@ -347,6 +352,9 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.5rem">Vault PIN (asked for every reveal; email/SMS codes stay fresh 5 minutes)</div>
         <div id="pin-status" style="font-size:0.72rem;color:var(--text3);margin-bottom:0.4rem"></div>
         <button class="btn-ghost" onclick="openPinChange()" style="width:100%;text-align:left;padding:0.6rem">Change PIN</button>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Account password</div>
+        <button class="btn-ghost" onclick="rotatePasswordBlind()" style="width:100%;text-align:left;padding:0.6rem">Rotate my password (blind)</button>
+        <div id="pw-rotate-out" style="font-size:0.72rem;margin-top:0.25rem"></div>
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Recovery guardians (three people you paired with in person; two of them can let you back in if you lose every phone)</div>
         <div id="guardians-box" style="margin-top:0.3rem;font-size:0.8rem"></div>
         <div id="holds-wrap" style="display:none;margin-top:0.9rem"><div style="font-size:0.8rem;color:var(--red)">Waiting changes to your wallet</div><div id="holds" style="margin-top:0.3rem"></div></div>
@@ -743,6 +751,46 @@ async function login(){
     if(a.password_must_change) alert('Change your account password now: someone who knew it started a PIN reset that you canceled. Use “Forgot password?” — the link goes to your recovery email.');
     tk=a.token;did=a.did||'';user=u;loginPw=p;document.getElementById('auth-pass').value='';localStorage.setItem('dp_token',tk);if(a.refresh_token)localStorage.setItem('dp_refresh',a.refresh_token);else localStorage.removeItem('dp_refresh');localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
   }catch(x){e.textContent=x.message||'Connection error';e.style.color='var(--red)'}}
+
+// Sign in with an emailed code: the same answer whether or not the username exists; the code goes to the account's mailbox.
+async function requestLoginCode(){
+  const u=document.getElementById('auth-user').value.trim().toLowerCase(),e=document.getElementById('auth-err');
+  e.style.color='var(--text3)';if(!u){e.textContent='Enter your username first';return}
+  try{
+    e.textContent='Sending…';
+    const r=await fetch(API+'/api/identity/login-code/request',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok){e.textContent=d.error||'Could not send a code';e.style.color='var(--red)';return}
+    e.textContent=d.note||'If that account exists, a code is on its way.';
+    document.getElementById('code-box').style.display='block';document.getElementById('auth-code').focus();
+  }catch(x){e.textContent='Connection error';e.style.color='var(--red)'}
+}
+async function loginWithCode(){
+  const u=document.getElementById('auth-user').value.trim().toLowerCase(),c=document.getElementById('auth-code').value.trim(),e=document.getElementById('auth-err');
+  if(!u||!/^\d{6}$/.test(c)){e.textContent='Username and the 6-digit code';e.style.color='var(--red)';return}
+  try{
+    e.textContent='Signing in…';e.style.color='var(--text3)';
+    const r=await fetch(API+'/api/identity/login-code/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,code:c,expires_in:'24h'})});
+    const a=await r.json().catch(()=>({}));
+    if(!r.ok||!a.token){e.textContent=a.error||'Sign-in failed';e.style.color='var(--red)';return}
+    if(a.password_must_change) alert('Change your account password now: someone who knew it started a PIN reset that you canceled. Use “Rotate my password (blind)” in Settings.');
+    tk=a.token;did=a.did||'';user=u;loginPw='';document.getElementById('auth-code').value='';document.getElementById('code-box').style.display='none';
+    localStorage.setItem('dp_token',tk);if(a.refresh_token)localStorage.setItem('dp_refresh',a.refresh_token);else localStorage.removeItem('dp_refresh');localStorage.setItem('dp_did',did);localStorage.setItem('dp_user',user);localStorage.setItem('dp_token_at',String(Date.now()));showApp()
+  }catch(x){e.textContent='Connection error';e.style.color='var(--red)'}
+}
+// Settings → Rotate my password (blind): PIN + the linked phone; the new password goes straight into the vault entries
+// that held the old one (named in the answer, never shown).
+async function rotatePasswordBlind(){
+  const o=document.getElementById('pw-rotate-out');
+  if(!confirm('Replace your account and mail password with a new random one nobody sees?\n\nIt goes into your vault entries that hold the current one. You will sign in with an emailed code or this phone. Your PIN and this phone confirm it.')) return;
+  o.style.color='var(--text3)';o.textContent='Rotating…';
+  try{
+    const d=await apiGated('POST','/api/identity/password/rotate-blind',{},'Rotate your account password');
+    const moved=(d.secrets_moved||[]).map(x=>x.name).join(', ');
+    o.style.color='var(--green)';
+    o.textContent='Rotated ✓ Mail password: '+d.mailbox+'. '+(moved?'Now in: '+moved+'.':d.stored_as?'Stored as '+d.stored_as.name+'.':'')+((d.skipped||[]).length?' Not changed: '+d.skipped.map(x=>x.name+' ('+x.why+')').join('; ')+'.':'')+' '+(d.sessions||'');
+  }catch(e){ if(sessionEnded(e)) return; o.style.color='var(--red)';o.textContent='Not rotated: '+e.message; }
+}
 
 // Device login approval: hand off to /device.html on this same origin, which reuses this
 // vault session (dp_token in localStorage) so approving is one tap.
