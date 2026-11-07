@@ -104,6 +104,17 @@ module.exports = function registerAccountHolds(deps) {
     unlink: 'a phone being removed from your wallet with the account password',
   };
 
+  // Things the phone should show that are not holds (item 6b): mail forwarding rules turned on in the last 48 hours —
+  // the window in which codes and reset links do not go through them, and the one to notice a stranger's rule in.
+  function notices(did) {
+    try {
+      return db.prepare(`SELECT id, forward_to, filter_from, COALESCE(activated_at, created_at) AS since FROM forward_relays
+          WHERE did = ? AND status = 'active' AND julianday(COALESCE(activated_at, created_at)) > julianday('now', '-2 days') ORDER BY id DESC LIMIT 10`).all(did)
+        .map(r => ({ kind: 'forward', rule_id: r.id, forward_to: r.forward_to, filter_from: r.filter_from, since: r.since,
+          text: `Mail forwarding to ${r.forward_to} was turned on. If this was not you, remove it in the Dustforge tab.` }));
+    } catch (_) { return []; }
+  }
+
   // ── eligibility ────────────────────────────────────────────────────────────────────────────────────────────────
   // The key row (`kind` D or P) of a phone of `did` that was active at some moment from `since` until now.
   function eligibleKey(did, deviceId, kind, since) {
@@ -206,7 +217,7 @@ module.exports = function registerAccountHolds(deps) {
     if (!key || !verify(key, messageFor(ch), signature) || !spendChallenge(ch)) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     sweep();
     const holds = openHolds(ch.did).filter(h => eligibleKey(ch.did, device_id, 'P', holdSince(h)));
-    res.json({ ok: true, holds: holds.map(view) });
+    res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did) });
   });
 
   // POST /api/identity/holds/:id/cancel {device_id, challenge_id, signature} — P of an eligible phone. No session.

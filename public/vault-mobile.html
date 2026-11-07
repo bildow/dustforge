@@ -1143,7 +1143,7 @@ async function addForward(){
   const to = prompt('Forward your @dustforge.com mail to which address?\n(e.g. you@gmail.com)');
   if(!to) return;
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to.trim())){ alert('That doesn\'t look like an email address.'); return; }
-  try { const r = await api('POST','/api/relay/create',{forward_to:to.trim()}); loadDustforge(); }
+  try { const r = await apiGated('POST','/api/relay/create',{forward_to:to.trim()},'Turn on mail forwarding'); loadDustforge(); }
   catch(e){ alert('Could not add forwarding: '+e.message); }
 }
 async function removeForward(id){

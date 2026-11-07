@@ -96,7 +96,7 @@ call POST /api/identity/login-code/request "" '{"username":"owner"}'; sleep 0.5
 LC2=$(Q "SELECT code FROM identity_2fa_codes WHERE did='$DID' AND purpose='login' AND used=0 ORDER BY id DESC LIMIT 1")
 call POST /api/relay/create "$OWN" '{"forward_to":"someone@example.com"}'; [ "$CODE" = 200 ] || fail "relay create: $CODE $BODY"
 call POST /api/identity/login-code/verify "" "$(jb username owner code "$LC2")"
-[ "$CODE" = 403 ] && echo "$BODY" | grep -q forwarding && ok "a code issued before a new forwarding rule is refused" || fail "fresh forward verify: $CODE $BODY"
+{ [ "$CODE" = 401 ] || { [ "$CODE" = 403 ] && echo "$BODY" | grep -q forwarding; }; } && ok "a code issued before a new forwarding rule is refused (the rule kills it: item 6a)" || fail "fresh forward verify: $CODE $BODY"
 N0=$(Q "SELECT COUNT(*) FROM identity_2fa_codes WHERE did='$DID' AND purpose='login'")
 call POST /api/identity/login-code/request "" '{"username":"owner"}'; sleep 0.5
 [ "$CODE" = 200 ] && [ "$R1" = "$BODY" ] && [ "$(Q "SELECT COUNT(*) FROM identity_2fa_codes WHERE did='$DID' AND purpose='login'")" = "$N0" ] \

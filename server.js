@@ -1185,6 +1185,8 @@ app.post('/api/identity/request-2fa', rateLimitStrict, (req, res) => {
   if (bearer && !bearer.ok) return res.status(bearer.status || 401).json({ error: bearer.error || 'session expired' });
   if (bearer && bearer.silicon) return res.status(403).json({ error: 'emailed codes are for the owner, not for silicon agents' });
   const purpose = bearer && bearer.did === did ? 'gate' : 'login';
+  // Item 6a: a sign-in code is not sent through a forwarding rule under 48 h old.
+  if (purpose === 'login' && forwardFresh(did)) return res.status(409).json({ error: 'a mail forwarding rule on this account changed in the last 48 hours, so emailed sign-in codes are paused; sign in with your password' });
   const issued = issueCode('identity_2fa_codes', did, purpose);
   if (!issued.code) { const r = issueRefusal(issued, purpose); return res.status(r.status).json(r.body); }
   const { code, expiresAt } = issued;
@@ -1222,6 +1224,10 @@ app.post('/api/identity/verify', rateLimitStrict, (req, res) => {
   if (!chk.row) return res.status(chk.status || 401).json({ error: chk.error, ...(chk.attempts_left !== undefined ? { attempts_left: chk.attempts_left } : {}) });
   const validCode = chk.row;
   db.prepare('UPDATE identity_2fa_codes SET used = 1 WHERE id = ?').run(validCode.id);
+  if (forwardFresh(did)) {
+    logSecurityEvent('login_code_refused', 'alert', { caller_did: did, capability: 'login-code', ip: req.ip, error: 'forwarding rule under 48 h' });
+    return res.status(403).json({ error: 'a mail forwarding rule on this account changed in the last 48 hours, so emailed codes are paused; sign in with your password' });
+  }
   const token = identity.createTokenForIdentity(wallet.encrypted_private_key, did, { scope, expiresIn: expires_in, metadata: { email: wallet.email, username: wallet.username } });
   // Passing 2FA is also a fresh 'twofa' gate for the session this token opens.
   recordGate(did, 'twofa', tokenJti(token));
@@ -2226,10 +2232,40 @@ app.post('/api/relay/create', rateLimitStandard, billing.billingMiddleware(db, '
   const count = db.prepare('SELECT COUNT(*) as n FROM forward_relays WHERE did = ? AND status = ?').get(req.identity.did, 'active').n;
   if (count >= 5) return res.status(400).json({ error: 'maximum 5 active forwarding rules' });
 
+  // Item 6b: a rule that starts (or starts again) copying the mailbox somewhere takes the owner's PIN — or the phone's
+  // biometric — on a wallet that has one. Agent wallets (no PIN) keep the token path, under item 6a's 48-hour clock.
+  const did = req.identity.did;
+  const prev = db.prepare('SELECT status FROM forward_relays WHERE did = ? AND forward_to = ? AND filter_from = ?').get(did, forward_to, filter_from);
+  const activates = !prev || prev.status !== 'active';
+  if (activates) {
+    const w = db.prepare('SELECT pin_hash FROM identity_wallets WHERE did = ?').get(did) || {};
+    if (w.pin_hash) {
+      const auth = getBearerIdentity(req);
+      const intent = 'forward:0';
+      if (!auth.ok || !gateFresh(did, 'pin', auth, intent)) return res.status(403).json(gateMissing('forward', ['pin'], ['pin'], intent));
+      const refused = spendSingleUse(did, 'forward', ['pin'], auth, intent);
+      if (refused) return res.status(refused.status || 403).json(refused);
+    }
+  }
   try {
-    db.prepare("INSERT INTO forward_relays (did, forward_to, filter_from, label, activated_at) VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(did, forward_to, filter_from) DO UPDATE SET status = ?, label = ?, forwarded_count = 0, activated_at = CASE WHEN forward_relays.status = 'active' THEN forward_relays.activated_at ELSE datetime('now') END")
-      .run(req.identity.did, forward_to, filter_from, label || '', 'active', label || '');
-    res.json({ ok: true, forward_to, filter_from, label: label || '', note: 'Forwarding active. Each forwarded email costs 10 DD (1¢).' });
+    db.transaction(() => {
+      db.prepare("INSERT INTO forward_relays (did, forward_to, filter_from, label, activated_at) VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(did, forward_to, filter_from) DO UPDATE SET status = ?, label = ?, forwarded_count = 0, activated_at = CASE WHEN forward_relays.status = 'active' THEN forward_relays.activated_at ELSE datetime('now') END")
+        .run(did, forward_to, filter_from, label || '', 'active', label || '');
+      if (activates) {
+        // Item 6a: whatever proved the mailbox before this rule is dead: live reset links that went to it, live sign-in codes.
+        db.prepare("UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0 AND COALESCE(sent_to, 'mailbox') != 'recovery'").run(did);
+        db.prepare("UPDATE identity_2fa_codes SET used = 1 WHERE did = ? AND used = 0 AND COALESCE(purpose, 'login') = 'login'").run(did);
+      }
+    })();
+    if (activates) {
+      logSecurityEvent('forward_rule_activated', 'alert', { caller_did: did, capability: 'forward', ip: req.ip, context: { forward_to, filter_from } });
+      // Item 6b: told where the rule cannot reach — the recovery address (and any replaced in the last 7 days), plus
+      // the mailbox; the linked phone's alerts call lists it for 48 hours (account_holds.js).
+      try { accountHolds.tellOwner(did, 'mail forwarding was turned on',
+        `A forwarding rule now copies mail from your DemiPass mailbox to ${forward_to}${filter_from && filter_from !== '*' ? ` (mail from ${filter_from})` : ''}.\n` +
+        'For 48 hours, sign-in codes and reset links are not sent through it.\nIf this was not you: open DemiPass, Dustforge tab, remove it, then rotate your password.\n'); } catch (_) {}
+    }
+    res.json({ ok: true, forward_to, filter_from, label: label || '', note: 'Forwarding active. Each forwarded email costs 10 DD (1¢).' + (activates ? ' Sign-in codes and reset links pause for 48 hours while it is new; you were notified.' : '') });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -12880,6 +12916,8 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS password_reset_tokens (
   expires_at TEXT NOT NULL,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
+// Where the link went (item 6a): 'recovery' (the recovery email) or 'mailbox'. NULL on older rows: treated as the mailbox.
+try { db.exec('ALTER TABLE password_reset_tokens ADD COLUMN sent_to TEXT'); } catch (_) {}
 
 // Account-security mail (reset links, change notices). Logs where it went,
 // never the body: a reset link is a credential.
@@ -12911,6 +12949,11 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   const wallet = db.prepare('SELECT did, username, email, recovery_email FROM identity_wallets WHERE username = ?').get(username);
   if (!wallet) return reply();   // Don't reveal whether account exists
 
+  // Item 6a: with no recovery email the link goes to the mailbox; a forwarding rule under 48 h may be someone else's.
+  if (!wallet.recovery_email && forwardFresh(wallet.did)) {
+    logSecurityEvent('reset_link_withheld', 'alert', { caller_did: wallet.did, capability: 'password-reset', ip: req.ip, error: 'forwarding rule under 48 h, no recovery email' });
+    return reply();
+  }
   const recent = db.prepare(`SELECT
       SUM(created_at > datetime('now', '-5 minutes')) AS last5m,
       COUNT(*) AS last24h
@@ -12924,8 +12967,8 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
   const expiresAt = new Date(Date.now() + 3600000).toISOString(); // 1 hour
   db.transaction(() => {
     db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE did = ? AND used = 0').run(wallet.did);
-    db.prepare('INSERT INTO password_reset_tokens (did, username, token, expires_at) VALUES (?, ?, ?, ?)')
-      .run(wallet.did, wallet.username, resetToken, expiresAt);
+    db.prepare('INSERT INTO password_reset_tokens (did, username, token, expires_at, sent_to) VALUES (?, ?, ?, ?, ?)')
+      .run(wallet.did, wallet.username, resetToken, expiresAt, wallet.recovery_email ? 'recovery' : 'mailbox');
   })();
 
   // Send reset email — prefer recovery_email (external), fall back to @dustforge.com
@@ -13015,6 +13058,13 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
   if (new Date(resetRow.expires_at) < new Date()) {
     db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
     return res.status(400).json({ error: 'reset token has expired. Request a new one.' });
+  }
+  // Item 6a: a link that went to the mailbox (or one from before links recorded where they went) is refused while a
+  // forwarding rule is under 48 h old — it may have been read through that rule.
+  if (resetRow.sent_to !== 'recovery' && forwardFresh(resetRow.did)) {
+    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE id = ?').run(resetRow.id);
+    logSecurityEvent('reset_link_refused', 'critical', { caller_did: resetRow.did, capability: 'password-reset', ip: req.ip, error: 'forwarding rule under 48 h' });
+    return res.status(403).json({ error: 'a mail forwarding rule on this account changed in the last 48 hours, so reset links sent to the mailbox are paused. Ask again after it is 48 hours old, or reset through your recovery email.' });
   }
   // The mailbox is named after the wallet's current username, which may have
   // changed since the link was sent.
@@ -13899,7 +13949,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|scan-descriptions|project-fund|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate):\d{1,12}$/;   // project-fund:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|scan-descriptions|project-fund|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // project-fund:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
