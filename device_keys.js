@@ -65,6 +65,11 @@ module.exports = function registerDeviceKeys(deps) {
   db.exec(`CREATE TABLE IF NOT EXISTS device_gate_proofs (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL, session TEXT NOT NULL,
     intent TEXT NOT NULL, at TEXT NOT NULL, used INTEGER NOT NULL DEFAULT 0)`);
   try { db.exec(`ALTER TABLE identity_wallets ADD COLUMN lock_after_sec INTEGER DEFAULT ${LOCK_DEFAULT}`); } catch (_) {}
+  // Item 9: how a phone was removed ('device' = with a phone's presence signature: no grace for cancels; 'password';
+  // or the reset that removed every phone), and which phone made a biometric proof (a young phone removes nothing).
+  try { db.exec('ALTER TABLE device_keys ADD COLUMN revoked_via TEXT'); } catch (_) {}
+  try { db.exec('ALTER TABLE device_gate_proofs ADD COLUMN device_id TEXT'); } catch (_) {}
+  const holds = () => deps.holds && deps.holds();
 
   const nowIso = () => new Date().toISOString();
   const isAgent = (auth) => !auth || !auth.ok || auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'));
@@ -198,7 +203,7 @@ module.exports = function registerDeviceKeys(deps) {
       return res.status(403).json({ error: 'not signed by an enrolled device of yours' });
     }
     if (!recordGate(auth.did, 'pin', session, intent, w.pin_set_at, null)) return res.status(503).json({ error: 'could not record the verification; try again', retry: true });
-    db.prepare('INSERT INTO device_gate_proofs (did, session, intent, at) VALUES (?, ?, ?, ?)').run(auth.did, session, intent, nowIso());
+    db.prepare('INSERT INTO device_gate_proofs (did, session, intent, at, device_id) VALUES (?, ?, ?, ?, ?)').run(auth.did, session, intent, nowIso(), k.device_id);
     if (intent === 'unlock:0') markUnlocked(auth.did, session, 'device');
     return res.json({ ok: true, gate: 'device', single_use: true, intent, via: 'biometric' });
   }
@@ -237,23 +242,49 @@ module.exports = function registerDeviceKeys(deps) {
     if (!ch) return res.status(403).json({ error: 'enrol challenge missing, used or expired' });
     const msg = messageFor(ch, device_id);
     if (!verifySig(key_d, msg, sig_d) || !verifySig(key_p, msg, sig_p)) return res.status(403).json({ error: 'each key must sign the enrol challenge (message + ":" + device_id)' });
+    const H = holds();
+    const pendingSame = H && H.openHolds(auth.did, 'enrol').some(h => { try { return JSON.parse(h.payload).device_id === device_id; } catch (_) { return false; } });
+    if (pendingSame) return res.status(409).json({ error: 'that phone is already waiting to be linked' });
     const refused = spendSingleUse(auth.did, 'device-enrol', ['pin'], auth, intent);
     if (refused) return res.status(refused.status || 403).json(refused);
-    const t = nowIso(), lbl = cleanLabel(label || 'phone', 60);
-    db.transaction(() => {
-      const ins = db.prepare('INSERT INTO device_keys (did, device_id, kind, public_key, label, enrolled_at) VALUES (?, ?, ?, ?, ?, ?)');
-      ins.run(auth.did, device_id, 'D', key_d, lbl, t); ins.run(auth.did, device_id, 'P', key_p, lbl, t);
-    })();
+    const lbl = cleanLabel(label || 'phone', 60);
+    // E1 (item 9): while a phone is linked, a new one waits 48 hours — cancelable from any linked phone — unless an
+    // established phone (linked ≥ 48 h) approves it with its presence key. Otherwise password + PIN alone would make an
+    // attacker's phone count at once: it could remove the owner's phones and cancel the owner's recoveries.
+    if (H && hasDevice(auth.did)) {
+      const h = H.createHold(auth.did, 'enrol', { device_id, label: lbl, key_d, key_p }, { why: lbl });
+      logSecurityEvent('device_enrol_pending', 'warn', { caller_did: auth.did, capability: 'device', target: lbl, ip: req.ip, context: { device_id, hold_id: h.id } });
+      return res.status(202).json({ ok: true, pending: true, device_id, label: lbl, hold_id: h.id, active_at: h.ready_at,
+        note: 'this phone is linked in 48 hours unless it is canceled — or at once if you approve it on a phone already linked for 48 hours or more (DemiPass → Settings)' });
+    }
+    const r = activateEnrolment(auth.did, { device_id, label: lbl, key_d, key_p });
+    if (!r.ok) return res.status(409).json({ error: r.error });
     logSecurityEvent('device_enrolled', 'warn', { caller_did: auth.did, capability: 'device', target: lbl, ip: req.ip, context: { device_id } });
-    notifyOwner(auth.did, `A device was added to your DemiPass wallet: ${lbl}`);
     res.status(201).json({ ok: true, device_id, label: lbl, note: 'approvals now need this phone (or another enrolled one)' });
   });
 
-  // GET /api/identity/devices
+  // Link a phone's two keys now (first phone, an approved or a due pending one). Re-checks the limits.
+  function activateEnrolment(did, p) {
+    if (!p || !/^[A-Za-z0-9_-]{8,64}$/.test(String(p.device_id || '')) || !parsePublicKey(p.key_d) || !parsePublicKey(p.key_p)) return { ok: false, error: 'bad enrolment' };
+    if (db.prepare('SELECT 1 FROM device_keys WHERE device_id = ? LIMIT 1').get(p.device_id)) return { ok: false, error: 'that device id is already known' };
+    const live = db.prepare('SELECT COUNT(DISTINCT device_id) AS n FROM device_keys WHERE did = ? AND revoked_at IS NULL').get(did).n;
+    if (live >= MAX_DEVICES) return { ok: false, error: `at most ${MAX_DEVICES} devices — remove one first` };
+    const t = nowIso(), lbl = cleanLabel(p.label || 'phone', 60);
+    db.transaction(() => {
+      const ins = db.prepare('INSERT INTO device_keys (did, device_id, kind, public_key, label, enrolled_at) VALUES (?, ?, ?, ?, ?, ?)');
+      ins.run(did, p.device_id, 'D', p.key_d, lbl, t); ins.run(did, p.device_id, 'P', p.key_p, lbl, t);
+    })();
+    notifyOwner(did, `A device was added to your DemiPass wallet: ${lbl}`);
+    return { ok: true };
+  }
+
+  // GET /api/identity/devices — linked phones, and phones waiting to be linked (E1).
   app.get('/api/identity/devices', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     const rows = db.prepare("SELECT device_id, label, MIN(enrolled_at) AS enrolled_at, MAX(last_used_at) AS last_used_at FROM device_keys WHERE did = ? AND revoked_at IS NULL GROUP BY device_id, label ORDER BY enrolled_at").all(auth.did);
-    res.json({ ok: true, devices: rows, lock_after_sec: lockAfter(auth.did), approvals_need_device: rows.length > 0 });
+    const H = holds();
+    const pending = H && !auth.silicon ? H.openHolds(auth.did, 'enrol').map(h => { let p = {}; try { p = JSON.parse(h.payload); } catch (_) {} return { device_id: p.device_id, label: p.label, hold_id: h.id, active_at: h.ready_at }; }) : [];
+    res.json({ ok: true, devices: rows, pending, lock_after_sec: lockAfter(auth.did), approvals_need_device: rows.length > 0 });
   });
 
   // DELETE /api/identity/devices/:device_id — PIN (device-revoke:0). Refused for agent tokens.
@@ -263,17 +294,30 @@ module.exports = function registerDeviceKeys(deps) {
     // not remove the owner's phone so that another can be linked (#47 review H1).
     const intent = 'device-revoke:0';
     const session = gateSession(auth);
-    const bio = db.prepare("SELECT id FROM device_gate_proofs WHERE did = ? AND session = ? AND intent = ? AND used = 0 AND at > ? ORDER BY id DESC LIMIT 1")
+    const bio = db.prepare("SELECT id, device_id FROM device_gate_proofs WHERE did = ? AND session = ? AND intent = ? AND used = 0 AND at > ? ORDER BY id DESC LIMIT 1")
       .get(auth.did, session, intent, new Date(Date.now() - 120000).toISOString());
     const pwOk = gateFresh(auth.did, 'password', auth);
     if (!gateFresh(auth.did, 'pin', auth, intent) || (!bio && !pwOk)) {
       const missing = [...(gateFresh(auth.did, 'pin', auth, intent) ? [] : ['pin']), ...(bio || pwOk ? [] : ['password'])];
       return res.status(403).json({ ...gateMissing('device-revoke', ['pin', 'password'], missing, intent), note: 'a biometric from a linked phone stands in for both' });
     }
+    const target = String(req.params.device_id);
+    // Item 9: a phone linked less than 48 hours ago removes no other phone (E1/H3), and while guardians are set the last
+    // phone stays (remove the guardians first, through their 48-hour change) — so no one can strip the owner's phones
+    // and then run a recovery or a reset nobody can cancel.
+    if (bio && bio.device_id && bio.device_id !== target) {
+      const prover = db.prepare("SELECT MIN(enrolled_at) AS at FROM device_keys WHERE did = ? AND device_id = ? AND revoked_at IS NULL").get(auth.did, bio.device_id);
+      if (!prover || !prover.at || Date.parse(prover.at) > Date.now() - 48 * 3600 * 1000) return res.status(403).json({ error: 'a phone linked less than 48 hours ago cannot remove another phone' });
+    }
+    const H = holds();
+    if (H && H.guardiansActive(auth.did)) {
+      const others = db.prepare('SELECT COUNT(DISTINCT device_id) AS n FROM device_keys WHERE did = ? AND revoked_at IS NULL AND device_id != ?').get(auth.did, target).n;
+      if (!others) return res.status(409).json({ error: 'this is your last linked phone and you have recovery guardians: remove the guardians first (it takes 48 hours), or link another phone' });
+    }
     const refused = spendSingleUse(auth.did, 'device-revoke', ['pin'], auth, intent);
     if (refused) return res.status(refused.status || 403).json(refused);
     if (bio) db.prepare('UPDATE device_gate_proofs SET used = 1 WHERE id = ?').run(bio.id);
-    const n = db.prepare('UPDATE device_keys SET revoked_at = ? WHERE did = ? AND device_id = ? AND revoked_at IS NULL').run(nowIso(), auth.did, String(req.params.device_id)).changes;
+    const n = db.prepare('UPDATE device_keys SET revoked_at = ?, revoked_via = ? WHERE did = ? AND device_id = ? AND revoked_at IS NULL').run(nowIso(), bio ? 'device' : 'password', auth.did, target).changes;
     if (!n) return res.status(404).json({ error: 'device not found' });
     logSecurityEvent('device_revoked', 'warn', { caller_did: auth.did, capability: 'device', target: String(req.params.device_id), ip: req.ip });
     notifyOwner(auth.did, 'A device was removed from your DemiPass wallet.');
@@ -320,12 +364,25 @@ module.exports = function registerDeviceKeys(deps) {
   }
 
   // A PIN reset with the account password (recovery) unlinks every phone: whoever reset it starts clean.
-  function revokeAll(did, why) {
-    const n = db.prepare('UPDATE device_keys SET revoked_at = ? WHERE did = ? AND revoked_at IS NULL').run(nowIso(), did).changes;
+  function revokeAll(did, why, via = 'reset') {
+    const n = db.prepare('UPDATE device_keys SET revoked_at = ?, revoked_via = ? WHERE did = ? AND revoked_at IS NULL').run(nowIso(), via, did).changes;
     db.prepare('DELETE FROM session_unlocks WHERE did = ?').run(did);
     if (n) { logSecurityEvent('devices_revoked', 'warn', { caller_did: did, capability: 'device', context: { why } }); notifyOwner(did, 'Every phone was removed from your DemiPass wallet (' + why + '). Link yours again in Settings.'); }
     return n;
   }
+  // A presence-key (P) signature, in this session, over a 'gate' challenge for `intent`, by an active phone of the
+  // caller — linked at least `minAgeSec` ago. Works while the PIN is locked (it proves the phone, not the PIN).
+  // Returns the key row or null; the challenge is spent either way.
+  function verifyPresence(auth, challengeId, signature, intent, minAgeSec = 0) {
+    if (isAgent(auth)) return null;
+    const ch = takeChallenge(auth.did, gateSession(auth), challengeId, 'gate', intent);
+    if (!ch) return null;
+    const k = signer(auth.did, 'P', messageFor(ch), signature);
+    if (!k) return null;
+    if (minAgeSec && Date.parse(k.enrolled_at) > Date.now() - minAgeSec * 1000) return null;
+    return k;
+  }
   return { approvalRefusal, unlockFresh, markUnlocked, verifyDeviceGate, hasDevice, lockAfter, messageFor, revokeAll,
+           verifySig, verifyPresence, activateEnrolment,
            LOCK_DEFAULT, LOCK_MIN, LOCK_MAX };
 };
