@@ -169,8 +169,8 @@ module.exports = function registerServiceTenants(deps) {
   // The person who answers for a wallet: for a wallet a fleet created, that fleet's owner WHATEVER its row's status now
   // (a created agent that left or was removed is still not a person: #68 re-review N1, the fleetExitRefusal rule); an
   // agent no fleet created has nobody → null (refused); anyone else answers for themselves.
-  const creatorOf = (did) => (db.prepare(`SELECT f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
-      WHERE s.member_did = ? AND s.created_by_fleet = 1 ORDER BY s.id DESC LIMIT 1`).get(did) || {}).owner_did || null;
+  // fleet_billing.creatorOf reads wallet_creators, which survives the row deletion when a wallet joins another fleet.
+  const creatorOf = (did) => (require('./fleet_billing').creatorOf(db, did) || {}).owner_did || null;
   const personFor = (did) => creatorOf(did) || (isAgentWallet(did) ? null : did);
   // A consent counts only while the person who approved it still answers for the wallet.
   const liveConsent = (did, tenant) => { const c = consentOf(did, tenant); return c && c.approved_by === personFor(did) ? c : null; };

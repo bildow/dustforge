@@ -259,6 +259,13 @@ AGS=$(login agent); call POST /api/identity/pin "$AGS" '{"pin":"1111","password"
 call POST /api/services/consent "$AGS" '{"service":"conduit","daily_cap_dd":400}'; N1=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$N1")" = "$(did owner)" ] \
   && ok "a created agent that left still answers to its creator: it cannot approve its own consent (N1)" || fail "N1: $CODE $BODY approver=$(Q "SELECT owner_did FROM use_approvals WHERE id=$N1")"
+# Re-linked into an accomplice's fleet (its removed row is deleted there), then removed again: still its creator's.
+call POST /api/fleet/other-agents/silicons "$OTH" "$(jbody handle relinked did "$(did agent)" member_token "$AGS")"; [ "$CODE" = 200 ] || [ "$CODE" = 201 ] || fail "relink: $CODE $BODY"
+[ "$(Q "SELECT COUNT(*) FROM fleet_silicons WHERE member_did='$(did agent)' AND created_by_fleet=1")" = 0 ] || fail "relink did not clear the creator row (test premise)"
+call DELETE /api/fleet/other-agents/silicons/relinked "$OTH"
+AGS2=$(login agent); call POST /api/services/consent "$AGS2" '{"service":"conduit","daily_cap_dd":300}'; N2=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$N2")" = "$(did owner)" ] \
+  && ok "re-linked elsewhere and removed again: still its creator's to approve (wallet_creators)" || fail "relink N1: $CODE $BODY approver=$(Q "SELECT owner_did FROM use_approvals WHERE id=$N2")"
 
 # ── listings ────────────────────────────────────────────────────────────────────────────────────────────────────
 call GET /api/services/charges "$EXT"; [ "$(echo "$BODY" | J paid.0.token_id)" = "$TID3" ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["paid"]))')" = 3 ] \

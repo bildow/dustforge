@@ -364,3 +364,21 @@ test('siliconSecrets lists own and delegated secrets', () => {
   assert.deepEqual(s.own.map(x => x.name), ['brain-openrouter']);
   assert.equal(s.delegated.length, 1); assert.equal(s.delegated[0].secret_name, 'phasewhip-ssh'); assert.equal(s.delegated[0].owner_did, OWNER);
 });
+
+// Legacy fixture (#68): fleet_silicons rows from before wallet_creators existed are backfilled at init, and the
+// record survives the row's deletion (clearStaleSiliconRows when the wallet joins another fleet).
+test('wallet_creators: backfilled from pre-existing created rows, survives row deletion, first creator kept', () => {
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE fleets (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_did TEXT, name TEXT, slug TEXT UNIQUE, wallet_did TEXT DEFAULT '', status TEXT DEFAULT 'active', max_agents INTEGER DEFAULT 5)`);
+  db.exec(`CREATE TABLE fleet_silicons (id INTEGER PRIMARY KEY AUTOINCREMENT, fleet_id INTEGER NOT NULL, member_did TEXT NOT NULL, handle TEXT NOT NULL,
+             silicon_id TEXT NOT NULL UNIQUE, status TEXT DEFAULT 'active', created_by_fleet INTEGER DEFAULT 0, joined_via TEXT DEFAULT 'owner', UNIQUE(fleet_id, handle), UNIQUE(fleet_id, member_did))`);
+  db.exec(`CREATE TABLE identity_transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT, amount_cents INTEGER, type TEXT, description TEXT DEFAULT '', balance_after INTEGER DEFAULT 0, provenance TEXT DEFAULT 'organic')`);
+  db.prepare("INSERT INTO fleets (owner_did, name, slug) VALUES ('did:key:creator', 'c', 'c-fleet'), ('did:key:accomplice', 'a', 'a-fleet')").run();
+  db.prepare("INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet) VALUES (1, 'did:key:agent', 'agent', 'sil_legacy1', 'removed', 1)").run();
+  try { fb.initSchema(db); } catch (_) { /* tables this fixture leaves out are not under test */ }
+  assert.deepEqual({ ...fb.creatorOf(db, 'did:key:agent') }, { fleet_id: 1, owner_did: 'did:key:creator' });
+  db.prepare("DELETE FROM fleet_silicons WHERE member_did = 'did:key:agent'").run();
+  db.prepare("INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet) VALUES (2, 'did:key:agent', 'relinked', 'sil_legacy1', 'active', 1)").run();
+  assert.equal(fb.creatorOf(db, 'did:key:agent').owner_did, 'did:key:creator');
+  assert.equal(fb.fleetExitRefusal(db, 'did:key:agent', 'did:key:accomplice') !== null, true);
+});
