@@ -749,7 +749,7 @@ const siliconManifest = {
   wallet: {
     balance: { method: "GET", endpoint: "/api/identity/balance?did={did}" },
     topup: { method: "POST", endpoint: "/api/stripe/checkout/topup", auth: "Bearer token required", body: { amount_cents: "500 | 1000 | 5000 | 10000" } },
-    transactions: { method: "GET", endpoint: "/api/identity/transactions?did={did}" }
+    transactions: { method: "GET", endpoint: "/api/identity/transactions?did={did}", auth: "Bearer: the wallet itself, the fleet that owns this agent, or admin" }
   },
   billing: {
     rateTable: { method: "GET", endpoint: "/api/billing/rates" },
@@ -1864,20 +1864,33 @@ app.get('/api/identity/ssn/codebook', (_req, res) => {
 // widely-shared key would silently link a carbon to thousands of strangers'
 // wallets. A carbon deliberately adds a silicon to a fleet they own; that
 // explicit membership is the relationship that can unlock data.
+// Membership means a fleet_silicons row in status 'active': every way into it takes the member's consent (claim,
+// member_token or admin link, provisioning, network accept). fleet_members is NOT used: POST /api/fleet/:slug/invite
+// writes any DID there with no consent, so trusting it let anyone make a fleet, "invite" a stranger and read their
+// balance and ledger (#72 review). Wallets the legacy /provision routes created sit only in fleet_members; they count
+// for the fleet that provisioned them (its server-written account_created entry names that fleet), which no invite can fake.
 //   fleetLink(a,b) => 'carbon'  if a OWNS a fleet that b is a member of
 //                     'silicon' if b OWNS a fleet that a is a member of
 //                     null      otherwise
 function fleetLink(a, b) {
   if (!a || !b || a === b) return null;
   const aOwnsBIn = db.prepare(
-    `SELECT 1 FROM fleets f JOIN fleet_members m ON m.fleet_id = f.id
-       WHERE f.owner_did = ? AND m.member_did = ? AND m.member_did != f.owner_did LIMIT 1`
-  ).get(a, b);
+    `SELECT 1 FROM fleets f WHERE f.owner_did = @owner AND f.owner_did != @member AND (
+         EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.fleet_id = f.id AND s.member_did = @member AND s.status = 'active')
+         OR (EXISTS (SELECT 1 FROM fleet_members m WHERE m.fleet_id = f.id AND m.member_did = @member)
+             AND NOT EXISTS (SELECT 1 FROM fleet_silicons s2 WHERE s2.fleet_id = f.id AND s2.member_did = @member)
+             AND EXISTS (SELECT 1 FROM identity_transactions t WHERE t.did = @member AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
+                         AND t.description IN ('Fleet-provisioned by ' || f.slug, 'Fleet bulk-provisioned by ' || f.slug)))) LIMIT 1`
+  ).get({ owner: a, member: b });
   if (aOwnsBIn) return 'carbon';
   const bOwnsAIn = db.prepare(
-    `SELECT 1 FROM fleets f JOIN fleet_members m ON m.fleet_id = f.id
-       WHERE f.owner_did = ? AND m.member_did = ? AND m.member_did != f.owner_did LIMIT 1`
-  ).get(b, a);
+    `SELECT 1 FROM fleets f WHERE f.owner_did = @owner AND f.owner_did != @member AND (
+         EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.fleet_id = f.id AND s.member_did = @member AND s.status = 'active')
+         OR (EXISTS (SELECT 1 FROM fleet_members m WHERE m.fleet_id = f.id AND m.member_did = @member)
+             AND NOT EXISTS (SELECT 1 FROM fleet_silicons s2 WHERE s2.fleet_id = f.id AND s2.member_did = @member)
+             AND EXISTS (SELECT 1 FROM identity_transactions t WHERE t.did = @member AND t.type = 'account_created' AND t.provenance = 'fleet_provisioned'
+                         AND t.description IN ('Fleet-provisioned by ' || f.slug, 'Fleet bulk-provisioned by ' || f.slug)))) LIMIT 1`
+  ).get({ owner: b, member: a });
   if (bOwnsAIn) return 'silicon';
   return null;
 }
@@ -1924,9 +1937,24 @@ app.get('/api/identity/balance', rateLimitStandard, (req, res) => {
   res.json({ did: wallet.did, balance_cents: wallet.balance_cents, status: wallet.status });
 });
 
-app.get('/api/identity/transactions', (req, res) => {
+// A wallet's full ledger: every amount, counterparty description and token id. It answered anyone who knew a DID, with
+// no token at all, while /balance next to it is private. Now: the owner, the fleet that owns this agent (carbon), or
+// the admin key — never 'public' (a ledger says far more than a balance). The caller's own view is also /api/identity/ledger.
+app.get('/api/identity/transactions', rateLimitStandard, (req, res) => {
   const { did } = req.query;
   if (!did) return res.status(400).json({ error: 'did required' });
+  const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
+  let callerDid = null;
+  const bearer = (req.headers.authorization || '').startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
+  if (bearer) {
+    const v = identity.verifyTokenStandalone(bearer);
+    if (v.valid && !billing.checkTokenRevocation(db, v.decoded).revoked) callerDid = v.decoded.sub;
+  }
+  // Agent tokens act as their wallet: a worker (sub = its parent) or a fleet-minted token reads nothing here (#72 review).
+  let agentTok = false;
+  if (bearer) { try { const d = JSON.parse(Buffer.from(bearer.split('.')[1] || '', 'base64url').toString('utf8')); agentTok = Boolean(d.wrk || d.auth_method === 'worker' || d.auth_method === 'fleet_owner_mint'); } catch (_) {} }
+  const allowed = isAdmin || (callerDid && !agentTok && (callerDid === did || fleetLink(callerDid, did) === 'carbon'));
+  if (!allowed) return res.status(403).json({ error: 'transactions are private: only the wallet itself, the fleet that owns this agent, or an admin' });
   const limit = Math.min(100, Number(req.query.limit) || 20);
   res.json(db.prepare('SELECT * FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT ?').all(did, limit));
 });
