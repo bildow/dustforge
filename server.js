@@ -8381,6 +8381,7 @@ require('./network_routes')({
   app, db, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   barrelGuardedTransfer, transferRefusal: transferBarrelRefusal, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys,   // registered below
+  guardians: () => recoveryGuardians,   // registered below (item 9)
 });
 // In-person contact pairing by QR (red team item 6): confirmed contacts are the only ones shares and transfers reach.
 require('./pairing')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, logSecurityEvent,

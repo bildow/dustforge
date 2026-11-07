@@ -62,13 +62,14 @@ O=$(login owner)
 call POST /api/identity/guardians "$O" '{"guardians":["g1","g2","g3"]}'
 [ "$CODE" = 409 ] && echo "$BODY" | grep -q "link your phone" && ok "R4 naming guardians needs the owner's linked phone" || fail "R4 no phone: $CODE $BODY"
 phone owner
-for case in "vouched:introduction" "agent:agent" "owner:own guardian" "stranger:in person" "nophone:phone linked"; do who=${case%%:*}; why=${case#*:}
+for case in "vouched:introduction" "agent:in person" "owner:own guardian" "stranger:in person" "nophone:phone linked" "nosuchuser:in person"; do who=${case%%:*}; why=${case#*:}
   call POST /api/identity/guardians "$O" '{"guardians":["g1","g2","'$who'"]}'
   [ "$CODE" = 409 ] && echo "$BODY" | grep -q "$why" && ok "R4 refused as a guardian: $who" || fail "R4 $who: $CODE $BODY"; done
 call POST /api/identity/guardians "$O" '{"guardians":["g1","g2","g3"]}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = guardian-set:0 ] && ok "R4 naming takes the PIN (guardian-set:0)" || fail "R4 pin: $CODE $BODY"
 pin "$O" guardian-set:0; call POST /api/identity/guardians "$O" '{"guardians":["g1","g2","g3"]}'
 { [ "$CODE" = 428 ] || [ "$CODE" = 423 ]; } && ok "R4 …and the owner's phone (unlocked, device signature)" || fail "R4 phone sig: $CODE $BODY"
-pin "$O" guardian-set:0; F=$(approve "$O" owner guardian-set:0 "g1,g2,g3")
+BIND(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=sorted((c.execute('SELECT did FROM identity_wallets WHERE username=?',(u,)).fetchone()[0],u) for u in sys.argv[2:]); print(','.join(u+'='+d for d,u in r))" "$DB_PATH" "$@"; }
+pin "$O" guardian-set:0; F=$(approve "$O" owner guardian-set:0 "$(BIND g1 g2 g3)")
 call POST /api/identity/guardians "$O" '{"guardians":["g1","g2","g3"],'"$F"'}'
 [ "$CODE" = 201 ] && ok "R4 three guardians invited" || fail "R4 invite: $CODE $BODY"
 acc(){ local T; T=$(login $1); call GET /api/identity/guardians "$T"; local id; id=$(echo "$BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); print([g['id'] for g in d['guarding'] if g['status']=='invited'][-1])")
@@ -86,7 +87,7 @@ pin "$O" device-revoke:0; call DELETE /api/identity/devices/phone-owner "$O"
 X "UPDATE device_gate_proofs SET used = 1"
 
 # ── R5 ──
-change(){ pin "$O" guardian-set:0; local F3; F3=$(approve "$O" owner guardian-set:0 "$2"); call POST /api/identity/guardians "$O" '{"guardians":'$1','"$F3"'}'; HOLD=$(echo "$BODY" | J hold_id); }
+change(){ pin "$O" guardian-set:0; local F3; F3=$(approve "$O" owner guardian-set:0 "$( [ -n "$2" ] && BIND $(echo $2 | tr , ' '))"); call POST /api/identity/guardians "$O" '{"guardians":'$1','"$F3"'}'; HOLD=$(echo "$BODY" | J hold_id); }
 change '["g1","g2","g4"]' "g1,g2,g4"
 [ "$CODE" = 202 ] && [ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE owner_did='$(did owner)' AND status='active'")" = 3 ] && ok "R5 changing an active set waits 48 h (202); the set is unchanged meanwhile" || fail "R5 change: $CODE $BODY"
 acc g4
@@ -100,12 +101,26 @@ X "UPDATE account_holds SET ready_at='$(iso -1)' WHERE id='$HOLD'"; sleep 2
 change '["g1","g2","g3"]' "g1,g2,g3"
 X "UPDATE account_holds SET ready_at='$(iso -1)' WHERE id='$HOLD'"; sleep 2
 [ "$(Q "SELECT status FROM account_holds WHERE id='$HOLD'")" = failed ] && [ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE guardian_did='$(did g4)' AND status='active'")" = 1 ] && ok "R5 a new guardian who did not accept in time fails the change; nothing changes" || fail "R5 unaccepted: $(Q "SELECT status FROM account_holds WHERE id='$HOLD'")"
+change '[]' ""
+[ "$CODE" = 202 ] && ok "R5 removing the set also waits 48 h" || fail "R5 remove: $CODE $BODY"
+call POST /api/identity/holds/challenge "" '{"purpose":"cancel","device_id":"phone-owner","hold_id":"'$HOLD'"}'; CH=$(echo "$BODY" | J challenge); MSG=$(echo "$BODY" | J message)
+call POST /api/identity/holds/$HOLD/cancel "" '{"device_id":"phone-owner","challenge":"'$CH'","signature":"'$(sig ownerp "$MSG")'"}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE owner_did='$(did owner)' AND status='active'")" = 3 ] && ok "R5 …and canceled from the owner's phone, the set stays" || fail "R5 remove cancel: $CODE $BODY"
+# M1: a guardian who leaves while a change that keeps them waits is not put back by it
+change '["g1","g2","g4"]' "g1,g2,g4"
+T2=$(login g2); call GET /api/identity/guardians "$T2"; G2ID=$(echo "$BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); print([g['id'] for g in d['guarding'] if g['status']=='active'][0])")
+call POST /api/identity/guardians/$G2ID/leave "$T2"
+X "UPDATE account_holds SET ready_at='$(iso -1)' WHERE id='$HOLD'"; sleep 2
+[ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE guardian_did='$(did g2)' AND status='active'")" = 0 ] && [ "$(Q "SELECT status FROM account_holds WHERE id='$HOLD'")" = failed ] && ok "#60 M1: a guardian who left is not put back by a waiting change (it fails)" || fail "M1: $(Q "SELECT status||' '||COALESCE(note,'') FROM account_holds WHERE id='$HOLD'")"
+# M2: the owner cannot drop a guardian by removing the contact; a guardian removing the owner leaves
+call POST /api/network/people/remove "$O" '{"username":"g1"}'
+[ "$CODE" = 409 ] && [ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE guardian_did='$(did g1)' AND status='active'")" = 1 ] && ok "#60 M2: the owner removing a guardian's contact is refused (change the guardians first)" || fail "M2 owner remove: $CODE $BODY"
+T1=$(login g1); call POST /api/network/people/remove "$T1" '{"username":"owner"}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE guardian_did='$(did g1)' AND status='active'")" = 0 ] && ok "#60 M2: a guardian removing the owner's contact leaves" || fail "M2 guardian remove: $CODE $BODY"
 T4=$(login g4); call GET /api/identity/guardians "$T4"; GID=$(echo "$BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); print([g['id'] for g in d['guarding'] if g['status']=='active'][0])")
 call POST /api/identity/guardians/$GID/leave "$T4"
 call GET /api/identity/guardians "$O"; [ "$(echo "$BODY" | J active)" = False ] && ok "R5 a guardian leaves at once; the set is no longer complete" || fail "R5 leave: $BODY"
 change '[]' ""
-[ "$CODE" = 202 ] && ok "R5 removing the set also waits 48 h" || fail "R5 remove: $CODE $BODY"
-X "UPDATE account_holds SET ready_at='$(iso -1)' WHERE id='$HOLD'"; sleep 2
-[ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE owner_did='$(did owner)' AND status='active'")" = 0 ] && ok "R5 …and then no guardians remain" || fail "R5 removed: $(Q "SELECT status||' '||COALESCE(note,'') FROM account_holds WHERE id='$HOLD'")"
+[ "$CODE" = 409 ] && [ "$(Q "SELECT COUNT(*) FROM recovery_guardians WHERE owner_did='$(did owner)' AND status='active'")" = 0 ] && ok "R5 with every guardian gone there is nothing left to remove" || fail "R5 empty: $CODE $BODY"
 A=$(login agent); call POST /api/identity/guardians "$A" '{"guardians":["g1","g2","g3"]}'; [ "$CODE" = 403 ] && ok "R4 an agent wallet cannot set guardians" || fail "R4 agent sets: $CODE"
 echo; [ $fails = 0 ] && echo "ALL PASS" || { echo "$fails FAILED"; exit 1; }

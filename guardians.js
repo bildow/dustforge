@@ -47,12 +47,14 @@ module.exports = function registerGuardians(deps) {
     return auth;
   }
   // Why `did` cannot guard `owner`, or null.
+  const NOT_PAIRED = 'a guardian must be someone you paired with in person (Fleet → Pair in person); an introduction is not enough';
+  // Pairing is checked first and every "no" before it is the same answer, so this route does not tell who exists or
+  // who is an agent (#60 review L3). Specific reasons only about people the owner paired with.
   function ineligible(owner, did) {
-    if (!did || did === owner) return 'you cannot be your own guardian';
+    if (did && did === owner) return 'you cannot be your own guardian';
+    if (!did || !pairedInPerson(owner, did)) return NOT_PAIRED;
     const w = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(did);
-    if (!w || w.status !== 'active') return 'no such person';
-    if (isAgentWallet(did)) return 'an agent wallet cannot be a guardian';
-    if (!pairedInPerson(owner, did)) return 'a guardian must be someone you paired with in person (Fleet → Pair in person); an introduction is not enough';
+    if (!w || w.status !== 'active' || isAgentWallet(did)) return NOT_PAIRED;
     if (!devices().hasDevice(did)) return 'a guardian needs a phone linked in their DemiPass app';
     return null;
   }
@@ -68,7 +70,7 @@ module.exports = function registerGuardians(deps) {
   // Activate the first set once all 3 have accepted.
   function maybeActivate(owner) {
     const rows = invitedFor(owner, null);
-    if (rows.length === SET_SIZE && rows.every(r => r.status === 'accepted') && !activeSet(owner).length) {
+    if (rows.length === SET_SIZE && rows.every(r => r.status === 'accepted') && !activeSet(owner).length && rows.every(r => !ineligible(owner, r.guardian_did))) {
       db.prepare("UPDATE recovery_guardians SET status = 'active' WHERE owner_did = ? AND status = 'accepted' AND change_id IS NULL").run(owner);
       logSecurityEvent('guardians_active', 'warn', { caller_did: owner, capability: 'guardians' });
       tell(owner, 'your recovery guardians are set', `All three accepted: ${rows.map(r => nameOf(r.guardian_did)).join(', ')}.\nIf you lose every phone, two of them together can let you back in after 48 hours — and any of your phones can stop it.\n`);
@@ -99,20 +101,17 @@ module.exports = function registerGuardians(deps) {
     if (!Array.isArray(list) || (list.length !== SET_SIZE && list.length !== 0)) return res.status(400).json({ error: `guardians: exactly ${SET_SIZE} people (or [] to remove them)` });
     if (!devices().hasDevice(owner)) return res.status(409).json({ error: 'link your phone first: guardians are set from it, and any of your phones can stop a recovery' });
     const dids = list.map(x => resolve(owner, x));
-    if (dids.some(d => !d)) return res.status(404).json({ error: 'one of them is not a DemiPass user' });
-    if (new Set(dids).size !== dids.length) return res.status(400).json({ error: 'three different people' });
-    for (const d of dids) { const why = ineligible(owner, d); if (why) return res.status(409).json({ error: `${nameOf(d) || 'that person'}: ${why}` }); }
+    if (new Set(dids.map(String)).size !== dids.length) return res.status(400).json({ error: 'three different people' });
+    for (let i = 0; i < dids.length; i++) { const why = ineligible(owner, dids[i]); if (why) return res.status(409).json({ error: `${String(list[i]).slice(0, 60)}: ${why}` }); }
     const active = activeSet(owner);
     if (!active.length && !dids.length) return res.status(409).json({ error: 'you have no guardians to remove' });
     const H = holds();
-    if (active.length || invitedFor(owner, null).length) {
-      const stop = H.startRefusal(owner, 'guardians');
-      if (stop) return res.status(stop.status).json(stop.body);
-      if (H.openHolds(owner, 'guardians').length) return res.status(409).json({ error: 'a change of your guardians is already waiting' });
-    }
+    const stop = H.startRefusal(owner, 'guardians');
+    if (stop) return res.status(stop.status).json(stop.body);
+    if (H.openHolds(owner, 'guardians').length) return res.status(409).json({ error: 'a change of your guardians is already waiting' });
     const intent = 'guardian-set:0';
     if (!gateFresh(owner, 'pin', auth, intent)) return res.status(403).json({ ...gateMissing('guardian-set', ['pin'], ['pin'], intent), error: 'setting guardians needs your PIN' });
-    const bind = [...dids].map(nameOf).sort().join(',');
+    const bind = [...dids].sort().map(d => `${nameOf(d)}=${d}`).join(',');
     const refused = devices().approvalRefusal(auth, 'guardian-set', 0, bind, req.body);
     if (refused) return res.status(refused.status).json(refused.body);
     const spent = spendSingleUse(owner, 'guardian-set', ['pin'], auth, intent);
@@ -120,11 +119,14 @@ module.exports = function registerGuardians(deps) {
     const t = nowIso();
     // A first set (nothing active): invite at once; an invitation not yet complete is replaced.
     if (!active.length) {
+      const dropped = invitedFor(owner, null).filter(r => !dids.includes(r.guardian_did));
       db.transaction(() => {
         db.prepare("UPDATE recovery_guardians SET status = 'removed', removed_at = ?, why = 'replaced before it was complete' WHERE owner_did = ? AND status IN ('invited', 'accepted') AND change_id IS NULL").run(t, owner);
         for (const d of dids) db.prepare("INSERT INTO recovery_guardians (owner_did, guardian_did, status, invited_at) VALUES (?, ?, 'invited', ?)").run(owner, d, t);
       })();
       for (const d of dids) tell(d, `${nameOf(owner)} asks you to be a recovery guardian`, `${nameOf(owner)} named you one of three people who can help them back into their DemiPass wallet if they lose every phone.\nAccept or decline in the DemiPass app (Settings → Guardians). You will never see their secrets or balance.\n`);
+      for (const r of dropped) tell(r.guardian_did, `${nameOf(owner)} withdrew their guardian invitation`, 'You are not one of their recovery guardians. Nothing to do.\n');
+      tell(owner, 'you named recovery guardians', `You asked ${dids.map(nameOf).join(', ')} to be your recovery guardians. They become active when all three accept.\nIf this was not you, someone has your PIN and phone: act now.\n`);
       logSecurityEvent('guardians_invited', 'warn', { caller_did: owner, capability: 'guardians', ip: req.ip });
       return res.status(201).json({ ok: true, invited: dids.map(nameOf), note: 'active when all three accept' });
     }
@@ -175,12 +177,28 @@ module.exports = function registerGuardians(deps) {
     const auth = personAuth(req, res); if (!auth) return;
     const r = db.prepare("SELECT * FROM recovery_guardians WHERE id = ? AND guardian_did = ? AND status = 'active'").get(Number(req.params.id), auth.did);
     if (!r) return res.status(404).json({ error: 'you are not their guardian' });
-    db.prepare("UPDATE recovery_guardians SET status = 'removed', removed_at = ?, why = 'left' WHERE id = ?").run(nowIso(), r.id);
-    logSecurityEvent('guardian_left', 'warn', { caller_did: r.owner_did, capability: 'guardians', context: { guardian: nameOf(auth.did) } });
-    if (deps.onGuardianLeft) { try { deps.onGuardianLeft(r.owner_did, auth.did); } catch (_) {} }
-    tell(r.owner_did, `${nameOf(auth.did)} is no longer your recovery guardian`, 'Recovery by guardians is unavailable until you name a replacement (Settings → Guardians; it takes 48 hours).\n');
+    leave(r.owner_did, auth.did, 'left');
     res.json({ ok: true, left: true });
   });
+  // A guardian leaves: every row of theirs for that owner goes, a pending change's too — so a change applying later
+  // cannot put them back without their consent (#60 review M1; that change then fails: not all accepted).
+  function leave(owner, guardian, why) {
+    const n = db.prepare("UPDATE recovery_guardians SET status = 'removed', removed_at = ?, why = ? WHERE owner_did = ? AND guardian_did = ? AND status IN ('invited', 'accepted', 'active')").run(nowIso(), why, owner, guardian).changes;
+    if (!n) return 0;
+    logSecurityEvent('guardian_left', 'warn', { caller_did: owner, capability: 'guardians', context: { guardian: nameOf(guardian), why } });
+    if (deps.onGuardianLeft) { try { deps.onGuardianLeft(owner, guardian); } catch (_) {} }
+    tell(owner, `${nameOf(guardian)} is no longer your recovery guardian`, 'Recovery by guardians is unavailable until you name a replacement (Settings → Guardians; it takes 48 hours).\n');
+    return n;
+  }
+  // Removing a contact (network_routes.js), #60 review M2: the owner cannot drop a guardian that way (it would switch
+  // recovery off at once, skipping the 48 h) — change the guardians first; a guardian removing the owner leaves.
+  function contactRemoval(me, other) {
+    if (db.prepare("SELECT 1 FROM recovery_guardians WHERE owner_did = ? AND guardian_did = ? AND status IN ('invited', 'accepted', 'active') LIMIT 1").get(me, other)) {
+      return { status: 409, body: { error: 'they are one of your recovery guardians: change your guardians first (Settings → Guardians; it takes 48 hours)' } };
+    }
+    leave(other, me, 'removed the contact');
+    return null;
+  }
 
   // Applying a due 'guardians' hold (account_holds.js calls this). Re-checks everything: every new guardian accepted
   // and still eligible. Throws to fail the hold.
@@ -201,6 +219,7 @@ module.exports = function registerGuardians(deps) {
   }
 
   // For step 3: the active set (exactly 3), and who may still approve.
-  const isActiveGuardian = (owner, did) => Boolean(db.prepare("SELECT 1 FROM recovery_guardians WHERE owner_did = ? AND guardian_did = ? AND status = 'active'").get(owner, did));
-  return { activeSet, ineligible, isActiveGuardian, applyChange, dropChange, SET_SIZE };
+  // An active guardian who is still eligible (paired in person, a person wallet, a phone) — what step 3 asks.
+  const isActiveGuardian = (owner, did) => Boolean(db.prepare("SELECT 1 FROM recovery_guardians WHERE owner_did = ? AND guardian_did = ? AND status = 'active'").get(owner, did)) && !ineligible(owner, did);
+  return { activeSet, ineligible, isActiveGuardian, applyChange, dropChange, contactRemoval, SET_SIZE };
 };
