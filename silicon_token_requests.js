@@ -97,7 +97,10 @@ module.exports = function registerSiliconTokenRequests(deps) {
     expireRequests();
     const fleet = db.prepare("SELECT * FROM fleets WHERE slug = ? AND COALESCE(status,'active') = 'active'").get(req.params.slug);
     if (!fleet) return res.status(404).json({ error: 'fleet not found' });
-    const member = fleet.owner_did === auth.did || db.prepare('SELECT 1 FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, auth.did);
+    // Membership by consent only: an active fleet_silicons row (created by the fleet, linked with the wallet's own
+    // token, or joined through the network). A bare fleet_members row can be written by POST /api/fleet/:slug/invite
+    // without asking the wallet (threat model item 17), so it files nothing (#77 review note on #78).
+    const member = fleet.owner_did === auth.did || db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active'").get(fleet.id, auth.did);
     if (!member) return res.status(403).json({ error: 'fleet membership required' });
     const s = fb.getSilicon(db, fleet.id, String(req.params.handle || '').toLowerCase());
     if (!s || s.status !== 'active') return res.status(404).json({ error: 'silicon not found in this fleet' });
@@ -125,12 +128,14 @@ module.exports = function registerSiliconTokenRequests(deps) {
     const says = clean(b.label || (auth.decoded && (auth.decoded.agent_name || auth.decoded.label)) || '', 80);
     // Who is asking, as the owner's card says it: the owner, the agent itself, or ANOTHER agent of the fleet.
     const role = auth.did === fleet.owner_did ? 'owner' : auth.did === s.member_did ? 'self'
-      : (db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, auth.did) || {}).role === 'admin' ? 'admin' : 'other_agent';
+      : (db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, auth.did) || {}).role === 'admin' ? 'admin'
+      // A member the fleet did not create (joined through the network or linked) is someone else's wallet: say so (#79 review).
+      : db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1 AND COALESCE(joined_via, 'owner') != 'network'").get(fleet.id, auth.did) ? 'other_agent' : 'outside_agent';
     const id = Number(db.prepare(`INSERT INTO silicon_token_requests (fleet_id, fleet_slug, silicon_row, handle, member_did, owner_did, requested_by_did,
         says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, role, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC)).lastInsertRowid);
     mailOwner(fleet.owner_did, `DemiPass: a token for @${s.handle} is asked for`,
-      `${role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in'} your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.${role === 'other_agent' ? ' If you approve, the agent that asked can act as @' + s.handle + '.' : ''}\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
+      `${role === 'outside_agent' ? 'A WALLET YOUR FLEET DID NOT CREATE, in' : role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in'} your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.${role === 'other_agent' || role === 'outside_agent' ? ' If you approve, the wallet that asked can act as @' + s.handle + '.' : ''}\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
     res.status(202).json({ ok: true, request_id: id, ...(claimSecret ? { claim_secret: claimSecret } : {}), expires_at: later(REQUEST_TTL_SEC),
       next: `the fleet owner approves it in the DemiPass app; then POST /api/silicon-token-requests/${id}/claim {claim_secret} once` });
   });
@@ -154,6 +159,11 @@ module.exports = function registerSiliconTokenRequests(deps) {
     const s = fb.getSilicon(db, r.fleet_id, r.handle);
     if (!fleet || fleet.owner_did !== auth.did || (fleet.status && fleet.status !== 'active') || !s || s.status !== 'active' || s.id !== r.silicon_row || s.joined_via === 'network') {
       return res.status(409).json({ error: 'the agent or the fleet changed since this was asked for: ask again' });
+    }
+    // Whoever filed it must still be the owner or a consented member: a filer that left or was removed, or a request
+    // filed before #79 by a bare fleet_members row, cannot be approved (#79 review).
+    if (r.requested_by_did !== fleet.owner_did && !db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active'").get(r.fleet_id, r.requested_by_did)) {
+      return res.status(409).json({ error: 'whoever asked for this is no longer in your fleet: it cannot be approved' });
     }
     const intent = `silicon-token:${r.id}`;
     if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json({ ...gateMissing('silicon-token', ['pin'], ['pin'], intent), error: `a token for @${r.handle} needs your PIN` });
