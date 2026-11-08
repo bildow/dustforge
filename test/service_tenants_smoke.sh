@@ -251,6 +251,15 @@ call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"merge-now
 approve "$OWN" "$W1"; call PUT /api/services/fleetgate/actions "$FG" "$(jbody actions '[{"action":"sign-charter","measured_cost_dd":5,"depth":"standard"}]' approval_id "$W1")"
 [ "$CODE" = 200 ] && [ "$(Q "SELECT depth FROM service_actions WHERE action='sign-charter'")" = standard ] && ok "approved: exactly that change applies" || fail "approved lower: $CODE $BODY"
 
+# ── requests wait long enough to be seen (Aaron 2026-11-08) ─────────────────────────────────────────────────────
+call POST /api/services/register "$OWN" '{"slug":"ttl-probe","name":"ttl"}'; GR=$(echo "$BODY" | J approval_id)
+HRS=$(python3 -c "import sqlite3,datetime as d; r=sqlite3.connect('$DB_PATH').execute('SELECT created_at, expires_at FROM use_approvals WHERE id=$GR').fetchone(); a,b=[d.datetime.fromisoformat(x.replace('Z','+00:00')) for x in r]; print(round((b-a).total_seconds()/3600))")
+[ "$HRS" = 24 ] && ok "a DemiPass grant waits a day for the owner (not 5 minutes)" || fail "grant TTL: $HRS h"
+[ "$(Q "SELECT summary FROM use_approvals WHERE id=$GR")" = "register service ttl-probe (ttl)" ] && ok "the card names what is granted" || fail "summary: $(Q "SELECT summary FROM use_approvals WHERE id=$GR")"
+V "$FG" "$(jbody token "$ET4" action broadcast call '{"to":"elevated-ttl"}')"; EAP=$(echo "$BODY" | J approval_id)
+MIN=$(python3 -c "import sqlite3,datetime as d; r=sqlite3.connect('$DB_PATH').execute('SELECT created_at, expires_at FROM use_approvals WHERE id=$EAP').fetchone(); a,b=[d.datetime.fromisoformat(x.replace('Z','+00:00')) for x in r]; print(round((b-a).total_seconds()/60))")
+[ "$MIN" = 60 ] && ok "an elevated action's request waits an hour (codes still rotate every 30 s)" || fail "action TTL: $MIN min"
+
 # ── fleet removal ends an agent's service access (M4) ──────────────────────────────────────────────────────────
 call POST /api/services/token "$AG" '{"service":"conduit"}'; ACT2=$(echo "$BODY" | J token)
 call DELETE /api/fleet/owner-agents/silicons/agent "$OWN"; [ "$CODE" = 200 ] || fail "remove agent: $CODE $BODY"
@@ -273,6 +282,32 @@ call GET /api/services/charges "$EXT"; [ "$(echo "$BODY" | J paid.0.token_id)" =
 call GET /api/services/charges "$FG"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["received"]))')" = 3 ] && ok "FLEETGATE sees what it received" || fail "fg received: $BODY"
 call GET /api/services/charges "$POOR"; [ "$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["paid"]), "received" in d)')" = "0 False" ] && ok "…and nobody else does" || fail "poor charges: $BODY"
 grep -q "$ST" "$S/server.log" && fail "a service token reached the server log" || ok "no token in the server log"
+
+# ── a day-long queue cannot be filled from one DID (#77 M3) ──────────────────────────────────────────────────────
+OWN=$(login owner); n202=0; last=""
+for k in $(seq 1 12); do call POST /api/services/register "$OWN" "$(jbody slug "spam-$k" name "label-$k")"; [ "$CODE" = 202 ] && n202=$((n202+1)); last=$CODE; done
+[ "$n202" -le 10 ] && [ "$last" = 429 ] && ok "the owner's own DID holds at most 10 waiting grants, whatever labels it uses" || fail "grant cap: $n202 then $last"
+
+# ── the owner's phone hears of every pending request (the D-signed alerts call) ──────────────────────────────────
+node -e 'const c=require("crypto"),fs=require("fs");for(const n of ["d","p"]){const {privateKey,publicKey}=c.generateKeyPairSync("ec",{namedCurve:"prime256v1"});
+fs.writeFileSync(process.argv[1]+"/"+n+".pem",privateKey.export({type:"pkcs8",format:"pem"}));fs.writeFileSync(process.argv[1]+"/"+n+".pub",publicKey.export({type:"spki",format:"der"}).toString("base64"))}' "$S"
+sig(){ node -e 'const c=require("crypto"),fs=require("fs"); process.stdout.write(c.sign("sha256", Buffer.from(process.argv[2]), fs.readFileSync(process.argv[1])).toString("base64"))' "$S/$1.pem" "$2"; }
+OWN=$(login owner)
+call POST /api/identity/device/challenge "$OWN" '{"purpose":"enrol","intent":"device-enrol:0"}'; CHD=$(echo "$BODY" | J challenge_id); MSG="$(echo "$BODY" | J message):phone-0001"
+pin "$OWN" 4321 "device-enrol:0"; call POST /api/identity/gate/verify "$OWN" '{"gate":"password","password":"hunter22"}'
+call POST /api/identity/device/enrol "$OWN" "$(printf '{"challenge_id":%s,"device_id":"phone-0001","label":"Pixel","key_d":"%s","key_p":"%s","sig_d":"%s","sig_p":"%s"}' "$CHD" "$(cat $S/d.pub)" "$(cat $S/p.pub)" "$(sig d "$MSG")" "$(sig p "$MSG")")"
+[ "$CODE" = 201 ] || fail "enrol: $CODE $BODY"
+PR=$(Q "SELECT id FROM use_approvals WHERE status='pending' AND service_key='svc:demipass:register' ORDER BY id DESC LIMIT 1")
+call POST /api/fleet/owner-agents/silicons/fg/token-requests "$OWN" '{"scope":"transact","expires_in":"7d"}'; STR_ID=$(echo "$BODY" | J request_id)
+[ -n "$STR_ID" ] && [ "$STR_ID" != None ] || fail "#78 token request: $CODE $BODY"
+call POST /api/identity/holds/challenge "" '{"purpose":"alerts","device_id":"phone-0001"}'; CH=$(echo "$BODY" | J challenge); M=$(echo "$BODY" | J message)
+call POST /api/identity/holds/alerts "" "$(jbody device_id phone-0001 challenge "$CH" signature "$(sig d "$M")")"
+echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); ids={x["id"] for x in d.get("approvals",[])}; sys.exit(0 if int(sys.argv[1]) in ids and 100000000000+int(sys.argv[2]) in ids else 1)' "$PR" "$STR_ID" \
+  && ok "the phone's alerts call lists pending requests: a grant, and an agent token request (#78)" || fail "alerts approvals: $BODY"
+python3 -c "import sqlite3,sys,datetime; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE device_keys SET revoked_at=?, revoked_via='recovery' WHERE device_id='phone-0001'\", (datetime.datetime.utcnow().isoformat()+'Z',)); c.commit()" "$DB_PATH"
+call POST /api/identity/holds/challenge "" '{"purpose":"alerts","device_id":"phone-0001"}'; CH=$(echo "$BODY" | J challenge); M=$(echo "$BODY" | J message)
+call POST /api/identity/holds/alerts "" "$(jbody device_id phone-0001 challenge "$CH" signature "$(sig d "$M")")"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("approvals",[])))')" = 0 ] && ok "a removed phone (still in its hold-cancel grace) is not told what waits (#77 M2)" || fail "removed phone: $CODE $BODY"
 
 [ $fails -gt 0 ] && { echo "--- server.log"; grep -i -m8 "error" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))

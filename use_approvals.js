@@ -19,7 +19,16 @@
 
 const crypto = require('crypto');
 
-const TTL_SEC = 5 * 60;           // pending request, and an approved one waiting to be used
+const TTL_SEC = 5 * 60;           // an approved request waiting to be used (and the code window: item 4c)
+// How long a request waits for the owner (Aaron 2026-11-08: "every wait is a request I approve in the app"). A use of a
+// secret waits an hour: the phone checks every 15 minutes and on open, so a 5-minute request expired before it was
+// seen (approvals 17-20, 26). DemiPass's own grants (svc:demipass:* — consent, registration,
+// weakening a gate) wait a day. Codes still rotate every 30 s and an approval is still used within 5 minutes.
+const PENDING_TTL_SEC = 60 * 60;
+const GRANT_PENDING_TTL_SEC = 24 * 3600;
+const GRANT_APPROVED_TTL_SEC = 60 * 60;    // the requester collects a grant when it next polls
+const isGrantKey = (k) => typeof k === 'string' && k.startsWith('svc:demipass:');
+const MAX_PENDING_GRANTS_OWN = 10;   // the owner's own DID's grant requests waiting at once, across all its labels
 const STEP_SEC = 30;              // code rotation
 const MAX_WRONG = 3;
 const MAX_PENDING_PER_OWNER = 30;
@@ -115,7 +124,15 @@ module.exports = function registerUseApprovals(deps) {
   // A one-line headline for the card. The owner approves the full bound call (`call`, shown as JSON), never this alone.
   function summaryOf({ kind, action, targetHost, targetUrl, params }) {
     if (kind === 'reveal') return 'reveal the value';
-    if (kind === 'service') return cleanLabel(`${targetHost || ''}: ${action}`, 120);
+    if (kind === 'service') {
+      // Name what is granted, so two requests never look alike on the card (#77 review L2).
+      const q = params || {};
+      const what = action === 'consent' ? `let ${String(q.wallet || '').slice(0, 24)}… pay ${q.service} up to ${q.daily_cap_dd} DD a day`
+        : action === 'register' ? `register service ${q.slug} (${q.name})`
+        : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action).join(', ')}`
+        : `${targetHost || ''}: ${action}`;
+      return cleanLabel(what, 120);
+    }
     const p = params || {};
     const cmd = (p.params && p.params.command) || p.command || '';
     const what = action === 'ssh_exec' ? `ssh ${targetHost || ''}: ${JSON.stringify(String(cmd)).slice(1, -1)}` : `${action} ${targetUrl || targetHost || ''}`;
@@ -138,7 +155,10 @@ module.exports = function registerUseApprovals(deps) {
 
   // ── lifecycle ──────────────────────────────────────────────────────────────────────────────────────────────────
   function expireOld() {
+    // A request that ends takes its one-use key with it (item 1: no private half outside an active window).
+    const gone = db.prepare("SELECT id FROM use_approvals WHERE status IN ('pending', 'approved') AND expires_at <= ? AND eph_pub IS NOT NULL").all(nowIso());
     db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ?, unwrap_blob = NULL WHERE status IN ('pending', 'approved') AND expires_at <= ?").run(nowIso(), nowIso());
+    if (cryptoDepth && cryptoDepth.dropEphemeral) for (const r of gone) cryptoDepth.dropEphemeral('a:' + r.id);
   }
   function view(row, me) {
     const owner = row.owner_did === me;
@@ -193,12 +213,18 @@ module.exports = function registerUseApprovals(deps) {
       const until = new Date(Date.parse(denied.decided_at) + DENY_COOLDOWN_SEC * 1000).toISOString();
       return { error: `the owner denied your last request — you can ask again after ${until}`, status: 429, extra: { cooldown_until: until } };
     }
-    const pending = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending'").get(secret.did).n;
+    // DemiPass grants wait a day, so they have their own queue (#77 review M3): they cannot crowd out uses of secrets,
+    // and the owner's own DID — whatever labels it signs in under — holds at most MAX_PENDING_GRANTS_OWN of them.
+    const grant = isGrantKey(secret.service_key);
+    const pending = db.prepare(`SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending' AND ${grant ? "service_key LIKE 'svc:demipass:%'" : "COALESCE(service_key, '') NOT LIKE 'svc:demipass:%'"}`).get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
+    if (grant && own && db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND requester_did = ? AND status = 'pending' AND service_key LIKE 'svc:demipass:%'").get(secret.did, requesterDid).n >= MAX_PENDING_GRANTS_OWN) {
+      return { error: `at most ${MAX_PENDING_GRANTS_OWN} of your own grant requests can wait at once`, status: 429 };
+    }
     const id = Number(db.prepare(`INSERT INTO use_approvals (kind, secret_id, owner_did, requester_did, requester_label, delegation_id, depth, purpose, summary,
                                   binding, code_key, created_at, expires_at, bound_call, service_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),
-           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
+           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(isGrantKey(secret.service_key) ? GRANT_PENDING_TTL_SEC : PENDING_TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
     // Item 1: a wrapped secret's request gets a one-use key (private half in memory only) the phone unwraps to.
     if (cryptoDepth) cryptoDepth.onRequestCreated({ id }, secret);
     const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id);
@@ -370,7 +396,7 @@ module.exports = function registerUseApprovals(deps) {
     if (cryptoDepth) { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
     if (cryptoDepth && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
-      .run(nowIso(), nowIso(), later(TTL_SEC), row.id).changes;
+      .run(nowIso(), nowIso(), later(isGrantKey(row.service_key) ? GRANT_APPROVED_TTL_SEC : TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'this request was decided meanwhile' });
     event('approval_approved', auth.did, row.secret_id, { approval_id: row.id, requester_did: row.requester_did, via: 'app' });
     logSecurityEvent('approval_approved', 'info', { caller_did: auth.did, capability: row.kind, context: { approval_id: row.id, requester_did: row.requester_did } });
@@ -400,5 +426,13 @@ module.exports = function registerUseApprovals(deps) {
       params: { ...(use.params || {}), approver_did: subject.approverDid }, delegationId: use.delegationId }, body);
   }
 
-  return { gate, gateService, depthOf, bindingOf, _codeAt: codeAt, STEP_SEC, TTL_SEC };
+  // What the owner's phone is told about (account_holds alerts, signed by the phone's D): pending requests, newest first,
+  // headline only — the full call is shown after the PIN opens it.
+  function pendingFor(ownerDid) {
+    expireOld();
+    return db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC LIMIT 20").all(ownerDid)
+      .map(r => { const v = view(r, ownerDid); return { id: r.id, title: v.secret.name || '', requester: v.requester || v.requester_label || '', summary: v.summary || '', depth: r.depth, expires_at: r.expires_at }; });
+  }
+
+  return { gate, gateService, depthOf, bindingOf, pendingFor, _codeAt: codeAt, STEP_SEC, TTL_SEC, PENDING_TTL_SEC };
 };

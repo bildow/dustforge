@@ -8605,7 +8605,7 @@ const accountHolds = require('./account_holds')({
   app, db, rateLimitStrict, rateLimitStandard, logSecurityEvent, cleanLabel, getBearerIdentity, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
-  guardians: () => recoveryGuardians, recovery: () => guardianRecovery,
+  guardians: () => recoveryGuardians, recovery: () => guardianRecovery, approvals: () => useApprovals,
 });
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({

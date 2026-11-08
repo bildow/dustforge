@@ -217,7 +217,21 @@ module.exports = function registerAccountHolds(deps) {
     if (!key || !verify(key, messageFor(ch), signature) || !spendChallenge(ch)) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     sweep();
     const holds = openHolds(ch.did).filter(h => eligibleKey(ch.did, device_id, 'P', holdSince(h)));
-    res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did) });
+    // Approval requests waiting on this owner (Aaron 2026-11-08: every wait is a request the phone tells him about).
+    let approvals = [];
+    // Only to a phone still linked: the grace that lets a removed phone cancel a takeover hold is not for reading what
+    // waits on the owner (#77 review M2).
+    try { const A = deps.approvals && deps.approvals(); if (A && A.pendingFor && !key.revoked_at) approvals = A.pendingFor(ch.did); } catch (_) {}
+    // Agent token requests (silicon_token_requests.js, #78) wait on the owner too. Their ids are offset into their own
+    // numeric range (the app keys notifications by a 1-12 digit id).
+    if (!key.revoked_at) {
+      try {
+        for (const r of db.prepare("SELECT id, handle, fleet_slug, scope, expires_in, created_at FROM silicon_token_requests WHERE owner_did = ? AND status = 'pending' AND expires_at > ? ORDER BY id DESC LIMIT 20").all(ch.did, new Date().toISOString())) {
+          approvals.push({ id: 100000000000 + r.id, title: `token for @${r.handle}`, requester: '', summary: `${r.fleet_slug}: @${r.handle} (${r.scope}, ${r.expires_in})`, depth: 'critical', kind: 'silicon-token' });
+        }
+      } catch (_) {}
+    }
+    res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did), approvals });
   });
 
   // POST /api/identity/holds/:id/cancel {device_id, challenge_id, signature} — P of an eligible phone. No session.
