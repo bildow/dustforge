@@ -22,7 +22,7 @@ const crypto = require('crypto');
 const TTL_SEC = 5 * 60;           // an approved request waiting to be used (and the code window: item 4c)
 // How long a request waits for the owner (Aaron 2026-11-08: "every wait is a request I approve in the app"). A use of a
 // secret waits an hour: the phone checks every 15 minutes and on open, so a 5-minute request expired before it was
-// seen (approvals 17-20, 26). DemiPass's own grants (svc:demipass:* — consent, registration, a silicon's token,
+// seen (approvals 17-20, 26). DemiPass's own grants (svc:demipass:* — consent, registration,
 // weakening a gate) wait a day. Codes still rotate every 30 s and an approval is still used within 5 minutes.
 const PENDING_TTL_SEC = 60 * 60;
 const GRANT_PENDING_TTL_SEC = 24 * 3600;
@@ -127,8 +127,7 @@ module.exports = function registerUseApprovals(deps) {
     if (kind === 'service') {
       // Name what is granted, so two requests never look alike on the card (#77 review L2).
       const q = params || {};
-      const what = action === 'silicon-token' ? `token for @${q.silicon} (${q.scope}, ${q.expires_in}), collected by ${q.collected_by}`
-        : action === 'consent' ? `let ${String(q.wallet || '').slice(0, 24)}… pay ${q.service} up to ${q.daily_cap_dd} DD a day`
+      const what = action === 'consent' ? `let ${String(q.wallet || '').slice(0, 24)}… pay ${q.service} up to ${q.daily_cap_dd} DD a day`
         : action === 'register' ? `register service ${q.slug} (${q.name})`
         : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action).join(', ')}`
         : `${targetHost || ''}: ${action}`;
