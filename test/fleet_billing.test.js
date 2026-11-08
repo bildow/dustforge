@@ -382,3 +382,16 @@ test('wallet_creators: backfilled from pre-existing created rows, survives row d
   assert.equal(fb.creatorOf(db, 'did:key:agent').owner_did, 'did:key:creator');
   assert.equal(fb.fleetExitRefusal(db, 'did:key:agent', 'did:key:accomplice') !== null, true);
 });
+
+// #83 review: a refill rule stored above the per-run cap (saved before it existed) pays at most the cap, and is
+// brought down to it at start.
+test('owner refill: legacy rule above the cap is clamped at start and at run time', () => {
+  const db = mkdb(); fb.initSchema(db);
+  db.prepare("INSERT INTO identity_wallets (did, username) VALUES ('did:key:big', 'big')").run();
+  db.prepare("INSERT INTO wallet_refill_rules (did, cadence, amount_cents, funding, enabled, next_run_at) VALUES ('did:key:big', 'weekly', 10000000, 'operator_grant', 1, '2000-01-01T00:00:00Z')").run();
+  const r1 = fb.runOwnerRefills(db, billing, { grantDids: ['did:key:big'] });
+  assert.equal(r1[0].ok, true);
+  assert.equal(billing.getDerivedBalance(db, 'did:key:big'), fb.OWNER_REFILL_MAX);
+  fb.initSchema(db);
+  assert.equal(db.prepare("SELECT amount_cents FROM wallet_refill_rules WHERE did = 'did:key:big'").get().amount_cents, fb.OWNER_REFILL_MAX);
+});

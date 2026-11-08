@@ -64,6 +64,8 @@ function initSchema(db) {
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
   )`);
+  // Rules saved before the per-run cap (#83) are brought down to it, so the stored rule matches what a run pays.
+  try { db.prepare('UPDATE wallet_refill_rules SET amount_cents = ? WHERE amount_cents > ?').run(OWNER_REFILL_MAX, OWNER_REFILL_MAX); } catch (_) {}
 
   db.exec(`CREATE TABLE IF NOT EXISTS billing_attributions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -645,7 +647,8 @@ function runOwnerRefills(db, billing, { now = Date.now(), grantDids } = {}) {
         result = { ok: false, error: 'operator grant not permitted for this wallet (OPERATOR_GRANT_DIDS)' };
       } else {
         const key = `auto_refill_${rule.id}_${rule.next_run_at}`;
-        result = billing.creditBalance(db, rule.did, rule.amount_cents, 'auto_refill_grant', `Scheduled ${rule.cadence} refill (operator grant)`, key);
+        // Clamped at run time too: a rule saved before the cap (#83) never credits more than OWNER_REFILL_MAX a run.
+        result = billing.creditBalance(db, rule.did, Math.min(rule.amount_cents, OWNER_REFILL_MAX), 'auto_refill_grant', `Scheduled ${rule.cadence} refill (operator grant)`, key);
       }
     } else {
       result = { ok: false, error: 'stripe-funded auto refill is not available yet' };

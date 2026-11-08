@@ -446,7 +446,7 @@ module.exports = function registerFleetRoutes(deps) {
     const cur = fb.getOwnerRefillRule(db, a.fleet.owner_did);
     const next = { cadence: b.cadence === undefined ? (cur ? cur.cadence : 'weekly') : String(b.cadence),
       amount_cents: b.amount_cents === undefined ? (cur ? cur.amount_cents : 0) : Number(b.amount_cents),
-      funding: b.funding === undefined ? (cur ? cur.funding : 'operator_grant') : String(b.funding), enabled: Boolean(b.enabled) };
+      funding: b.funding === undefined ? (cur ? cur.funding : 'operator_grant') : String(b.funding), enabled: b.enabled === true };
     if (!FREQ[next.cadence]) return res.status(400).json({ error: 'cadence: daily | weekly | monthly' });
     if (!Number.isInteger(next.amount_cents) || next.amount_cents < 0 || next.amount_cents > fb.OWNER_REFILL_MAX) return res.status(400).json({ error: `amount_cents: 0 to ${fb.OWNER_REFILL_MAX} a run` });
     const wasOn = Boolean(cur && cur.enabled && cur.amount_cents > 0);
