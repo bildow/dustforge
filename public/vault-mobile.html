@@ -1409,7 +1409,7 @@ function networkSection(n){
   h+='<div style="display:flex;gap:0.5rem;margin:0 0 0.6rem"><button class="btn-primary" style="flex:1" onclick="openPair()">Pair in person (QR)</button><button class="btn-ghost" style="flex:1" onclick="openEmailPair()">Pair by email code</button></div>';
   // Email-code links I sent (type their code) and ones I opened (read my code to them).
   for(const e of ((epairData&&epairData.pairings)||[])){
-    if(e.role==='inviter') h+='<div class="fill-req" style="cursor:pointer" onclick="openEmailPairing('+Number(e.pair_id)+')"><div>'+(e.status==='joined'?'<b>'+esc(e.other||'')+'</b> opened your link — type the code they read you':'Link sent to '+esc(e.to||'')+' — waiting for them to open it')+'</div><div style="color:var(--text3);margin-top:0.2rem">until '+esc(new Date(e.expires_at).toLocaleTimeString())+' · tap to '+(e.status==='joined'?'type the code':'see or cancel')+'</div></div>';
+    if(e.role==='inviter') h+='<div class="fill-req" style="cursor:pointer" onclick="openEmailPairing('+Number(e.pair_id)+')"><div>'+(e.status==='joined'?'Sent to '+esc(e.sent_to_user?'@'+e.sent_to_user:e.to||'')+' — opened by <b>@'+esc(e.other||'')+'</b>'+(epairMismatch(e)?' <span style="color:var(--red)">⚠ not the wallet you sent it to</span>':'')+' — type the code they read you':'Link sent to '+esc(e.sent_to_user?'@'+e.sent_to_user:e.to||'')+' — waiting for them to open it')+'</div><div style="color:var(--text3);margin-top:0.2rem">until '+esc(new Date(e.expires_at).toLocaleTimeString())+' · tap to '+(e.status==='joined'?'type the code':'see or cancel')+'</div></div>';
     else h+='<div class="fill-req" style="cursor:pointer" onclick="openEmailPairing('+Number(e.pair_id)+')"><div>Your code for <b>'+esc(e.other||'')+'</b> — tap to show it</div></div>';
   }
   const qrPeople=(n.people||[]).filter(p=>p.confirmed_via==='qr');
@@ -1582,6 +1582,9 @@ async function openEmailPairing(id){
   try{ epairOpen=await api('GET','/api/network/pair/email/'+Number(id)); }catch(e){ if(!sessionEnded(e)) alert(e.message); return; }
   document.getElementById('epair-msg').textContent=''; renderEmailPairing(); openModal('epair');
 }
+// The wallet that opened my link is not the one I meant: by username the server refuses that outright; by address the
+// opener's own address(es) did not match the one the link went to (a forwarded email?).
+function epairMismatch(e){ return !!e&&e.role==='inviter'&&e.status==='joined'&&!e.sent_to_user&&e.opener_matches_address===false; }
 function renderEmailPairing(){
   const e=epairOpen; if(!e) return; const body=document.getElementById('epair-body');
   if(e.role==='joiner'){
@@ -1592,7 +1595,9 @@ function renderEmailPairing(){
   }
   document.getElementById('epair-title').textContent='Pair by email code';
   if(e.status==='joined'){
-    body.innerHTML='<p style="font-size:0.8rem;color:var(--text3)"><b>'+esc(e.other||'')+'</b> opened your link. Type the 6-digit code they read you — only if you recognise who is speaking.</p>'
+    body.innerHTML='<p style="font-size:0.8rem;color:var(--text3)">Sent to '+esc(e.sent_to_user?'@'+e.sent_to_user:e.to||'')+' — opened by <b>@'+esc(e.other||'')+'</b>.</p>'
+      +(epairMismatch(e)?'<p style="font-size:0.8rem;color:var(--red)">⚠ @'+esc(e.other||'')+'\'s wallet does not have the address you sent the link to. The email may have been forwarded. Type the code only if you know @'+esc(e.other||'')+' is the person you meant — otherwise cancel.</p>':'')
+      +'<p style="font-size:0.8rem;color:var(--text3)">Type the 6-digit code they read you — only if you recognise who is speaking.</p>'
       +'<label>Their code</label><input type="text" id="epair-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="6 digits">'
       +'<div style="font-size:0.72rem;color:var(--text3);margin-top:0.3rem">'+Number(e.code_tries_left)+' tries left · <a href="#" style="color:var(--accent)" onclick="cancelEmailPair();return false">cancel</a></div>';
     setEpairActions('Confirm','confirmEmailPair()');

@@ -9,7 +9,7 @@
 #   - confirmed: contacts with verified_via 'email-code', both mailed; DD works, shares are refused (qr/vouch only);
 #   - legacy: a contact already confirmed in person (a pre-seeded 'qr' row) stays 'qr' after an email pairing.
 set -u
-W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd); ROOT=$W
 S=$(mktemp -d /tmp/dustforge-epair-smoke.XXXXXX)
 PORT=${PORT:-3831}; SMTP_PORT=${SMTP_PORT:-3832}; API=http://127.0.0.1:$PORT
 [ -d "$W/node_modules" ] || export NODE_PATH=${NODE_PATH:-/home/flimflam/project/dustforge/node_modules}
@@ -42,7 +42,7 @@ H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3");
 const db = new Database(process.env.DB_PATH);
-for (const u of ["pa", "pb", "pc", "pd", "agentg"]) { const id = identity.createIdentity();
+for (const u of ["pa", "pb", "pc", "pd", "pe", "pf", "agentg"]) { const id = identity.createIdentity();
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 1000, ?)").run(id.did, u, u + "@dustforge.com", id.encrypted_private_key || id.encryptedPrivateKey, process.argv[1]);
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 1000, ?, ?, 1000)").run(id.did, "topup", "smoke"); }
 const owner = db.prepare("SELECT did FROM identity_wallets WHERE username = ?").get("pd").did;
@@ -50,8 +50,8 @@ const f = db.prepare("INSERT INTO fleets (owner_did, name, slug) VALUES (?, ?, ?
 db.prepare("INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet) VALUES (?, (SELECT did FROM identity_wallets WHERE username = ?), ?, ?, ?, 1)").run(f, "agentg", "agentg", "sil_epair", "active");' "$H"
 did(){ Q "SELECT did FROM identity_wallets WHERE username='$1'"; }
 login(){ call POST /api/identity/auth-fingerprint "" '{"username":"'$1'","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
-A=$(login pa); B=$(login pb); C=$(login pc); D=$(login pd); G=$(login agentg)
-for t in "$A" "$B" "$C" "$D"; do call POST /api/identity/pin "$t" '{"pin":"4321","password":"hunter22"}'; [ "$CODE" = 200 ] || fail "pin: $CODE $BODY"; done
+A=$(login pa); B=$(login pb); C=$(login pc); D=$(login pd); E=$(login pe); F=$(login pf); G=$(login agentg)
+for t in "$A" "$B" "$C" "$D" "$E" "$F"; do call POST /api/identity/pin "$t" '{"pin":"4321","password":"hunter22"}'; [ "$CODE" = 200 ] || fail "pin: $CODE $BODY"; done
 call POST /api/identity/pin "$G" '{"pin":"4321","password":"hunter22"}'
 pin(){ call POST /api/identity/gate/verify "$1" '{"gate":"pin","pin":"4321","intent":"'$2'"}'; [ "$CODE" = 200 ] || fail "pin $2: $CODE $BODY"; }
 mailtoken(){ sleep 0.6; python3 - "$S/mail.log" "$1" <<'EOF'
@@ -77,15 +77,18 @@ TOK=$(mailtoken pb@dustforge.com); [ -n "$TOK" ] && ok "the link went by mail to
 # ── B opens it ──────────────────────────────────────────────────────────────────────────────────────────────────────
 call POST /api/network/pair/email/join "$B" '{"token":"'"${ID}"'.AAAAAAAAAAAAAAAAAAAAAA"}'; [ "$CODE" = 404 ] && ok "a wrong token → 404" || fail "wrong token: $CODE"
 call POST /api/network/pair/email/join "$G" '{"token":"'"$TOK"'"}'; [ "$CODE" = 403 ] && ok "an agent cannot open it" || fail "agent join: $CODE"
+pin "$C" "pair:$ID"; call POST /api/network/pair/email/join "$C" '{"token":"'"$TOK"'"}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "pb's wallet" && [ "$(Q "SELECT status FROM email_pairings WHERE id=$ID")" = sent ] && ok "a link sent to @pb: another wallet (a forwarded email) cannot open it" || fail "target bind: $CODE $BODY"
 call POST /api/network/pair/email/join "$B" '{"token":"'"$TOK"'"}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "pair:$ID" ] && [ "$(Q "SELECT status FROM email_pairings WHERE id=$ID")" = sent ] && ok "opening it takes B's PIN first (nothing bound before)" || fail "join no pin: $CODE $BODY"
 pin "$B" "pair:$ID"; call POST /api/network/pair/email/join "$B" '{"token":"https://demipass.com/vault-mobile.html#epair='"$TOK"'"}'
 BCODE=$(echo "$BODY" | J code)
 [ "$CODE" = 200 ] && [[ "$BCODE" =~ ^[0-9]{6}$ ]] && [ "$(echo "$BODY" | J role)" = joiner ] && ok "B opened it (the whole URL works) and B's screen shows the code" || fail "join: $CODE $BODY"
-call POST /api/network/pair/email/join "$C" '{"token":"'"$TOK"'"}'; pin "$C" "pair:$ID"; call POST /api/network/pair/email/join "$C" '{"token":"'"$TOK"'"}'
-[ "$CODE" = 409 ] && ok "once B opened it, another wallet cannot" || fail "second joiner: $CODE $BODY"
+call GET /api/network/pair/email "$A"; A1=$CODE; AL=$(echo "$BODY" | python3 -c 'import json,sys; print(len([p for p in json.load(sys.stdin)["pairings"] if p["status"]=="joined"]))')
+call GET /api/network/pair/email "$B"; B1=$CODE; BL=$(echo "$BODY" | python3 -c 'import json,sys; print(len([p for p in json.load(sys.stdin)["pairings"] if p["role"]=="joiner"]))')
+[ "$A1" = 200 ] && [ "$B1" = 200 ] && [ "$AL" = 1 ] && [ "$BL" = 1 ] && ok "GET /api/network/pair/email answers (200) and lists the pairing for A and for B" || fail "list route: $A1 $B1 $AL $BL"
 call GET /api/network/pair/email/$ID "$A"
-[ "$(echo "$BODY" | J code)" = None ] && [ "$(echo "$BODY" | J type_code)" = True ] && [ "$(echo "$BODY" | J other)" = pb ] && ok "A sees who opened it, never the code" || fail "A view: $BODY"
+[ "$(echo "$BODY" | J code)" = None ] && [ "$(echo "$BODY" | J type_code)" = True ] && [ "$(echo "$BODY" | J other)" = pb ] && [ "$(echo "$BODY" | J sent_to_user)" = pb ] && ok "A sees it was sent to @pb and opened by @pb, never the code" || fail "A view: $BODY"
 call GET /api/network/pair/email "$A"; ! echo "$BODY" | grep -q "$BCODE" && ok "A's list does not hold the code" || fail "code in A's list"
 
 # ── A types the code ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -109,9 +112,44 @@ call POST /api/blindkey/shares "$A" '{"secret":"epair-secret","to":"pb"}'
 # ── three wrong codes cancel ────────────────────────────────────────────────────────────────────────────────────────
 call POST /api/network/pair/email "$A" '{"to":"pc@dustforge.com"}'; ID2=$(echo "$BODY" | J pair_id); TOK2=$(mailtoken pc@dustforge.com)
 pin "$C" "pair:$ID2"; call POST /api/network/pair/email/join "$C" '{"token":"'"$TOK2"'"}'; CC=$(echo "$BODY" | J code)
-for k in 1 2 3; do W=$(printf '%06d' $(( (10#$CC + k) % 1000000 ))); call POST /api/network/pair/email/$ID2/confirm "$A" '{"code":"'"$W"'"}'; done
+for k in 1 2 3; do WC=$(printf '%06d' $(( (10#$CC + k) % 1000000 ))); call POST /api/network/pair/email/$ID2/confirm "$A" '{"code":"'"$WC"'"}'; done
 [ "$(echo "$BODY" | J status)" = cancelled ] && [ "$(Q "SELECT status || '/' || COALESCE(code,'null') FROM email_pairings WHERE id=$ID2")" = cancelled/null ] && ok "3 wrong codes cancel it (code erased)" || fail "3 wrong: $BODY"
 call POST /api/network/pair/email/$ID2/confirm "$A" '{"code":"'"$CC"'"}'; [ "$CODE" = 409 ] && ok "…and the right code no longer works" || fail "after cancel: $CODE"
+
+# ── mail-bomb: one mailbox, many spellings → at most 3 links a day; display names and lists refused ──────────────────
+n400=0; for v in 'x1<victim@gmail.com>' 'Victim <victim@gmail.com>' 'victim@gmail.com, other@example.com' '"v" <victim@gmail.com>' 'victim@gmail.com;x@y.com' 'grp: victim@gmail.com;'; do
+  call POST /api/network/pair/email "$F" "$(python3 -c 'import json,sys; print(json.dumps({"to":sys.argv[1]}))' "$v")"; [ "$CODE" = 400 ] && n400=$((n400+1)); done
+[ "$n400" = 6 ] && ok "display names, lists and groups are refused (one bare mailbox only)" || fail "bare mailbox: $n400/6"
+for v in victim@gmail.com Victim@Gmail.com v.ictim@gmail.com vi.ctim@gmail.com victim+1@gmail.com victim+a.b@gmail.com victim@googlemail.com V.I.C.T.I.M@gmail.com victim+zz@googlemail.com vic.tim@gmail.com victi.m@gmail.com victim+q@gmail.com VICTIM@GMAIL.COM v.i.ctim@gmail.com victim+x@gmail.com vict.im+y@gmail.com; do
+  for who in "$C" "$D" "$E"; do call POST /api/network/pair/email "$who" '{"to":"'"$v"'"}'; [ "$CODE" = 201 ] && { call POST /api/network/pair/email/$(echo "$BODY" | J pair_id)/cancel "$who"; }; done
+done
+sleep 0.8
+[ "$(Q "SELECT COUNT(*) FROM email_pairings WHERE to_canon='victim@gmail.com'")" = 3 ] && ok "16 spellings of one Gmail inbox (+tags, dots, case, googlemail), 3 senders, cancels: 3 links in all" || fail "per-mailbox cap: $(Q "SELECT COUNT(*) FROM email_pairings WHERE to_canon='victim@gmail.com'")"
+[ "$(grep -c -i -E "^To: .*@(gmail|googlemail)\.com" "$S/mail.log")" -le 3 ] && ok "…and at most 3 mails reached it" || fail "mails to victim: $(grep -c -i -E '^To: .*@(gmail|googlemail)' "$S/mail.log")"
+for k in $(seq 1 10); do call POST /api/network/pair/email "$F" '{"to":"u'$k'@example.org"}'; [ "$CODE" = 201 ] && call POST /api/network/pair/email/$(echo "$BODY" | J pair_id)/cancel "$F"; done
+call POST /api/network/pair/email "$F" '{"to":"u11@example.org"}'; [ "$CODE" = 429 ] && ok "a sender gets 10 links a day, cancelled ones included" || fail "sender cap: $CODE $BODY"
+
+# ── an address invite tells A whether the opener's own address is the one it went to ────────────────────────────────
+call POST /api/network/pair/email "$A" '{"to":"pe@dustforge.com"}'; IE=$(echo "$BODY" | J pair_id); TE=$(mailtoken pe@dustforge.com)
+pin "$E" "pair:$IE"; call POST /api/network/pair/email/join "$E" '{"token":"'"$TE"'"}'; EC=$(echo "$BODY" | J code)
+call GET /api/network/pair/email/$IE "$A"; [ "$(echo "$BODY" | J opener_matches_address)" = True ] && ok "by address: the opener's own address matches → opener_matches_address true" || fail "match true: $BODY"
+call POST /api/network/pair/email "$A" '{"to":"stranger@example.net"}'; IX=$(echo "$BODY" | J pair_id); TX=$(mailtoken stranger@example.net)
+pin "$C" "pair:$IX"; call POST /api/network/pair/email/join "$C" '{"token":"'"$TX"'"}'
+call GET /api/network/pair/email/$IX "$A"; [ "$(echo "$BODY" | J opener_matches_address)" = False ] && [ "$(echo "$BODY" | J other)" = pc ] && ok "a forwarded address link opened by @pc → opener_matches_address false (the app warns)" || fail "match false: $BODY"
+call POST /api/network/pair/email/$IX/cancel "$A"
+# The opener became an agent between opening and A's confirm → refused inside the transaction.
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); f=c.execute(\"SELECT id FROM fleets WHERE slug='d-fleet'\").fetchone()[0]; c.execute(\"INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet) VALUES (?, (SELECT did FROM identity_wallets WHERE username='pe'), 'pe', 'sil_pe', 'active', 0)\", (f,)); c.commit()" "$DB_PATH"
+pin "$A" "pair:$IE"; call POST /api/network/pair/email/$IE/confirm "$A" '{"code":"'"$EC"'"}'
+[ "$CODE" = 409 ] && [ "$(Q "SELECT COUNT(*) FROM network_peers WHERE (did_a=(SELECT did FROM identity_wallets WHERE username='pe') OR did_b=(SELECT did FROM identity_wallets WHERE username='pe')) AND verified_via='email-code'")" = 0 ] \
+  && ok "the opener turned agent before the confirm → 409, nothing paired" || fail "agent recheck: $CODE $BODY"
+
+# ── a vouch raises an email-code pair (A–pb) to 'vouch' ─────────────────────────────────────────────────────────────
+source "$ROOT/test/lib/pair_in_person.sh"
+pair_in_person "$C" 4321 "$A" 4321; pair_in_person "$C" 4321 "$B" 4321
+pin "$C" "vouch:0"; call POST /api/network/vouch "$C" '{"a":"pa","b":"pb","note":"smoke"}'; VC=$CODE; VID=$(echo "$BODY" | J vouch.id); [ "$VID" = None ] && VID=$(echo "$BODY" | J id)
+{ [ "$VC" = 200 ] || [ "$VC" = 201 ]; } && ok "a vouch for an email-code pair is accepted (not 'already confirmed')" || fail "vouch on email-code: $VC $BODY"
+pin "$A" "vouch:$VID"; call POST /api/network/vouches/$VID/accept "$A"; pin "$B" "vouch:$VID"; call POST /api/network/vouches/$VID/accept "$B"
+[ "$(Q "SELECT verified_via FROM network_peers WHERE did_a='$LO' AND did_b='$HI'")" = vouch ] && ok "…and once both accept, A–pb is 'vouch' (shares open)" || fail "vouch upgrade: $(Q "SELECT verified_via FROM network_peers WHERE did_a='$LO' AND did_b='$HI'") $BODY"
 
 # ── legacy: a contact confirmed in person stays 'qr' ────────────────────────────────────────────────────────────────
 PD=$(did pd); LO2=$(python3 -c "import sys;print(sorted(sys.argv[1:])[0])" "$PA" "$PD"); HI2=$(python3 -c "import sys;print(sorted(sys.argv[1:])[1])" "$PA" "$PD")

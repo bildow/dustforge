@@ -8581,10 +8581,11 @@ require('./network_routes')({
   guardians: () => recoveryGuardians,   // registered below (item 9)
 });
 // In-person contact pairing by QR (red team item 6): confirmed contacts are the only ones shares and transfers reach.
-require('./pairing')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, logSecurityEvent,
-  devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a) });
-// Email-code pairing (Aaron's ruling 2026-11-07): a remote way to confirm a contact — counts for DD and contacts, not shares.
+// Email-code pairing (Aaron's ruling 2026-11-07): a remote way to confirm a contact — counts for DD and contacts, not
+// shares. Registered BEFORE pairing.js: its GET /api/network/pair/email would otherwise be taken by GET /pair/:id (#75 review).
 require('./email_pairing')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, logSecurityEvent,
+  devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a) });
+require('./pairing')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, logSecurityEvent,
   devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a) });
 // Browser extension install page (public/extension.html): the Chrome waitlist while the store listing is pending.
 require('./extension_routes')({ app, db });

@@ -21,11 +21,25 @@ const crypto = require('crypto');
 const TTL_SEC = 30 * 60;          // an unopened link
 const JOINED_TTL_SEC = 30 * 60;   // after B opened it, for A to type the code
 const MAX_OPEN = 3;               // open links one inviter may have
-const MAX_PER_ADDRESS_DAY = 3;    // links to one address in 24 h, from anyone
+const MAX_PER_ADDRESS_DAY = 3;    // links to one mailbox in 24 h, from anyone (canonical: +tags, Gmail dots, case)
+const MAX_PER_SENDER_DAY = 10;    // links one inviter may send in 24 h, cancelled and expired ones included
 const MAX_CODE_TRIES = 3;
 const MAX_WRONG_PER_HOUR = 10;    // wrong link tokens one wallet may present in an hour
 const TOKEN_RE = /^(\d{1,12})\.([A-Za-z0-9_-]{22})$/;
-const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
+const EMAIL_RE = /^[^\s@<>",;:()\[\]\\]{1,64}@[^\s@<>",;:()\[\]\\]{1,190}\.[^\s@<>",;:()\[\]\\]{2,}$/;
+const cap = require('./mail_recipient_cap');
+const addressparser = require('nodemailer/lib/addressparser');
+// Exactly one bare mailbox, as nodemailer would read it: no display name, no group, no list, nothing around it (#75
+// review: "x1<victim@gmail.com>" passed the old check and nodemailer delivered it). → the bare address, lower-cased, or null.
+function bareMailbox(raw) {
+  const t = String(raw || '').trim();
+  if (!EMAIL_RE.test(t)) return null;
+  let parsed; try { parsed = addressparser(t); } catch (_) { return null; }
+  if (!Array.isArray(parsed) || parsed.length !== 1 || parsed[0].group || parsed[0].name || !parsed[0].address) return null;
+  if (parsed[0].address.toLowerCase() !== t.toLowerCase()) return null;
+  if (cap.recipientList(t).length !== 1) return null;
+  return t.toLowerCase();
+}
 
 module.exports = function registerEmailPairing(deps) {
   const { app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse, logSecurityEvent } = deps;
@@ -36,6 +50,9 @@ module.exports = function registerEmailPairing(deps) {
     id INTEGER PRIMARY KEY,
     inviter_did TEXT NOT NULL,
     to_email TEXT NOT NULL,
+    to_canon TEXT NOT NULL,                     -- the mailbox it counts against (mail_recipient_cap.canonicalAddress)
+    target_did TEXT DEFAULT NULL,               -- an invite by username: only that wallet may open it
+    opener_matches INTEGER DEFAULT NULL,        -- an invite by address: did the opener's own address(es) match it
     secret_hash TEXT NOT NULL,
     joiner_did TEXT DEFAULT NULL,
     code TEXT DEFAULT NULL,
@@ -48,7 +65,7 @@ module.exports = function registerEmailPairing(deps) {
     cancelled_by TEXT DEFAULT NULL
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_ep_inviter ON email_pairings(inviter_did, status)');
-  db.exec('CREATE INDEX IF NOT EXISTS idx_ep_to ON email_pairings(to_email, created_at)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_ep_to ON email_pairings(to_canon, created_at)');
   db.exec(`CREATE TABLE IF NOT EXISTS contact_pairing_misses (did TEXT NOT NULL, at TEXT NOT NULL)`);   // pairing.js's, shared
 
   const nowIso = () => new Date().toISOString();
@@ -84,6 +101,10 @@ module.exports = function registerEmailPairing(deps) {
       pair_id: row.id, kind: 'email-code', status: row.status, role: inviter ? 'inviter' : 'joiner',
       to: inviter ? mask(row.to_email) : null,
       other: inviter ? (row.joiner_did ? name(row.joiner_did) : null) : name(row.inviter_did),
+      // Who A meant, and whether the wallet that opened it is that one (#75 review): by username it must be; by address
+      // A is told whether the opener's own address(es) are the one the link went to.
+      ...(inviter ? { sent_to_user: row.target_did ? name(row.target_did) : null,
+        opener_matches_address: row.joiner_did && !row.target_did ? Boolean(row.opener_matches) : null } : {}),
       // Only B's screen shows the code; A types it.
       code: !inviter && row.status === 'joined' ? row.code : null,
       type_code: inviter && row.status === 'joined',
@@ -106,19 +127,26 @@ module.exports = function registerEmailPairing(deps) {
     const raw = String((req.body || {}).to || '').trim();
     if (!raw || raw.length > 254) return res.status(400).json({ error: 'to: an email address, or the username of a contact' });
     let to = null, target = null;
-    if (EMAIL_RE.test(raw)) to = raw.toLowerCase();
-    else {
+    if (raw.includes('@') || /[<>,;"]/.test(raw)) {
+      to = bareMailbox(raw);
+      if (!to) return res.status(400).json({ error: 'to: one plain email address (no name, no list), or the username of a person' });
+    } else {
       target = db.prepare('SELECT did, username, email, status FROM identity_wallets WHERE username = ?').get(raw.toLowerCase());
       if (!target || target.status !== 'active' || !target.email) return res.status(404).json({ error: 'no wallet by that name with an address to send to — give an email address instead' });
       if (isAgent(target.did)) return res.status(403).json({ error: 'that is an agent wallet: people only' });
-      to = String(target.email).toLowerCase();
+      to = bareMailbox(target.email);
+      if (!to) return res.status(409).json({ error: 'that wallet has no plain address to send to — give an email address instead' });
     }
-    if ((target && target.did === p.wallet.did) || [p.wallet.email, p.wallet.recovery_email].filter(Boolean).map(e => String(e).toLowerCase()).includes(to)) {
-      return res.status(400).json({ error: 'that is your own address' });
+    const canon = cap.canonicalAddress(to);
+    const mine = [p.wallet.email, p.wallet.recovery_email].filter(Boolean).map(e => cap.canonicalAddress(e));
+    if ((target && target.did === p.wallet.did) || mine.includes(canon)) return res.status(400).json({ error: 'that is your own address' });
+    const dayAgo = new Date(Date.now() - 86400000).toISOString();
+    if (db.prepare('SELECT COUNT(*) AS n FROM email_pairings WHERE inviter_did = ? AND created_at > ?').get(p.wallet.did, dayAgo).n >= MAX_PER_SENDER_DAY) {
+      return res.status(429).json({ error: `at most ${MAX_PER_SENDER_DAY} pairing links a day` });
     }
     const open = db.prepare("SELECT COUNT(*) AS n FROM email_pairings WHERE inviter_did = ? AND status IN ('sent','joined')").get(p.wallet.did).n;
     if (open >= MAX_OPEN) return res.status(429).json({ error: `at most ${MAX_OPEN} links open at once — finish or cancel one` });
-    const recent = db.prepare('SELECT COUNT(*) AS n FROM email_pairings WHERE to_email = ? AND created_at > ?').get(to, new Date(Date.now() - 86400000).toISOString()).n;
+    const recent = db.prepare('SELECT COUNT(*) AS n FROM email_pairings WHERE to_canon = ? AND created_at > ?').get(canon, dayAgo).n;
     if (recent >= MAX_PER_ADDRESS_DAY) return res.status(429).json({ error: 'that address has had enough pairing links today' });
     const secret = crypto.randomBytes(16).toString('base64url');
     let id = 0;
@@ -126,7 +154,7 @@ module.exports = function registerEmailPairing(deps) {
       const cand = 100000000000 + crypto.randomInt(0, 899999999999);
       // The PIN intent is pair:<id>, shared with QR pairings: never reuse an id either kind holds.
       if (db.prepare('SELECT 1 FROM contact_pairings WHERE id = ?').get(cand)) continue;
-      try { db.prepare('INSERT INTO email_pairings (id, inviter_did, to_email, secret_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)').run(cand, p.wallet.did, to, sha(secret), nowIso(), later(TTL_SEC)); id = cand; }
+      try { db.prepare('INSERT INTO email_pairings (id, inviter_did, to_email, to_canon, target_did, secret_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').run(cand, p.wallet.did, to, canon, target ? target.did : null, sha(secret), nowIso(), later(TTL_SEC)); id = cand; }
       catch (e) { if (!/UNIQUE|PRIMARY/.test(e.message)) throw e; }
     }
     if (!id) return res.status(503).json({ error: 'could not start a pairing; try again' });
@@ -163,6 +191,8 @@ module.exports = function registerEmailPairing(deps) {
     if (row.inviter_did === p.wallet.did) return res.status(400).json({ error: 'that is your own pairing link' });
     if (row.status === 'joined' && row.joiner_did === p.wallet.did) return res.json({ ok: true, ...viewFor(row, p.wallet.did) });   // reopened: same code
     if (row.status !== 'sent') return res.status(409).json({ error: row.status === 'joined' ? 'this link was already opened by another wallet — ask them to cancel it and send a new one' : `this link is ${row.status}` });
+    // Sent to a username: only that wallet opens it (#75 review — a forwarded link is no way in for anyone else).
+    if (row.target_did && row.target_did !== p.wallet.did) return res.status(409).json({ error: `this link is for ${name(row.target_did)}'s wallet: sign in as ${name(row.target_did)} to open it` });
     // B's own PIN binds B's wallet: a session token alone (a stolen one) cannot pair B to anyone.
     const intent = `pair:${row.id}`;
     if (!gateFresh(p.wallet.did, 'pin', p.auth, intent)) return res.status(403).json({ ...gateMissing('pair', ['pin'], ['pin'], intent), error: `confirming ${name(row.inviter_did)} as a contact needs your PIN` });
@@ -172,8 +202,9 @@ module.exports = function registerEmailPairing(deps) {
         const spent = spendSingleUse(p.wallet.did, 'pair', ['pin'], p.auth, intent);
         if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
         const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-        const n = db.prepare("UPDATE email_pairings SET joiner_did = ?, code = ?, status = 'joined', joined_at = ?, expires_at = ? WHERE id = ? AND status = 'sent' AND expires_at > ?")
-          .run(p.wallet.did, code, nowIso(), later(JOINED_TTL_SEC), row.id, nowIso()).changes;
+        const own = [p.wallet.email, p.wallet.recovery_email].filter(Boolean).map(e => cap.canonicalAddress(e));
+        const n = db.prepare("UPDATE email_pairings SET joiner_did = ?, code = ?, status = 'joined', joined_at = ?, expires_at = ?, opener_matches = ? WHERE id = ? AND status = 'sent' AND expires_at > ?")
+          .run(p.wallet.did, code, nowIso(), later(JOINED_TTL_SEC), own.includes(row.to_canon) ? 1 : 0, row.id, nowIso()).changes;
         if (n !== 1) throw Object.assign(new Error('this link was opened meanwhile, or expired'), { statusCode: 409 });
         joined = db.prepare('SELECT * FROM email_pairings WHERE id = ?').get(row.id);
       }).immediate();
@@ -230,6 +261,8 @@ module.exports = function registerEmailPairing(deps) {
       db.transaction(() => {
         const spent = spendSingleUse(me, 'pair', ['pin'], p.auth, intent);
         if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
+        const jb = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(row.joiner_did);
+        if (!jb || jb.status !== 'active' || isAgent(row.joiner_did)) throw Object.assign(new Error(`${other} can no longer be paired (not an active person)`), { statusCode: 409 });
         const n = db.prepare("UPDATE email_pairings SET status = 'confirmed', decided_at = ?, code = NULL WHERE id = ? AND status = 'joined' AND expires_at > ?").run(nowIso(), row.id, nowIso()).changes;
         if (n !== 1) throw Object.assign(new Error('this pairing changed meanwhile'), { statusCode: 409 });
         const [x, y] = pairDids(row.inviter_did, row.joiner_did);
