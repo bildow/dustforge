@@ -194,6 +194,7 @@
   <div id="net-requests"></div>
   <div id="share-requests"></div>
   <div id="scan-requests"></div>
+  <div id="agent-token-requests"></div>
   <div id="approval-requests"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
@@ -1843,6 +1844,7 @@ async function submitShare(){
 let approvals=[], apOpen=null, apTimer=null, apBusy=false, apResolve=null;
 async function loadApprovals(){
   if(lockState.locked) return;
+  loadAgentTokenRequests();   // a waiting agent-token request shows at start and after unlock, not only on the poll
   const epoch=sessionEpoch;
   try{ const r=await api('GET','/api/blindkey/approvals'); if(epoch!==sessionEpoch||!vaultOpen) return; approvals=r.incoming||[]; }
   catch(e){ if(sessionEnded(e)||e.status===429) return; }
@@ -2858,6 +2860,30 @@ async function loadScanRequests(){
     +'<div class="fr-row"><button class="btn-primary" '+(scanBusy.has(q.id)?'disabled ':'')+'onclick="scanDecide('+Number(q.id)+',true)">Approve</button>'
     +'<button class="btn-ghost" '+(scanBusy.has(q.id)?'disabled ':'')+'onclick="scanDecide('+Number(q.id)+',false)">Deny</button></div></div>').join('');
 }
+// Agent token requests (silicon_token_requests.js): someone in a fleet of mine asks for a token for one of its agents.
+// Approving mints it for whoever holds the claim secret (never shown here); the PIN and the linked phone approve.
+let agentTokReqs=[], agentTokBusy=new Set();
+async function loadAgentTokenRequests(){
+  if(lockState.locked) return;
+  try{ const r=await api('GET','/api/silicon-token-requests'); agentTokReqs=r.requests||[]; }catch(e){ if(sessionEnded(e)) return; }
+  const el=document.getElementById('agent-token-requests'); if(!el) return;
+  el.innerHTML=agentTokReqs.map(q=>'<div class="fill-req"><div>A token for your agent <b>@'+esc(q.handle)+'</b> (fleet '+esc(q.fleet)+') is asked for: <b>'+esc(q.scope)+'</b>, lasting '+esc(q.expires_in)+'</div>'
+    +(q.requester_role==='other_agent'?'<div style="color:var(--red);margin-top:0.25rem">Another agent, @'+esc(q.requested_by||'?')+', asks for @'+esc(q.handle)+'\'s token. If approved, @'+esc(q.requested_by||'?')+' can act as @'+esc(q.handle)+'.</div>':'')
+    +(q.requested_by||q.says_it_is?'<div style="color:var(--text3);margin-top:0.25rem">asked by '+esc(q.requested_by||'?')+(q.says_it_is?', saying it is for “'+esc(q.says_it_is)+'”':'')+'</div>':'')
+    +'<div style="color:var(--text3);margin-top:0.25rem">The token acts as @'+esc(q.handle)+' (spends its DD, uses what it was given) until it expires. It goes only to whoever filed the request. Approve only if you expected it.</div>'
+    +'<div class="fr-row"><button class="btn-primary" '+(agentTokBusy.has(q.id)?'disabled ':'')+'onclick="agentTokDecide('+Number(q.id)+',true)">Approve</button>'
+    +'<button class="btn-ghost" '+(agentTokBusy.has(q.id)?'disabled ':'')+'onclick="agentTokDecide('+Number(q.id)+',false)">Deny</button></div></div>').join('');
+}
+async function agentTokDecide(id, ok){
+  if(agentTokBusy.has(id)) return; agentTokBusy.add(id); loadAgentTokenRequests();
+  const q=agentTokReqs.find(x=>x.id===id)||{};
+  try{
+    if(ok) await apiGated('POST','/api/silicon-token-requests/'+id+'/approve',{},'Give @'+(q.handle||'the agent')+' a '+(q.scope||'')+' token? Your PIN approves it.');
+    else await api('POST','/api/silicon-token-requests/'+id+'/deny',{});
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+  finally{ agentTokBusy.delete(id); }
+  loadAgentTokenRequests();
+}
 async function scanDecide(id, ok){
   if(scanBusy.has(id)) return; scanBusy.add(id); loadScanRequests();
   try{
@@ -3290,7 +3316,7 @@ document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.vis
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
 let pollN=0;
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0){loadShares();loadScanRequests();}}},4000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0){loadShares();loadScanRequests();loadAgentTokenRequests();}}},4000);
 
 // ── Pair in person (QR): a contact confirmed face to face; only these can be shared with (red team item 6) ──────
 // One side shows a QR, the other scans it in this app. Only the shower's screen gets the 6-digit code; the scanner
