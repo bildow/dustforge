@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, interactive-widget=resizes-content">
 <title>DemiPass</title>
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#08111a">
@@ -86,9 +86,9 @@
   .btn-ghost { padding:0.5rem 0.8rem; background:transparent; border:1px solid var(--border); border-radius:8px; color:var(--text2); font-size:0.8rem; cursor:pointer; }
 
   /* Modal */
-  .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:100; justify-content:center; align-items:flex-end; }
+  .modal-bg { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:100; justify-content:center; align-items:flex-end; padding-bottom:var(--kb,0px); }
   .modal-bg.show { display:flex; }
-  .modal-sheet { background:var(--card); border-radius:16px 16px 0 0; width:100%; max-width:500px; max-height:85vh; overflow-y:auto; padding:1.5rem; }
+  .modal-sheet { background:var(--card); border-radius:16px 16px 0 0; width:100%; max-width:500px; max-height:calc(85vh - var(--kb,0px)); overflow-y:auto; padding:1.5rem; }
   .modal-sheet h3 { margin-bottom:1rem; }
   .modal-sheet label { display:block; font-size:0.8rem; color:var(--text3); margin:0.75rem 0 0.25rem; }
   .modal-sheet input, .modal-sheet select { width:100%; padding:0.6rem; background:var(--bg); border:1px solid var(--border); border-radius:8px; color:var(--text); font-size:0.9rem; }
@@ -554,6 +554,25 @@
   </div>
 </div>
 
+<!-- A project (cost center): who pays for its operator work, and its own wallet -->
+<div id="modal-project" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3 id="proj-title"></h3>
+    <div id="proj-ops" style="font-size:0.75rem;color:var(--text3)"></div>
+    <label>Who pays for work on this project</label>
+    <div style="display:flex;gap:0.5rem"><button id="proj-mode-owner" onclick="chooseProjectMode('owner')" style="flex:1">Bill my wallet</button><button id="proj-mode-wallet" onclick="chooseProjectMode('project_wallet')" style="flex:1">Bill the project</button></div>
+    <div id="proj-owner-note" style="font-size:0.75rem;color:var(--text2);margin-top:0.6rem"></div>
+    <div id="proj-idle" style="font-size:0.72rem;color:var(--text3);margin-top:0.4rem;display:none"></div>
+    <div id="proj-wallet" style="display:none;margin-top:0.75rem">
+      <div style="display:flex;justify-content:space-between;align-items:baseline"><span style="font-size:0.8rem;color:var(--text3)">Project wallet</span><strong><span id="proj-balance">0</span> DD</strong></div>
+      <div style="font-size:0.7rem;color:var(--text3);margin-top:0.2rem">Operator work is charged here; if it runs short, your wallet covers the rest.</div>
+      <label>Add DD from my wallet</label><input type="number" id="proj-amount" min="1" step="1" inputmode="numeric" placeholder="e.g. 1000">
+    </div>
+    <div id="proj-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" id="proj-fund" onclick="fundOpenProject()">Add DD</button></div>
+  </div>
+</div>
+
 <!-- Send DD to a connection -->
 <div id="modal-send" class="modal-bg" onclick="if(event.target===this)closeModal()">
   <div class="modal-sheet">
@@ -915,19 +934,16 @@ async function loadFleet(){
       h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.35rem;font-size:0.68rem;color:var(--text3)"><span>'+(s.refill.enabled?('refill +'+dd(s.refill.amount_cents)+' below '+dd(s.refill.threshold_cents)):'no auto-refill')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</span>'+tokenChip(s.token)+'</div>';
       h+='</div>';
     }
-    // Projects
-    if(d.projects&&d.projects.length){
+    // Projects: cards like the silicons above; tap one for its billing (Aaron 2026-11-07).
+    fleetProjects=d.projects||[]; fleetSiliconsCache=d.silicons||[];
+    if(fleetProjects.length){
       h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Projects (cost centers)</span></div>';
-      for(const [pi,p] of d.projects.entries()){
-        h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.45rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">';
-        h+='<div><strong>'+esc(p.project)+'</strong><div style="font-size:0.65rem;color:var(--text3)">'+p.operators.length+' operator'+(p.operators.length===1?'':'s')+' · wallet '+dd(p.wallet_balance_cents)+' DD</div></div>';
-        h+='<select onchange="setBillMode('+jsArg(p.project)+',this.value)" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.7rem;margin:0"><option value="owner"'+(p.bill_mode==='owner'?' selected':'')+'>bill my wallet</option><option value="project_wallet"'+(p.bill_mode==='project_wallet'?' selected':'')+'>bill project wallet</option></select>';
+      for(const [pi,p] of fleetProjects.entries()){
+        const own=p.bill_mode==='project_wallet'&&p.wallet_did&&p.wallet_did!==did;
+        h+='<div onclick="openProject('+pi+')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
+        h+='<div style="display:flex;justify-content:space-between;align-items:center"><strong style="color:var(--accent)">'+esc(p.project)+'</strong><div style="font-weight:700">'+(own?dd(p.wallet_balance_cents)+' DD':'<span style="font-weight:400;font-size:0.75rem;color:var(--text2)">billed to you</span>')+'</div></div>';
+        h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.35rem">'+p.operators.length+' operator'+(p.operators.length===1?'':'s')+' · '+(own?'its own wallet pays':'your wallet pays')+'</div>';
         h+='</div>';
-        // Fund the project's own wallet from mine (PIN). Not shown when the project bills my wallet directly.
-        if(p.wallet_did&&p.wallet_did!==did){
-          const fid='pf-'+pi;   // by row: two project names can clean to the same id (#71 review L5)
-          h+='<div style="display:flex;gap:0.4rem;align-items:center;padding:0.35rem 0 0.5rem;border-bottom:1px solid rgba(39,68,95,0.25)"><input type="number" inputmode="numeric" id="'+fid+'" min="1" placeholder="DD" style="width:6rem;margin:0;padding:0.35rem;font-size:0.75rem"><button class="btn-ghost" onclick="fundProject('+jsArg(p.project)+','+jsArg(fid)+')" style="font-size:0.72rem;padding:0.35rem 0.6rem">Add DD from my wallet</button></div>';
-        }
       }
     }
     // Attribution
@@ -970,6 +986,38 @@ async function fundProject(project, inputId){
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
 }
 async function setBillMode(project,mode){try{await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(project),{bill_mode:mode})}catch(e){alert(e.message);loadFleet()}}
+// One project's sheet: who pays for operator-requested work on it, and (when it is the project) its wallet and funding.
+var fleetProjects=[], projOpen=null, fleetSiliconsCache=[];   // var: loadFleet can run before this line is reached
+function openProject(i){ projOpen=fleetProjects[i]; if(!projOpen) return; document.getElementById('proj-msg').textContent=''; document.getElementById('proj-amount').value=''; renderProject(); openModal('project'); }
+function renderProject(){
+  const p=projOpen; if(!p) return;
+  const has=p.wallet_did&&p.wallet_did!==did, own=has&&p.bill_mode==='project_wallet';
+  document.getElementById('proj-title').textContent=p.project;
+  const opName=(x)=>{ const sd=fleetSiliconsCache.find(z=>z.did===x); return sd?'@'+sd.handle:(x===did?'you':String(x).slice(8,20)+'…'); };
+  document.getElementById('proj-ops').textContent=p.operators.length+' operator'+(p.operators.length===1?'':'s')+(p.operators.length?': '+p.operators.map(opName).join(', '):'');
+  for(const [id,m] of [['proj-mode-owner','owner'],['proj-mode-wallet','project_wallet']]){ const b=document.getElementById(id); b.className=(p.bill_mode===m?'btn-primary':'btn-ghost'); b.disabled=(m==='project_wallet'&&!has); }
+  document.getElementById('proj-wallet').style.display=own?'block':'none';
+  document.getElementById('proj-balance').textContent=dd(p.wallet_balance_cents||0);
+  const idle=document.getElementById('proj-idle');
+  if(!own&&has&&Number(p.wallet_balance_cents)>0){ idle.style.display='block'; idle.textContent='Its own wallet still holds '+dd(p.wallet_balance_cents)+' DD. That is spent only when the project\'s wallet itself acts (an agent signed in as it), or for operator work once you switch to "Bill the project".'; }
+  else idle.style.display='none';
+  document.getElementById('proj-owner-note').style.display=own?'none':'block';
+  document.getElementById('proj-fund').style.display=own?'':'none';
+  document.getElementById('proj-owner-note').textContent=has?'Work your operators ask for on this project is charged to your wallet.':'This project has no wallet of its own: its work is charged to your wallet.';
+}
+async function chooseProjectMode(mode){
+  const p=projOpen; if(!p||p.bill_mode===mode) return;
+  try{ await api('PATCH','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(p.project),{bill_mode:mode}); p.bill_mode=mode; renderProject(); loadFleet(); }
+  catch(e){ if(!sessionEnded(e)) document.getElementById('proj-msg').textContent=e.message; }
+}
+async function fundOpenProject(){
+  const p=projOpen; const a=Number(document.getElementById('proj-amount').value||0); const m=document.getElementById('proj-msg');
+  if(!p) return; if(!Number.isInteger(a)||a<1){ m.textContent='Enter a whole number of DD'; return; }
+  try{
+    const r=await apiGated('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(p.project)+'/fund',{amount_cents:a},'Move '+dd(a)+' DD from your wallet into project '+p.project+'? Your PIN approves it.');
+    p.wallet_balance_cents=r.wallet_balance_cents; document.getElementById('proj-amount').value=''; renderProject(); m.className='modal-msg ok'; m.textContent='Added. '+p.project+' holds '+dd(r.wallet_balance_cents)+' DD.'; loadFleet();
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ m.className='modal-msg err'; m.textContent=e.message; } }
+}
 async function revokeWorkLink(id){if(!confirm('Revoke work link #'+id+'?'))return;try{await api('POST','/api/work-links/'+id+'/revoke');siliconHandle?openSilicon(siliconHandle):loadFleet()}catch(e){alert(e.message)}}
 function openAddSilicon(){if(!fleetSlug){alert('No fleet yet');return}document.getElementById('sil-msg').textContent='';openModal('silicon')}
 function updateSiliconFields(){const c=document.getElementById('sil-mode').value==='create';document.getElementById('sil-create-fields').style.display=c?'block':'none';document.getElementById('sil-existing-fields').style.display=c?'none':'block'}
@@ -3088,6 +3136,32 @@ function gateName(g){return ({pin:'PIN',fingerprint:'PIN',twofa:'email code',sms
 
 document.getElementById('auth-pass').addEventListener('keydown',e=>{if(e.key==='Enter')login()});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeModal()}});
+// ── On-screen keyboard vs bottom sheets (Aaron 2026-11-07: the number pad covered Send and the PIN button) ───────────
+// 1) Where the browser shrinks the visual viewport for the keyboard, the sheets sit above it (--kb). 2) The keyboard's
+// own action key moves to the next field and, on the last one, presses the sheet's main button — so the button never
+// has to be reachable behind the keyboard. 3) A focused field scrolls its sheet's buttons into view. The app (1.11+)
+// also resizes for the keyboard (adjustResize).
+(function(){
+  const W=(typeof window!=='undefined')?window:null; const vv=W&&W.visualViewport; const root=document.documentElement;
+  function kb(){ if(!vv||!root||!root.style) return; const h=Math.max(0, Math.round(W.innerHeight-vv.height-vv.offsetTop)); root.style.setProperty('--kb', (h>80?h:0)+'px'); }
+  if(vv){ vv.addEventListener('resize',kb); vv.addEventListener('scroll',kb); }
+  const fieldsOf=(sheet)=>[...sheet.querySelectorAll('input,select,textarea')].filter(f=>!f.disabled&&f.type!=='hidden'&&f.type!=='checkbox'&&f.type!=='radio'&&f.type!=='file'&&f.offsetParent!==null);
+  const mainButton=(sheet)=>[...sheet.querySelectorAll('.modal-actions .btn-primary')].find(b=>!b.disabled&&b.offsetParent!==null)||null;
+  document.addEventListener('focusin',e=>{
+    const f=e.target; const sheet=f&&f.closest&&f.closest('.modal-sheet'); if(!sheet||!/^(INPUT|SELECT|TEXTAREA)$/.test(f.tagName)) return;
+    if(f.tagName==='INPUT'&&!f.getAttribute('enterkeyhint')){ const all=fieldsOf(sheet); const i=all.indexOf(f); f.setAttribute('enterkeyhint', i>=0&&i<all.length-1?'next':'go'); }
+    setTimeout(()=>{ kb(); const acts=sheet.querySelector('.modal-actions'); if(acts&&acts.scrollIntoView) acts.scrollIntoView({block:'nearest'}); try{ f.scrollIntoView({block:'nearest'}); }catch(_){} },350);
+  });
+  document.addEventListener('keydown',e=>{
+    if(e.key!=='Enter'||e.defaultPrevented) return;
+    const f=e.target; if(!f||f.tagName!=='INPUT'||f.hasAttribute('onkeydown')) return;   // fields with their own Enter handling keep it
+    const sheet=f.closest('.modal-sheet'); if(!sheet) return;
+    e.preventDefault();
+    const all=fieldsOf(sheet); const i=all.indexOf(f);
+    if(i>=0&&i<all.length-1){ all[i+1].focus(); return; }
+    const b=mainButton(sheet); if(b) b.click();
+  });
+})();
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadVault()},30000);
 document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadVault()});
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
