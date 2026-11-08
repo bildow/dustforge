@@ -45,7 +45,9 @@ const DENY_COOLDOWN_SEC = 10 * 60;  // after the owner denies a requester, it ma
 module.exports = function registerUseApprovals(deps) {
   const { app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
           logSecurityEvent, cleanLabel, billing, sendMail, deviceKeys, cryptoDepth } = deps;
-  const secretOf = (id) => db.prepare('SELECT id, name, did, wrap_state, wrapped_value, security_depth FROM blindkey_secrets WHERE id = ?').get(id);
+  // ref_code too: the phone refuses an unwrap whose ref is not the secret's own (crypto_depth approvalView → DeviceBridge.unwrap;
+  // missing, every wrapped approval failed on the phone with "which secret this is for is missing" — Aaron 2026-11-08, approval 34).
+  const secretOf = (id) => db.prepare('SELECT id, name, ref_code, did, wrap_state, wrapped_value, security_depth FROM blindkey_secrets WHERE id = ?').get(id);
   const limiter = rateLimitFill || rateLimitStandard;
 
   db.exec(`CREATE TABLE IF NOT EXISTS use_approvals (

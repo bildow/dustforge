@@ -101,6 +101,10 @@ for i in $(seq 1 20); do [ -n "$(Q "SELECT COALESCE(eph_pub,'') FROM use_approva
 call GET /api/demipass/approvals "$A"; UN=$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x for x in d["incoming"] if x["id"]=='$AP'][0]; print(json.dumps(a.get("unwrap")))')
 EPH=$(echo "$UN" | J eph_pub); WD=$(echo "$UN" | python3 -c 'import json,sys; print(json.load(sys.stdin)["wraps"]["'$FP'"])')
 [ -n "$EPH" ] && [ -n "$WD" ] && ok "the owner's approval view carries the one-use key and the phone's wrap" || fail "view: $UN"
+# What the real phone checks before it unwraps (DeviceBridge.unwrap): did, ref and name present and the secret's own.
+[ "$(echo "$UN" | J ref)" = "$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=(SELECT secret_id FROM use_approvals WHERE id=$AP)")" ] && [ -n "$(echo "$UN" | J ref)" ] \
+  && [ "$(echo "$UN" | J name)" = "$(Q "SELECT name FROM blindkey_secrets WHERE id=(SELECT secret_id FROM use_approvals WHERE id=$AP)")" ] && [ "$(echo "$UN" | J did)" = "$(Q "SELECT did FROM blindkey_secrets WHERE id=(SELECT secret_id FROM use_approvals WHERE id=$AP)")" ] \
+  && ok "…and names the secret as the phone requires (did, ref, name: approval 34 failed without the ref)" || fail "unwrap names: $UN"
 BIND=$(Q "SELECT binding FROM use_approvals WHERE id=$AP")
 devsign "$A" "approval-open:$AP" "$BIND"; call POST /api/demipass/approvals/$AP/open "$A" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'; CODEV=$(echo "$BODY" | J code)
 [ "$CODE" = 200 ] || fail "open: $CODE $BODY"
