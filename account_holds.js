@@ -219,7 +219,9 @@ module.exports = function registerAccountHolds(deps) {
     const holds = openHolds(ch.did).filter(h => eligibleKey(ch.did, device_id, 'P', holdSince(h)));
     // Approval requests waiting on this owner (Aaron 2026-11-08: every wait is a request the phone tells him about).
     let approvals = [];
-    try { const A = deps.approvals && deps.approvals(); if (A && A.pendingFor) approvals = A.pendingFor(ch.did); } catch (_) {}
+    // Only to a phone still linked: the grace that lets a removed phone cancel a takeover hold is not for reading what
+    // waits on the owner (#77 review M2).
+    try { const A = deps.approvals && deps.approvals(); if (A && A.pendingFor && !key.revoked_at) approvals = A.pendingFor(ch.did); } catch (_) {}
     res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did), approvals });
   });
 

@@ -28,6 +28,7 @@ const PENDING_TTL_SEC = 60 * 60;
 const GRANT_PENDING_TTL_SEC = 24 * 3600;
 const GRANT_APPROVED_TTL_SEC = 60 * 60;    // the requester collects a grant when it next polls
 const isGrantKey = (k) => typeof k === 'string' && k.startsWith('svc:demipass:');
+const MAX_PENDING_GRANTS_OWN = 10;   // the owner's own DID's grant requests waiting at once, across all its labels
 const STEP_SEC = 30;              // code rotation
 const MAX_WRONG = 3;
 const MAX_PENDING_PER_OWNER = 30;
@@ -123,7 +124,16 @@ module.exports = function registerUseApprovals(deps) {
   // A one-line headline for the card. The owner approves the full bound call (`call`, shown as JSON), never this alone.
   function summaryOf({ kind, action, targetHost, targetUrl, params }) {
     if (kind === 'reveal') return 'reveal the value';
-    if (kind === 'service') return cleanLabel(`${targetHost || ''}: ${action}`, 120);
+    if (kind === 'service') {
+      // Name what is granted, so two requests never look alike on the card (#77 review L2).
+      const q = params || {};
+      const what = action === 'silicon-token' ? `token for @${q.silicon} (${q.scope}, ${q.expires_in}), collected by ${q.collected_by}`
+        : action === 'consent' ? `let ${String(q.wallet || '').slice(0, 24)}… pay ${q.service} up to ${q.daily_cap_dd} DD a day`
+        : action === 'register' ? `register service ${q.slug} (${q.name})`
+        : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action).join(', ')}`
+        : `${targetHost || ''}: ${action}`;
+      return cleanLabel(what, 120);
+    }
     const p = params || {};
     const cmd = (p.params && p.params.command) || p.command || '';
     const what = action === 'ssh_exec' ? `ssh ${targetHost || ''}: ${JSON.stringify(String(cmd)).slice(1, -1)}` : `${action} ${targetUrl || targetHost || ''}`;
@@ -146,7 +156,10 @@ module.exports = function registerUseApprovals(deps) {
 
   // ── lifecycle ──────────────────────────────────────────────────────────────────────────────────────────────────
   function expireOld() {
+    // A request that ends takes its one-use key with it (item 1: no private half outside an active window).
+    const gone = db.prepare("SELECT id FROM use_approvals WHERE status IN ('pending', 'approved') AND expires_at <= ? AND eph_pub IS NOT NULL").all(nowIso());
     db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ?, unwrap_blob = NULL WHERE status IN ('pending', 'approved') AND expires_at <= ?").run(nowIso(), nowIso());
+    if (cryptoDepth && cryptoDepth.dropEphemeral) for (const r of gone) cryptoDepth.dropEphemeral('a:' + r.id);
   }
   function view(row, me) {
     const owner = row.owner_did === me;
@@ -201,8 +214,14 @@ module.exports = function registerUseApprovals(deps) {
       const until = new Date(Date.parse(denied.decided_at) + DENY_COOLDOWN_SEC * 1000).toISOString();
       return { error: `the owner denied your last request — you can ask again after ${until}`, status: 429, extra: { cooldown_until: until } };
     }
-    const pending = db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending'").get(secret.did).n;
+    // DemiPass grants wait a day, so they have their own queue (#77 review M3): they cannot crowd out uses of secrets,
+    // and the owner's own DID — whatever labels it signs in under — holds at most MAX_PENDING_GRANTS_OWN of them.
+    const grant = isGrantKey(secret.service_key);
+    const pending = db.prepare(`SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending' AND ${grant ? "service_key LIKE 'svc:demipass:%'" : "COALESCE(service_key, '') NOT LIKE 'svc:demipass:%'"}`).get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
+    if (grant && own && db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND requester_did = ? AND status = 'pending' AND service_key LIKE 'svc:demipass:%'").get(secret.did, requesterDid).n >= MAX_PENDING_GRANTS_OWN) {
+      return { error: `at most ${MAX_PENDING_GRANTS_OWN} of your own grant requests can wait at once`, status: 429 };
+    }
     const id = Number(db.prepare(`INSERT INTO use_approvals (kind, secret_id, owner_did, requester_did, requester_label, delegation_id, depth, purpose, summary,
                                   binding, code_key, created_at, expires_at, bound_call, service_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),

@@ -23,7 +23,8 @@
 const crypto = require('crypto');
 
 const MARKER = 'dpwrap:v1';                 // what encrypted_value holds once wrapped (never decrypts)
-const EPHEMERAL_TTL_MS = 75 * 60 * 1000;    // longer than an approval's life (60 min pending + 5 min approved; use_approvals.js)
+const EPHEMERAL_TTL_MS = 15 * 60 * 1000;    // an owner unwrap session ('s:')
+const APPROVAL_EPHEMERAL_TTL_MS = 70 * 60 * 1000;   // an approval's one-use key ('a:'): 60 min pending + 5 min approved (use_approvals.js); dropped when the request ends
 const OAEP = { padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha1' };   // Android Keystore OAEP: MGF1 is SHA-1
 
 module.exports = function registerCryptoDepth(deps) {
@@ -73,7 +74,7 @@ module.exports = function registerCryptoDepth(deps) {
     sweep();
     const have = eph.get(tag);
     if (have) return have.pending ? have.pending : have.pub;
-    const entry = { priv: null, pub: null, exp: Date.now() + EPHEMERAL_TTL_MS };
+    const entry = { priv: null, pub: null, exp: Date.now() + (String(tag).startsWith('a:') ? APPROVAL_EPHEMERAL_TTL_MS : EPHEMERAL_TTL_MS) };
     entry.pending = genRsa().then(({ pub: publicKey, priv: privateKey }) => {
       entry.priv = privateKey; entry.pub = publicKey.export({ type: 'spki', format: 'der' }).toString('base64'); entry.pending = null;
       return entry.pub;

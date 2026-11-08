@@ -388,26 +388,33 @@ module.exports = function registerFleetRoutes(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/token-request', rateLimitStandard, (req, res) => {
     const who = bearer(req, res); if (!who) return;
     if (who.decoded.wrk || who.decoded.auth_method === 'worker') return res.status(403).json({ error: 'a worker token cannot ask for a silicon token' });
+    const notFound = () => res.status(404).json({ error: 'silicon not found' });
     const fleet = db.prepare("SELECT * FROM fleets WHERE slug = ? AND status = 'active'").get(req.params.slug);
-    if (!fleet) return res.status(404).json({ error: 'fleet not found' });
+    if (!fleet) return notFound();
+    // Who may ask (#77 review M1, L5): the fleet owner's own tokens, or an agent this fleet CREATED (the silicon itself
+    // included) — never a linked or network-joined wallet, which is someone else's. Checked before the silicon is
+    // looked up, so outsiders learn nothing about which handles exist.
+    const createdHere = Boolean(db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1 AND COALESCE(joined_via, 'owner') != 'network'").get(fleet.id, who.did));
+    if (who.did !== fleet.owner_did && !createdHere) return notFound();
+    if (who.decoded.fleet && String(who.decoded.fleet) !== fleet.slug) return notFound();   // a token minted by another fleet speaks for that one
     const s = fb.getSilicon(db, fleet.id, String(req.params.handle || '').toLowerCase());
-    if (!s || s.status !== 'active') return res.status(404).json({ error: 'silicon not found' });
+    if (!s || s.status !== 'active') return notFound();
     if (s.joined_via === 'network' || !fb.ownedOutright(s)) return res.status(403).json({ error: `@${s.handle} keeps its own key: it signs in itself` });
-    const isSelf = who.did === s.member_did;
-    const isPeer = Boolean(db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active'").get(fleet.id, who.did));
-    if (!isSelf && !isPeer) return res.status(403).json({ error: 'only the silicon itself or another agent of its fleet can ask for its token' });
     const b = req.body || {};
     const scope = b.scope === undefined ? TOKEN_SCOPE_CAP : String(b.scope);
     if (!identity.ISSUABLE_SCOPES.includes(scope) || identity.scopeAtLeast(scope, 'admin')) return res.status(400).json({ error: `scope must be read, write or ${TOKEN_SCOPE_CAP}` });
+    if (!identity.scopeAtLeast(who.scope, scope)) return res.status(403).json({ error: `your token is ${who.scope}: it can ask for ${who.scope} at most` });   // #77 review L4
     const expiresIn = b.expires_in === undefined ? '30d' : String(b.expires_in);
     const m = /^(\d+)(h|d)$/.exec(expiresIn);
     if (!m || (m[2] === 'd' ? Number(m[1]) * 24 : Number(m[1])) > 30 * 24 || Number(m[1]) < 1) return res.status(400).json({ error: 'expires_in: 1h to 30d' });
     const A = deps.approvals && deps.approvals();
     if (!A || !A.gateService) return res.status(503).json({ error: 'approvals unavailable' });
     const requester = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(who.did) || {};
-    const g = A.gateService({ key: 'svc:demipass:silicon-token', name: `token for @${s.handle}`, approverDid: fleet.owner_did, depth: 'elevated' },
+    // Critical: the PIN opens it every time, a recent unlock does not stand in (#77 review L6). Bound to the silicon's
+    // wallet, not only its handle (L3).
+    const g = A.gateService({ key: 'svc:demipass:silicon-token', name: `token for @${s.handle}`, approverDid: fleet.owner_did, depth: 'critical' },
       { did: who.did, label: requester.username || '' },
-      { action: 'silicon-token', targetHost: fleet.slug, params: { silicon: s.handle, scope, expires_in: expiresIn, collected_by: requester.username || who.did } }, b);
+      { action: 'silicon-token', targetHost: fleet.slug, params: { silicon: s.handle, silicon_did: s.member_did, scope, expires_in: expiresIn, collected_by: requester.username || who.did } }, b);
     if (!g.ok) { const body = { ...(g.body || {}) }; delete body.owner; if (g.status === 202) body.next = `Park this. The fleet owner approves it in the DemiPass app; then make the same call once more with approval_id to collect @${s.handle}'s token.`; return res.status(g.status).json(body); }
     const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(s.member_did);
     if (!wallet) return res.status(404).json({ error: 'identity not found' });

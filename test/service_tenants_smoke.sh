@@ -255,10 +255,20 @@ approve "$OWN" "$W1"; call PUT /api/services/fleetgate/actions "$FG" "$(jbody ac
 call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" '{"scope":"transact","expires_in":"7d"}'; TR=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$TR")" = "$(did owner)" ] && [ "$(Q "SELECT service_key FROM use_approvals WHERE id=$TR")" = svc:demipass:silicon-token ] && noname \
   && ok "another agent of the fleet asks for @agent's token: a request on the owner's phone (202, names nobody)" || fail "token request: $CODE $BODY"
+[ "$(Q "SELECT summary FROM use_approvals WHERE id=$TR")" = "token for @agent (transact, 7d), collected by cd" ] && [ "$(Q "SELECT depth FROM use_approvals WHERE id=$TR")" = critical ] \
+  && ok "the card names the silicon, scope, lifetime and collector; critical (PIN every time)" || fail "summary: $(Q "SELECT summary FROM use_approvals WHERE id=$TR")"
 HRS=$(python3 -c "import sqlite3,datetime as d; r=sqlite3.connect('$DB_PATH').execute('SELECT created_at, expires_at FROM use_approvals WHERE id=$TR').fetchone(); a,b=[d.datetime.fromisoformat(x.replace('Z','+00:00')) for x in r]; print(round((b-a).total_seconds()/3600))")
 [ "$HRS" = 24 ] && ok "a DemiPass grant waits a day for the owner (not 5 minutes)" || fail "grant TTL: $HRS h"
 call POST /api/fleet/owner-agents/silicons/agent/token-request "$STR" '{}'; A1=$CODE
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$EXT" '{}'; [ "$A1" = 403 ] && [ "$CODE" = 403 ] && ok "another fleet's agent, or a person outside the fleet, cannot ask" || fail "outsider request: $A1 $CODE"
+call POST /api/fleet/owner-agents/silicons/agent/token-request "$EXT" '{}'; [ "$A1" = 404 ] && [ "$CODE" = 404 ] && ok "another fleet's agent, or a person outside the fleet, cannot ask (404: no handle is confirmed)" || fail "outsider request: $A1 $CODE"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); f=c.execute(\"SELECT id FROM fleets WHERE slug='owner-agents'\").fetchone()[0]; d=c.execute(\"SELECT did FROM identity_wallets WHERE username='ext'\").fetchone()[0]; c.execute(\"INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet, joined_via) VALUES (?, ?, 'ext-net', 'sil_extnet', 'active', 0, 'network')\", (f, d)); c.commit()" "$DB_PATH"
+call POST /api/fleet/owner-agents/silicons/agent/token-request "$EXT" '{}'; [ "$CODE" = 404 ] && ok "a network-joined member (someone else's wallet) cannot ask for a created silicon's token (#77 M1)" || fail "network peer: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM fleet_silicons WHERE handle='ext-net'\"); c.commit()" "$DB_PATH"
+CDR=$(node -e '
+const identity = require("./identity"); const Database = require("better-sqlite3");
+const db = new Database(process.env.DB_PATH); const w = db.prepare("SELECT did, encrypted_private_key FROM identity_wallets WHERE username = ?").get("cd");
+process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: "read", expiresIn: "1h", metadata: { auth_method: "fleet_owner_mint", fleet: "owner-agents" } }));')
+call POST /api/fleet/owner-agents/silicons/agent/token-request "$CDR" '{"scope":"transact"}'; [ "$CODE" = 403 ] && ok "a read token cannot ask for a transact token (#77 L4)" || fail "scope escalation: $CODE $BODY"
 call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" "$(jbody scope transact expires_in 7d approval_id "$TR")"; [ "$CODE" = 202 ] && ok "collecting before approval: still pending" || fail "early collect: $CODE"
 approve "$OWN" "$TR"
 call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" "$(jbody scope transact expires_in 30d approval_id "$TR")"; [ "$CODE" = 409 ] && ok "the approval binds scope and lifetime (30d instead of 7d → 409)" || fail "binding: $CODE $BODY"
@@ -293,6 +303,11 @@ call GET /api/services/charges "$FG"; [ "$(echo "$BODY" | python3 -c 'import jso
 call GET /api/services/charges "$POOR"; [ "$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["paid"]), "received" in d)')" = "0 False" ] && ok "…and nobody else does" || fail "poor charges: $BODY"
 grep -q "$ST" "$S/server.log" && fail "a service token reached the server log" || ok "no token in the server log"
 
+# ── a day-long queue cannot be filled from one DID (#77 M3) ──────────────────────────────────────────────────────
+OWN=$(login owner); n202=0; last=""
+for k in $(seq 1 12); do call POST /api/services/register "$OWN" "$(jbody slug "spam-$k" name "label-$k")"; [ "$CODE" = 202 ] && n202=$((n202+1)); last=$CODE; done
+[ "$n202" -le 10 ] && [ "$last" = 429 ] && ok "the owner's own DID holds at most 10 waiting grants, whatever labels it uses" || fail "grant cap: $n202 then $last"
+
 # ── the owner's phone hears of every pending request (the D-signed alerts call) ──────────────────────────────────
 node -e 'const c=require("crypto"),fs=require("fs");for(const n of ["d","p"]){const {privateKey,publicKey}=c.generateKeyPairSync("ec",{namedCurve:"prime256v1"});
 fs.writeFileSync(process.argv[1]+"/"+n+".pem",privateKey.export({type:"pkcs8",format:"pem"}));fs.writeFileSync(process.argv[1]+"/"+n+".pub",publicKey.export({type:"spki",format:"der"}).toString("base64"))}' "$S"
@@ -307,6 +322,10 @@ call POST /api/identity/holds/challenge "" '{"purpose":"alerts","device_id":"pho
 call POST /api/identity/holds/alerts "" "$(jbody device_id phone-0001 challenge "$CH" signature "$(sig d "$M")")"
 echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x for x in d.get("approvals",[]) if x["id"]==int(sys.argv[1])]; sys.exit(0 if a and a[0]["title"]=="demipass · silicon-token" else 1)' "$PR" \
   && ok "the phone's alerts call lists the pending request (headline only)" || fail "alerts approvals: $BODY"
+python3 -c "import sqlite3,sys,datetime; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE device_keys SET revoked_at=?, revoked_via='recovery' WHERE device_id='phone-0001'\", (datetime.datetime.utcnow().isoformat()+'Z',)); c.commit()" "$DB_PATH"
+call POST /api/identity/holds/challenge "" '{"purpose":"alerts","device_id":"phone-0001"}'; CH=$(echo "$BODY" | J challenge); M=$(echo "$BODY" | J message)
+call POST /api/identity/holds/alerts "" "$(jbody device_id phone-0001 challenge "$CH" signature "$(sig d "$M")")"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("approvals",[])))')" = 0 ] && ok "a removed phone (still in its hold-cancel grace) is not told what waits (#77 M2)" || fail "removed phone: $CODE $BODY"
 
 [ $fails -gt 0 ] && { echo "--- server.log"; grep -i -m8 "error" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))
