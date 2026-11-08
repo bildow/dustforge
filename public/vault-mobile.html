@@ -670,6 +670,27 @@
 </div>
 
 <!-- Pair in person (QR) — red team item 6 -->
+<!-- A person in the network (tap a People card) -->
+<div id="modal-person" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3 id="person-name"></h3>
+    <div id="person-state" style="font-size:0.8rem"></div>
+    <div id="person-pair" style="display:flex;gap:0.5rem;margin-top:0.9rem"><button class="btn-ghost" style="flex:1" onclick="personQr()">Pair in person (QR)</button><button class="btn-ghost" style="flex:1" onclick="personEmail()">Pair by email code</button></div>
+    <div id="person-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="personRemove()">Remove</button><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" onclick="personSend()">Send DD</button></div>
+  </div>
+</div>
+
+<!-- Pair by email code: send a link / type their code (inviter) · show my code (the one who opened the link) -->
+<div id="modal-epair" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3 id="epair-title">Pair by email code</h3>
+    <div id="epair-body"></div>
+    <div id="epair-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" id="epair-go">Send link</button></div>
+  </div>
+</div>
+
 <div id="modal-pair" class="modal-bg" onclick="if(event.target===this)closePair()">
   <div class="modal-sheet" style="text-align:center">
     <h3>Pair in person</h3>
@@ -706,6 +727,7 @@ let fillReqs=[], fillBusy=new Set();   // browser fill requests waiting on this 
 let grantReqs=[];   // agent browser-fill grants waiting on this wallet (ids share fillBusy as 'g'+id)
 let accessReqs=[], accessPick={};  // agents in your fleets asking for a secret (ids share fillBusy as 'a'+id), and the secret picked per card
 let vouchData=null;   // introductions (vouches): GET /api/network/vouches
+let epairData=null, epairOpen=null, personOpen=null;   // email-code pairings (GET /api/network/pair/email); the open person sheet
 let netData=null, netBusy=new Set(), sendTo=null, sendBusy=false, topupBusy=false;   // network: GET /api/network, requests being decided, the open send
 let pinSetupDone=null, pinUnlockDone=null;   // resolvers of the pending PIN sheets (settled false by logout)
 let pinUnlockIntent=null;   // the one action the open PIN sheet unlocks, as the server named it in its 403
@@ -1312,6 +1334,7 @@ async function showApp(){
   loadNetwork();
   // Item 9: a waiting change to the wallet shows in Settings; opened from the alert notification, go there.
   if(location.hash==='#holds'){ goPage('settings'); loadDevices(); loadHolds(); } else loadHolds();
+  epairFromHash();   // opened from an email-code pairing link
 }
 
 // ── Network: people, agents joining a fleet, sending DD ───────────────────
@@ -1324,6 +1347,7 @@ async function loadNetwork(){
   try{ const r=await api('GET','/api/network'); if(epoch!==sessionEpoch) return null; netData=r; }
   catch(e){ if(sessionEnded(e)||epoch!==sessionEpoch) return null; if(e.status!==429) netData=null; }
   try{ const v=await api('GET','/api/network/vouches'); if(epoch!==sessionEpoch) return null; vouchData=v; }catch(e){ if(sessionEnded(e)) return null; }
+  try{ const ep=await api('GET','/api/network/pair/email'); if(epoch!==sessionEpoch) return null; epairData=ep; }catch(e){ if(sessionEnded(e)) return null; }
   renderNetRequests();
   return netData;
 }
@@ -1382,7 +1406,12 @@ function networkSection(n){
     h+='<div class="fr-row" style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-primary" style="flex:1" onclick="openTopup()">Ask for DD</button><button class="btn-ghost" style="flex:1" onclick="openSend('+jsArg(m.owner)+')">Send DD</button><button class="btn-ghost" style="flex:1" onclick="leaveFleet()">Leave fleet</button></div></div>';
   }
   h+='<div class="section-head" style="padding:0.25rem 0 0.5rem"><span class="section-title">People</span><span style="font-size:0.7rem;color:var(--text3)">'+dd(n.me&&n.me.balance_cents)+' DD in your wallet</span></div>';
-  h+='<button class="btn-primary" style="width:100%;margin:0 0 0.6rem" onclick="openPair()">Pair in person (QR)</button>';
+  h+='<div style="display:flex;gap:0.5rem;margin:0 0 0.6rem"><button class="btn-primary" style="flex:1" onclick="openPair()">Pair in person (QR)</button><button class="btn-ghost" style="flex:1" onclick="openEmailPair()">Pair by email code</button></div>';
+  // Email-code links I sent (type their code) and ones I opened (read my code to them).
+  for(const e of ((epairData&&epairData.pairings)||[])){
+    if(e.role==='inviter') h+='<div class="fill-req" style="cursor:pointer" onclick="openEmailPairing('+Number(e.pair_id)+')"><div>'+(e.status==='joined'?'<b>'+esc(e.other||'')+'</b> opened your link — type the code they read you':'Link sent to '+esc(e.to||'')+' — waiting for them to open it')+'</div><div style="color:var(--text3);margin-top:0.2rem">until '+esc(new Date(e.expires_at).toLocaleTimeString())+' · tap to '+(e.status==='joined'?'type the code':'see or cancel')+'</div></div>';
+    else h+='<div class="fill-req" style="cursor:pointer" onclick="openEmailPairing('+Number(e.pair_id)+')"><div>Your code for <b>'+esc(e.other||'')+'</b> — tap to show it</div></div>';
+  }
   const qrPeople=(n.people||[]).filter(p=>p.confirmed_via==='qr');
   if(qrPeople.length>=2) h+='<button class="btn-ghost" style="width:100%;margin:0 0 0.6rem;font-size:0.75rem" onclick="openVouch()">Introduce two people you met in person</button>';
   const intros=((vouchData&&vouchData.vouches)||[]).filter(v=>v.status==='pending');
@@ -1398,8 +1427,11 @@ function networkSection(n){
   }
   if(!(n.people||[]).length) h+='<div class="empty" style="font-size:0.75rem">No contacts yet. Meet them and tap “Pair in person”: you can share secrets only with people you paired with face to face.</div>';
   for(const p of n.people||[]){
-    h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:0.5rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.82rem">';
-    h+='<span><strong>'+esc(p.username||String(p.did).slice(8,20)+'…')+'</strong> '+(p.confirmed?'<span title="confirmed" style="font-size:0.65rem;color:var(--green,#3fb950)">'+(p.confirmed_via==='vouch'?'✓ vouched by @'+esc(p.vouched_by||''):'✓ met in person')+'</span>':'<span style="font-size:0.65rem;color:var(--text3)">not paired — no sharing</span>')+'</span><span style="display:flex;gap:0.4rem"><button class="btn-primary" style="font-size:0.7rem;padding:0.35rem 0.6rem" onclick="openSend('+jsArg(p.username)+')">Send DD</button><button class="btn-ghost" style="font-size:0.7rem" onclick="removePerson('+jsArg(p.username)+')">Remove</button></span></div>';
+    const via=p.confirmed_via, tag=p.confirmed?(via==='vouch'?'✓ vouched by @'+esc(p.vouched_by||''):via==='email-code'?'✓ confirmed by email code':'✓ met in person'):'not paired — no sharing';
+    h+='<div onclick="openPerson('+jsArg(p.username)+')" style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.7rem 1rem;margin-bottom:0.5rem;cursor:pointer">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center"><strong style="color:var(--accent)">'+esc(p.username||String(p.did).slice(8,20)+'…')+'</strong><span style="font-size:0.7rem;color:var(--text3)">›</span></div>';
+    h+='<div style="font-size:0.68rem;margin-top:0.3rem;color:'+(p.confirmed?'var(--green,#3fb950)':'var(--text3)')+'">'+tag+(p.confirmed&&!p.can_share?' <span style="color:var(--text3)">· DD only, no sharing</span>':'')+'</div>';
+    h+='</div>';
   }
   if((n.agents||[]).length){
     h+='<div style="font-size:0.7rem;color:var(--text3);margin:0.6rem 0 1rem">Your agents are under Silicons below. To send one DD: <span>';
@@ -1510,6 +1542,92 @@ async function topupAct(id, act){
 }
 function declineTopup(id){ topupAct(id,'decline'); }
 function withdrawTopup(id){ topupAct(id,'withdraw'); }
+// ── A person's sheet (Aaron 2026-11-07: people are clickable like agents) ──────────────────────────────────────────
+function openPerson(username){
+  const p=((netData&&netData.people)||[]).find(x=>x.username===username); if(!p) return; personOpen=p;
+  document.getElementById('person-name').textContent=p.username;
+  const via=p.confirmed_via;
+  document.getElementById('person-state').innerHTML=p.confirmed
+    ?('<span style="color:var(--green,#3fb950)">'+(via==='vouch'?'✓ Confirmed — vouched by @'+esc(p.vouched_by||''):via==='email-code'?'✓ Confirmed by email code':'✓ Confirmed — you met in person')+'</span>'+(p.can_share?'<div style="color:var(--text3);margin-top:0.25rem">You can send each other DD and share secrets.</div>':'<div style="color:var(--text3);margin-top:0.25rem">You can send each other DD. Sharing secrets still takes pairing in person.</div>'))
+    :'<span style="color:var(--text3)">A contact, not confirmed: you can send each other DD; to share secrets, pair in person.</span>';
+  document.getElementById('person-pair').style.display=p.can_share?'none':'flex';
+  document.getElementById('person-msg').textContent='';
+  openModal('person');
+}
+function personSend(){ const p=personOpen; closeSheet('person'); if(p) openSend(p.username); }
+function personRemove(){ const p=personOpen; closeSheet('person'); if(p) removePerson(p.username); }
+function personQr(){ closeSheet('person'); openPair(); }
+function personEmail(){ const p=personOpen; closeSheet('person'); openEmailPair(p?p.username:''); }
+
+// ── Pair by email code (email_pairing.js): I send a link; they open it signed in and read me the code; I type it ────
+function openEmailPair(to){
+  epairOpen=null;
+  document.getElementById('epair-title').textContent='Pair by email code';
+  document.getElementById('epair-body').innerHTML='<p style="font-size:0.8rem;color:var(--text3);margin-bottom:0.5rem">We email them a link. They open it signed in to their own DemiPass wallet and see a 6-digit code. They tell you the code themselves — a call, or in person — and you type it here. Only accept a code from someone you recognise.</p>'
+    +'<label>Their email, or their DemiPass username</label><input type="text" id="epair-to" autocomplete="off" autocapitalize="none" placeholder="name@example.com or username" value="'+esc(to||'')+'">';
+  setEpairActions('Send link','sendEmailPair()');
+  document.getElementById('epair-msg').textContent=''; openModal('epair');
+}
+function setEpairActions(label, fn){
+  const b=document.getElementById('epair-go'); if(!label){ b.style.display='none'; return; }
+  b.style.display=''; b.textContent=label; b.setAttribute('onclick',fn);
+}
+async function sendEmailPair(){
+  const to=String(document.getElementById('epair-to').value||'').trim(); const m=document.getElementById('epair-msg');
+  if(!to){ m.className='modal-msg err'; m.textContent='Enter their email or username'; return; }
+  try{ const r=await api('POST','/api/network/pair/email',{to}); epairOpen=r; renderEmailPairing(); m.className='modal-msg ok'; m.textContent=r.next||'Sent.'; loadNetwork(); }
+  catch(e){ if(!sessionEnded(e)){ m.className='modal-msg err'; m.textContent=e.message; } }
+}
+async function openEmailPairing(id){
+  try{ epairOpen=await api('GET','/api/network/pair/email/'+Number(id)); }catch(e){ if(!sessionEnded(e)) alert(e.message); return; }
+  document.getElementById('epair-msg').textContent=''; renderEmailPairing(); openModal('epair');
+}
+function renderEmailPairing(){
+  const e=epairOpen; if(!e) return; const body=document.getElementById('epair-body');
+  if(e.role==='joiner'){
+    document.getElementById('epair-title').textContent='Your code for '+(e.other||'');
+    body.innerHTML='<div style="font-size:2.2rem;font-weight:700;letter-spacing:0.3rem;text-align:center;margin:0.75rem 0">'+esc(e.code||'——————')+'</div>'
+      +'<p style="font-size:0.8rem;color:var(--text3)">Tell <b>'+esc(e.other||'')+'</b> this code yourself — a call or in person, never by email or chat. They type it in their app. If you did not expect this, tap Cancel.</p>';
+    setEpairActions('Cancel this pairing','cancelEmailPair()'); return;
+  }
+  document.getElementById('epair-title').textContent='Pair by email code';
+  if(e.status==='joined'){
+    body.innerHTML='<p style="font-size:0.8rem;color:var(--text3)"><b>'+esc(e.other||'')+'</b> opened your link. Type the 6-digit code they read you — only if you recognise who is speaking.</p>'
+      +'<label>Their code</label><input type="text" id="epair-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="6 digits">'
+      +'<div style="font-size:0.72rem;color:var(--text3);margin-top:0.3rem">'+Number(e.code_tries_left)+' tries left · <a href="#" style="color:var(--accent)" onclick="cancelEmailPair();return false">cancel</a></div>';
+    setEpairActions('Confirm','confirmEmailPair()');
+  } else {
+    body.innerHTML='<p style="font-size:0.8rem;color:var(--text3)">Link sent to '+esc(e.to||'')+'. When they open it, they see a code to read you; this screen then asks for it. The link works until '+esc(new Date(e.expires_at).toLocaleTimeString())+'.</p>'
+      +'<div style="font-size:0.72rem;margin-top:0.3rem"><a href="#" style="color:var(--accent)" onclick="cancelEmailPair();return false">Cancel the link</a></div>';
+    setEpairActions('Check again','openEmailPairing('+Number(e.pair_id)+')');
+  }
+}
+async function confirmEmailPair(){
+  const e=epairOpen; const m=document.getElementById('epair-msg'); if(!e) return;
+  const code=String((document.getElementById('epair-code')||{}).value||'').replace(/\s+/g,'');
+  if(!/^\d{6}$/.test(code)){ m.className='modal-msg err'; m.textContent='Type the 6 digits they read you'; return; }
+  try{
+    const r=await apiGated('POST','/api/network/pair/email/'+Number(e.pair_id)+'/confirm',{code},'Confirm '+(e.other||'')+' as a contact? Your PIN approves it.');
+    epairOpen=r; document.getElementById('epair-body').innerHTML='<p style="font-size:0.85rem">✓ '+esc(e.other||'')+' is a confirmed contact.</p><p style="font-size:0.75rem;color:var(--text3)">You can send each other DD. Sharing secrets still takes pairing in person.</p>';
+    setEpairActions(null); m.textContent=''; loadNetwork();
+  }catch(x){ if(!/cancelled/.test(x.message)&&!sessionEnded(x)){ m.className='modal-msg err'; m.textContent=x.message; if(x.status===403&&/cancelled/.test(x.message)) loadNetwork(); } }
+}
+async function cancelEmailPair(){
+  const e=epairOpen; if(!e) return;
+  try{ await api('POST','/api/network/pair/email/'+Number(e.pair_id)+'/cancel',{}); }catch(_){}
+  closeSheet('epair'); loadNetwork();
+}
+// A link from the email (vault-mobile.html#epair=<id>.<secret>): open it once signed in; the PIN binds this wallet.
+async function epairFromHash(){
+  const h=String(location.hash||''); if(!h.startsWith('#epair=')) return;
+  const token=h.slice(7);
+  try{ history.replaceState(null,'',location.pathname+location.search); }catch(_){}
+  try{
+    const r=await apiGated('POST','/api/network/pair/email/join',{token},'Open this pairing link as '+user+'? Your PIN approves it.');
+    epairOpen=r; document.getElementById('epair-msg').textContent=''; renderEmailPairing(); openModal('epair'); loadNetwork();
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert('Pairing link: '+e.message); }
+}
+
 async function removePerson(username){
   if(!confirm('Remove '+username+' from your contacts? You can no longer send each other DD until one of you adds the other again.')) return;
   try{ await api('POST','/api/network/people/remove',{username}); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
@@ -1685,7 +1803,7 @@ function peopleSection(s){
 }
 async function openShare(name, mode){
   shareMode={name,mode};
-  const n=netData||await loadNetwork(); const people=((n&&n.people)||[]).filter(p=>p.confirmed);   // shares go only to people paired in person
+  const n=netData||await loadNetwork(); const people=((n&&n.people)||[]).filter(p=>p.can_share!==undefined?p.can_share:(p.confirmed&&p.confirmed_via!=='email-code'));   // shares: in person (QR) or vouched — not an email code
   document.getElementById('sh-title').textContent=mode==='transfer'?'Transfer to a person':'Share with a person';
   document.getElementById('sh-what').textContent=name;
   document.getElementById('sh-go').textContent=mode==='transfer'?'Transfer':'Share';

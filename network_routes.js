@@ -243,6 +243,7 @@ module.exports = function registerNetworkRoutes(deps) {
     const peers = db.prepare("SELECT * FROM network_peers WHERE (did_a = ? OR did_b = ?) AND status = 'active' ORDER BY id").all(me, me)
       .map(p => { const did = p.did_a === me ? p.did_b : p.did_a; return { kind: 'person', did, username: walletName(did), since: p.created_at,
                confirmed: Boolean(p.verified_via), confirmed_via: p.verified_via || null,
+               can_share: ['qr', 'vouch'].includes(p.verified_via),   // email-code: DD and contacts only (email_pairing.js)
                vouched_by: p.vouched_by ? walletName(p.vouched_by) : null, confirmed_at: p.verified_at || null }; });   // confirmed = paired in person (pairing.js)
     const fleet = ownedFleet(me);
     const agents = fleet ? db.prepare("SELECT * FROM fleet_silicons WHERE fleet_id = ? AND status = 'active' ORDER BY handle").all(fleet.id)
