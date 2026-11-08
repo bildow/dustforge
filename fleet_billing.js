@@ -1027,7 +1027,7 @@ function tokenWarningEmail({ silicon, token }) {
 }
 
 module.exports = {
-  ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf,
+  ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
