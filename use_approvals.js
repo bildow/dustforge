@@ -81,6 +81,21 @@ module.exports = function registerUseApprovals(deps) {
   try { db.exec('ALTER TABLE use_approvals ADD COLUMN service_key TEXT DEFAULT NULL'); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_owner ON use_approvals(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_requester ON use_approvals(requester_did, status)');
+  // A wrapped secret's request needs its one-use key, which lives only in this process's memory (crypto_depth.js). At
+  // start there are none, so every such request still waiting (or approved, its unwrap made to a key now gone) can never
+  // be used: end it here, so the requester can ask again at once instead of being handed the dead one back as
+  // already_pending until it times out (Aaron 2026-11-08, approval 34 after the #80 deploy).
+  try {
+    const dead = db.prepare(`SELECT a.id, a.requester_did, a.secret_id FROM use_approvals a JOIN blindkey_secrets s ON s.id = a.secret_id
+        WHERE a.status IN ('pending', 'approved') AND (a.eph_pub IS NOT NULL OR s.wrap_state = 'device')`).all();
+    const end = db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ?, unwrap_blob = NULL WHERE id = ? AND status IN ('pending', 'approved')");
+    for (const r of dead) {
+      end.run(new Date().toISOString(), r.id);
+      try { db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+        .run('approval_expired', 'server', r.secret_id, '*', JSON.stringify({ approval_id: r.id, reason: 'server restart: its one-use key is gone; ask again' })); } catch (_) {}
+    }
+    if (dead.length) console.log(`[approvals] ${dead.length} wrapped-secret request(s) ended at start (one-use keys do not survive a restart)`);
+  } catch (_) { /* no wrap columns yet: nothing is wrapped */ }
 
   const nowIso = () => new Date().toISOString();
   const later = (sec) => new Date(Date.now() + sec * 1000).toISOString();
