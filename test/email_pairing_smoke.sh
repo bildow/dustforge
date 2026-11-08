@@ -116,7 +116,7 @@ for k in 1 2 3; do WC=$(printf '%06d' $(( (10#$CC + k) % 1000000 ))); call POST 
 [ "$(echo "$BODY" | J status)" = cancelled ] && [ "$(Q "SELECT status || '/' || COALESCE(code,'null') FROM email_pairings WHERE id=$ID2")" = cancelled/null ] && ok "3 wrong codes cancel it (code erased)" || fail "3 wrong: $BODY"
 call POST /api/network/pair/email/$ID2/confirm "$A" '{"code":"'"$CC"'"}'; [ "$CODE" = 409 ] && ok "…and the right code no longer works" || fail "after cancel: $CODE"
 
-# ── mail-bomb: one mailbox, many spellings → at most 3 links a day; display names and lists refused ──────────────────
+# ── mail-bomb: one mailbox, many spellings → at most 5 links a day (3 per sender); display names and lists refused ──────────────────
 n400=0; for v in 'x1<victim@gmail.com>' 'Victim <victim@gmail.com>' 'victim@gmail.com, other@example.com' '"v" <victim@gmail.com>' 'victim@gmail.com;x@y.com' 'grp: victim@gmail.com;'; do
   call POST /api/network/pair/email "$F" "$(python3 -c 'import json,sys; print(json.dumps({"to":sys.argv[1]}))' "$v")"; [ "$CODE" = 400 ] && n400=$((n400+1)); done
 [ "$n400" = 6 ] && ok "display names, lists and groups are refused (one bare mailbox only)" || fail "bare mailbox: $n400/6"
@@ -124,8 +124,9 @@ for v in victim@gmail.com Victim@Gmail.com v.ictim@gmail.com vi.ctim@gmail.com v
   for who in "$C" "$D" "$E"; do call POST /api/network/pair/email "$who" '{"to":"'"$v"'"}'; [ "$CODE" = 201 ] && { call POST /api/network/pair/email/$(echo "$BODY" | J pair_id)/cancel "$who"; }; done
 done
 sleep 0.8
-[ "$(Q "SELECT COUNT(*) FROM email_pairings WHERE to_canon='victim@gmail.com'")" = 3 ] && ok "16 spellings of one Gmail inbox (+tags, dots, case, googlemail), 3 senders, cancels: 3 links in all" || fail "per-mailbox cap: $(Q "SELECT COUNT(*) FROM email_pairings WHERE to_canon='victim@gmail.com'")"
-[ "$(grep -c -i -E "^To: .*@(gmail|googlemail)\.com" "$S/mail.log")" -le 3 ] && ok "…and at most 3 mails reached it" || fail "mails to victim: $(grep -c -i -E '^To: .*@(gmail|googlemail)' "$S/mail.log")"
+[ "$(Q "SELECT COUNT(*) FROM email_pairings WHERE to_canon='victim@gmail.com'")" = 5 ] && ok "16 spellings of one Gmail inbox (+tags, dots, case, googlemail), 3 senders, cancels: 5 links in all" || fail "per-mailbox cap: $(Q "SELECT COUNT(*) FROM email_pairings WHERE to_canon='victim@gmail.com'")"
+[ "$(Q "SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM email_pairings WHERE to_canon='victim@gmail.com' GROUP BY inviter_did)")" -le 3 ] && ok "…no one sender more than 3 of them (one wallet can't use up a person's day)" || fail "per-pair cap"
+[ "$(grep -c -i -E "^To: .*@(gmail|googlemail)\.com" "$S/mail.log")" -le 5 ] && ok "…and at most 5 mails reached it" || fail "mails to victim: $(grep -c -i -E '^To: .*@(gmail|googlemail)' "$S/mail.log")"
 for k in $(seq 1 10); do call POST /api/network/pair/email "$F" '{"to":"u'$k'@example.org"}'; [ "$CODE" = 201 ] && call POST /api/network/pair/email/$(echo "$BODY" | J pair_id)/cancel "$F"; done
 call POST /api/network/pair/email "$F" '{"to":"u11@example.org"}'; [ "$CODE" = 429 ] && ok "a sender gets 10 links a day, cancelled ones included" || fail "sender cap: $CODE $BODY"
 
@@ -137,6 +138,12 @@ call POST /api/network/pair/email "$A" '{"to":"stranger@example.net"}'; IX=$(ech
 pin "$C" "pair:$IX"; call POST /api/network/pair/email/join "$C" '{"token":"'"$TX"'"}'
 call GET /api/network/pair/email/$IX "$A"; [ "$(echo "$BODY" | J opener_matches_address)" = False ] && [ "$(echo "$BODY" | J other)" = pc ] && ok "a forwarded address link opened by @pc → opener_matches_address false (the app warns)" || fail "match false: $BODY"
 call POST /api/network/pair/email/$IX/cancel "$A"
+# A recovery email is set unverified: it must not make a forwarded link's opener "match" (#75 re-review).
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE identity_wallets SET recovery_email='spoof.target@example.net' WHERE username='pd'\"); c.commit()" "$DB_PATH"
+call POST /api/network/pair/email "$A" '{"to":"spoof.target@example.net"}'; IS=$(echo "$BODY" | J pair_id); TS=$(mailtoken spoof.target@example.net)
+pin "$D" "pair:$IS"; call POST /api/network/pair/email/join "$D" '{"token":"'"$TS"'"}'
+call GET /api/network/pair/email/$IS "$A"; [ "$(echo "$BODY" | J opener_matches_address)" = False ] && ok "an unverified recovery email set to the target address does not count as a match" || fail "recovery spoof: $BODY"
+call POST /api/network/pair/email/$IS/cancel "$A"
 # The opener became an agent between opening and A's confirm → refused inside the transaction.
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); f=c.execute(\"SELECT id FROM fleets WHERE slug='d-fleet'\").fetchone()[0]; c.execute(\"INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet) VALUES (?, (SELECT did FROM identity_wallets WHERE username='pe'), 'pe', 'sil_pe', 'active', 0)\", (f,)); c.commit()" "$DB_PATH"
 pin "$A" "pair:$IE"; call POST /api/network/pair/email/$IE/confirm "$A" '{"code":"'"$EC"'"}'

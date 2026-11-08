@@ -21,7 +21,8 @@ const crypto = require('crypto');
 const TTL_SEC = 30 * 60;          // an unopened link
 const JOINED_TTL_SEC = 30 * 60;   // after B opened it, for A to type the code
 const MAX_OPEN = 3;               // open links one inviter may have
-const MAX_PER_ADDRESS_DAY = 3;    // links to one mailbox in 24 h, from anyone (canonical: +tags, Gmail dots, case)
+const MAX_PER_ADDRESS_DAY = 5;    // links to one mailbox in 24 h, from anyone (canonical: +tags, Gmail dots, case) — the standing 5/day/recipient mail rule
+const MAX_PER_PAIR_DAY = 3;       // from one inviter to one mailbox in 24 h: one wallet cannot use up a person's whole day (#75 re-review)
 const MAX_PER_SENDER_DAY = 10;    // links one inviter may send in 24 h, cancelled and expired ones included
 const MAX_CODE_TRIES = 3;
 const MAX_WRONG_PER_HOUR = 10;    // wrong link tokens one wallet may present in an hour
@@ -148,6 +149,9 @@ module.exports = function registerEmailPairing(deps) {
     if (open >= MAX_OPEN) return res.status(429).json({ error: `at most ${MAX_OPEN} links open at once — finish or cancel one` });
     const recent = db.prepare('SELECT COUNT(*) AS n FROM email_pairings WHERE to_canon = ? AND created_at > ?').get(canon, dayAgo).n;
     if (recent >= MAX_PER_ADDRESS_DAY) return res.status(429).json({ error: 'that address has had enough pairing links today' });
+    if (db.prepare('SELECT COUNT(*) AS n FROM email_pairings WHERE to_canon = ? AND inviter_did = ? AND created_at > ?').get(canon, p.wallet.did, dayAgo).n >= MAX_PER_PAIR_DAY) {
+      return res.status(429).json({ error: `at most ${MAX_PER_PAIR_DAY} pairing links a day to one address` });
+    }
     const secret = crypto.randomBytes(16).toString('base64url');
     let id = 0;
     for (let i = 0; i < 8 && !id; i++) {
@@ -202,7 +206,9 @@ module.exports = function registerEmailPairing(deps) {
         const spent = spendSingleUse(p.wallet.did, 'pair', ['pin'], p.auth, intent);
         if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
         const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-        const own = [p.wallet.email, p.wallet.recovery_email].filter(Boolean).map(e => cap.canonicalAddress(e));
+        // Only the address DemiPass issued: a recovery email is set unverified, so it would let a forwarded-link holder
+        // switch A's mismatch warning off (#75 re-review).
+        const own = [p.wallet.email].filter(Boolean).map(e => cap.canonicalAddress(e));
         const n = db.prepare("UPDATE email_pairings SET joiner_did = ?, code = ?, status = 'joined', joined_at = ?, expires_at = ?, opener_matches = ? WHERE id = ? AND status = 'sent' AND expires_at > ?")
           .run(p.wallet.did, code, nowIso(), later(JOINED_TTL_SEC), own.includes(row.to_canon) ? 1 : 0, row.id, nowIso()).changes;
         if (n !== 1) throw Object.assign(new Error('this link was opened meanwhile, or expired'), { statusCode: 409 });
