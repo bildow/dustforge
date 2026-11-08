@@ -251,31 +251,11 @@ call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"merge-now
 approve "$OWN" "$W1"; call PUT /api/services/fleetgate/actions "$FG" "$(jbody actions '[{"action":"sign-charter","measured_cost_dd":5,"depth":"standard"}]' approval_id "$W1")"
 [ "$CODE" = 200 ] && [ "$(Q "SELECT depth FROM service_actions WHERE action='sign-charter'")" = standard ] && ok "approved: exactly that change applies" || fail "approved lower: $CODE $BODY"
 
-# ── a silicon's token is a REQUEST the fleet owner approves (Aaron 2026-11-08), never a value the owner mints ─────────
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" '{"scope":"transact","expires_in":"7d"}'; TR=$(echo "$BODY" | J approval_id)
-[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$TR")" = "$(did owner)" ] && [ "$(Q "SELECT service_key FROM use_approvals WHERE id=$TR")" = svc:demipass:silicon-token ] && noname \
-  && ok "another agent of the fleet asks for @agent's token: a request on the owner's phone (202, names nobody)" || fail "token request: $CODE $BODY"
-[ "$(Q "SELECT summary FROM use_approvals WHERE id=$TR")" = "token for @agent (transact, 7d), collected by cd" ] && [ "$(Q "SELECT depth FROM use_approvals WHERE id=$TR")" = critical ] \
-  && ok "the card names the silicon, scope, lifetime and collector; critical (PIN every time)" || fail "summary: $(Q "SELECT summary FROM use_approvals WHERE id=$TR")"
-HRS=$(python3 -c "import sqlite3,datetime as d; r=sqlite3.connect('$DB_PATH').execute('SELECT created_at, expires_at FROM use_approvals WHERE id=$TR').fetchone(); a,b=[d.datetime.fromisoformat(x.replace('Z','+00:00')) for x in r]; print(round((b-a).total_seconds()/3600))")
+# ── requests wait long enough to be seen (Aaron 2026-11-08) ─────────────────────────────────────────────────────
+call POST /api/services/register "$OWN" '{"slug":"ttl-probe","name":"ttl"}'; GR=$(echo "$BODY" | J approval_id)
+HRS=$(python3 -c "import sqlite3,datetime as d; r=sqlite3.connect('$DB_PATH').execute('SELECT created_at, expires_at FROM use_approvals WHERE id=$GR').fetchone(); a,b=[d.datetime.fromisoformat(x.replace('Z','+00:00')) for x in r]; print(round((b-a).total_seconds()/3600))")
 [ "$HRS" = 24 ] && ok "a DemiPass grant waits a day for the owner (not 5 minutes)" || fail "grant TTL: $HRS h"
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$STR" '{}'; A1=$CODE
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$EXT" '{}'; [ "$A1" = 404 ] && [ "$CODE" = 404 ] && ok "another fleet's agent, or a person outside the fleet, cannot ask (404: no handle is confirmed)" || fail "outsider request: $A1 $CODE"
-python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); f=c.execute(\"SELECT id FROM fleets WHERE slug='owner-agents'\").fetchone()[0]; d=c.execute(\"SELECT did FROM identity_wallets WHERE username='ext'\").fetchone()[0]; c.execute(\"INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet, joined_via) VALUES (?, ?, 'ext-net', 'sil_extnet', 'active', 0, 'network')\", (f, d)); c.commit()" "$DB_PATH"
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$EXT" '{}'; [ "$CODE" = 404 ] && ok "a network-joined member (someone else's wallet) cannot ask for a created silicon's token (#77 M1)" || fail "network peer: $CODE $BODY"
-python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM fleet_silicons WHERE handle='ext-net'\"); c.commit()" "$DB_PATH"
-CDR=$(node -e '
-const identity = require("./identity"); const Database = require("better-sqlite3");
-const db = new Database(process.env.DB_PATH); const w = db.prepare("SELECT did, encrypted_private_key FROM identity_wallets WHERE username = ?").get("cd");
-process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: "read", expiresIn: "1h", metadata: { auth_method: "fleet_owner_mint", fleet: "owner-agents" } }));')
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$CDR" '{"scope":"transact"}'; [ "$CODE" = 403 ] && ok "a read token cannot ask for a transact token (#77 L4)" || fail "scope escalation: $CODE $BODY"
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" "$(jbody scope transact expires_in 7d approval_id "$TR")"; [ "$CODE" = 202 ] && ok "collecting before approval: still pending" || fail "early collect: $CODE"
-approve "$OWN" "$TR"
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" "$(jbody scope transact expires_in 30d approval_id "$TR")"; [ "$CODE" = 409 ] && ok "the approval binds scope and lifetime (30d instead of 7d → 409)" || fail "binding: $CODE $BODY"
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" "$(jbody scope transact expires_in 7d approval_id "$TR")"; NT=$(echo "$BODY" | J token)
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J did)" = "$(did agent)" ] && ok "approved: the requester collects @agent's token" || fail "collect: $CODE $BODY"
-call GET /api/services/consents "$NT"; [ "$CODE" = 200 ] && ok "…and it works as @agent's own token" || fail "token works: $CODE $BODY"
-call POST /api/fleet/owner-agents/silicons/agent/token-request "$CD" "$(jbody scope transact expires_in 7d approval_id "$TR")"; [ "$CODE" = 410 ] && ok "one collection per approval (again → 410)" || fail "recollect: $CODE"
+[ "$(Q "SELECT summary FROM use_approvals WHERE id=$GR")" = "register service ttl-probe (ttl)" ] && ok "the card names what is granted" || fail "summary: $(Q "SELECT summary FROM use_approvals WHERE id=$GR")"
 V "$FG" "$(jbody token "$ET4" action broadcast call '{"to":"elevated-ttl"}')"; EAP=$(echo "$BODY" | J approval_id)
 MIN=$(python3 -c "import sqlite3,datetime as d; r=sqlite3.connect('$DB_PATH').execute('SELECT created_at, expires_at FROM use_approvals WHERE id=$EAP').fetchone(); a,b=[d.datetime.fromisoformat(x.replace('Z','+00:00')) for x in r]; print(round((b-a).total_seconds()/60))")
 [ "$MIN" = 60 ] && ok "an elevated action's request waits an hour (codes still rotate every 30 s)" || fail "action TTL: $MIN min"
@@ -317,11 +297,13 @@ call POST /api/identity/device/challenge "$OWN" '{"purpose":"enrol","intent":"de
 pin "$OWN" 4321 "device-enrol:0"; call POST /api/identity/gate/verify "$OWN" '{"gate":"password","password":"hunter22"}'
 call POST /api/identity/device/enrol "$OWN" "$(printf '{"challenge_id":%s,"device_id":"phone-0001","label":"Pixel","key_d":"%s","key_p":"%s","sig_d":"%s","sig_p":"%s"}' "$CHD" "$(cat $S/d.pub)" "$(cat $S/p.pub)" "$(sig d "$MSG")" "$(sig p "$MSG")")"
 [ "$CODE" = 201 ] || fail "enrol: $CODE $BODY"
-call POST /api/fleet/owner-agents/silicons/fg/token-request "$CD" '{}'; PR=$(echo "$BODY" | J approval_id)
+PR=$(Q "SELECT id FROM use_approvals WHERE status='pending' AND service_key='svc:demipass:register' ORDER BY id DESC LIMIT 1")
+call POST /api/fleet/owner-agents/silicons/fg/token-requests "$OWN" '{"scope":"transact","expires_in":"7d"}'; STR_ID=$(echo "$BODY" | J request_id)
+[ -n "$STR_ID" ] && [ "$STR_ID" != None ] || fail "#78 token request: $CODE $BODY"
 call POST /api/identity/holds/challenge "" '{"purpose":"alerts","device_id":"phone-0001"}'; CH=$(echo "$BODY" | J challenge); M=$(echo "$BODY" | J message)
 call POST /api/identity/holds/alerts "" "$(jbody device_id phone-0001 challenge "$CH" signature "$(sig d "$M")")"
-echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x for x in d.get("approvals",[]) if x["id"]==int(sys.argv[1])]; sys.exit(0 if a and a[0]["title"]=="demipass · silicon-token" else 1)' "$PR" \
-  && ok "the phone's alerts call lists the pending request (headline only)" || fail "alerts approvals: $BODY"
+echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); ids={x["id"] for x in d.get("approvals",[])}; sys.exit(0 if int(sys.argv[1]) in ids and 100000000000+int(sys.argv[2]) in ids else 1)' "$PR" "$STR_ID" \
+  && ok "the phone's alerts call lists pending requests: a grant, and an agent token request (#78)" || fail "alerts approvals: $BODY"
 python3 -c "import sqlite3,sys,datetime; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE device_keys SET revoked_at=?, revoked_via='recovery' WHERE device_id='phone-0001'\", (datetime.datetime.utcnow().isoformat()+'Z',)); c.commit()" "$DB_PATH"
 call POST /api/identity/holds/challenge "" '{"purpose":"alerts","device_id":"phone-0001"}'; CH=$(echo "$BODY" | J challenge); M=$(echo "$BODY" | J message)
 call POST /api/identity/holds/alerts "" "$(jbody device_id phone-0001 challenge "$CH" signature "$(sig d "$M")")"

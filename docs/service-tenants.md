@@ -107,23 +107,21 @@ Registration:
 
 ## A tenant's own token: requested, never minted for it
 
-A tenant's wallet is usually a fleet silicon. Its DemiPass token is **requested**:
-`POST /api/fleet/<fleet>/silicons/<handle>/token-request {scope?, expires_in?}`.
+A tenant's wallet is usually a fleet silicon. Its DemiPass token is **requested** through dustforge #78
+(`silicon_token_requests.js`).
 
-Who may request:
-- the silicon itself, to renew;
-- another active agent of the same fleet, such as the pane building it.
+1. File the request from the tenant's own container: `POST /api/fleet/<fleet>/silicons/<handle>/token-requests {scope, expires_in, claim_secret_hash}`.
+2. The fleet owner approves it in the app, with the PIN and the phone.
+3. The holder of the claim secret collects the token once: `POST /api/silicon-token-requests/<id>/claim`.
 
-Flow:
-1. The fleet owner approves in the app: PIN to open, and the phone signs.
-2. The same call again with `approval_id` hands the token to whoever asked, once.
-3. The approval binds the silicon, the scope, the lifetime and who collects it.
+Nothing should ask the owner to mint a token.
 
-The owner's own mint route still exists, but nothing should ask the owner to use it.
+**How long requests wait** (#77):
+- DemiPass grants (consent, registration, gate-weakening) wait 24 h.
+- A use of a secret, or an elevated tenant action, waits 1 h.
 
-Every DemiPass grant waits a day for the owner: consents, registrations, silicon tokens and gate-weakening. A use of a
-secret, or an elevated tenant action, waits an hour. Pending requests reach the owner's phone through its signed
-alerts check (app 1.12+).
+Pending requests of both kinds, and agent token requests, reach the owner's still-linked phone through its signed
+alerts check, which app 1.12+ notifies.
 
 ## Who may call an action
 
