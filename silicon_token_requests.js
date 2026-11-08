@@ -97,7 +97,10 @@ module.exports = function registerSiliconTokenRequests(deps) {
     expireRequests();
     const fleet = db.prepare("SELECT * FROM fleets WHERE slug = ? AND COALESCE(status,'active') = 'active'").get(req.params.slug);
     if (!fleet) return res.status(404).json({ error: 'fleet not found' });
-    const member = fleet.owner_did === auth.did || db.prepare('SELECT 1 FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, auth.did);
+    // Membership by consent only: an active fleet_silicons row (created by the fleet, linked with the wallet's own
+    // token, or joined through the network). A bare fleet_members row can be written by POST /api/fleet/:slug/invite
+    // without asking the wallet (threat model item 17), so it files nothing (#77 review note on #78).
+    const member = fleet.owner_did === auth.did || db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active'").get(fleet.id, auth.did);
     if (!member) return res.status(403).json({ error: 'fleet membership required' });
     const s = fb.getSilicon(db, fleet.id, String(req.params.handle || '').toLowerCase());
     if (!s || s.status !== 'active') return res.status(404).json({ error: 'silicon not found in this fleet' });

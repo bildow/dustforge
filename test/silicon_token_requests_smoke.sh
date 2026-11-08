@@ -43,13 +43,16 @@ const Database = require("better-sqlite3"); const db = new Database(process.env.
 const fid = db.prepare("SELECT id FROM fleets WHERE slug = ?").get("aaron-agents").id;
 const did = u => db.prepare("SELECT did FROM identity_wallets WHERE username = ?").get(u).did;
 db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)").run(fid, did("brainy"), "agent");
+// brainy joined by consent (network accept): an active fleet_silicons row. outsider-x is only "invited" (fleet_members, no consent).
+fb.upsertSilicon(db, { fleetId: fid, memberDid: did("brainy"), handle: "brainy" }); db.prepare("UPDATE fleet_silicons SET joined_via = ? WHERE handle = ?").run("network", "brainy");
+db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)").run(fid, did("outsider-x"), "agent");
 for (const h of ["conduit", "netjoin", "sib"]) { fb.upsertSilicon(db, { fleetId: fid, memberDid: did(h), handle: h }); db.prepare("UPDATE fleet_silicons SET created_by_fleet = 1 WHERE handle = ?").run(h); }
 db.prepare("UPDATE fleet_silicons SET joined_via = ? WHERE handle = ?").run("network", "netjoin");'
 PIN(){ call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"'$1'"}'; }
 R=/api/fleet/aaron-agents/silicons/conduit/token-requests
 
 umask 077; SECRET=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))'); SH=$(printf '%s' "$SECRET" | sha256sum | cut -d' ' -f1)
-call POST $R "$O" '{"label":"x"}'; [ "$CODE" = 403 ] && ok "someone outside the fleet cannot ask" || fail "outsider: $CODE $BODY"
+call POST $R "$O" '{"label":"x"}'; [ "$CODE" = 403 ] && ok "a wallet only 'invited' (fleet_members, no consent) cannot ask (threat model item 17)" || fail "invited outsider: $CODE $BODY"
 call POST /api/fleet/aaron-agents/silicons/netjoin/token-requests "$B" '{}'; [ "$CODE" = 403 ] && ok "an agent that joined through the network keeps its own key: refused" || fail "network: $CODE"
 call POST $R "$B" '{"scope":"admin"}'; [ "$CODE" = 400 ] && ok "admin scope → 400" || fail "admin scope: $CODE"
 call POST $R "$B" '{"claim_secret_hash":"xyz"}'; [ "$CODE" = 400 ] && ok "a malformed claim_secret_hash → 400" || fail "bad hash: $CODE"
