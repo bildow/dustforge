@@ -2868,6 +2868,7 @@ async function loadAgentTokenRequests(){
   try{ const r=await api('GET','/api/silicon-token-requests'); agentTokReqs=r.requests||[]; }catch(e){ if(sessionEnded(e)) return; }
   const el=document.getElementById('agent-token-requests'); if(!el) return;
   el.innerHTML=agentTokReqs.map(q=>'<div class="fill-req"><div>A token for your agent <b>@'+esc(q.handle)+'</b> (fleet '+esc(q.fleet)+') is asked for: <b>'+esc(q.scope)+'</b>, lasting '+esc(q.expires_in)+'</div>'
+    +(q.requester_role==='other_agent'?'<div style="color:var(--red);margin-top:0.25rem">Another agent, @'+esc(q.requested_by||'?')+', asks for @'+esc(q.handle)+'\'s token. If approved, @'+esc(q.requested_by||'?')+' can act as @'+esc(q.handle)+'.</div>':'')
     +(q.requested_by||q.says_it_is?'<div style="color:var(--text3);margin-top:0.25rem">asked by '+esc(q.requested_by||'?')+(q.says_it_is?', saying it is for “'+esc(q.says_it_is)+'”':'')+'</div>':'')
     +'<div style="color:var(--text3);margin-top:0.25rem">The token acts as @'+esc(q.handle)+' (spends its DD, uses what it was given) until it expires. It goes only to whoever filed the request. Approve only if you expected it.</div>'
     +'<div class="fr-row"><button class="btn-primary" '+(agentTokBusy.has(q.id)?'disabled ':'')+'onclick="agentTokDecide('+Number(q.id)+',true)">Approve</button>'

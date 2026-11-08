@@ -52,6 +52,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
     decided_at TEXT DEFAULT NULL,
     claimed_at TEXT DEFAULT NULL
   )`);
+  try { db.exec("ALTER TABLE silicon_token_requests ADD COLUMN requester_role TEXT DEFAULT ''"); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_str_owner ON silicon_token_requests(owner_did, status)');
 
   const sha = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -83,13 +84,16 @@ module.exports = function registerSiliconTokenRequests(deps) {
   }
   const view = (r) => ({ id: r.id, fleet: r.fleet_slug, handle: r.handle, scope: r.scope, expires_in: r.expires_in, says_it_is: r.says_it_is,
     requested_by: (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(r.requested_by_did) || {}).username || null,
-    status: r.status, created_at: r.created_at, expires_at: r.expires_at, intent: `silicon-token:${r.id}` });
+    requester_role: r.requester_role || '', status: r.status, created_at: r.created_at, expires_at: r.expires_at, intent: `silicon-token:${r.id}` });
+  const requesterName = (r) => (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(r.requested_by_did) || {}).username || '?';
 
   // ── file a request ──────────────────────────────────────────────────────────────────────────────────────────────
   app.post('/api/fleet/:slug/silicons/:handle/token-requests', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
     if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-    if (auth.silicon || (auth.decoded && auth.decoded.wrk)) return res.status(403).json({ error: 'ask with a wallet token of a fleet member' });
+    // A fleet-minted token acts as its agent but never reaches the agent's other fleets or its siblings through that
+    // fleet's owner (fleet_routes.js fleetAuth; leak_scan.js does the same) — #78 review M.
+    if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) return res.status(403).json({ error: 'ask with a fleet member\'s own wallet token (not a fleet-minted or worker token)' });
     expireRequests();
     const fleet = db.prepare("SELECT * FROM fleets WHERE slug = ? AND COALESCE(status,'active') = 'active'").get(req.params.slug);
     if (!fleet) return res.status(404).json({ error: 'fleet not found' });
@@ -101,8 +105,14 @@ module.exports = function registerSiliconTokenRequests(deps) {
     const b = req.body || {};
     const scope = b.scope === undefined ? TOKEN_SCOPE_CAP : String(b.scope);
     if (!identity.ISSUABLE_SCOPES.includes(scope) || identity.scopeAtLeast(scope, 'admin')) return res.status(400).json({ error: `scope must be read, write or ${TOKEN_SCOPE_CAP}` });
-    const expiresIn = b.expires_in === undefined ? '30d' : String(b.expires_in);
-    if (!/^\d{1,4}[smhd]$/.test(expiresIn)) return res.status(400).json({ error: 'expires_in: e.g. 24h, 7d, 30d' });
+    // The lifetime on the owner's card is the one minted: capped here by the scope's ceiling (identity.js), at least 1 h.
+    const asked = b.expires_in === undefined ? '30d' : String(b.expires_in);
+    const m = /^(\d{1,5})([smhd])$/.exec(asked);
+    if (!m) return res.status(400).json({ error: 'expires_in: e.g. 24h, 7d, 30d' });
+    const secs = Number(m[1]) * { s: 1, m: 60, h: 3600, d: 86400 }[m[2]];
+    if (secs < 3600) return res.status(400).json({ error: 'expires_in: at least 1h' });
+    const capSecs = Math.min(secs, (identity.SCOPE_MAX_TTL && identity.SCOPE_MAX_TTL[scope]) || 30 * 86400);
+    const expiresIn = capSecs % 86400 === 0 ? `${capSecs / 86400}d` : capSecs % 3600 === 0 ? `${capSecs / 3600}h` : `${capSecs}s`;
     let claimHash, claimSecret = null;
     if (b.claim_secret_hash !== undefined) {
       claimHash = String(b.claim_secret_hash).toLowerCase();
@@ -113,9 +123,12 @@ module.exports = function registerSiliconTokenRequests(deps) {
       return res.status(429).json({ error: 'too many token requests waiting for the owner' });
     }
     const says = clean(b.label || (auth.decoded && (auth.decoded.agent_name || auth.decoded.label)) || '', 80);
+    // Who is asking, as the owner's card says it: the owner, the agent itself, or ANOTHER agent of the fleet.
+    const role = auth.did === fleet.owner_did ? 'owner' : auth.did === s.member_did ? 'self'
+      : (db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, auth.did) || {}).role === 'admin' ? 'admin' : 'other_agent';
     const id = Number(db.prepare(`INSERT INTO silicon_token_requests (fleet_id, fleet_slug, silicon_row, handle, member_did, owner_did, requested_by_did,
-        says_it_is, scope, expires_in, claim_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC)).lastInsertRowid);
+        says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, role, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC)).lastInsertRowid);
     mailOwner(fleet.owner_did, `DemiPass: a token for @${s.handle} is asked for`,
       `Someone in your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
     res.status(202).json({ ok: true, request_id: id, ...(claimSecret ? { claim_secret: claimSecret } : {}), expires_at: later(REQUEST_TTL_SEC),
@@ -124,7 +137,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
 
   // ── the owner's side ────────────────────────────────────────────────────────────────────────────────────────────
   app.get('/api/silicon-token-requests', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = ownerAuth(req, res); if (!auth) return;
     expireRequests();
     const rows = db.prepare("SELECT * FROM silicon_token_requests WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC").all(auth.did);
     res.json({ ok: true, requests: rows.map(view) });
@@ -139,13 +152,13 @@ module.exports = function registerSiliconTokenRequests(deps) {
     // The fleet is still this owner's and the agent still in it, as it was asked for.
     const fleet = db.prepare('SELECT * FROM fleets WHERE id = ?').get(r.fleet_id);
     const s = fb.getSilicon(db, r.fleet_id, r.handle);
-    if (!fleet || fleet.owner_did !== auth.did || !s || s.status !== 'active' || s.id !== r.silicon_row || s.joined_via === 'network') {
+    if (!fleet || fleet.owner_did !== auth.did || (fleet.status && fleet.status !== 'active') || !s || s.status !== 'active' || s.id !== r.silicon_row || s.joined_via === 'network') {
       return res.status(409).json({ error: 'the agent or the fleet changed since this was asked for: ask again' });
     }
     const intent = `silicon-token:${r.id}`;
     if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json({ ...gateMissing('silicon-token', ['pin'], ['pin'], intent), error: `a token for @${r.handle} needs your PIN` });
     const dk = devices();
-    const refused = dk ? dk.approvalRefusal(auth, 'silicon-token', r.id, `${r.fleet_slug}/${r.handle}:${r.scope}`, req.body) : null;
+    const refused = dk ? dk.approvalRefusal(auth, 'silicon-token', r.id, `${r.fleet_slug}/${r.handle}:${r.scope}:${r.expires_in} asked by ${requesterName(r)}`, req.body) : null;
     if (refused) return res.status(refused.status).json(refused.body);
     const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(r.member_did);
     if (!wallet) return res.status(404).json({ error: 'identity not found' });
@@ -186,7 +199,11 @@ module.exports = function registerSiliconTokenRequests(deps) {
     const n = db.prepare("UPDATE silicon_token_requests SET status = 'claimed', sealed = NULL, claimed_at = ? WHERE id = ? AND status = 'approved'").run(nowIso(), r.id).changes;
     if (n !== 1) return res.status(410).json({ error: 'already claimed', status: 'claimed' });
     let token;
-    try { token = blindkeyDecrypt(r.sealed); } catch (_) { return res.status(500).json({ error: 'could not open the approved token' }); }
+    try { token = blindkeyDecrypt(r.sealed); } catch (_) {
+      // Marked claimed already: nobody will ever hold this token, so it must not stay valid (#78 review).
+      if (r.token_jti) db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ?").run(r.token_jti);
+      return res.status(500).json({ error: 'could not open the approved token; it was revoked: ask again' });
+    }
     res.json({ ok: true, handle: r.handle, did: r.member_did, scope: r.scope, token, note: 'shown once: store it in a 0600 file' });
   }
   app.post('/api/silicon-token-requests/:id/claim', rateLimitStandard, claim);

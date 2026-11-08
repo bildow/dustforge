@@ -64,6 +64,9 @@ call POST /api/silicon-token-requests/$R1/claim "" '{"claim_secret":"nope"}'; [ 
 call GET /api/silicon-token-requests "$A"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["requests"]))')" = 2 ] && [ "$(echo "$BODY" | J requests.1.says_it_is)" = "conduit container" ] \
   && ok "the owner sees both, with what the asker says it is for" || fail "list: $BODY"
 call GET /api/silicon-token-requests "$B"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["requests"]))')" = 0 ] && ok "the asker sees none to decide" || fail "asker list: $BODY"
+call GET /api/silicon-token-requests "$A"; [ "$(echo "$BODY" | J requests.1.requester_role)" = other_agent ] && [ "$(echo "$BODY" | J requests.0.requester_role)" = owner ] \
+  && ok "the card says when ANOTHER agent asks for this agent's token" || fail "role: $BODY"
+call POST $R "$B" '{"expires_in":"10m"}'; [ "$CODE" = 400 ] && ok "a lifetime under an hour → 400" || fail "10m: $CODE"
 call POST /api/silicon-token-requests/$R1/approve "$B" '{}'; [ "$CODE" = 404 ] && ok "the asker cannot approve" || fail "asker approve: $CODE"
 call POST /api/silicon-token-requests/$R1/approve "$A" '{}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "silicon-token:$R1" ] && ok "approving needs the PIN (intent silicon-token:$R1)" || fail "no pin: $CODE $BODY"
@@ -76,13 +79,16 @@ SUB=$(python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; p+="="*(-
 call GET /api/demipass/list "$TOK"; [ "$CODE" = 200 ] && ok "…and works as conduit" || fail "use: $CODE $BODY"
 call POST /api/fleet/aaron-agents/silicons/conduit/token "$TOK" '{}'; [ "$CODE" = 403 ] && ok "…but cannot run the fleet (fleet_owner_mint)" || fail "fleet mint with it: $CODE"
 call POST /api/silicon-token-requests/$R1/claim "" '{"claim_secret":"'$SECRET'"}'; [ "$CODE" = 410 ] && ok "a second claim → 410" || fail "reclaim: $CODE"
+call POST /api/fleet/aaron-agents/silicons/netjoin/token-requests "$TOK" '{}'; [ "$CODE" = 403 ] && ok "a fleet-minted token cannot ask (no reaching a sibling through it)" || fail "minted asks: $CODE $BODY"
+call GET /api/silicon-token-requests "$TOK"; [ "$CODE" = 403 ] && ok "…nor list the owner's requests" || fail "minted lists: $CODE"
 [ "$(Q "SELECT sealed FROM silicon_token_requests WHERE id=$R1")" = None ] && ok "nothing of the token is kept after the claim" || fail "sealed kept"
 
 call POST /api/silicon-token-requests/$R2/deny "$A" '{}'; [ "$CODE" = 200 ] || fail "deny: $CODE"
 call POST /api/fleet/aaron-agents/silicons/conduit/token-requests/$R2/claim "" '{"claim_secret":"'$C2'"}'; [ "$CODE" = 410 ] && ok "a denied request cannot be claimed (fleet path too)" || fail "denied claim: $CODE $BODY"
 
 # An approved token nobody claims in time is revoked.
-call POST $R "$A" '{"expires_in":"1h"}'; R3=$(echo "$BODY" | J request_id); C3=$(echo "$BODY" | J claim_secret)
+call POST $R "$A" '{"expires_in":"9999d"}'; R3=$(echo "$BODY" | J request_id); C3=$(echo "$BODY" | J claim_secret)
+[ "$(Q "SELECT expires_in FROM silicon_token_requests WHERE id=$R3")" = 30d ] && ok "9999d asked: the card and the token say 30d (the transact ceiling)" || fail "cap: $(Q "SELECT expires_in FROM silicon_token_requests WHERE id=$R3")"
 PIN "silicon-token:$R3"; call POST /api/silicon-token-requests/$R3/approve "$A" '{}'; [ "$CODE" = 200 ] || fail "approve 3: $CODE $BODY"
 JTI=$(Q "SELECT token_jti FROM silicon_token_requests WHERE id=$R3")
 X "UPDATE silicon_token_requests SET expires_at='2000-01-01T00:00:00.000Z' WHERE id=$R3"
