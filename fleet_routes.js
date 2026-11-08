@@ -435,10 +435,32 @@ module.exports = function registerFleetRoutes(deps) {
     res.json({ ok: true, granted_dd: amount, balance_after: r.balance_after, approval_id: g.approval_id });
   });
 
+  // The owner's scheduled operator grant creates DD. Arming it, raising its amount or making it more frequent is a
+  // request the owner approves on the phone (critical: the PIN every time, the phone signs) — a token alone (an agent
+  // holding the owner's session) armed up to 10M DD a day before (#82 review). Turning it off or lowering it stays one tap.
+  const FREQ = { monthly: 1, weekly: 2, daily: 3 };
   app.put('/api/fleet/:slug/owner-refill', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
+    if (a.decoded.wrk || a.decoded.auth_method === 'worker') return res.status(403).json({ error: 'a worker token cannot change the refill' });
+    const b = req.body || {};
+    const cur = fb.getOwnerRefillRule(db, a.fleet.owner_did);
+    const next = { cadence: b.cadence === undefined ? (cur ? cur.cadence : 'weekly') : String(b.cadence),
+      amount_cents: b.amount_cents === undefined ? (cur ? cur.amount_cents : 0) : Number(b.amount_cents),
+      funding: b.funding === undefined ? (cur ? cur.funding : 'operator_grant') : String(b.funding), enabled: Boolean(b.enabled) };
+    if (!FREQ[next.cadence]) return res.status(400).json({ error: 'cadence: daily | weekly | monthly' });
+    if (!Number.isInteger(next.amount_cents) || next.amount_cents < 0 || next.amount_cents > fb.OWNER_REFILL_MAX) return res.status(400).json({ error: `amount_cents: 0 to ${fb.OWNER_REFILL_MAX} a run` });
+    const wasOn = Boolean(cur && cur.enabled && cur.amount_cents > 0);
+    const raises = next.enabled && next.amount_cents > 0 && (!wasOn || next.amount_cents > cur.amount_cents || FREQ[next.cadence] > FREQ[cur.cadence] || next.funding !== cur.funding);
+    if (raises) {
+      const A = deps.approvals && deps.approvals();
+      if (!A || !A.gateService) return res.status(503).json({ error: 'approvals unavailable' });
+      const g = A.gateService({ key: 'svc:demipass:owner-refill', name: `refill ${next.amount_cents} DD ${next.cadence}`, approverDid: a.fleet.owner_did, depth: 'critical' },
+        { did: a.did, label: (a.decoded && (a.decoded.agent_label || a.decoded.username)) || '' },
+        { action: 'owner-refill', targetHost: a.fleet.slug, params: { cadence: next.cadence, amount_cents: next.amount_cents, funding: next.funding } }, b);
+      if (!g.ok) { const body = { ...(g.body || {}) }; delete body.owner; if (g.status === 202) body.next = 'Approve it in your DemiPass requests, then save again.'; return res.status(g.status).json(body); }
+    }
     try {
-      const rule = fb.setOwnerRefillRule(db, a.fleet.owner_did, req.body || {});
+      const rule = fb.setOwnerRefillRule(db, a.fleet.owner_did, next);
       res.json({ ok: true, rule });
     } catch (e) { fail(res, e); }
   });
