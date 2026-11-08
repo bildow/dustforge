@@ -410,6 +410,31 @@ module.exports = function registerFleetRoutes(deps) {
     res.json({ ok: true, rule: fb.getOwnerRefillRule(db, a.fleet.owner_did), balance_cents: billing.getDerivedBalance(db, a.fleet.owner_did),
                grant_permitted: (process.env.OPERATOR_GRANT_DIDS || '').split(',').map(x => x.trim()).includes(a.fleet.owner_did) });
   });
+  // A one-off operator grant to the fleet owner's own wallet, by REQUEST (Aaron 2026-11-08: "refill my main wallet with
+  // 30,000 DD" — and every wait is a request he approves in the app). The owner's own tokens (his panes included) file
+  // it; it waits on his phone as a critical request (the PIN every time, the phone signs); the same call again with
+  // approval_id credits it, once (idempotent on the approval). Only a wallet in OPERATOR_GRANT_DIDS, at most
+  // OWNER_GRANT_MAX DD a grant.
+  const OWNER_GRANT_MAX = 100000;
+  app.post('/api/fleet/:slug/owner-grant', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
+    if (a.decoded.wrk || a.decoded.auth_method === 'worker') return res.status(403).json({ error: 'a worker token cannot ask for a grant' });
+    if (!fb.operatorGrantAllowed(a.fleet.owner_did)) return res.status(403).json({ error: 'operator grants are not permitted for this wallet (OPERATOR_GRANT_DIDS)' });
+    const b = req.body || {};
+    const amount = Number(b.amount_cents);
+    if (!Number.isInteger(amount) || amount < 1 || amount > OWNER_GRANT_MAX) return res.status(400).json({ error: `amount_cents: a whole number of DD, 1 to ${OWNER_GRANT_MAX}` });
+    const A = deps.approvals && deps.approvals();
+    if (!A || !A.gateService) return res.status(503).json({ error: 'approvals unavailable' });
+    const g = A.gateService({ key: 'svc:demipass:owner-grant', name: `operator grant of ${amount} DD`, approverDid: a.fleet.owner_did, depth: 'critical' },
+      { did: a.did, label: (a.decoded && (a.decoded.agent_label || a.decoded.username)) || '' },
+      { action: 'owner-grant', targetHost: a.fleet.slug, params: { amount_cents: amount, to: 'your own wallet' } }, b);
+    if (!g.ok) { const body = { ...(g.body || {}) }; delete body.owner; if (g.status === 202) body.next = 'Waiting on your approval in the DemiPass app; then make the same call once more with approval_id.'; return res.status(g.status).json(body); }
+    const r = billing.creditBalance(db, a.fleet.owner_did, amount, 'operator_grant', `Operator grant ${amount} DD (approval ${g.approval_id})`, `owner_grant_${g.approval_id}`);
+    if (!r.ok) return res.status(500).json({ error: r.error || 'credit failed' });
+    log(`operator grant ${amount} DD to ${a.fleet.owner_did} on approval ${g.approval_id}`);
+    res.json({ ok: true, granted_dd: amount, balance_after: r.balance_after, approval_id: g.approval_id });
+  });
+
   app.put('/api/fleet/:slug/owner-refill', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
     try {
