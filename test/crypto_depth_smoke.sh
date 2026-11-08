@@ -5,7 +5,7 @@
 #   - an agent's /use parks for approval; the phone approves with an unwrap made for that one request; the agent's
 #     call runs once with the value (the upstream sees it); the approval cannot be used again;
 #   - a heap snapshot of the server outside the approval window holds no plaintext;
-#   - a code read aloud cannot open it; a restart loses pending one-use keys (asked again);
+#   - a code read aloud cannot open it; a restart ends the requests whose one-use keys it lost (ask again at once);
 #   - lowering to standard needs the phone's unwrap; then it is host-readable again (reveal works).
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -131,10 +131,9 @@ sleep 1; HS=$(snap); [ -n "$HS" ] && ! grep -qaF -- "$V" "$HS" && ok "a heap sna
 # ── restart: pending one-use keys are gone ──
 call POST /api/demipass/use "$AG" '{"ref":"'$REF'","params":{"url":"https://repo.dustroot.com/api/v1/repos","method":"GET"}}'; AP2=$(echo "$BODY" | J approval_id)
 kill $SRV; wait $SRV 2>/dev/null; start; A=$(login cd-owner); pin "$A" unlock:0
-BIND2=$(Q "SELECT binding FROM use_approvals WHERE id=$AP2")
-devsign "$A" "approval-open:$AP2" "$BIND2"; call POST /api/demipass/approvals/$AP2/open "$A" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'; C2=$(echo "$BODY" | J code)
-devsign "$A" "approval:$AP2" "$BIND2"; call POST /api/demipass/approvals/$AP2/approve "$A" '{"code":"'$C2'","device_challenge_id":'$CH',"device_signature":"'$SG'","unwrap":"'$UW'"}'
-[ "$CODE" = 409 ] && [ "$(echo "$BODY" | J ask_again)" = True ] && ok "after a restart a pending request's one-use key is gone → 409, asked again (nothing on disk could open it)" || fail "restart: $CODE $BODY"
+[ "$(Q "SELECT status FROM use_approvals WHERE id=$AP2")" = expired ] && ok "after a restart a waiting request whose one-use key is gone is ended at start (nothing on disk could open it)" || fail "restart: status $(Q "SELECT status FROM use_approvals WHERE id=$AP2")"
+call POST /api/demipass/use "$AG" '{"ref":"'$REF'","params":{"url":"https://repo.dustroot.com/api/v1/repos","method":"GET"}}'; AP3=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$AP3" != "$AP2" ] && [ "$(echo "$BODY" | J already_pending)" != True ] && ok "…so asking again gets a fresh request at once, not the dead one back as already_pending (approval 34)" || fail "re-ask: $CODE $BODY"
 
 # ── transfer refused; lowering needs the phone ──
 call POST /api/network/requests "$A" '{"to":"cd-nophone","as":"person"}' >/dev/null
