@@ -49,4 +49,18 @@ call POST /api/fleet/owner-agents/owner-grant "$OWN" '{"amount_cents":20000,"app
 call POST /api/fleet/owner-agents/owner-grant "$OWN" '{"amount_cents":30000,"approval_id":'$AP'}'
 [ "$CODE" = 200 ] && [ "$(bal owner)" = $((B0 + 30000)) ] && [ "$(Q "SELECT COUNT(*) FROM identity_transactions WHERE type='operator_grant' AND amount_cents=30000")" = 1 ] && ok "approved: 30000 DD credited to the owner's wallet, one ledger row" || fail "collect: $CODE $BODY bal $(bal owner)"
 call POST /api/fleet/owner-agents/owner-grant "$OWN" '{"amount_cents":30000,"approval_id":'$AP'}'; [ "$CODE" = 410 ] && [ "$(bal owner)" = $((B0 + 30000)) ] && ok "once only (again → 410, no second credit)" || fail "replay: $CODE bal $(bal owner)"
+# ── the scheduled grant: arming or raising it is a request too (#82 review); off or lower is one tap ──────────────────
+ap_and_save(){ local id=$1 body=$2
+  call POST /api/identity/gate/verify "$OWN" '{"gate":"pin","pin":"4321","intent":"approval-open:'$id'"}'; call POST /api/demipass/approvals/$id/open "$OWN"; local k; k=$(echo "$BODY" | J code)
+  call POST /api/demipass/approvals/$id/approve "$OWN" '{"code":"'$k'"}'; call PUT /api/fleet/owner-agents/owner-refill "$OWN" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$body" "$id")"; }
+ARM='{"cadence":"weekly","amount_cents":10000,"enabled":true,"funding":"operator_grant"}'
+call PUT /api/fleet/owner-agents/owner-refill "$OWN" "$ARM"; R1=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT COALESCE(enabled,0) FROM wallet_refill_rules WHERE did='$(did owner)'")" != 1 ] && [ "$(Q "SELECT summary FROM use_approvals WHERE id=$R1")" = "scheduled refill of 10000 DD weekly to your own wallet" ] \
+  && ok "arming the scheduled grant with a token alone files a request; nothing armed" || fail "arm: $CODE $BODY"
+ap_and_save "$R1" "$ARM"; [ "$CODE" = 200 ] && [ "$(Q "SELECT enabled || ':' || amount_cents FROM wallet_refill_rules WHERE did='$(did owner)'")" = "1:10000" ] && ok "approved: armed at 10000 weekly" || fail "armed: $CODE $BODY"
+call PUT /api/fleet/owner-agents/owner-refill "$OWN" '{"cadence":"weekly","amount_cents":5000,"enabled":true,"funding":"operator_grant"}'; [ "$CODE" = 200 ] && ok "lowering it: one tap, no request" || fail "lower: $CODE $BODY"
+call PUT /api/fleet/owner-agents/owner-refill "$OWN" '{"cadence":"daily","amount_cents":5000,"enabled":true,"funding":"operator_grant"}'; [ "$CODE" = 202 ] && ok "weekly → daily is a raise: a request" || fail "cadence raise: $CODE $BODY"
+call PUT /api/fleet/owner-agents/owner-refill "$OWN" '{"cadence":"weekly","amount_cents":20000,"enabled":true,"funding":"operator_grant"}'; [ "$CODE" = 202 ] && ok "a higher amount is a request" || fail "amount raise: $CODE $BODY"
+call PUT /api/fleet/owner-agents/owner-refill "$OWN" '{"cadence":"weekly","amount_cents":10000000,"enabled":true,"funding":"operator_grant"}'; [ "$CODE" = 400 ] && ok "above 100,000 DD a run → 400 (was 10,000,000)" || fail "cap: $CODE"
+call PUT /api/fleet/owner-agents/owner-refill "$OWN" '{"cadence":"weekly","amount_cents":5000,"enabled":false,"funding":"operator_grant"}'; [ "$CODE" = 200 ] && [ "$(Q "SELECT enabled FROM wallet_refill_rules WHERE did='$(did owner)'")" = 0 ] && ok "turning it off: one tap" || fail "off: $CODE $BODY"
 echo "$fails failure(s)"; exit $(( fails > 0 ))

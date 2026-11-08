@@ -146,6 +146,7 @@ module.exports = function registerUseApprovals(deps) {
       const q = params || {};
       const what = action === 'consent' ? `let ${String(q.wallet || '').slice(0, 24)}… pay ${q.service} up to ${q.daily_cap_dd} DD a day`
         : action === 'register' ? `register service ${q.slug} (${q.name})`
+        : action === 'owner-refill' ? `scheduled refill of ${q.amount_cents} DD ${q.cadence} to your own wallet`
         : action === 'owner-grant' ? `operator grant of ${q.amount_cents} DD to your own wallet`
         : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action).join(', ')}`
         : `${targetHost || ''}: ${action}`;

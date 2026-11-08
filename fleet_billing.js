@@ -15,6 +15,7 @@ const crypto = require('crypto');
 
 const INITIATORS = new Set(['self', 'operator', 'autonomous', 'work_link']);
 const CADENCES = { daily: 1, weekly: 7, monthly: 30 };          // days
+const OWNER_REFILL_MAX = 100000;   // DD a scheduled operator-grant run (the same cap as a one-off grant, #82)
 const REFILL_COOLDOWN_MS = 10 * 60 * 1000;                       // one threshold refill per silicon per 10 min
 const WORK_LINK_MAX_TTL_TICKS = 100000;
 const WORK_LINK_DEFAULT_TTL_SECONDS = 7 * 86400;                 // wall-clock cap on top of the tick window
@@ -63,6 +64,8 @@ function initSchema(db) {
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT DEFAULT CURRENT_TIMESTAMP
   )`);
+  // Rules saved before the per-run cap (#83) are brought down to it, so the stored rule matches what a run pays.
+  try { db.prepare('UPDATE wallet_refill_rules SET amount_cents = ? WHERE amount_cents > ?').run(OWNER_REFILL_MAX, OWNER_REFILL_MAX); } catch (_) {}
 
   db.exec(`CREATE TABLE IF NOT EXISTS billing_attributions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -611,7 +614,7 @@ function nextRunAfter(cadence, fromIso, now = Date.now()) {
 function setOwnerRefillRule(db, did, { cadence = 'weekly', amount_cents = 0, funding = 'operator_grant', enabled = false, next_run_at = null }) {
   if (!CADENCES[cadence]) throw Object.assign(new Error('cadence: daily | weekly | monthly'), { statusCode: 400 });
   const amt = Number(amount_cents);
-  if (!Number.isInteger(amt) || amt < 0 || amt > 10000000) throw Object.assign(new Error('amount_cents: integer 0-10000000'), { statusCode: 400 });
+  if (!Number.isInteger(amt) || amt < 0 || amt > OWNER_REFILL_MAX) throw Object.assign(new Error(`amount_cents: integer 0-${OWNER_REFILL_MAX}`), { statusCode: 400 });
   if (!['operator_grant', 'stripe'].includes(funding)) throw Object.assign(new Error("funding: 'operator_grant' or 'stripe'"), { statusCode: 400 });
   const next = next_run_at || nextRunAfter(cadence, null);
   db.prepare(`INSERT INTO wallet_refill_rules (did, cadence, amount_cents, funding, enabled, next_run_at)
@@ -644,7 +647,8 @@ function runOwnerRefills(db, billing, { now = Date.now(), grantDids } = {}) {
         result = { ok: false, error: 'operator grant not permitted for this wallet (OPERATOR_GRANT_DIDS)' };
       } else {
         const key = `auto_refill_${rule.id}_${rule.next_run_at}`;
-        result = billing.creditBalance(db, rule.did, rule.amount_cents, 'auto_refill_grant', `Scheduled ${rule.cadence} refill (operator grant)`, key);
+        // Clamped at run time too: a rule saved before the cap (#83) never credits more than OWNER_REFILL_MAX a run.
+        result = billing.creditBalance(db, rule.did, Math.min(rule.amount_cents, OWNER_REFILL_MAX), 'auto_refill_grant', `Scheduled ${rule.cadence} refill (operator grant)`, key);
       }
     } else {
       result = { ok: false, error: 'stripe-funded auto refill is not available yet' };
@@ -1027,7 +1031,7 @@ function tokenWarningEmail({ silicon, token }) {
 }
 
 module.exports = {
-  ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed,
+  ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed, OWNER_REFILL_MAX,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,

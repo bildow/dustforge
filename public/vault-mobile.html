@@ -993,10 +993,16 @@ function workLinkRow(l,tick){
   if(['pending','active'].includes(l.status))h+='<button class="btn-ghost" onclick="revokeWorkLink('+Number(l.id)+')" style="font-size:0.65rem">Revoke</button>';
   return h+'</div>';
 }
+// Raising or arming the scheduled grant is a request approved on this phone (#82 review): the first save files it and
+// says so; once approved (Requests, above), Save again carries the approval and applies it.
+var ownRefillApproval=null;
 async function saveOwnerRefill(){
+  const body={cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:'operator_grant'};
+  if(ownRefillApproval&&ownRefillApproval.key===JSON.stringify(body)) body.approval_id=ownRefillApproval.id;
   try{
-    await api('PUT','/api/fleet/'+encodeURIComponent(fleetSlug)+'/owner-refill',{cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:'operator_grant'});
-    loadFleet();
+    const r=await api('PUT','/api/fleet/'+encodeURIComponent(fleetSlug)+'/owner-refill',body);
+    if(r&&r.status==='approval_pending'){ ownRefillApproval={id:r.approval_id,key:JSON.stringify({...body,approval_id:undefined})}; alert('Raising your refill is a request: approve it in Requests (your PIN), then tap Save again.'); loadApprovals&&loadApprovals(); return; }
+    ownRefillApproval=null; loadFleet();
   }catch(e){alert(e.message)}
 }
 // Move DD from my wallet into a project's cost-center wallet (POST …/projects/:project/fund). The PIN approves each one.
