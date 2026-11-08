@@ -67,7 +67,7 @@ call POST /api/silicon-token-requests/$R1/claim "" '{"claim_secret":"nope"}'; [ 
 call GET /api/silicon-token-requests "$A"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["requests"]))')" = 2 ] && [ "$(echo "$BODY" | J requests.1.says_it_is)" = "conduit container" ] \
   && ok "the owner sees both, with what the asker says it is for" || fail "list: $BODY"
 call GET /api/silicon-token-requests "$B"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["requests"]))')" = 0 ] && ok "the asker sees none to decide" || fail "asker list: $BODY"
-call GET /api/silicon-token-requests "$A"; [ "$(echo "$BODY" | J requests.1.requester_role)" = other_agent ] && [ "$(echo "$BODY" | J requests.0.requester_role)" = owner ] \
+call GET /api/silicon-token-requests "$A"; [ "$(echo "$BODY" | J requests.1.requester_role)" = outside_agent ] && [ "$(echo "$BODY" | J requests.0.requester_role)" = owner ] \
   && ok "the card says when ANOTHER agent asks for this agent's token" || fail "role: $BODY"
 call POST $R "$B" '{"expires_in":"10m"}'; [ "$CODE" = 400 ] && ok "a lifetime under an hour → 400" || fail "10m: $CODE"
 call POST /api/silicon-token-requests/$R1/approve "$B" '{}'; [ "$CODE" = 404 ] && ok "the asker cannot approve" || fail "asker approve: $CODE"
@@ -105,4 +105,11 @@ for i in 1 2 3; do call POST $R "$B" '{}'; done; call POST $R "$B" '{}'
 [ "$CODE" = 429 ] && ok "a 4th waiting request for one agent → 429" || fail "cap: $CODE"
 
 [ $fails -gt 0 ] && { echo "--- server.log"; grep -i -m5 "error" "$S/server.log"; }
+# #79 review: the filer must still be in the fleet when the owner approves; an outside wallet is labelled as one.
+call POST /api/fleet/aaron-agents/silicons/sib/token-requests "$B" '{"scope":"read","expires_in":"1h"}'; RX=$(echo "$BODY" | J request_id)
+call GET /api/silicon-token-requests "$A"; echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); r=[x for x in (d.get("requests") or []) if x.get("id")==int(sys.argv[1])]; sys.exit(0 if r and r[0].get("requester_role")=="outside_agent" else 1)' "$RX" \
+  && ok "a network-joined filer is shown as a wallet the fleet did not create" || fail "role: $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET status='removed' WHERE handle='brainy'\"); c.commit()" "$DB_PATH"
+PIN "silicon-token:$RX"; call POST /api/silicon-token-requests/$RX/approve "$A" '{}'
+[ "$CODE" = 409 ] && ok "a filer that has left the fleet: its request cannot be approved" || fail "left filer approve: $CODE $BODY"
 echo "$fails failure(s)"; exit $(( fails > 0 ))
