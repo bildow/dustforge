@@ -105,6 +105,26 @@ Registration:
   - Each wallet can be at most one tenant.
   - The slugs `demipass`, `dustforge`, `admin`, `meter`, `services` and `api` are reserved.
 
+## A tenant's own token: requested, never minted for it
+
+A tenant's wallet is usually a fleet silicon. Its DemiPass token is **requested**:
+`POST /api/fleet/<fleet>/silicons/<handle>/token-request {scope?, expires_in?}`.
+
+Who may request:
+- the silicon itself, to renew;
+- another active agent of the same fleet, such as the pane building it.
+
+Flow:
+1. The fleet owner approves in the app: PIN to open, and the phone signs.
+2. The same call again with `approval_id` hands the token to whoever asked, once.
+3. The approval binds the silicon, the scope, the lifetime and who collects it.
+
+The owner's own mint route still exists, but nothing should ask the owner to use it.
+
+Every DemiPass grant waits a day for the owner: consents, registrations, silicon tokens and gate-weakening. A use of a
+secret, or an elevated tenant action, waits an hour. Pending requests reach the owner's phone through its signed
+alerts check (app 1.12+).
+
 ## Who may call an action
 
 - **Own account.** Any wallet may call an `open` action, paying for it itself. The tenant owner may also call closed actions.

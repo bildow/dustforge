@@ -217,7 +217,10 @@ module.exports = function registerAccountHolds(deps) {
     if (!key || !verify(key, messageFor(ch), signature) || !spendChallenge(ch)) return res.status(NOT_HERE.status).json(NOT_HERE.body);
     sweep();
     const holds = openHolds(ch.did).filter(h => eligibleKey(ch.did, device_id, 'P', holdSince(h)));
-    res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did) });
+    // Approval requests waiting on this owner (Aaron 2026-11-08: every wait is a request the phone tells him about).
+    let approvals = [];
+    try { const A = deps.approvals && deps.approvals(); if (A && A.pendingFor) approvals = A.pendingFor(ch.did); } catch (_) {}
+    res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did), approvals });
   });
 
   // POST /api/identity/holds/:id/cancel {device_id, challenge_id, signature} — P of an eligible phone. No session.

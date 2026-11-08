@@ -19,7 +19,15 @@
 
 const crypto = require('crypto');
 
-const TTL_SEC = 5 * 60;           // pending request, and an approved one waiting to be used
+const TTL_SEC = 5 * 60;           // an approved request waiting to be used (and the code window: item 4c)
+// How long a request waits for the owner (Aaron 2026-11-08: "every wait is a request I approve in the app"). A use of a
+// secret waits an hour: the phone checks every 15 minutes and on open, so a 5-minute request expired before it was
+// seen (approvals 17-20, 26). DemiPass's own grants (svc:demipass:* — consent, registration, a silicon's token,
+// weakening a gate) wait a day. Codes still rotate every 30 s and an approval is still used within 5 minutes.
+const PENDING_TTL_SEC = 60 * 60;
+const GRANT_PENDING_TTL_SEC = 24 * 3600;
+const GRANT_APPROVED_TTL_SEC = 60 * 60;    // the requester collects a grant when it next polls
+const isGrantKey = (k) => typeof k === 'string' && k.startsWith('svc:demipass:');
 const STEP_SEC = 30;              // code rotation
 const MAX_WRONG = 3;
 const MAX_PENDING_PER_OWNER = 30;
@@ -198,7 +206,7 @@ module.exports = function registerUseApprovals(deps) {
     const id = Number(db.prepare(`INSERT INTO use_approvals (kind, secret_id, owner_did, requester_did, requester_label, delegation_id, depth, purpose, summary,
                                   binding, code_key, created_at, expires_at, bound_call, service_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),
-           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
+           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(isGrantKey(secret.service_key) ? GRANT_PENDING_TTL_SEC : PENDING_TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
     // Item 1: a wrapped secret's request gets a one-use key (private half in memory only) the phone unwraps to.
     if (cryptoDepth) cryptoDepth.onRequestCreated({ id }, secret);
     const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id);
@@ -370,7 +378,7 @@ module.exports = function registerUseApprovals(deps) {
     if (cryptoDepth) { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
     if (cryptoDepth && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
-      .run(nowIso(), nowIso(), later(TTL_SEC), row.id).changes;
+      .run(nowIso(), nowIso(), later(isGrantKey(row.service_key) ? GRANT_APPROVED_TTL_SEC : TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'this request was decided meanwhile' });
     event('approval_approved', auth.did, row.secret_id, { approval_id: row.id, requester_did: row.requester_did, via: 'app' });
     logSecurityEvent('approval_approved', 'info', { caller_did: auth.did, capability: row.kind, context: { approval_id: row.id, requester_did: row.requester_did } });
@@ -400,5 +408,13 @@ module.exports = function registerUseApprovals(deps) {
       params: { ...(use.params || {}), approver_did: subject.approverDid }, delegationId: use.delegationId }, body);
   }
 
-  return { gate, gateService, depthOf, bindingOf, _codeAt: codeAt, STEP_SEC, TTL_SEC };
+  // What the owner's phone is told about (account_holds alerts, signed by the phone's D): pending requests, newest first,
+  // headline only — the full call is shown after the PIN opens it.
+  function pendingFor(ownerDid) {
+    expireOld();
+    return db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC LIMIT 20").all(ownerDid)
+      .map(r => { const v = view(r, ownerDid); return { id: r.id, title: v.secret.name || '', requester: v.requester || v.requester_label || '', summary: v.summary || '', depth: r.depth, expires_at: r.expires_at }; });
+  }
+
+  return { gate, gateService, depthOf, bindingOf, pendingFor, _codeAt: codeAt, STEP_SEC, TTL_SEC, PENDING_TTL_SEC };
 };

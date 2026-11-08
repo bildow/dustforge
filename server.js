@@ -8571,7 +8571,7 @@ billing.setAttribution(fleetBilling, require('./dd_ledger'));
 const fleetRoutes = require('./fleet_routes')({
   app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
   rateLimitStandard, adminKey: ADMIN_API_KEY, crypto, grantAllContextsDelegation,
-  getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
+  getBearerIdentity, gateFresh, gateMissing, spendSingleUse, approvals: () => useApprovals,
 });
 // Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
 require('./network_routes')({
@@ -8605,7 +8605,7 @@ const accountHolds = require('./account_holds')({
   app, db, rateLimitStrict, rateLimitStandard, logSecurityEvent, cleanLabel, getBearerIdentity, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
-  guardians: () => recoveryGuardians, recovery: () => guardianRecovery,
+  guardians: () => recoveryGuardians, recovery: () => guardianRecovery, approvals: () => useApprovals,
 });
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({

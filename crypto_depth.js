@@ -23,7 +23,7 @@
 const crypto = require('crypto');
 
 const MARKER = 'dpwrap:v1';                 // what encrypted_value holds once wrapped (never decrypts)
-const EPHEMERAL_TTL_MS = 15 * 60 * 1000;    // longer than an approval's life (5 min pending + 5 min approved)
+const EPHEMERAL_TTL_MS = 75 * 60 * 1000;    // longer than an approval's life (60 min pending + 5 min approved; use_approvals.js)
 const OAEP = { padding: crypto.constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha1' };   // Android Keystore OAEP: MGF1 is SHA-1
 
 module.exports = function registerCryptoDepth(deps) {
