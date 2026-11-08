@@ -110,7 +110,9 @@ module.exports = function registerSecretSharing(deps) {
   // lookup alone is phishable, so shares and transfers need this — a contact made by request carries no share rights.
   function isConfirmedPeer(x, y) {
     const [a, b] = x < y ? [x, y] : [y, x];
-    try { return Boolean(db.prepare("SELECT 1 FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active' AND verified_via IS NOT NULL").get(a, b)); }
+    // In person (qr) or introduced by someone met in person (vouch). An email-code pair (email_pairing.js) is a contact
+    // for DD, not for shares, until Aaron rules otherwise (threat model item 6, ruling 2026-11-07).
+    try { return Boolean(db.prepare("SELECT 1 FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active' AND verified_via IN ('qr','vouch')").get(a, b)); }
     catch (_) { return false; }   // no verified_via column yet: nobody is confirmed
   }
   const PAIR_HINT = 'meet them and pair in person: Fleet → Pair in person (QR) — you compare a 6-digit code on both screens';

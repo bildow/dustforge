@@ -314,7 +314,8 @@ module.exports = function registerPairing(deps) {
       if (!w.pin_hash) return res.status(409).json({ error: `${w.username} has no PIN yet, so they could not accept` });
     }
     const existing = peerRow(wa.did, wb.did);
-    if (existing && existing.verified_via) return res.status(409).json({ error: `${wa.username} and ${wb.username} are already confirmed contacts` });
+    // An email-code pair (email_pairing.js) may be raised to a vouch: it carries no share rights until then.
+    if (existing && existing.verified_via && existing.verified_via !== 'email-code') return res.status(409).json({ error: `${wa.username} and ${wb.username} are already confirmed contacts` });
     const [da, dbb] = pairDids(wa.did, wb.did);
     if (db.prepare("SELECT 1 FROM contact_vouches WHERE did_a = ? AND did_b = ? AND status = 'pending'").get(da, dbb)) return res.status(409).json({ error: 'an introduction of these two is already waiting' });
     if (db.prepare("SELECT COUNT(*) AS n FROM contact_vouches WHERE voucher_did = ? AND status = 'pending'").get(me).n >= VOUCH_MAX_OPEN) {
@@ -412,10 +413,11 @@ module.exports = function registerPairing(deps) {
     res.json({ ok: true, vouch: vouchView(db.prepare('SELECT * FROM contact_vouches WHERE id = ?').get(v.id), auth.did) });
   });
 
-  // A confirmed contact: active, and verified in person by QR or by the vouch of someone both met in person.
+  // A confirmed contact for shares: active, and verified in person by QR or by the vouch of someone both met in person.
+  // An email-code pair is a contact for DD only (email_pairing.js; threat model item 6 ruling 2026-11-07).
   function isConfirmedPeer(x, y) {
     const [a, b] = pairDids(x, y);
-    return Boolean(db.prepare("SELECT 1 FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active' AND verified_via IS NOT NULL").get(a, b));
+    return Boolean(db.prepare("SELECT 1 FROM network_peers WHERE did_a = ? AND did_b = ? AND status = 'active' AND verified_via IN ('qr','vouch')").get(a, b));
   }
   return { isConfirmedPeer, TTL_SEC, MAX_OPEN };
 };
