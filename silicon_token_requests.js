@@ -130,7 +130,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
         says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, role, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC)).lastInsertRowid);
     mailOwner(fleet.owner_did, `DemiPass: a token for @${s.handle} is asked for`,
-      `Someone in your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
+      `${role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in'} your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.${role === 'other_agent' ? ' If you approve, the agent that asked can act as @' + s.handle + '.' : ''}\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
     res.status(202).json({ ok: true, request_id: id, ...(claimSecret ? { claim_secret: claimSecret } : {}), expires_at: later(REQUEST_TTL_SEC),
       next: `the fleet owner approves it in the DemiPass app; then POST /api/silicon-token-requests/${id}/claim {claim_secret} once` });
   });

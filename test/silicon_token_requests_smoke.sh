@@ -21,7 +21,7 @@ kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -5 "$S/server.log"; exit
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
-for (const u of ["owner-a", "brainy", "outsider-x", "conduit", "netjoin"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
+for (const u of ["owner-a", "brainy", "outsider-x", "conduit", "netjoin", "sib"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 100000, ?)").run(id.did, u, u + "@dustforge.com", enc, process.argv[1]);
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 100000, ?, ?, 100000)").run(id.did, "topup", "smoke"); }' "$H"
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
@@ -43,7 +43,7 @@ const Database = require("better-sqlite3"); const db = new Database(process.env.
 const fid = db.prepare("SELECT id FROM fleets WHERE slug = ?").get("aaron-agents").id;
 const did = u => db.prepare("SELECT did FROM identity_wallets WHERE username = ?").get(u).did;
 db.prepare("INSERT OR IGNORE INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, ?)").run(fid, did("brainy"), "agent");
-for (const h of ["conduit", "netjoin"]) { fb.upsertSilicon(db, { fleetId: fid, memberDid: did(h), handle: h }); db.prepare("UPDATE fleet_silicons SET created_by_fleet = 1 WHERE handle = ?").run(h); }
+for (const h of ["conduit", "netjoin", "sib"]) { fb.upsertSilicon(db, { fleetId: fid, memberDid: did(h), handle: h }); db.prepare("UPDATE fleet_silicons SET created_by_fleet = 1 WHERE handle = ?").run(h); }
 db.prepare("UPDATE fleet_silicons SET joined_via = ? WHERE handle = ?").run("network", "netjoin");'
 PIN(){ call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"'$1'"}'; }
 R=/api/fleet/aaron-agents/silicons/conduit/token-requests
@@ -79,7 +79,8 @@ SUB=$(python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; p+="="*(-
 call GET /api/demipass/list "$TOK"; [ "$CODE" = 200 ] && ok "…and works as conduit" || fail "use: $CODE $BODY"
 call POST /api/fleet/aaron-agents/silicons/conduit/token "$TOK" '{}'; [ "$CODE" = 403 ] && ok "…but cannot run the fleet (fleet_owner_mint)" || fail "fleet mint with it: $CODE"
 call POST /api/silicon-token-requests/$R1/claim "" '{"claim_secret":"'$SECRET'"}'; [ "$CODE" = 410 ] && ok "a second claim → 410" || fail "reclaim: $CODE"
-call POST /api/fleet/aaron-agents/silicons/netjoin/token-requests "$TOK" '{}'; [ "$CODE" = 403 ] && ok "a fleet-minted token cannot ask (no reaching a sibling through it)" || fail "minted asks: $CODE $BODY"
+call POST /api/fleet/aaron-agents/silicons/sib/token-requests "$TOK" '{}'
+[ "$CODE" = 403 ] && [ "$(Q "SELECT COUNT(*) FROM silicon_token_requests WHERE handle='sib'")" = 0 ] && ok "a fleet-minted token cannot ask for a fleet-created sibling's token" || fail "minted asks: $CODE $BODY"
 call GET /api/silicon-token-requests "$TOK"; [ "$CODE" = 403 ] && ok "…nor list the owner's requests" || fail "minted lists: $CODE"
 [ "$(Q "SELECT sealed FROM silicon_token_requests WHERE id=$R1")" = None ] && ok "nothing of the token is kept after the claim" || fail "sealed kept"
 
