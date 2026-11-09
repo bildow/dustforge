@@ -19,8 +19,9 @@
 //   POST /api/fleet/:slug/silicons/:handle/token-requests {create: {display_name?, username?}, scope?, expires_in?, …}
 // On the owner's approval (PIN + phone, the phone's text starting "create ") the fleet creates the agent exactly as the
 // owner's own POST /api/fleet/:slug/silicons {create} does (fleet_routes.js createFleetSilicon: mailbox + wallet,
-// charged like /provision, created_by_fleet = 1) and mints its first token; the claim hands over the token, the DID and
-// the mailbox password, once.
+// charged like /provision, created_by_fleet = 1) and mints its first token; the claim hands over the token and the DID,
+// once. The new mailbox's password goes to nobody (PR #84 review: it is a full sign-in, beyond the scope the owner's
+// phone signed for); the owner can set one later from their own session.
 // A request waits REQUEST_TTL_SEC for the owner; an approved token waits CLAIM_TTL_SEC to be claimed, then it is
 // revoked (nobody holds it). The minted token is what POST …/silicons/:handle/token makes (auth_method
 // fleet_owner_mint: it acts as the agent's wallet but never runs a fleet), capped at transact.
@@ -30,6 +31,7 @@ const CLAIM_TTL_SEC = 60 * 60;
 const MAX_PENDING_PER_SILICON = 3;
 const MAX_PENDING_PER_FLEET = 20;
 const TOKEN_SCOPE_CAP = 'transact';
+const CREATING_STALE_SEC = 10 * 60;   // a creation still unfinished after this was interrupted
 const HEX64 = /^[0-9a-f]{64}$/;
 
 module.exports = function registerSiliconTokenRequests(deps) {
@@ -82,6 +84,13 @@ module.exports = function registerSiliconTokenRequests(deps) {
       if (r.token_jti) db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ?").run(r.token_jti);
     }
     db.prepare("UPDATE silicon_token_requests SET status = 'expired', sealed = NULL, decided_at = COALESCE(decided_at, ?) WHERE status IN ('pending','approved') AND expires_at <= ?").run(t, t);
+    // A creation the server did not finish (it stopped mid-way) is ended after CREATING_STALE_SEC: 'failed' when the
+    // agent exists (ask for its token), 'expired' when it does not (ask again) — never stuck (PR #84 review).
+    const stale = new Date(Date.now() - CREATING_STALE_SEC * 1000).toISOString();
+    for (const r of db.prepare("SELECT id, fleet_id, username FROM silicon_token_requests WHERE status = 'creating' AND decided_at <= ?").all(stale)) {
+      const made = db.prepare("SELECT 1 FROM identity_wallets w JOIN fleet_silicons s ON s.member_did = w.did WHERE w.username = ? AND s.fleet_id = ?").get(r.username, r.fleet_id);
+      db.prepare("UPDATE silicon_token_requests SET status = ?, sealed = NULL WHERE id = ? AND status = 'creating'").run(made ? 'failed' : 'expired', r.id);
+    }
   }
   const sweeper = setInterval(() => { try { expireRequests(); } catch (_) {} }, 60000); if (sweeper.unref) sweeper.unref();
 
@@ -130,7 +139,12 @@ module.exports = function registerSiliconTokenRequests(deps) {
       if (!fc.createCheck) return res.status(501).json({ error: 'agent creation is not available here' });
       username = String(b.create.username || handle).toLowerCase();
       displayName = clean(b.create.display_name || handle, 100);
-      try { fc.createCheck(fleet, handle, username); } catch (e) { return res.status(e.statusCode || 400).json(e.body || { error: e.message }); }
+      try { fc.createCheck(fleet, handle, username); } catch (e) {
+        // The owner sees why; anyone else learns only that it cannot be asked now, not the payer's balance or the
+        // fleet's limits (PR #84 review). Malformed input is still a 400 for everyone.
+        if (auth.did === fleet.owner_did || e.statusCode === 400) return res.status(e.statusCode || 400).json(e.body || { error: e.message });
+        return res.status(409).json({ error: `@${handle} cannot be asked for now` });
+      }
       if (db.prepare("SELECT 1 FROM silicon_token_requests WHERE fleet_id = ? AND creates = 1 AND status IN ('pending','creating') AND (handle = ? OR username = ?)").get(fleet.id, handle, username)) {
         return res.status(409).json({ error: `a request to create @${handle} is already waiting` });
       }
@@ -172,7 +186,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
     const who = role === 'outside_agent' ? 'A WALLET YOUR FLEET DID NOT CREATE, in' : role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in';
     if (creates) {
       mailOwner(fleet.owner_did, `DemiPass: a new agent @${s.handle} is asked for`,
-        `${who} your fleet ${fleet.slug} asks you to CREATE a new agent @${s.handle} (wallet and mailbox ${username}@dustforge.com, charged like a provision) and give it a ${scope} token (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}. If you approve, the wallet that asked receives that token and the new mailbox's password, and can act as @${s.handle}.\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
+        `${who} your fleet ${fleet.slug} asks you to CREATE a new agent @${s.handle} (wallet and mailbox ${username}@dustforge.com, charged like a provision) and give it a ${scope} token (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}. If you approve, the wallet that asked receives that token (and nothing else) and can act as @${s.handle} within it.\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
     } else {
       mailOwner(fleet.owner_did, `DemiPass: a token for @${s.handle} is asked for`,
         `${who} your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.${role === 'other_agent' || role === 'outside_agent' ? ' If you approve, the wallet that asked can act as @' + s.handle + '.' : ''}\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
@@ -249,31 +263,36 @@ module.exports = function registerSiliconTokenRequests(deps) {
       db.transaction(() => {
         const spent = spendSingleUse(auth.did, 'silicon-token', ['pin'], auth, intent);
         if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
-        if (db.prepare("UPDATE silicon_token_requests SET status = 'creating' WHERE id = ? AND status = 'pending'").run(r.id).changes !== 1) {
+        if (db.prepare("UPDATE silicon_token_requests SET status = 'creating', decided_at = ? WHERE id = ? AND status = 'pending'").run(nowIso(), r.id).changes !== 1) {
           throw Object.assign(new Error('this request changed meanwhile'), { statusCode: 409 });
         }
       }).immediate();
     } catch (e) { return res.status(e.statusCode || 500).json(e.body || { error: e.message }); }
+    // The mailbox password is random and handed to nobody: the filer gets exactly the token the owner signed for.
     const password = crypto.randomBytes(18).toString('base64url');
     let made;
     try {
       made = await fleetCreate().createFleetSilicon(fleet, { handle: r.handle, displayName: r.display_name || r.handle, username: r.username, password, by: auth.did });
     } catch (e) {
       // Nothing was made: the request waits again for a fresh approval.
-      db.prepare("UPDATE silicon_token_requests SET status = 'pending' WHERE id = ? AND status = 'creating'").run(r.id);
+      db.prepare("UPDATE silicon_token_requests SET status = 'pending', decided_at = NULL WHERE id = ? AND status = 'creating'").run(r.id);
       return res.status(e.statusCode && e.statusCode !== 500 ? 409 : 500).json({ error: `@${r.handle} was not created: ${(e.body && e.body.error) || e.message}` });
     }
+    let jti = null;
     try {
       const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(made.did);
       const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
         scope: r.scope, expiresIn: r.expires_in,
         metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: r.fleet_slug, minted_by: auth.did, token_request: r.id },
       });
-      const jti = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).jti || null;
-      db.prepare(`UPDATE silicon_token_requests SET status = 'approved', member_did = ?, silicon_row = ?, sealed = ?, token_jti = ?, decided_at = ?, expires_at = ?
+      jti = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).jti || null;
+      const n = db.prepare(`UPDATE silicon_token_requests SET status = 'approved', member_did = ?, silicon_row = ?, sealed = ?, token_jti = ?, decided_at = ?, expires_at = ?
                   WHERE id = ? AND status = 'creating'`)
-        .run(made.did, made.silicon.id, blindkeyEncrypt(JSON.stringify({ token, password })), jti, nowIso(), later(CLAIM_TTL_SEC), r.id);
+        .run(made.did, made.silicon.id, blindkeyEncrypt(token), jti, nowIso(), later(CLAIM_TTL_SEC), r.id).changes;
+      if (n !== 1) throw new Error('the request changed meanwhile');
     } catch (e) {
+      // A token nobody can claim must not stay valid.
+      if (jti) db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ?").run(jti);
       // The agent exists (the owner approved it); only its first token failed. It stays in the fleet; ask for a token.
       db.prepare("UPDATE silicon_token_requests SET status = 'denied', decided_at = ? WHERE id = ? AND status = 'creating'").run(nowIso(), r.id);
       return res.status(500).json({ error: `@${r.handle} was created, but its token could not be minted: ask for a token for @${r.handle}` });
@@ -297,14 +316,12 @@ module.exports = function registerSiliconTokenRequests(deps) {
     if (!r || !crypto.timingSafeEqual(presented, stored)) return res.status(404).json({ error: 'no such request' });
     if (req.params.slug && (req.params.slug !== r.fleet_slug || String(req.params.handle || '').toLowerCase() !== r.handle)) return res.status(404).json({ error: 'no such request' });
     if (r.status === 'pending') return res.status(202).json({ ok: false, status: 'pending', next: 'waiting for the fleet owner to approve in the app' });
+    if (r.status === 'creating') return res.status(202).json({ ok: false, status: 'creating', next: 'approved; the agent is being created — ask again in a moment' });
     if (r.status !== 'approved') return res.status(410).json({ error: `this request is ${r.status}`, status: r.status });
     const n = db.prepare("UPDATE silicon_token_requests SET status = 'claimed', sealed = NULL, claimed_at = ? WHERE id = ? AND status = 'approved'").run(nowIso(), r.id).changes;
     if (n !== 1) return res.status(410).json({ error: 'already claimed', status: 'claimed' });
-    let token, password = null;
-    try {
-      token = blindkeyDecrypt(r.sealed);
-      if (r.creates) ({ token, password } = JSON.parse(token));
-    } catch (_) {
+    let token;
+    try { token = blindkeyDecrypt(r.sealed); } catch (_) {
       // Marked claimed already: nobody will ever hold this token, so it must not stay valid (#78 review).
       if (r.token_jti) db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ?").run(r.token_jti);
       return res.status(500).json({ error: 'could not open the approved token; it was revoked: ask again' });
@@ -312,7 +329,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
     if (r.creates) {
       const w = db.prepare('SELECT email, username FROM identity_wallets WHERE did = ?').get(r.member_did) || {};
       return res.json({ ok: true, created: true, handle: r.handle, did: r.member_did, email: w.email, username: w.username, scope: r.scope, token,
-                        password_once: password, note: 'shown once: store the token and the mailbox password in 0600 files' });
+                        note: 'shown once: store it in a 0600 file' });
     }
     res.json({ ok: true, handle: r.handle, did: r.member_did, scope: r.scope, token, note: 'shown once: store it in a 0600 file' });
   }

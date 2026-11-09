@@ -124,7 +124,7 @@ Nothing should ask the owner to mint a token.
    - `created_by_fleet = 1`.
 
    The server then mints the agent's first token.
-3. The claim hands over the token, the new DID and the mailbox password, once.
+3. The claim hands over the token and the new DID, once. The new mailbox's password goes to nobody. It would be a full sign-in, beyond the scope the owner's phone signed for.
 
 Nothing should ask the owner to create an agent in their own session either.
 

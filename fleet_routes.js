@@ -144,13 +144,19 @@ module.exports = function registerFleetRoutes(deps) {
     return { prior, payer };
   }
   async function createFleetSilicon(fleet, { handle, displayName, contactEmail = '', refill = {}, username, password, by }) {
-    const { prior, payer } = createCheck(fleet, handle, username);
+    createCheck(fleet, handle, username);
     const id = identity.createIdentity();
     const emailResult = await dustforge.createAccount(username, password);
     if (!emailResult.ok) throw refusal(500, `email creation failed: ${emailResult.error}`);
     const referral = crypto.randomBytes(6).toString('hex');
     const pwHash = emailResult.password_hash || await passwords.hashPassword(password);
+    // Everything after the mailbox is one transaction, checked again first: anything that changed while the mailbox
+    // was made (the handle or username taken, the fleet full, the payer short) rolls the charge back with it
+    // (PR #84 review: a concurrent create was charged with no agent row, and capacity could be passed).
+    let s;
     const txn = db.transaction(() => {
+      const { prior, payer } = createCheck(fleet, handle, username);
+      if (prior && prior.member_did !== id.did) db.prepare("UPDATE fleet_silicons SET handle = handle || '~' || id WHERE id = ?").run(prior.id);
       const debit = billing.deductBalance(db, payer, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
       if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: { error: 'insufficient balance to provision', detail: debit.error, payer_did: payer } });
       db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
@@ -158,12 +164,14 @@ module.exports = function registerFleetRoutes(deps) {
       db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, 'account_created', ?, 0, 'fleet_provisioned')")
         .run(id.did, `Fleet-provisioned by ${fleet.slug}`);
       db.prepare("INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, id.did);
+      s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
+      db.prepare('UPDATE fleet_silicons SET created_by_fleet = 1 WHERE id = ?').run(s.id);   // owned outright: the fleet made it
     });
-    txn();
-    // A removed silicon's handle can be reused: its row is renamed out of the way.
-    if (prior && prior.member_did !== id.did) db.prepare("UPDATE fleet_silicons SET handle = handle || '~' || id WHERE id = ?").run(prior.id);
-    let s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
-    db.prepare('UPDATE fleet_silicons SET created_by_fleet = 1 WHERE id = ?').run(s.id);   // owned outright: the fleet made it
+    try { txn.immediate(); } catch (e) {
+      // Nothing was charged or written; the mailbox made for it is removed again.
+      Promise.resolve(dustforge.deleteAccount(username)).catch(() => log(`orphan mailbox ${username}@dustforge.com left after a refused create`));
+      throw e.statusCode ? e : refusal(409, `@${handle} could not be created: ${e.message}`);
+    }
     s = fb.getSilicon(db, fleet.id, id.did);
     const walletRow = { username, email: emailResult.email };
     const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet: walletRow, apiBase });

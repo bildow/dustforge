@@ -4,8 +4,10 @@
 #     exists, a second request for the same handle, a bad `create` and a fleet that cannot pay are refused;
 #   - the owner sees "create" on the card and approves with the PIN; the fleet creates the agent exactly like the
 #     owner's own create (created_by_fleet, charged like a provision) and mints its first token;
-#   - the claim hands over the token, the DID and the mailbox password once; the token works as the new agent;
-#   - a handle taken meanwhile, or a mailbox that cannot be made, leaves no agent and the request waiting.
+#   - the claim hands over the token and the DID once (never the mailbox password: PR #84 review); it works as the agent;
+#   - a handle taken meanwhile, or a mailbox that cannot be made, leaves no agent, no charge and the request waiting;
+#   - PR #84 review: a create racing the request is charged once; a claim while creating waits (202); an interrupted
+#     creation is ended by the sweep; a non-owner learns nothing about the payer.
 # No network beyond 127.0.0.1.
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -19,11 +21,13 @@ class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_POST(self):
         n = int(self.headers.get('Content-Length') or 0); self.rfile.read(n)
+        if os.path.exists(os.path.join(sys.argv[2], 'stalwart-slow')):
+            import time; time.sleep(4)
         down = os.path.exists(os.path.join(sys.argv[2], 'stalwart-down'))
         body = json.dumps({'error': 'down', 'title': 'stalwart down'} if down else {'data': 4242}).encode()
         self.send_response(500 if down else 200); self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body)
-http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+http.server.ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 PY
 python3 "$S/stalwart.py" "$SPORT" "$S" & STW=$!
 export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
@@ -105,9 +109,9 @@ PIN "silicon-token:$R1"; call POST /api/silicon-token-requests/$R1/approve "$A" 
 
 # ── claiming ──
 call POST /api/silicon-token-requests/$R1/claim "" '{"claim_secret":"'$C1'"}'
-TOK=$(echo "$BODY" | J token); PW=$(echo "$BODY" | J password_once)
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J created)" = True ] && [ "$(echo "$BODY" | J did)" = "$NEWDID" ] && [ "$(echo "$BODY" | J email)" = provisioner@dustforge.com ] && [ ${#PW} -ge 20 ] \
-  && ok "claimed once: token, DID, mailbox and its password" || fail "claim: $CODE $(echo "$BODY" | head -c 200)"
+TOK=$(echo "$BODY" | J token)
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J created)" = True ] && [ "$(echo "$BODY" | J did)" = "$NEWDID" ] && [ "$(echo "$BODY" | J email)" = provisioner@dustforge.com ] \
+  && [ "$(echo "$BODY" | J password_once)" = None ] && ok "claimed once: token and DID — and no mailbox password (it would be a full sign-in)" || fail "claim: $CODE $(echo "$BODY" | head -c 200)"
 SUB=$(python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; p+="="*(-len(p)%4); print(json.loads(base64.urlsafe_b64decode(p))["sub"])' "$TOK")
 [ "$SUB" = "$NEWDID" ] && ok "the token is the new agent's" || fail "sub: $SUB"
 call GET /api/demipass/list "$TOK"; [ "$CODE" = 200 ] && ok "…and works as @provisioner" || fail "use: $CODE $BODY"
@@ -132,10 +136,36 @@ rm -f "$S/stalwart-down"
 PIN "silicon-token:$R2"; call POST /api/silicon-token-requests/$R2/approve "$A" '{}'; [ "$CODE" = 200 ] && ok "…approved again once it is back" || fail "re-approve: $CODE $BODY"
 call POST /api/fleet/aaron-agents/silicons/helper-two/token-requests/$R2/claim "" '{"claim_secret":"'$C2'"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J scope)" = read ] && ok "…and claimed on the fleet path" || fail "claim 2: $CODE"
 
+# ── PR #84 review: a create racing the request is charged once; a claim while creating waits ──
+X "UPDATE fleets SET max_agents = 50 WHERE slug = 'aaron-agents'"
+call POST /api/fleet/aaron-agents/silicons/race-a/token-requests "$A" '{"create":{"username":"race-a-req"}}'; R4=$(echo "$BODY" | J request_id); C4=$(echo "$BODY" | J claim_secret)
+touch "$S/stalwart-slow"; B2=$(bal); PIN "silicon-token:$R4"
+( call POST /api/silicon-token-requests/$R4/approve "$A" '{}'; echo "$CODE $BODY" > "$S/approve4" ) & AP=$!
+sleep 1.5
+call POST /api/silicon-token-requests/$R4/claim "" '{"claim_secret":"'$C4'"}'; [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = creating ] && ok "a claim while the agent is being created → 202 (keep polling)" || fail "creating claim: $CODE $BODY"
+call POST /api/fleet/aaron-agents/silicons "$A" '{"handle":"race-a","create":{"username":"race-a-own"}}'; OWNCODE=$CODE
+wait $AP; rm -f "$S/stalwart-slow"; read -r ACODE ABODY < "$S/approve4"
+AGENTS=$(Q "SELECT COUNT(*) FROM fleet_silicons WHERE handle='race-a'"); ORPH=$(Q "SELECT COUNT(*) FROM identity_wallets w WHERE username LIKE 'race-a-%' AND NOT EXISTS (SELECT 1 FROM fleet_silicons s WHERE s.member_did = w.did)")
+# Whichever finishes first makes the agent; the other is refused inside its own transaction, uncharged. The request
+# is approved if it won, and waits again if it lost.
+ST4=$(Q "SELECT status FROM silicon_token_requests WHERE id=$R4")
+{ { [ "$ACODE" = 200 ] && [ "$ST4" = approved ] && [ "$OWNCODE" = 409 ]; } || { [ "$ACODE" != 200 ] && [ "$ST4" = pending ] && [ "$OWNCODE" = 200 ]; }; } \
+  && [ "$AGENTS" = 1 ] && [ "$ORPH" = 0 ] && [ $(( B2 - $(bal) )) = 1000 ] \
+  && ok "a create racing the request: one agent, charged once, no orphan wallet, the loser refused uncharged (owner $OWNCODE, request $ACODE → $ST4)" || fail "race: agents=$AGENTS orphans=$ORPH charged=$(( B2 - $(bal) )) own=$OWNCODE approve=$ACODE $ABODY status=$(Q "SELECT status FROM silicon_token_requests WHERE id=$R4")"
+
+# ── PR #84 review: an interrupted creation does not stay stuck ──
+call POST /api/fleet/aaron-agents/silicons/crash-a/token-requests "$A" '{"create":{}}'; R5=$(echo "$BODY" | J request_id)
+X "UPDATE silicon_token_requests SET status='creating', decided_at='2000-01-01T00:00:00.000Z' WHERE id=$R5"
+call GET /api/silicon-token-requests "$A"
+[ "$(Q "SELECT status FROM silicon_token_requests WHERE id=$R5")" = expired ] && ok "a creation interrupted mid-way (no agent) is ended by the sweep: expired" || fail "stuck: $(Q "SELECT status FROM silicon_token_requests WHERE id=$R5")"
+call POST /api/fleet/aaron-agents/silicons/crash-a/token-requests "$A" '{"create":{}}'; [ "$CODE" = 202 ] && ok "…and the handle can be asked for again" || fail "re-file: $CODE $BODY"
+
 # ── a fleet that cannot pay is told when asking (capacity raised, so it is the balance that refuses) ──
 X "UPDATE fleets SET max_agents = 50 WHERE slug = 'aaron-agents'"
 X "INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES ('$PAYER', -$(bal), 'adjust', 'smoke', 0)"
-call POST /api/fleet/aaron-agents/silicons/too-poor/token-requests "$A" '{"create":{}}'; [ "$CODE" = 402 ] && ok "a fleet that cannot pay for an agent: 402 when asking" || fail "poor: $CODE $BODY"
+call POST /api/fleet/aaron-agents/silicons/too-poor/token-requests "$A" '{"create":{}}'; [ "$CODE" = 402 ] && ok "a fleet that cannot pay for an agent: 402 to the owner" || fail "poor: $CODE $BODY"
+call POST /api/fleet/aaron-agents/silicons/too-poor-b/token-requests "$B" '{"create":{}}'
+[ "$CODE" = 409 ] && ! echo "$BODY" | grep -q payer && ok "…a non-owner learns only that it cannot be asked now (no payer, no balance)" || fail "poor non-owner: $CODE $BODY"
 
 [ $fails -gt 0 ] && { echo "--- server.log"; grep -i -m5 "error" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))
