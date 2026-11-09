@@ -21,7 +21,7 @@
 // owner's own POST /api/fleet/:slug/silicons {create} does (fleet_routes.js createFleetSilicon: mailbox + wallet,
 // charged like /provision, created_by_fleet = 1) and mints its first token; the claim hands over the token and the DID,
 // once. The new mailbox's password goes to nobody (PR #84 review: it is a full sign-in, beyond the scope the owner's
-// phone signed for); the owner can set one later from their own session.
+// phone signed for). The agent works by its tokens; nothing here sets a mailbox password later (follow-up issue).
 // A request waits REQUEST_TTL_SEC for the owner; an approved token waits CLAIM_TTL_SEC to be claimed, then it is
 // revoked (nobody holds it). The minted token is what POST …/silicons/:handle/token makes (auth_method
 // fleet_owner_mint: it acts as the agent's wallet but never runs a fleet), capped at transact.
