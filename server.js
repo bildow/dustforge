@@ -8616,7 +8616,8 @@ const deviceKeys = require('./device_keys')({
 // Agent token requests (silicon_token_requests.js): asked for by a fleet member, approved in the owner's app (PIN +
 // phone), claimed once with a claim secret. Aaron 2026-11-08, for Conduit's tenant token.
 require('./silicon_token_requests')({ app, db, identity, crypto, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh,
-  gateMissing, spendSingleUse, blindkeyEncrypt, blindkeyDecrypt, logSecurityEvent, devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a) });
+  gateMissing, spendSingleUse, blindkeyEncrypt, blindkeyDecrypt, logSecurityEvent, devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a),
+  fleetCreate: () => fleetRoutes });   // agent creation requests create the agent the way the owner's own create does
 // Recovery guardians (red team item 9, step 2): 3 people paired in person, each accepting with PIN + phone.
 const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, devices: () => deviceKeys, holds: () => accountHolds, sendMail: (...a) => fleetRoutes.sendMail(...a),

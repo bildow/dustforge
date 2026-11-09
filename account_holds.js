@@ -226,8 +226,10 @@ module.exports = function registerAccountHolds(deps) {
     // numeric range (the app keys notifications by a 1-12 digit id).
     if (!key.revoked_at) {
       try {
-        for (const r of db.prepare("SELECT id, handle, fleet_slug, scope, expires_in, created_at FROM silicon_token_requests WHERE owner_did = ? AND status = 'pending' AND expires_at > ? ORDER BY id DESC LIMIT 20").all(ch.did, new Date().toISOString())) {
-          approvals.push({ id: 100000000000 + r.id, title: `token for @${r.handle}`, requester: '', summary: `${r.fleet_slug}: @${r.handle} (${r.scope}, ${r.expires_in})`, depth: 'critical', kind: 'silicon-token' });
+        for (const r of db.prepare("SELECT id, handle, fleet_slug, scope, expires_in, created_at, COALESCE(creates, 0) AS creates FROM silicon_token_requests WHERE owner_did = ? AND status = 'pending' AND expires_at > ? ORDER BY id DESC LIMIT 20").all(ch.did, new Date().toISOString())) {
+          // A creation request says so in the headline: a new agent, not a token for one that exists.
+          approvals.push({ id: 100000000000 + r.id, title: r.creates ? `new agent @${r.handle}` : `token for @${r.handle}`, requester: '',
+            summary: `${r.fleet_slug}: ${r.creates ? 'create ' : ''}@${r.handle} (${r.scope}, ${r.expires_in})`, depth: 'critical', kind: 'silicon-token' });
         }
       } catch (_) {}
     }
