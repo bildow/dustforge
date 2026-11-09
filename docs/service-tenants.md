@@ -116,6 +116,18 @@ A tenant's wallet is usually a fleet silicon. Its DemiPass token is **requested*
 
 Nothing should ask the owner to mint a token.
 
+**An agent that does not exist yet is requested the same way** (Aaron 2026-11-09):
+1. File the request with `create`: `POST /api/fleet/<fleet>/silicons/<new-handle>/token-requests {create: {display_name?, username?}, scope, expires_in, claim_secret_hash}`.
+2. The owner's card and phone text say "create". On approval (PIN and phone), the fleet creates the agent exactly as the owner's own `POST /api/fleet/<fleet>/silicons {create}` does:
+   - a new wallet and mailbox;
+   - charged like a provision to the fleet's payer;
+   - `created_by_fleet = 1`.
+
+   The server then mints the agent's first token.
+3. The claim hands over the token, the new DID and the mailbox password, once.
+
+Nothing should ask the owner to create an agent in their own session either.
+
 **How long requests wait** (#77):
 - DemiPass grants (consent, registration, gate-weakening) wait 24 h.
 - A use of a secret, or an elevated tenant action, waits 1 h.

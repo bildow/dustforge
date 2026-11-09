@@ -123,6 +123,57 @@ module.exports = function registerFleetRoutes(deps) {
     });
   });
 
+  // ── Creating an agent ─────────────────────────────────────────────────────────────────────────────────────────
+  // A brand-new identity (mailbox + wallet) made by the fleet, charged like /provision to the fleet's payer, marked
+  // created_by_fleet. Two callers: the owner's POST /api/fleet/:slug/silicons {create}, and an agent creation request
+  // approved in the owner's app (silicon_token_requests.js). createCheck throws {statusCode, body} for any refusal and
+  // is run again by createFleetSilicon, so a request approved later is checked against the fleet as it is then.
+  const USERNAME_RE = /^[a-z0-9][a-z0-9._-]{2,30}$/;
+  const refusal = (statusCode, error, extra = {}) => Object.assign(new Error(error), { statusCode, body: { error, ...extra } });
+  function createCheck(fleet, handle, username) {
+    if (!fb.HANDLE_RE.test(handle)) throw refusal(400, 'handle: 2-31 chars, lowercase alphanumeric and hyphens');
+    const prior = fb.getSilicon(db, fleet.id, handle);
+    if (prior && prior.status !== 'removed') throw refusal(409, 'handle already used in this fleet');
+    if (fb.activeFleetOf(db, fleet.owner_did)) throw refusal(409, 'the fleet owner is an agent in a fleet, so it cannot take agents');
+    if (!USERNAME_RE.test(username)) throw refusal(400, 'username must be 3-31 chars, lowercase alphanumeric');
+    if (db.prepare('SELECT 1 FROM identity_wallets WHERE username = ?').get(username)) throw refusal(409, 'username already taken');
+    const count = db.prepare('SELECT COUNT(*) AS n FROM fleet_members WHERE fleet_id = ?').get(fleet.id).n;
+    if (count >= fleet.max_agents) throw refusal(403, `fleet is at capacity (${fleet.max_agents} members)`);
+    const payer = fleet.wallet_did || fleet.owner_did;
+    if (billing.getDerivedBalance(db, payer) < PROVISION_COST) throw refusal(402, 'insufficient balance to provision', { required: PROVISION_COST, payer_did: payer });
+    return { prior, payer };
+  }
+  async function createFleetSilicon(fleet, { handle, displayName, contactEmail = '', refill = {}, username, password, by }) {
+    const { prior, payer } = createCheck(fleet, handle, username);
+    const id = identity.createIdentity();
+    const emailResult = await dustforge.createAccount(username, password);
+    if (!emailResult.ok) throw refusal(500, `email creation failed: ${emailResult.error}`);
+    const referral = crypto.randomBytes(6).toString('hex');
+    const pwHash = emailResult.password_hash || await passwords.hashPassword(password);
+    const txn = db.transaction(() => {
+      const debit = billing.deductBalance(db, payer, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
+      if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: { error: 'insufficient balance to provision', detail: debit.error, payer_did: payer } });
+      db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
+        .run(id.did, username, emailResult.email, id.encrypted_private_key, referral, emailResult.stalwart_id, pwHash);
+      db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, 'account_created', ?, 0, 'fleet_provisioned')")
+        .run(id.did, `Fleet-provisioned by ${fleet.slug}`);
+      db.prepare("INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, id.did);
+    });
+    txn();
+    // A removed silicon's handle can be reused: its row is renamed out of the way.
+    if (prior && prior.member_did !== id.did) db.prepare("UPDATE fleet_silicons SET handle = handle || '~' || id WHERE id = ?").run(prior.id);
+    let s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
+    db.prepare('UPDATE fleet_silicons SET created_by_fleet = 1 WHERE id = ?').run(s.id);   // owned outright: the fleet made it
+    s = fb.getSilicon(db, fleet.id, id.did);
+    const walletRow = { username, email: emailResult.email };
+    const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet: walletRow, apiBase });
+    const subject = `DemiPass: ${handle} created in fleet ${fleet.slug} — your DID record`;
+    sendMail({ to: emailResult.email, subject, text });
+    if (contactEmail && contactEmail !== emailResult.email) sendMail({ to: contactEmail, subject, text });
+    log(`created ${handle} (${id.did}, ${emailResult.email}) in ${fleet.slug} by ${by}`);
+    return { did: id.did, email: emailResult.email, username, silicon: s };
+  }
+
   // ── Silicons ──────────────────────────────────────────────────────────────
   app.get('/api/fleet/:slug/silicons', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res); if (!a) return;
@@ -222,46 +273,14 @@ module.exports = function registerFleetRoutes(deps) {
                           silicon: fb.siliconView(db, billing, fb.getSilicon(db, fleet.id, handle), { fleet }) });
       }
 
-      // Create a brand-new identity (mailbox + wallet), charged like /provision.
-      if (fb.activeFleetOf(db, fleet.owner_did)) return res.status(409).json({ error: 'the fleet owner is an agent in a fleet, so it cannot take agents' });
+      // Create a brand-new identity (mailbox + wallet), charged like /provision (createFleetSilicon below).
       const create = b.create && typeof b.create === 'object' ? b.create : {};
       const username = String(create.username || handle).toLowerCase();
-      if (!/^[a-z0-9][a-z0-9._-]{2,30}$/.test(username)) return res.status(400).json({ error: 'username must be 3-31 chars, lowercase alphanumeric' });
-      if (db.prepare('SELECT 1 FROM identity_wallets WHERE username = ?').get(username)) return res.status(409).json({ error: 'username already taken' });
       const password = create.password ? String(create.password) : crypto.randomBytes(12).toString('base64url');
       if (password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
-      const count = db.prepare('SELECT COUNT(*) AS n FROM fleet_members WHERE fleet_id = ?').get(fleet.id).n;
-      if (count >= fleet.max_agents) return res.status(403).json({ error: `fleet is at capacity (${fleet.max_agents} members)` });
-      const payer = fleet.wallet_did || fleet.owner_did;
-      if (billing.getDerivedBalance(db, payer) < PROVISION_COST) return res.status(402).json({ error: 'insufficient balance to provision', required: PROVISION_COST, payer_did: payer });
-
-      const id = identity.createIdentity();
-      const emailResult = await dustforge.createAccount(username, password);
-      if (!emailResult.ok) return res.status(500).json({ error: `email creation failed: ${emailResult.error}` });
-      const referral = crypto.randomBytes(6).toString('hex');
-      const pwHash = emailResult.password_hash || await passwords.hashPassword(password);
-      const txn = db.transaction(() => {
-        const debit = billing.deductBalance(db, payer, PROVISION_COST, 'fleet_provision', `Provision ${username} for fleet ${fleet.slug}`);
-        if (!debit.ok) throw Object.assign(new Error(debit.error || 'insufficient balance'), { statusCode: 402, body: { error: 'insufficient balance to provision', detail: debit.error, payer_did: payer } });
-        db.prepare('INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, referral_code, stalwart_id, password_hash) VALUES (?, ?, ?, ?, 0, ?, ?, ?)')
-          .run(id.did, username, emailResult.email, id.encrypted_private_key, referral, emailResult.stalwart_id, pwHash);
-        db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after, provenance) VALUES (?, 0, 'account_created', ?, 0, 'fleet_provisioned')")
-          .run(id.did, `Fleet-provisioned by ${fleet.slug}`);
-        db.prepare("INSERT INTO fleet_members (fleet_id, member_did, role) VALUES (?, ?, 'agent')").run(fleet.id, id.did);
-      });
-      txn();
-      freePrior(id.did);
-      let s = fb.upsertSilicon(db, { fleetId: fleet.id, memberDid: id.did, handle, displayName, contactEmail: contactEmail || emailResult.email, refill });
-      db.prepare('UPDATE fleet_silicons SET created_by_fleet = 1 WHERE id = ?').run(s.id);   // owned outright: the fleet made it
-      s = fb.getSilicon(db, fleet.id, id.did);
-      const walletRow = { username, email: emailResult.email };
-      const text = fb.didRecordEmail({ silicon: s, fleet: { ...fleet, owner_username: ownerUsername(fleet.owner_did) }, wallet: walletRow, apiBase });
-      const subject = `DemiPass: ${handle} created in fleet ${fleet.slug} — your DID record`;
-      sendMail({ to: emailResult.email, subject, text });
-      if (contactEmail && contactEmail !== emailResult.email) sendMail({ to: contactEmail, subject, text });
-      log(`created ${handle} (${id.did}, ${emailResult.email}) in ${fleet.slug} by ${a.did}`);
-      return res.json({ ok: true, mode: 'created', did: id.did, email: emailResult.email, username, password_once: create.password ? undefined : password,
-                        silicon: fb.siliconView(db, billing, s, { fleet }) });
+      const made = await createFleetSilicon(fleet, { handle, displayName, contactEmail, refill, username, password, by: a.did });
+      return res.json({ ok: true, mode: 'created', did: made.did, email: made.email, username, password_once: create.password ? undefined : password,
+                        silicon: fb.siliconView(db, billing, made.silicon, { fleet }) });
     } catch (e) { return fail(res, e); }
   });
 
@@ -698,5 +717,5 @@ module.exports = function registerFleetRoutes(deps) {
     try { res.json({ ok: true, link: linkView(fb.revokeWorkLink(db, { id: Number(req.params.id), byDid: who.did }), who.did) }); } catch (e) { fail(res, e); }
   });
 
-  return { sendMail };
+  return { sendMail, createCheck, createFleetSilicon, PROVISION_COST };
 };

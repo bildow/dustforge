@@ -14,6 +14,13 @@
 //   POST /api/silicon-token-requests/:id/deny         the fleet owner
 //   POST /api/silicon-token-requests/:id/claim {claim_secret}   no session: the secret is the proof; 202 while pending
 //        (also at POST /api/fleet/:slug/silicons/:handle/token-requests/:id/claim)
+// Creating an agent by request (Aaron 2026-11-09: "File 'create an agent' as a dustforge app request … the provisioner
+// is fleet-created like Conduit"): the same call for a handle the fleet does not have yet, with `create`:
+//   POST /api/fleet/:slug/silicons/:handle/token-requests {create: {display_name?, username?}, scope?, expires_in?, …}
+// On the owner's approval (PIN + phone, the phone's text starting "create ") the fleet creates the agent exactly as the
+// owner's own POST /api/fleet/:slug/silicons {create} does (fleet_routes.js createFleetSilicon: mailbox + wallet,
+// charged like /provision, created_by_fleet = 1) and mints its first token; the claim hands over the token, the DID and
+// the mailbox password, once.
 // A request waits REQUEST_TTL_SEC for the owner; an approved token waits CLAIM_TTL_SEC to be claimed, then it is
 // revoked (nobody holds it). The minted token is what POST …/silicons/:handle/token makes (auth_method
 // fleet_owner_mint: it acts as the agent's wallet but never runs a fleet), capped at transact.
@@ -53,6 +60,10 @@ module.exports = function registerSiliconTokenRequests(deps) {
     claimed_at TEXT DEFAULT NULL
   )`);
   try { db.exec("ALTER TABLE silicon_token_requests ADD COLUMN requester_role TEXT DEFAULT ''"); } catch (_) {}
+  // Agent creation requests: the agent does not exist when asked for (silicon_row 0, member_did '' until approval).
+  for (const col of ["creates INTEGER DEFAULT 0", "display_name TEXT DEFAULT ''", "username TEXT DEFAULT ''"]) {
+    try { db.exec(`ALTER TABLE silicon_token_requests ADD COLUMN ${col}`); } catch (_) {}
+  }
   db.exec('CREATE INDEX IF NOT EXISTS idx_str_owner ON silicon_token_requests(owner_did, status)');
 
   const sha = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
@@ -84,8 +95,12 @@ module.exports = function registerSiliconTokenRequests(deps) {
   }
   const view = (r) => ({ id: r.id, fleet: r.fleet_slug, handle: r.handle, scope: r.scope, expires_in: r.expires_in, says_it_is: r.says_it_is,
     requested_by: (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(r.requested_by_did) || {}).username || null,
-    requester_role: r.requester_role || '', status: r.status, created_at: r.created_at, expires_at: r.expires_at, intent: `silicon-token:${r.id}` });
+    requester_role: r.requester_role || '', status: r.status, created_at: r.created_at, expires_at: r.expires_at, intent: `silicon-token:${r.id}`,
+    creates: Boolean(r.creates), ...(r.creates ? { display_name: r.display_name, username: r.username, cost_dd: fleetCreate().PROVISION_COST || null } : {}) });
   const requesterName = (r) => (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(r.requested_by_did) || {}).username || '?';
+  // What the phone signs: a creation says so first, so a token for an existing agent and a new agent never share a text.
+  const bindFor = (r) => `${r.creates ? 'create ' : ''}${r.fleet_slug}/${r.handle}:${r.scope}:${r.expires_in} asked by ${requesterName(r)}`;
+  const fleetCreate = deps.fleetCreate || (() => ({}));
 
   // ── file a request ──────────────────────────────────────────────────────────────────────────────────────────────
   app.post('/api/fleet/:slug/silicons/:handle/token-requests', rateLimitStandard, (req, res) => {
@@ -102,10 +117,29 @@ module.exports = function registerSiliconTokenRequests(deps) {
     // without asking the wallet (threat model item 17), so it files nothing (#77 review note on #78).
     const member = fleet.owner_did === auth.did || db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active'").get(fleet.id, auth.did);
     if (!member) return res.status(403).json({ error: 'fleet membership required' });
-    const s = fb.getSilicon(db, fleet.id, String(req.params.handle || '').toLowerCase());
-    if (!s || s.status !== 'active') return res.status(404).json({ error: 'silicon not found in this fleet' });
-    if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network and keeps its own key: it signs in itself` });
     const b = req.body || {};
+    const handle = String(req.params.handle || '').toLowerCase();
+    const found = fb.getSilicon(db, fleet.id, handle);
+    const creates = b.create !== undefined;
+    let s, username = '', displayName = '';
+    if (creates) {
+      // A new agent: nothing by this handle in the fleet yet; checked now and again when the owner approves.
+      if (!b.create || typeof b.create !== 'object' || Array.isArray(b.create)) return res.status(400).json({ error: 'create: an object {display_name?, username?}' });
+      if (found && found.status !== 'removed') return res.status(409).json({ error: `@${handle} already exists in this fleet: ask for its token without create` });
+      const fc = fleetCreate();
+      if (!fc.createCheck) return res.status(501).json({ error: 'agent creation is not available here' });
+      username = String(b.create.username || handle).toLowerCase();
+      displayName = clean(b.create.display_name || handle, 100);
+      try { fc.createCheck(fleet, handle, username); } catch (e) { return res.status(e.statusCode || 400).json(e.body || { error: e.message }); }
+      if (db.prepare("SELECT 1 FROM silicon_token_requests WHERE fleet_id = ? AND creates = 1 AND status IN ('pending','creating') AND (handle = ? OR username = ?)").get(fleet.id, handle, username)) {
+        return res.status(409).json({ error: `a request to create @${handle} is already waiting` });
+      }
+      s = { id: 0, handle, member_did: '' };
+    } else {
+      s = found;
+      if (!s || s.status !== 'active') return res.status(404).json({ error: 'silicon not found in this fleet' });
+      if (s.joined_via === 'network') return res.status(403).json({ error: `@${s.handle} joined through the network and keeps its own key: it signs in itself` });
+    }
     const scope = b.scope === undefined ? TOKEN_SCOPE_CAP : String(b.scope);
     if (!identity.ISSUABLE_SCOPES.includes(scope) || identity.scopeAtLeast(scope, 'admin')) return res.status(400).json({ error: `scope must be read, write or ${TOKEN_SCOPE_CAP}` });
     // The lifetime on the owner's card is the one minted: capped here by the scope's ceiling (identity.js), at least 1 h.
@@ -121,21 +155,28 @@ module.exports = function registerSiliconTokenRequests(deps) {
       claimHash = String(b.claim_secret_hash).toLowerCase();
       if (!HEX64.test(claimHash)) return res.status(400).json({ error: 'claim_secret_hash: the sha256 (64 hex) of a secret you keep' });
     } else { claimSecret = crypto.randomBytes(24).toString('base64url'); claimHash = sha(claimSecret); }
-    if (db.prepare("SELECT COUNT(*) AS n FROM silicon_token_requests WHERE silicon_row = ? AND status = 'pending'").get(s.id).n >= MAX_PENDING_PER_SILICON
+    if ((!creates && db.prepare("SELECT COUNT(*) AS n FROM silicon_token_requests WHERE silicon_row = ? AND status = 'pending'").get(s.id).n >= MAX_PENDING_PER_SILICON)
       || db.prepare("SELECT COUNT(*) AS n FROM silicon_token_requests WHERE fleet_id = ? AND status = 'pending'").get(fleet.id).n >= MAX_PENDING_PER_FLEET) {
       return res.status(429).json({ error: 'too many token requests waiting for the owner' });
     }
     const says = clean(b.label || (auth.decoded && (auth.decoded.agent_name || auth.decoded.label)) || '', 80);
     // Who is asking, as the owner's card says it: the owner, the agent itself, or ANOTHER agent of the fleet.
-    const role = auth.did === fleet.owner_did ? 'owner' : auth.did === s.member_did ? 'self'
+    const role = auth.did === fleet.owner_did ? 'owner' : (!creates && auth.did === s.member_did) ? 'self'
       : (db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, auth.did) || {}).role === 'admin' ? 'admin'
       // A member the fleet did not create (joined through the network or linked) is someone else's wallet: say so (#79 review).
       : db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1 AND COALESCE(joined_via, 'owner') != 'network'").get(fleet.id, auth.did) ? 'other_agent' : 'outside_agent';
     const id = Number(db.prepare(`INSERT INTO silicon_token_requests (fleet_id, fleet_slug, silicon_row, handle, member_did, owner_did, requested_by_did,
-        says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, role, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC)).lastInsertRowid);
-    mailOwner(fleet.owner_did, `DemiPass: a token for @${s.handle} is asked for`,
-      `${role === 'outside_agent' ? 'A WALLET YOUR FLEET DID NOT CREATE, in' : role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in'} your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.${role === 'other_agent' || role === 'outside_agent' ? ' If you approve, the wallet that asked can act as @' + s.handle + '.' : ''}\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
+        says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at, creates, display_name, username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, role, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC),
+        creates ? 1 : 0, displayName, username).lastInsertRowid);
+    const who = role === 'outside_agent' ? 'A WALLET YOUR FLEET DID NOT CREATE, in' : role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in';
+    if (creates) {
+      mailOwner(fleet.owner_did, `DemiPass: a new agent @${s.handle} is asked for`,
+        `${who} your fleet ${fleet.slug} asks you to CREATE a new agent @${s.handle} (wallet and mailbox ${username}@dustforge.com, charged like a provision) and give it a ${scope} token (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}. If you approve, the wallet that asked receives that token and the new mailbox's password, and can act as @${s.handle}.\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
+    } else {
+      mailOwner(fleet.owner_did, `DemiPass: a token for @${s.handle} is asked for`,
+        `${who} your fleet ${fleet.slug} asks for a ${scope} token for @${s.handle} (lasting ${expiresIn})${says ? `, saying it is for "${says}"` : ''}.${role === 'other_agent' || role === 'outside_agent' ? ' If you approve, the wallet that asked can act as @' + s.handle + '.' : ''}\nApprove or deny it in the DemiPass app (Settings → Agent token requests). It waits ${REQUEST_TTL_SEC / 3600} hours.\n`);
+    }
     res.status(202).json({ ok: true, request_id: id, ...(claimSecret ? { claim_secret: claimSecret } : {}), expires_at: later(REQUEST_TTL_SEC),
       next: `the fleet owner approves it in the DemiPass app; then POST /api/silicon-token-requests/${id}/claim {claim_secret} once` });
   });
@@ -148,7 +189,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
     res.json({ ok: true, requests: rows.map(view) });
   });
 
-  app.post('/api/silicon-token-requests/:id/approve', rateLimitStandard, (req, res) => {
+  app.post('/api/silicon-token-requests/:id/approve', rateLimitStandard, async (req, res) => {
     const auth = ownerAuth(req, res); if (!auth) return;
     expireRequests();
     const r = db.prepare('SELECT * FROM silicon_token_requests WHERE id = ? AND owner_did = ?').get(Number(req.params.id), auth.did);
@@ -156,9 +197,19 @@ module.exports = function registerSiliconTokenRequests(deps) {
     if (r.status !== 'pending') return res.status(409).json({ error: `this request is ${r.status}` });
     // The fleet is still this owner's and the agent still in it, as it was asked for.
     const fleet = db.prepare('SELECT * FROM fleets WHERE id = ?').get(r.fleet_id);
-    const s = fb.getSilicon(db, r.fleet_id, r.handle);
-    if (!fleet || fleet.owner_did !== auth.did || (fleet.status && fleet.status !== 'active') || !s || s.status !== 'active' || s.id !== r.silicon_row || s.joined_via === 'network') {
-      return res.status(409).json({ error: 'the agent or the fleet changed since this was asked for: ask again' });
+    if (!fleet || fleet.owner_did !== auth.did || (fleet.status && fleet.status !== 'active')) {
+      return res.status(409).json({ error: 'the fleet changed since this was asked for: ask again' });
+    }
+    if (r.creates) {
+      // The handle and username must still be free, and the fleet able to take and pay for one more agent.
+      const fc = fleetCreate();
+      if (!fc.createCheck) return res.status(501).json({ error: 'agent creation is not available here' });
+      try { fc.createCheck(fleet, r.handle, r.username); } catch (e) { return res.status(409).json({ error: `cannot create @${r.handle} now: ${(e.body && e.body.error) || e.message}` }); }
+    } else {
+      const s = fb.getSilicon(db, r.fleet_id, r.handle);
+      if (!s || s.status !== 'active' || s.id !== r.silicon_row || s.joined_via === 'network') {
+        return res.status(409).json({ error: 'the agent or the fleet changed since this was asked for: ask again' });
+      }
     }
     // Whoever filed it must still be the owner or a consented member: a filer that left or was removed, or a request
     // filed before #79 by a bare fleet_members row, cannot be approved (#79 review).
@@ -168,8 +219,9 @@ module.exports = function registerSiliconTokenRequests(deps) {
     const intent = `silicon-token:${r.id}`;
     if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json({ ...gateMissing('silicon-token', ['pin'], ['pin'], intent), error: `a token for @${r.handle} needs your PIN` });
     const dk = devices();
-    const refused = dk ? dk.approvalRefusal(auth, 'silicon-token', r.id, `${r.fleet_slug}/${r.handle}:${r.scope}:${r.expires_in} asked by ${requesterName(r)}`, req.body) : null;
+    const refused = dk ? dk.approvalRefusal(auth, 'silicon-token', r.id, bindFor(r), req.body) : null;
     if (refused) return res.status(refused.status).json(refused.body);
+    if (r.creates) return approveCreate(req, res, auth, r, fleet, intent);
     const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(r.member_did);
     if (!wallet) return res.status(404).json({ error: 'identity not found' });
     try {
@@ -190,6 +242,46 @@ module.exports = function registerSiliconTokenRequests(deps) {
     res.json({ ok: true, approved: { handle: r.handle, scope: r.scope, expires_in: r.expires_in }, claim_within_seconds: CLAIM_TTL_SEC });
   });
 
+  // An approved creation: the PIN is spent and the request taken ('creating') in one step, so a second approval cannot
+  // make a second agent; then the fleet creates the agent and its first token is minted and sealed for the claim.
+  async function approveCreate(req, res, auth, r, fleet, intent) {
+    try {
+      db.transaction(() => {
+        const spent = spendSingleUse(auth.did, 'silicon-token', ['pin'], auth, intent);
+        if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
+        if (db.prepare("UPDATE silicon_token_requests SET status = 'creating' WHERE id = ? AND status = 'pending'").run(r.id).changes !== 1) {
+          throw Object.assign(new Error('this request changed meanwhile'), { statusCode: 409 });
+        }
+      }).immediate();
+    } catch (e) { return res.status(e.statusCode || 500).json(e.body || { error: e.message }); }
+    const password = crypto.randomBytes(18).toString('base64url');
+    let made;
+    try {
+      made = await fleetCreate().createFleetSilicon(fleet, { handle: r.handle, displayName: r.display_name || r.handle, username: r.username, password, by: auth.did });
+    } catch (e) {
+      // Nothing was made: the request waits again for a fresh approval.
+      db.prepare("UPDATE silicon_token_requests SET status = 'pending' WHERE id = ? AND status = 'creating'").run(r.id);
+      return res.status(e.statusCode && e.statusCode !== 500 ? 409 : 500).json({ error: `@${r.handle} was not created: ${(e.body && e.body.error) || e.message}` });
+    }
+    try {
+      const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(made.did);
+      const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
+        scope: r.scope, expiresIn: r.expires_in,
+        metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: r.fleet_slug, minted_by: auth.did, token_request: r.id },
+      });
+      const jti = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).jti || null;
+      db.prepare(`UPDATE silicon_token_requests SET status = 'approved', member_did = ?, silicon_row = ?, sealed = ?, token_jti = ?, decided_at = ?, expires_at = ?
+                  WHERE id = ? AND status = 'creating'`)
+        .run(made.did, made.silicon.id, blindkeyEncrypt(JSON.stringify({ token, password })), jti, nowIso(), later(CLAIM_TTL_SEC), r.id);
+    } catch (e) {
+      // The agent exists (the owner approved it); only its first token failed. It stays in the fleet; ask for a token.
+      db.prepare("UPDATE silicon_token_requests SET status = 'denied', decided_at = ? WHERE id = ? AND status = 'creating'").run(nowIso(), r.id);
+      return res.status(500).json({ error: `@${r.handle} was created, but its token could not be minted: ask for a token for @${r.handle}` });
+    }
+    if (logSecurityEvent) logSecurityEvent('silicon_created_by_request', 'warn', { caller_did: auth.did, ip: req.ip, target: r.handle, context: { request_id: r.id, fleet: r.fleet_slug, did: made.did, scope: r.scope } });
+    res.json({ ok: true, created: { handle: r.handle, did: made.did, email: made.email }, approved: { handle: r.handle, scope: r.scope, expires_in: r.expires_in }, claim_within_seconds: CLAIM_TTL_SEC });
+  }
+
   app.post('/api/silicon-token-requests/:id/deny', rateLimitStandard, (req, res) => {
     const auth = ownerAuth(req, res); if (!auth) return;
     const n = db.prepare("UPDATE silicon_token_requests SET status = 'denied', decided_at = ? WHERE id = ? AND owner_did = ? AND status = 'pending'").run(nowIso(), Number(req.params.id), auth.did).changes;
@@ -208,11 +300,19 @@ module.exports = function registerSiliconTokenRequests(deps) {
     if (r.status !== 'approved') return res.status(410).json({ error: `this request is ${r.status}`, status: r.status });
     const n = db.prepare("UPDATE silicon_token_requests SET status = 'claimed', sealed = NULL, claimed_at = ? WHERE id = ? AND status = 'approved'").run(nowIso(), r.id).changes;
     if (n !== 1) return res.status(410).json({ error: 'already claimed', status: 'claimed' });
-    let token;
-    try { token = blindkeyDecrypt(r.sealed); } catch (_) {
+    let token, password = null;
+    try {
+      token = blindkeyDecrypt(r.sealed);
+      if (r.creates) ({ token, password } = JSON.parse(token));
+    } catch (_) {
       // Marked claimed already: nobody will ever hold this token, so it must not stay valid (#78 review).
       if (r.token_jti) db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ?").run(r.token_jti);
       return res.status(500).json({ error: 'could not open the approved token; it was revoked: ask again' });
+    }
+    if (r.creates) {
+      const w = db.prepare('SELECT email, username FROM identity_wallets WHERE did = ?').get(r.member_did) || {};
+      return res.json({ ok: true, created: true, handle: r.handle, did: r.member_did, email: w.email, username: w.username, scope: r.scope, token,
+                        password_once: password, note: 'shown once: store the token and the mailbox password in 0600 files' });
     }
     res.json({ ok: true, handle: r.handle, did: r.member_did, scope: r.scope, token, note: 'shown once: store it in a 0600 file' });
   }
