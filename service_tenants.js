@@ -34,7 +34,15 @@ const crypto = require('crypto');
 // Margin over a tenant's measured cost, credited to the tenant with the cost (the tenant's price = cost + margin).
 // Aaron's order left the figure blank; 20 is a placeholder pending his number — change it here (one line, reviewed
 // PR). Charges record the margin they used.
-const SERVICE_MARGIN_PCT = 20;
+const SERVICE_MARGIN_PCT = 20;          // the default; a tenant's owner sets its own (PUT /api/services/:slug/margin)
+const MAX_MARGIN_PCT = 33;              // Aaron 2026-11-10: "33% seems like the top we will charge"
+// Metered follow-ups (2026-11-10): work a caller started (a door submission) keeps billing after its token expired —
+// later review rounds, in portions of at most MAX_PORTION_DD (25¢) — only when the caller opted in: the token carries a
+// follow-up budget (claim fu_dd, chosen at mint, no more than the daily consent). Only an action the tenant's owner
+// approved as starting work (its `follow_ups` list) is an origin, and only the actions listed there, as they stood at
+// the origin charge, are follow-ups of it; at the origin's margin or lower; for FOLLOW_UP_DAYS (#88 review H1/H2/M1/M3).
+const FOLLOW_UP_DAYS = 14;
+const MAX_PORTION_DD = 250;
 const SVC_ISS = 'demipass-svc';
 const RECEIPT_DOMAIN = 'dustforge-service-charge:v1\n';   // signed bytes = domain + receipt: never valid as a meter receipt
 const SLUG_RE = /^[a-z][a-z0-9-]{1,30}$/;
@@ -85,6 +93,10 @@ module.exports = function registerServiceTenants(deps) {
   // goes stale (Conduit moved from k1 to phasewhip; panes kept the dead address). Set by PUT /api/services/:slug/connect.
   try { db.exec("ALTER TABLE service_tenants ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''"); } catch (_) {}
   try { db.exec("ALTER TABLE service_tenants ADD COLUMN mcp_server TEXT NOT NULL DEFAULT ''"); } catch (_) {}
+  // The tenant's own margin (NULL: the default). Raised or lowered by its owner, approved in the app, 0..MAX_MARGIN_PCT.
+  try { db.exec('ALTER TABLE service_tenants ADD COLUMN margin_pct INTEGER'); } catch (_) {}
+  // An action that starts work names the actions that may bill as its follow-ups (JSON list; NULL: none).
+  try { db.exec('ALTER TABLE service_actions ADD COLUMN follow_ups TEXT'); } catch (_) {}
   // A tenant may charge only a token it verified, only for an action it verified, while that token lives.
   db.exec(`CREATE TABLE IF NOT EXISTS service_verifications (
     tenant_id INTEGER NOT NULL,
@@ -118,6 +130,13 @@ module.exports = function registerServiceTenants(deps) {
     UNIQUE (tenant_id, idempotency_key)
   )`);
   db.exec('CREATE INDEX IF NOT EXISTS idx_svc_charges_payer ON service_charges(payer_did, tenant_id, created_at)');
+  // A metered follow-up names the charge that started the work (NULL: an ordinary charge on a live token).
+  try { db.exec('ALTER TABLE service_charges ADD COLUMN follows_charge_id TEXT'); } catch (_) {}
+  // On an origin charge: the follow-up actions it allows, as they stood when it was made (JSON list; NULL: none).
+  try { db.exec('ALTER TABLE service_charges ADD COLUMN follow_ups TEXT'); } catch (_) {}
+  // The follow-up budget the caller's token carried (claim fu_dd; 0: no follow-ups).
+  try { db.exec('ALTER TABLE service_verifications ADD COLUMN follow_up_dd INTEGER NOT NULL DEFAULT 0'); } catch (_) {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_svc_charges_follows ON service_charges(follows_charge_id)'); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_svc_charges_token ON service_charges(token_jti)');
   db.exec(`CREATE TABLE IF NOT EXISTS service_delegations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,14 +199,18 @@ module.exports = function registerServiceTenants(deps) {
   // A consent counts only while the person who approved it still answers for the wallet.
   const liveConsent = (did, tenant) => { const c = consentOf(did, tenant); return c && c.approved_by === personFor(did) ? c : null; };
   const jsonList = (s) => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } };
-  function actionView(a) {
+  const marginOf = (t) => Math.min(MAX_MARGIN_PCT, t && Number.isInteger(t.margin_pct) && t.margin_pct >= 0 ? t.margin_pct : SERVICE_MARGIN_PCT);
+  function actionView(a, m = SERVICE_MARGIN_PCT) {
     return { action: a.action, scope: a.scope, depth: a.depth, open: Boolean(a.open), measured_cost_dd: a.measured_cost_dd,
-      max_cost_dd: a.max_cost_dd, margin_pct: SERVICE_MARGIN_PCT, price_dd: priceOf(a.measured_cost_dd), max_price_dd: priceOf(a.max_cost_dd) };
+      max_cost_dd: a.max_cost_dd, margin_pct: m, price_dd: priceOf(a.measured_cost_dd, m), max_price_dd: priceOf(a.max_cost_dd, m),
+      ...(jsonList(a.follow_ups).length ? { follow_ups: jsonList(a.follow_ups) } : {}) };
   }
   function tenantView(t) {
     const actions = db.prepare("SELECT * FROM service_actions WHERE tenant_id = ? AND status = 'active' ORDER BY action").all(t.id);
-    return { slug: t.slug, name: t.name, service_did: t.service_did, audience: 'svc:' + t.slug, margin_pct: SERVICE_MARGIN_PCT,
-      endpoint: t.endpoint || null, mcp_server: t.mcp_server || null, actions: actions.map(actionView) };
+    const m = marginOf(t);
+    return { slug: t.slug, name: t.name, service_did: t.service_did, audience: 'svc:' + t.slug, margin_pct: m,
+      endpoint: t.endpoint || null, mcp_server: t.mcp_server || null, actions: actions.map(a => actionView(a, m)),
+      follow_ups: { days: FOLLOW_UP_DAYS, max_portion_dd: MAX_PORTION_DD, budget: 'the caller\'s token (follow_up_dd at mint)' } };
   }
   function event(type, actor, detail) {
     try { db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(type, actor, null, 'service', JSON.stringify(detail)); } catch (_) {}
@@ -308,18 +331,19 @@ module.exports = function registerServiceTenants(deps) {
     const at = nowIso();
     const prior = db.prepare('SELECT actions FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, d.jti);
     const actions = [...new Set([...jsonList(prior && prior.actions), action.action])];
-    db.prepare(`INSERT INTO service_verifications (tenant_id, token_jti, did, iat, exp, src_auth, fleet, parent_jti, svc_scopes, actions, cap_dd, delegation_id, first_at, last_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    const fuDd = Number.isInteger(d.fu_dd) && d.fu_dd > 0 ? d.fu_dd : 0;
+    db.prepare(`INSERT INTO service_verifications (tenant_id, token_jti, did, iat, exp, src_auth, fleet, parent_jti, svc_scopes, actions, cap_dd, delegation_id, first_at, last_at, follow_up_dd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(tenant_id, token_jti) DO UPDATE SET last_at = excluded.last_at, actions = excluded.actions, delegation_id = excluded.delegation_id`)
       .run(tenant.id, d.jti, d.sub, d.iat || null, d.exp, d.src_auth || null, d.fleet ? String(d.fleet) : null, d.minted_by_jti || null,
-           Array.isArray(d.svc_scopes) ? JSON.stringify(d.svc_scopes) : null, JSON.stringify(actions), cap, who.delegation ? who.delegation.id : null, at, at);
+           Array.isArray(d.svc_scopes) ? JSON.stringify(d.svc_scopes) : null, JSON.stringify(actions), cap, who.delegation ? who.delegation.id : null, at, at, fuDd);
     const spent = db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ?').get(d.jti, tenant.id).s;
     return { status: 200, body: {
       ok: true, wallet: d.sub, token_id: d.jti, scope, service_scopes: Array.isArray(d.svc_scopes) ? d.svc_scopes : null,
       action: action.action, action_scope: action.scope, depth: action.depth, via: who.via,
       ...(who.delegation ? { delegation_id: who.delegation.id, principal: principalId(tenant, who.delegation.owner_did) } : {}),
       ...(approval ? { approval_id: approval } : {}),
-      price: actionView(action), cap_dd: cap, spent_dd: spent, expires_at: new Date(d.exp * 1000).toISOString(),
+      price: actionView(action, marginOf(tenant)), cap_dd: cap, spent_dd: spent, follow_up_dd: fuDd, expires_at: new Date(d.exp * 1000).toISOString(),
     } };
   }
 
@@ -332,11 +356,42 @@ module.exports = function registerServiceTenants(deps) {
     if (!action) return { status: 404, body: { error: `no action '${String(b.action || '')}' at ${tenant.slug}` } };
     const cost = b.cost_dd === undefined ? action.measured_cost_dd : b.cost_dd;
     if (!Number.isInteger(cost) || cost < 1 || cost > action.max_cost_dd) return { status: 400, body: { error: `cost_dd: an integer from 1 to ${action.max_cost_dd} (this action's max_cost_dd)` } };
-    if (typeof b.idempotency_key !== 'string' || !IDEM_RE.test(b.idempotency_key)) return { status: 400, body: { error: 'idempotency_key: 8-100 of [A-Za-z0-9._:-] (one per billed call; a retry sends the same key)' } };
-    if (typeof b.token_id !== 'string' || !/^[0-9a-f]{8,64}$/.test(b.token_id)) return { status: 400, body: { error: 'token_id: from your verify of the caller\'s token' } };
-    const dd = priceOf(cost);
+    const dry = b.dry_run === true;
+    const followUp = b.follow_up_of !== undefined;
+    if (!dry && (typeof b.idempotency_key !== 'string' || !IDEM_RE.test(b.idempotency_key))) return { status: 400, body: { error: 'idempotency_key: 8-100 of [A-Za-z0-9._:-] (one per billed call; a retry sends the same key)' } };
+    if (followUp && (typeof b.follow_up_of !== 'string' || !/^sc_[0-9a-f]{24}$/.test(b.follow_up_of))) return { status: 400, body: { error: 'follow_up_of: the charge_id that started this work' } };
+    if (!followUp && (typeof b.token_id !== 'string' || !/^[0-9a-f]{8,64}$/.test(b.token_id))) return { status: 400, body: { error: 'token_id: from your verify of the caller\'s token' } };
+    let margin = marginOf(tenant);
+    let dd = priceOf(cost, margin);
 
-    const prior = db.prepare('SELECT * FROM service_charges WHERE tenant_id = ? AND idempotency_key = ?').get(tenant.id, b.idempotency_key);
+    // A metered follow-up: the authority is the charge that started the work and the follow-up budget its token
+    // carried, not a live token (it has expired by the time a later review round runs). See FOLLOW_UP_DAYS above.
+    let origin = null;
+    if (followUp) {
+      origin = db.prepare('SELECT * FROM service_charges WHERE charge_id = ? AND tenant_id = ?').get(b.follow_up_of, tenant.id);
+      if (!origin) return { status: 404, body: { error: 'follow_up_of: no charge of this service with that id' } };
+      if (origin.follows_charge_id) return { status: 400, body: { error: 'follow_up_of: name the charge that started the work, not another follow-up', origin: origin.follows_charge_id } };
+      if (!jsonList(origin.follow_ups).includes(action.action)) return { status: 403, body: { error: `'${action.action}' is not a follow-up the charge ${origin.charge_id} allowed when it was made` } };
+      if (Date.parse(origin.created_at) < Date.now() - FOLLOW_UP_DAYS * 86400000) return { status: 403, body: { error: `follow-ups end ${FOLLOW_UP_DAYS} days after the charge that started the work` } };
+      if (cost > MAX_PORTION_DD) return { status: 400, body: { error: `a follow-up is billed in portions of at most ${MAX_PORTION_DD} DD (cost); split it` } };
+    }
+    // A follow-up pays the margin of the charge that started the work, or the tenant's current one if lower (M1).
+    if (followUp) { margin = Math.min(origin.margin_pct, margin); dd = priceOf(cost, margin); }
+    const chargeMargin = margin, chargeDd = dd;
+
+    const prior = dry ? null : db.prepare('SELECT * FROM service_charges WHERE tenant_id = ? AND idempotency_key = ?').get(tenant.id, b.idempotency_key);
+    if (prior && followUp) {
+      if (prior.follows_charge_id !== b.follow_up_of || prior.action !== action.action || prior.cost_dd !== cost) return { status: 409, body: { error: 'this idempotency_key was already used for a different charge', charge_id: prior.charge_id } };
+      // A replay is a go-ahead for the work: only while the origin token is unrevoked and the consent live.
+      const ov = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, origin.token_jti);
+      const ow = ov ? authority(tenant, action, ov.did, ov.svc_scopes ? jsonList(ov.svc_scopes) : null) : null;
+      if (!ov || revoked({ jti: ov.token_jti, sub: ov.did, iat: ov.iat, src_auth: ov.src_auth, fleet: ov.fleet, parent_jti: ov.parent_jti }) || !liveConsent(ov.did, tenant)
+          || !ow.ok || (ov.delegation_id && !(ow.delegation && ow.delegation.id === ov.delegation_id))) {
+        return { status: 409, body: { error: 'this follow-up was charged, but its token or consent has since been withdrawn: stop the work', charge_id: prior.charge_id } };
+      }
+      return { status: 200, body: chargeView(prior, true) };
+    }
+
     if (prior) {
       // A retry may come with a new token of the same wallet (the first expired, or the caller's process restarted
       // after it was charged): that is still the same charge, so it replays. Another wallet's token never does
@@ -347,7 +402,7 @@ module.exports = function registerServiceTenants(deps) {
       // consent withdrawn never gets a "go ahead").
       const nv = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, b.token_id);
       const nvScopes = nv && nv.svc_scopes ? jsonList(nv.svc_scopes) : null;
-      const samePayer = Boolean(nv && nv.did === prior.payer_did && nv.exp > nowSec() && jsonList(nv.actions).includes(action.action)
+      const samePayer = Boolean(!prior.follows_charge_id && nv && nv.did === prior.payer_did && nv.exp > nowSec() && jsonList(nv.actions).includes(action.action)
         && (!nvScopes || nvScopes.includes(action.scope))
         && !revoked({ jti: nv.token_jti, sub: nv.did, iat: nv.iat, src_auth: nv.src_auth, fleet: nv.fleet, parent_jti: nv.parent_jti })
         && liveConsent(nv.did, tenant));
@@ -356,14 +411,23 @@ module.exports = function registerServiceTenants(deps) {
       }
       return { status: 200, body: chargeView(prior, true) };
     }
-    const v = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, b.token_id);
+    const v = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, followUp ? origin.token_jti : b.token_id);
     if (!v) return { status: 403, body: { error: 'verify this token first (POST /api/services/verify): a tenant charges only callers it verified' } };
-    // Only for an action this token was verified for (an elevated one: only after its approval passed), within the
-    // token's scopes (#68 review M2).
-    if (!jsonList(v.actions).includes(action.action)) return { status: 403, body: { error: `this token was not verified for '${action.action}'; verify it for that action first` } };
     const scopes = v.svc_scopes ? jsonList(v.svc_scopes) : null;
-    if (scopes && !scopes.includes(action.scope)) return { status: 403, body: { error: `this token does not carry the '${action.scope}' scope` } };
-    if (v.exp <= nowSec()) return { status: 401, body: { error: 'the caller\'s token has expired; charge within its life' } };
+    if (followUp) {
+      if (!(v.follow_up_dd > 0)) return { status: 403, body: { error: 'the token that started this work allowed no follow-ups (follow_up_dd at mint)' } };
+      if (action.depth !== 'standard') return { status: 403, body: { error: 'an elevated action is never a follow-up: it needs its own verified token' } };
+      // The caller's authority now, not only when the work started: a delegation withdrawn ends the follow-ups (M2).
+      const who = authority(tenant, action, v.did, scopes);
+      if (!who.ok) return { status: 403, body: { error: who.error } };
+      if (v.delegation_id && !(who.delegation && who.delegation.id === v.delegation_id)) return { status: 403, body: { error: 'the delegation this work started under has ended' } };
+    } else {
+      // Only for an action this token was verified for (an elevated one: only after its approval passed), within the
+      // token's scopes (#68 review M2).
+      if (!jsonList(v.actions).includes(action.action)) return { status: 403, body: { error: `this token was not verified for '${action.action}'; verify it for that action first` } };
+      if (scopes && !scopes.includes(action.scope)) return { status: 403, body: { error: `this token does not carry the '${action.scope}' scope` } };
+      if (v.exp <= nowSec()) return { status: 401, body: { error: 'the caller\'s token has expired; charge within its life' } };
+    }
     const dead = revoked({ jti: v.token_jti, sub: v.did, iat: v.iat, src_auth: v.src_auth, fleet: v.fleet, parent_jti: v.parent_jti });
     if (dead) return { status: 401, body: { error: dead } };
     if (v.did === tenant.service_did) return { status: 400, body: { error: 'a tenant does not charge itself' } };
@@ -371,15 +435,30 @@ module.exports = function registerServiceTenants(deps) {
     if (!consent) return { status: 402, body: { error: `the caller has no standing consent to pay ${tenant.slug}`, consent_required: true } };
     const barrel = barrelRefusal(v.did, dd);
     if (barrel) return { status: barrel.statusCode || 403, body: barrel.body || { error: barrel.message } };
+    // Follow-ups draw on the token's follow-up budget, apart from its cap for ordinary charges.
+    const followed = () => db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ? AND follows_charge_id IS NOT NULL').get(v.token_jti, tenant.id).s;
+    const ordinary = () => db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ? AND follows_charge_id IS NULL').get(v.token_jti, tenant.id).s;
+
+    // A dry run ("survey the wallet" before a portion of work): every check a charge makes, nothing written.
+    if (dry) {
+      if (cost > MAX_PORTION_DD) return { status: 400, body: { error: `a dry run asks about one portion: at most ${MAX_PORTION_DD} DD (cost)` } };
+      const w = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(v.did);
+      const today = spentToday(v.did, tenant);
+      const bal = billing.getDerivedBalance(db, v.did);
+      const why = (!w || w.status !== 'active') ? 'wallet_inactive' : (!followUp && ordinary() + chargeDd > v.cap_dd) ? 'token_cap'
+        : (today + chargeDd > consent.daily_cap_dd) ? 'daily_cap' : (followUp && followed() + chargeDd > v.follow_up_dd) ? 'follow_up_budget'
+        : (bal < chargeDd) ? 'insufficient' : null;
+      return { status: why ? 402 : 200, body: { ok: !why, dry_run: true, would_charge_dd: chargeDd, margin_pct: chargeMargin, ...(why ? { refused: why } : {}) } };
+    }
 
     const run = db.transaction(() => {
-      const spent = db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ?').get(v.token_jti, tenant.id).s;
-      if (spent + dd > v.cap_dd) { const e = new Error('cap'); e.cap = { kind: 'token', spent, cap: v.cap_dd }; throw e; }
+      if (!followUp) { const spent = ordinary(); if (spent + dd > v.cap_dd) { const e = new Error('cap'); e.cap = { kind: 'token', spent, cap: v.cap_dd }; throw e; } }
+      if (followUp) { const f = followed(); if (f + chargeDd > v.follow_up_dd) { const e = new Error('cap'); e.cap = { kind: 'follow_up', spent: f, cap: v.follow_up_dd }; throw e; } }
       const today = spentToday(v.did, tenant);
       if (today + dd > consent.daily_cap_dd) { const e = new Error('cap'); e.cap = { kind: 'daily', spent: today, cap: consent.daily_cap_dd }; throw e; }
       const charge_id = 'sc_' + crypto.randomBytes(12).toString('hex');
       const at = nowIso();
-      const what = `service ${tenant.slug}/${action.action} cost ${cost} + ${SERVICE_MARGIN_PCT}% ${charge_id}`;
+      const what = `service ${tenant.slug}/${action.action} cost ${cost} + ${margin}% ${charge_id}${followUp ? ' (follows ' + origin.charge_id + ')' : ''}`;
       // Both rows carry the caller's token (the one that made the charge). Typed as transfers: DD moves between
       // wallets, so its lineage follows (dd_ledger.recordTransfer below), not a spend.
       const debit = billing.deductBalance(db, v.did, dd, 'service_transfer_out', what, { tokenJti: v.token_jti });
@@ -387,19 +466,21 @@ module.exports = function registerServiceTenants(deps) {
       const credit = billing.creditBalance(db, tenant.service_did, dd, 'service_transfer_in', what, null, { tokenJti: v.token_jti });
       if (!credit.ok) throw new Error('credit to the tenant wallet failed: ' + credit.error);
       const receipt = JSON.stringify({ v: RECEIPT_VERSION, type: 'dustforge_service_charge', charge_id, issuer, service: tenant.slug,
-        payer: v.did, payee: tenant.service_did, action: action.action, cost_dd: cost, margin_pct: SERVICE_MARGIN_PCT, dd,
-        token_id: v.token_jti, idempotency_key: b.idempotency_key, at });
+        payer: v.did, payee: tenant.service_did, action: action.action, cost_dd: cost, margin_pct: margin, dd,
+        token_id: v.token_jti, idempotency_key: b.idempotency_key, ...(followUp ? { follows: origin.charge_id } : {}), at });
       const sig = crypto.sign(null, Buffer.from(RECEIPT_DOMAIN + receipt, 'utf8'), meterKey.privateKey).toString('base64url');
       db.prepare(`INSERT INTO service_charges (charge_id, tenant_id, payer_did, payee_did, action, cost_dd, margin_pct, dd, token_jti, delegation_id,
-                  idempotency_key, receipt, sig, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .run(charge_id, tenant.id, v.did, tenant.service_did, action.action, cost, SERVICE_MARGIN_PCT, dd, v.token_jti, v.delegation_id,
-             b.idempotency_key, receipt, sig, at);
+                  idempotency_key, receipt, sig, created_at, follows_charge_id, follow_ups) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(charge_id, tenant.id, v.did, tenant.service_did, action.action, cost, margin, dd, v.token_jti, v.delegation_id,
+             b.idempotency_key, receipt, sig, at, followUp ? origin.charge_id : null,
+             !followUp && v.follow_up_dd > 0 && jsonList(action.follow_ups).length ? JSON.stringify(jsonList(action.follow_ups)) : null);
       return { row: db.prepare('SELECT * FROM service_charges WHERE charge_id = ?').get(charge_id), balance_after: debit.balance_after };
     });
     let out;
     try { out = run.immediate(); }
     catch (e) {
       if (e.cap && e.cap.kind === 'token') return { status: 402, body: { error: `this charge would pass the caller token's spend cap (${e.cap.spent} + ${dd} > ${e.cap.cap} DD); the caller mints a token with a higher cap_dd`, required_dd: dd, cap_dd: e.cap.cap, spent_dd: e.cap.spent, cap_exceeded: true } };
+      if (e.cap && e.cap.kind === 'follow_up') return { status: 402, body: { error: `this would pass the follow-up budget the caller's token carried (${e.cap.spent} + ${dd} > ${e.cap.cap} DD)`, follow_up_budget_exceeded: true, spent_dd: e.cap.spent, follow_up_dd: e.cap.cap } };
       if (e.cap) return { status: 402, body: { error: `this charge would pass the caller's daily consent for ${tenant.slug} (${e.cap.spent} + ${dd} > ${e.cap.cap} DD in 24 h)`, required_dd: dd, daily_cap_dd: e.cap.cap, spent_today_dd: e.cap.spent, daily_cap_exceeded: true } };
       if (e.debit) {
         const insufficient = /insufficient/.test(e.debit.error || '');
@@ -415,6 +496,7 @@ module.exports = function registerServiceTenants(deps) {
   }
   function chargeView(r, replayed) {
     return { ok: true, replayed, charge_id: r.charge_id, action: r.action, cost_dd: r.cost_dd, margin_pct: r.margin_pct, dd: r.dd,
+      ...(r.follows_charge_id ? { follows: r.follows_charge_id } : {}),
       token_id: r.token_jti, at: r.created_at, receipt: r.receipt, sig: r.sig, signed: 'Ed25519 over "' + RECEIPT_DOMAIN.trim() + '\\n" + receipt', issuer };
   }
 
@@ -422,15 +504,21 @@ module.exports = function registerServiceTenants(deps) {
   const lim = rateLimitStandard || ((req, res, next) => next());
 
   app.get('/api/services', lim, (req, res) => {
-    res.json({ margin_pct: SERVICE_MARGIN_PCT, issuer, tenants: db.prepare("SELECT * FROM service_tenants WHERE status = 'active' ORDER BY slug").all().map(tenantView) });
+    res.json({ margin_pct: SERVICE_MARGIN_PCT, max_margin_pct: MAX_MARGIN_PCT, issuer, tenants: db.prepare("SELECT * FROM service_tenants WHERE status = 'active' ORDER BY slug").all().map(tenantView) });
   });
   app.get('/api/services/charges', lim, (req, res) => {
     const auth = walletAuth(req, res, { minScope: 'read' }); if (!auth) return;
     const n = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
-    const cols = 'c.charge_id, t.slug AS service, c.action, c.cost_dd, c.margin_pct, c.dd, c.token_jti AS token_id, c.delegation_id, c.created_at';
+    const cols = 'c.charge_id, t.slug AS service, c.action, c.cost_dd, c.margin_pct, c.dd, c.token_jti AS token_id, c.delegation_id, c.created_at, c.follows_charge_id AS follows';
     const paid = db.prepare(`SELECT ${cols} FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.payer_did = ? ORDER BY c.id DESC LIMIT ?`).all(auth.did, n);
     const tenant = tenantByDid(auth.did);
-    const received = tenant ? db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? ORDER BY c.id DESC LIMIT ?`).all(tenant.id, n) : [];
+    // A tenant finds one of its own charges by the idempotency key it chose (the FLEETGATE meter: a PR's door branch
+    // names the submit charge's key, so later review rounds bill as follow-ups of it). Its own charges only.
+    const key = typeof req.query.idempotency_key === 'string' ? req.query.idempotency_key : null;
+    if (key !== null && (!tenant || !IDEM_RE.test(key))) return res.status(tenant ? 400 : 403).json({ error: tenant ? 'idempotency_key: 8-100 of [A-Za-z0-9._:-]' : 'only a tenant looks up its charges by key' });
+    const received = !tenant ? [] : key !== null
+      ? db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? AND c.idempotency_key = ?`).all(tenant.id, key)
+      : db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? ORDER BY c.id DESC LIMIT ?`).all(tenant.id, n);
     res.json({ ok: true, paid, ...(tenant ? { received } : {}) });
   });
   app.get('/api/services/delegations', lim, (req, res) => {
@@ -531,6 +619,27 @@ module.exports = function registerServiceTenants(deps) {
     res.json({ ok: true, ...tenantView(tenantBySlug(t.slug)) });
   });
 
+  // The tenant's margin over its measured cost (what callers pay above it): {margin_pct} 0..MAX_MARGIN_PCT. Only the
+  // tenant's owner asks, from their own session, and approves it in the app (svc:demipass:margin): it changes what every
+  // caller pays. Charges already made keep the margin in their row and receipt.
+  app.put('/api/services/:slug/margin', lim, (req, res) => {
+    const auth = walletAuth(req, res); if (!auth) return;
+    const t = tenantBySlug(req.params.slug);
+    if (!t) return res.status(404).json({ error: 'no such service' });
+    if (auth.did !== t.owner_did || isAgentToken(auth)) return res.status(403).json({ error: 'the tenant\'s owner sets its margin, from their own session' });
+    const b = req.body || {};
+    const m = b.margin_pct;
+    if (!Number.isInteger(m) || m < 0 || m > MAX_MARGIN_PCT) return res.status(400).json({ error: `margin_pct: a whole number 0..${MAX_MARGIN_PCT}` });
+    if (m === marginOf(t)) return res.json({ ok: true, unchanged: true, ...tenantView(t) });
+    const g = personApproval('svc:demipass:margin', `${t.slug}: margin ${marginOf(t)}% → ${m}%`, t.owner_did, 'elevated', { did: auth.did, label: t.slug }, 'margin', t.slug,
+      { service: t.slug, margin_pct: m, was: marginOf(t) }, b, null);
+    if (!g.ok) return res.status(g.status).json(g.body);
+    db.prepare('UPDATE service_tenants SET margin_pct = ? WHERE id = ?').run(m, t.id);
+    event('service_margin_set', auth.did, { service: t.slug, margin_pct: m, approval_id: g.approval_id });
+    logSecurityEvent('service_margin_set', 'info', { caller_did: auth.did, capability: 'service-margin', target: t.slug, context: { margin_pct: m, was: marginOf(t) } });
+    res.json({ ok: true, ...tenantView(tenantBySlug(t.slug)) });
+  });
+
   // The tenant's price list. The tenant wallet or its owner. Anything that weakens a gate — a lower depth, a closed
   // action opened, a gated action moved to another scope, an action added to (or moved into) a scope someone holds by
   // delegation — waits on the tenant owner's approval of exactly that change (#68 review M3).
@@ -551,13 +660,28 @@ module.exports = function registerServiceTenants(deps) {
       const scope = a.scope !== undefined ? String(a.scope) : (cur ? cur.scope : action);   // omitted: keep the current scope
       if (!ACTION_RE.test(scope)) return res.status(400).json({ error: `scope '${scope}': 1-41 of [a-z0-9_.-]` });
       if (a.retired === true) { rows.push({ action, retired: true }); continue; }
-      const cost = a.measured_cost_dd, max = a.max_cost_dd === undefined ? cost : a.max_cost_dd;
+      // Omitted on an existing action: keep its costs (e.g. a change to follow_ups alone).
+      const cost = a.measured_cost_dd === undefined && cur ? cur.measured_cost_dd : a.measured_cost_dd;
+      const max = a.max_cost_dd === undefined ? (a.measured_cost_dd === undefined && cur ? cur.max_cost_dd : cost) : a.max_cost_dd;
       if (!Number.isInteger(cost) || cost < 1 || cost > MAX_COST_DD) return res.status(400).json({ error: `${action}: measured_cost_dd 1-${MAX_COST_DD}` });
       if (!Number.isInteger(max) || max < cost || max > MAX_COST_DD) return res.status(400).json({ error: `${action}: max_cost_dd from measured_cost_dd to ${MAX_COST_DD}` });
       const depth = a.depth === undefined ? (cur ? cur.depth : 'standard') : String(a.depth);
       if (!DEPTHS.includes(depth)) return res.status(400).json({ error: `${action}: depth is one of ${DEPTHS.join(', ')}` });
       const open = a.open === undefined ? (cur ? cur.open : 1) : (a.open ? 1 : 0);
-      rows.push({ action, scope, cost, max, depth, open });
+      // follow_ups: the actions that may bill as follow-ups of this one (it starts work). Omitted: keep the current list.
+      let fus = a.follow_ups === undefined ? jsonList(cur && cur.follow_ups) : a.follow_ups;
+      if (!Array.isArray(fus) || fus.length > 10 || fus.some(x => typeof x !== 'string' || !ACTION_RE.test(x))) return res.status(400).json({ error: `${action}: follow_ups is a list of up to 10 action names` });
+      fus = [...new Set(fus)];
+      rows.push({ action, scope, cost, max, depth, open, follow_ups: fus });
+    }
+    // A follow-up must already be a priced, active, standard action (in this call or before it): an approved list can
+    // never name an action the tenant creates later, wherever it puts it (#88 re-review L1).
+    for (const r of rows) {
+      for (const f of (r.follow_ups || [])) {
+        const inCall = rows.find(x => x.action === f && !x.retired);
+        const live = inCall || actionOf(t, f);
+        if (!live || (inCall ? inCall.depth : live.depth) !== 'standard') return res.status(400).json({ error: `${r.action}: follow-up '${f}' must be an existing standard action` });
+      }
     }
     const delegated = (scope) => Boolean(db.prepare("SELECT 1 FROM service_delegations WHERE tenant_id = ? AND scope = ? AND status = 'active' LIMIT 1").get(t.id, scope));
     // Compared with the row whatever its status: retiring and re-adding is no way around this.
@@ -565,23 +689,27 @@ module.exports = function registerServiceTenants(deps) {
       if (r.retired) return false;
       const cur = anyActionOf(t, r.action);
       if (!cur) return delegated(r.scope);
-      return DEPTHS.indexOf(r.depth) < DEPTHS.indexOf(cur.depth) || (r.open && !cur.open)
+      // Letting an action start billable follow-up work, or adding to what may follow it, is weakening too (#88 H1/H2).
+      const addsFollowUps = (r.follow_ups || []).some(x => !jsonList(cur.follow_ups).includes(x));
+      return addsFollowUps || DEPTHS.indexOf(r.depth) < DEPTHS.indexOf(cur.depth) || (r.open && !cur.open)
         || (r.scope !== cur.scope && (cur.depth !== 'standard' || !cur.open || delegated(r.scope)));
-    });
+    }).concat(rows.filter(r => !r.retired && !anyActionOf(t, r.action) && !delegated(r.scope) && ((r.follow_ups || []).length
+      || db.prepare("SELECT 1 FROM service_actions WHERE tenant_id = ? AND follow_ups LIKE ? LIMIT 1").get(t.id, '%"' + r.action + '"%'))));
     if (weakens.length) {
       const g = personApproval(`svc:demipass:weaken`, `weaken ${t.slug} actions`, t.owner_did, 'elevated', { did: auth.did, label: t.slug }, 'weaken', t.slug,
-        { service: t.slug, changes: weakens.map(r => ({ action: r.action, scope: r.scope, depth: r.depth, open: Boolean(r.open) })) }, body, null);
+        { service: t.slug, changes: weakens.map(r => ({ action: r.action, scope: r.scope, depth: r.depth, open: Boolean(r.open), ...((r.follow_ups || []).length ? { follow_ups: r.follow_ups } : {}) })) }, body, null);
       if (!g.ok) return res.status(g.status).json({ ...g.body, weakens: weakens.map(r => r.action) });
     }
     const at = nowIso();
     db.transaction(() => {
       for (const r of rows) {
         if (r.retired) { db.prepare("UPDATE service_actions SET status = 'retired', updated_at = ? WHERE tenant_id = ? AND action = ?").run(at, t.id, r.action); continue; }
-        db.prepare(`INSERT INTO service_actions (tenant_id, action, scope, measured_cost_dd, max_cost_dd, depth, open, status, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+        db.prepare(`INSERT INTO service_actions (tenant_id, action, scope, measured_cost_dd, max_cost_dd, depth, open, status, updated_at, follow_ups)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                     ON CONFLICT(tenant_id, action) DO UPDATE SET scope = excluded.scope, measured_cost_dd = excluded.measured_cost_dd,
-                      max_cost_dd = excluded.max_cost_dd, depth = excluded.depth, open = excluded.open, status = 'active', updated_at = excluded.updated_at`)
-          .run(t.id, r.action, r.scope, r.cost, r.max, r.depth, r.open, at);
+                      max_cost_dd = excluded.max_cost_dd, depth = excluded.depth, open = excluded.open, status = 'active', updated_at = excluded.updated_at,
+                      follow_ups = excluded.follow_ups`)
+          .run(t.id, r.action, r.scope, r.cost, r.max, r.depth, r.open, at, r.follow_ups && r.follow_ups.length ? JSON.stringify(r.follow_ups) : null);
       }
     })();
     event('service_actions_set', auth.did, { service: t.slug, actions: rows.map(r => r.action), weakened: weakens.map(r => r.action) });
@@ -649,11 +777,15 @@ module.exports = function registerServiceTenants(deps) {
       if (!Array.isArray(scopes) || !scopes.length || scopes.length > 20 || scopes.some(s => !known.includes(s))) return res.status(400).json({ error: `scopes: a list from ${known.join(', ') || '(none yet)'}` });
     }
     const cap = b.cap_dd === undefined ? Math.min(TOKEN_CAP_DEFAULT_DD, consent.daily_cap_dd) : b.cap_dd;
+    // The follow-up budget: what work this token starts may keep billing after it expires (review rounds). Opt-in,
+    // never above the daily consent (which still caps every day).
+    const fuDd = b.follow_up_dd === undefined ? 0 : b.follow_up_dd;
+    if (!Number.isInteger(fuDd) || fuDd < 0 || fuDd > consent.daily_cap_dd) return res.status(400).json({ error: `follow_up_dd: 0-${consent.daily_cap_dd} (your daily consent for ${t.slug})` });
     if (!Number.isInteger(cap) || cap < 1 || cap > consent.daily_cap_dd) return res.status(400).json({ error: `cap_dd: 1-${consent.daily_cap_dd} (your daily consent for ${t.slug})` });
     const w = db.prepare('SELECT encrypted_private_key, did, status FROM identity_wallets WHERE did = ?').get(auth.did);
     if (!w || w.status !== 'active' || !w.encrypted_private_key) return res.status(403).json({ error: 'wallet not active' });
     const dec = auth.decoded || {};
-    const meta = { iss: SVC_ISS, aud: 'svc:' + t.slug, auth_method: 'service_token', cap_dd: cap, minted_by_jti: dec.jti || null,
+    const meta = { iss: SVC_ISS, aud: 'svc:' + t.slug, auth_method: 'service_token', cap_dd: cap, ...(fuDd ? { fu_dd: fuDd } : {}), minted_by_jti: dec.jti || null,
       ...(dec.sid ? { sid: dec.sid } : {}), ...(dec.auth_method ? { src_auth: dec.auth_method } : {}), ...(dec.fleet ? { fleet: dec.fleet } : {}),
       ...(scopes ? { svc_scopes: scopes } : {}) };
     let token;
@@ -661,7 +793,7 @@ module.exports = function registerServiceTenants(deps) {
     catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
     const d = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
     event('service_token_minted', auth.did, { service: t.slug, token_id: d.jti, cap_dd: cap, exp: d.exp });
-    res.status(201).json({ ok: true, token, token_id: d.jti, service: t.slug, audience: d.aud, scope: d.scope, cap_dd: cap,
+    res.status(201).json({ ok: true, token, token_id: d.jti, service: t.slug, audience: d.aud, scope: d.scope, cap_dd: cap, follow_up_dd: fuDd,
       ...(scopes ? { scopes } : {}), expires_at: new Date(d.exp * 1000).toISOString(),
       use: `send it to ${t.name} as Authorization: Bearer <token>; it opens nothing at DemiPass itself` });
   });
