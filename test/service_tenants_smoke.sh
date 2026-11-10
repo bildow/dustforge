@@ -262,6 +262,10 @@ C "$FG" "$(jbody action review cost_dd 100 follow_up_of sc_000000000000000000000
 C "$CD" "$(jbody action post cost_dd 2 follow_up_of "$CID" idempotency_key fu-other-0001)"; A4=$CODE
 [ "$A1" = 400 ] && [ "$A2" = 403 ] && [ "$A3" = 404 ] && [ "$A4" = 404 ] && [ "$(bal ext)" = $((E2 - 120)) ] \
   && ok "follow-ups only of the charge that started the work (not a follow-up), only in its scope (never sign-charter), only by its own tenant" || fail "fu refusals: $A1 $A2 $A3 $A4"
+call GET "/api/services/charges?idempotency_key=pr-submit-0001" "$FG"
+[ "$(echo "$BODY" | python3 -c 'import json,sys; r=json.load(sys.stdin)["received"]; print(len(r), r[0]["charge_id"])')" = "1 $CID" ] && ok "a tenant finds its own charge by the key it chose" || fail "by key: $BODY"
+call GET "/api/services/charges?idempotency_key=pr-submit-0001" "$CD"; A1=$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["received"]))')
+call GET "/api/services/charges?idempotency_key=pr-submit-0001" "$EXT"; [ "$A1" = 0 ] && [ "$CODE" = 403 ] && ok "…never another tenant's, and not as a caller" || fail "by key others: $A1 $CODE"
 N0=$(Q "SELECT COUNT(*) FROM service_charges")
 C "$FG" "$(jbody action review cost_dd 10 follow_up_of "$CID" dry_run true)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J would_charge_dd)" = 12 ] && [ "$(bal ext)" = $((E2 - 120)) ] && [ "$(Q "SELECT COUNT(*) FROM service_charges")" = "$N0" ] \

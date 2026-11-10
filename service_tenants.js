@@ -491,7 +491,13 @@ module.exports = function registerServiceTenants(deps) {
     const cols = 'c.charge_id, t.slug AS service, c.action, c.cost_dd, c.margin_pct, c.dd, c.token_jti AS token_id, c.delegation_id, c.created_at';
     const paid = db.prepare(`SELECT ${cols} FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.payer_did = ? ORDER BY c.id DESC LIMIT ?`).all(auth.did, n);
     const tenant = tenantByDid(auth.did);
-    const received = tenant ? db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? ORDER BY c.id DESC LIMIT ?`).all(tenant.id, n) : [];
+    // A tenant finds one of its own charges by the idempotency key it chose (the FLEETGATE meter: a PR's door branch
+    // names the submit charge's key, so later review rounds bill as follow-ups of it). Its own charges only.
+    const key = typeof req.query.idempotency_key === 'string' ? req.query.idempotency_key : null;
+    if (key !== null && (!tenant || !IDEM_RE.test(key))) return res.status(tenant ? 400 : 403).json({ error: tenant ? 'idempotency_key: 8-100 of [A-Za-z0-9._:-]' : 'only a tenant looks up its charges by key' });
+    const received = !tenant ? [] : key !== null
+      ? db.prepare(`SELECT ${cols}, c.payer_did AS payer, c.follows_charge_id AS follows FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? AND c.idempotency_key = ?`).all(tenant.id, key)
+      : db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? ORDER BY c.id DESC LIMIT ?`).all(tenant.id, n);
     res.json({ ok: true, paid, ...(tenant ? { received } : {}) });
   });
   app.get('/api/services/delegations', lim, (req, res) => {
