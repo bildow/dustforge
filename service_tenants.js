@@ -358,7 +358,8 @@ module.exports = function registerServiceTenants(deps) {
     // A follow-up's dry run sizes a whole step (billed later in portions), bounded by the follow-up budget, not by one
     // charge's max_cost_dd.
     const wholeStep = b.dry_run === true && b.follow_up_of !== undefined;
-    if (!Number.isInteger(cost) || cost < 1 || cost > (wholeStep ? 1000000 : action.max_cost_dd)) return { status: 400, body: { error: `cost_dd: an integer from 1 to ${action.max_cost_dd} (this action's max_cost_dd)` } };
+    const costMax = wholeStep ? CONSENT_CAP_MAX_DD : action.max_cost_dd;
+    if (!Number.isInteger(cost) || cost < 1 || cost > costMax) return { status: 400, body: { error: wholeStep ? `cost_dd: an integer from 1 to ${costMax} (a whole step)` : `cost_dd: an integer from 1 to ${costMax} (this action's max_cost_dd)` } };
     const dry = b.dry_run === true;
     const followUp = b.follow_up_of !== undefined;
     if (!dry && (typeof b.idempotency_key !== 'string' || !IDEM_RE.test(b.idempotency_key))) return { status: 400, body: { error: 'idempotency_key: 8-100 of [A-Za-z0-9._:-] (one per billed call; a retry sends the same key)' } };
