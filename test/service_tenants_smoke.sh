@@ -48,7 +48,12 @@ INSERT INTO use_approvals (secret_id, owner_did, requester_did, depth, binding, 
 CREATE TABLE service_tenants (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL, service_did TEXT NOT NULL UNIQUE,
   owner_did TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL, approval_id INTEGER, created_at TEXT NOT NULL);
 INSERT INTO service_tenants (slug, name, service_did, owner_did, created_by, created_at)
-  VALUES ('legacy-svc', 'Legacy', 'did:key:zLegacySvc', 'did:key:zLegacyOwner', 'did:key:zLegacyOwner', '2026-11-07T00:00:00Z');""")
+  VALUES ('legacy-svc', 'Legacy', 'did:key:zLegacySvc', 'did:key:zLegacyOwner', 'did:key:zLegacyOwner', '2026-11-07T00:00:00Z');
+CREATE TABLE service_charges (id INTEGER PRIMARY KEY AUTOINCREMENT, charge_id TEXT NOT NULL UNIQUE, tenant_id INTEGER NOT NULL, payer_did TEXT NOT NULL,
+  payee_did TEXT NOT NULL, action TEXT NOT NULL, cost_dd INTEGER NOT NULL, margin_pct INTEGER NOT NULL, dd INTEGER NOT NULL, token_jti TEXT NOT NULL,
+  delegation_id INTEGER, idempotency_key TEXT NOT NULL, receipt TEXT NOT NULL, sig TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (tenant_id, idempotency_key));
+INSERT INTO service_charges (charge_id, tenant_id, payer_did, payee_did, action, cost_dd, margin_pct, dd, token_jti, idempotency_key, receipt, sig, created_at)
+  VALUES ('sc_legacy0000000000000000', 1, 'did:key:zLegacyAgent', 'did:key:zLegacySvc', 'post', 2, 20, 3, 'abcdef0123', 'legacy-key-0001', '{}', 'x', '2026-11-07T00:00:00Z');""")
 c.commit()
 EOF
 
@@ -64,6 +69,9 @@ call GET /api/services/legacy-svc ""
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J endpoint)" = None ] && [ "$(echo "$BODY" | J mcp_server)" = None ] \
   && [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('service_tenants') WHERE name IN ('endpoint','mcp_server')")" = 2 ] \
   && ok "legacy service_tenants: the old row is kept, endpoint and mcp_server added (empty → null in the view)" || fail "legacy tenants: $CODE $BODY"
+[ "$(echo "$BODY" | J margin_pct)" = 20 ] && [ "$(Q "SELECT COALESCE(follows_charge_id,'null') || '/' || dd FROM service_charges WHERE charge_id='sc_legacy0000000000000000'")" = null/3 ] \
+  && ok "legacy: a tenant without margin_pct prices at the default 20%; an old charge row is kept and gains follows_charge_id (NULL)" || fail "legacy margin/charges: $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM service_charges WHERE charge_id='sc_legacy0000000000000000'\"); c.commit()" "$DB_PATH"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM service_tenants WHERE slug='legacy-svc'\"); c.commit()" "$DB_PATH"
 
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
@@ -236,6 +244,50 @@ call POST /api/services/token "$EXT2" '{"service":"conduit"}'; ECT=$(echo "$BODY
 EJ=$(python3 -c 'import json,base64,sys; p=sys.argv[1].split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["jti"])' "$EXT2")
 call POST /api/identity/tokens/revoke "$EXT2" "$(jbody jti "$EJ")"; [ "$CODE" = 200 ] || fail "parent revoke: $CODE $BODY"
 V "$CD" "$(jbody token "$ECT" action post)"; [ "$CODE" = 401 ] && ok "revoking the token that minted it kills the service token" || fail "parent revoke: $CODE $BODY"
+
+# ── metered follow-ups, dry runs, per-tenant margin (Aaron 2026-11-10: bill each review round, ≤25¢ at a time; 33% top) ──
+SQ(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
+SQ "UPDATE service_consents SET daily_cap_dd = 100000 WHERE payer_did = '$(did ext)' AND status = 'active'"   # this section needs room under the day's cap
+E2=$(bal ext); FG0=$(bal fg)
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0001)"; FU=$(echo "$BODY" | J charge_id)
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follows)" = "$CID" ] && [ "$(echo "$BODY" | J token_id)" = "$TID" ] && [ "$(echo "$BODY" | J dd)" = 120 ] \
+  && [ "$(bal ext)" = $((E2 - 120)) ] && [ "$(bal fg)" = $((FG0 + 120)) ] && [ "$(Q "SELECT follows_charge_id FROM service_charges WHERE charge_id='$FU'")" = "$CID" ] \
+  && echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert json.loads(d["receipt"])["follows"]' \
+  && ok "a follow-up (no live token): billed to the same wallet, attributed to the same token, the receipt names the charge it follows" || fail "follow-up: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0001)"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && [ "$(bal ext)" = $((E2 - 120)) ] && ok "a follow-up retried with its key replays (no second debit)" || fail "fu replay: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$FU" idempotency_key fu-review-0003)"; A1=$CODE
+C "$FG" "$(jbody action sign-charter cost_dd 5 follow_up_of "$CID" idempotency_key fu-sign-0001)"; A2=$CODE
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of sc_000000000000000000000000 idempotency_key fu-none-0001)"; A3=$CODE
+C "$CD" "$(jbody action post cost_dd 2 follow_up_of "$CID" idempotency_key fu-other-0001)"; A4=$CODE
+[ "$A1" = 400 ] && [ "$A2" = 403 ] && [ "$A3" = 404 ] && [ "$A4" = 404 ] && [ "$(bal ext)" = $((E2 - 120)) ] \
+  && ok "follow-ups only of the charge that started the work (not a follow-up), only in its scope (never sign-charter), only by its own tenant" || fail "fu refusals: $A1 $A2 $A3 $A4"
+N0=$(Q "SELECT COUNT(*) FROM service_charges")
+C "$FG" "$(jbody action review cost_dd 10 follow_up_of "$CID" dry_run true)"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J would_charge_dd)" = 12 ] && [ "$(bal ext)" = $((E2 - 120)) ] && [ "$(Q "SELECT COUNT(*) FROM service_charges")" = "$N0" ] \
+  && ok "a dry run surveys the wallet: what it would charge, nothing written" || fail "dry run: $CODE $BODY"
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" dry_run true)"
+[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J refused)" = insufficient ] && ok "a dry run on a wallet that can't pay → 402 refused: insufficient" || fail "dry poor: $CODE $BODY"
+# per-tenant margin: the owner asks from their own session, approves in the app; at most 33%
+call PUT /api/services/fleetgate/margin "$FG" '{"margin_pct":33}'; A1=$CODE
+call PUT /api/services/fleetgate/margin "$OWN" '{"margin_pct":34}'; A2=$CODE
+[ "$A1" = 403 ] && [ "$A2" = 400 ] && ok "only the tenant's owner sets its margin, and never above 33%" || fail "margin refusals: $A1 $A2"
+call PUT /api/services/fleetgate/margin "$OWN" '{"margin_pct":33}'; MQ=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT COALESCE(margin_pct,'null') FROM service_tenants WHERE slug='fleetgate'")" = null ] && ok "a margin change waits on the owner's approval" || fail "margin ask: $CODE $BODY"
+approve "$OWN" "$MQ"; call PUT /api/services/fleetgate/margin "$OWN" "$(jbody margin_pct 33 approval_id "$MQ")"
+call GET /api/services/fleetgate ""
+[ "$(echo "$BODY" | J margin_pct)" = 33 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print({a["action"]:a["price_dd"] for a in json.load(sys.stdin)["actions"]}["submit"])')" = 27 ] \
+  && ok "approved: fleetgate at 33% (submit 20 → 27); other tenants keep the default" || fail "margin: $BODY"
+call GET /api/services/conduit ""; [ "$(echo "$BODY" | J margin_pct)" = 20 ] || fail "conduit margin changed"
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0002)"
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J dd)" = 133 ] && [ "$(echo "$BODY" | J margin_pct)" = 33 ] && ok "charges use the tenant's margin (100 → 133); the row and receipt record it" || fail "margin charge: $CODE $BODY"
+call POST /api/services/token/revoke "$EXT" "$(jbody token_id "$TID")"
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0004)"; A1=$CODE
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0002)"; A2=$CODE
+[ "$A1" = 401 ] && [ "$A2" = 409 ] && ok "revoking the token that started the work stops its follow-ups (and their replays)" || fail "fu revoked: $A1 $A2 $BODY"
+SQ "UPDATE service_consents SET daily_cap_dd = 1000 WHERE payer_did = '$(did ext)' AND status = 'active'"
+SQ "UPDATE service_tenants SET margin_pct = NULL WHERE slug = 'fleetgate'"
+SQ "DELETE FROM service_charges WHERE follows_charge_id IS NOT NULL"   # the listings below count the earlier charges only
 
 # ── delegation and depth ────────────────────────────────────────────────────────────────────────────────────────
 call POST /api/services/token "$AG" '{"service":"fleetgate"}'; AT=$(echo "$BODY" | J token); [ "$CODE" = 201 ] || fail "agent mint: $CODE $BODY"
