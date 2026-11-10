@@ -271,6 +271,8 @@ call PUT /api/services/fleetgate/actions "$FG" "$FU_ACT"; WQ=$(echo "$BODY" | J 
   && ok "letting submit start billable follow-up work waits on the owner's approval" || fail "follow_ups ask: $CODE $BODY"
 approve "$OWN" "$WQ"; call PUT /api/services/fleetgate/actions "$FG" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$FU_ACT" "$WQ")"
 [ "$CODE" = 200 ] || fail "follow_ups set: $CODE $BODY"
+call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"submit","follow_ups":["review","ghost"]}]}'
+[ "$CODE" = 400 ] && ok "a follow-up list may only name existing standard actions (never one created later)" || fail "ghost follow-up: $CODE $BODY"
 call POST /api/services/token "$EXT" '{"service":"fleetgate","follow_up_dd":100001}'; [ "$CODE" = 400 ] && ok "a follow-up budget above the daily consent is refused" || fail "fu budget > consent: $CODE"
 call POST /api/services/token "$EXT" '{"service":"fleetgate","follow_up_dd":600}'; ST4=$(echo "$BODY" | J token); TID4=$(echo "$BODY" | J token_id)
 [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follow_up_dd)" = 600 ] || fail "mint fu: $CODE $BODY"

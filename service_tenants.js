@@ -384,7 +384,9 @@ module.exports = function registerServiceTenants(deps) {
       if (prior.follows_charge_id !== b.follow_up_of || prior.action !== action.action || prior.cost_dd !== cost) return { status: 409, body: { error: 'this idempotency_key was already used for a different charge', charge_id: prior.charge_id } };
       // A replay is a go-ahead for the work: only while the origin token is unrevoked and the consent live.
       const ov = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, origin.token_jti);
-      if (!ov || revoked({ jti: ov.token_jti, sub: ov.did, iat: ov.iat, src_auth: ov.src_auth, fleet: ov.fleet, parent_jti: ov.parent_jti }) || !liveConsent(ov.did, tenant)) {
+      const ow = ov ? authority(tenant, action, ov.did, ov.svc_scopes ? jsonList(ov.svc_scopes) : null) : null;
+      if (!ov || revoked({ jti: ov.token_jti, sub: ov.did, iat: ov.iat, src_auth: ov.src_auth, fleet: ov.fleet, parent_jti: ov.parent_jti }) || !liveConsent(ov.did, tenant)
+          || !ow.ok || (ov.delegation_id && !(ow.delegation && ow.delegation.id === ov.delegation_id))) {
         return { status: 409, body: { error: 'this follow-up was charged, but its token or consent has since been withdrawn: stop the work', charge_id: prior.charge_id } };
       }
       return { status: 200, body: chargeView(prior, true) };
@@ -672,6 +674,15 @@ module.exports = function registerServiceTenants(deps) {
       fus = [...new Set(fus)];
       rows.push({ action, scope, cost, max, depth, open, follow_ups: fus });
     }
+    // A follow-up must already be a priced, active, standard action (in this call or before it): an approved list can
+    // never name an action the tenant creates later, wherever it puts it (#88 re-review L1).
+    for (const r of rows) {
+      for (const f of (r.follow_ups || [])) {
+        const inCall = rows.find(x => x.action === f && !x.retired);
+        const live = inCall || actionOf(t, f);
+        if (!live || (inCall ? inCall.depth : live.depth) !== 'standard') return res.status(400).json({ error: `${r.action}: follow-up '${f}' must be an existing standard action` });
+      }
+    }
     const delegated = (scope) => Boolean(db.prepare("SELECT 1 FROM service_delegations WHERE tenant_id = ? AND scope = ? AND status = 'active' LIMIT 1").get(t.id, scope));
     // Compared with the row whatever its status: retiring and re-adding is no way around this.
     const weakens = rows.filter(r => {
@@ -682,7 +693,8 @@ module.exports = function registerServiceTenants(deps) {
       const addsFollowUps = (r.follow_ups || []).some(x => !jsonList(cur.follow_ups).includes(x));
       return addsFollowUps || DEPTHS.indexOf(r.depth) < DEPTHS.indexOf(cur.depth) || (r.open && !cur.open)
         || (r.scope !== cur.scope && (cur.depth !== 'standard' || !cur.open || delegated(r.scope)));
-    }).concat(rows.filter(r => !r.retired && !anyActionOf(t, r.action) && (r.follow_ups || []).length && !delegated(r.scope)));
+    }).concat(rows.filter(r => !r.retired && !anyActionOf(t, r.action) && !delegated(r.scope) && ((r.follow_ups || []).length
+      || db.prepare("SELECT 1 FROM service_actions WHERE tenant_id = ? AND follow_ups LIKE ? LIMIT 1").get(t.id, '%"' + r.action + '"%'))));
     if (weakens.length) {
       const g = personApproval(`svc:demipass:weaken`, `weaken ${t.slug} actions`, t.owner_did, 'elevated', { did: auth.did, label: t.slug }, 'weaken', t.slug,
         { service: t.slug, changes: weakens.map(r => ({ action: r.action, scope: r.scope, depth: r.depth, open: Boolean(r.open), ...((r.follow_ups || []).length ? { follow_ups: r.follow_ups } : {}) })) }, body, null);
