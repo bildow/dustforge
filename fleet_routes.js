@@ -535,6 +535,41 @@ module.exports = function registerFleetRoutes(deps) {
     }
   });
 
+  // ── Remove a project ──────────────────────────────────────────────────────
+  // Aaron 2026-11-09: a button under Projects (cost centers) removes a project from my wallet; if it holds a balance,
+  // that returns to my total. The owner's own token and the PIN every time (intent project-remove:<row id>, one use).
+  // A refusal that needs no PIN (unknown project, a balance that is not the owner's to take) is answered before it.
+  app.delete('/api/fleet/:slug/projects/:project', rateLimitStandard, (req, res) => {
+    const a = fleetAuth(req, res, { roles: ['owner'], minScope: 'transact' }); if (!a) return;
+    if (a.decoded && (a.decoded.wrk || a.decoded.auth_method === 'worker')) return res.status(403).json({ error: "only the owner's own token can remove a project" });
+    const p = db.prepare('SELECT * FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(a.fleet.id, req.params.project);
+    if (!p) return res.status(404).json({ error: 'project not found on this fleet board' });
+    const separate = Boolean(p.wallet_did && p.wallet_did !== a.fleet.owner_did);
+    const bal = separate ? billing.getDerivedBalance(db, p.wallet_did) : 0;
+    const shared = separate && db.prepare('SELECT COUNT(*) AS n FROM fleet_projects WHERE wallet_did = ? AND id <> ?').get(p.wallet_did, p.id).n > 0;
+    if (bal < 0) return res.status(409).json({ error: `project ${p.project}'s wallet owes ${-bal} DD; settle that before removing it`, balance_cents: bal });
+    if (bal > 0 && (shared || !fb.projectWalletOwned(db, a.fleet, p))) {
+      return res.status(409).json({ error: shared
+        ? `project ${p.project}'s wallet also pays for another project, so its ${bal} DD stay there`
+        : `project ${p.project}'s wallet is an account of its own, so its ${bal} DD are not yours to take back; ask it to send them, then remove the project`, balance_cents: bal });
+    }
+    const intent = `project-remove:${p.id}`;
+    const auth = getBearerIdentity(req);
+    if (!auth.ok || !gateFresh(a.did, 'pin', auth, intent)) {
+      return res.status(403).json({ ...gateMissing('project-remove', ['pin'], ['pin'], intent), error: `removing project ${p.project} takes your PIN`, balance_cents: bal });
+    }
+    const refused = spendSingleUse(a.did, 'project-remove', ['pin'], auth, intent);
+    if (refused) return res.status(refused.status || 403).json(refused);
+    try {
+      const r = fb.removeProject(db, billing, { fleet: a.fleet, project: p.project, ledger });
+      log(`removed project ${r.project} from fleet ${a.fleet.slug}; ${r.swept} DD returned to ${a.fleet.owner_did}`);
+      res.json({ ok: true, project: r.project, returned_cents: r.swept,
+                 balance_after: r.owner_balance_after !== null ? r.owner_balance_after : billing.getDerivedBalance(db, a.fleet.owner_did) });
+    } catch (e) {
+      res.status(e.statusCode || 500).json({ error: e.message });
+    }
+  });
+
   // ── Attribution report + manual scheduler run ─────────────────────────────
   app.get('/api/fleet/:slug/attribution', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner', 'admin'] }); if (!a) return;

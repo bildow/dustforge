@@ -571,6 +571,7 @@
     </div>
     <div id="proj-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" id="proj-fund" onclick="fundOpenProject()">Add DD</button></div>
+    <button class="btn-ghost" id="proj-remove" onclick="removeOpenProject()" style="width:100%;margin-top:0.75rem;color:var(--red);border-color:var(--red)">Remove this project</button>
   </div>
 </div>
 
@@ -1032,6 +1033,7 @@ function renderProject(){
   else idle.style.display='none';
   document.getElementById('proj-owner-note').style.display=own?'none':'block';
   document.getElementById('proj-fund').style.display=own?'':'none';
+  document.getElementById('proj-remove').style.display=(fleetData&&fleetData.fleet&&fleetData.fleet.owner_did===did)?'':'none';   // owner only (#86 L3)
   document.getElementById('proj-owner-note').textContent=has?'Work your operators ask for on this project is charged to your wallet.':'This project has no wallet of its own: its work is charged to your wallet.';
 }
 async function chooseProjectMode(mode){
@@ -1045,6 +1047,20 @@ async function fundOpenProject(){
   try{
     const r=await apiGated('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(p.project)+'/fund',{amount_cents:a},'Move '+dd(a)+' DD from your wallet into project '+p.project+'? Your PIN approves it.');
     p.wallet_balance_cents=r.wallet_balance_cents; document.getElementById('proj-amount').value=''; renderProject(); m.className='modal-msg ok'; m.textContent='Added. '+p.project+' holds '+dd(r.wallet_balance_cents)+' DD.'; loadFleet();
+  }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ m.className='modal-msg err'; m.textContent=e.message; } }
+}
+// Remove the open project from my fleet board (DELETE …/projects/:project, Aaron 2026-11-09). Whatever its own wallet
+// holds comes back to my balance in the same step; the PIN approves it.
+async function removeOpenProject(){
+  const p=projOpen; const m=document.getElementById('proj-msg'); if(!p) return;
+  const has=p.wallet_did&&p.wallet_did!==did, bal=has?Number(p.wallet_balance_cents||0):0;
+  const what='Remove project '+p.project+'?'+(bal>0?' Its '+dd(bal)+' DD return to your wallet.':'')+' Its operators lose it, and work tagged with it is refused. Your PIN approves it.';
+  if(!confirm(what)) return;
+  try{
+    const r=await apiGated('DELETE','/api/fleet/'+encodeURIComponent(fleetSlug)+'/projects/'+encodeURIComponent(p.project),null,what);
+    closeModal(); projOpen=null;
+    alert('Removed '+r.project+(r.returned_cents>0?'. '+dd(r.returned_cents)+' DD returned; your wallet holds '+dd(r.balance_after)+' DD.':'.'));
+    loadFleet(); if(typeof loadBalance==='function') loadBalance();
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ m.className='modal-msg err'; m.textContent=e.message; } }
 }
 async function revokeWorkLink(id){if(!confirm('Revoke work link #'+id+'?'))return;try{await api('POST','/api/work-links/'+id+'/revoke');siliconHandle?openSilicon(siliconHandle):loadFleet()}catch(e){alert(e.message)}}

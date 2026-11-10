@@ -504,6 +504,73 @@ function transferRefill(db, billing, { fromDid, toDid, amount, description, ledg
   return out;
 }
 
+// ── Removing a project (Aaron 2026-11-09) ───────────────────────────────────────
+// Whether a project's own wallet is the fleet owner's to empty when the project is removed. Only a wallet this fleet
+// made: the board's own project wallet (minted for this board as project-<name>, the row's owner and wallet, a member
+// of this fleet), or a wallet this fleet created (wallet_creators). A wallet that is someone's own account — a linked
+// or network-joined silicon, a person — is never swept: its balance is its own.
+function projectWalletOwned(db, fleet, p) {
+  if (!p || !p.wallet_did || p.wallet_did === fleet.owner_did) return false;
+  const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(p.wallet_did);
+  if (!w) return false;
+  const member = db.prepare('SELECT 1 FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, p.wallet_did);
+  if (mintedProjectWallet(db, fleet, p, w, member)) return true;
+  return Boolean(db.prepare('SELECT 1 FROM wallet_creators WHERE did = ? AND owner_did = ? AND fleet_id = ?').get(p.wallet_did, fleet.owner_did, fleet.id));
+}
+// The board's own wallet, as bin/mint-project-owners.js makes it: project-<name>, the row's owner and wallet, a member
+// of this fleet, and no password (nobody signs in as it). A username alone is not enough: anyone can register
+// project-<anything> (#86 review M1), and such an account has a password.
+function mintedProjectWallet(db, fleet, p, w, member) {
+  if (!w) w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(p.wallet_did);
+  if (member === undefined) member = db.prepare('SELECT 1 FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, p.wallet_did);
+  if (!w || !member || p.owner_did !== p.wallet_did || w.username !== 'project-' + p.project) return false;
+  const pw = db.prepare('SELECT password_hash FROM identity_wallets WHERE did = ?').get(p.wallet_did);
+  return !(pw && pw.password_hash);
+}
+// Removes a project from the board. Whatever its own wallet holds goes back to the fleet owner first, in the same
+// transaction (all or nothing): the sweep, the board row, its operators, and the wallet's fleet membership and refill
+// rule when the board minted it. Returns { swept, owner_balance_after }.
+function removeProject(db, billing, { fleet, project, ledger }) {
+  const txn = db.transaction(() => {
+    const p = db.prepare('SELECT * FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(fleet.id, project);
+    if (!p) throw Object.assign(new Error('project not found on this fleet board'), { statusCode: 404 });
+    const separate = Boolean(p.wallet_did && p.wallet_did !== fleet.owner_did);
+    const shared = separate && db.prepare('SELECT COUNT(*) AS n FROM fleet_projects WHERE wallet_did = ? AND id <> ?').get(p.wallet_did, p.id).n > 0;
+    const owned = separate && !shared && projectWalletOwned(db, fleet, p);
+    const bal = separate ? billing.getDerivedBalance(db, p.wallet_did) : 0;
+    // A wallet in debt (a clawback after it spent) is not dropped from the board: the debt would sit on a wallet
+    // nobody tracks (#86 review M2).
+    if (bal < 0) throw Object.assign(new Error(`project ${p.project}'s wallet owes ${-bal} DD; settle that before removing it`), { statusCode: 409 });
+    if (bal > 0 && !owned) {
+      throw Object.assign(new Error(shared
+        ? `project ${p.project}'s wallet also pays for another project, so its ${bal} DD stay there; remove that project's link first`
+        : `project ${p.project}'s wallet is an account of its own (not one this fleet made), so its ${bal} DD are not yours to take back; ask it to send them, then remove the project`),
+        { statusCode: 409 });
+    }
+    let swept = 0, ownerAfter = null;
+    if (bal > 0) {
+      const desc = `Project ${p.project} removed: its ${bal} DD returned to the fleet owner (fleet ${fleet.slug})`;
+      const d = billing.deductBalance(db, p.wallet_did, bal, 'fleet_project_removed_transfer_out', desc);
+      if (!d.ok) throw Object.assign(new Error(d.error || 'could not empty the project wallet'), { statusCode: 409, body: d });
+      const c = billing.creditBalance(db, fleet.owner_did, bal, 'fleet_project_removed_transfer_in', desc);
+      if (!c.ok) throw Object.assign(new Error(c.error || 'credit failed'), { statusCode: 500, body: c });
+      swept = bal; ownerAfter = c.balance_after;
+    }
+    db.prepare('DELETE FROM fleet_project_operators WHERE project_id = ?').run(p.id);
+    db.prepare('DELETE FROM fleet_projects WHERE id = ?').run(p.id);
+    // The board's own wallet leaves the fleet with its project, and no rule keeps refilling it. Only that wallet: an
+    // agent this fleet created stays an agent (its membership and refills are its silicon row's business; #86 L1).
+    if (owned && mintedProjectWallet(db, fleet, p)) {
+      db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(fleet.id, p.wallet_did);
+      db.prepare('UPDATE wallet_refill_rules SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(p.wallet_did);
+    }
+    return { project: p.project, wallet_did: p.wallet_did || null, swept, owner_balance_after: ownerAfter };
+  });
+  const out = txn();
+  if (out.swept > 0 && ledger && typeof ledger.recordTransfer === 'function') { try { ledger.recordTransfer(db, out.wallet_did, fleet.owner_did, out.swept); } catch (_) {} }
+  return out;
+}
+
 // ── Top-up asks (network_routes.js) ─────────────────────────────────────────
 // The fleet owner a wallet is an active agent of, or null.
 function agentFleetOwner(db, did) {
@@ -1034,7 +1101,7 @@ module.exports = {
   ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed, OWNER_REFILL_MAX,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
-  thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
+  thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, projectWalletOwned, removeProject, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
   runOwnerRefills, runSiliconRefills, runTokenWarnings, runRefills,
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
