@@ -35,12 +35,16 @@ for (const project of PROJECTS) {
   let did;
   const preExisting = findWalletByUsername.get(walletUsername);
   if (preExisting) {
-    did = preExisting.did;
-    console.log('[reuse]', walletUsername, '->', did.slice(0, 32) + '...');
+    // Never adopt an account someone registered under this name (#86 review M1): it would become a project wallet
+    // its registrant can sign in to and spend from, and removing the project would sweep that person's own DD.
+    console.error('[refuse]', walletUsername, 'already exists as', preExisting.did.slice(0, 32) + '...', '- not a wallet this script made; pick another project name');
+    continue;
   } else {
     const id = identity.createIdentity();
     upsertWallet.run(id.did, walletUsername, walletEmail, id.encrypted_private_key);
     did = id.did;
+    // Recorded as this fleet's own wallet: what removing the project may return to the owner.
+    db.prepare("INSERT OR IGNORE INTO wallet_creators (did, owner_did, fleet_id, recorded_at) VALUES (?, ?, ?, datetime('now'))").run(did, fleet.owner_did, fleet.id);
     console.log('[mint]', walletUsername, '->', did.slice(0, 32) + '...');
   }
   insertMember.run(fleet.id, did);

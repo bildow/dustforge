@@ -514,8 +514,18 @@ function projectWalletOwned(db, fleet, p) {
   const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(p.wallet_did);
   if (!w) return false;
   const member = db.prepare('SELECT 1 FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, p.wallet_did);
-  if (member && p.owner_did === p.wallet_did && w.username === 'project-' + p.project) return true;
+  if (mintedProjectWallet(db, fleet, p, w, member)) return true;
   return Boolean(db.prepare('SELECT 1 FROM wallet_creators WHERE did = ? AND owner_did = ? AND fleet_id = ?').get(p.wallet_did, fleet.owner_did, fleet.id));
+}
+// The board's own wallet, as bin/mint-project-owners.js makes it: project-<name>, the row's owner and wallet, a member
+// of this fleet, and no password (nobody signs in as it). A username alone is not enough: anyone can register
+// project-<anything> (#86 review M1), and such an account has a password.
+function mintedProjectWallet(db, fleet, p, w, member) {
+  if (!w) w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(p.wallet_did);
+  if (member === undefined) member = db.prepare('SELECT 1 FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, p.wallet_did);
+  if (!w || !member || p.owner_did !== p.wallet_did || w.username !== 'project-' + p.project) return false;
+  const pw = db.prepare('SELECT password_hash FROM identity_wallets WHERE did = ?').get(p.wallet_did);
+  return !(pw && pw.password_hash);
 }
 // Removes a project from the board. Whatever its own wallet holds goes back to the fleet owner first, in the same
 // transaction (all or nothing): the sweep, the board row, its operators, and the wallet's fleet membership and refill
@@ -528,6 +538,9 @@ function removeProject(db, billing, { fleet, project, ledger }) {
     const shared = separate && db.prepare('SELECT COUNT(*) AS n FROM fleet_projects WHERE wallet_did = ? AND id <> ?').get(p.wallet_did, p.id).n > 0;
     const owned = separate && !shared && projectWalletOwned(db, fleet, p);
     const bal = separate ? billing.getDerivedBalance(db, p.wallet_did) : 0;
+    // A wallet in debt (a clawback after it spent) is not dropped from the board: the debt would sit on a wallet
+    // nobody tracks (#86 review M2).
+    if (bal < 0) throw Object.assign(new Error(`project ${p.project}'s wallet owes ${-bal} DD; settle that before removing it`), { statusCode: 409 });
     if (bal > 0 && !owned) {
       throw Object.assign(new Error(shared
         ? `project ${p.project}'s wallet also pays for another project, so its ${bal} DD stay there; remove that project's link first`
@@ -537,16 +550,17 @@ function removeProject(db, billing, { fleet, project, ledger }) {
     let swept = 0, ownerAfter = null;
     if (bal > 0) {
       const desc = `Project ${p.project} removed: its ${bal} DD returned to the fleet owner (fleet ${fleet.slug})`;
-      const d = billing.deductBalance(db, p.wallet_did, bal, 'project_removed_out', desc);
+      const d = billing.deductBalance(db, p.wallet_did, bal, 'fleet_project_removed_transfer_out', desc);
       if (!d.ok) throw Object.assign(new Error(d.error || 'could not empty the project wallet'), { statusCode: 409, body: d });
-      const c = billing.creditBalance(db, fleet.owner_did, bal, 'project_removed_in', desc);
+      const c = billing.creditBalance(db, fleet.owner_did, bal, 'fleet_project_removed_transfer_in', desc);
       if (!c.ok) throw Object.assign(new Error(c.error || 'credit failed'), { statusCode: 500, body: c });
       swept = bal; ownerAfter = c.balance_after;
     }
     db.prepare('DELETE FROM fleet_project_operators WHERE project_id = ?').run(p.id);
     db.prepare('DELETE FROM fleet_projects WHERE id = ?').run(p.id);
-    if (owned) {
-      // The board's own wallet leaves the fleet with its project; no rule keeps refilling an empty, unused wallet.
+    // The board's own wallet leaves the fleet with its project, and no rule keeps refilling it. Only that wallet: an
+    // agent this fleet created stays an agent (its membership and refills are its silicon row's business; #86 L1).
+    if (owned && mintedProjectWallet(db, fleet, p)) {
       db.prepare("DELETE FROM fleet_members WHERE fleet_id = ? AND member_did = ? AND role = 'agent'").run(fleet.id, p.wallet_did);
       db.prepare('UPDATE wallet_refill_rules SET enabled = 0, updated_at = CURRENT_TIMESTAMP WHERE did = ?').run(p.wallet_did);
     }

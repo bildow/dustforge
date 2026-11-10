@@ -22,8 +22,12 @@ kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -5 "$S/server.log"; exit
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
-for (const [u, bal] of [["owner-a", 100000], ["other-x", 100000], ["project-bench", 5000], ["project-ops", 0], ["project-pair", 700], ["indie-w", 900]]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
-  db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, ?, ?)").run(id.did, u, u + "@dustforge.com", enc, bal, process.argv[1]);
+const ledger = require("./dd_ledger"); try { ledger.initSchema && ledger.initSchema(db); } catch (_) {}
+// Board-minted project wallets have no password (bin/mint-project-owners.js); project-squat registered its name itself.
+for (const [u, bal, pw] of [["owner-a", 100000, 1], ["other-x", 100000, 1], ["project-bench", 5000, 0], ["project-ops", 0, 0], ["project-pair", 700, 0],
+                            ["indie-w", 900, 1], ["project-squat", 400, 1], ["project-debt", -50, 0]]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
+  db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, ?, ?)").run(id.did, u, u + "@dustforge.com", enc, bal, pw ? process.argv[1] : null);
+  if (u === "project-bench") ledger.recordCredit(db, { did: id.did, amount_cents: bal, source: "stripe_topup", origin_event_id: "cs_smoke_bench", chargebackable: 1 });
   if (bal) db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, ?, ?, ?, ?)").run(id.did, bal, "topup", "smoke", bal); }' "$H"
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 J(){ python3 -c 'import json,sys; d=json.load(sys.stdin); v=d
@@ -55,6 +59,8 @@ def proj(name, wallet, member=True):
 proj('bench', d('project-bench')); proj('ops', d('project-ops'))
 proj('pair', d('project-pair')); proj('pair2', d('project-pair'))        # one wallet behind two projects
 proj('indie', d('indie-w'))                                              # someone's own account, not minted by the board
+proj('squat', d('project-squat'))                                        # right name, but a registered account (password)
+proj('debt', d('project-debt'))                                          # a board wallet in debt
 c.execute("INSERT INTO fleet_projects (fleet_id, project, owner_did, wallet_did, lane_address) VALUES (?, 'mine', ?, ?, 'mine@dustforge.com')", (fid, a, a))
 c.execute("INSERT INTO wallet_refill_rules (did, amount_cents, enabled) VALUES (?, 100, 1)", (d('project-bench'),))
 c.commit()
@@ -71,10 +77,15 @@ PIN "project-remove:$PID"; call DELETE /api/fleet/fleet-one/projects/bench "$A"
   && [ "$(Q "SELECT COUNT(*) FROM fleet_members WHERE member_did=(SELECT did FROM identity_wallets WHERE username='project-bench')")" = 0 ] \
   && [ "$(Q "SELECT enabled FROM wallet_refill_rules WHERE did=(SELECT did FROM identity_wallets WHERE username='project-bench')")" = 0 ] \
   && ok "row, operators, the wallet's fleet membership and its refill rule are gone" || fail "leftovers"
-[ "$(Q "SELECT COUNT(*) FROM identity_transactions WHERE type IN ('project_removed_out','project_removed_in')")" = 2 ] && ok "the return is two ledger rows (out of the project, into the owner)" || fail "ledger rows"
+[ "$(Q "SELECT COUNT(*) FROM identity_transactions WHERE type IN ('fleet_project_removed_transfer_out','fleet_project_removed_transfer_in')")" = 2 ] && ok "the return is two transfer rows (out of the project, into the owner)" || fail "ledger rows"
+OWNER_HASH_LOTS=$(node -e '
+const L = require("./dd_ledger"); const db = new (require("better-sqlite3"))(process.env.DB_PATH);
+const owner = db.prepare("SELECT did FROM identity_wallets WHERE username = ?").get("owner-a").did;
+console.log(db.prepare("SELECT COUNT(*) AS n FROM dd_ledger WHERE holder_hash = ? AND parent_lot_id IS NOT NULL AND chargebackable = 1 AND amount_cents = 5000").get(L.didHash(owner)).n);')
+[ "${OWNER_HASH_LOTS:-0}" -ge 1 ] && ok "the DD keep their lineage: the owner now holds a child lot of the project's chargebackable lot (#86 H1)" || fail "lineage: lots=$OWNER_HASH_LOTS"
 call DELETE /api/fleet/fleet-one/projects/bench "$A"; [ "$CODE" = 404 ] && ok "removed twice → 404" || fail "twice: $CODE"
 call GET /api/fleet/fleet-one/overview "$A"
-[ "$(echo "$BODY" | python3 -c 'import json,sys; print(sorted(p["project"] for p in json.load(sys.stdin).get("projects",[])))')" = "['indie', 'mine', 'ops', 'pair', 'pair2']" ] \
+[ "$(echo "$BODY" | python3 -c 'import json,sys; print(sorted(p["project"] for p in json.load(sys.stdin).get("projects",[])))')" = "['debt', 'indie', 'mine', 'ops', 'pair', 'pair2', 'squat']" ] \
   && ok "the board no longer lists bench" || fail "board: $(echo "$BODY" | head -c 300)"
 
 PID=$(Q "SELECT id FROM fleet_projects WHERE project='ops'"); A1=$(BAL owner-a)
@@ -95,6 +106,12 @@ PID=$(Q "SELECT id FROM fleet_projects WHERE project='pair'")
 PIN "project-remove:$PID"; call DELETE /api/fleet/fleet-one/projects/pair "$A"
 [ "$CODE" = 409 ] && [ "$(BAL project-pair)" = 700 ] && ok "a wallet behind two projects → 409, its DD stay" || fail "pair: $CODE $BODY"
 
+PID=$(Q "SELECT id FROM fleet_projects WHERE project='squat'")
+PIN "project-remove:$PID"; call DELETE /api/fleet/fleet-one/projects/squat "$A"
+[ "$CODE" = 409 ] && [ "$(BAL project-squat)" = 400 ] && ok "a registered account named project-<name> is not the board's: 409, its DD stay (#86 M1)" || fail "squat: $CODE $BODY"
+PID=$(Q "SELECT id FROM fleet_projects WHERE project='debt'")
+PIN "project-remove:$PID"; call DELETE /api/fleet/fleet-one/projects/debt "$A"
+[ "$CODE" = 409 ] && [ -n "$(Q "SELECT id FROM fleet_projects WHERE project='debt'")" ] && ok "a project wallet in debt is not dropped: 409, row kept (#86 M2)" || fail "debt: $CODE $BODY"
 call DELETE /api/fleet/fleet-one/projects/nope "$A"; [ "$CODE" = 404 ] && ok "unknown project → 404" || fail "404: $CODE"
 call DELETE /api/fleet/fleet-one/projects/pair2 "$X"; [ "$CODE" = 403 ] && [ "$(BAL project-pair)" = 700 ] && ok "someone outside the fleet → 403" || fail "outsider: $CODE"
 

@@ -547,6 +547,7 @@ module.exports = function registerFleetRoutes(deps) {
     const separate = Boolean(p.wallet_did && p.wallet_did !== a.fleet.owner_did);
     const bal = separate ? billing.getDerivedBalance(db, p.wallet_did) : 0;
     const shared = separate && db.prepare('SELECT COUNT(*) AS n FROM fleet_projects WHERE wallet_did = ? AND id <> ?').get(p.wallet_did, p.id).n > 0;
+    if (bal < 0) return res.status(409).json({ error: `project ${p.project}'s wallet owes ${-bal} DD; settle that before removing it`, balance_cents: bal });
     if (bal > 0 && (shared || !fb.projectWalletOwned(db, a.fleet, p))) {
       return res.status(409).json({ error: shared
         ? `project ${p.project}'s wallet also pays for another project, so its ${bal} DD stay there`

@@ -1033,6 +1033,7 @@ function renderProject(){
   else idle.style.display='none';
   document.getElementById('proj-owner-note').style.display=own?'none':'block';
   document.getElementById('proj-fund').style.display=own?'':'none';
+  document.getElementById('proj-remove').style.display=(fleetData&&fleetData.fleet&&fleetData.fleet.owner_did===did)?'':'none';   // owner only (#86 L3)
   document.getElementById('proj-owner-note').textContent=has?'Work your operators ask for on this project is charged to your wallet.':'This project has no wallet of its own: its work is charged to your wallet.';
 }
 async function chooseProjectMode(mode){
