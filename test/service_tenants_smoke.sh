@@ -131,10 +131,12 @@ call GET /api/services/fleetgate ""
 
 # ── where callers connect (registry: endpoint + mcp_server; every change waits on the tenant owner) ─────────────
 call PUT /api/services/fleetgate/connect "$EXT" '{"endpoint":"https://evil.example/door"}'; [ "$CODE" = 403 ] && ok "only the tenant (or its owner) sets where callers connect" || fail "ext connect: $CODE"
-bad=0; for e in 'http://evil.example/door' 'https://u:p@repo.example/door' 'https://repo.example/door?x=1' 'ftp://repo.example' 'nope'; do
+bad=0; for e in 'http://evil.example/door' 'https://u:p@repo.example/door' 'https://repo.example/door?x=1' 'ftp://repo.example' 'nope' \
+    'http://x.ts.net\\@evil.com/door' 'HTTPS://Repo.Example/door' 'http://evil.ts.net.attacker.com/door' 'https://repo.example/a b'; do
   call PUT /api/services/fleetgate/connect "$FG" "$(jbody endpoint "$e")"; [ "$CODE" = 400 ] || { bad=1; echo "  $e → $CODE"; }; done
 call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass fleetgate"}'; [ "$CODE" = 400 ] || bad=1
-[ $bad = 0 ] && ok "endpoint must be https (http only on *.ts.net), no credentials/query; mcp_server is package#bin" || fail "connect validation"
+call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"evilpkg#x"}'; [ "$CODE" = 403 ] || { bad=1; echo "  third-party mcp → $CODE"; }
+[ $bad = 0 ] && ok "endpoint: https (http only on *.ts.net), plain normal-form ASCII, no credentials/query/backslash; mcp_server first-party package#bin" || fail "connect validation"
 CB='{"endpoint":"https://repo.example/-/fleetgate/door/","mcp_server":"demipass#fleetgate-mcp"}'
 call PUT /api/services/fleetgate/connect "$FG" "$CB"; CQ=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$CQ")" = "$(did owner)" ] && [ "$(Q "SELECT endpoint FROM service_tenants WHERE slug='fleetgate'")" = "" ] \
@@ -225,6 +227,8 @@ E1=$(bal ext); C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID2" idempo
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" idempotency_key pr-submit-0001)"
 [ "$CODE" = 409 ] && [ "$(bal poor)" = 5 ] && ok "another wallet's token with that key → 409 (never someone else's charge)" || fail "other-wallet replay: $CODE $BODY"
 call POST /api/services/token/revoke "$EXT" "$(jbody token_id "$TID2")"; [ "$CODE" = 200 ] || fail "revoke: $CODE $BODY"
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID2" idempotency_key pr-submit-0001)"
+[ "$CODE" = 409 ] && ok "a revoked token gets no replay (never a go-ahead for a token its wallet withdrew)" || fail "revoked replay: $CODE $BODY"
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID2" idempotency_key after-revoke-1)"; A1=$CODE
 V "$FG" "$(jbody token "$ST2" action submit)"; [ "$A1" = 401 ] && [ "$CODE" = 401 ] && ok "a revoked service token: verify and charge → 401" || fail "revoked: $A1 $CODE"
 EXT2=$(login ext); asked /api/services/consent "$EXT2" "$EXT2" '{"service":"conduit","daily_cap_dd":100}' >/dev/null
