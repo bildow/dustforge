@@ -355,7 +355,10 @@ module.exports = function registerServiceTenants(deps) {
     const action = actionOf(tenant, b.action);
     if (!action) return { status: 404, body: { error: `no action '${String(b.action || '')}' at ${tenant.slug}` } };
     const cost = b.cost_dd === undefined ? action.measured_cost_dd : b.cost_dd;
-    if (!Number.isInteger(cost) || cost < 1 || cost > action.max_cost_dd) return { status: 400, body: { error: `cost_dd: an integer from 1 to ${action.max_cost_dd} (this action's max_cost_dd)` } };
+    // A follow-up's dry run sizes a whole step (billed later in portions), bounded by the follow-up budget, not by one
+    // charge's max_cost_dd.
+    const wholeStep = b.dry_run === true && b.follow_up_of !== undefined;
+    if (!Number.isInteger(cost) || cost < 1 || cost > (wholeStep ? 1000000 : action.max_cost_dd)) return { status: 400, body: { error: `cost_dd: an integer from 1 to ${action.max_cost_dd} (this action's max_cost_dd)` } };
     const dry = b.dry_run === true;
     const followUp = b.follow_up_of !== undefined;
     if (!dry && (typeof b.idempotency_key !== 'string' || !IDEM_RE.test(b.idempotency_key))) return { status: 400, body: { error: 'idempotency_key: 8-100 of [A-Za-z0-9._:-] (one per billed call; a retry sends the same key)' } };
@@ -373,7 +376,7 @@ module.exports = function registerServiceTenants(deps) {
       if (origin.follows_charge_id) return { status: 400, body: { error: 'follow_up_of: name the charge that started the work, not another follow-up', origin: origin.follows_charge_id } };
       if (!jsonList(origin.follow_ups).includes(action.action)) return { status: 403, body: { error: `'${action.action}' is not a follow-up the charge ${origin.charge_id} allowed when it was made` } };
       if (Date.parse(origin.created_at) < Date.now() - FOLLOW_UP_DAYS * 86400000) return { status: 403, body: { error: `follow-ups end ${FOLLOW_UP_DAYS} days after the charge that started the work` } };
-      if (cost > MAX_PORTION_DD) return { status: 400, body: { error: `a follow-up is billed in portions of at most ${MAX_PORTION_DD} DD (cost); split it` } };
+      if (!dry && cost > MAX_PORTION_DD) return { status: 400, body: { error: `a follow-up is billed in portions of at most ${MAX_PORTION_DD} DD (cost); split it` } };
     }
     // A follow-up pays the margin of the charge that started the work, or the tenant's current one if lower (M1).
     if (followUp) { margin = Math.min(origin.margin_pct, margin); dd = priceOf(cost, margin); }
@@ -441,7 +444,11 @@ module.exports = function registerServiceTenants(deps) {
 
     // A dry run ("survey the wallet" before a portion of work): every check a charge makes, nothing written.
     if (dry) {
-      if (cost > MAX_PORTION_DD) return { status: 400, body: { error: `a dry run asks about one portion: at most ${MAX_PORTION_DD} DD (cost)` } };
+      // A follow-up's dry run may ask about a whole step before it runs (the meter surveys one model call, which it then
+      // bills in ≤250 DD portions), up to what the token's follow-up budget could ever pay; an ordinary one, one portion.
+      // (#57 review: surveying only one portion let a 250 DD wallet start a 1,000 DD call.)
+      if (!followUp && cost > MAX_PORTION_DD) return { status: 400, body: { error: `a dry run asks about one portion: at most ${MAX_PORTION_DD} DD (cost)` } };
+      if (followUp && dd > v.follow_up_dd) return { status: 402, body: { ok: false, dry_run: true, would_charge_dd: dd, margin_pct: margin, refused: 'follow_up_budget' } };
       const w = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(v.did);
       const today = spentToday(v.did, tenant);
       const bal = billing.getDerivedBalance(db, v.did);
