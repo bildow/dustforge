@@ -341,15 +341,16 @@ module.exports = function registerServiceTenants(deps) {
       // A retry may come with a new token of the same wallet (the first expired, or the caller's process restarted
       // after it was charged): that is still the same charge, so it replays. Another wallet's token never does
       // (demipass #17 review M1). A replay moves no DD.
-      // The new token must itself still be good: verified for this action, unexpired, not revoked, its consent live
-      // (#87 review L: a revoked token or consent never gets a "go ahead").
-      const samePayer = prior.token_jti === b.token_id || (() => {
-        const nv = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, b.token_id);
-        if (!nv || nv.did !== prior.payer_did || nv.exp <= Math.floor(Date.now() / 1000) || !jsonList(nv.actions).includes(action.action)) return false;
-        const it = db.prepare('SELECT revoked FROM issued_tokens WHERE jti = ?').get(b.token_id);
-        if (it && it.revoked) return false;
-        return Boolean(liveConsent(nv.did, tenant));
-      })();
+      // The token retrying (the first one or another of the same wallet) must still be good, with the same checks a
+      // charge runs: verified for this action and its scope, unexpired, not revoked by any route (its own flag, the
+      // wallet, a session or time cutoff, a fleet cut, its parent), its consent live (#87 review L/L1: a token or
+      // consent withdrawn never gets a "go ahead").
+      const nv = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, b.token_id);
+      const nvScopes = nv && nv.svc_scopes ? jsonList(nv.svc_scopes) : null;
+      const samePayer = Boolean(nv && nv.did === prior.payer_did && nv.exp > nowSec() && jsonList(nv.actions).includes(action.action)
+        && (!nvScopes || nvScopes.includes(action.scope))
+        && !revoked({ jti: nv.token_jti, sub: nv.did, iat: nv.iat, src_auth: nv.src_auth, fleet: nv.fleet, parent_jti: nv.parent_jti })
+        && liveConsent(nv.did, tenant));
       if (!samePayer || prior.action !== action.action || prior.cost_dd !== cost) {
         return { status: 409, body: { error: 'this idempotency_key was already used for a different charge', charge_id: prior.charge_id } };
       }
@@ -506,7 +507,8 @@ module.exports = function registerServiceTenants(deps) {
   }
   // Which MCP server callers' machines run for a tenant is code on their machines, run with their DemiPass session
   // nearby: first-party only (the demipass package's own servers) until there is a trust model for others (#87 M2).
-  const MCP_FIRST_PARTY = /^demipass#[a-z0-9][a-z0-9._-]{0,60}$/;
+  const MCP_FIRST_PARTY_SERVERS = new Set(['demipass#demipass-mcp', 'demipass#fleetgate-mcp']);   // the MCP servers the demipass package ships
+  const MCP_FIRST_PARTY = { test: (v) => MCP_FIRST_PARTY_SERVERS.has(v) };
   app.put('/api/services/:slug/connect', lim, (req, res) => {
     const auth = walletAuth(req, res); if (!auth) return;
     const t = tenantBySlug(req.params.slug);
@@ -518,7 +520,7 @@ module.exports = function registerServiceTenants(deps) {
     const ne = normalizeEndpoint(endpoint);
     if (ne.error) return res.status(400).json({ error: ne.error });
     if (mcp !== '' && !MCP_SERVER_RE.test(mcp)) return res.status(400).json({ error: 'mcp_server: "<npm package>#<bin>", e.g. demipass#fleetgate-mcp' });
-    if (mcp !== '' && !MCP_FIRST_PARTY.test(mcp)) return res.status(403).json({ error: 'mcp_server: only first-party servers (demipass#<bin>) for now' });
+    if (mcp !== '' && !MCP_FIRST_PARTY.test(mcp)) return res.status(403).json({ error: `mcp_server: only first-party servers for now (${[...MCP_FIRST_PARTY_SERVERS].join(', ')})` });
     if (endpoint === (t.endpoint || '') && mcp === (t.mcp_server || '')) return res.json({ ok: true, unchanged: true, ...tenantView(t) });
     const g = personApproval('svc:demipass:connect', `point callers of ${t.slug} at ${endpoint || '(nothing)'}; their agents run ${mcp || '(no MCP server)'}`, t.owner_did, 'elevated',
       { did: auth.did, label: t.slug }, 'connect', t.slug, { service: t.slug, endpoint, mcp_server: mcp, was: { endpoint: t.endpoint || '', mcp_server: t.mcp_server || '' } }, b, null);
