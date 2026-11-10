@@ -3,6 +3,9 @@
 # People (PINs): owner (has a fleet), otherowner (another fleet), ext (an outside wallet), poor (5 DD). Silicons of owner's
 # fleet: fg (FLEETGATE's wallet), cd (Conduit's), agent. A silicon of otherowner's fleet: stranger.
 #   - legacy: a use_approvals table from before this change (no service_key) keeps its rows and gains the column;
+#   - legacy: a service_tenants table from before endpoint/mcp_server keeps its row and gains both (''); connect
+#     (PUT /api/services/:slug/connect) waits on the tenant owner's approval, validates the URL, and is listed;
+#   - a charge retried with another token of the same wallet replays; another wallet's token with that key → 409;
 #   - registration, consent to pay, and weakening a gate each wait on a person's approval in the app (PIN to open):
 #     a token alone asks, never grants (#68 review H1, M3);
 #   - prices: cost + margin, public; service tokens: audience-locked, refused by every other DemiPass route;
@@ -41,7 +44,11 @@ c.executescript("""CREATE TABLE use_approvals (id INTEGER PRIMARY KEY AUTOINCREM
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL, opened_at TEXT, opened_session TEXT, opened_via TEXT, approved_at TEXT, approved_via TEXT,
   used_at TEXT, decided_at TEXT, wrong_codes INTEGER DEFAULT 0, notified_at TEXT, bound_call TEXT DEFAULT '', eph_pub TEXT DEFAULT NULL, unwrap_blob TEXT DEFAULT NULL);
 INSERT INTO use_approvals (secret_id, owner_did, requester_did, depth, binding, code_key, created_at, expires_at, status)
-  VALUES (7, 'did:key:zLegacyOwner', 'did:key:zLegacyAgent', 'elevated', 'b1', 'aa', '2026-11-01T00:00:00Z', '2026-11-01T00:05:00Z', 'used');""")
+  VALUES (7, 'did:key:zLegacyOwner', 'did:key:zLegacyAgent', 'elevated', 'b1', 'aa', '2026-11-01T00:00:00Z', '2026-11-01T00:05:00Z', 'used');
+CREATE TABLE service_tenants (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL, service_did TEXT NOT NULL UNIQUE,
+  owner_did TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL, approval_id INTEGER, created_at TEXT NOT NULL);
+INSERT INTO service_tenants (slug, name, service_did, owner_did, created_by, created_at)
+  VALUES ('legacy-svc', 'Legacy', 'did:key:zLegacySvc', 'did:key:zLegacyOwner', 'did:key:zLegacyOwner', '2026-11-07T00:00:00Z');""")
 c.commit()
 EOF
 
@@ -53,6 +60,11 @@ trap 'kill $SRV 2>/dev/null; rm -rf "$S"' EXIT
 
 [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('use_approvals') WHERE name='service_key'")" = 1 ] && [ "$(Q "SELECT status || '/' || COALESCE(service_key,'null') FROM use_approvals WHERE id=1")" = used/null ] \
   && ok "legacy use_approvals: the old row is kept, service_key added (NULL)" || fail "legacy migration"
+call GET /api/services/legacy-svc ""
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J endpoint)" = None ] && [ "$(echo "$BODY" | J mcp_server)" = None ] \
+  && [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('service_tenants') WHERE name IN ('endpoint','mcp_server')")" = 2 ] \
+  && ok "legacy service_tenants: the old row is kept, endpoint and mcp_server added (empty → null in the view)" || fail "legacy tenants: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM service_tenants WHERE slug='legacy-svc'\"); c.commit()" "$DB_PATH"
 
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
@@ -116,6 +128,24 @@ call PUT /api/services/conduit/actions "$CD" '{"actions":[{"action":"post","scop
 call GET /api/services/fleetgate ""
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J margin_pct)" = 20 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; a={x["action"]:x for x in json.load(sys.stdin)["actions"]}; print(a["submit"]["price_dd"], a["review"]["max_price_dd"])')" = "24 360" ] \
   && ok "public price list: measured cost + 20% margin (submit 20 → 24; review max 300 → 360)" || fail "price list: $CODE $BODY"
+
+# ── where callers connect (registry: endpoint + mcp_server; every change waits on the tenant owner) ─────────────
+call PUT /api/services/fleetgate/connect "$EXT" '{"endpoint":"https://evil.example/door"}'; [ "$CODE" = 403 ] && ok "only the tenant (or its owner) sets where callers connect" || fail "ext connect: $CODE"
+bad=0; for e in 'http://evil.example/door' 'https://u:p@repo.example/door' 'https://repo.example/door?x=1' 'ftp://repo.example' 'nope'; do
+  call PUT /api/services/fleetgate/connect "$FG" "$(jbody endpoint "$e")"; [ "$CODE" = 400 ] || { bad=1; echo "  $e → $CODE"; }; done
+call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass fleetgate"}'; [ "$CODE" = 400 ] || bad=1
+[ $bad = 0 ] && ok "endpoint must be https (http only on *.ts.net), no credentials/query; mcp_server is package#bin" || fail "connect validation"
+CB='{"endpoint":"https://repo.example/-/fleetgate/door/","mcp_server":"demipass#fleetgate-mcp"}'
+call PUT /api/services/fleetgate/connect "$FG" "$CB"; CQ=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$CQ")" = "$(did owner)" ] && [ "$(Q "SELECT endpoint FROM service_tenants WHERE slug='fleetgate'")" = "" ] \
+  && ok "a connect change waits on the tenant owner's approval (202, nothing changed)" || fail "connect ask: $CODE $BODY"
+approve "$OWN" "$CQ"; call PUT /api/services/fleetgate/connect "$FG" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$CB" "$CQ")"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J endpoint)" = https://repo.example/-/fleetgate/door ] && [ "$(echo "$BODY" | J mcp_server)" = demipass#fleetgate-mcp ] \
+  && ok "approved: endpoint (trailing / trimmed) and mcp_server set" || fail "connect: $CODE $BODY"
+call GET /api/services ""; [ "$(echo "$BODY" | python3 -c 'import json,sys; print([t.get("endpoint") for t in json.load(sys.stdin)["tenants"] if t["slug"]=="fleetgate"][0])')" = https://repo.example/-/fleetgate/door ] \
+  && ok "the public registry lists the endpoint (clients read it; nothing hard-codes a URL)" || fail "registry: $BODY"
+call PUT /api/services/fleetgate/connect "$FG" '{"endpoint":"https://repo.example/-/fleetgate/door"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J unchanged)" = True ] && ok "the same values again: no approval asked" || fail "unchanged: $CODE $BODY"
+call PUT /api/services/conduit/connect "$OWN" '{"endpoint":"http://phasewhip.taildb5a42.ts.net:8080"}'; [ "$CODE" = 202 ] && ok "http on a tailnet *.ts.net host is allowed (and still waits on approval)" || fail "ts.net: $CODE $BODY"
 
 # ── consent to pay (approved by the person who answers for the wallet) ─────────────────────────────────────────
 call POST /api/services/token "$EXT" '{"service":"fleetgate"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J consent_required)" = True ] && ok "no service token without consent to pay that service" || fail "mint w/o consent: $CODE $BODY"
@@ -189,6 +219,11 @@ call POST /api/services/token "$POOR" '{"service":"fleetgate"}'; PT=$(echo "$BOD
 V "$FG" "$(jbody token "$PT" action submit)"; C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" idempotency_key poor-0001)"
 [ "$CODE" = 402 ] && [ "$(bal poor)" = 5 ] && [ "$(Q "SELECT COUNT(*) FROM service_charges WHERE token_jti='$PTID'")" = 0 ] && ok "too little DD → 402 for the caller, nothing written" || fail "402: $CODE $BODY"
 V "$FG" "$(jbody token "$ST2" action submit)"
+E1=$(bal ext); C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID2" idempotency_key pr-submit-0001)"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && [ "$(echo "$BODY" | J charge_id)" = "$CID" ] && [ "$(bal ext)" = "$E1" ] \
+  && ok "a retry with ANOTHER token of the same wallet replays the charge (no debit) — a re-minted token can finish a paid call" || fail "same-wallet replay: $CODE $BODY"
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" idempotency_key pr-submit-0001)"
+[ "$CODE" = 409 ] && [ "$(bal poor)" = 5 ] && ok "another wallet's token with that key → 409 (never someone else's charge)" || fail "other-wallet replay: $CODE $BODY"
 call POST /api/services/token/revoke "$EXT" "$(jbody token_id "$TID2")"; [ "$CODE" = 200 ] || fail "revoke: $CODE $BODY"
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID2" idempotency_key after-revoke-1)"; A1=$CODE
 V "$FG" "$(jbody token "$ST2" action submit)"; [ "$A1" = 401 ] && [ "$CODE" = 401 ] && ok "a revoked service token: verify and charge → 401" || fail "revoked: $A1 $CODE"

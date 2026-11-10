@@ -80,6 +80,11 @@ module.exports = function registerServiceTenants(deps) {
     updated_at TEXT NOT NULL,
     UNIQUE (tenant_id, action)
   )`);
+  // Where callers reach the tenant, and which MCP server a caller's agent attaches to it with (2026-11-10, Aaron: "a
+  // systemic tool to onboard to the MCP service seamlessly"). Kept in the registry so no client hard-codes a URL that
+  // goes stale (Conduit moved from k1 to phasewhip; panes kept the dead address). Set by PUT /api/services/:slug/connect.
+  try { db.exec("ALTER TABLE service_tenants ADD COLUMN endpoint TEXT NOT NULL DEFAULT ''"); } catch (_) {}
+  try { db.exec("ALTER TABLE service_tenants ADD COLUMN mcp_server TEXT NOT NULL DEFAULT ''"); } catch (_) {}
   // A tenant may charge only a token it verified, only for an action it verified, while that token lives.
   db.exec(`CREATE TABLE IF NOT EXISTS service_verifications (
     tenant_id INTEGER NOT NULL,
@@ -182,7 +187,7 @@ module.exports = function registerServiceTenants(deps) {
   function tenantView(t) {
     const actions = db.prepare("SELECT * FROM service_actions WHERE tenant_id = ? AND status = 'active' ORDER BY action").all(t.id);
     return { slug: t.slug, name: t.name, service_did: t.service_did, audience: 'svc:' + t.slug, margin_pct: SERVICE_MARGIN_PCT,
-      actions: actions.map(actionView) };
+      endpoint: t.endpoint || null, mcp_server: t.mcp_server || null, actions: actions.map(actionView) };
   }
   function event(type, actor, detail) {
     try { db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(type, actor, null, 'service', JSON.stringify(detail)); } catch (_) {}
@@ -333,7 +338,14 @@ module.exports = function registerServiceTenants(deps) {
 
     const prior = db.prepare('SELECT * FROM service_charges WHERE tenant_id = ? AND idempotency_key = ?').get(tenant.id, b.idempotency_key);
     if (prior) {
-      if (prior.token_jti !== b.token_id || prior.action !== action.action || prior.cost_dd !== cost) {
+      // A retry may come with a new token of the same wallet (the first expired, or the caller's process restarted
+      // after it was charged): that is still the same charge, so it replays. Another wallet's token never does
+      // (demipass #17 review M1). A replay moves no DD.
+      const samePayer = prior.token_jti === b.token_id || (() => {
+        const nv = db.prepare('SELECT did FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, b.token_id);
+        return Boolean(nv && nv.did === prior.payer_did);
+      })();
+      if (!samePayer || prior.action !== action.action || prior.cost_dd !== cost) {
         return { status: 409, body: { error: 'this idempotency_key was already used for a different charge', charge_id: prior.charge_id } };
       }
       return { status: 200, body: chargeView(prior, true) };
@@ -465,6 +477,41 @@ module.exports = function registerServiceTenants(deps) {
     event('service_registered', auth.did, { slug, service_did: serviceDid, owner_did: ownerDid, approval_id: g.approval_id });
     logSecurityEvent('service_registered', 'info', { caller_did: auth.did, capability: 'service-register', target: slug, context: { service_did: serviceDid } });
     res.status(201).json({ ok: true, ...tenantView(tenantBySlug(slug)), owner_is_you: ownerDid === auth.did });
+  });
+
+  // Where callers connect, and the MCP server agents attach with: {endpoint, mcp_server}. The tenant wallet or its owner
+  // asks; every change waits on the tenant owner's approval in the app (svc:demipass:connect), because the endpoint is
+  // where callers send their service tokens. endpoint: an https URL (http only on a tailnet *.ts.net host), no
+  // credentials, query or fragment. mcp_server: "<npm package>#<bin>", e.g. "demipass#fleetgate-mcp". '' clears either.
+  const MCP_SERVER_RE = /^(@[a-z0-9][a-z0-9._-]{0,60}\/)?[a-z0-9][a-z0-9._-]{0,80}#[a-z0-9][a-z0-9._-]{0,60}$/;
+  function endpointRefusal(v) {
+    if (v === '') return null;
+    let u; try { u = new URL(v); } catch (_) { return 'endpoint: a URL'; }
+    if (v.length > 200) return 'endpoint: at most 200 characters';
+    if (u.username || u.password || u.search || u.hash) return 'endpoint: no credentials, query or fragment';
+    if (u.protocol === 'https:') return null;
+    if (u.protocol === 'http:' && /\.ts\.net$/i.test(u.hostname)) return null;
+    return 'endpoint: https (http only on a tailnet *.ts.net host)';
+  }
+  app.put('/api/services/:slug/connect', lim, (req, res) => {
+    const auth = walletAuth(req, res); if (!auth) return;
+    const t = tenantBySlug(req.params.slug);
+    if (!t) return res.status(404).json({ error: 'no such service' });
+    if (auth.did !== t.service_did && auth.did !== t.owner_did) return res.status(403).json({ error: 'the tenant wallet or its owner sets where callers connect' });
+    const b = req.body || {};
+    const endpoint = b.endpoint === undefined ? (t.endpoint || '') : String(b.endpoint).trim().replace(/\/+$/, '');
+    const mcp = b.mcp_server === undefined ? (t.mcp_server || '') : String(b.mcp_server).trim();
+    const bad = endpointRefusal(endpoint);
+    if (bad) return res.status(400).json({ error: bad });
+    if (mcp !== '' && !MCP_SERVER_RE.test(mcp)) return res.status(400).json({ error: 'mcp_server: "<npm package>#<bin>", e.g. demipass#fleetgate-mcp' });
+    if (endpoint === (t.endpoint || '') && mcp === (t.mcp_server || '')) return res.json({ ok: true, unchanged: true, ...tenantView(t) });
+    const g = personApproval('svc:demipass:connect', `point callers of ${t.slug} at ${endpoint || '(nothing)'}`, t.owner_did, 'elevated',
+      { did: auth.did, label: t.slug }, 'connect', t.slug, { service: t.slug, endpoint, mcp_server: mcp, was: { endpoint: t.endpoint || '', mcp_server: t.mcp_server || '' } }, b, null);
+    if (!g.ok) return res.status(g.status).json(g.body);
+    db.prepare('UPDATE service_tenants SET endpoint = ?, mcp_server = ? WHERE id = ?').run(endpoint, mcp, t.id);
+    event('service_connect_set', auth.did, { service: t.slug, endpoint, mcp_server: mcp, approval_id: g.approval_id });
+    logSecurityEvent('service_connect_set', 'info', { caller_did: auth.did, capability: 'service-connect', target: t.slug, context: { endpoint, mcp_server: mcp } });
+    res.json({ ok: true, ...tenantView(tenantBySlug(t.slug)) });
   });
 
   // The tenant's price list. The tenant wallet or its owner. Anything that weakens a gate — a lower depth, a closed
