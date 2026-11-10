@@ -53,10 +53,19 @@ CREATE TABLE service_charges (id INTEGER PRIMARY KEY AUTOINCREMENT, charge_id TE
   payee_did TEXT NOT NULL, action TEXT NOT NULL, cost_dd INTEGER NOT NULL, margin_pct INTEGER NOT NULL, dd INTEGER NOT NULL, token_jti TEXT NOT NULL,
   delegation_id INTEGER, idempotency_key TEXT NOT NULL, receipt TEXT NOT NULL, sig TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE (tenant_id, idempotency_key));
 INSERT INTO service_charges (charge_id, tenant_id, payer_did, payee_did, action, cost_dd, margin_pct, dd, token_jti, idempotency_key, receipt, sig, created_at)
-  VALUES ('sc_legacy0000000000000000', 1, 'did:key:zLegacyAgent', 'did:key:zLegacySvc', 'post', 2, 20, 3, 'abcdef0123', 'legacy-key-0001', '{}', 'x', '2026-11-07T00:00:00Z');""")
+  VALUES ('sc_legacy0000000000000000', 1, 'did:key:zLegacyAgent', 'did:key:zLegacySvc', 'post', 2, 20, 3, 'abcdef0123', 'legacy-key-0001', '{}', 'x', '2026-11-07T00:00:00Z');
+CREATE TABLE service_actions (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id INTEGER NOT NULL, action TEXT NOT NULL, scope TEXT NOT NULL,
+  measured_cost_dd INTEGER NOT NULL, max_cost_dd INTEGER NOT NULL, depth TEXT NOT NULL DEFAULT 'standard', open INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'active', updated_at TEXT NOT NULL, UNIQUE (tenant_id, action));
+INSERT INTO service_actions (tenant_id, action, scope, measured_cost_dd, max_cost_dd, updated_at) VALUES (1, 'post', 'post', 2, 20, '2026-11-07T00:00:00Z');
+CREATE TABLE service_verifications (tenant_id INTEGER NOT NULL, token_jti TEXT NOT NULL, did TEXT NOT NULL, iat INTEGER, exp INTEGER NOT NULL,
+  src_auth TEXT, fleet TEXT, parent_jti TEXT, svc_scopes TEXT, actions TEXT NOT NULL DEFAULT '[]', cap_dd INTEGER NOT NULL, delegation_id INTEGER,
+  first_at TEXT NOT NULL, last_at TEXT NOT NULL, PRIMARY KEY (tenant_id, token_jti));
+INSERT INTO service_verifications (tenant_id, token_jti, did, exp, actions, cap_dd, first_at, last_at) VALUES (1, 'abcdef0123', 'did:key:zLegacyAgent', 1, '["post"]', 500, '2026-11-07T00:00:00Z', '2026-11-07T00:00:00Z');""")
 c.commit()
 EOF
 
+curl -s -o /dev/null -m 2 "$API/api/health" && { echo "port $PORT is already serving: refusing to test someone else's server (PORT=…)"; exit 1; }
 start(){ node server.js >>"$S/server.log" 2>&1 & SRV=$!
   for i in $(seq 1 40); do curl -s -o /dev/null "$API/api/health" && break; sleep 0.5; done
   kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -5 "$S/server.log"; exit 1; }; }
@@ -71,7 +80,10 @@ call GET /api/services/legacy-svc ""
   && ok "legacy service_tenants: the old row is kept, endpoint and mcp_server added (empty → null in the view)" || fail "legacy tenants: $CODE $BODY"
 [ "$(echo "$BODY" | J margin_pct)" = 20 ] && [ "$(Q "SELECT COALESCE(follows_charge_id,'null') || '/' || dd FROM service_charges WHERE charge_id='sc_legacy0000000000000000'")" = null/3 ] \
   && ok "legacy: a tenant without margin_pct prices at the default 20%; an old charge row is kept and gains follows_charge_id (NULL)" || fail "legacy margin/charges: $BODY"
-python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM service_charges WHERE charge_id='sc_legacy0000000000000000'\"); c.commit()" "$DB_PATH"
+[ "$(Q "SELECT COALESCE(follow_ups,'null') FROM service_actions WHERE tenant_id=1 AND action='post'")" = null ] && [ "$(Q "SELECT follow_up_dd FROM service_verifications WHERE token_jti='abcdef0123'")" = 0 ] \
+  && [ "$(Q "SELECT COALESCE(follow_ups,'null') FROM service_charges WHERE charge_id='sc_legacy0000000000000000'")" = null ] \
+  && ok "legacy: old action, verification and charge rows kept; no follow-ups allowed by any of them (NULL / 0)" || fail "legacy follow-up columns"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); [c.execute(q) for q in (\"DELETE FROM service_charges WHERE charge_id='sc_legacy0000000000000000'\", 'DELETE FROM service_actions WHERE tenant_id=1', 'DELETE FROM service_verifications WHERE tenant_id=1')]; c.commit()" "$DB_PATH"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM service_tenants WHERE slug='legacy-svc'\"); c.commit()" "$DB_PATH"
 
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
@@ -248,30 +260,52 @@ V "$CD" "$(jbody token "$ECT" action post)"; [ "$CODE" = 401 ] && ok "revoking t
 # ── metered follow-ups, dry runs, per-tenant margin (Aaron 2026-11-10: bill each review round, ≤25¢ at a time; 33% top) ──
 SQ(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
 SQ "UPDATE service_consents SET daily_cap_dd = 100000 WHERE payer_did = '$(did ext)' AND status = 'active'"   # this section needs room under the day's cap
+SQ "UPDATE identity_wallets SET balance_cents = balance_cents + 5000 WHERE username = 'ext'"
+SQ "INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) SELECT did, 5000, 'topup', 'smoke', balance_cents FROM identity_wallets WHERE username = 'ext'"
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-old-0001)"
+[ "$CODE" = 403 ] && ok "a charge made before (or without) the follow-up opt-in starts nothing: no follow-ups of it" || fail "old origin: $CODE $BODY"
+# The tenant marks submit as starting work that review may follow: that is weakening, so the owner approves it.
+FU_ACT='{"actions":[{"action":"submit","follow_ups":["review"]}]}'
+call PUT /api/services/fleetgate/actions "$FG" "$FU_ACT"; WQ=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT COALESCE(follow_ups,'null') FROM service_actions WHERE action='submit' AND tenant_id=(SELECT id FROM service_tenants WHERE slug='fleetgate')")" = null ] \
+  && ok "letting submit start billable follow-up work waits on the owner's approval" || fail "follow_ups ask: $CODE $BODY"
+approve "$OWN" "$WQ"; call PUT /api/services/fleetgate/actions "$FG" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$FU_ACT" "$WQ")"
+[ "$CODE" = 200 ] || fail "follow_ups set: $CODE $BODY"
+call POST /api/services/token "$EXT" '{"service":"fleetgate","follow_up_dd":100001}'; [ "$CODE" = 400 ] && ok "a follow-up budget above the daily consent is refused" || fail "fu budget > consent: $CODE"
+call POST /api/services/token "$EXT" '{"service":"fleetgate","follow_up_dd":600}'; ST4=$(echo "$BODY" | J token); TID4=$(echo "$BODY" | J token_id)
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follow_up_dd)" = 600 ] || fail "mint fu: $CODE $BODY"
+V "$FG" "$(jbody token "$ST4" action submit)"; [ "$(echo "$BODY" | J follow_up_dd)" = 600 ] && ok "the caller opts in: a token with a 600 DD follow-up budget, shown at verify" || fail "verify fu: $BODY"
+C "$FG" "$(jbody action submit cost_dd 10 token_id "$TID4" idempotency_key door-origin-0001)"; ORG=$(echo "$BODY" | J charge_id)
+[ "$CODE" = 201 ] && [ "$(Q "SELECT follow_ups FROM service_charges WHERE charge_id='$ORG'")" = '["review"]' ] && ok "the origin charge records what may follow it, as it stood then" || fail "origin: $CODE $BODY"
 E2=$(bal ext); FG0=$(bal fg)
-C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0001)"; FU=$(echo "$BODY" | J charge_id)
-[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follows)" = "$CID" ] && [ "$(echo "$BODY" | J token_id)" = "$TID" ] && [ "$(echo "$BODY" | J dd)" = 120 ] \
-  && [ "$(bal ext)" = $((E2 - 120)) ] && [ "$(bal fg)" = $((FG0 + 120)) ] && [ "$(Q "SELECT follows_charge_id FROM service_charges WHERE charge_id='$FU'")" = "$CID" ] \
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$ORG" idempotency_key fu-review-0001)"; FU=$(echo "$BODY" | J charge_id)
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follows)" = "$ORG" ] && [ "$(echo "$BODY" | J token_id)" = "$TID4" ] && [ "$(echo "$BODY" | J dd)" = 120 ] \
+  && [ "$(bal ext)" = $((E2 - 120)) ] && [ "$(bal fg)" = $((FG0 + 120)) ] \
   && echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert json.loads(d["receipt"])["follows"]' \
-  && ok "a follow-up (no live token): billed to the same wallet, attributed to the same token, the receipt names the charge it follows" || fail "follow-up: $CODE $BODY"
-C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0001)"
+  && ok "a follow-up (no live token needed): same wallet, same token, the receipt names the charge it follows" || fail "follow-up: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$ORG" idempotency_key fu-review-0001)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && [ "$(bal ext)" = $((E2 - 120)) ] && ok "a follow-up retried with its key replays (no second debit)" || fail "fu replay: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 251 follow_up_of "$ORG" idempotency_key fu-big-0001)"; A0=$CODE
 C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$FU" idempotency_key fu-review-0003)"; A1=$CODE
-C "$FG" "$(jbody action sign-charter cost_dd 5 follow_up_of "$CID" idempotency_key fu-sign-0001)"; A2=$CODE
+C "$FG" "$(jbody action sign-charter cost_dd 5 follow_up_of "$ORG" idempotency_key fu-sign-0001)"; A2=$CODE
+C "$FG" "$(jbody action submit cost_dd 10 follow_up_of "$ORG" idempotency_key fu-submit-0001)"; A2b=$CODE
 C "$FG" "$(jbody action review cost_dd 100 follow_up_of sc_000000000000000000000000 idempotency_key fu-none-0001)"; A3=$CODE
-C "$CD" "$(jbody action post cost_dd 2 follow_up_of "$CID" idempotency_key fu-other-0001)"; A4=$CODE
-[ "$A1" = 400 ] && [ "$A2" = 403 ] && [ "$A3" = 404 ] && [ "$A4" = 404 ] && [ "$(bal ext)" = $((E2 - 120)) ] \
-  && ok "follow-ups only of the charge that started the work (not a follow-up), only in its scope (never sign-charter), only by its own tenant" || fail "fu refusals: $A1 $A2 $A3 $A4"
-call GET "/api/services/charges?idempotency_key=pr-submit-0001" "$FG"
-[ "$(echo "$BODY" | python3 -c 'import json,sys; r=json.load(sys.stdin)["received"]; print(len(r), r[0]["charge_id"])')" = "1 $CID" ] && ok "a tenant finds its own charge by the key it chose" || fail "by key: $BODY"
-call GET "/api/services/charges?idempotency_key=pr-submit-0001" "$CD"; A1=$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["received"]))')
-call GET "/api/services/charges?idempotency_key=pr-submit-0001" "$EXT"; [ "$A1" = 0 ] && [ "$CODE" = 403 ] && ok "…never another tenant's, and not as a caller" || fail "by key others: $A1 $CODE"
+C "$CD" "$(jbody action post cost_dd 2 follow_up_of "$ORG" idempotency_key fu-other-0001)"; A4=$CODE
+[ "$A0" = 400 ] && [ "$A1" = 400 ] && [ "$A2" = 403 ] && [ "$A2b" = 403 ] && [ "$A3" = 404 ] && [ "$A4" = 404 ] && [ "$(bal ext)" = $((E2 - 120)) ] \
+  && ok "follow-ups: ≤250 DD a portion, of the origin only, only the actions it allowed (not sign-charter, not another submit), only by its tenant" || fail "fu refusals: $A0 $A1 $A2 $A2b $A3 $A4"
+# The tenant adds a new action to the scope later: not a follow-up of an origin made before it (#88 H2).
+call PUT /api/services/fleetgate/actions "$FG" '{"actions":[{"action":"audit-x","scope":"submit","measured_cost_dd":50}]}'
+C "$FG" "$(jbody action audit-x cost_dd 50 follow_up_of "$ORG" idempotency_key fu-audit-0001)"; [ "$CODE" = 403 ] && ok "an action added to the price list later never bills as a follow-up" || fail "audit-x: $CODE $BODY"
 N0=$(Q "SELECT COUNT(*) FROM service_charges")
-C "$FG" "$(jbody action review cost_dd 10 follow_up_of "$CID" dry_run true)"
+C "$FG" "$(jbody action review cost_dd 10 follow_up_of "$ORG" dry_run true)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J would_charge_dd)" = 12 ] && [ "$(bal ext)" = $((E2 - 120)) ] && [ "$(Q "SELECT COUNT(*) FROM service_charges")" = "$N0" ] \
   && ok "a dry run surveys the wallet: what it would charge, nothing written" || fail "dry run: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 251 follow_up_of "$ORG" dry_run true)"; [ "$CODE" = 400 ] && ok "a dry run asks about one portion (≤250 DD)" || fail "dry big: $CODE"
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" dry_run true)"
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J refused)" = insufficient ] && ok "a dry run on a wallet that can't pay → 402 refused: insufficient" || fail "dry poor: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 250 follow_up_of "$ORG" idempotency_key fu-review-0005)"; A1=$CODE      # 120 + 300 = 420 of 600
+C "$FG" "$(jbody action review cost_dd 200 follow_up_of "$ORG" idempotency_key fu-review-0006)"; A2=$CODE      # + 240 > 600
+[ "$A1" = 201 ] && [ "$A2" = 402 ] && [ "$(echo "$BODY" | J follow_up_budget_exceeded)" = True ] && ok "follow-ups stop at the token's follow-up budget (600 DD)" || fail "fu budget: $A1 $A2 $BODY"
 # per-tenant margin: the owner asks from their own session, approves in the app; at most 33%
 call PUT /api/services/fleetgate/margin "$FG" '{"margin_pct":33}'; A1=$CODE
 call PUT /api/services/fleetgate/margin "$OWN" '{"margin_pct":34}'; A2=$CODE
@@ -283,15 +317,19 @@ call GET /api/services/fleetgate ""
 [ "$(echo "$BODY" | J margin_pct)" = 33 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print({a["action"]:a["price_dd"] for a in json.load(sys.stdin)["actions"]}["submit"])')" = 27 ] \
   && ok "approved: fleetgate at 33% (submit 20 → 27); other tenants keep the default" || fail "margin: $BODY"
 call GET /api/services/conduit ""; [ "$(echo "$BODY" | J margin_pct)" = 20 ] || fail "conduit margin changed"
-C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0002)"
-[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J dd)" = 133 ] && [ "$(echo "$BODY" | J margin_pct)" = 33 ] && ok "charges use the tenant's margin (100 → 133); the row and receipt record it" || fail "margin charge: $CODE $BODY"
-call POST /api/services/token/revoke "$EXT" "$(jbody token_id "$TID")"
-C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0004)"; A1=$CODE
-C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$CID" idempotency_key fu-review-0002)"; A2=$CODE
+C "$FG" "$(jbody action review cost_dd 50 follow_up_of "$ORG" idempotency_key fu-review-0007)"
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J margin_pct)" = 20 ] && [ "$(echo "$BODY" | J dd)" = 60 ] && ok "a follow-up keeps its origin's margin (20%) when the tenant's rose (#88 M1)" || fail "fu margin: $CODE $BODY"
+C "$FG" "$(jbody action submit cost_dd 10 token_id "$TID4" idempotency_key door-origin-0002)"
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J dd)" = 14 ] && [ "$(echo "$BODY" | J margin_pct)" = 33 ] && ok "new charges use the tenant's margin (10 → 14 at 33%)" || fail "margin charge: $CODE $BODY"
+call GET /api/services/charges "$EXT"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(sum(1 for c in json.load(sys.stdin)["paid"] if c.get("follows")))')" -ge 1 ] && ok "the payer's own list shows which charge each follow-up follows" || fail "payer list: $BODY"
+call POST /api/services/token/revoke "$EXT" "$(jbody token_id "$TID4")"
+C "$FG" "$(jbody action review cost_dd 10 follow_up_of "$ORG" idempotency_key fu-review-0008)"; A1=$CODE
+C "$FG" "$(jbody action review cost_dd 100 follow_up_of "$ORG" idempotency_key fu-review-0001)"; A2=$CODE
 [ "$A1" = 401 ] && [ "$A2" = 409 ] && ok "revoking the token that started the work stops its follow-ups (and their replays)" || fail "fu revoked: $A1 $A2 $BODY"
 SQ "UPDATE service_consents SET daily_cap_dd = 1000 WHERE payer_did = '$(did ext)' AND status = 'active'"
 SQ "UPDATE service_tenants SET margin_pct = NULL WHERE slug = 'fleetgate'"
-SQ "DELETE FROM service_charges WHERE follows_charge_id IS NOT NULL"   # the listings below count the earlier charges only
+SQ "DELETE FROM service_charges WHERE token_jti = '$TID4'"   # the listings below count the earlier charges only
+SQ "UPDATE service_actions SET status = 'retired' WHERE action = 'audit-x'"
 
 # ── delegation and depth ────────────────────────────────────────────────────────────────────────────────────────
 call POST /api/services/token "$AG" '{"service":"fleetgate"}'; AT=$(echo "$BODY" | J token); [ "$CODE" = 201 ] || fail "agent mint: $CODE $BODY"
