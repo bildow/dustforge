@@ -302,7 +302,14 @@ N0=$(Q "SELECT COUNT(*) FROM service_charges")
 C "$FG" "$(jbody action review cost_dd 10 follow_up_of "$ORG" dry_run true)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J would_charge_dd)" = 12 ] && [ "$(bal ext)" = $((E2 - 120)) ] && [ "$(Q "SELECT COUNT(*) FROM service_charges")" = "$N0" ] \
   && ok "a dry run surveys the wallet: what it would charge, nothing written" || fail "dry run: $CODE $BODY"
-C "$FG" "$(jbody action review cost_dd 251 follow_up_of "$ORG" dry_run true)"; [ "$CODE" = 400 ] && ok "a dry run asks about one portion (≤250 DD)" || fail "dry big: $CODE"
+C "$FG" "$(jbody action review cost_dd 400 follow_up_of "$ORG" dry_run true)"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J would_charge_dd)" = 480 ] && ok "a follow-up's dry run surveys a whole step (400 DD) before it runs" || fail "dry whole: $CODE $BODY"
+C "$FG" "$(jbody action review cost_dd 600 follow_up_of "$ORG" dry_run true)"
+[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J refused)" = follow_up_budget ] && ok "…but never more than the token's follow-up budget could pay" || fail "dry over budget: $CODE $BODY"
+N1=$(Q "SELECT COUNT(*) FROM service_charges")
+C "$FG" '{"action":"review","cost_dd":400,"follow_up_of":"'"$ORG"'","dry_run":"true","idempotency_key":"fu-truthy-0001"}'
+[ "$CODE" = 400 ] && [ "$(Q "SELECT COUNT(*) FROM service_charges")" = "$N1" ] && ok "only dry_run: true is a dry run (\"true\" is a real charge, held to 250 DD; nothing written)" || fail "truthy dry: $CODE $BODY"
+C "$FG" "$(jbody action submit cost_dd 251 token_id "$TID4" dry_run true)"; [ "$CODE" = 400 ] && ok "an ordinary dry run asks about one portion (≤250 DD)" || fail "dry big: $CODE"
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" dry_run true)"
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J refused)" = insufficient ] && ok "a dry run on a wallet that can't pay → 402 refused: insufficient" || fail "dry poor: $CODE $BODY"
 C "$FG" "$(jbody action review cost_dd 250 follow_up_of "$ORG" idempotency_key fu-review-0005)"; A1=$CODE      # 120 + 300 = 420 of 600
