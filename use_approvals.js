@@ -427,9 +427,10 @@ module.exports = function registerUseApprovals(deps) {
     // (the request id and the exact call's binding); a session token alone approves nothing.
     if (deviceKeys) { const r = deviceKeys.approvalRefusal(auth, 'approval', row.id, row.binding, req.body); if (r) return res.status(r.status).json(r.body); }
     // Item 1: a wrapped secret's approval carries the phone's unwrap (the data key, re-encrypted to the one-use key).
+    // A scope change (kind 'scope') uses no value, so a wrapped secret's scope is approved without one.
     const sec = secretOf(row.secret_id);
-    if (cryptoDepth) { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
-    if (cryptoDepth && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
+    if (cryptoDepth && row.kind !== 'scope') { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
+    if (cryptoDepth && row.kind !== 'scope' && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
       .run(nowIso(), nowIso(), later(isGrantKey(row.service_key) || row.kind === 'scope' ? GRANT_APPROVED_TTL_SEC : TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'this request was decided meanwhile' });
