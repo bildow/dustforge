@@ -62,37 +62,47 @@ for r in "$ADM" "$XADM"; do SQ "INSERT INTO blindkey_contexts (secret_id, contex
 B='"base_url":"http://127.0.0.1:3803","username":"aaron"'
 SIL="silicon:$(python3 -c 'import secrets;print(secrets.token_hex(16))')"
 python3 -c "import sqlite3,sys,hashlib; c=sqlite3.connect(sys.argv[1]); d=c.execute(\"SELECT did FROM identity_wallets WHERE username='owner-a'\").fetchone()[0]; c.execute('INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)', ('bot-1', 'did:key:zBot1', d, hashlib.sha256(sys.argv[2].encode()).hexdigest())); c.commit()" "$DB_PATH" "$SIL"
+# Every owner rotation is approved in the DemiPass app (#96 review H1). FJ: the call, approved, then repeated.
+PW=hunter22
+call POST /api/identity/pin "$A" '{"pin":"4321","password":"'$PW'"}'; [ "$CODE" = 200 ] || fail "pin: $CODE $BODY"
+approve(){ call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"approval-open:'$1'"}'; call POST /api/demipass/approvals/$1/open "$A"; local k; k=$(echo "$BODY" | J code)
+  call POST /api/demipass/approvals/$1/approve "$A" '{"code":"'$k'"}'; [ "$CODE" = 200 ] || fail "approve $1: $CODE $BODY"; }
+FJ(){ local t=$1 body=$2; call POST /api/demipass/rotate-blind/forgejo "$t" "$body"; [ "$CODE" = 202 ] || return 0
+  local id; id=$(echo "$BODY" | J approval_id); approve "$id"
+  call POST /api/demipass/rotate-blind/forgejo "$t" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$body" "$id")"; }
+call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
+[ "$CODE" = 202 ] && [ ! -e "$S/forge.aaron" ] && ok "the owner's token alone does not rotate: 202, approved in the app first (nothing sent to Forgejo)" || fail "unapproved: $CODE $BODY"
 call POST /api/demipass/rotate-blind/forgejo "$SIL" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
 [ "$CODE" = 403 ] && [ ! -e "$S/forge.aaron" ] && ok "an agent token never rotates its owner's login (nothing sent to Forgejo)" || fail "agent: $CODE $BODY"
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$BANK'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'
+FJ "$A" '{"ref":"'$BANK'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'
 [ "$CODE" = 409 ] && [ ! -e "$S/forge.kyle" ] && [ "$(Q "SELECT status FROM blindkey_secrets WHERE ref_code='$BANK'")" = active ] && ok "an unrelated secret (not a Forgejo login) cannot be used to reset someone: 409, nothing changed" || fail "bank: $CODE $BODY"
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J signed_in)" = True ] && [ "$(echo "$BODY" | J new_ref)" = "$LOGIN" ] && [ "$(cat "$S/forge.aaron")" = 32 ] \
   && [ "$(Q "SELECT version || '/' || COALESCE(account_username,'') FROM blindkey_secrets WHERE ref_code='$LOGIN'")" = "2/aaron" ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE name LIKE '%-pending-%'")" = 0 ] \
   && ! echo "$BODY" | grep -q "old-password-123" && ok "blind rotation: a 32-char random password that signs in; same ref; the login is now bound to aaron; no pending entry left; no value returned" || fail "rotate: $CODE $BODY"
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'
 [ "$CODE" = 409 ] && ok "a bound login cannot be pointed at another user" || fail "rebind: $CODE $BODY"
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A1=$CODE
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'; A2=$CODE
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A1=$CODE
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'; A2=$CODE
 [ "$A1" = 200 ] && [ "$A2" = 409 ] && [ "$(Q "SELECT version || '/' || COALESCE(account_username,'') FROM blindkey_secrets WHERE ref_code='$LOGIN'")" = "3/aaron" ] && [ ! -e "$S/forge.kyle" ] \
   && ok "…and stays bound through every rotation (v3 is still aaron's; kyle is never reset)" || fail "rebind after 2nd rotation: $A1 $A2 $(Q "SELECT version || '/' || COALESCE(account_username,'') FROM blindkey_secrets WHERE ref_code='$LOGIN'")"
 touch "$S/forge.refuse"; V0=$(Q "SELECT version FROM blindkey_secrets WHERE ref_code='$LOGIN'")
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
 [ "$CODE" = 502 ] && [ "$(echo "$BODY" | J changed)" = False ] && [ "$(Q "SELECT version FROM blindkey_secrets WHERE ref_code='$LOGIN'")" = "$V0" ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE name LIKE '%-pending-%'")" = 0 ] \
   && ok "Forgejo refusing the change leaves the vault as it was (no pending entry kept)" || fail "refused: $CODE $BODY"
 rm -f "$S/forge.refuse"; touch "$S/forge.drop"
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
 [ "$CODE" = 502 ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE name LIKE 'forgejo-aaron-web-login-pending-%' AND status='active'")" = 1 ] \
   && ok "the connection dropping after Forgejo applied it: the new password is kept in a pending vault entry (never lost)" || fail "drop: $CODE $BODY"
 rm -f "$S/forge.drop"; SQ "DELETE FROM blindkey_secrets WHERE name LIKE '%-pending-%'"
-touch "$S/forge.ldap"; call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A1=$CODE; rm -f "$S/forge.ldap"
-SQ "UPDATE blindkey_secrets SET frozen = 1 WHERE ref_code='$ADM'"; call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A2=$CODE; SQ "UPDATE blindkey_secrets SET frozen = 0 WHERE ref_code='$ADM'"
+touch "$S/forge.ldap"; FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A1=$CODE; rm -f "$S/forge.ldap"
+SQ "UPDATE blindkey_secrets SET frozen = 1 WHERE ref_code='$ADM'"; FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A2=$CODE; SQ "UPDATE blindkey_secrets SET frozen = 0 WHERE ref_code='$ADM'"
 SQ "UPDATE blindkey_contexts SET target_url_pattern='https://repo.dustroot.com/api/v1/repos/*' WHERE secret_id=(SELECT id FROM blindkey_secrets WHERE ref_code='$ADM')"
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A3=$CODE
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A3=$CODE
 [ "$A1" = 409 ] && [ "$A2" = 423 ] && [ "$A3" = 403 ] && ok "an externally-authenticated user, a frozen admin token, and a token whose scope does not reach the admin API are refused" || fail "guards: $A1 $A2 $A3"
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"https://evil.example","username":"aaron"}'; A1=$CODE
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"https://repo.dustroot.com:3000","username":"aaron"}'; A2=$CODE
-call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$XADM'",'"$B"'}'; A3=$CODE
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"https://evil.example","username":"aaron"}'; A1=$CODE
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"https://repo.dustroot.com:3000","username":"aaron"}'; A2=$CODE
+FJ "$A" '{"ref":"'$LOGIN'","admin_ref":"'$XADM'",'"$B"'}'; A3=$CODE
 [ "$A1" = 400 ] && [ "$A2" = 400 ] && [ "$A3" = 404 ] && ok "only https on the Forgejo hosts (no other port); only the owner's own admin token" || fail "refusals: $A1 $A2 $A3"
 call POST /api/demipass/rotate-blind/forgejo "$X" '{"ref":"'$LOGIN'","admin_ref":"'$XADM'",'"$B"'}'; [ "$CODE" = 404 ] && ok "someone else cannot rotate my login" || fail "other: $CODE"
 echo; [ $fails = 0 ] && echo "forgejo_rotate_smoke: all passed" || { echo "forgejo_rotate_smoke: $fails FAILED"; exit 1; }

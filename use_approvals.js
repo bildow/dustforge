@@ -163,6 +163,9 @@ module.exports = function registerUseApprovals(deps) {
         : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action + (c.follow_ups ? ` (then bills ${c.follow_ups.join('/')} later)` : '')).join(', ')}`
         : action === 'mail-webhook' ? `let Resend report delivered/bounced/complained to ${q.endpoint}`
         : action === 'outside-ask' ? `your agent asks @${q.person} (your in-person contact) for ${q.secret || 'a secret'}: "${String(q.reason || '').slice(0, 60)}"`
+        : action === 'rotate-blind' ? `rotate the password of ${q.target_user}@${targetHost || ''} blind (a new random one, stored in your vault)`
+        : action === 'delegation-widen' ? `widen agent delegation #${q.delegation_id}: ${[q.may_rotate === true ? 'it may rotate the password' : '', q.timeout_seconds ? `calls may wait up to ${q.timeout_seconds} s` : ''].filter(Boolean).join('; ')}`
+        : action === 'rotate-forgejo' ? `rotate the Forgejo login of ${q.username} blind (a new random one, stored in your vault)`
         : action === 'margin' ? `${q.service}: margin ${q.was}% → ${q.margin_pct}% over cost on every call`
         : action === 'connect' ? `point callers of ${q.service} at ${q.endpoint || '(nothing)'}; agents run ${q.mcp_server || '(no MCP server)'}`
         : `${targetHost || ''}: ${action}`;
