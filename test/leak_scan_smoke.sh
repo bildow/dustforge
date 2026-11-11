@@ -84,8 +84,34 @@ call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"s
 ! echo "$OUT" | grep -qF -- "$(cat "$S/seed")" && ! echo "$OUT" | grep -qF -- "$(sed 's/"/\\"/' "$S/seed")" && ok "the scanner's output never contains the value" || fail "value printed"
 ! echo "$OUT" | grep -q tiny && ok "values shorter than 8 characters are not matched (oracle bound)" || fail "short matched"
 echo "$OUT" | grep -q "revoked" && [ "$(Q "SELECT revoked_reason FROM leak_scan_tokens WHERE id=$TID")" = hit ] && ok "the first hit revokes the token (stop the line; one positive answer per token)" || fail "revoke on hit: $OUT"
+# The rest of that run (Aaron 2026-11-11): for 30 minutes the token keeps scanning; further copies are kept for the
+# owner behind the PIN, the token listing an agent session reads never changes (#92 review H1), and the answer is the
+# same whatever is sent (a clean file answers "leak" too: no oracle).
+H0=$(Q "SELECT COUNT(*) FROM leak_scan_hits WHERE token_id=$TID"); HITS(){ python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("hits")))'; }
+call GET /api/demipass/leak-scan/tokens "$A"; L0=$(echo "$BODY" | HITS | md5sum)
 OUT=$(SCAN ci "$S/clean"); RC=$?
-[ $RC = 2 ] && echo "$OUT" | grep -q "found a leak and was revoked" && ok "…it scans nothing more until a new one is approved" || fail "after hit: rc=$RC $OUT"
+[ $RC = 1 ] && echo "$OUT" | grep -q "NOT CHECKED" && [ "$(Q "SELECT COUNT(*) FROM leak_scan_drain_finds WHERE token_id=$TID")" = 0 ] && ok "during the drain a clean file gets the same answer; the scanner says it did not check this tree" || fail "drain clean: rc=$RC $OUT"
+mkdir -p "$S/second"; cp "$S/tree/notes.md" "$S/second/other-place.md"
+OUT=$(SCAN ci "$S/second"); RC=$?
+call GET /api/demipass/leak-scan/tokens "$A"
+[ $RC = 1 ] && [ "$(Q "SELECT COUNT(*) FROM leak_scan_hits WHERE token_id=$TID")" = "$H0" ] && [ "$(echo "$BODY" | HITS | md5sum)" = "$L0" ] && [ "$(Q "SELECT COUNT(*) FROM leak_scan_drain_finds WHERE token_id=$TID")" = 1 ] \
+  && ok "…a copy found in the drain is kept apart: the hit list and token listing do not change (no guessing oracle)" || fail "drain second: rc=$RC $OUT"
+HID1=$(Q "SELECT id FROM leak_scan_hits WHERE token_id=$TID ORDER BY id LIMIT 1")
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-hits:'$HID1'"}'; call POST /api/demipass/leak-scan/hits/$HID1 "$A" '{}'
+[ "$CODE" = 200 ] && echo "$BODY" | grep -q "other-place.md" && echo "$BODY" | grep -q found_later_in_the_run && ok "…and shown with the first hit behind the PIN (\"where?\" names every copy of the run)" || fail "where drained: $CODE $BODY"
+# One run of the shipped scanner goes on past its first hit and records a copy in a later batch (#92 review H2).
+mint onerun; OR1=$(echo "$BODY" | J id); mkdir -p "$S/onerun"
+python3 -c 'import sys; v=open(sys.argv[1]).read().strip(); open(sys.argv[2]+"/a-first.txt","w").write("key: "+v+"\n"+("x"*80+"\n")*21000); open(sys.argv[2]+"/b-later.txt","w").write("again: "+v+"\n")' "$S/seed" "$S/onerun"
+OUT=$(SCAN onerun "$S/onerun"); RC=$?
+[ $RC = 1 ] && [ "$(Q "SELECT COUNT(*) FROM leak_scan_hits WHERE token_id=$OR1")" = 1 ] && Q "SELECT found FROM leak_scan_drain_finds WHERE token_id=$OR1" | grep -q "b-later.txt" && echo "$OUT" | grep -q "the rest of the run was scanned" \
+  && ok "one scanner run continues past its first hit: the later file's copy is recorded for the owner" || fail "one run: rc=$RC $OUT"
+# The owner can stop a draining token at once (#92 review M1).
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-token:'$OR1'"}'; call DELETE /api/demipass/leak-scan/tokens/$OR1 "$A"; A1=$CODE
+OUT=$(SCAN onerun "$S/clean"); RC=$?
+[ "$A1" = 200 ] && [ $RC = 2 ] && [ "$(Q "SELECT revoked_reason FROM leak_scan_tokens WHERE id=$OR1")" = owner ] && ok "…and the owner can stop a draining token: it scans nothing more" || fail "stop drain: $A1 rc=$RC $OUT"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('UPDATE leak_scan_tokens SET drain_until=? WHERE id=?', ('2000-01-01T00:00:00.000Z', int(sys.argv[2]))); c.commit()" "$DB_PATH" "$TID"
+OUT=$(SCAN ci "$S/clean"); RC=$?
+[ $RC = 2 ] && echo "$OUT" | grep -q "found a leak and was revoked" && ok "…after the drain window it scans nothing more until a new one is approved" || fail "after drain: rc=$RC $OUT"
 mint json; mkdir -p "$S/t2"; cp "$S/tree/sub/transcript.jsonl" "$S/t2/"
 OUT=$(SCAN json "$S/t2"); RC=$?
 [ $RC = 1 ] && ok "the JSON-escaped form (a transcript line) is found too" || fail "json form: rc=$RC $OUT"
@@ -138,6 +164,17 @@ call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"
 call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"'$CS'"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J tokens.1.label)" = ci-demipass ] && [ "$(Q "SELECT COALESCE(sealed,'') FROM leak_scan_token_requests WHERE id=$RQ")" = "" ] && ok "the asker claims both tokens once; nothing sealed is kept" || fail "claim: $CODE"
 call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"'$CS'"}'; [ "$CODE" = 410 ] && ok "…a second claim gets nothing (410)" || fail "reclaim: $CODE"
+# A request waits a day for the owner (not 15 minutes), and the scanner that asked picks it up on a later run:
+# --request --no-wait leaves a 0600 pending file and exits 3; --claim writes the token once approved (Aaron 2026-11-11).
+mkdir -p "$S/pend"; OUT=$(DEMIPASS_URL=$API DEMIPASS_TOKEN="$AG" node bin/leak-scan.js --request --no-wait "$S/pend" pane-later 2>&1); RC=$?
+PF=$(ls "$S/pend"/.pending-*.json 2>/dev/null | head -1); RQP=$(basename "$PF" .json | sed 's/.pending-//')
+[ $RC = 3 ] && [ -n "$PF" ] && [ "$(stat -c %a "$PF")" = 600 ] && [ ! -e "$S/pend/pane-later.token" ] && ok "--request --no-wait: a 0600 pending file, exit 3 (waiting for the owner)" || fail "no-wait: rc=$RC $OUT"
+python3 -c "import sqlite3,sys,datetime; c=sqlite3.connect(sys.argv[1]); e=c.execute('SELECT expires_at FROM leak_scan_token_requests WHERE id=?', (int(sys.argv[2]),)).fetchone()[0]; d=datetime.datetime.fromisoformat(e.replace('Z','+00:00'))-datetime.datetime.now(datetime.timezone.utc); sys.exit(0 if d.total_seconds()>23*3600 else 1)" "$DB_PATH" "$RQP" && ok "…the request waits a day for the owner" || fail "request ttl"
+OUT=$(DEMIPASS_URL=$API node bin/leak-scan.js --claim "$S/pend" 2>&1); [ $? = 3 ] && ok "--claim before the owner decides: still waiting (exit 3)" || fail "claim early: $OUT"
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-approve:'$RQP'"}'; call POST /api/demipass/leak-scan/token-requests/$RQP/approve "$A"
+OUT=$(DEMIPASS_URL=$API node bin/leak-scan.js --claim "$S/pend" 2>&1); RC=$?
+[ $RC = 0 ] && [ -s "$S/pend/pane-later.token" ] && [ "$(stat -c %a "$S/pend/pane-later.token")" = 600 ] && [ -z "$(ls "$S/pend"/.pending-*.json 2>/dev/null)" ] \
+  && ok "…after the owner approves, the next --claim writes the token (0600) and clears the pending file" || fail "claim: rc=$RC $OUT"
 call POST /api/demipass/leak-scan/token-requests "$AG" '{"labels":["nope"]}'; RQ2=$(echo "$BODY" | J request_id); CS2=$(echo "$BODY" | J claim_secret)
 call POST /api/demipass/leak-scan/token-requests/$RQ2/deny "$A"; call POST /api/demipass/leak-scan/token-requests/$RQ2/claim "" '{"claim_secret":"'$CS2'"}'
 [ "$CODE" = 410 ] && ok "a denied request yields nothing" || fail "deny: $CODE"
@@ -170,7 +207,7 @@ OUT=$(DEPLOY "$(tip)"); RC=$?
   && ok "deploy gate: a commit carrying a vault value → refused, never prints the value, nothing merged" || fail "gate leak: rc=$RC $OUT"
 git -C "$G/work" rm -q leak.yml; echo "hello again" > "$G/work/a.txt"; git -C "$G/work" commit -qam fix; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
 OUT=$(DEPLOY "$(tip)"); RC=$?
-[ $RC = 3 ] && echo "$OUT" | grep -q "scan could not run\|revoked" && ok "deploy gate: the token that found the leak is revoked — nothing deploys until a new one is placed" || fail "gate after hit: rc=$RC $OUT"
+[ $RC = 3 ] && echo "$OUT" | grep -q "scan could not run\|revoked\|already found a leak\|NOT CHECKED" && ok "deploy gate: the token that found the leak is revoked — nothing deploys until a new one is placed" || fail "gate after hit: rc=$RC $OUT"
 # a type change (a symlink replaced by a file holding the value) is scanned too (#45 review M1)
 mint gate3; cp "$S/gate3.tok" "$G/scan.token"
 ln -s a.txt "$G/work/cfg.env"; git -C "$G/work" add -A; git -C "$G/work" commit -qm link; git -C "$G/work" push -q origin HEAD:main 2>/dev/null
