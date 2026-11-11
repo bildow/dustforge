@@ -149,6 +149,7 @@ module.exports = function registerUseApprovals(deps) {
         : action === 'owner-refill' ? `scheduled refill of ${q.amount_cents} DD ${q.cadence} to your own wallet`
         : action === 'owner-grant' ? `operator grant of ${q.amount_cents} DD to your own wallet`
         : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action + (c.follow_ups ? ` (then bills ${c.follow_ups.join('/')} later)` : '')).join(', ')}`
+        : action === 'mail-webhook' ? `let Resend report delivered/bounced/complained to ${q.endpoint}`
         : action === 'margin' ? `${q.service}: margin ${q.was}% → ${q.margin_pct}% over cost on every call`
         : action === 'connect' ? `point callers of ${q.service} at ${q.endpoint || '(nothing)'}; agents run ${q.mcp_server || '(no MCP server)'}`
         : `${targetHost || ''}: ${action}`;
