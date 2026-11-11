@@ -29,7 +29,7 @@ const resendSrv = http.createServer((req, res) => {
   });
 });
 
-let api, base, mr, smtpSent = [];
+let api, base, mr, smtpSent = [], capReserved = 0;
 const OPERATOR = 'did:key:zOperator', ALICE = 'did:key:zAlice', BOB = 'did:key:zBob';
 const call = async (method, path, { as, body, headers = {}, raw } = {}) => {
   const r = await fetch(base + path, { method, headers: { ...(as ? { authorization: 'Bearer ' + as } : {}), ...(body || raw ? { 'content-type': 'application/json' } : {}), ...headers },
@@ -53,6 +53,11 @@ test.before(async () => {
     logSecurityEvent: () => {}, approvals: () => ({ gateService: (k, c, call, body) => (body.approval_id === 7 ? { ok: true, approval_id: 7 } : { ok: false, status: 202, body: { status: 'approval_pending', approval_id: 7 } }) }),
     createEmailTransport: () => ({ sendMail: async (m) => { smtpSent.push(m); return { messageId: m.messageId, response: '250 2.0.0 Ok: queued as ABC123' }; } }),
     operatorAllowed: (did) => did === OPERATOR, publicApi: 'https://api.example' });
+  // A route like /api/email/send: replay guard first, then a cap that counts reservations, then the send.
+  app.post('/send', mr.replayGuard(ident), (req, res, next) => { capReserved++; next(); }, async (req, res) => {
+    try { const s = await mr.send({ did: ident(req).did, from: 'alice@dustforge.com', to: req.body.to, subject: req.body.subject, text: 't', clientKey: req.headers['idempotency-key'] || null }); res.json({ ok: true, ...s }); }
+    catch (e) { res.status(e.status || 502).json({ error: e.message }); }
+  });
   api = http.createServer(app); await new Promise(ok => api.listen(0, '127.0.0.1', ok)); base = `http://127.0.0.1:${api.address().port}`;
 });
 test.after(() => { resendSrv.close(); api.close(); });
@@ -153,4 +158,19 @@ test('an address sending refused deliveries is turned away after 30 in ten minut
   let last;
   for (let i = 0; i < 31; i++) last = await call('POST', '/api/email/webhooks/resend', { raw, headers: sign(raw, { key: crypto.randomBytes(24) }) });
   assert.strictEqual(last.status, 429);
+});
+
+test('an Idempotency-Key repeat is answered before any cap or charge; another message under it is 422; a concurrent one 409', async () => {
+  process.env.RESEND_API_KEY = 're_testkey';
+  const first = await call('POST', '/send', { as: ALICE, body: { to: 'q@example.com', subject: 'once' }, headers: { 'idempotency-key': 'brain-0002-abc' } });
+  assert.strictEqual(first.status, 200); const sentBefore = rs.sent.length, cap = capReserved;
+  for (let i = 0; i < 5; i++) {
+    const r = await call('POST', '/send', { as: ALICE, body: { to: 'q@example.com', subject: 'once' }, headers: { 'idempotency-key': 'brain-0002-abc' } });
+    assert.strictEqual(r.body.replayed, true); assert.strictEqual(r.body.send_id, first.body.send_id); assert.strictEqual(r.body.billed, 0);
+  }
+  assert.strictEqual(capReserved, cap, 'replays reserve no cap slot'); assert.strictEqual(rs.sent.length, sentBefore, 'and send nothing');
+  const diff = await call('POST', '/send', { as: ALICE, body: { to: 'q@example.com', subject: 'other' }, headers: { 'idempotency-key': 'brain-0002-abc' } });
+  assert.strictEqual(diff.status, 422);
+  const [a, b] = await Promise.all([0, 1].map(() => call('POST', '/send', { as: ALICE, body: { to: 'w@example.com', subject: 'race' }, headers: { 'idempotency-key': 'brain-race-0001' } })));
+  assert.deepStrictEqual([a.status, b.status].sort(), [200, 409]); assert.strictEqual(rs.sent.filter(x => x.body.subject === 'race').length, 1, 'one email');
 });

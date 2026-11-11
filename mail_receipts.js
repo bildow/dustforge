@@ -73,6 +73,18 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     const sendId = clientKey ? 'es_' + crypto.createHash('sha256').update(`${did}\n${clientKey}`).digest('hex').slice(0, 24) : 'es_' + crypto.randomBytes(12).toString('hex');
     // `to` is the validated list ("a@x, b@y", up to 10): Resend takes an array of addresses (#90 review H1).
     const toList = String(to).split(',').map(x => x.trim()).filter(Boolean);
+    const subjectSha = crypto.createHash('sha256').update(String(subject || '')).digest('hex');
+    // A client key is claimed before anything is sent: a second request with the same key at the same moment finds the
+    // claim (409) instead of sending again (#90 re-review).
+    if (clientKey) {
+      try {
+        db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, status, events, created_at, updated_at, client_key)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', 'sending', '[]', ?, ?, ?)`).run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, now(), now(), clientKey);
+      } catch (e) { throw Object.assign(new Error('a send with this Idempotency-Key is already in progress or done'), { status: 409 }); }
+    }
+    try { return await deliver(); }
+    catch (e) { if (clientKey) db.prepare("DELETE FROM email_receipts WHERE send_id = ? AND status = 'sending'").run(sendId); throw e; }
+    async function deliver() {
     const messageId = `<${sendId}@dustforge.com>`;
     let provider, providerId = null, mid = messageId;
     if (resendKey()) {
@@ -88,11 +100,36 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     // The mail has left: a receipt that fails to write must not turn into a refund and a retry (a second message).
     try {
       db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, provider_id, message_id, status, events, created_at, updated_at, client_key)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)`)
-        .run(sendId, did, tokenJti || null, from, toList.join(', '), crypto.createHash('sha256').update(String(subject || '')).digest('hex'), provider, providerId, mid,
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)
+                  ON CONFLICT(send_id) DO UPDATE SET provider = excluded.provider, provider_id = excluded.provider_id, message_id = excluded.message_id,
+                    status = 'accepted', events = excluded.events, updated_at = excluded.updated_at`)
+        .run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, provider, providerId, mid,
              JSON.stringify([{ type: 'accepted', at, by: provider }]), at, at, clientKey || null);
     } catch (e) { console.error(`[mail-receipts] sent ${sendId} (${provider} ${providerId || '-'}) but the receipt did not write: ${e.message}`); }
     return { send_id: sendId, provider, provider_id: provider === 'resend' ? providerId : null, message_id: mid };
+    }
+  }
+
+  // Express middleware for /api/email/send, mounted before every cap, reservation and charge: a request repeating an
+  // earlier Idempotency-Key gets that send's receipt and reserves, charges and sends nothing (#90 re-review H). The same
+  // key with a different message is refused (422); a send still in flight is 409.
+  function replayGuard(getIdentity) {
+    return (req, res, next) => {
+      const key = req.headers['idempotency-key'];
+      if (typeof key !== 'string') return next();
+      if (!/^[A-Za-z0-9._:-]{8,100}$/.test(key)) return res.status(400).json({ error: 'Idempotency-Key: 8-100 of [A-Za-z0-9._:-]' });
+      const a = getIdentity(req);
+      if (!a || !a.ok) return next();                         // the auth middleware answers this
+      const r = byClientKey(a.did, key);
+      if (!r) return next();
+      const b = req.body || {};
+      const sameTo = String(b.to || '').split(',').map(x => x.trim()).filter(Boolean).join(', ') === r.to_addr;
+      const sameSubject = crypto.createHash('sha256').update(String(b.subject || '')).digest('hex') === r.subject_sha256;
+      if (!sameTo || !sameSubject) return res.status(422).json({ error: 'this Idempotency-Key was used for a different message', send_id: r.send_id });
+      if (r.status === 'sending') return res.status(409).json({ error: 'a send with this Idempotency-Key is still in progress; ask again shortly', send_id: r.send_id });
+      return res.json({ ok: true, replayed: true, billed: 0, send_id: r.send_id, provider: r.provider, resend_id: r.provider === 'resend' ? r.provider_id : null,
+        message_id: r.message_id, status: r.status, status_url: `/api/email/sends/${r.send_id}` });
+    };
   }
 
   function view(r) {
@@ -143,7 +180,7 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
       // the team's Resend rate limit, which sending shares: once a minute per receipt, 30 an hour per wallet, never
       // after a final status (M2).
       const recent = refreshLog.get(a.did) || []; const cut = Date.now() - 3600000;
-      const mine = recent.filter(t => t > cut);
+      const mine = recent.filter(t => t > cut); if (!mine.length) refreshLog.delete(a.did);
       if (TERMINAL.has(r.status)) refresh = { ok: false, skipped: `final status (${r.status})` };
       else if (r.refreshed_at && Date.now() - Date.parse(r.refreshed_at) < REFRESH_COOLDOWN_MS) refresh = { ok: false, skipped: 'refreshed less than a minute ago' };
       else if (mine.length >= REFRESH_PER_DID_HOUR) refresh = { ok: false, skipped: `at most ${REFRESH_PER_DID_HOUR} refreshes an hour` };
@@ -196,7 +233,7 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
   // Refusals are counted per address in memory and logged at most once a minute each (an unauthenticated route must not
   // grow the database, M4); an address with 30 refusals in 10 minutes is turned away before any work.
   const refused = new Map();
-  function refusedLately(ip) { const t = (refused.get(ip) || []).filter(x => x > Date.now() - 600000); refused.set(ip, t); return t; }
+  function refusedLately(ip) { const t = (refused.get(ip) || []).filter(x => x > Date.now() - 600000); if (t.length) refused.set(ip, t); else refused.delete(ip); return t; }
   const record = db.transaction((svixId, sendId, type, at, detail) => {
     if (db.prepare('SELECT 1 FROM mail_webhook_seen WHERE svix_id = ?').get(svixId)) return 'duplicate';
     db.prepare('INSERT INTO mail_webhook_seen (svix_id, at) VALUES (?, ?)').run(svixId, now());
@@ -212,7 +249,7 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     const raw = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : '';
     const bad = verifySvix(secret, req.headers, raw);
     if (bad) {
-      const t = refusedLately(ip); t.push(Date.now());
+      const t = refusedLately(ip); t.push(Date.now()); refused.set(ip, t);
       if (t.length === 1 || t.length % 30 === 0) { try { logSecurityEvent('mail_webhook_refused', 'warn', { capability: 'mail-webhook', context: { reason: bad, refusals_10min: t.length } }); } catch (_) {} }
       return res.status(401).json({ error: bad });
     }
@@ -220,7 +257,7 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     if (!ev || typeof ev !== 'object' || Array.isArray(ev)) return res.status(400).json({ error: 'not a JSON object' });
     if (Date.now() - lastPrune > 3600000) { lastPrune = Date.now(); db.prepare('DELETE FROM mail_webhook_seen WHERE at < ?').run(new Date(Date.now() - 7 * 86400000).toISOString()); }
     const type = String(ev.type || ''), data = (ev.data && typeof ev.data === 'object') ? ev.data : {};
-    const known = (EVENTS.includes(type) || type === 'email.suppressed') && data.email_id;
+    const known = EVENTS.includes(type) && data.email_id;
     const r = known ? db.prepare("SELECT send_id FROM email_receipts WHERE provider = 'resend' AND provider_id = ?").get(String(data.email_id)) : null;
     const detail = data.bounce ? { bounce: { type: data.bounce.type, sub_type: data.bounce.subType || data.bounce.sub_type, message: String(data.bounce.message || '').slice(0, 300) } } : null;
     const out = record(String(req.headers['svix-id']), r ? r.send_id : null, type, String(ev.created_at || data.created_at || now()), detail);
@@ -246,7 +283,6 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     if (!g.ok) { const b = { ...(g.body || {}) }; delete b.owner; return res.status(g.status).json(b); }
     // A re-registration replaces the old webhook rather than leaving it to fail against a secret we no longer hold (L2).
     const prev = db.prepare("SELECT v FROM mail_provider_state WHERE k = 'resend_webhook_id'").get();
-    if (prev && prev.v) await resend('DELETE', `/webhooks/${encodeURIComponent(prev.v)}`).catch(() => null);
     const r = await resend('POST', '/webhooks', { endpoint, events: EVENTS }).catch(e => ({ status: 0, data: { message: e.message } }));
     const secret = r.data && (r.data.signing_secret || r.data.secret);
     if ((r.status !== 200 && r.status !== 201) || !secret) {
@@ -255,9 +291,11 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     }
     storeSecret(String(secret));
     db.prepare('INSERT INTO mail_provider_state (k, v, updated_at) VALUES (?, ?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v, updated_at = excluded.updated_at').run('resend_webhook_id', String(r.data.id || ''), now());
+    // Only now that the new one exists: the old webhook goes (created first, so events never stop).
+    if (prev && prev.v && prev.v !== String(r.data.id || '')) await resend('DELETE', `/webhooks/${encodeURIComponent(prev.v)}`).catch(() => null);
     try { logSecurityEvent('mail_webhook_registered', 'info', { caller_did: a.did, capability: 'mail-webhook', context: { webhook_id: r.data.id, endpoint } }); } catch (_) {}
     res.json({ ok: true, webhook_id: r.data.id || null, endpoint, events: EVENTS });
   });
 
-  return { send, byClientKey, verifySvix, applyEvent };
+  return { send, byClientKey, replayGuard, verifySvix, applyEvent };
 };

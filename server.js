@@ -2213,7 +2213,7 @@ app.post('/api/billing/topup', (req, res) => {
 // refuses is refunded (it never became mail) and its slot given back.
 // Mail receipts (mail_receipts.js): registered below, once approvals exist; the send route uses it at request time.
 let mailReceiptsApi = null;
-app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, rateLimitStandard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db), billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+app.post('/api/email/send', (req, res, next) => (mailReceiptsApi ? mailReceiptsApi.replayGuard(getBearerIdentity)(req, res, next) : next()), mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, rateLimitStandard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db), billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
@@ -2229,16 +2229,8 @@ app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_se
     const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
     // Sent through the receipts layer: Resend's API when a Resend key is configured (its email id comes back and is
     // logged, returned and kept, so delivered/bounced/complained can be asked for later), else the SMTP transport.
-    // The caller's own Idempotency-Key: the same key again returns the first send instead of mailing twice; this
-    // request's charge comes back (#90 review L1).
-    const clientKey = typeof req.headers['idempotency-key'] === 'string' && /^[A-Za-z0-9._:-]{8,100}$/.test(req.headers['idempotency-key']) ? req.headers['idempotency-key'] : null;
-    const already = clientKey && mailReceiptsApi.byClientKey(req.identity.did, clientKey);
-    if (already) {
-      let refunded = 0;
-      if (req.billing && req.billing.deducted > 0) { const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'email_send_refund', 'Refund: repeat of an earlier send (same Idempotency-Key)', { tokenJti: req.billing.token_jti || null }); if (r && r.ok) refunded = req.billing.deducted; }
-      return res.json({ ok: true, replayed: true, refunded, send_id: already.send_id, provider: already.provider, resend_id: already.provider === 'resend' ? already.provider_id : null,
-        message_id: already.message_id, status: already.status, status_url: `/api/email/sends/${already.send_id}` });
-    }
+    // The caller's own Idempotency-Key (a repeat was already answered by replayGuard, before any cap or charge).
+    const clientKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : null;
     const sent = await mailReceiptsApi.send({ did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody, clientKey });
     console.log(`[email] sent: ${fromAddr} -> ${to} token=${req.billing.token_jti || '-'} send=${sent.send_id} ${sent.provider}=${sent.provider_id || '-'} msgid=${sent.message_id || '-'}`);
     res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code),
@@ -2253,7 +2245,7 @@ app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_se
       const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'email_send_refund', 'Refund: mail not accepted by the mail server', { tokenJti: req.billing.token_jti || null });
       if (r && r.ok) refunded = req.billing.deducted;
     }
-    res.status(502).json({ error: "delivery failed: " + e.message, refunded });
+    res.status(e.status === 409 ? 409 : 502).json({ error: (e.status === 409 ? '' : 'delivery failed: ') + e.message, refunded });
   }
 });
 
