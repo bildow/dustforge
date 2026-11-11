@@ -6400,7 +6400,7 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
     // The approval binds this scope's id and name (#97 review: two scopes with one pattern must not share an approval).
     if (!scopeChangeGate(req, res, secret, 'scope', { action: 'context-edit', targetUrl: HTTP_SCOPE_ACTIONS.has(next.action_type) ? (next.target_url_pattern || '*') : '', targetHost: HTTP_SCOPE_ACTIONS.has(next.action_type) ? '' : (next.target_host_pattern || '*'),
-      params: { ...(req.body || {}), context_id: contextId, context_name: row.context_name } })) return;
+      params: { ...(req.body || {}), context_id: contextId, current_context_name: row.context_name } })) return;   // a requested rename stays bound as asked
   }
 
   const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];

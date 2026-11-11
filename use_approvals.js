@@ -86,8 +86,9 @@ module.exports = function registerUseApprovals(deps) {
   // be used: end it here, so the requester can ask again at once instead of being handed the dead one back as
   // already_pending until it times out (Aaron 2026-11-08, approval 34 after the #80 deploy).
   try {
+    // A scope change (kind 'scope') uses no value and no key: it survives a restart whatever the secret's wrap state.
     const dead = db.prepare(`SELECT a.id, a.requester_did, a.secret_id FROM use_approvals a JOIN blindkey_secrets s ON s.id = a.secret_id
-        WHERE a.status IN ('pending', 'approved') AND (a.eph_pub IS NOT NULL OR s.wrap_state = 'device')`).all();
+        WHERE a.status IN ('pending', 'approved') AND a.kind != 'scope' AND (a.eph_pub IS NOT NULL OR s.wrap_state = 'device')`).all();
     const end = db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ?, unwrap_blob = NULL WHERE id = ? AND status IN ('pending', 'approved')");
     for (const r of dead) {
       end.run(new Date().toISOString(), r.id);

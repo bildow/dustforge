@@ -139,6 +139,16 @@ call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":["GET","POST"],"
 call PATCH /api/demipass/context/$C2 "$AG" '{"allowed_methods":["GET","POST"],"ask_owner":true}'; R2=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ -n "$R1" ] && [ "$R1" != "$R2" ] && [ "$(Q "SELECT json_extract(bound_call,'$.body.context_id') FROM use_approvals WHERE id=$R2")" = "$C2" ] && ok "the same widening on a sibling scope is a different request, bound to the scope id ($R1 vs $R2)" || fail "sibling binding: $CODE $R1 $R2 $BODY"
 
+call PATCH /api/demipass/context/$C2 "$AG" '{"context_name":"brain-panel-renamed","ask_owner":true}'; R3=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT json_extract(bound_call,'$.body.context_name')||'|'||json_extract(bound_call,'$.body.current_context_name') FROM use_approvals WHERE id=$R3")" = "brain-panel-renamed|brain-panel-2" ] && ok "a rename binds the asked name next to the current one" || fail "rename binding: $CODE $(Q "SELECT bound_call FROM use_approvals WHERE id=$R3")"
+# a pending scope request on a phone-wrapped secret survives a restart (it needs no one-use key)
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET wrap_state='device' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$SID"
+kill $SRV; wait $SRV 2>/dev/null; node --require ./test/fixtures/upstream-redirect.js server.js >>"$S/server.log" 2>&1 & SRV=$!
+for i in $(seq 1 40); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
+[ "$(Q "SELECT status FROM use_approvals WHERE id=$R3")" = pending ] && ok "after a restart the scope request on a wrapped secret is still pending" || fail "restart expired it: $(Q "SELECT status FROM use_approvals WHERE id=$R3")"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET wrap_state=NULL WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$SID"
+A=$(login owner-a); AG=$(login owner-a); B=$(login agent-b)
+
 # ── http_body honours the list too ──
 pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_name":"dash-token","context_name":"put-body","action_type":"http_body","target_url_pattern":"https://repo.dustroot.com/hook","allowed_methods":["PUT"]}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J context.allowed_methods.0)" = PUT ] || fail "body scope add: $CODE $BODY"
