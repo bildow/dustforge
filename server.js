@@ -5850,11 +5850,11 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version,
                                     provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
-                                    security_depth, gate_policy, fill_origins, fill_username)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
+                                    security_depth, gate_policy, fill_origins, fill_username, account_username)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
     `).run(ownerDid, newName, descriptionWithout(existing.description, existing.encrypted_value), existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
            existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days,
-           existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null);
+           existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null, existing.account_username ?? null);
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
@@ -12549,6 +12549,127 @@ app.get('/api/debug/route-break-check', (_req, res) => res.json({ alive: true, s
 // Blind Rotation (moved before cruise — route registration issue after cruise)
 // ============================================================
 const rotatingSecrets = new Set();   // secret ids with a blind rotation in flight
+// ── Blind rotation of a Forgejo web login (Aaron 2026-11-11: "build the blind Forgejo rotation; vault-filled login is
+// the point") ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+// { ref: the login's password secret, admin_ref: a Forgejo token of the owner's with site-admin rights, username,
+//   base_url? (default https://repo.dustroot.com) }. The server makes a 192-bit password, sets it with Forgejo's admin
+// API, checks it signs in, and rotates the vault entry to it (same ref). Nobody sees it; the login is filled from the
+// vault from then on. Owner's own session only (#93 review H2). The login is bound to one Forgejo user on one host
+// (recorded on first use, H1). The admin token is used as a /use would use it (H3). The new password is written to a
+// pending entry before Forgejo is asked, so no outcome can lose it (H4).
+const FORGEJO_ROTATE_HOSTS = new Set(['repo.dustroot.com', 'git.dustroot.com']);
+const forgejoRotating = new Set();   // host + user: one rotation of a Forgejo account at a time (M4)
+app.post('/api/blindkey/rotate-blind/forgejo', rateLimitStandard, async (req, res) => {
+  const actor = getDemiPassActor(req, res);
+  if (!actor.ok) return;
+  if (actor.mode === 'admin') return res.status(403).json({ error: 'the owner rotates their own login, from their session' });
+  const auth = getBearerIdentity(req);
+  if (!auth.ok || auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint'))) {
+    return res.status(403).json({ error: "an agent never rotates its owner's human login: the owner does, from their own session" });
+  }
+  const { ref, admin_ref, username, reason } = req.body || {};
+  const base = String((req.body || {}).base_url || 'https://repo.dustroot.com').replace(/\/+$/, '');
+  let u; try { u = new URL(base); } catch (_) { return res.status(400).json({ error: 'base_url: a URL' }); }
+  // The smoke's mock only: a loopback http host, and only under NODE_ENV=test.
+  const testHost = process.env.NODE_ENV === 'test' && process.env.FORGEJO_ROTATE_TEST_HOST && u.protocol === 'http:' && u.host === process.env.FORGEJO_ROTATE_TEST_HOST && ['127.0.0.1', 'localhost'].includes(u.hostname);
+  if (!testHost && (u.protocol !== 'https:' || !FORGEJO_ROTATE_HOSTS.has(u.hostname) || u.port) || (u.pathname !== '/' && u.pathname !== '') || u.username || u.search || u.hash) {
+    return res.status(400).json({ error: `base_url: https://${[...FORGEJO_ROTATE_HOSTS].join(' or https://')}` });
+  }
+  if (!ref || !admin_ref) return res.status(400).json({ error: 'ref (the login password) and admin_ref (a Forgejo admin token) required' });
+  if (typeof username !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$/.test(username)) return res.status(400).json({ error: 'username: the Forgejo login name' });
+  const ownerDid = actor.did;
+  const secret = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'").get(ownerDid, ref);
+  if (!secret) return res.status(404).json({ error: 'active secret not found for this ref code' });
+  if (secret.secret_type !== 'password') return res.status(400).json({ error: 'blind rotation only supports password secrets' });
+  if (secret.ownership === 'shared' || secret.ownership === 'delegated') return res.status(403).json({ error: `a ${secret.ownership} credential is not rotated blind` });
+  if (secret.rotatable === 0) return res.status(403).json({ error: 'this secret is marked not rotatable' });
+  if (secret.frozen) return res.status(423).json({ error: 'secret is frozen — its owner unfreezes it in the DemiPass app' });
+  if (secret.wrap_state === 'device') return res.status(409).json({ error: 'this login is wrapped to your phone: lower it to standard first, or rotate it by hand' });
+  // H1: the login belongs to this Forgejo user on this host. A bound login must match; an unbound one must look like a
+  // Forgejo login (provider, a fill origin on this host, or its name) and is bound now.
+  const bound = secret.account_username || secret.fill_username;
+  let origins = []; try { origins = JSON.parse(secret.fill_origins || '[]') || []; } catch (_) { origins = []; }
+  const originHere = origins.some(o => { try { return new URL(o).host === u.host; } catch (_) { return false; } });
+  if (bound && bound.toLowerCase() !== username.toLowerCase()) return res.status(409).json({ error: `this login is for ${bound}, not ${username}` });
+  if (origins.length && !originHere) return res.status(409).json({ error: `this login fills on ${origins.join(', ')}, not ${u.host}` });
+  if (!bound && !originHere && String(secret.provider || '').toLowerCase() !== 'forgejo' && !/forgejo|dustroot/i.test(secret.name)) {
+    return res.status(409).json({ error: 'this secret does not look like a Forgejo login (no provider forgejo, fill origin or Forgejo name): set its provider or fill origin first' });
+  }
+  // H3: the admin token is used as /use would use it: sole, live, unfrozen, standard depth, its gate policy and a context
+  // that allows an http_header call to this admin endpoint, logged.
+  const admin = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'").get(ownerDid, admin_ref);
+  if (!admin) return res.status(404).json({ error: 'admin_ref: no active secret of yours with that ref' });
+  if ((admin.ownership || 'sole') !== 'sole') return res.status(403).json({ error: 'admin_ref: a shared or delegated token is not used here' });
+  if (admin.expires_at && admin.expires_at <= new Date().toISOString()) return res.status(403).json({ error: 'admin_ref: expired' });
+  if ((admin.security_depth || 'standard') !== 'standard' || admin.wrap_state === 'device') return res.status(403).json({ error: 'admin_ref: an elevated or phone-wrapped token needs its own approval; use /use, or a standard-depth admin token' });
+  const origin = u.origin;   // never the raw base: "https://host?" would slip a stray ? into every path (#93 re-review L)
+  const adminPath = `${origin}/api/v1/admin/users/${encodeURIComponent(username)}`;
+  { // Some context of the token must allow an http_header call to this admin endpoint (the test mock is matched as the
+    // real host would be).
+    const matchUrl = testHost ? `https://repo.dustroot.com/api/v1/admin/users/${encodeURIComponent(username)}` : adminPath;
+    const ctxs = db.prepare("SELECT context_name FROM blindkey_contexts WHERE secret_id = ? AND status = 'active' AND action_type = 'http_header'").all(admin.id);
+    const tried = ctxs.map(c => enforceBlindkeyContext(admin, c.context_name, 'http_header', matchUrl, testHost ? 'repo.dustroot.com' : u.hostname));
+    if (admin.frozen) return res.status(423).json({ error: 'admin_ref: the token is frozen' });
+    const okIdx = tried.findIndex(t => t.allowed);
+    if (okIdx < 0) return res.status(403).json({ error: `admin_ref: none of the token's contexts allows ${matchUrl}`, ...(tried[0] ? { detail: tried[0].error } : {}) });
+    var adminCtxName = ctxs[okIdx].context_name; }
+  const lockKey = `${FORGEJO_ROTATE_HOSTS.has(u.hostname) ? 'dustroot-forgejo' : u.host}\n${username.toLowerCase()}`;   // repo. and git. are one Forgejo
+  if (rotatingSecrets.has(secret.id) || forgejoRotating.has(lockKey)) return res.status(409).json({ error: 'a rotation of this login is already running' });
+  rotatingSecrets.add(secret.id); forgejoRotating.add(lockKey);
+  let fresh = null, adminToken = null, pendingId = null;
+  const carry = (name, description) => db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code, category, provider,
+      fill_origins, fill_username, account_username, gate_policy, security_depth, ownership, labels, rotatable)
+      VALUES (?, ?, ?, 'password', ?, '{}', 'active', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(ownerDid, name, description, blindkeyEncrypt(fresh), generateRefCode('password', name),
+      secret.category, secret.provider || 'forgejo', secret.fill_origins ?? null, secret.fill_username ?? null, username, secret.gate_policy ?? null, secret.security_depth || 'standard',
+      'sole', secret.labels || '[]', 1).lastInsertRowid;
+  try {
+    // Inside the try: whatever these throw, the finally releases the lock (#93 re-review L).
+    { const g = checkGatePolicy(ownerDid, 'use', admin, auth); if (!g.ok) return res.status(g.status || 403).json(g); }
+    { const g = checkGatePolicy(ownerDid, 'rotate', secret, auth); if (!g.ok) return res.status(g.status || 403).json(g); }
+    try { adminToken = blindkeyDecrypt(admin.encrypted_value); } catch (_) { return res.status(500).json({ error: 'could not open the admin token' }); }
+    const call = (method, path, body, authz) => fetch(origin + path, { method, redirect: 'error', signal: AbortSignal.timeout(20000),
+      headers: { 'content-type': 'application/json', accept: 'application/json', authorization: authz }, body: body === undefined ? undefined : JSON.stringify(body) });
+    // M3: only a local Forgejo account is changed, under its own login name.
+    const cur = await call('GET', `/api/v1/users/${encodeURIComponent(username)}`, undefined, 'token ' + adminToken);
+    const curJ = await cur.json().catch(() => ({}));
+    if (cur.status !== 200) return res.status(cur.status === 404 ? 404 : 502).json({ error: `Forgejo: user ${username}: HTTP ${cur.status}`, changed: false });
+    if (Number(curJ.source_id || 0) !== 0) return res.status(409).json({ error: `${username} signs in through an external source (source ${curJ.source_id}); its password is not Forgejo's to change`, changed: false });
+    egressLog(req, admin, 'http_header', adminPath);
+    // A use of that context, counted like /use counts it, only now that the call is made (#93 re-review L).
+    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE secret_id = ? AND context_name = ?').run(admin.id, adminCtxName);
+    fresh = crypto.randomBytes(24).toString('base64url');
+    // H4: the new password is in the vault before Forgejo is asked; removed only when Forgejo definitely refused.
+    pendingId = carry(`${secret.name.replace(/_v\d+$/, '')}-pending-${Date.now()}`, `Forgejo login for ${username}: a blind rotation was setting this password; if the rotation did not finish, this may be the password now`);
+    let set;
+    try { set = await call('PATCH', `/api/v1/admin/users/${encodeURIComponent(username)}`, { login_name: curJ.login_name || curJ.login || username, source_id: 0, password: fresh, must_change_password: false }, 'token ' + adminToken); }
+    catch (e) { pendingId = null; return res.status(502).json({ error: 'Forgejo did not answer: the new password may or may not be set; it is kept in the vault as a pending entry', changed: 'unknown' }); }
+    if (set.status >= 400 && set.status < 500) {
+      db.prepare('DELETE FROM blindkey_secrets WHERE id = ?').run(pendingId); pendingId = null;
+      const d = await set.json().catch(() => ({}));
+      return res.status(set.status === 403 || set.status === 401 ? 403 : 502).json({ error: `Forgejo refused the change: HTTP ${set.status} ${String(d.message || '').slice(0, 160)}`, changed: false });
+    }
+    if (set.status !== 200) { pendingId = null; return res.status(502).json({ error: `Forgejo answered ${set.status}: the change may have been applied; the new password is kept in the vault as a pending entry`, changed: 'unknown' }); }
+    let signedIn = false;
+    try { const check = await call('GET', '/api/v1/user', undefined, 'Basic ' + Buffer.from(`${username}:${fresh}`).toString('base64'));
+          signedIn = check.status === 200 && String(((await check.json().catch(() => ({}))) || {}).login || '').toLowerCase() === username.toLowerCase(); } catch (_) { signedIn = false; }
+    const r = rotateSecretValue(ownerDid, secret, fresh, 60, req.ip);
+    if (r.status !== 200) {
+      const keep = pendingId; pendingId = null;
+      db.prepare("UPDATE blindkey_secrets SET description = ? WHERE id = ?").run(`Forgejo login for ${username} after a blind rotation whose vault step failed: this is the password now`, keep);
+      return res.status(500).json({ error: 'Forgejo took the new password but the vault rotation failed; it is kept as the pending entry', recovered_ref: (db.prepare('SELECT ref_code FROM blindkey_secrets WHERE id = ?').get(keep) || {}).ref_code, changed: true });
+    }
+    db.prepare('DELETE FROM blindkey_secrets WHERE id = ?').run(pendingId); pendingId = null;
+    db.prepare('UPDATE blindkey_secrets SET account_username = ? WHERE id = ?').run(username, r.body.new_secret_id);   // bound, every version (H1; #93 re-review)
+    const newRow = db.prepare('SELECT ref_code FROM blindkey_secrets WHERE id = ?').get(r.body.new_secret_id);
+    logSecurityEvent('blind_rotation', signedIn ? 'info' : 'warn', { caller_did: ownerDid, capability: 'rotate-blind-forgejo', target: secret.name, ip: req.ip, context: { username, host: u.hostname, verified: signedIn, reason: cleanLabel(String(reason || ''), 200) } });
+    res.json({ ok: true, old_ref: ref, new_ref: newRow ? newRow.ref_code : null, new_name: r.body.new_name, forgejo_user: username, signed_in: signedIn,
+      ...(signedIn ? {} : { warning: 'Forgejo took the password but the sign-in check did not pass: try the vault fill; the old value is kept for an hour' }),
+      note: 'The new password exists only in the vault; sign in to Forgejo with the DemiPass fill.' });
+  } catch (e) {
+    res.status(502).json({ error: 'rotation failed: ' + e.message, changed: pendingId ? 'unknown — the new password is kept in the vault as a pending entry' : false });
+  } finally { rotatingSecrets.delete(secret.id); forgejoRotating.delete(lockKey); fresh = null; adminToken = null; }
+});
+
 app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
