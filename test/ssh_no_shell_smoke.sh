@@ -149,7 +149,7 @@ FCID=$(python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); print(c.e
 FC(){ use "{\"ref\":\"$FREF\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"command\":\"$1\"}"; }
 C=$(FC "id"); [ "$C" = 403 ] && grep -q "no commands are allowed" "$S/use.json" && [ ! -s "$S/ssh.log" ] && ok "a new SSH entry runs nothing (forced commands by default), ssh never started" || fail "fc default: $C $(cat "$S/use.json")"
 call PATCH /api/demipass/context/$FCID '{"allowed_commands":["uptime","systemctl status *"]}'
-[ "$CODE" = 403 ] && echo "$BODY" | grep -q "scope:$FSID" && ok "adding commands is widening → the owner's PIN" || fail "fc add no pin: $CODE $BODY"
+[ "$CODE" = 202 ] && echo "$BODY" | grep -q approval_pending && ok "adding commands is widening → a request the owner approves on the phone (PIN there)" || fail "fc add no pin: $CODE $BODY"
 call POST /api/identity/gate/verify "{\"gate\":\"pin\",\"pin\":\"4321\",\"intent\":\"scope:$FSID\"}"
 call PATCH /api/demipass/context/$FCID '{"allowed_commands":["uptime","systemctl status *"]}'; [ "$CODE" = 200 ] && ok "with the PIN the owner lists uptime and 'systemctl status *'" || fail "fc add: $CODE $BODY"
 C=$(FC "uptime"); [ "$C" = 200 ] && grep -q -- "-- deploy@100.83.112.88 uptime$" "$S/ssh.log" && ok "a listed command runs" || fail "fc uptime: $C $(cat "$S/use.json")"
