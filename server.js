@@ -12612,13 +12612,10 @@ app.post('/api/blindkey/rotate-blind/forgejo', rateLimitStandard, async (req, re
     if (admin.frozen) return res.status(423).json({ error: 'admin_ref: the token is frozen' });
     const okIdx = tried.findIndex(t => t.allowed);
     if (okIdx < 0) return res.status(403).json({ error: `admin_ref: none of the token's contexts allows ${matchUrl}`, ...(tried[0] ? { detail: tried[0].error } : {}) });
-    // A use of that context, counted like /use counts it (its max_uses holds; #93 re-review L).
-    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE secret_id = ? AND context_name = ?').run(admin.id, ctxs[okIdx].context_name); }
+    var adminCtxName = ctxs[okIdx].context_name; }
   const lockKey = `${FORGEJO_ROTATE_HOSTS.has(u.hostname) ? 'dustroot-forgejo' : u.host}\n${username.toLowerCase()}`;   // repo. and git. are one Forgejo
   if (rotatingSecrets.has(secret.id) || forgejoRotating.has(lockKey)) return res.status(409).json({ error: 'a rotation of this login is already running' });
   rotatingSecrets.add(secret.id); forgejoRotating.add(lockKey);
-  { const g = checkGatePolicy(ownerDid, 'use', admin, auth); if (!g.ok) { rotatingSecrets.delete(secret.id); forgejoRotating.delete(lockKey); return res.status(g.status || 403).json(g); } }
-  { const g = checkGatePolicy(ownerDid, 'rotate', secret, auth); if (!g.ok) { rotatingSecrets.delete(secret.id); forgejoRotating.delete(lockKey); return res.status(g.status || 403).json(g); } }
   let fresh = null, adminToken = null, pendingId = null;
   const carry = (name, description) => db.prepare(`INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version, ref_code, category, provider,
       fill_origins, fill_username, account_username, gate_policy, security_depth, ownership, labels, rotatable)
@@ -12626,6 +12623,9 @@ app.post('/api/blindkey/rotate-blind/forgejo', rateLimitStandard, async (req, re
       secret.category, secret.provider || 'forgejo', secret.fill_origins ?? null, secret.fill_username ?? null, username, secret.gate_policy ?? null, secret.security_depth || 'standard',
       'sole', secret.labels || '[]', 1).lastInsertRowid;
   try {
+    // Inside the try: whatever these throw, the finally releases the lock (#93 re-review L).
+    { const g = checkGatePolicy(ownerDid, 'use', admin, auth); if (!g.ok) return res.status(g.status || 403).json(g); }
+    { const g = checkGatePolicy(ownerDid, 'rotate', secret, auth); if (!g.ok) return res.status(g.status || 403).json(g); }
     try { adminToken = blindkeyDecrypt(admin.encrypted_value); } catch (_) { return res.status(500).json({ error: 'could not open the admin token' }); }
     const call = (method, path, body, authz) => fetch(origin + path, { method, redirect: 'error', signal: AbortSignal.timeout(20000),
       headers: { 'content-type': 'application/json', accept: 'application/json', authorization: authz }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -12635,6 +12635,8 @@ app.post('/api/blindkey/rotate-blind/forgejo', rateLimitStandard, async (req, re
     if (cur.status !== 200) return res.status(cur.status === 404 ? 404 : 502).json({ error: `Forgejo: user ${username}: HTTP ${cur.status}`, changed: false });
     if (Number(curJ.source_id || 0) !== 0) return res.status(409).json({ error: `${username} signs in through an external source (source ${curJ.source_id}); its password is not Forgejo's to change`, changed: false });
     egressLog(req, admin, 'http_header', adminPath);
+    // A use of that context, counted like /use counts it, only now that the call is made (#93 re-review L).
+    db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE secret_id = ? AND context_name = ?').run(admin.id, adminCtxName);
     fresh = crypto.randomBytes(24).toString('base64url');
     // H4: the new password is in the vault before Forgejo is asked; removed only when Forgejo definitely refused.
     pendingId = carry(`${secret.name.replace(/_v\d+$/, '')}-pending-${Date.now()}`, `Forgejo login for ${username}: a blind rotation was setting this password; if the rotation did not finish, this may be the password now`);
