@@ -84,9 +84,9 @@ module.exports = function registerLeakScan(deps) {
   // address"). Never the @dustforge.com mailbox: an agent signed in as the owner can read it, and file:lines must not reach
   // it (#45 re-review). First the owner's oldest catch-all forwarding address that has been active for 48 hours (a
   // younger rule may not be the owner's yet: forwardFresh in server.js), else the recovery email. None: no mail.
-  // Item 6b (forward rules need the PIN) went live 2026-11-07: a rule activated before that could have been made by anything
+  // Item 6b (forward rules need the PIN) was merged 2026-11-07 21:03Z: a rule activated before that could have been made by anything
   // holding the session token, so only later ones count (#95 review M2).
-  const PIN_GATED_FORWARD_SINCE = '2026-11-07T00:00:00Z';
+  const PIN_GATED_FORWARD_SINCE = '2026-11-08T00:00:00Z';   // item 6b (#70) merged 2026-11-07T21:03Z: the next whole day, so no rule made before its deploy counts (#95 re-review)
   const internalMailbox = (e) => /@dustforge\.com$/.test(String(e || '').trim().toLowerCase().replace(/\.+$/, ''));
   function reportDestination(did) {
     try {
