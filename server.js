@@ -10328,6 +10328,8 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS demipass_access_requests (
   decided_at TEXT,
   expires_at TEXT NOT NULL
 )`); } catch(_) {}
+// The fleet owner whose in-person contact an outside agent asked (NULL: the requester's own fleet owner was asked).
+try { db.exec('ALTER TABLE demipass_access_requests ADD COLUMN via_owner_did TEXT DEFAULT NULL'); } catch (_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_dar_owner ON demipass_access_requests(owner_did, status)"); } catch(_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_dar_requester ON demipass_access_requests(requester_did, status)"); } catch(_) {}
 const ACCESS_REQUEST_TTL_DAYS = 7;
@@ -10353,10 +10355,11 @@ function ownSecretFor(did, pick) {
 // Pending requests waiting on an owner, for the app's approval cards (sent with GET /fill/pending).
 function pendingAccessRequests(ownerDid) {
   expireAccessRequests();
-  return db.prepare(`SELECT r.*, w.username AS requester FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.requester_did
+  return db.prepare(`SELECT r.*, w.username AS requester, v.username AS via_owner FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.requester_did
+                     LEFT JOIN identity_wallets v ON v.did = r.via_owner_did
                      WHERE r.owner_did = ? AND r.status = 'pending' ORDER BY r.id`).all(ownerDid).map(r => {
     const match = ownSecretFor(ownerDid, r.secret_hint);
-    return { id: r.id, intent: `access:${r.id}`, requester: r.requester, secret_hint: r.secret_hint, reason: r.reason,
+    return { id: r.id, intent: `access:${r.id}`, requester: r.requester, ...(r.via_owner ? { agent_of: r.via_owner } : {}), secret_hint: r.secret_hint, reason: r.reason,
              match: match ? { name: match.name, ref: match.ref_code } : null, created_at: r.created_at, expires_at: r.expires_at };
   });
 }
@@ -10372,9 +10375,17 @@ app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
   if (typeof reason !== 'string' || reason.length > 500) return res.status(400).json({ error: 'reason: max 500 characters' });
   const ownerRow = db.prepare('SELECT did, username FROM identity_wallets WHERE username = ? OR did = ?').get(owner, owner);
   const askable = fleetOwnersOf(auth.did);
-  if (!ownerRow || !askable.some(o => o.owner_did === ownerRow.did)) {
-    return res.status(403).json({ error: 'you can ask only the owner of a fleet you belong to', you_can_ask: askable.map(o => o.username) });
+  // An agent may also ask a person its fleet owner has confirmed in person (QR or vouch; not an email-code contact),
+  // e.g. Brain asking Kyle for a Cloudflare zone token (Aaron 2026-11-11: "that's a delegation from Kyle's wallet, not a
+  // stashed token"). The person sees whose agent asks and decides in their app with their PIN; a reason is required.
+  let viaOwner = null;
+  if (ownerRow && !askable.some(o => o.owner_did === ownerRow.did) && secretSharing.isAgentWallet(auth.did) && !secretSharing.isAgentWallet(ownerRow.did)) {
+    viaOwner = askable.find(o => secretSharing.isConfirmedPeer(o.owner_did, ownerRow.did)) || null;
   }
+  if (!ownerRow || (!askable.some(o => o.owner_did === ownerRow.did) && !viaOwner)) {
+    return res.status(403).json({ error: "you can ask the owner of a fleet you belong to, or a person your fleet's owner has confirmed in person", you_can_ask: askable.map(o => o.username) });
+  }
+  if (viaOwner && !String(reason || '').trim()) return res.status(400).json({ error: 'reason: asking someone outside your fleet needs a reason they can read' });
   expireAccessRequests();
   const hint = cleanLabel(secret, 100).trim(), why = cleanLabel(reason, 500).trim();
   const same = db.prepare("SELECT id FROM demipass_access_requests WHERE requester_did = ? AND owner_did = ? AND secret_hint = ? AND status = 'pending'").get(auth.did, ownerRow.did, hint);
@@ -10384,8 +10395,8 @@ app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
   const all = db.prepare("SELECT COUNT(*) AS n FROM demipass_access_requests WHERE owner_did = ? AND status = 'pending'").get(ownerRow.did).n;
   if (all >= ACCESS_REQUEST_MAX_PENDING_PER_OWNER) return res.status(429).json({ error: `${ownerRow.username} has too many requests waiting; try again later` });
   const expiresAt = new Date(Date.now() + ACCESS_REQUEST_TTL_DAYS * 86400000).toISOString();
-  const id = db.prepare('INSERT INTO demipass_access_requests (requester_did, owner_did, secret_hint, reason, expires_at) VALUES (?, ?, ?, ?, ?)')
-    .run(auth.did, ownerRow.did, hint, why, expiresAt).lastInsertRowid;
+  const id = db.prepare('INSERT INTO demipass_access_requests (requester_did, owner_did, secret_hint, reason, expires_at, via_owner_did) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(auth.did, ownerRow.did, hint, why, expiresAt, viaOwner ? viaOwner.owner_did : null).lastInsertRowid;
   logSecurityEvent('access_requested', 'info', { caller_did: auth.did, agent_name: auth.agent_name, capability: 'access_request', target: hint, ip: req.ip, context: { owner: ownerRow.username, request_id: id } });
   res.status(201).json({ ok: true, request_id: id, status: 'pending', owner: ownerRow.username, expires_at: expiresAt,
     next: `${ownerRow.username} approves it in the DemiPass app with their PIN. Check GET /api/demipass/access-requests; once approved the secret is listed in GET /api/demipass/menu` });

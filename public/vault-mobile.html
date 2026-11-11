@@ -1725,7 +1725,7 @@ function renderFillRequests(){
       // The owner picks which secret to share; the one the agent named is preselected when it exists.
       const want=accessPick[a.id]!==undefined?accessPick[a.id]:(a.match?a.match.ref:'');
       const opts=secrets.filter(x=>x.status==='active').map(x=>'<option value="'+esc(x.ref||x.name)+'"'+((x.ref||x.name)===want?' selected':'')+'>'+esc(x.name)+'</option>').join('');
-      return '<div class="fill-req"><div><b>@'+esc(a.requester)+'</b> asks to use '+(a.secret_hint?'<b>'+esc(a.secret_hint)+'</b>':'one of your secrets')+'</div>'
+      return '<div class="fill-req"><div><b>@'+esc(a.requester)+'</b>'+(a.agent_of?' <span style="color:var(--yellow)">(an agent of @'+esc(a.agent_of)+', outside your fleet)</span>':'')+' asks to use '+(a.secret_hint?'<b>'+esc(a.secret_hint)+'</b>':'one of your secrets')+'</div>'
       +(a.reason?'<div style="margin-top:0.25rem">“'+esc(a.reason)+'”</div>':'')
       +'<div style="color:var(--text3);margin-top:0.25rem">They can use it through DemiPass without ever seeing it. You can revoke it any time.</div>'
       +'<select id="ar-secret-'+Number(a.id)+'" onchange="accessPick['+Number(a.id)+']=this.value" style="margin:0.4rem 0 0;width:100%"><option value="">choose a secret…</option>'+opts+'</select>'
