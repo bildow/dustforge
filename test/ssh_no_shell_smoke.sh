@@ -64,7 +64,19 @@ for (const ref of ["DP-PWD-box-0001", "DP-PWD-nul-0001"]) { const sid = db.prepa
 db.prepare("INSERT INTO identity_transactions (did, amount_cents, type) VALUES (?, 1000, ?)").run(id.did, "credit");'
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 TOK=$(curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'Content-Type: application/json' -d '{"username":"owner","password":"ownerpass1","scope":"transact"}' | python3 -c 'import json,sys;print(json.load(sys.stdin).get("token",""))')
-rot(){ curl -s -o "$S/last.json" -w '%{http_code}' -X POST "$API/api/blindkey/rotate-blind" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$1"; }
+
+# Owner rotations are approved in the DemiPass app (#96 review H1): RA = the call, approved with the owner's PIN, then repeated.
+curl -s -o /dev/null -X POST "$API/api/identity/pin" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"pin":"4321","password":"ownerpass1"}'
+_j(){ python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"; }
+_p(){ curl -s -X POST "$API$1" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" ${2:+-d "$2"}; }
+RA(){ local body=$1 out=$2 c id k
+  c=$(curl -s -o "$out" -w '%{http_code}' -m 60 -X POST "$API/api/blindkey/rotate-blind" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$body")
+  [ "$c" = 202 ] || { echo "$c"; return; }
+  id=$(_j approval_id <"$out"); _p /api/identity/gate/verify '{"gate":"pin","pin":"4321","intent":"approval-open:'$id'"}' >/dev/null
+  k=$(_p /api/demipass/approvals/$id/open | _j code); _p /api/demipass/approvals/$id/approve '{"code":"'$k'"}' >/dev/null
+  curl -s -o "$out" -w '%{http_code}' -m 60 -X POST "$API/api/blindkey/rotate-blind" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" \
+    -d "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$body" "$id")"; }
+rot(){ RA "$1" "$S/last.json"; }
 before=$(ls /tmp | grep -c '^\.dp_')
 
 MARK=$S/pwned
