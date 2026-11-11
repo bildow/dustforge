@@ -6,10 +6,14 @@
 //        --strict       the deploy gate and CI: nothing is skipped (no directory but .git; a file too large → exit 2)
 //        --incremental  only the bytes appended since the last run (append-only logs such as transcripts); offsets
 //                       are kept in <state.json> and advanced only after a clean scan
-//   node bin/leak-scan.js --request <dir> <label>...
+//   node bin/leak-scan.js --request [--no-wait] <dir> <label>...
 //        ask for one scan token per label; the owner approves in the DemiPass app; each token is written to
 //        <dir>/<label>.token (0600) and never printed. Asks with the owner's DemiPass session (DEMIPASS_TOKEN, or the
-//        SDK credentials file ~/.config/demipass/credentials.json); waits up to 15 minutes.
+//        SDK credentials file ~/.config/demipass/credentials.json). The request is kept in <dir>/.pending-<id>.json
+//        (0600) and waits a day for the owner: this waits up to 15 minutes (--no-wait: not at all), and any later
+//        --claim picks the tokens up once approved. Exit 3: still waiting for the owner.
+//   node bin/leak-scan.js --claim <dir>
+//        claim every pending request in <dir> the owner has approved (the daily timer runs this first).
 // The server does the matching (only it holds the values) and answers one bit — leak or clean. Which secret and where
 // go to the owner only (mail and the app). This program never receives, holds or prints a value. Zero dependencies (Node ≥ 18), so CI and pane hooks can copy it as is.
 // Scanning takes a scan token: DEMIPASS_SCAN_TOKEN, or DEMIPASS_SCAN_TOKEN_FILE (a 0600 file). A session token is
@@ -39,28 +43,46 @@ function sessionHeader() {
   try { const c = JSON.parse(fs.readFileSync(creds, 'utf8')); if (c && c.token) return 'Bearer ' + c.token; } catch (_) {}
   throw new Error('sign in with the DemiPass SDK (or set DEMIPASS_TOKEN) to ask for scan tokens');
 }
-async function requestTokens(dir, labels) {
-  if (!dir || !labels.length || labels.some(l => !/^[A-Za-z0-9._-]{1,60}$/.test(l))) { console.error('usage: leak-scan --request <dir> <label>... (labels: letters, digits, . _ -)'); process.exit(2); }
+// One claim attempt for a pending request file: 'done' (tokens written, file removed), 'waiting', or 'gone' (denied or
+// expired: file removed).
+async function claimOne(dir, file) {
+  const p = JSON.parse(fs.readFileSync(file, 'utf8'));
+  const c = await fetch(API + `/api/demipass/leak-scan/token-requests/${p.request_id}/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ claim_secret: p.claim_secret }) });
+  const cd = await c.json().catch(() => ({}));
+  if (c.status === 202) return 'waiting';
+  if (!c.ok) { fs.rmSync(file, { force: true }); console.error(`leak-scan: request ${p.request_id} ended without tokens: ${cd.error || c.status}`); return 'gone'; }
+  for (const t of cd.tokens || []) {
+    const out = path.join(dir, t.label + '.token');
+    fs.writeFileSync(out, t.token + '\n', { mode: 0o600 }); fs.chmodSync(out, 0o600);
+    console.log(`leak-scan: wrote ${out} (0600)`);
+  }
+  fs.rmSync(file, { force: true });
+  return 'done';
+}
+const pendingFiles = (dir) => { try { return fs.readdirSync(dir).filter(f => /^\.pending-\d+\.json$/.test(f)).map(f => path.join(dir, f)); } catch (_) { return []; } };
+async function claimPending(dir) {
+  let waiting = 0;
+  for (const f of pendingFiles(dir)) if (await claimOne(dir, f) === 'waiting') waiting++;
+  return waiting;
+}
+async function requestTokens(dir, labels, { wait = true } = {}) {
+  if (!dir || !labels.length || labels.some(l => !/^[A-Za-z0-9._-]{1,60}$/.test(l))) { console.error('usage: leak-scan --request [--no-wait] <dir> <label>... (labels: letters, digits, . _ -)'); process.exit(2); }
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const r = await fetch(API + '/api/demipass/leak-scan/token-requests', { method: 'POST', headers: { 'content-type': 'application/json', authorization: sessionHeader() }, body: JSON.stringify({ labels }) });
   const d = await r.json().catch(() => ({}));
   if (r.status !== 202) throw new Error(`request refused: HTTP ${r.status}: ${d.error || ''}`);
-  console.log(`leak-scan: asked for ${labels.length} scan token(s) (request ${d.request_id}) — approve it in the DemiPass app (Settings → Leak scanner)`);
-  const until = Date.now() + 15 * 60 * 1000;
-  while (Date.now() < until) {
-    await new Promise(ok => setTimeout(ok, 4000));
-    const c = await fetch(API + `/api/demipass/leak-scan/token-requests/${d.request_id}/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ claim_secret: d.claim_secret }) });
-    const cd = await c.json().catch(() => ({}));
-    if (c.status === 202) continue;
-    if (!c.ok) throw new Error(`not approved: ${cd.error || c.status}`);
-    for (const t of cd.tokens || []) {
-      const out = path.join(dir, t.label + '.token');
-      fs.writeFileSync(out, t.token + '\n', { mode: 0o600 }); fs.chmodSync(out, 0o600);
-      console.log(`leak-scan: wrote ${out} (0600)`);
-    }
-    return;
-  }
-  throw new Error('the request expired before it was approved');
+  const file = path.join(dir, `.pending-${d.request_id}.json`);
+  fs.writeFileSync(file, JSON.stringify({ request_id: d.request_id, claim_secret: d.claim_secret, labels, asked_at: new Date().toISOString() }) + '\n', { mode: 0o600 }); fs.chmodSync(file, 0o600);
+  console.log(`leak-scan: asked for ${labels.length} scan token(s) (request ${d.request_id}) — approve it in the DemiPass app (Settings → Leak scanner); it waits a day`);
+  const until = Date.now() + (wait ? 15 * 60 * 1000 : 0);
+  do {
+    if (wait) await new Promise(ok => setTimeout(ok, 4000));
+    const st = await claimOne(dir, file);
+    if (st === 'done') return;
+    if (st === 'gone') throw new Error('the request was denied or expired');
+  } while (Date.now() < until);
+  console.log('leak-scan: still waiting for the owner; the next run (or --claim) picks the tokens up once approved');
+  process.exit(3);
 }
 let STRICT = false;
 const skipped = [];
@@ -108,7 +130,11 @@ async function post(auth, batch) {
   if (d.leak) { leak = true; revokedNote = d.note || 'a vault value was found; the owner has the details'; }
 }
 (async () => {
-  if (process.argv[2] === '--request') return requestTokens(process.argv[3], process.argv.slice(4));
+  if (process.argv[2] === '--request') {
+    const noWait = process.argv[3] === '--no-wait';
+    return requestTokens(process.argv[noWait ? 4 : 3], process.argv.slice(noWait ? 5 : 4), { wait: !noWait });
+  }
+  if (process.argv[2] === '--claim') { const w = await claimPending(process.argv[3]); if (w) { console.log(`leak-scan: ${w} request(s) still waiting for the owner`); process.exit(3); } return; }
   const args = process.argv.slice(2);
   let stateFile = null;
   for (;;) {

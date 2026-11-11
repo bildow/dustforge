@@ -24,8 +24,14 @@ const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const DAILY_BYTES = 64 * 1024 * 1024;
 const MAX_CHUNKS = 200;
 const DAILY_REQUESTS = 150;
-const REQUEST_TTL_SEC = 15 * 60;     // a token request waits this long for the owner
-const CLAIM_TTL_SEC = 60 * 60;       // approved tokens wait this long to be claimed (then they are dropped, unclaimed)
+// A token request waits a day for the owner's tap; the scanner that asked claims it on its next run (the daily timer, a
+// pane start), so nobody has to be watching a terminal when the owner approves (Aaron 2026-11-11).
+const REQUEST_TTL_SEC = 24 * 3600;
+const CLAIM_TTL_SEC = 48 * 3600;     // approved tokens wait this long to be claimed (then they are dropped, unclaimed)
+// After its first hit a token keeps scanning the rest of that run for DRAIN_SEC: every further hit is recorded for the
+// owner ("where?"), and the scanner hears the same answer whatever it sends (no oracle: one positive bit per token,
+// ever). One run then locates every copy instead of one per approved token (Aaron 2026-11-11).
+const DRAIN_SEC = 30 * 60;
 const MAX_LABELS = 8;
 const MAX_PENDING_REQUESTS = 5;
 
@@ -44,7 +50,7 @@ module.exports = function registerLeakScan(deps) {
     day TEXT DEFAULT '',
     bytes_today INTEGER DEFAULT 0
   )`);
-  for (const c of ['revoked_reason TEXT DEFAULT NULL', 'request_id INTEGER DEFAULT NULL', 'requests_today INTEGER DEFAULT 0']) { try { db.exec('ALTER TABLE leak_scan_tokens ADD COLUMN ' + c); } catch (_) {} }
+  for (const c of ['revoked_reason TEXT DEFAULT NULL', 'request_id INTEGER DEFAULT NULL', 'requests_today INTEGER DEFAULT 0', 'drain_until TEXT DEFAULT NULL']) { try { db.exec('ALTER TABLE leak_scan_tokens ADD COLUMN ' + c); } catch (_) {} }
   // What a hit found, for the owner only (the app's Settings → leak scanner, and the mail).
   db.exec(`CREATE TABLE IF NOT EXISTS leak_scan_hits (
     id INTEGER PRIMARY KEY AUTOINCREMENT, owner_did TEXT NOT NULL, token_id INTEGER, token_label TEXT DEFAULT '',
@@ -100,8 +106,9 @@ module.exports = function registerLeakScan(deps) {
     if (!h.startsWith('Scan ')) { res.status(403).json({ error: 'scanning takes a scan token (Authorization: Scan <token>) — a session token is never a scan oracle; request one with POST /api/demipass/leak-scan/token-requests' }); return null; }
     const row = db.prepare('SELECT * FROM leak_scan_tokens WHERE token_hash = ?').get(sha(h.slice(5).trim()));
     if (!row) { res.status(401).json({ error: 'invalid scan token' }); return null; }
-    if (row.revoked_at) { res.status(401).json({ error: row.revoked_reason === 'hit' ? 'this scan token found a leak and was revoked — fix the leak, then have a new token approved' : 'this scan token is revoked', revoked: row.revoked_reason || 'revoked' }); return null; }
-    return { did: row.owner_did, tokenRow: row };
+    const draining = row.revoked_reason === 'hit' && row.drain_until && row.drain_until > nowIso();
+    if (row.revoked_at && !draining) { res.status(401).json({ error: row.revoked_reason === 'hit' ? 'this scan token found a leak and was revoked — fix the leak, then have a new token approved' : 'this scan token is revoked', revoked: row.revoked_reason || 'revoked' }); return null; }
+    return { did: row.owner_did, tokenRow: row, draining };
   }
 
   // POST /api/blindkey/leak-scan/tokens {label} — the owner mints one in their own session (PIN, intent scan-token:0).
@@ -195,7 +202,7 @@ module.exports = function registerLeakScan(deps) {
     const by = cleanLabel((auth.decoded && (auth.decoded.agent_name || auth.decoded.label)) || String(req.headers['user-agent'] || '').slice(0, 60), 80);
     const id = Number(db.prepare('INSERT INTO leak_scan_token_requests (owner_did, labels, requested_by, claim_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)')
       .run(auth.did, JSON.stringify(labels.map(l => cleanLabel(l, 80))), by, sha(claim), nowIso(), later(REQUEST_TTL_SEC)).lastInsertRowid);
-    mailOwner(auth.did, 'DemiPass: a leak scanner asks for scan tokens', `Something acting for you asks for ${labels.length} leak-scan token(s): ${labels.join(', ')}.\nApprove or deny it in the DemiPass app (Settings → Leak scanner). It expires in ${REQUEST_TTL_SEC / 60} minutes.\n`);
+    mailOwner(auth.did, 'DemiPass: a leak scanner asks for scan tokens', `Something acting for you asks for ${labels.length} leak-scan token(s): ${labels.join(', ')}.\nApprove or deny it in the DemiPass app (Settings → Leak scanner). It waits for you for ${REQUEST_TTL_SEC / 3600} hours; the scanner picks the tokens up on its next run.\n`);
     res.status(202).json({ ok: true, request_id: id, claim_secret: claim, expires_at: later(REQUEST_TTL_SEC),
       next: 'the owner approves it in the DemiPass app; then POST /api/demipass/leak-scan/token-requests/' + id + '/claim {claim_secret} once' });
   });
@@ -289,16 +296,25 @@ module.exports = function registerLeakScan(deps) {
       }
     } finally { needles = null; }
     let revoked = false;
+    if (caller.draining) {
+      // The rest of a run after its first hit: found copies go to the owner; the answer never varies with what was sent.
+      if (hits.length) db.prepare('INSERT INTO leak_scan_hits (owner_did, token_id, token_label, found, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(caller.did, caller.tokenRow.id, caller.tokenRow.label || '', JSON.stringify(hits.slice(0, 200).map(h => ({ name: h.name, ref: h.ref, chunk: h.chunk }))), nowIso());
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
+        .run('leak_scan', caller.did, null, null, JSON.stringify({ bytes, chunks: chunks.length, hits: hits.length, token_id: caller.tokenRow.id, draining: true }));
+      return res.json({ ok: true, scanned_bytes: bytes, leak: true, token_revoked: true, draining: true,
+        note: 'this token already found a leak: the rest of the run is recorded for the owner (DemiPass app → Settings → Leak scanner → "where?")' });
+    }
     if (hits.length) {
       db.prepare('INSERT INTO leak_scan_hits (owner_did, token_id, token_label, found, created_at) VALUES (?, ?, ?, ?, ?)')
         .run(caller.did, caller.tokenRow.id, caller.tokenRow.label || '', JSON.stringify(hits.slice(0, 200).map(h => ({ name: h.name, ref: h.ref, chunk: h.chunk }))), nowIso());
       // Stop the line: this token is done (one positive answer, ever, per token).
-      revoked = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'hit' WHERE id = ? AND revoked_at IS NULL").run(nowIso(), caller.tokenRow.id).changes === 1;
+      revoked = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'hit', drain_until = ? WHERE id = ? AND revoked_at IS NULL").run(nowIso(), later(DRAIN_SEC), caller.tokenRow.id).changes === 1;
       const names = [...new Set(hits.map(h => h.name))];
       // Names only — where it was found is in the app behind the PIN: an owner mailbox a pane can read must not become
       // the chunk channel (#45 re-review, low).
       mailOwner(caller.did, `DemiPass: a vault value was found by the leak scanner (${caller.tokenRow.label || 'scan token ' + caller.tokenRow.id})`,
-        `The leak scanner "${caller.tokenRow.label || caller.tokenRow.id}" found a value of: ${names.join(', ')}.\n\nWhere it was found: DemiPass app → Settings → Leak scanner → "where?" (your PIN). Rotate those secrets and remove the copies. The scan token was revoked; approve a new one when it is clean.\n`);
+        `The leak scanner "${caller.tokenRow.label || caller.tokenRow.id}" found a value of: ${names.join(', ')}.\n\nWhere it was found: DemiPass app → Settings → Leak scanner → "where?" (your PIN). Rotate those secrets and remove the copies. The scan token was revoked; it records the rest of this run's copies for you, then stops. Approve a new one when it is clean.\n`);
     }
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
       .run('leak_scan', caller.did, null, null, JSON.stringify({ bytes, chunks: chunks.length, hits: hits.length, token_id: caller.tokenRow.id, revoked }));
@@ -306,7 +322,7 @@ module.exports = function registerLeakScan(deps) {
     for (const name of [...new Set(hits.map(h => h.name))]) logSecurityEvent('leak_scan_hit', 'critical', { caller_did: caller.did, capability: 'leak-scan', target: name, context: { ref: (hits.find(h => h.name === name) || {}).ref, token_id: caller.tokenRow.id } });
     // One bit to the scanner: what and where go to the owner only (mail and the app).
     res.json({ ok: true, scanned_bytes: bytes, leak: hits.length > 0,
-      ...(hits.length ? { token_revoked: revoked, note: 'a vault value was found: what and where were sent to the owner (DemiPass app → Settings → Leak scanner, and mail); this scan token is revoked' } : {}) });
+      ...(hits.length ? { token_revoked: revoked, draining: revoked, note: 'a vault value was found: what and where were sent to the owner (DemiPass app → Settings → Leak scanner, and mail); this scan token is revoked, and records the rest of this run for the owner' } : {}) });
   });
 
   return { MIN_LEN };
