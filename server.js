@@ -4759,8 +4759,10 @@ function grantAllContextsDelegation(ownerDid, delegateDid, secretId, grantedBy, 
     return Number(db.prepare(`INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
                               VALUES (?, ?, ?, NULL, ?, ?, ?)`).run(ownerDid, delegateDid, secretId, maxUses, grantedBy, expiresAt).lastInsertRowid);
   }
+  // A fresh grant starts from the defaults: a rotation right or longer limit the owner approved before a revoke is not
+  // brought back by delegating again (#96 re-review M1).
   db.prepare(`UPDATE demipass_delegations SET status = 'active', max_uses = ?, use_count = 0, granted_by = ?, granted_at = CURRENT_TIMESTAMP,
-              revoked_at = NULL, expires_at = ? WHERE id = ?`).run(maxUses, grantedBy, expiresAt, rows[0].id);
+              revoked_at = NULL, expires_at = ?, may_rotate = 0, timeout_seconds = NULL WHERE id = ?`).run(maxUses, grantedBy, expiresAt, rows[0].id);
   for (const r of rows.slice(1)) db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ? AND status = 'active'").run(r.id);
   return rows[0].id;
 }
@@ -10267,7 +10269,7 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
           status = 'active', max_uses = excluded.max_uses, use_count = 0,
-          granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at
+          granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at, may_rotate = 0, timeout_seconds = NULL
         WHERE COALESCE(demipass_delegations.delegate_kind, 'agent') = 'agent'
       `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
       delegation = db.prepare("SELECT id, COALESCE(delegate_kind, 'agent') AS kind FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?")
@@ -12818,6 +12820,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
         WHERE s.ref_code = ? AND s.status = 'active' AND d.owner_did = s.did AND d.delegate_did = ? AND d.status = 'active'
           AND COALESCE(d.delegate_kind, 'agent') = 'agent' AND d.may_rotate = 1 ORDER BY d.id LIMIT 1`).get(ref, callerAuth.did) : null;
     if (viaDelegation && viaDelegation.expires_at && new Date(viaDelegation.expires_at).getTime() <= Date.now()) viaDelegation = null;
+    if (viaDelegation && !ownFleetAgent(viaDelegation.owner_did, viaDelegation.delegate_did)) viaDelegation = null;   // checked before ssh (#96 re-review L1)
     if (!viaDelegation) {
       // One answer whether or not the ref exists (no probing other owners' refs).
       logSecurityEvent('rotate_denied', 'alert', { caller_did: callerAuth && callerAuth.did, capability: 'rotate_blind', target: String(ref).slice(0, 80), ip: req.ip, error: agentTok ? 'agent token without a rotation grant' : 'not the owner, no rotation grant' });

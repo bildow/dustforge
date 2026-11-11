@@ -177,5 +177,12 @@ B0=$(BAL "$(DID owner)")
 call POST /api/demipass/use "$O" '{"name":"laptop_v2","action":"ssh_exec","target_host":"100.83.112.88","target_user":"aaron","command":"sleep 40"}'
 B1=$(BAL "$(DID owner)")
 [ "$CODE" = 504 ] && [ "$B0" = "$B1" ] && ok "the owner's direct call is cut off at 30 s and not charged" || fail "direct: $CODE $B0 → $B1 $BODY"
+# re-review M1: revoke, delegate again → the old rotation right and limit do not come back
+call POST /api/demipass/delegate/revoke "$O" '{"delegation_id":'$D1'}'
+call POST /api/demipass/delegate "$O" '{"secret_name":"box_v2","delegate_did":"'$AG'"}'; DN=$(echo "$BODY" | J delegation_id)
+R=$(SQ "SELECT status, may_rotate, timeout_seconds FROM demipass_delegations WHERE id = $DN")
+[ "$R" = '[{"status":"active","may_rotate":0,"timeout_seconds":null}]' ] && ok "a delegation revoked and granted again starts from the defaults (no rotation, 30 s)" || fail "revive kept settings: $R ($DN vs $D1)"
+ROT "$A" "$NEWREF"
+[ "$CODE" = 403 ] && ok "…and the agent cannot rotate under the revived grant" || fail "revived rotate: $CODE $BODY"
 grep -q "boxpass\|laptoppass" "$S/server.log" && fail "a password reached the server log" || ok "no password in the server log"
 [ $fails = 0 ] && echo "rotate_grant_timeout_smoke: all passed" || { echo "rotate_grant_timeout_smoke: $fails failure(s)"; exit 1; }
