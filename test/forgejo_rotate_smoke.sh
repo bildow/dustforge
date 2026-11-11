@@ -72,6 +72,10 @@ call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref"
   && ! echo "$BODY" | grep -q "old-password-123" && ok "blind rotation: a 32-char random password that signs in; same ref; the login is now bound to aaron; no pending entry left; no value returned" || fail "rotate: $CODE $BODY"
 call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'
 [ "$CODE" = 409 ] && ok "a bound login cannot be pointed at another user" || fail "rebind: $CODE $BODY"
+call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'; A1=$CODE
+call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'","base_url":"http://127.0.0.1:3803","username":"kyle"}'; A2=$CODE
+[ "$A1" = 200 ] && [ "$A2" = 409 ] && [ "$(Q "SELECT version || '/' || COALESCE(account_username,'') FROM blindkey_secrets WHERE ref_code='$LOGIN'")" = "3/aaron" ] && [ ! -e "$S/forge.kyle" ] \
+  && ok "…and stays bound through every rotation (v3 is still aaron's; kyle is never reset)" || fail "rebind after 2nd rotation: $A1 $A2 $(Q "SELECT version || '/' || COALESCE(account_username,'') FROM blindkey_secrets WHERE ref_code='$LOGIN'")"
 touch "$S/forge.refuse"; V0=$(Q "SELECT version FROM blindkey_secrets WHERE ref_code='$LOGIN'")
 call POST /api/demipass/rotate-blind/forgejo "$A" '{"ref":"'$LOGIN'","admin_ref":"'$ADM'",'"$B"'}'
 [ "$CODE" = 502 ] && [ "$(echo "$BODY" | J changed)" = False ] && [ "$(Q "SELECT version FROM blindkey_secrets WHERE ref_code='$LOGIN'")" = "$V0" ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE name LIKE '%-pending-%'")" = 0 ] \
