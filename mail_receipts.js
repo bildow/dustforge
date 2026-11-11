@@ -51,6 +51,7 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
   db.exec('CREATE INDEX IF NOT EXISTS idx_mail_webhook_seen_at ON mail_webhook_seen(at)');
   try { db.exec('ALTER TABLE email_receipts ADD COLUMN refreshed_at TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE email_receipts ADD COLUMN client_key TEXT'); } catch (_) {}
+  try { db.exec('ALTER TABLE email_receipts ADD COLUMN body_sha256 TEXT'); } catch (_) {}
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_email_receipts_client_key ON email_receipts(did, client_key) WHERE client_key IS NOT NULL');
 
   const now = () => new Date().toISOString();
@@ -70,7 +71,9 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
   // A caller's own idempotency key (header Idempotency-Key on /api/email/send): the same key again returns the first
   // send's receipt instead of mailing twice (#90 review L1).
   function byClientKey(did, key) { return key ? db.prepare('SELECT * FROM email_receipts WHERE did = ? AND client_key = ?').get(did, key) : null; }
-  async function send({ did, tokenJti, from, to, subject, text, clientKey }) {
+  const sha = (x) => crypto.createHash('sha256').update(String(x || '')).digest('hex');
+  // bodySha: the caller's body before anything is added to it (the referral link), what a repeat is compared with.
+  async function send({ did, tokenJti, from, to, subject, text, clientKey, bodySha }) {
     const sendId = clientKey ? 'es_' + crypto.createHash('sha256').update(`${did}\n${clientKey}`).digest('hex').slice(0, 24) : 'es_' + crypto.randomBytes(12).toString('hex');
     // `to` is the validated list ("a@x, b@y", up to 10): Resend takes an array of addresses (#90 review H1).
     const toList = String(to).split(',').map(x => x.trim()).filter(Boolean);
@@ -80,11 +83,12 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     if (clientKey) {
       // A claim left by a send that died mid-way (a crash between claim and answer) is abandoned after 5 minutes: the
       // key can be used again rather than answering 409 for ever. A send takes seconds; Resend's own idempotency on the
-      // same send id still stops a duplicate if the dead one did reach it.
+      // same send id (24 h) still stops a duplicate if the dead one did reach it. The SMTP fallback has no such guard:
+      // there, a crash after the relay accepted but before the receipt was written can mean a second copy.
       db.prepare("DELETE FROM email_receipts WHERE did = ? AND client_key = ? AND status = 'sending' AND created_at < ?").run(did, clientKey, new Date(Date.now() - STALE_CLAIM_MS).toISOString());
       try {
-        db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, status, events, created_at, updated_at, client_key)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', 'sending', '[]', ?, ?, ?)`).run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, now(), now(), clientKey);
+        db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, status, events, created_at, updated_at, client_key, body_sha256)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', 'sending', '[]', ?, ?, ?, ?)`).run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, now(), now(), clientKey, bodySha || sha(text));
       } catch (e) { throw Object.assign(new Error('a send with this Idempotency-Key is already in progress or done'), { status: 409 }); }
     }
     try { return await deliver(); }
@@ -104,12 +108,12 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     const at = now();
     // The mail has left: a receipt that fails to write must not turn into a refund and a retry (a second message).
     try {
-      db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, provider_id, message_id, status, events, created_at, updated_at, client_key)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?)
+      db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, provider_id, message_id, status, events, created_at, updated_at, client_key, body_sha256)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?)
                   ON CONFLICT(send_id) DO UPDATE SET provider = excluded.provider, provider_id = excluded.provider_id, message_id = excluded.message_id,
                     status = 'accepted', events = excluded.events, updated_at = excluded.updated_at`)
         .run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, provider, providerId, mid,
-             JSON.stringify([{ type: 'accepted', at, by: provider }]), at, at, clientKey || null);
+             JSON.stringify([{ type: 'accepted', at, by: provider }]), at, at, clientKey || null, bodySha || sha(text));
     } catch (e) { console.error(`[mail-receipts] sent ${sendId} (${provider} ${providerId || '-'}) but the receipt did not write: ${e.message}`); }
     return { send_id: sendId, provider, provider_id: provider === 'resend' ? providerId : null, message_id: mid };
     }
@@ -129,8 +133,9 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
       if (!r) return next();
       const b = req.body || {};
       const sameTo = String(b.to || '').split(',').map(x => x.trim()).filter(Boolean).join(', ') === r.to_addr;
-      const sameSubject = crypto.createHash('sha256').update(String(b.subject || '')).digest('hex') === r.subject_sha256;
-      if (!sameTo || !sameSubject) return res.status(422).json({ error: 'this Idempotency-Key was used for a different message', send_id: r.send_id });
+      const sameSubject = sha(b.subject) === r.subject_sha256;
+      const sameBody = !r.body_sha256 || sha(b.body) === r.body_sha256;
+      if (!sameTo || !sameSubject || !sameBody) return res.status(422).json({ error: 'this Idempotency-Key was used for a different message', send_id: r.send_id });
       if (r.status === 'sending' && Date.parse(r.created_at) < Date.now() - STALE_CLAIM_MS) return next();   // abandoned: send() clears it
       if (r.status === 'sending') return res.status(409).json({ error: 'a send with this Idempotency-Key is still in progress; ask again shortly', send_id: r.send_id });
       return res.json({ ok: true, replayed: true, billed: 0, send_id: r.send_id, provider: r.provider, resend_id: r.provider === 'resend' ? r.provider_id : null,

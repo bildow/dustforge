@@ -54,8 +54,8 @@ test.before(async () => {
     createEmailTransport: () => ({ sendMail: async (m) => { smtpSent.push(m); return { messageId: m.messageId, response: '250 2.0.0 Ok: queued as ABC123' }; } }),
     operatorAllowed: (did) => did === OPERATOR, publicApi: 'https://api.example' });
   // A route like /api/email/send: replay guard first, then a cap that counts reservations, then the send.
-  app.post('/send', mr.replayGuard(ident), (req, res, next) => { capReserved++; next(); }, async (req, res) => {
-    try { const s = await mr.send({ did: ident(req).did, from: 'alice@dustforge.com', to: req.body.to, subject: req.body.subject, text: 't', clientKey: req.headers['idempotency-key'] || null }); res.json({ ok: true, ...s }); }
+  app.post('/send', mr.replayGuard((req) => ident(req)), (req, res, next) => { capReserved++; next(); }, async (req, res) => {
+    try { const s = await mr.send({ did: ident(req).did, from: 'alice@dustforge.com', to: req.body.to, subject: req.body.subject, text: (req.body.body || 't') + ' [ref]', clientKey: req.headers['idempotency-key'] || null, bodySha: crypto.createHash('sha256').update(String(req.body.body || '')).digest('hex') }); res.json({ ok: true, ...s }); }
     catch (e) { res.status(e.status || 502).json({ error: e.message }); }
   });
   api = http.createServer(app); await new Promise(ok => api.listen(0, '127.0.0.1', ok)); base = `http://127.0.0.1:${api.address().port}`;
@@ -171,6 +171,10 @@ test('an Idempotency-Key repeat is answered before any cap or charge; another me
   assert.strictEqual(capReserved, cap, 'replays reserve no cap slot'); assert.strictEqual(rs.sent.length, sentBefore, 'and send nothing');
   const diff = await call('POST', '/send', { as: ALICE, body: { to: 'q@example.com', subject: 'other' }, headers: { 'idempotency-key': 'brain-0002-abc' } });
   assert.strictEqual(diff.status, 422);
+  const diffBody = await call('POST', '/send', { as: ALICE, body: { to: 'q@example.com', subject: 'once', body: 'changed' }, headers: { 'idempotency-key': 'brain-0002-abc' } });
+  assert.strictEqual(diffBody.status, 422, 'a different body under the same key is refused, not silently dropped');
+  const readTok = await call('POST', '/send', { as: ALICE + ':read', body: { to: 'q@example.com', subject: 'once' }, headers: { 'idempotency-key': 'brain-0002-abc' } });
+  assert.strictEqual(readTok.body.replayed, true, 'any live token of the wallet gets its replay');
   const [a, b] = await Promise.all([0, 1].map(() => call('POST', '/send', { as: ALICE, body: { to: 'w@example.com', subject: 'race' }, headers: { 'idempotency-key': 'brain-race-0001' } })));
   assert.deepStrictEqual([a.status, b.status].sort(), [200, 409]); assert.strictEqual(rs.sent.filter(x => x.body.subject === 'race').length, 1, 'one email');
 });

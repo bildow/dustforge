@@ -2213,7 +2213,7 @@ app.post('/api/billing/topup', (req, res) => {
 // refuses is refunded (it never became mail) and its slot given back.
 // Mail receipts (mail_receipts.js): registered below, once approvals exist; the send route uses it at request time.
 let mailReceiptsApi = null;
-app.post('/api/email/send', (req, res, next) => (mailReceiptsApi ? mailReceiptsApi.replayGuard(getBearerIdentity)(req, res, next) : next()), mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, rateLimitStandard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db), billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+app.post('/api/email/send', rateLimitStandard, (req, res, next) => (mailReceiptsApi ? mailReceiptsApi.replayGuard(getReadIdentity)(req, res, next) : next()), mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db), billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
@@ -2231,7 +2231,8 @@ app.post('/api/email/send', (req, res, next) => (mailReceiptsApi ? mailReceiptsA
     // logged, returned and kept, so delivered/bounced/complained can be asked for later), else the SMTP transport.
     // The caller's own Idempotency-Key (a repeat was already answered by replayGuard, before any cap or charge).
     const clientKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : null;
-    const sent = await mailReceiptsApi.send({ did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody, clientKey });
+    const sent = await mailReceiptsApi.send({ did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody, clientKey,
+      bodySha: crypto.createHash('sha256').update(String(body || '')).digest('hex') });
     console.log(`[email] sent: ${fromAddr} -> ${to} token=${req.billing.token_jti || '-'} send=${sent.send_id} ${sent.provider}=${sent.provider_id || '-'} msgid=${sent.message_id || '-'}`);
     res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code),
       send_id: sent.send_id, provider: sent.provider, resend_id: sent.provider_id, message_id: sent.message_id, status: 'accepted',
