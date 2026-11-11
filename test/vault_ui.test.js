@@ -642,7 +642,7 @@ test('hostile secret names stay inert: handlers get JSON string literals, data n
   const decode = v => v.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
   const handlers = html => [...html.matchAll(/\son\w+="([^"]*)"/g)].map(m => decode(m[1]));
   const hs = [...handlers(list), ...handlers(detail)], lit = JSON.stringify(evil);
-  assert.ok(hs.includes(`event.stopPropagation();showDetail(${lit})`), 'list row');
+  assert.ok(hs.includes(`event.stopPropagation();if(!poolDrag.justDropped)showDetail(${lit})`), 'list row');
   assert.ok(hs.includes(`revealSecret(${lit})`));
   assert.ok(hs.includes(`revokeSecret(${lit})`));
   assert.ok(hs.includes(`toggleFreeze(${lit},true)`));

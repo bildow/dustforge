@@ -520,7 +520,8 @@ module.exports = function registerSecretSharing(deps) {
     let keptId = null, ended = [];
     try {
       db.transaction(() => {
-        const moved = db.prepare(`UPDATE blindkey_secrets SET did = ?, name = ?, version = 1, replaced_by = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND did = ? AND status = 'active'`)
+        // The sender's pool and labels are the sender's organisation, not the recipient's: they start clear (#91 review L5).
+        const moved = db.prepare(`UPDATE blindkey_secrets SET did = ?, name = ?, version = 1, replaced_by = NULL, category = NULL, labels = '[]', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND did = ? AND status = 'active'`)
           .run(t.to_did, t.final_name, t.secret_id, t.from_did).changes;
         if (moved !== 1) throw new Error('the secret changed meanwhile');
         let meta = {}; try { meta = JSON.parse(secret.metadata || '{}') || {}; } catch (_) {}

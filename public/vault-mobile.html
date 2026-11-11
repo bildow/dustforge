@@ -56,6 +56,8 @@
   /* Sections */
   .section { padding:0 1rem 1rem; }
   .section-head { display:flex; justify-content:space-between; align-items:center; padding:0.75rem 0; }
+  [data-pool-card].drop-over { outline:2px solid var(--accent); outline-offset:-2px; }
+  [data-ref] { -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
   .section-title { font-size:0.85rem; font-weight:700; color:var(--text2); text-transform:uppercase; letter-spacing:0.05em; }
 
   /* Secret cards */
@@ -215,10 +217,12 @@
         <span class="section-title">Credentials</span>
         <div style="display:flex;gap:0.4rem">
           <button class="btn-ghost" onclick="startScan()" style="font-size:0.75rem">Scan QR</button>
+          <button class="btn-ghost" onclick="addPool()" style="font-size:0.75rem" title="Add a pool">+ Pool</button>
           <button class="btn-primary" onclick="openModal('store')">+ New</button>
         </div>
       </div>
       <div id="vault-note" style="font-size:0.7rem;color:var(--yellow);text-align:center"></div>
+      <div style="font-size:0.65rem;color:var(--text3);text-align:center;margin-bottom:0.4rem">Hold a secret, then drag it onto another pool to move it.</div>
       <div id="secret-list"><div class="empty">Loading...</div></div>
     </div>
     <div style="padding:0.5rem 1rem;display:flex;gap:0.5rem">
@@ -877,6 +881,7 @@ async function rotatePasswordBlind(){
 function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
 function logout(){
+  if(typeof poolDrag !== 'undefined' && poolDrag.reset) poolDrag.reset();
   // Shared storage (and its refresh token) is revoked and cleared only while it is still this window's session:
   // if another window has since signed in as another account, that session is theirs and stays untouched.
   if(storedIsMine()){
@@ -1166,6 +1171,29 @@ async function revokeWorker(wid){if(!confirm('Revoke worker '+wid+'? Its tokens 
 async function removeSilicon(){if(!confirm('Remove @'+siliconHandle+' from the fleet? Its wallet and identity stay; only the fleet link and auto-refill go.'))return;try{await api('DELETE','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(siliconHandle));closeSilicon()}catch(e){alert(e.message)}}
 
 // Nav
+// Swipe left / right anywhere on a page to move to the next / previous bottom tab (Aaron 2026-11-11). Not while typing,
+// in an open sheet, inside something that scrolls sideways, behind the lock, or while dragging a secret.
+(function(){
+  if(typeof window === 'undefined' || typeof document === 'undefined' || !document.addEventListener) return;   // the UI test sandbox
+  let s0 = null;
+  const sideways = (el) => { for(let n = el; n && n !== document.body; n = n.parentElement){ const ox = getComputedStyle(n).overflowX; if((ox === 'auto' || ox === 'scroll') && n.scrollWidth > n.clientWidth + 4) return true; } return false; };
+  document.addEventListener('touchstart', (e) => {
+    s0 = null;
+    if(e.touches.length !== 1 || !tk || (typeof lockState !== 'undefined' && lockState.locked) || document.querySelector('.modal-bg.show')) return;
+    const t = e.target;
+    if(t.closest('input, textarea, select, [contenteditable], .bottomnav, [data-noswipe]') || sideways(t)) return;
+    s0 = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
+  }, { passive: true });
+  document.addEventListener('touchend', (e) => {
+    const a = s0; s0 = null;
+    if(!a || poolDrag.active || poolDrag.justDropped) return;
+    const p = e.changedTouches[0], dx = p.clientX - a.x, dy = p.clientY - a.y;
+    if(Date.now() - a.t > 700 || Math.abs(dx) < 70 || Math.abs(dx) < 2 * Math.abs(dy)) return;
+    const tabs = [...document.querySelectorAll('.bn-item')], i = tabs.findIndex(x => x.classList.contains('active'));
+    const j = i + (dx < 0 ? 1 : -1);
+    if(i >= 0 && j >= 0 && j < tabs.length) tabs[j].click();
+  }, { passive: true });
+})();
 document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>{
   document.querySelectorAll('.bn-item').forEach(x=>x.classList.remove('active'));
   document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));
@@ -2066,9 +2094,9 @@ async function loadVault(){
   if(lockState.locked) return;   // nothing rendered behind the lock screen
   const seq=++vaultSeq;
   try {
-    const fresh = await api('GET','/api/demipass/dashboard');
+    const [fresh, pools] = await Promise.all([api('GET','/api/demipass/dashboard'), api('GET','/api/demipass/pools').catch(()=>null)]);
     if(seq!==vaultSeq) return;   // a newer load (resume, online, poll) already answered
-    dashboardData = fresh;
+    dashboardData = fresh; if(pools) vaultPools = pools;
     vaultLoadedAt = Date.now();
     document.getElementById('bal').textContent = dashboardData.balance_dd || 0;
     secrets = dashboardData.secrets || [];
@@ -2107,35 +2135,42 @@ function categorizeSecret(s) {
   return 'Uncategorized';
 }
 
+// Pools (Aaron 2026-11-11): a pool is a secret's category. Pools the owner added show while empty (with Remove);
+// a secret is moved by holding it and dragging it onto another pool (or "Move to pool" in its sheet).
+var vaultPools = { pools: [], uncategorized: 0 };
+// Grouped exactly as the server keeps them: a secret's category, or "uncategorized" (no guessing from names, #91 L3).
+const poolKey = (s) => (s.category ? String(s.category).toLowerCase() : 'uncategorized');
+const poolLabel = (k) => titleCase(String(k).replace(/-/g, ' '));
 function renderSecrets(){
-  if(!secrets.length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}
-
-  // Group secrets by category
+  // A refresh never pulls the row out from under a finger: it waits for the hold or drag to end (#91 review M2).
+  if(poolDrag.active || poolDrag.holding){ poolDrag.pendingRender = true; return; }
   const groups = {};
-  for(const s of secrets){
-    const cat = categorizeSecret(s);
-    if(!groups[cat]) groups[cat] = [];
-    groups[cat].push(s);
-  }
+  for(const s of secrets){ const k = poolKey(s); (groups[k] = groups[k] || []).push(s); }
+  for(const p of (vaultPools.pools || [])) if(!groups[p.name]) groups[p.name] = [];
+  if(!Object.keys(groups).length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}
 
-  // Sort groups: groups with worst health first
+  // Sort groups: groups with worst health first; empty pools last
   const healthPriority = {red:0, yellow:1, green:2, neutral:3};
-  const sortedGroups = Object.entries(groups).sort((a,b) => {
-    const worstA = Math.min(...a[1].map(s => healthPriority[s.health] || 3));
-    const worstB = Math.min(...b[1].map(s => healthPriority[s.health] || 3));
-    return worstA - worstB;
-  });
+  const worst = (items) => items.length ? Math.min(...items.map(s => healthPriority[s.health] ?? 3)) : 9;
+  const sortedGroups = Object.entries(groups).sort((a,b) => worst(a[1]) - worst(b[1]) || a[0].localeCompare(b[0]));
 
   let h = '';
-  for(const [groupName, items] of sortedGroups){
+  for(const [poolK, items] of sortedGroups){
+    const groupName = poolLabel(poolK);
     const total = items.length;
+    if(!total){
+      h += '<div data-pool="'+esc(poolK)+'" data-pool-card="'+esc(poolK)+'" style="background:var(--card);border:1px dashed var(--border);border-radius:12px;margin-bottom:0.75rem;padding:0.75rem 1rem;display:flex;justify-content:space-between;align-items:center">';
+      h += '<div><div style="font-weight:700;font-size:0.9rem">'+esc(groupName)+'</div><div style="font-size:0.7rem;color:var(--text3)">empty — drag a secret here</div></div>';
+      h += '<button class="btn-ghost" style="font-size:0.7rem" onclick="event.stopPropagation();removePool('+jsArg(poolK)+')">Remove</button></div>';
+      continue;
+    }
     const healthy = items.filter(s => s.health === 'green' || s.health === 'neutral').length;
     const pct = Math.round((healthy / total) * 100);
     const barColor = pct >= 80 ? 'var(--green)' : pct >= 50 ? 'var(--yellow)' : 'var(--red)';
     const hasIssues = items.some(s => s.health === 'red' || s.health === 'yellow');
     const frozen = items.filter(s => s.frozen).length;
 
-    h += '<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:0.75rem;overflow:hidden">';
+    h += '<div data-pool="'+esc(poolK)+'" data-pool-card="'+esc(poolK)+'" style="background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:0.75rem;overflow:hidden">';
     h += '<div onclick="toggleGroup('+jsArg(groupName)+')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
     h += '<div>';
     h += '<div style="font-weight:700;font-size:0.9rem">'+esc(groupName)+'</div>';
@@ -2156,7 +2191,7 @@ function renderSecrets(){
       const fr = s.frozen ? ' ❄' : '';
       const rec = s.recommendation ? ' <span style="color:var(--yellow);font-size:0.6rem">'+esc(s.recommendation)+'</span>' : '';
 
-      h += '<div onclick="event.stopPropagation();showDetail('+jsArg(s.name)+')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
+      h += '<div data-ref="'+esc(s.ref||'')+'" data-from="'+esc(poolK)+'" onclick="event.stopPropagation();if(!poolDrag.justDropped)showDetail('+jsArg(s.name)+')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
       h += '<div style="width:10px;height:10px;border-radius:50%;flex-shrink:0;background:'+healthColor+'"></div>';
       h += '<div style="flex:1;min-width:0"><div style="font-size:0.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(s.name)+fr+'</div>';
       h += '<div style="font-size:0.65rem;color:var(--text3)">'+esc(s.type||'-')+' &middot; '+s.use_count+' uses'+rec+'</div></div>';
@@ -2170,6 +2205,80 @@ function renderSecrets(){
   }
   document.getElementById('secret-list').innerHTML=h;
 }
+
+async function addPool(){
+  const n = prompt('Name for the new pool (for example: api, test, client-x)');
+  if(!n || !n.trim()) return;
+  try{ vaultPools = await api('POST','/api/demipass/pools',{name:n.trim()}); renderSecrets(); }
+  catch(e){ if(!sessionEnded(e)) alert(e.message); }
+}
+async function removePool(k){
+  if(!confirm('Remove the empty pool "'+poolLabel(k)+'"?')) return;
+  try{ vaultPools = await api('DELETE','/api/demipass/pools/'+encodeURIComponent(k)); renderSecrets(); }
+  catch(e){ if(!sessionEnded(e)) alert(e.message); }
+}
+const poolMoveSeq = {};
+async function movePool(ref, k){
+  const s = secrets.find(x => x.ref === ref); if(!s) return;
+  const seq = (poolMoveSeq[ref] = (poolMoveSeq[ref] || 0) + 1);
+  const prev = s.category; s.category = (k === 'uncategorized' ? '' : k); renderSecrets();   // moves at once; undone if refused
+  try{ const r = await api('POST','/api/demipass/secrets/'+encodeURIComponent(ref)+'/pool',{pool:k}); if(seq === poolMoveSeq[ref]) { vaultPools = r; renderSecrets(); } }
+  catch(e){ if(seq === poolMoveSeq[ref]) { s.category = prev; renderSecrets(); } if(!sessionEnded(e)) alert(e.message); }   // only the latest move rolls back
+}
+// Hold (450 ms) a secret row, drag it onto another pool, let go. Touch and mouse. The list scrolls near its edges.
+var poolDrag = { active:false, holding:false, justDropped:false, pendingRender:false };
+(function(){
+  if(typeof window === 'undefined' || typeof document === 'undefined' || !document.getElementById) return;   // the UI test sandbox
+  const list = document.getElementById('secret-list'); if(!list || !list.addEventListener) return;
+  let hold = null, d = null;
+  const pt = (e) => { const t = (e.touches && e.touches[0]) || (e.changedTouches && e.changedTouches[0]) || e; return { x:t.clientX, y:t.clientY }; };
+  function poolAt(p){ if(d) d.ghost.style.display='none'; const el = document.elementFromPoint(p.x, p.y); if(d) d.ghost.style.display=''; const c = el && el.closest('[data-pool]'); return c ? c.dataset.pool : null; }
+  function begin(row, p){
+    if(!row.dataset.ref) return;
+    const g = row.cloneNode(true);
+    g.style.cssText += ';position:fixed;width:240px;pointer-events:none;opacity:0.92;background:var(--surface);border:1px solid var(--accent);z-index:9999;box-shadow:0 6px 18px rgba(0,0,0,.45)';
+    document.body.appendChild(g);
+    d = { ref: row.dataset.ref, from: row.dataset.from, over: null, ghost: g }; poolDrag.active = true; poolDrag.holding = false;
+    try{ navigator.vibrate && navigator.vibrate(15); }catch(_){}
+    move(p);
+  }
+  function move(p){
+    d.ghost.style.left = (p.x - 120) + 'px'; d.ghost.style.top = (p.y - 22) + 'px';
+    const k = poolAt(p);
+    if(k !== d.over){ document.querySelectorAll('[data-pool-card].drop-over').forEach(x => x.classList.remove('drop-over')); if(k && k !== d.from){ const c = document.querySelector('[data-pool-card="'+(window.CSS && CSS.escape ? CSS.escape(k) : k)+'"]'); if(c) c.classList.add('drop-over'); } d.over = k; }
+    const edge = 70; if(p.y < edge) window.scrollBy(0, -12); else if(p.y > window.innerHeight - edge) window.scrollBy(0, 12);
+  }
+  function end(cancelled){
+    const go = !cancelled && d && d.over && d.over !== d.from ? { ref: d.ref, k: d.over } : null;   // a cancelled gesture moves nothing
+    if(d){ d.ghost.remove(); document.querySelectorAll('[data-pool-card].drop-over').forEach(x => x.classList.remove('drop-over')); }
+    d = null; poolDrag.active = false; poolDrag.justDropped = true; setTimeout(() => { poolDrag.justDropped = false; }, 400);
+    flushRender();
+    if(go) movePool(go.ref, go.k);
+  }
+  function flushRender(){ if(poolDrag.pendingRender && !poolDrag.active && !poolDrag.holding){ poolDrag.pendingRender = false; renderSecrets(); } }
+  function startHold(e){
+    // One finger only: a second touch ends any hold and abandons a drag without moving anything (#91 re-review L1).
+    if(e.touches && e.touches.length !== 1){ cancelHold(); if(d) end(true); return; }
+    cancelHold();
+    const row = e.target.closest('[data-ref]'); if(!row || !row.dataset.ref) return; const p = pt(e); poolDrag.holding = true; hold = { row, p, timer: setTimeout(() => { hold = null; begin(row, p); }, 450) };
+  }
+  function cancelHold(){ if(hold){ clearTimeout(hold.timer); hold = null; } if(poolDrag.holding){ poolDrag.holding = false; flushRender(); } }
+  // Holds start on the list; moves and ends are followed on the whole document, so a row redrawn or scrolled away
+  // mid-gesture never leaves a drag stuck (#91 review M2).
+  list.addEventListener('touchstart', startHold, { passive:true });
+  document.addEventListener('touchstart', (e) => { if(d && e.touches.length > 1){ cancelHold(); end(true); } }, { passive:true });
+  // The blocking touchmove sits on the list (a drag always starts there), so scrolling elsewhere never waits on it.
+  list.addEventListener('touchmove', (e) => { if(!d && !hold) return; const p = pt(e); if(d){ e.preventDefault(); move(p); } else if(hold && Math.hypot(p.x - hold.p.x, p.y - hold.p.y) > 10) cancelHold(); }, { passive:false });
+  document.addEventListener('touchend', (e) => { if(e.touches.length) return; cancelHold(); if(d){ e.preventDefault(); end(); } });
+  document.addEventListener('touchcancel', () => { cancelHold(); if(d) end(true); });
+  // Sign-out or the lock mid-gesture: no ghost left on screen, nothing waiting (#91 re-review L3).
+  poolDrag.reset = () => { if(hold){ clearTimeout(hold.timer); hold = null; } if(d){ d.ghost.remove(); d = null; } document.querySelectorAll('[data-pool-card].drop-over').forEach(x => x.classList.remove('drop-over'));
+    poolDrag.active = false; poolDrag.holding = false; poolDrag.pendingRender = false; };
+  document.addEventListener('contextmenu', (e) => { if(d || hold) e.preventDefault(); });   // Android's own long-press menu
+  list.addEventListener('mousedown', (e) => { if(e.button === 0) startHold(e); });
+  window.addEventListener('mousemove', (e) => { const p = pt(e); if(d) move(p); else if(hold && Math.hypot(p.x - hold.p.x, p.y - hold.p.y) > 6) cancelHold(); });
+  window.addEventListener('mouseup', () => { cancelHold(); if(d) end(); });
+})();
 
 function toggleGroup(name){
   const el = document.getElementById('group-'+name);
@@ -2204,7 +2313,9 @@ function showDetail(name) {
   h += `<div><span style="color:var(--text3)">Uses:</span> ${s.use_count}</div>`;
   h += `<div><span style="color:var(--text3)">Ownership:</span> ${esc(s.ownership)}</div>`;
   h += `<div><span style="color:var(--text3)">Rotatable:</span> ${s.rotatable?'yes':'no'}</div>`;
-  h += `<div><span style="color:var(--text3)">Category:</span> ${esc(s.category||'—')}</div>`;
+  { const cur = poolKey(s), names = [...new Set([cur, ...(vaultPools.pools||[]).map(p => p.name), ...secrets.map(poolKey)])].sort();
+    h += `<div style="grid-column:1/-1"><span style="color:var(--text3)">Pool:</span> <select onchange="movePool(${jsArg(s.ref||'')}, this.value)" ${s.ref?'':'disabled'} style="font-size:0.75rem;padding:0.15rem 0.3rem">`
+      + names.map(k => `<option value="${esc(k)}"${k===cur?' selected':''}>${esc(poolLabel(k))}</option>`).join('') + `</select></div>`; }
   if(s.provider) h += `<div><span style="color:var(--text3)">Provider:</span> ${esc(s.provider)}</div>`;
   h += `</div>`;
   if(s.labels&&s.labels.length){
@@ -2847,6 +2958,7 @@ if(typeof document!=='undefined'&&document.addEventListener) document.addEventLi
   if(cover) cover.style.display='none';
 });
 function lockNow(){
+  if(typeof poolDrag !== 'undefined' && poolDrag.reset) poolDrag.reset();
   if(lockState.locked) return;
   lockState.locked=true;
   reloadIfStale();   // nothing is open behind a lock: the moment to pick up a newer page
