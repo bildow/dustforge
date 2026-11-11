@@ -88,6 +88,28 @@ for n in 2 3 4 5; do call POST /api/demipass/access-requests "$A" '{"owner":"own
 call POST /api/demipass/access-requests "$A" '{"owner":"owner","secret":"cap-6"}'
 [ "$CODE" = 429 ] && ok "at most 5 pending requests per agent and owner" || fail "cap: $CODE $BODY"
 
+# An agent may ask a person its fleet owner confirmed in person (QR/vouch) — e.g. Brain asking Kyle for a zone token
+# (Aaron 2026-11-11). An email-code contact or a stranger cannot be asked; an outside ask needs a reason.
+python3 -c "
+import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); d={u:c.execute('SELECT did FROM identity_wallets WHERE username=?',(u,)).fetchone()[0] for u in ('owner','other','outsider')}
+cols=[r[1] for r in c.execute('PRAGMA table_info(network_peers)')]
+def pair(x,y,via):
+    a,b=sorted([d[x],d[y]]); vals={'did_a':a,'did_b':b,'status':'active','verified_via':via}
+    ks=[k for k in vals if k in cols]; c.execute('INSERT INTO network_peers ('+','.join(ks)+') VALUES ('+','.join('?'*len(ks))+')',[vals[k] for k in ks])
+pair('owner','other','qr'); pair('owner','outsider','email'); c.commit()" "$DB_PATH"
+approve(){ call POST /api/identity/gate/verify "$1" '{"gate":"pin","pin":"4321","intent":"approval-open:'$2'"}'; call POST /api/demipass/approvals/$2/open "$1"; local k; k=$(echo "$BODY" | J code)
+  call POST /api/demipass/approvals/$2/approve "$1" '{"code":"'$k'"}'; [ "$CODE" = 200 ] || fail "approve $2: $CODE $BODY"; }
+call POST /api/demipass/access-requests "$A" '{"owner":"other","secret":"cf-zone-token"}'; A1=$CODE
+OB='{"owner":"other","secret":"cf-zone-token","reason":"manage the dustforge.com zone for Aaron"}'
+call POST /api/demipass/access-requests "$A" "$OB"; OAP=$(echo "$BODY" | J approval_id); A2=$CODE
+call POST /api/demipass/access-requests "$A" '{"owner":"outsider","secret":"cf-zone-token","reason":"x"}'; A3=$CODE
+[ "$A1" = 400 ] && [ "$A2" = 202 ] && [ "$A3" = 403 ] && [ "$(python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute(\"SELECT COUNT(*) FROM demipass_access_requests WHERE owner_did=(SELECT did FROM identity_wallets WHERE username='other')\").fetchone()[0])" "$DB_PATH")" = 0 ] \
+  && ok "an outside ask needs a reason and the agent's owner's approval first (202, nothing filed); an email-code contact cannot be asked" || fail "outside ask: $A1 $A2 $A3 $BODY"
+approve "$O" "$OAP"; call POST /api/demipass/access-requests "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$OB" "$OAP")"; ORQ=$(echo "$BODY" | J request_id)
+[ "$CODE" = 201 ] && ok "…once the owner approves, the ask reaches the person" || fail "outside ask after approval: $CODE $BODY"
+OT=$P
+call GET /api/demipass/fill/pending "$OT"
+[ "$(echo "$BODY" | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin)["access_requests"] if x["id"]=='$ORQ'][0]; print(r["requester"], r.get("agent_of"), r.get("grant_days"), r["match"])')" = "agent owner 30 None" ] && ok "…the person's card says whose agent asks, the 30-day limit, and preselects nothing" || fail "outside card: $BODY"
 call GET /api/demipass/fill/pending "$O"
 N=$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["access_requests"]))')
 CARD=$(echo "$BODY" | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin)["access_requests"] if x["id"]=='$RQ'][0]; print(r["requester"], r["match"]["ref"], r["intent"], "‮" in r["reason"])')
