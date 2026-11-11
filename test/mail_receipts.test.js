@@ -11,7 +11,7 @@ const Database = require('better-sqlite3');
 
 const WH_KEY = crypto.randomBytes(24);
 const WH_SECRET = 'whsec_' + WH_KEY.toString('base64');
-const rs = { sent: [], refuse: false, lastEvent: 'complained', webhooks: [] };
+const rs = { sent: [], refuse: false, lastEvent: 'complained', webhooks: [], deleted: [], gets: 0 };
 const resendSrv = http.createServer((req, res) => {
   let b = ''; req.on('data', c => { b += c; }); req.on('end', () => {
     const j = (s, o) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
@@ -21,8 +21,10 @@ const resendSrv = http.createServer((req, res) => {
       const body = JSON.parse(b); rs.sent.push({ body, idem: req.headers['idempotency-key'] });
       return j(200, { id: 're_' + String(rs.sent.length).padStart(8, '0') });
     }
+    if (req.method === 'DELETE' && req.url.startsWith('/webhooks/')) { rs.deleted.push(req.url.split('/')[2]); return j(200, { deleted: true }); }
+    if (req.method === 'GET' && req.url.startsWith('/emails/')) rs.gets++;
     if (req.method === 'GET' && req.url.startsWith('/emails/')) return j(200, { id: req.url.split('/')[2], last_event: rs.lastEvent, created_at: '2026-11-10T12:00:00Z' });
-    if (req.method === 'POST' && req.url === '/webhooks') { rs.webhooks.push(JSON.parse(b)); return j(201, { object: 'webhook', id: 'wh_1', signing_secret: WH_SECRET }); }
+    if (req.method === 'POST' && req.url === '/webhooks') { rs.webhooks.push(JSON.parse(b)); return j(201, { object: 'webhook', id: 'wh_' + rs.webhooks.length, signing_secret: WH_SECRET }); }
     j(404, { message: 'no route' });
   });
 });
@@ -46,7 +48,8 @@ test.before(async () => {
   const raw = new Set(['/api/email/webhooks/resend']);
   app.use((req, res, next) => (raw.has(req.path) ? next() : express.json()(req, res, next)));
   const db = new Database(':memory:');
-  mr = require('../mail_receipts')({ app, db, getBearerIdentity: (req) => { const t = (req.headers.authorization || '').slice(7); return t ? { ok: true, did: t, decoded: {} } : { ok: false, status: 401, error: 'sign in' }; },
+  const ident = (req) => { const t = (req.headers.authorization || '').slice(7); return t ? { ok: true, did: t.replace(/:read$/, ''), decoded: {} } : { ok: false, status: 401, error: 'sign in' }; };
+  mr = require('../mail_receipts')({ app, db, getReadIdentity: ident, getBearerIdentity: (req) => (/:read$/.test(req.headers.authorization || '') ? { ok: false, status: 403, error: 'transact scope required' } : ident(req)),
     logSecurityEvent: () => {}, approvals: () => ({ gateService: (k, c, call, body) => (body.approval_id === 7 ? { ok: true, approval_id: 7 } : { ok: false, status: 202, body: { status: 'approval_pending', approval_id: 7 } }) }),
     createEmailTransport: () => ({ sendMail: async (m) => { smtpSent.push(m); return { messageId: m.messageId, response: '250 2.0.0 Ok: queued as ABC123' }; } }),
     operatorAllowed: (did) => did === OPERATOR, publicApi: 'https://api.example' });
@@ -64,14 +67,22 @@ test('a send through Resend: its email id comes back, idempotent on the send id;
   const byResend = await call('GET', '/api/email/sends/re_00000001', { as: ALICE });
   assert.strictEqual(byOurs.body.status, 'accepted'); assert.strictEqual(byResend.body.send_id, first.send_id);
   assert.strictEqual((await call('GET', `/api/email/sends/${first.send_id}`, { as: BOB })).status, 404, 'never someone else\'s receipt');
+  assert.strictEqual((await call('GET', `/api/email/sends/${first.send_id}`, { as: ALICE + ':read' })).status, 200, 'a read-scope token of the wallet reads its receipts');
   assert.strictEqual((await call('GET', '/api/email/sends')).status, 401);
+});
+
+test('several recipients ("a, b") go to Resend as a list; a client key gives the same send id and finds the first send', async () => {
+  const s = await mr.send({ did: ALICE, from: 'alice@dustforge.com', to: 'a@example.com, b@example.com', subject: 's', text: 't', clientKey: 'brain-send-0001' });
+  assert.deepStrictEqual(rs.sent.at(-1).body.to, ['a@example.com', 'b@example.com']);
+  assert.strictEqual(mr.byClientKey(ALICE, 'brain-send-0001').send_id, s.send_id);
+  assert.strictEqual(mr.byClientKey(BOB, 'brain-send-0001'), undefined, 'keys are per wallet');
 });
 
 test('Resend refusing the message throws (the route refunds); no receipt is written', async () => {
   rs.refuse = true;
   await assert.rejects(mr.send({ did: ALICE, from: 'alice@dustforge.com', to: 'x@example.com', subject: 's', text: 't' }), /Resend refused the message: HTTP 422/);
   rs.refuse = false;
-  assert.strictEqual((await call('GET', '/api/email/sends', { as: ALICE })).body.sends.length, 1);
+  assert.strictEqual((await call('GET', '/api/email/sends', { as: ALICE })).body.sends.length, 2);
 });
 
 test('without a Resend key: the SMTP relay, with a receipt that says it has no delivery events', async () => {
@@ -92,6 +103,12 @@ test('the webhook: refused until registered; registering is the operator\'s, thr
   assert.strictEqual(ask.status, 202); assert.strictEqual(rs.webhooks.length, 0, 'nothing registered before approval');
   const ok = await call('POST', '/api/email/webhooks/resend/register', { as: OPERATOR, body: { approval_id: 7 } });
   assert.strictEqual(ok.status, 200); assert.strictEqual(ok.body.webhook_id, 'wh_1');
+  const again = await call('POST', '/api/email/webhooks/resend/register', { as: OPERATOR, body: { approval_id: 7 } });
+  assert.strictEqual(again.body.webhook_id, 'wh_2'); assert.deepStrictEqual(rs.deleted, ['wh_1'], 're-registering removes the old webhook');
+  process.env.RESEND_WEBHOOK_SECRET = 'whsec_x';
+  assert.strictEqual((await call('POST', '/api/email/webhooks/resend/register', { as: OPERATOR, body: { approval_id: 7 } })).status, 409, 'an environment secret would override it');
+  delete process.env.RESEND_WEBHOOK_SECRET;
+  assert.strictEqual((await call('POST', '/api/email/webhooks/resend/register', { as: OPERATOR + ':read', body: {} })).status, 403, 'not with a read-scope token');
   assert.ok(!JSON.stringify(ok.body).includes(WH_SECRET.slice(6, 20)), 'the answer never carries the secret');
   assert.deepStrictEqual(rs.webhooks[0].events.includes('email.bounced'), true); assert.strictEqual(rs.webhooks[0].endpoint, 'https://api.example/api/email/webhooks/resend');
 });
@@ -103,6 +120,7 @@ test('signed events move the receipt forward only; bad, stale and replayed deliv
   await post('email.sent', '2026-11-10T12:00:30Z');   // late and out of order
   r = await call('GET', `/api/email/sends/${first.send_id}`, { as: ALICE }); assert.strictEqual(r.body.status, 'delivered', 'a late "sent" never moves it back');
   assert.deepStrictEqual(r.body.events.map(e => e.type), ['accepted', 'delivered', 'sent']);
+  assert.strictEqual(r.body.last_event_at, '2026-11-10T12:01:00Z', 'last_event_at never moves back for a late event');
   await post('email.bounced', '2026-11-10T12:02:00Z', { bounce: { type: 'Permanent', subType: 'General', message: 'mailbox unavailable' } });
   r = await call('GET', `/api/email/sends/${first.send_id}`, { as: ALICE }); assert.strictEqual(r.body.status, 'bounced'); assert.strictEqual(r.body.events.at(-1).detail.bounce.type, 'Permanent');
   const raw = JSON.stringify({ type: 'email.complained', data: { email_id: 're_00000001' } });
@@ -113,12 +131,26 @@ test('signed events move the receipt forward only; bad, stale and replayed deliv
   assert.strictEqual((await call('POST', '/api/email/webhooks/resend', { raw, headers: h })).body.duplicate, true, 'a replayed delivery is ignored');
   const other = JSON.stringify({ type: 'email.delivered', data: { email_id: 're_notours' } });
   assert.strictEqual((await call('POST', '/api/email/webhooks/resend', { raw: other, headers: sign(other) })).body.unknown_email, true);
+  assert.strictEqual((await call('POST', '/api/email/webhooks/resend', { raw: 'null', headers: sign('null') })).status, 400, 'a signed non-object body');
+
 });
 
-test('?refresh=1 asks Resend for its last event', async () => {
+test('?refresh=1 asks Resend: opened counts as delivered; once a minute per receipt; never after a final status', async () => {
   process.env.RESEND_API_KEY = 're_testkey';
   const s = await mr.send({ did: BOB, from: 'bob@dustforge.com', to: 'k@example.com', subject: 's', text: 't' });
-  rs.lastEvent = 'delivered';
-  const r = await call('GET', `/api/email/sends/${s.provider_id}?refresh=1`, { as: BOB });
-  assert.strictEqual(r.body.refresh.last_event, 'delivered'); assert.strictEqual(r.body.status, 'delivered');
+  rs.lastEvent = 'opened';
+  let r = await call('GET', `/api/email/sends/${s.provider_id}?refresh=1`, { as: BOB });
+  assert.strictEqual(r.body.refresh.last_event, 'opened'); assert.strictEqual(r.body.status, 'delivered'); assert.strictEqual(r.body.events.at(-1).detail.source, 'refresh');
+  const n = rs.gets;
+  r = await call('GET', `/api/email/sends/${s.provider_id}?refresh=1`, { as: BOB });
+  assert.match(r.body.refresh.skipped, /less than a minute/); assert.strictEqual(rs.gets, n, 'no call to Resend');
+  r = await call('GET', `/api/email/sends/${first.send_id}?refresh=1`, { as: ALICE });
+  assert.match(r.body.refresh.skipped, /final status \(complained\)/);
+});
+
+test('an address sending refused deliveries is turned away after 30 in ten minutes', async () => {
+  const raw = JSON.stringify({ type: 'email.delivered', data: { email_id: 're_00000001' } });
+  let last;
+  for (let i = 0; i < 31; i++) last = await call('POST', '/api/email/webhooks/resend', { raw, headers: sign(raw, { key: crypto.randomBytes(24) }) });
+  assert.strictEqual(last.status, 429);
 });

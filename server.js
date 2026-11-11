@@ -366,6 +366,19 @@ function getBearerIdentity(req) {
   };
 }
 
+// Any live token of the wallet, read scope included (receipt lookups: a token that may send mail may read what became
+// of it). Same verification and revocation as getBearerIdentity, without the transact floor.
+function getReadIdentity(req) {
+  const a = getBearerIdentity(req);
+  if (a.ok || a.status !== 403) return a;
+  const token = (req.headers.authorization || '').slice(7);
+  const v = identity.verifyTokenStandalone(token);
+  if (!v.valid) return { ok: false, status: 401, error: v.error };
+  const dead = billing.checkTokenRevocation(db, v.decoded);
+  if (dead.revoked) return { ok: false, status: 401, error: dead.reason };
+  return { ok: true, did: v.decoded.sub, scope: v.decoded.scope || 'read', decoded: v.decoded, silicon: false };
+}
+
 function getDemiPassActor(req, res, options = {}) {
   const allowAdmin = options.allowAdmin !== false;
   const auth = getBearerIdentity(req);
@@ -2216,7 +2229,17 @@ app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_se
     const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
     // Sent through the receipts layer: Resend's API when a Resend key is configured (its email id comes back and is
     // logged, returned and kept, so delivered/bounced/complained can be asked for later), else the SMTP transport.
-    const sent = await mailReceiptsApi.send({ did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody });
+    // The caller's own Idempotency-Key: the same key again returns the first send instead of mailing twice; this
+    // request's charge comes back (#90 review L1).
+    const clientKey = typeof req.headers['idempotency-key'] === 'string' && /^[A-Za-z0-9._:-]{8,100}$/.test(req.headers['idempotency-key']) ? req.headers['idempotency-key'] : null;
+    const already = clientKey && mailReceiptsApi.byClientKey(req.identity.did, clientKey);
+    if (already) {
+      let refunded = 0;
+      if (req.billing && req.billing.deducted > 0) { const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'email_send_refund', 'Refund: repeat of an earlier send (same Idempotency-Key)', { tokenJti: req.billing.token_jti || null }); if (r && r.ok) refunded = req.billing.deducted; }
+      return res.json({ ok: true, replayed: true, refunded, send_id: already.send_id, provider: already.provider, resend_id: already.provider === 'resend' ? already.provider_id : null,
+        message_id: already.message_id, status: already.status, status_url: `/api/email/sends/${already.send_id}` });
+    }
+    const sent = await mailReceiptsApi.send({ did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody, clientKey });
     console.log(`[email] sent: ${fromAddr} -> ${to} token=${req.billing.token_jti || '-'} send=${sent.send_id} ${sent.provider}=${sent.provider_id || '-'} msgid=${sent.message_id || '-'}`);
     res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code),
       send_id: sent.send_id, provider: sent.provider, resend_id: sent.provider_id, message_id: sent.message_id, status: 'accepted',
@@ -8655,7 +8678,7 @@ const useApprovals = require('./use_approvals')({
   logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail, deviceKeys, cryptoDepth,
 });
 // Mail receipts: every /api/email/send names the provider's message id; Resend's delivery events come back signed.
-mailReceiptsApi = require('./mail_receipts')({ app, db, rateLimitStandard, getBearerIdentity, logSecurityEvent, approvals: () => useApprovals,
+mailReceiptsApi = require('./mail_receipts')({ app, db, rateLimitStandard, getBearerIdentity, getReadIdentity, logSecurityEvent, approvals: () => useApprovals,
   createEmailTransport, operatorAllowed: (did) => require('./fleet_billing').operatorGrantAllowed(did),
   publicApi: (process.env.PUBLIC_API_URL || 'https://api.dustforge.com').replace(/\/$/, '') });
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
