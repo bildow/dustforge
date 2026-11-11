@@ -99,6 +99,25 @@ function sudoRefusal(sudo, { owner, keyName, secretId }) {
   }
   return null;
 }
+// How long one /use may wait on its target (Aaron 2026-11-11, from the EVAL pane: slow providers ran past 30 s and the
+// cut-off calls were still charged). Per delegation, set by the owner; 30 s otherwise.
+const USE_TIMEOUT_DEFAULT_S = 30, USE_TIMEOUT_MIN_S = 5, USE_TIMEOUT_MAX_S = 180;
+function useTimeoutMs(delegationId) {
+  if (!delegationId) return USE_TIMEOUT_DEFAULT_S * 1000;
+  let t = null;
+  try { t = (db.prepare('SELECT timeout_seconds FROM demipass_delegations WHERE id = ?').get(delegationId) || {}).timeout_seconds; } catch (_) {}
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < USE_TIMEOUT_MIN_S) return USE_TIMEOUT_DEFAULT_S * 1000;
+  return Math.min(n, USE_TIMEOUT_MAX_S) * 1000;
+}
+// A call DemiPass itself cut off at its time limit (fetch abort, or ssh killed by sshRun's timer).
+function isCutOff(e) {
+  return !!e && (e.code === 'use_cut_off' || e.name === 'TimeoutError' || (e.cause && e.cause.name === 'TimeoutError'));
+}
+// An agent token (silicon, worker, fleet-minted), as the delegate and Forgejo-rotation routes judge it.
+function isAgentAuth(auth) {
+  return !auth || !auth.ok || !!auth.silicon || !!(auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint'));
+}
 function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } = {}) {
   const refuse = (why) => { throw Object.assign(new Error(why), { stdout: '', stderr: why, status: 2 }); };
   if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) refuse('invalid ssh user or host');
@@ -129,7 +148,7 @@ function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } 
       if (settled) return; settled = true; clearTimeout(timer); if (hard) clearTimeout(hard);
       const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8') + (why ? `\n[${why}]` : '');
       if (code === 0 && !why) return resolve(stdout);
-      reject(Object.assign(new Error(why || `exit ${code}`), { stdout, stderr, status: code || 1 }));
+      reject(Object.assign(new Error(why || `exit ${code}`), { stdout, stderr, status: code || 1, timedOut: why === 'timed out' }));
     }
     child.on('error', e => { if (!settled) { settled = true; clearTimeout(timer); if (hard) clearTimeout(hard); reject(Object.assign(new Error(e.message), { stdout: '', stderr: e.message, status: 1 })); } });
     child.on('close', (code) => finish(code));
@@ -3361,6 +3380,8 @@ for (const col of [
   'reveal_until TEXT DEFAULT NULL',          // the reveal grant's window closes here
   "note TEXT DEFAULT ''",
   "via TEXT DEFAULT ''",                     // '' | 'share' | 'transfer' (the access the old owner kept)
+  'timeout_seconds INTEGER DEFAULT NULL',    // how long a /use under this delegation may wait on the target (NULL = 30 s)
+  'may_rotate INTEGER DEFAULT 0',            // owner-granted: the agent may blind-rotate this entry (SSH password)
 ]) { try { db.exec(`ALTER TABLE demipass_delegations ADD COLUMN ${col}`); } catch (_) {} }
 
 // Cleanup expired cosign requests every 60 seconds
@@ -5092,6 +5113,8 @@ async function useRoute(req, res) {
       db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
       return res.status(403).json({ error: 'this secret is no longer yours; ask its owner to share it' });
     }
+    // How long the target may take: the delegation's own limit (owner-set, up to 180 s), else 30 s.
+    const callTimeoutMs = useTimeoutMs(tokenRow.delegation_id);
 
     // Frozen after the token was issued: the token dies with it (#43 re-audit follow-up 2).
     if (secret.frozen) {
@@ -5184,7 +5207,7 @@ async function useRoute(req, res) {
             method,
             headers: { [header_name]: header_prefix + decryptedValue, 'Content-Type': 'application/json' },
             body: reqBody ? JSON.stringify(reqBody) : undefined,
-            signal: AbortSignal.timeout(30000),
+            signal: AbortSignal.timeout(callTimeoutMs),
           });
           const secretRedacted = useLimits.redactedBody(await useLimits.readCapped(response), decryptedValue);
           result = { status: response.status, body: secretRedacted };
@@ -5239,7 +5262,7 @@ async function useRoute(req, res) {
             const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
             egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
             if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
-            const output = await sshRun(effectiveUser, target_host, password, remote, { input });
+            const output = await sshRun(effectiveUser, target_host, password, remote, { input, timeout: callTimeoutMs });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
@@ -5249,6 +5272,8 @@ async function useRoute(req, res) {
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
             result = { stdout: redact((sshErr.stdout || '').toString()), stderr: redact((sshErr.stderr || '').toString()), exit_code: sshErr.status || 1 };
+            // Killed at the time limit: the call was cut off, which the catch below answers (504, not charged).
+            if (sshErr.timedOut) throw Object.assign(new Error('cut off'), { code: 'use_cut_off', partial: result });
           }
           break;
         }
@@ -5282,7 +5307,7 @@ async function useRoute(req, res) {
             method: bodyMethod,
             headers: { 'Content-Type': content_type },
             body: bodyStr,
-            signal: AbortSignal.timeout(30000),
+            signal: AbortSignal.timeout(callTimeoutMs),
           });
           const bodyRedacted = useLimits.redactedBody(await useLimits.readCapped(bodyResponse), decryptedValue);
           result = { status: bodyResponse.status, body: bodyRedacted };
@@ -5441,7 +5466,7 @@ async function useRoute(req, res) {
               'Content-Type': 'application/json',
             },
             body: JSON.stringify({ query }),
-            signal: AbortSignal.timeout(30000),
+            signal: AbortSignal.timeout(callTimeoutMs),
           });
           const dbRedacted = useLimits.redactedBody(await useLimits.readCapped(dbResponse), decryptedValue);
           result = { status: dbResponse.status, body: dbRedacted };
@@ -5502,6 +5527,30 @@ async function useRoute(req, res) {
           .run(secret.id, req.identity.did, action, 'failure', e.message.slice(0, 200), req.identity?.agent_name || '');
       } catch(_) {}
 
+      if (isCutOff(e)) {
+        // DemiPass cut the call off at its limit (Aaron 2026-11-11): the caller is not charged for it. The request did go
+        // out with the secret, so the token is spent and the call counts against the delegation, scope and secret.
+        let refunded = 0;
+        try {
+          db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
+          if (tokenRow.delegation_id) db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
+          db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
+          if (tokenRow.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
+        } catch (_) {}
+        if (req.billing && req.billing.deducted > 0 && !req._useRefunded) {
+          req._useRefunded = true;
+          try {
+            const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'api_call_compute_refund',
+              `Refund: ${action} cut off at ${callTimeoutMs / 1000} s`, { tokenJti: req.billing.token_jti || null });
+            if (r && r.ok) refunded = req.billing.deducted;
+          } catch (_) {}
+        }
+        const body = { error: `the target did not answer within ${callTimeoutMs / 1000} s; DemiPass cut the call off and did not charge for it`,
+                       cut_off: true, timeout_seconds: callTimeoutMs / 1000, refunded_dd: refunded };
+        if (tokenRow.delegation_id && callTimeoutMs < USE_TIMEOUT_MAX_S * 1000) body.hint = `the secret's owner can raise this delegation's limit (up to ${USE_TIMEOUT_MAX_S} s)`;
+        if (e.partial) body.result = e.partial;
+        return res.status(504).json(body);
+      }
       if (e.code === 'upstream_too_large' || e.code === 'upstream_redirect') {
         // The upstream call was made with the secret and is charged, so it also uses up the
         // token and counts against the delegation and the secret, like a success. A refused redirect too: the
@@ -10274,6 +10323,46 @@ app.post('/api/blindkey/delegate/revoke', rateLimitStandard, (req, res) => {
 });
 
 // GET /api/blindkey/delegations — list delegations (as owner or delegate)
+// The owner's settings on one agent delegation (Aaron 2026-11-11): timeout_seconds — how long a /use under it may wait on
+// the target (5–180, null for the 30 s default); may_rotate — the agent may blind-rotate the entry's SSH password. Set
+// only from the owner's own session: an agent never widens its own grant. Rotation goes only to an agent the owner's
+// fleet created; a person's share and an outside agent never get it.
+app.patch('/api/blindkey/delegations/:id', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'Bearer token required' });
+  if (isAgentAuth(auth)) return res.status(403).json({ error: "an agent does not change its own grant; the owner does, from their own session" });
+  const d = db.prepare('SELECT * FROM demipass_delegations WHERE id = ?').get(Number(req.params.id));
+  if (!d || d.owner_did !== auth.did) return res.status(404).json({ error: 'no delegation of yours with that id' });
+  if (d.status !== 'active') return res.status(409).json({ error: `this delegation is ${d.status}` });
+  if ((d.delegate_kind || 'agent') !== 'agent') return res.status(400).json({ error: "that is a share with a person; these settings are for an agent's delegation" });
+  const b = req.body || {};
+  const sets = [], vals = [];
+  if (b.timeout_seconds !== undefined) {
+    const t = b.timeout_seconds;
+    if (t !== null && !(Number.isInteger(t) && t >= USE_TIMEOUT_MIN_S && t <= USE_TIMEOUT_MAX_S)) {
+      return res.status(400).json({ error: `timeout_seconds: a whole number from ${USE_TIMEOUT_MIN_S} to ${USE_TIMEOUT_MAX_S}, or null for the ${USE_TIMEOUT_DEFAULT_S} s default` });
+    }
+    sets.push('timeout_seconds = ?'); vals.push(t);
+  }
+  if (b.may_rotate !== undefined) {
+    if (typeof b.may_rotate !== 'boolean') return res.status(400).json({ error: 'may_rotate: true or false' });
+    if (b.may_rotate) {
+      const ownAgent = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+          WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'`).get(auth.did, d.delegate_did);
+      if (!ownAgent) return res.status(403).json({ error: "rotation is given only to an agent your own fleet created" });
+      const sec = db.prepare('SELECT secret_type FROM blindkey_secrets WHERE id = ?').get(d.secret_id);
+      if (!sec || sec.secret_type !== 'password') return res.status(400).json({ error: 'blind rotation is for password entries' });
+    }
+    sets.push('may_rotate = ?'); vals.push(b.may_rotate ? 1 : 0);
+  }
+  if (!sets.length) return res.status(400).json({ error: 'nothing to change: timeout_seconds and/or may_rotate' });
+  db.prepare(`UPDATE demipass_delegations SET ${sets.join(', ')} WHERE id = ?`).run(...vals, d.id);
+  const after = db.prepare('SELECT timeout_seconds, may_rotate FROM demipass_delegations WHERE id = ?').get(d.id);
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+    'delegation_settings', auth.did, d.secret_id, null, JSON.stringify({ delegation_id: d.id, delegate_did: d.delegate_did, timeout_seconds: after.timeout_seconds, may_rotate: !!after.may_rotate }));
+  res.json({ ok: true, delegation_id: d.id, timeout_seconds: after.timeout_seconds || USE_TIMEOUT_DEFAULT_S, may_rotate: !!after.may_rotate });
+});
+
 app.get('/api/blindkey/delegations', rateLimitStandard, (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
@@ -10317,6 +10406,8 @@ app.get('/api/blindkey/delegations', rateLimitStandard, (req, res) => {
     granted_at: d.granted_at,
     revoked_at: d.revoked_at,
     expires_at: d.expires_at,
+    timeout_seconds: d.timeout_seconds || USE_TIMEOUT_DEFAULT_S,
+    may_rotate: !!d.may_rotate,
     kind: d.delegate_kind || 'agent',
     ...(d.delegate_kind === 'person' ? { offer_state: d.offer_state, reveal_allowed: Boolean(d.reveal_allowed), via: d.via || 'share' } : {}),
     role: d.owner_did === callerDid ? 'owner' : 'delegate',
@@ -12678,14 +12769,36 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   if (!ref) return res.status(400).json({ error: 'ref (current ref code) required' });
   if (!target_host) return res.status(400).json({ error: 'target_host required' });
 
-  const ownerDid = actor.did || null;
-  const secret = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'").get(ownerDid, ref);
+  // Who rotates (Aaron 2026-11-11): the owner, from their own session. An agent token rotates only an entry its owner
+  // delegated to it with rotation allowed (may_rotate, owner-set): a person's login is the owner's alone.
+  const callerAuth = actor.mode === 'admin' ? null : getBearerIdentity(req);
+  const agentTok = actor.mode !== 'admin' && isAgentAuth(callerAuth);
+  let secret = null, viaDelegation = null;
+  if (actor.mode !== 'admin' && !agentTok) {
+    secret = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'").get(actor.did, ref) || null;
+  }
+  // Not the owner in their own session (an agent token, or another wallet such as an agent's own): only through a
+  // delegation of this entry to the caller that the owner has allowed to rotate.
+  const byDelegate = actor.mode !== 'admin' && !secret;
+  if (byDelegate) {
+    viaDelegation = callerAuth && callerAuth.ok ? db.prepare(`SELECT d.* FROM demipass_delegations d JOIN blindkey_secrets s ON s.id = d.secret_id
+        WHERE s.ref_code = ? AND s.status = 'active' AND d.owner_did = s.did AND d.delegate_did = ? AND d.status = 'active'
+          AND COALESCE(d.delegate_kind, 'agent') = 'agent' AND d.may_rotate = 1 ORDER BY d.id LIMIT 1`).get(ref, callerAuth.did) : null;
+    if (viaDelegation && viaDelegation.expires_at && new Date(viaDelegation.expires_at).getTime() <= Date.now()) viaDelegation = null;
+    if (!viaDelegation) {
+      // One answer whether or not the ref exists (no probing other owners' refs).
+      logSecurityEvent('rotate_denied', 'alert', { caller_did: callerAuth && callerAuth.did, capability: 'rotate_blind', target: String(ref).slice(0, 80), ip: req.ip, error: agentTok ? 'agent token without a rotation grant' : 'not the owner, no rotation grant' });
+      return res.status(403).json({ error: "only the entry's owner rotates it, from their own session — or an agent the owner delegated it to with rotation allowed" });
+    }
+    secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(viaDelegation.secret_id);
+  }
   if (!secret) return res.status(404).json({ error: 'active secret not found for this ref code' });
+  const ownerDid = secret.did;
   if (secret.secret_type !== 'password') return res.status(400).json({ error: 'blind rotation only supports password secrets' });
 
   // Per-credential gate policy for rotate (admin/service operator bypasses).
   if (actor.mode !== 'admin') {
-    const g = checkGatePolicy(ownerDid, 'rotate', secret, getBearerIdentity(req));
+    const g = checkGatePolicy(ownerDid, 'rotate', secret, callerAuth);
     if (!g.ok) return res.status(g.status || 403).json(g);
   }
 
@@ -12711,7 +12824,10 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   // The current password goes to target_host as the SSH login and to sudo there: only a host the secret's own ssh_exec
   // scope covers (#43 re-review N2 — this route never checked the scope).
   if (actor.mode !== 'admin') {
-    const picked = soleContext(secret, { action: 'ssh_exec', targetHost: target_host });
+    // An agent's grant limited to one scope rotates only within it.
+    const grantCtx = viaDelegation && viaDelegation.context_id != null ? db.prepare('SELECT context_name FROM blindkey_contexts WHERE id = ?').get(viaDelegation.context_id) : null;
+    if (viaDelegation && viaDelegation.context_id != null && !grantCtx) return res.status(403).json({ error: "the scope of this agent's grant no longer exists" });
+    const picked = grantCtx ? { context: grantCtx.context_name } : soleContext(secret, { action: 'ssh_exec', targetHost: target_host });
     const chk = enforceBlindkeyContext(secret, picked.context, 'ssh_exec', null, typeof target_host === 'string' ? target_host : null);
     if (!chk.allowed) {
       logSecurityEvent('rotate_scope_denied', 'alert', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), ip: req.ip, error: chk.error, context: { secret: secret.name } });
@@ -12789,7 +12905,9 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     // From here to the response nothing awaits, so the rows below are written from this re-read state.
     const fresh = db.prepare("SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND status = 'active'").get(secret.id, ownerDid);
     const again = fresh ? nextVersionName(ownerDid, baseName, fresh.version) : null;
-    if (!fresh || !again || again.conflict || again.name !== target.name) {
+    // An agent's grant revoked (or its rotation right withdrawn) while ssh ran: the host goes back too.
+    const grantGone = viaDelegation && !db.prepare("SELECT 1 FROM demipass_delegations WHERE id = ? AND status = 'active' AND may_rotate = 1").get(viaDelegation.id);
+    if (!fresh || !again || again.conflict || again.name !== target.name || grantGone) {
       let back = false;
       try { back = (await sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 })).includes('ROLLED_BACK'); } catch (_) {}
       if (back) return res.status(409).json({ error: 'the secret changed while it was being rotated (rotated, removed or moved); the host was set back to the previous password', old_ref: ref });
@@ -12823,9 +12941,21 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     } catch(_) {}
 
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
+    const ctxMap = new Map();
     for (const ctx of oldContexts) {
-      db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)')
+      const ins = db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)')
         .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
+      ctxMap.set(ctx.id, Number(ins.lastInsertRowid));
+    }
+    // Agents the entry was delegated to keep it on the new version, like its contexts (2026-11-11): an agent that
+    // rotated its own grant would otherwise lose the password it just set. A person's share does not move.
+    let delegationsMoved = 0;
+    for (const d of db.prepare("SELECT * FROM demipass_delegations WHERE secret_id = ? AND status = 'active' AND COALESCE(delegate_kind, 'agent') = 'agent'").all(secret.id)) {
+      if (d.context_id != null && !ctxMap.has(d.context_id)) continue;   // its scope did not carry over
+      try {
+        db.prepare('UPDATE demipass_delegations SET secret_id = ?, context_id = ? WHERE id = ?').run(newSecret.id, d.context_id == null ? null : ctxMap.get(d.context_id), d.id);
+        delegationsMoved++;
+      } catch (_) {}
     }
 
     db.prepare(`UPDATE blindkey_secrets SET status = 'revoked', replaced_by = ?, ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).run(newSecret.id, secret.id);
@@ -12837,7 +12967,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
 
     res.json({
       ok: true, old_ref: ref, old_status: 'revoked', new_ref: newSecret.ref_code, new_name: newName,
-      target_host, target_user: sshUser, contexts_transferred: oldContexts.length,
+      target_host, target_user: sshUser, contexts_transferred: oldContexts.length, delegations_transferred: delegationsMoved,
+      rotated_by: byDelegate ? 'delegate' : 'owner',
       note: 'Password rotated. New password generated server-side and never entered any agent context.',
     });
   } catch (e) {
