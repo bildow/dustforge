@@ -51,4 +51,16 @@ call POST "/api/demipass/secrets/$R2/pool" "$A" '{"pool":"uncategorized"}'; [ "$
 call POST "/api/demipass/secrets/$RX/pool" "$A" '{"pool":"mine"}'; A1=$CODE; call POST "/api/demipass/secrets/not-a-ref/pool" "$A" '{"pool":"x"}'
 [ "$A1" = 404 ] && [ "$CODE" = 400 ] && [ "$(Q "SELECT category FROM blindkey_secrets WHERE ref_code='$RX'")" = api ] && ok "someone else's secret cannot be moved (404); a bad ref → 400" || fail "other: $A1 $CODE"
 call GET /api/demipass/pools ""; [ "$CODE" = 401 ] && ok "pools need a session" || fail "anon: $CODE"
+# An agent acting as the owner (a silicon token) reads the vault as before, but never reorganises it (#91 review M1).
+SIL="silicon:$(python3 -c 'import secrets;print(secrets.token_hex(16))')"
+python3 -c "import sqlite3,sys,hashlib; c=sqlite3.connect(sys.argv[1]); d=c.execute(\"SELECT did FROM identity_wallets WHERE username='owner-a'\").fetchone()[0]; c.execute('INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)', ('bot-1', 'did:key:zBot1', d, hashlib.sha256(sys.argv[2].encode()).hexdigest())); c.commit()" "$DB_PATH" "$SIL"
+call GET /api/demipass/pools "$SIL"; A0=$CODE
+call POST "/api/demipass/secrets/$R1/pool" "$SIL" '{"pool":"bot-moved"}'; A1=$CODE
+call POST /api/demipass/pools "$SIL" '{"name":"bot-pool"}'; A2=$CODE
+call DELETE /api/demipass/pools/api "$SIL"; A3=$CODE
+[ "$A0" = 200 ] && [ "$A1" = 403 ] && [ "$A2" = 403 ] && [ "$A3" = 403 ] && [ "$(Q "SELECT category FROM blindkey_secrets WHERE ref_code='$R1'")" = api ] \
+  && ok "an agent token reads pools but cannot move, add or remove (owner only)" || fail "agent: $A0 $A1 $A2 $A3"
+# A ref whose name part is empty (a name with no ASCII letters or digits) can still be moved (#91 L2).
+call POST /api/demipass/store "$A" "$(mk ___ '')"; R3=$(echo "$BODY" | J ref)
+call POST "/api/demipass/secrets/$R3/pool" "$A" '{"pool":"api"}'; [ "$CODE" = 200 ] && ok "a ref with an empty name part ($R3) moves" || fail "empty ref part: $R3 $CODE $BODY"
 echo; [ $fails = 0 ] && echo "vault_pools_smoke: all passed" || { echo "vault_pools_smoke: $fails FAILED"; exit 1; }

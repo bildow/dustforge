@@ -1178,7 +1178,7 @@ async function removeSilicon(){if(!confirm('Remove @'+siliconHandle+' from the f
   const sideways = (el) => { for(let n = el; n && n !== document.body; n = n.parentElement){ const ox = getComputedStyle(n).overflowX; if((ox === 'auto' || ox === 'scroll') && n.scrollWidth > n.clientWidth + 4) return true; } return false; };
   document.addEventListener('touchstart', (e) => {
     s0 = null;
-    if(e.touches.length !== 1 || (typeof lockState !== 'undefined' && lockState.locked) || document.querySelector('.modal-bg.show')) return;
+    if(e.touches.length !== 1 || !tk || (typeof lockState !== 'undefined' && lockState.locked) || document.querySelector('.modal-bg.show')) return;
     const t = e.target;
     if(t.closest('input, textarea, select, [contenteditable], .bottomnav, [data-noswipe]') || sideways(t)) return;
     s0 = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
@@ -2137,9 +2137,12 @@ function categorizeSecret(s) {
 // Pools (Aaron 2026-11-11): a pool is a secret's category. Pools the owner added show while empty (with Remove);
 // a secret is moved by holding it and dragging it onto another pool (or "Move to pool" in its sheet).
 var vaultPools = { pools: [], uncategorized: 0 };
-const poolKey = (s) => (s.category ? String(s.category).toLowerCase() : categorizeSecret(s).toLowerCase());
+// Grouped exactly as the server keeps them: a secret's category, or "uncategorized" (no guessing from names, #91 L3).
+const poolKey = (s) => (s.category ? String(s.category).toLowerCase() : 'uncategorized');
 const poolLabel = (k) => titleCase(String(k).replace(/-/g, ' '));
 function renderSecrets(){
+  // A refresh never pulls the row out from under a finger: it waits for the hold or drag to end (#91 review M2).
+  if(poolDrag.active || poolDrag.holding){ poolDrag.pendingRender = true; return; }
   const groups = {};
   for(const s of secrets){ const k = poolKey(s); (groups[k] = groups[k] || []).push(s); }
   for(const p of (vaultPools.pools || [])) if(!groups[p.name]) groups[p.name] = [];
@@ -2213,14 +2216,16 @@ async function removePool(k){
   try{ vaultPools = await api('DELETE','/api/demipass/pools/'+encodeURIComponent(k)); renderSecrets(); }
   catch(e){ if(!sessionEnded(e)) alert(e.message); }
 }
+const poolMoveSeq = {};
 async function movePool(ref, k){
   const s = secrets.find(x => x.ref === ref); if(!s) return;
+  const seq = (poolMoveSeq[ref] = (poolMoveSeq[ref] || 0) + 1);
   const prev = s.category; s.category = (k === 'uncategorized' ? '' : k); renderSecrets();   // moves at once; undone if refused
-  try{ vaultPools = await api('POST','/api/demipass/secrets/'+encodeURIComponent(ref)+'/pool',{pool:k}); renderSecrets(); }
-  catch(e){ s.category = prev; renderSecrets(); if(!sessionEnded(e)) alert(e.message); }
+  try{ const r = await api('POST','/api/demipass/secrets/'+encodeURIComponent(ref)+'/pool',{pool:k}); if(seq === poolMoveSeq[ref]) { vaultPools = r; renderSecrets(); } }
+  catch(e){ if(seq === poolMoveSeq[ref]) { s.category = prev; renderSecrets(); } if(!sessionEnded(e)) alert(e.message); }   // only the latest move rolls back
 }
 // Hold (450 ms) a secret row, drag it onto another pool, let go. Touch and mouse. The list scrolls near its edges.
-var poolDrag = { active:false, justDropped:false };
+var poolDrag = { active:false, holding:false, justDropped:false, pendingRender:false };
 (function(){
   if(typeof window === 'undefined' || typeof document === 'undefined' || !document.getElementById) return;   // the UI test sandbox
   const list = document.getElementById('secret-list'); if(!list || !list.addEventListener) return;
@@ -2232,7 +2237,7 @@ var poolDrag = { active:false, justDropped:false };
     const g = row.cloneNode(true);
     g.style.cssText += ';position:fixed;width:240px;pointer-events:none;opacity:0.92;background:var(--surface);border:1px solid var(--accent);z-index:9999;box-shadow:0 6px 18px rgba(0,0,0,.45)';
     document.body.appendChild(g);
-    d = { ref: row.dataset.ref, from: row.dataset.from, over: null, ghost: g }; poolDrag.active = true;
+    d = { ref: row.dataset.ref, from: row.dataset.from, over: null, ghost: g }; poolDrag.active = true; poolDrag.holding = false;
     try{ navigator.vibrate && navigator.vibrate(15); }catch(_){}
     move(p);
   }
@@ -2246,14 +2251,19 @@ var poolDrag = { active:false, justDropped:false };
     const go = d && d.over && d.over !== d.from ? { ref: d.ref, k: d.over } : null;
     if(d){ d.ghost.remove(); document.querySelectorAll('[data-pool-card].drop-over').forEach(x => x.classList.remove('drop-over')); }
     d = null; poolDrag.active = false; poolDrag.justDropped = true; setTimeout(() => { poolDrag.justDropped = false; }, 400);
+    flushRender();
     if(go) movePool(go.ref, go.k);
   }
-  function startHold(e){ const row = e.target.closest('[data-ref]'); if(!row || !row.dataset.ref) return; const p = pt(e); hold = { row, p, timer: setTimeout(() => { hold = null; begin(row, p); }, 450) }; }
-  function cancelHold(){ if(hold){ clearTimeout(hold.timer); hold = null; } }
+  function flushRender(){ if(poolDrag.pendingRender && !poolDrag.active && !poolDrag.holding){ poolDrag.pendingRender = false; renderSecrets(); } }
+  function startHold(e){ const row = e.target.closest('[data-ref]'); if(!row || !row.dataset.ref) return; const p = pt(e); poolDrag.holding = true; hold = { row, p, timer: setTimeout(() => { hold = null; begin(row, p); }, 450) }; }
+  function cancelHold(){ if(hold){ clearTimeout(hold.timer); hold = null; } if(poolDrag.holding){ poolDrag.holding = false; flushRender(); } }
+  // Holds start on the list; moves and ends are followed on the whole document, so a row redrawn or scrolled away
+  // mid-gesture never leaves a drag stuck (#91 review M2).
   list.addEventListener('touchstart', startHold, { passive:true });
-  list.addEventListener('touchmove', (e) => { const p = pt(e); if(d){ e.preventDefault(); move(p); } else if(hold && Math.hypot(p.x - hold.p.x, p.y - hold.p.y) > 10) cancelHold(); }, { passive:false });
-  list.addEventListener('touchend', (e) => { cancelHold(); if(d){ e.preventDefault(); end(); } });
-  list.addEventListener('touchcancel', () => { cancelHold(); if(d) end(); });
+  document.addEventListener('touchmove', (e) => { if(!d && !hold) return; const p = pt(e); if(d){ e.preventDefault(); move(p); } else if(hold && Math.hypot(p.x - hold.p.x, p.y - hold.p.y) > 10) cancelHold(); }, { passive:false });
+  document.addEventListener('touchend', (e) => { cancelHold(); if(d){ e.preventDefault(); end(); } });
+  document.addEventListener('touchcancel', () => { cancelHold(); if(d) end(); });
+  document.addEventListener('contextmenu', (e) => { if(d || hold) e.preventDefault(); });   // Android's own long-press menu
   list.addEventListener('mousedown', (e) => { if(e.button === 0) startHold(e); });
   window.addEventListener('mousemove', (e) => { const p = pt(e); if(d) move(p); else if(hold && Math.hypot(p.x - hold.p.x, p.y - hold.p.y) > 6) cancelHold(); });
   window.addEventListener('mouseup', () => { cancelHold(); if(d) end(); });

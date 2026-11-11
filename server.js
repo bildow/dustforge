@@ -14383,10 +14383,16 @@ function sendSMS(toPhone, body) {
 try { db.exec(`CREATE TABLE IF NOT EXISTS vault_pools (did TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (did, name))`); } catch (_) {}
 const POOL_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 const POOL_MAX = 50;
+// Moving and adding/removing pools is the owner's act: an agent token (silicon, worker, fleet-minted) acting as the
+// owner is refused, as for every owner-only change (#91 review M1). Reading the list is the vault read it already has.
+function poolOwnerRefusal(auth) {
+  if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) return 'only the vault owner, from their own session, changes pools';
+  return null;
+}
 const poolName = (x) => String(x == null ? '' : x).trim().toLowerCase().replace(/\s+/g, '-');
 function poolsOf(did) {
   const counts = db.prepare(`SELECT COALESCE(NULLIF(category, ''), '') AS name, COUNT(*) AS n FROM blindkey_secrets
-                             WHERE did = ? AND status IN ('active', 'rotating') GROUP BY 1`).all(did);
+                             WHERE did = ? AND status = 'active' GROUP BY 1`).all(did);
   const added = db.prepare('SELECT name, created_at FROM vault_pools WHERE did = ?').all(did);
   const m = new Map();
   for (const a of added) m.set(a.name, { name: a.name, count: 0, added: true });
@@ -14402,18 +14408,21 @@ app.get('/api/blindkey/pools', rateLimitStandard, (req, res) => {
 app.post('/api/blindkey/pools', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  { const no = poolOwnerRefusal(auth); if (no) return res.status(403).json({ error: no }); }
   const name = poolName((req.body || {}).name);
   if (!POOL_RE.test(name) || name === 'uncategorized') return res.status(400).json({ error: 'name: letters, digits and dashes, up to 40 (spaces become dashes)' });
-  if (db.prepare('SELECT COUNT(*) AS n FROM vault_pools WHERE did = ?').get(auth.did).n >= POOL_MAX) return res.status(409).json({ error: `at most ${POOL_MAX} pools` });
+  const known = poolsOf(auth.did).pools;
+  if (!known.some(p => p.name === name) && known.length >= POOL_MAX) return res.status(409).json({ error: `at most ${POOL_MAX} pools` });
   db.prepare('INSERT OR IGNORE INTO vault_pools (did, name) VALUES (?, ?)').run(auth.did, name);
   res.status(201).json({ ok: true, name, ...poolsOf(auth.did) });
 });
 app.delete('/api/blindkey/pools/:name', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  { const no = poolOwnerRefusal(auth); if (no) return res.status(403).json({ error: no }); }
   const name = poolName(req.params.name);
   if (!POOL_RE.test(name)) return res.status(400).json({ error: 'name' });
-  const inUse = db.prepare("SELECT COUNT(*) AS n FROM blindkey_secrets WHERE did = ? AND category = ? AND status IN ('active', 'rotating')").get(auth.did, name).n;
+  const inUse = db.prepare("SELECT COUNT(*) AS n FROM blindkey_secrets WHERE did = ? AND category = ? AND status = 'active'").get(auth.did, name).n;
   if (inUse) return res.status(409).json({ error: `pool ${name} still holds ${inUse} secret${inUse === 1 ? '' : 's'}: move them out first`, count: inUse });
   const r = db.prepare('DELETE FROM vault_pools WHERE did = ? AND name = ?').run(auth.did, name);
   if (!r.changes) return res.status(404).json({ error: 'no such pool' });
@@ -14423,15 +14432,15 @@ app.delete('/api/blindkey/pools/:name', rateLimitStandard, (req, res) => {
 app.post('/api/blindkey/secrets/:ref/pool', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  { const no = poolOwnerRefusal(auth); if (no) return res.status(403).json({ error: no }); }
   const ref = String(req.params.ref || '');
-  if (!/^DP-[A-Z]+-[A-Za-z0-9]+-[0-9a-f]{8}$/.test(ref)) return res.status(400).json({ error: 'ref: a DP-… ref code' });
+  if (!/^DP-[A-Z]+-[A-Za-z0-9]{0,16}-[0-9a-f]{8}$/.test(ref)) return res.status(400).json({ error: 'ref: a DP-… ref code' });
   const sec = db.prepare("SELECT id, name, category FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status IN ('active', 'rotating')").get(auth.did, ref);
   if (!sec) return res.status(404).json({ error: 'no live secret of yours with that ref' });
   const raw = poolName((req.body || {}).pool);
   const to = raw === '' || raw === 'uncategorized' ? null : raw;
   if (to !== null && !POOL_RE.test(to)) return res.status(400).json({ error: 'pool: letters, digits and dashes, up to 40' });
-  if (to !== null && !db.prepare('SELECT 1 FROM vault_pools WHERE did = ? AND name = ?').get(auth.did, to)
-      && db.prepare('SELECT COUNT(*) AS n FROM vault_pools WHERE did = ?').get(auth.did).n >= POOL_MAX) return res.status(409).json({ error: `at most ${POOL_MAX} pools` });
+  if (to !== null) { const known = poolsOf(auth.did).pools; if (!known.some(p => p.name === to) && known.length >= POOL_MAX) return res.status(409).json({ error: `at most ${POOL_MAX} pools` }); }
   db.transaction(() => {
     if (to !== null) db.prepare('INSERT OR IGNORE INTO vault_pools (did, name) VALUES (?, ?)').run(auth.did, to);   // the pool stays when emptied later
     db.prepare('UPDATE blindkey_secrets SET category = ? WHERE id = ? AND did = ?').run(to, sec.id, auth.did);
