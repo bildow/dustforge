@@ -68,13 +68,15 @@ call POST /api/demipass/use "$AG" '{"ref":"'$REF'","params":{"url":"https://repo
 [ "$(echo "$BODY" | J result.body.seen)" = "Bearer [REDACTED]" ] && ok "the value went out as the header and came back redacted" || fail "redaction: $BODY"
 
 # ── the owner's agent adds a GET-only scope on one URL, handed to B: a request on the phone ──
-ADD='{"secret_name":"dash-token","context_name":"brain-panel","action_type":"http_header","target_url_pattern":"https://server.dustroot.com/api/panel/brain","allowed_methods":["get"],"delegate_did":"'$BDID'"}'
+ADD='{"secret_name":"dash-token","context_name":"brain-panel","action_type":"http_header","target_url_pattern":"https://server.dustroot.com/api/panel/brain","allowed_methods":["get"],"delegate_did":"'$BDID'","ask_owner":true}'
 call POST /api/demipass/context/add "$AG" '{"secret_name":"dash-token","context_name":"x","action_type":"ssh_exec","allowed_methods":["GET"]}'
 [ "$CODE" = 400 ] && ok "allowed_methods on an ssh_exec scope → 400" || fail "methods on ssh: $CODE $BODY"
 call POST /api/demipass/context/add "$AG" '{"secret_name":"dash-token","context_name":"x","action_type":"http_header","allowed_methods":["FETCH"]}'
 [ "$CODE" = 400 ] && ok "an unknown method → 400" || fail "bad method: $CODE $BODY"
 call POST /api/demipass/context/add "$AG" '{"secret_name":"dash-token","context_name":"x","action_type":"http_header","delegate_did":"did:key:zNobody"}'
 [ "$CODE" = 404 ] && ok "an unknown delegate → 404 before anything is asked" || fail "bad delegate: $CODE $BODY"
+call POST /api/demipass/context/add "$AG" "${ADD%,\"ask_owner\":true\}}}"
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "scope:$SID" ] && echo "$BODY" | grep -q "ask_owner" && ok "without the PIN (and without ask_owner): the PIN challenge, which names ask_owner" || fail "bare add: $CODE $BODY"
 call POST /api/demipass/context/add "$AG" "$ADD"; AP=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = approval_pending ] && [ -n "$AP" ] && [ "$AP" != None ] && ok "agent adds the scope → 202 approval_pending, request $AP" || fail "add parks: $CODE $BODY"
 [ "$(Q "SELECT kind||'/'||depth FROM use_approvals WHERE id=$AP")" = "scope/critical" ] && ok "kind scope, critical (the PIN opens it)" || fail "kind/depth: $(Q "SELECT kind||'/'||depth FROM use_approvals WHERE id=$AP")"
@@ -119,8 +121,10 @@ call POST /api/demipass/request-token "$B" '{"ref":"'$REF'","context":"brain-pan
 
 # ── the owner's agent: fewer methods needs nothing; more parks; rotation carries the list ──
 call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":["GET","POST"]}'
+[ "$CODE" = 403 ] && ok "adding POST without the PIN → the PIN challenge (the app answers it)" || fail "widen bare: $CODE $BODY"
+call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":["GET","POST"],"ask_owner":true}'
 [ "$CODE" = 202 ] && [ "$(Q "SELECT allowed_methods FROM blindkey_contexts WHERE id=$CID")" = '["GET"]' ] && ok "adding POST without the PIN → a request on the phone; nothing changed ($(Q "SELECT summary FROM use_approvals WHERE id=$(echo "$BODY" | J approval_id)"))" || fail "widen: $CODE $BODY"
-call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":null}'
+call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":null,"ask_owner":true}'
 [ "$CODE" = 202 ] && ok "lifting the list (any method) → a request on the phone" || fail "lift: $CODE $BODY"
 call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":[]}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT allowed_methods FROM blindkey_contexts WHERE id=$CID")" = '[]' ] && ok "narrowing to no method: no PIN" || fail "narrow: $CODE $BODY"
@@ -131,8 +135,8 @@ call POST /api/demipass/use "$B" '{"use_token":"'$T'","params":{"url":"https://s
 # ── a scope edit's approval is bound to that scope: a sibling with the same pattern gets its own request ──
 pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_name":"dash-token","context_name":"brain-panel-2","action_type":"http_header","target_url_pattern":"https://server.dustroot.com/api/panel/brain","allowed_methods":["GET"]}'
 C2=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID AND context_name='brain-panel-2'"); [ "$CODE" = 200 ] && [ -n "$C2" ] || fail "sibling add: $CODE $BODY"
-call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":["GET","POST"]}'; R1=$(echo "$BODY" | J approval_id)
-call PATCH /api/demipass/context/$C2 "$AG" '{"allowed_methods":["GET","POST"]}'; R2=$(echo "$BODY" | J approval_id)
+call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":["GET","POST"],"ask_owner":true}'; R1=$(echo "$BODY" | J approval_id)
+call PATCH /api/demipass/context/$C2 "$AG" '{"allowed_methods":["GET","POST"],"ask_owner":true}'; R2=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ -n "$R1" ] && [ "$R1" != "$R2" ] && [ "$(Q "SELECT json_extract(bound_call,'$.body.context_id') FROM use_approvals WHERE id=$R2")" = "$C2" ] && ok "the same widening on a sibling scope is a different request, bound to the scope id ($R1 vs $R2)" || fail "sibling binding: $CODE $R1 $R2 $BODY"
 
 # ── http_body honours the list too ──

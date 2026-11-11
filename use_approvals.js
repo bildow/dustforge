@@ -254,7 +254,7 @@ module.exports = function registerUseApprovals(deps) {
     // DemiPass grants wait a day, so they have their own queue (#77 review M3): they cannot crowd out uses of secrets,
     // and the owner's own DID — whatever labels it signs in under — holds at most MAX_PENDING_GRANTS_OWN of them.
     const grant = isGrantKey(secret.service_key) || kind === 'scope';   // a scope change waits a day too (the owner's own grant)
-    const GRANT_SQL = "(service_key LIKE 'svc:demipass:%' OR kind = 'scope')";
+    const GRANT_SQL = "(COALESCE(service_key, '') LIKE 'svc:demipass:%' OR kind = 'scope')";   // NULL keys count as ordinary
     const pending = db.prepare(`SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending' AND ${grant ? GRANT_SQL : 'NOT ' + GRANT_SQL}`).get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
     if (grant && own && db.prepare(`SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND requester_did = ? AND status = 'pending' AND ${GRANT_SQL}`).get(secret.did, requesterDid).n >= MAX_PENDING_GRANTS_OWN) {

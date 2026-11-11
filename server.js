@@ -3721,10 +3721,14 @@ function scopeChangeGate(req, res, secret, what, use) {
     if (refused) { res.status(refused.status || 403).json(refused); return false; }
     return true;
   }
-  // No PIN in this session — an agent signed in as the owner (a pane on a device login). The change is then a request
-  // the owner opens with the PIN and approves on the phone, like every other grant (Aaron 2026-11-08): it binds this
-  // exact change (the body as sent), waits a day, and the same call once more with approval_id applies it.
-  if (!use) { res.status(403).json(gateMissing(what, ['pin'], ['pin'], intent)); return false; }
+  // No PIN in this session. The app answers the challenge below with the PIN and retries. An agent signed in as the
+  // owner (a pane on a device login) has no PIN to give: with ask_owner:true the change is instead a request the owner
+  // opens with the PIN and approves on the phone, like every other grant (Aaron 2026-11-08) — it binds this exact
+  // change (the body as sent), waits a day, and the same call once more with approval_id applies it.
+  if (!use || !(req.body && req.body.ask_owner)) {
+    res.status(403).json({ ...gateMissing(what, ['pin'], ['pin'], intent), ...(use ? { ask_owner: 'no PIN here? send the same call with ask_owner:true — the owner approves it in the DemiPass app' } : {}) });
+    return false;
+  }
   const d = auth.decoded || {};
   const g = useApprovals.gate({ id: secret.id, did: secret.did, name: secret.name, ref_code: secret.ref_code, security_depth: 'critical', service_key: null, wrap_state: null },
     { did: auth.did, label: d.agent_label || d.username || '' },
