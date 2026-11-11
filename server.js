@@ -114,6 +114,42 @@ function useTimeoutMs(delegationId) {
 function isCutOff(e) {
   return !!e && (e.code === 'use_cut_off' || e.name === 'TimeoutError' || (e.cause && e.cause.name === 'TimeoutError'));
 }
+// A call cut off at its limit costs nothing (Aaron 2026-11-11) and returns nothing: no partial output, so a cut-off
+// call is never free work (#96 review M2). Answers the 504.
+function answerCutOff(req, res, action, ms, { delegated = false } = {}) {
+  let refunded = 0;
+  if (req.billing && req.billing.deducted > 0 && !req._useRefunded) {
+    req._useRefunded = true;
+    try {
+      const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'api_call_compute_refund',
+        `Refund: ${action} cut off at ${ms / 1000} s`, { tokenJti: req.billing.token_jti || null });
+      if (r && r.ok) refunded = req.billing.deducted;
+    } catch (_) {}
+  }
+  const body = { error: `the target did not answer within ${ms / 1000} s; DemiPass cut the call off and did not charge for it`,
+                 cut_off: true, timeout_seconds: ms / 1000, refunded_dd: refunded };
+  if (delegated && ms < USE_TIMEOUT_MAX_S * 1000) body.hint = `the secret's owner can raise this delegation's limit (up to ${USE_TIMEOUT_MAX_S} s)`;
+  return res.status(504).json(body);
+}
+// The owner approves, in the DemiPass app with the PIN, an act on their own entry that an agent session could otherwise
+// do in their name (#96 review H1: a device-flow MCP token is the owner's wallet, not the owner). Returns true to go on,
+// or answers (202 with the approval request, or the refusal) and returns false.
+function ownerApproves(req, res, ownerDid, key, name, action, target, params) {
+  const auth = getBearerIdentity(req);
+  const g = useApprovals.gateService({ key, name, approverDid: ownerDid, depth: 'elevated' },
+    { did: auth.did, label: cleanLabel(auth.agent_name || (auth.decoded && auth.decoded.agent_label) || 'session', 40) },
+    { action, targetHost: String(target || '').slice(0, 200), params }, req.body || {});
+  if (g.ok) return true;
+  const b = { ...(g.body || {}) };
+  if (g.status === 202) b.next = 'the owner approves this in the DemiPass app; then repeat the same call with approval_id';
+  res.status(g.status || 403).json(b);
+  return false;
+}
+// An agent the owner's own fleet created (consented, owned outright) — the delegate route's "own agent".
+function ownFleetAgent(ownerDid, agentDid) {
+  return !!db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+      WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'`).get(ownerDid, agentDid);
+}
 // An agent token (silicon, worker, fleet-minted), as the delegate and Forgejo-rotation routes judge it.
 function isAgentAuth(auth) {
   return !auth || !auth.ok || !!auth.silicon || !!(auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint'));
@@ -5273,7 +5309,7 @@ async function useRoute(req, res) {
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
             result = { stdout: redact((sshErr.stdout || '').toString()), stderr: redact((sshErr.stderr || '').toString()), exit_code: sshErr.status || 1 };
             // Killed at the time limit: the call was cut off, which the catch below answers (504, not charged).
-            if (sshErr.timedOut) throw Object.assign(new Error('cut off'), { code: 'use_cut_off', partial: result });
+            if (sshErr.timedOut) throw Object.assign(new Error('cut off'), { code: 'use_cut_off' });
           }
           break;
         }
@@ -5528,28 +5564,15 @@ async function useRoute(req, res) {
       } catch(_) {}
 
       if (isCutOff(e)) {
-        // DemiPass cut the call off at its limit (Aaron 2026-11-11): the caller is not charged for it. The request did go
-        // out with the secret, so the token is spent and the call counts against the delegation, scope and secret.
-        let refunded = 0;
+        // DemiPass cut the call off at its limit (Aaron 2026-11-11): not charged. The request did go out with the
+        // secret, so the token is spent and the call counts against the delegation, scope and secret.
         try {
           db.prepare("UPDATE blindkey_use_tokens SET status = 'used', used_at = datetime('now') WHERE id = ?").run(tokenRow.id);
           if (tokenRow.delegation_id) db.prepare('UPDATE demipass_delegations SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.delegation_id);
           db.prepare('UPDATE blindkey_secrets SET use_count = use_count + 1, last_used_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id);
           if (tokenRow.context_id) db.prepare('UPDATE blindkey_contexts SET use_count = use_count + 1 WHERE id = ?').run(tokenRow.context_id);
         } catch (_) {}
-        if (req.billing && req.billing.deducted > 0 && !req._useRefunded) {
-          req._useRefunded = true;
-          try {
-            const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'api_call_compute_refund',
-              `Refund: ${action} cut off at ${callTimeoutMs / 1000} s`, { tokenJti: req.billing.token_jti || null });
-            if (r && r.ok) refunded = req.billing.deducted;
-          } catch (_) {}
-        }
-        const body = { error: `the target did not answer within ${callTimeoutMs / 1000} s; DemiPass cut the call off and did not charge for it`,
-                       cut_off: true, timeout_seconds: callTimeoutMs / 1000, refunded_dd: refunded };
-        if (tokenRow.delegation_id && callTimeoutMs < USE_TIMEOUT_MAX_S * 1000) body.hint = `the secret's owner can raise this delegation's limit (up to ${USE_TIMEOUT_MAX_S} s)`;
-        if (e.partial) body.result = e.partial;
-        return res.status(504).json(body);
+        return answerCutOff(req, res, action, callTimeoutMs, { delegated: !!tokenRow.delegation_id });
       }
       if (e.code === 'upstream_too_large' || e.code === 'upstream_redirect') {
         // The upstream call was made with the secret and is charged, so it also uses up the
@@ -5650,7 +5673,7 @@ async function useRoute(req, res) {
             'Content-Type': 'application/json',
           },
           body: reqBody ? JSON.stringify(reqBody) : undefined,
-          signal: AbortSignal.timeout(30000),
+          signal: AbortSignal.timeout(USE_TIMEOUT_DEFAULT_S * 1000),
         });
         // Redact any echo of the secret in the response
         const secretRedacted = useLimits.redactedBody(await useLimits.readCapped(response), decryptedValue);
@@ -5748,7 +5771,7 @@ async function useRoute(req, res) {
           const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
           egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
           if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
-          const output = await sshRun(target_user, target_host, password, remote, { input });
+          const output = await sshRun(target_user, target_host, password, remote, { input, timeout: USE_TIMEOUT_DEFAULT_S * 1000 });
 
           // Redact any echo of credentials in the output
           const redactedOutput = output
@@ -5764,6 +5787,7 @@ async function useRoute(req, res) {
             .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
             .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
           result = { stdout: redact(stdout), stderr: redact(stderr), exit_code: sshErr.status || 1 };
+          if (sshErr.timedOut) throw Object.assign(new Error('cut off'), { code: 'use_cut_off' });
         }
         break;
       }
@@ -5775,6 +5799,7 @@ async function useRoute(req, res) {
     countUse();
     res.json({ ok: true, action, secret_name: name, result });
   } catch (e) {
+    if (isCutOff(e)) { countUse(); return answerCutOff(req, res, action, USE_TIMEOUT_DEFAULT_S * 1000); }   // #96 review M1
     if (e.code === 'upstream_too_large') { countUse(); return res.status(413).json(e.body); }
     if (e.code === 'upstream_redirect') { countUse(); return res.status(502).json(e.body); }   // the request went out
     res.status(500).json({ error: `action failed: ${e.message}` });
@@ -10347,15 +10372,19 @@ app.patch('/api/blindkey/delegations/:id', rateLimitStandard, (req, res) => {
   if (b.may_rotate !== undefined) {
     if (typeof b.may_rotate !== 'boolean') return res.status(400).json({ error: 'may_rotate: true or false' });
     if (b.may_rotate) {
-      const ownAgent = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
-          WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'`).get(auth.did, d.delegate_did);
-      if (!ownAgent) return res.status(403).json({ error: "rotation is given only to an agent your own fleet created" });
+      if (!ownFleetAgent(auth.did, d.delegate_did)) return res.status(403).json({ error: "rotation is given only to an agent your own fleet created" });
       const sec = db.prepare('SELECT secret_type FROM blindkey_secrets WHERE id = ?').get(d.secret_id);
       if (!sec || sec.secret_type !== 'password') return res.status(400).json({ error: 'blind rotation is for password entries' });
     }
     sets.push('may_rotate = ?'); vals.push(b.may_rotate ? 1 : 0);
   }
   if (!sets.length) return res.status(400).json({ error: 'nothing to change: timeout_seconds and/or may_rotate' });
+  // Widening (rotation on, a longer limit) is approved by the owner in the app (#96 review H1); narrowing is not.
+  const curT = d.timeout_seconds || USE_TIMEOUT_DEFAULT_S, newT = b.timeout_seconds === undefined ? curT : (b.timeout_seconds || USE_TIMEOUT_DEFAULT_S);
+  if ((b.may_rotate === true && !d.may_rotate) || newT > curT) {
+    if (!ownerApproves(req, res, auth.did, 'svc:demipass:delegation-widen', `Agent delegation #${d.id}: ${[b.may_rotate === true && !d.may_rotate ? 'may rotate' : '', newT > curT ? `wait up to ${newT} s` : ''].filter(Boolean).join(', ')}`,
+        'delegation-widen', d.delegate_did, { delegation_id: d.id, may_rotate: b.may_rotate === undefined ? null : b.may_rotate, timeout_seconds: b.timeout_seconds === undefined ? null : b.timeout_seconds })) return;
+  }
   db.prepare(`UPDATE demipass_delegations SET ${sets.join(', ')} WHERE id = ?`).run(...vals, d.id);
   const after = db.prepare('SELECT timeout_seconds, may_rotate FROM demipass_delegations WHERE id = ?').get(d.id);
   db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
@@ -12704,6 +12733,10 @@ app.post('/api/blindkey/rotate-blind/forgejo', rateLimitStandard, async (req, re
     const okIdx = tried.findIndex(t => t.allowed);
     if (okIdx < 0) return res.status(403).json({ error: `admin_ref: none of the token's contexts allows ${matchUrl}`, ...(tried[0] ? { detail: tried[0].error } : {}) });
     var adminCtxName = ctxs[okIdx].context_name; }
+  // The owner approves it in the DemiPass app (#96 review H1: a device-flow agent session is the owner's wallet too).
+  if (rotatingSecrets.has(secret.id)) return res.status(409).json({ error: 'a rotation of this login is already running' });   // before an approval is spent
+  if (!ownerApproves(req, res, ownerDid, 'svc:demipass:rotate-forgejo', `Rotate Forgejo login ${cleanLabel(username, 40)}`, 'rotate-forgejo', u.host,
+      { secret_id: secret.id, admin_secret_id: admin.id, username: username.toLowerCase(), base })) return;
   const lockKey = `${FORGEJO_ROTATE_HOSTS.has(u.hostname) ? 'dustroot-forgejo' : u.host}\n${username.toLowerCase()}`;   // repo. and git. are one Forgejo
   if (rotatingSecrets.has(secret.id) || forgejoRotating.has(lockKey)) return res.status(409).json({ error: 'a rotation of this login is already running' });
   rotatingSecrets.add(secret.id); forgejoRotating.add(lockKey);
@@ -12788,7 +12821,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     if (!viaDelegation) {
       // One answer whether or not the ref exists (no probing other owners' refs).
       logSecurityEvent('rotate_denied', 'alert', { caller_did: callerAuth && callerAuth.did, capability: 'rotate_blind', target: String(ref).slice(0, 80), ip: req.ip, error: agentTok ? 'agent token without a rotation grant' : 'not the owner, no rotation grant' });
-      return res.status(403).json({ error: "only the entry's owner rotates it, from their own session — or an agent the owner delegated it to with rotation allowed" });
+      return res.status(403).json({ error: "no active entry of yours with that ref, and no delegation of it to you with rotation allowed" });
     }
     secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(viaDelegation.secret_id);
   }
@@ -12853,6 +12886,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   }
   // The login rotated is the account the secret was stored for; naming another one is refused (#43 re-audit
   // follow-up 3: a shared password must not let the caller reset whichever account it names).
+  // A delegate rotates only the account the entry was stored for: it never names one (#96 review M3).
+  if (byDelegate && !secret.account_username) return res.status(403).json({ error: "this entry does not record its account; its owner rotates it (or stores the account) first" });
   if (secret.account_username && target_user && target_user !== secret.account_username) {
     return res.status(403).json({ error: `this secret is the password of '${secret.account_username}'; rotate that account` });
   }
@@ -12867,6 +12902,11 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     + 'echo ' + sq(sudoPassword) + ' | sudo -S bash -c ' + sq('echo ' + sq(sshUser + ':' + password) + ' | chpasswd') + ' 2>/dev/null\n'
     + 'echo ' + done + '\n';
 
+  // The owner's own rotation is approved by the owner in the DemiPass app (#96 review H1): the session calling may be an
+  // agent signed in to the owner's wallet (device flow). Asked last, once every other check has passed.
+  if (rotatingSecrets.has(secret.id)) return res.status(409).json({ error: 'this secret is being rotated right now — wait for that to finish' });   // before an approval is spent
+  if (!byDelegate && actor.mode !== 'admin' && !ownerApproves(req, res, ownerDid, 'svc:demipass:rotate-blind', `Rotate ${cleanLabel(secret.name, 60)} (${sshUser}@${target_host})`,
+      'rotate-blind', target_host, { secret_id: secret.id, ref, target_user: sshUser })) return;
   // One rotation of a secret at a time: ssh no longer blocks the process, so a second call would otherwise change the
   // host password under the first one (2026-11-07).
   if (rotatingSecrets.has(secret.id)) return res.status(409).json({ error: 'this secret is being rotated right now — wait for that to finish' });
@@ -12906,7 +12946,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const fresh = db.prepare("SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND status = 'active'").get(secret.id, ownerDid);
     const again = fresh ? nextVersionName(ownerDid, baseName, fresh.version) : null;
     // An agent's grant revoked (or its rotation right withdrawn) while ssh ran: the host goes back too.
-    const grantGone = viaDelegation && !db.prepare("SELECT 1 FROM demipass_delegations WHERE id = ? AND status = 'active' AND may_rotate = 1").get(viaDelegation.id);
+    const grantGone = viaDelegation && !(db.prepare("SELECT 1 FROM demipass_delegations WHERE id = ? AND status = 'active' AND may_rotate = 1 AND (expires_at IS NULL OR expires_at = '' OR datetime(expires_at) > datetime('now'))").get(viaDelegation.id)
+      && ownFleetAgent(ownerDid, viaDelegation.delegate_did));
     if (!fresh || !again || again.conflict || again.name !== target.name || grantGone) {
       let back = false;
       try { back = (await sshRun(sshUser, target_host, newPassword, 'bash -s', { input: chpasswdScript(newPassword, currentPassword, 'ROLLED_BACK'), timeout: 15000 })).includes('ROLLED_BACK'); } catch (_) {}
@@ -12947,11 +12988,12 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
         .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
       ctxMap.set(ctx.id, Number(ins.lastInsertRowid));
     }
-    // Agents the entry was delegated to keep it on the new version, like its contexts (2026-11-11): an agent that
-    // rotated its own grant would otherwise lose the password it just set. A person's share does not move.
+    // The owner's own agents keep the entry on the new version, like its contexts (2026-11-11): an agent that rotated its
+    // own grant would otherwise lose the password it just set. A person's share and an outside agent's do not move.
     let delegationsMoved = 0;
     for (const d of db.prepare("SELECT * FROM demipass_delegations WHERE secret_id = ? AND status = 'active' AND COALESCE(delegate_kind, 'agent') = 'agent'").all(secret.id)) {
       if (d.context_id != null && !ctxMap.has(d.context_id)) continue;   // its scope did not carry over
+      if (!ownFleetAgent(ownerDid, d.delegate_did)) continue;   // an outside agent's delegation stays with the old version, as before (#96 review M4)
       try {
         db.prepare('UPDATE demipass_delegations SET secret_id = ?, context_id = ? WHERE id = ?').run(newSecret.id, d.context_id == null ? null : ctxMap.get(d.context_id), d.id);
         delegationsMoved++;

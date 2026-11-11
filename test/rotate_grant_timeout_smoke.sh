@@ -81,6 +81,13 @@ SQ(){ node -e 'const db=new (require("better-sqlite3"))(process.env.DB_PATH); co
 O=$(login owner); A=$(login agent); A2=$(login agent2); X=$(login outsider)
 [ "$O" != None ] && [ "$A" != None ] && [ "$A2" != None ] && [ "$X" != None ] && ok "four wallets signed in" || { fail login; exit 1; }
 AG=$(DID agent); AG2=$(DID agent2); OUT=$(DID outsider)
+call POST /api/identity/pin "$O" '{"pin":"4321","password":"hunter22"}'; [ "$CODE" = 200 ] || fail "pin: $CODE $BODY"
+approve(){ call POST /api/identity/gate/verify "$O" '{"gate":"pin","pin":"4321","intent":"approval-open:'$1'"}'; call POST /api/demipass/approvals/$1/open "$O"; local k; k=$(echo "$BODY" | J code)
+  call POST /api/demipass/approvals/$1/approve "$O" '{"code":"'$k'"}'; [ "$CODE" = 200 ] || fail "approve $1: $CODE $BODY"; }
+WITH(){ python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$1" "$2"; }
+# The owner's widening/rotation from any session: 202 (an approval request), approved in the app, then the same call.
+APPROVED(){ local m=$1 path=$2 body=$3; call "$m" "$path" "$O" "$body"; [ "$CODE" = 202 ] || { echo "expected 202: $CODE $BODY"; return; }
+  local id; id=$(echo "$BODY" | J approval_id); approve "$id"; call "$m" "$path" "$O" "$(WITH "$body" "$id")"; }
 
 # ── legacy fixture ──
 R=$(SQ "SELECT timeout_seconds, may_rotate FROM demipass_delegations WHERE delegate_did = 'did:key:legacyagent'")
@@ -112,15 +119,19 @@ call PATCH /api/demipass/delegations/$DOUT "$O" '{"may_rotate":true}'
 for t in 4 181 '"60"' 30.5; do call PATCH /api/demipass/delegations/$D1 "$O" '{"timeout_seconds":'$t'}'; [ "$CODE" = 400 ] || fail "timeout $t accepted: $CODE"; done
 ok "timeout_seconds outside 5–180 (or not a whole number) is refused"
 call PATCH /api/demipass/delegations/$D1 "$O" '{"may_rotate":true}'
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J may_rotate)" = True ] && ok "owner grants its agent rotation of box" || fail "grant: $CODE $BODY"
+[ "$CODE" = 202 ] && ok "granting rotation from a session is a request the owner approves in the app (202)" || fail "grant needs approval: $CODE $BODY"
+APPROVED PATCH /api/demipass/delegations/$D1 '{"may_rotate":true}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J may_rotate)" = True ] && ok "…approved: the agent may rotate box" || fail "grant: $CODE $BODY"
 
 # ── rotation by the agent ──
 ROT "$A" DP-PWD-laptop-0001 aaron
 [ "$CODE" = 403 ] && ok "the grant covers only box: the agent still cannot rotate laptop" || fail "laptop: $CODE $BODY"
 ROT "$A" DP-PWD-box-0001
 NEWREF=$(echo "$BODY" | J new_ref)
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J rotated_by)" = delegate ] && [ "$(echo "$BODY" | J delegations_transferred)" = 3 ] \
-  && ok "the agent rotates box under its grant; its, agent2's and the outside delegation move to the new version" || fail "agent rotate: $CODE $BODY"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J rotated_by)" = delegate ] && [ "$(echo "$BODY" | J delegations_transferred)" = 2 ] \
+  && ok "the agent rotates box under its grant, no approval; its and agent2's delegations move to the new version" || fail "agent rotate: $CODE $BODY"
+R=$(SQ "SELECT s.status FROM demipass_delegations d JOIN blindkey_secrets s ON s.id = d.secret_id WHERE d.id = $DOUT")
+[ "$R" = '[{"status":"revoked"}]' ] && ok "the outside agent's delegation stays on the old, revoked version" || fail "M4: $R"
 R=$(SQ "SELECT d.id, s.ref_code, d.may_rotate FROM demipass_delegations d JOIN blindkey_secrets s ON s.id = d.secret_id WHERE d.id IN ($D1, $D2) ORDER BY d.id")
 [ "$R" = "[{\"id\":$D1,\"ref_code\":\"$NEWREF\",\"may_rotate\":1},{\"id\":$D2,\"ref_code\":\"$NEWREF\",\"may_rotate\":0}]" ] && ok "delegations point at $NEWREF; the grant moved with them" || fail "moved: $R"
 call POST /api/demipass/use "$A" '{"ref":"'$NEWREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo still-mine"}'
@@ -128,21 +139,30 @@ call POST /api/demipass/use "$A" '{"ref":"'$NEWREF'","action":"ssh_exec","target
 ROT "$A2" "$NEWREF"
 [ "$CODE" = 403 ] && ok "agent2 (delegated, no rotation grant) cannot rotate" || fail "agent2: $CODE $BODY"
 ROT "$O" DP-PWD-laptop-0001 aaron
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J rotated_by)" = owner ] && ok "the owner rotates their own login from their session" || fail "owner: $CODE $BODY"
+[ "$CODE" = 202 ] && ok "the owner's wallet token alone does not rotate the login: 202, an approval request" || fail "owner unapproved: $CODE $BODY"
+APPROVED POST /api/demipass/rotate-blind '{"ref":"DP-PWD-laptop-0001","target_host":"100.83.112.88","target_user":"aaron"}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J rotated_by)" = owner ] && ok "…approved in the app: the owner's login is rotated" || fail "owner: $CODE $BODY"
+# M3: a delegate never names the account
+node -e 'const db=new (require("better-sqlite3"))(process.env.DB_PATH); db.prepare("UPDATE blindkey_secrets SET account_username = NULL WHERE ref_code = ?").run(process.argv[1])' "$NEWREF"
+ROT "$A" "$NEWREF" aaron
+[ "$CODE" = 403 ] && ok "a delegate cannot rotate an entry that does not record its account (no naming another)" || fail "M3: $CODE $BODY"
+node -e 'const db=new (require("better-sqlite3"))(process.env.DB_PATH); db.prepare("UPDATE blindkey_secrets SET account_username = ? WHERE ref_code = ?").run("deploy", process.argv[1])' "$NEWREF"
 
 # ── /use timeout ──
 call GET /api/demipass/delegations "$O"
 echo "$BODY" | python3 -c 'import json,sys; d={x["id"]:x for x in json.load(sys.stdin)["delegations"]}; x=d['$D1']; sys.exit(0 if x["timeout_seconds"]==30 and x["may_rotate"] is True else 1)' \
   && ok "listing shows timeout 30 s by default and the rotation grant" || fail "listing: $BODY"
-call PATCH /api/demipass/delegations/$D1 "$O" '{"timeout_seconds":180}'
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J timeout_seconds)" = 180 ] && ok "owner sets the agent's limit to 180 s" || fail "180: $CODE $BODY"
+APPROVED PATCH /api/demipass/delegations/$D1 '{"timeout_seconds":180}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J timeout_seconds)" = 180 ] && ok "a longer limit (180 s) is approved in the app, then set" || fail "180: $CODE $BODY"
 call PATCH /api/demipass/delegations/$D1 "$O" '{"timeout_seconds":5}'
+[ "$CODE" = 200 ] && ok "a shorter limit needs no approval" || fail "lower: $CODE $BODY"
 B0=$(BAL "$AG"); t0=$(date +%s)
-call POST /api/demipass/use "$A" '{"ref":"'$NEWREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"sleep 9"}'
+call POST /api/demipass/use "$A" '{"ref":"'$NEWREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo WORK-DONE; sleep 9"}'
 dt=$(( $(date +%s) - t0 )); B1=$(BAL "$AG")
 [ "$CODE" = 504 ] && [ "$(echo "$BODY" | J cut_off)" = True ] && [ "$(echo "$BODY" | J timeout_seconds)" = 5 ] && [ $dt -ge 5 ] && [ $dt -lt 15 ] \
   && ok "a call past the 5 s limit is cut off: 504 after ${dt}s" || fail "cut off: $CODE ${dt}s $BODY"
 [ "$B0" = "$B1" ] && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && ok "the cut-off call is not charged (balance $B0 → $B1, 10 DD back)" || fail "charged: $B0 → $B1 $BODY"
+echo "$BODY" | grep -q WORK-DONE && fail "a cut-off call returned partial output: $BODY" || ok "a cut-off call returns no partial output"
 R=$(SQ "SELECT type, amount_cents FROM identity_transactions WHERE did = '$AG' ORDER BY id DESC LIMIT 2")
 echo "$R" | grep -q api_call_compute_refund && ok "the refund is its own ledger row" || fail "ledger: $R"
 call POST /api/demipass/use "$A2" '{"ref":"'$NEWREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"sleep 7"}'
@@ -152,5 +172,10 @@ call POST /api/demipass/use "$A" '{"ref":"'$NEWREF'","action":"ssh_exec","target
 B1=$(BAL "$AG")
 [ "$CODE" = 200 ] && [ $((B0 - B1)) = 10 ] && ok "a call that completes is charged as before (10 DD)" || fail "normal charge: $CODE $B0 → $B1"
 
+# M1: the owner's direct call (by name) is cut off at 30 s and not charged either
+B0=$(BAL "$(DID owner)")
+call POST /api/demipass/use "$O" '{"name":"laptop_v2","action":"ssh_exec","target_host":"100.83.112.88","target_user":"aaron","command":"sleep 40"}'
+B1=$(BAL "$(DID owner)")
+[ "$CODE" = 504 ] && [ "$B0" = "$B1" ] && ok "the owner's direct call is cut off at 30 s and not charged" || fail "direct: $CODE $B0 → $B1 $BODY"
 grep -q "boxpass\|laptoppass" "$S/server.log" && fail "a password reached the server log" || ok "no password in the server log"
 [ $fails = 0 ] && echo "rotate_grant_timeout_smoke: all passed" || { echo "rotate_grant_timeout_smoke: $fails failure(s)"; exit 1; }

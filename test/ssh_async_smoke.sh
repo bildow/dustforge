@@ -86,9 +86,21 @@ runs=$(grep -c '^ARGV' "$S/ssh.log")
 C3=$(use '{"use_token":"'$UT'","target_user":"deploy","command":"echo third"}' c3)
 [ "$C3" = 410 ] && ok "(c) after it ran, the token is spent (410)" || fail "(c) reuse after: $C3 $(cat "$S/c3.json")"
 # (d) two blind rotations of one secret at once
+
+# Owner rotations are approved in the DemiPass app (#96 review H1): RA = the call, approved with the owner's PIN, then repeated.
+curl -s -o /dev/null -X POST "$API/api/identity/pin" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d '{"pin":"4321","password":"ownerpass1"}'
+_j(){ python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"; }
+_p(){ curl -s -X POST "$API$1" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" ${2:+-d "$2"}; }
+RA(){ local body=$1 out=$2 c id k
+  c=$(curl -s -o "$out" -w '%{http_code}' -m 60 -X POST "$API/api/blindkey/rotate-blind" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$body")
+  [ "$c" = 202 ] || { echo "$c"; return; }
+  id=$(_j approval_id <"$out"); _p /api/identity/gate/verify '{"gate":"pin","pin":"4321","intent":"approval-open:'$id'"}' >/dev/null
+  k=$(_p /api/demipass/approvals/$id/open | _j code); _p /api/demipass/approvals/$id/approve '{"code":"'$k'"}' >/dev/null
+  curl -s -o "$out" -w '%{http_code}' -m 60 -X POST "$API/api/blindkey/rotate-blind" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" \
+    -d "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]=int(sys.argv[2]); print(json.dumps(b))' "$body" "$id")"; }
 rot(){ curl -s -o "$S/$2.json" -w '%{http_code}' -m 60 -X POST "$API/api/blindkey/rotate-blind" -H 'Content-Type: application/json' -H "Authorization: Bearer $TOK" -d "$1"; }
-rot '{"ref":"DP-PWD-box-0001","target_host":"100.83.112.88"}' r1 >"$S/r1.code" & P1=$!
-sleep 0.5
+RA '{"ref":"DP-PWD-box-0001","target_host":"100.83.112.88"}' "$S/r1.json" >"$S/r1.code" & P1=$!
+sleep 1.5
 R2=$(rot '{"ref":"DP-PWD-box-0001","target_host":"100.83.112.88"}' r2)
 wait $P1; R1=$(cat "$S/r1.code")
 [ "$R1" = 200 ] && [ "$R2" = 409 ] && ok "(d) a second rotation of the same secret while one runs → 409; the first completes" || fail "(d) rotations: $R1 $(head -c 200 "$S/r1.json") / $R2 $(head -c 200 "$S/r2.json")"
