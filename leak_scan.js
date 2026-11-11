@@ -152,10 +152,12 @@ module.exports = function registerLeakScan(deps) {
     const spent = spendSingleUse(auth.did, 'scan-hits', ['pin'], auth, intent);
     if (spent) return res.status(spent.status || 403).json(spent);
     // Copies the same token found during its drain come with the first hit; their places were named by the scanner.
-    const drained = h.token_id ? db.prepare('SELECT found, created_at FROM leak_scan_drain_finds WHERE token_id = ? AND owner_did = ? ORDER BY id').all(h.token_id, auth.did) : [];
+    const rows = h.token_id ? db.prepare('SELECT found, created_at FROM leak_scan_drain_finds WHERE token_id = ? AND owner_did = ? ORDER BY id').all(h.token_id, auth.did) : [];
+    const truncated = rows.some(d => d.found === '"truncated"'), drained = rows.filter(d => d.found !== '"truncated"');
     res.json({ ok: true, id, token_label: h.token_label, created_at: h.created_at, found: JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk })),
       ...(drained.length ? { found_later_in_the_run: drained.flatMap(d => JSON.parse(d.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk, at: d.created_at }))),
-        note: 'places after the first are as the scanner named them' } : {}) });
+        note: 'places after the first are as the scanner named them' } : {}),
+      ...(truncated ? { found_later_truncated: true, truncated_note: 'more copies were found than are kept (50): rescan after cleaning these' } : {}) });
   });
   // POST /api/blindkey/leak-scan/descriptions {redact_ids?} — which of my descriptions and notes hold one of my vault
   // values (by name, never the value), and with redact_ids (rows picked from a check), cut the values out of those. The owner's own session with the PIN
@@ -307,9 +309,12 @@ module.exports = function registerLeakScan(deps) {
     let revoked = false;
     if (caller.draining) {
       // The rest of a run after its first hit: found copies go to the owner; the answer never varies with what was sent.
-      const kept = db.prepare('SELECT COUNT(*) AS n FROM leak_scan_drain_finds WHERE token_id = ?').get(caller.tokenRow.id).n;
-      if (hits.length && kept < 50) db.prepare('INSERT INTO leak_scan_drain_finds (token_id, owner_did, found, created_at) VALUES (?, ?, ?, ?)')
-        .run(caller.tokenRow.id, caller.did, JSON.stringify(hits.slice(0, 200).map(h => ({ name: h.name, ref: h.ref, chunk: h.chunk }))), nowIso());
+      // Written after the answer has gone (setImmediate): a hit costs the request no more time than a miss (#92 L).
+      const found = hits.length ? JSON.stringify(hits.slice(0, 200).map(h => ({ name: h.name, ref: h.ref, chunk: h.chunk }))) : null, tokId = caller.tokenRow.id, owner = caller.did;
+      if (found) setImmediate(() => { try {
+        const kept = db.prepare('SELECT COUNT(*) AS n FROM leak_scan_drain_finds WHERE token_id = ?').get(tokId).n;
+        if (kept < 51) db.prepare('INSERT INTO leak_scan_drain_finds (token_id, owner_did, found, created_at) VALUES (?, ?, ?, ?)').run(tokId, owner, kept < 50 ? found : '"truncated"', nowIso());
+      } catch (_) {} });
       db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
         .run('leak_scan', caller.did, null, null, JSON.stringify({ bytes, chunks: chunks.length, hits: hits.length, token_id: caller.tokenRow.id, draining: true }));
       return res.json({ ok: true, scanned_bytes: bytes, leak: true, token_revoked: true, draining: true, already_found: true,
