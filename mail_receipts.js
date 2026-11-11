@@ -24,6 +24,7 @@ const RANK = { accepted: 0, queued: 0, scheduled: 0, sent: 1, delivery_delayed: 
 const AS_STATUS = { opened: 'delivered', clicked: 'delivered', queued: 'accepted', scheduled: 'accepted' };
 const TERMINAL = new Set(['bounced', 'failed', 'suppressed', 'complained']);
 const REFRESH_COOLDOWN_MS = 60 * 1000, REFRESH_PER_DID_HOUR = 30;
+const STALE_CLAIM_MS = 5 * 60 * 1000;
 const SIG_TOLERANCE_SEC = 300;
 
 module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerIdentity, getReadIdentity, logSecurityEvent, approvals, createEmailTransport, operatorAllowed, publicApi }) {
@@ -77,6 +78,10 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     // A client key is claimed before anything is sent: a second request with the same key at the same moment finds the
     // claim (409) instead of sending again (#90 re-review).
     if (clientKey) {
+      // A claim left by a send that died mid-way (a crash between claim and answer) is abandoned after 5 minutes: the
+      // key can be used again rather than answering 409 for ever. A send takes seconds; Resend's own idempotency on the
+      // same send id still stops a duplicate if the dead one did reach it.
+      db.prepare("DELETE FROM email_receipts WHERE did = ? AND client_key = ? AND status = 'sending' AND created_at < ?").run(did, clientKey, new Date(Date.now() - STALE_CLAIM_MS).toISOString());
       try {
         db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, status, events, created_at, updated_at, client_key)
                     VALUES (?, ?, ?, ?, ?, ?, 'pending', 'sending', '[]', ?, ?, ?)`).run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, now(), now(), clientKey);
@@ -126,6 +131,7 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
       const sameTo = String(b.to || '').split(',').map(x => x.trim()).filter(Boolean).join(', ') === r.to_addr;
       const sameSubject = crypto.createHash('sha256').update(String(b.subject || '')).digest('hex') === r.subject_sha256;
       if (!sameTo || !sameSubject) return res.status(422).json({ error: 'this Idempotency-Key was used for a different message', send_id: r.send_id });
+      if (r.status === 'sending' && Date.parse(r.created_at) < Date.now() - STALE_CLAIM_MS) return next();   // abandoned: send() clears it
       if (r.status === 'sending') return res.status(409).json({ error: 'a send with this Idempotency-Key is still in progress; ask again shortly', send_id: r.send_id });
       return res.json({ ok: true, replayed: true, billed: 0, send_id: r.send_id, provider: r.provider, resend_id: r.provider === 'resend' ? r.provider_id : null,
         message_id: r.message_id, status: r.status, status_url: `/api/email/sends/${r.send_id}` });
