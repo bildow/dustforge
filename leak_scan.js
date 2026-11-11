@@ -84,34 +84,59 @@ module.exports = function registerLeakScan(deps) {
   // address"). Never the @dustforge.com mailbox: an agent signed in as the owner can read it, and file:lines must not reach
   // it (#45 re-review). First the owner's oldest catch-all forwarding address that has been active for 48 hours (a
   // younger rule may not be the owner's yet: forwardFresh in server.js), else the recovery email. None: no mail.
+  // Item 6b (forward rules need the PIN) went live 2026-11-07: a rule activated before that could have been made by anything
+  // holding the session token, so only later ones count (#95 review M2).
+  const PIN_GATED_FORWARD_SINCE = '2026-11-07T00:00:00Z';
+  const internalMailbox = (e) => /@dustforge\.com$/.test(String(e || '').trim().toLowerCase().replace(/\.+$/, ''));
   function reportDestination(did) {
-    let to = null, kind = null;
     try {
-      const f = db.prepare("SELECT forward_to FROM forward_relays WHERE did = ? AND status = 'active' AND COALESCE(filter_from,'*') = '*' AND julianday(COALESCE(activated_at, created_at)) <= julianday('now', '-2 days') ORDER BY julianday(COALESCE(activated_at, created_at)) ASC LIMIT 1").get(did);
-      if (f && f.forward_to) { to = f.forward_to; kind = 'forwarding'; }
+      const rules = db.prepare(`SELECT id, forward_to FROM forward_relays WHERE did = ? AND status = 'active' AND COALESCE(filter_from,'*') = '*'
+          AND activated_at IS NOT NULL AND julianday(activated_at) >= julianday(?) AND julianday(activated_at) <= julianday('now', '-2 days')
+          ORDER BY julianday(activated_at) ASC`).all(did, PIN_GATED_FORWARD_SINCE);
+      const f = rules.find(r => r.forward_to && !internalMailbox(r.forward_to));
+      if (f) return { to: f.forward_to, kind: 'forwarding', rule_id: f.id, masked: maskEmail(f.forward_to) };
     } catch (_) {}
-    if (!to) {
-      const w = db.prepare('SELECT recovery_email FROM identity_wallets WHERE did = ?').get(did) || {};
-      const r = String(w.recovery_email || '').trim();
-      if (r && !/@dustforge\.com$/i.test(r)) { to = r; kind = 'recovery'; }
-    }
-    return to ? { to, kind, masked: maskEmail(to) } : null;
+    const w = db.prepare('SELECT recovery_email FROM identity_wallets WHERE did = ?').get(did) || {};
+    const r = String(w.recovery_email || '').trim();
+    if (!r || internalMailbox(r)) return null;
+    // A recovery address set in the last 48 hours may not be the owner's (#95 review): not a destination yet.
+    try { if (db.prepare("SELECT 1 FROM recovery_email_history WHERE did = ? AND julianday(replaced_at) > julianday('now', '-2 days') LIMIT 1").get(did)) return null; } catch (_) {}
+    return { to: r, kind: 'recovery', rule_id: null, masked: maskEmail(r) };
   }
   const maskEmail = (e) => { const [u, d] = String(e).split('@'); return (u ? u[0] + '***' : '***') + '@' + (d || ''); };
+  // A location as the scanner named it, reduced to path-like characters for the report and the mail: a scan token chooses
+  // these labels, and the mail goes to an outside inbox under DemiPass's name (#95 review: no planted links).
+  const place = (w) => String(w || '').replace(/[^\w./:@#+,=~-]/g, '_').replace(/:\/\//g, ':_/').slice(0, 200) || '(no location given)';
+  const MAX_HITS = 50;
   function hitsReport(did, days) {
-    const rows = db.prepare("SELECT id, token_label, token_id, found, created_at FROM leak_scan_hits WHERE owner_did = ? AND created_at >= ? ORDER BY id DESC LIMIT 50")
-      .all(did, new Date(Date.now() - days * 86400000).toISOString());
-    const hits = rows.map(h => ({ id: h.id, created_at: h.created_at, token: h.token_label || ('token ' + h.token_id),
-      found: JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk })) }));
-    const lines = [`DemiPass leak scan: where values were found (last ${days} days, ${hits.length} hit${hits.length === 1 ? '' : 's'})`, ''];
+    const rows = db.prepare("SELECT id, token_label, token_id, found, created_at FROM leak_scan_hits WHERE owner_did = ? AND created_at >= ? ORDER BY id DESC LIMIT ?")
+      .all(did, new Date(Date.now() - days * 86400000).toISOString(), MAX_HITS + 1);
+    const truncated = rows.length > MAX_HITS;
+    let laterTruncated = false;
+    const hits = rows.slice(0, MAX_HITS).map(h => {
+      const found = JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: place(f.chunk) }));
+      // The rest of that run (#95 review M1): the copies found after the first, as the per-hit route shows them.
+      const later = [];
+      if (h.token_id) for (const d of db.prepare('SELECT found FROM leak_scan_drain_finds WHERE token_id = ? AND owner_did = ? ORDER BY id').all(h.token_id, did)) {
+        let v; try { v = JSON.parse(d.found); } catch (_) { continue; }
+        if (v === 'truncated') { laterTruncated = true; continue; }
+        if (Array.isArray(v)) for (const f of v) later.push({ name: f.name, ref: f.ref, where: place(f.chunk) });
+      }
+      return { id: h.id, created_at: h.created_at, token: h.token_label || ('token ' + h.token_id), found, found_later_in_the_run: later };
+    });
+    const copies = hits.reduce((n, h) => n + h.found.length + h.found_later_in_the_run.length, 0);
+    const lines = [`DemiPass leak scan: where values were found (last ${days} days, ${hits.length} hit${hits.length === 1 ? '' : 's'}, ${copies} cop${copies === 1 ? 'y' : 'ies'})`, ''];
     for (const h of hits) {
-      lines.push(`#${h.id}  ${String(h.created_at).slice(0, 16).replace('T', ' ')} UTC  by scan token "${h.token}"`);
-      for (const f of h.found) lines.push(`  - ${f.name} (${f.ref || 'no ref'}) in ${f.where || '(no location given)'}`);
+      lines.push(`#${h.id}  ${String(h.created_at).slice(0, 16).replace('T', ' ')} UTC  by scan token "${place(h.token)}"`);
+      for (const f of h.found) lines.push(`  - ${f.name} (${f.ref || 'no ref'}) in ${f.where}`);
+      for (const f of h.found_later_in_the_run) lines.push(`  - ${f.name} (${f.ref || 'no ref'}) in ${f.where}   (later in the same run)`);
       lines.push('');
     }
+    if (truncated) lines.push(`More than ${MAX_HITS} hits in this window: only the latest ${MAX_HITS} are listed. Clean these, then look again.`);
+    if (laterTruncated) lines.push('More copies were found in a run than are kept (50): rescan after cleaning these.');
     lines.push('No values are in this report: names, refs and where they were found only.');
     lines.push('Next: remove each copy at that place, rotate those secrets, then approve a new scan token.');
-    return { hits, text: lines.join('\n') };
+    return { hits, truncated, later_truncated: laterTruncated, text: lines.join('\n') };
   }
   const newToken = () => 'dpscan_' + crypto.randomBytes(24).toString('base64url');
   function mint(ownerDid, label, requestId) {
@@ -172,7 +197,7 @@ module.exports = function registerLeakScan(deps) {
     res.json({ ok: true, tokens: db.prepare('SELECT id, label, created_at, revoked_at, revoked_reason, last_used_at, bytes_today, requests_today, day FROM leak_scan_tokens WHERE owner_did = ? ORDER BY id DESC').all(auth.did),
       ...(person ? { hits: db.prepare('SELECT id, token_id, token_label, found, created_at FROM leak_scan_hits WHERE owner_did = ? ORDER BY id DESC LIMIT 20').all(auth.did)
         .map(h => ({ id: h.id, token_id: h.token_id, token_label: h.token_label, created_at: h.created_at, secrets: [...new Set(JSON.parse(h.found).map(f => f.name))] })),
-        report_to: (() => { const d = reportDestination(auth.did); return d ? { masked: d.masked, kind: d.kind } : null; })() } : {}) });
+        report_to: (() => { const d = reportDestination(auth.did); return d ? { masked: d.masked, address: d.to, kind: d.kind } : null; })() } : {}) });
   });
   // POST /api/blindkey/leak-scan/hits-report {days?, mail?} — where EVERY hit of the last `days` (default 30, ≤ 90) was
   // found, behind one approval: the PIN or the linked phone's biometric (intent scan-hits:0, "all"). With mail: true the
@@ -196,12 +221,14 @@ module.exports = function registerLeakScan(deps) {
       else {
         let ok = false;
         try { ok = deps.sendMail ? Boolean(await deps.sendMail({ to: d.to, subject: `DemiPass: where the leak scanner found values (${report.hits.length} hit${report.hits.length === 1 ? '' : 's'})`, text: report.text })) : false; } catch (_) { ok = false; }
-        mailed = { sent: ok, to: d.masked, kind: d.kind, ...(ok ? {} : { error: 'the mail could not be sent: try again' }) };
+        mailed = { sent: ok, to: d.masked, kind: d.kind, rule_id: d.rule_id, ...(ok ? {} : { error: 'the mail could not be sent: try again' }) };
       }
     }
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
-      .run('leak_report', auth.did, null, null, JSON.stringify({ days, hits: report.hits.length, mailed: mailed ? { sent: mailed.sent, kind: mailed.kind || null } : null }));
-    res.json({ ok: true, days, hits: report.hits, text: report.text, mailed });
+      .run('leak_report', auth.did, null, null, JSON.stringify({ days, hits: report.hits.length, truncated: report.truncated,
+        mailed: mailed ? { sent: mailed.sent, to: mailed.to || null, kind: mailed.kind || null, rule_id: mailed.rule_id || null } : null }));
+    if (mailed) delete mailed.rule_id;
+    res.json({ ok: true, days, hits: report.hits, truncated: report.truncated, later_truncated: report.later_truncated, text: report.text, mailed });
   });
   // POST /api/blindkey/leak-scan/hits/:id — where a hit was found (file:lines), for the owner with the PIN
   // (intent scan-hits:<id>).

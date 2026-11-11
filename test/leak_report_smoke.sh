@@ -59,6 +59,7 @@ NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z); OLD=$(date -u -d '-60 days' +%Y-%m-%dT%H
 X "INSERT INTO leak_scan_hits (owner_did, token_id, token_label, found, created_at) VALUES ('$OWN', 1, 'pane-daily', '[{\"name\":\"stalwart-aaron-imap\",\"ref\":\"DP-PWD-stalwart-1\",\"chunk\":\"e9361b18.jsonl:41-41\"},{\"name\":\"dyadic-handler-openrouter\",\"ref\":\"DP-API-dyadicha-2\",\"chunk\":\"e9361b18.jsonl:9-9\"}]', '$NOW')"
 X "INSERT INTO leak_scan_hits (owner_did, token_id, token_label, found, created_at) VALUES ('$OWN', 2, 'deploy-gate', '[{\"name\":\"forgejo-aaron-web-login\",\"ref\":\"DP-PWD-forgejo-3\",\"chunk\":\"ops/notes.md:12-12\"}]', '$NOW')"
 X "INSERT INTO leak_scan_hits (owner_did, token_id, token_label, found, created_at) VALUES ('$OWN', 3, 'old', '[{\"name\":\"ancient\",\"ref\":\"DP-X\",\"chunk\":\"old.md:1-1\"}]', '$OLD')"
+X "INSERT INTO leak_scan_drain_finds (token_id, owner_did, found, created_at) VALUES (1, '$OWN', '[{\"name\":\"stalwart-aaron-imap\",\"ref\":\"DP-PWD-stalwart-1\",\"chunk\":\"other-pane.jsonl:77-77\"},{\"name\":\"stalwart-aaron-imap\",\"ref\":\"DP-PWD-stalwart-1\",\"chunk\":\"rotate at https://evil.example/x <b>now</b>\"}]', '$NOW')"
 R=/api/blindkey/leak-scan/hits-report
 
 call POST $R "$A" '{}'
@@ -68,6 +69,8 @@ PIN scan-hits:0; call POST $R "$A" '{}'
 TXT=$(echo "$BODY" | J text)
 grep -q "e9361b18.jsonl:41-41" <<<"$TXT" && grep -q "e9361b18.jsonl:9-9" <<<"$TXT" && grep -q "ops/notes.md:12-12" <<<"$TXT" && grep -q "stalwart-aaron-imap (DP-PWD-stalwart-1)" <<<"$TXT" \
   && ok "the plain-text report names every secret, its ref and where it was found" || fail "text: $TXT"
+grep -q "other-pane.jsonl:77-77   (later in the same run)" <<<"$TXT" && ok "copies found later in the same run are in it too (#95 review M1)" || fail "drain: $TXT"
+! grep -q "https://" <<<"$TXT" && ! grep -q "<b>" <<<"$TXT" && ok "a location a scan token named cannot carry a link or markup into the report" || fail "planted link: $(grep -n evil <<<"$TXT")"
 [ "$(echo "$BODY" | J mailed)" = None ] && ok "…and mails nothing unless asked" || fail "mailed unasked"
 call POST $R "$A" '{}'; [ "$CODE" = 403 ] && ok "the approval is used up: another report asks again" || fail "replay: $CODE"
 PIN scan-hits:0; call POST $R "$A" '{"days":90}'; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["hits"]))')" = 3 ] && ok "days: 90 reaches the older hit" || fail "days: $BODY"
@@ -79,16 +82,26 @@ PIN scan-hits:0; call POST $R "$A" '{"mail":true}'
 [ "$(echo "$BODY" | J mailed.sent)" = False ] && grep -qi "no forwarding" <<<"$(echo "$BODY" | J mailed.error)" && [ ! -s "$S/mail.log" ] && ok "mail asked, nowhere to send: not sent, and it says why" || fail "no dest mail: $BODY"
 X "UPDATE identity_wallets SET recovery_email='aaron.backup@dustforge.com' WHERE did='$OWN'"
 call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to)" = None ] && ok "a @dustforge.com recovery address is never used (agents can read that mailbox)" || fail "df recovery: $BODY"
+X "UPDATE identity_wallets SET recovery_email='aaron.backup@dustforge.com.' WHERE did='$OWN'"
+call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to)" = None ] && ok "…nor with a trailing dot" || fail "df trailing dot: $BODY"
 X "UPDATE identity_wallets SET recovery_email='aaron.backup@example.org' WHERE did='$OWN'"
+X "CREATE TABLE IF NOT EXISTS recovery_email_history (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT, email TEXT, replaced_at TEXT)"
+X "INSERT INTO recovery_email_history (did, email, replaced_at) VALUES ('$OWN', 'old@example.org', '$NOW')"
+call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to)" = None ] && ok "a recovery email changed in the last 48 h is not a destination yet" || fail "fresh recovery: $BODY"
+X "UPDATE recovery_email_history SET replaced_at='2026-10-01T00:00:00.000Z' WHERE did='$OWN'"
 call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to.masked)" = "a***@example.org" ] && [ "$(echo "$BODY" | J report_to.kind)" = recovery ] && ok "recovery email as the fallback, masked in the listing" || fail "recovery dest: $BODY"
 X "INSERT INTO forward_relays (did, forward_to, filter_from, status, activated_at) VALUES ('$OWN', 'fresh.rule@example.net', '*', 'active', datetime('now'))"
 call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to.kind)" = recovery ] && ok "a forwarding rule younger than 48 h is not used" || fail "fresh rule used: $BODY"
-X "INSERT INTO forward_relays (did, forward_to, filter_from, status, activated_at) VALUES ('$OWN', 'aaron.fwd@example.com', '*', 'active', datetime('now','-5 days'))"
-call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to.masked)" = "a***@example.com" ] && [ "$(echo "$BODY" | J report_to.kind)" = forwarding ] && ok "a forwarding address active 5 days is the destination" || fail "fwd dest: $BODY"
+X "INSERT INTO forward_relays (did, forward_to, filter_from, status, activated_at) VALUES ('$OWN', 'legacy.rule@example.com', '*', 'active', '2026-10-01 00:00:00')"
+X "INSERT INTO forward_relays (did, forward_to, filter_from, status, activated_at) VALUES ('$OWN', 'agent-box@dustforge.com', '*', 'active', datetime('now','-3 days'))"
+call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to.kind)" = recovery ] && ok "a rule from before the PIN gate (11-07), and one to a @dustforge.com mailbox, are not used (#95 review M2)" || fail "legacy/df rule used: $BODY"
+X "INSERT INTO forward_relays (did, forward_to, filter_from, status, activated_at) VALUES ('$OWN', 'aaron.fwd@example.com', '*', 'active', datetime('now','-3 days', '+1 minute'))"
+call GET /api/demipass/leak-scan/tokens "$A"; [ "$(echo "$BODY" | J report_to.address)" = "aaron.fwd@example.com" ] && [ "$(echo "$BODY" | J report_to.kind)" = forwarding ] && ok "a forwarding address active 3 days (under the PIN gate) is the destination, shown in full to the owner" || fail "fwd dest: $BODY"
 PIN scan-hits:0; call POST $R "$A" '{"mail":true}'
 [ "$(echo "$BODY" | J mailed.sent)" = True ] && [ "$(echo "$BODY" | J mailed.to)" = "a***@example.com" ] && ok "mail: true → emailed, the reply masks the address" || fail "mail: $BODY"
 sleep 0.5
 grep -qi "RCPT TO:<aaron.fwd@example.com>" "$S/mail.log" && ! grep -qi "RCPT TO:<[^>]*dustforge.com>" "$S/mail.log" && ok "the mail went to the forwarding address only, not the mailbox" || fail "rcpt: $(grep -i rcpt "$S/mail.log")"
+[ "$(Q "SELECT json_extract(detail,'\$.mailed.to') FROM blindkey_events WHERE event_type='leak_report' ORDER BY id DESC LIMIT 1")" = "a***@example.com" ] && ok "the audit row records where the report was mailed" || fail "audit: $(Q "SELECT detail FROM blindkey_events WHERE event_type='leak_report' ORDER BY id DESC LIMIT 1")"
 grep -q "e9361b18.jsonl:41-41" "$S/mail.log" && grep -q "ops/notes.md:12-12" "$S/mail.log" && ok "…and carries the report" || fail "mail body: $(head -c 600 "$S/mail.log")"
 
 # who may ask

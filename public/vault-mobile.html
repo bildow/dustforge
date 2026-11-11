@@ -3091,7 +3091,7 @@ async function loadScanTokens(){
       // One approval for all of them: where every leak was found, optionally mailed to the forwarding address.
       +((r.hits||[]).length?'<div style="margin-top:0.5rem;padding:0.5rem;border:1px solid var(--border);border-radius:8px">'
         +'<button class="btn-primary" onclick="leakReport()" style="width:100%;font-size:0.75rem">Show where all leaks were found (last 30 days)</button>'
-        +(r.report_to?'<label style="display:flex;gap:0.4rem;align-items:center;margin-top:0.4rem;font-size:0.72rem"><input type="checkbox" id="leak-mail" style="width:auto;margin:0"> Also email the report to '+esc(r.report_to.masked)+' ('+(r.report_to.kind==='forwarding'?'your forwarding address':'your recovery email')+')</label>'
+        +(r.report_to?'<label style="display:flex;gap:0.4rem;align-items:center;margin-top:0.4rem;font-size:0.72rem"><input type="checkbox" id="leak-mail" data-to="'+esc(r.report_to.address||r.report_to.masked)+'" style="width:auto;margin:0"> Also email the report to '+esc(r.report_to.address||r.report_to.masked)+' ('+(r.report_to.kind==='forwarding'?'your forwarding address':'your recovery email')+')</label>'
           :'<div style="font-size:0.68rem;color:var(--text3);margin-top:0.3rem">No forwarding address (active 48 hours) or recovery email on file, so the report shows here only.</div>')
         +'<div id="leak-report-out" style="margin-top:0.4rem"></div></div>':'');
   }catch(e){ if(!sessionEnded(e)) el.textContent=e.message; }
@@ -3104,7 +3104,7 @@ async function leakReport(){
   const out=document.getElementById('leak-report-out'); const box=document.getElementById('leak-mail'); const mail=!!(box&&box.checked);
   if(out){ out.style.color='var(--text3)'; out.textContent='Waiting for your approval…'; }
   try{
-    const r=await apiGated('POST','/api/blindkey/leak-scan/hits-report',{days:30,mail},'Show where every leak was found'+(mail?' and email the report':'')+'? Your PIN or phone approves it.');
+    const r=await apiGated('POST','/api/blindkey/leak-scan/hits-report',{days:30,mail},'Show where every leak was found'+(mail?' and email the report to '+String((box&&box.dataset&&box.dataset.to)||'your forwarding address'):'')+'? Your PIN or phone approves it.');
     leakReportText=r.text||'';
     if(!out) return;
     out.style.color='var(--text)';
