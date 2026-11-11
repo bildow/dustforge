@@ -128,6 +128,21 @@ call POST /api/demipass/request-token "$B" '{"ref":"'$REF'","context":"brain-pan
 call POST /api/demipass/use "$B" '{"use_token":"'$T'","params":{"url":"https://server.dustroot.com/api/panel/brain","method":"GET"}}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "no methods are allowed" && ok "B: GET now refused (nothing allowed)" || fail "B none: $CODE $BODY"
 
+# ── a scope edit's approval is bound to that scope: a sibling with the same pattern gets its own request ──
+pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_name":"dash-token","context_name":"brain-panel-2","action_type":"http_header","target_url_pattern":"https://server.dustroot.com/api/panel/brain","allowed_methods":["GET"]}'
+C2=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID AND context_name='brain-panel-2'"); [ "$CODE" = 200 ] && [ -n "$C2" ] || fail "sibling add: $CODE $BODY"
+call PATCH /api/demipass/context/$CID "$AG" '{"allowed_methods":["GET","POST"]}'; R1=$(echo "$BODY" | J approval_id)
+call PATCH /api/demipass/context/$C2 "$AG" '{"allowed_methods":["GET","POST"]}'; R2=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ -n "$R1" ] && [ "$R1" != "$R2" ] && [ "$(Q "SELECT json_extract(bound_call,'$.body.context_id') FROM use_approvals WHERE id=$R2")" = "$C2" ] && ok "the same widening on a sibling scope is a different request, bound to the scope id ($R1 vs $R2)" || fail "sibling binding: $CODE $R1 $R2 $BODY"
+
+# ── http_body honours the list too ──
+pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_name":"dash-token","context_name":"put-body","action_type":"http_body","target_url_pattern":"https://repo.dustroot.com/hook","allowed_methods":["PUT"]}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J context.allowed_methods.0)" = PUT ] || fail "body scope add: $CODE $BODY"
+H1=$(hits)
+call POST /api/demipass/request-token "$AG" '{"ref":"'$REF'","context":"put-body","action":"http_body","target_url":"https://repo.dustroot.com/hook"}'; T=$(echo "$BODY" | J use_token)
+call POST /api/demipass/use "$AG" '{"use_token":"'$T'","params":{"url":"https://repo.dustroot.com/hook","method":"POST","body_template":{"k":"{{secret}}"}}}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "allows only PUT" && [ "$(hits)" = "$H1" ] && ok "http_body: POST on a PUT-only scope → 403, no upstream hit" || fail "body post: $CODE $(hits)/$H1 $BODY"
+
 # ── rotation carries the list (the ref moves to the new version) ──
 call POST /api/blindkey/rotate "$A" '{"name":"dash-token","new_value":"dash-token-value-2-9b1e4c"}'
 NSID=$(Q "SELECT id FROM blindkey_secrets WHERE did='$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")' AND name LIKE 'dash-token%' AND status='active' ORDER BY id DESC LIMIT 1")

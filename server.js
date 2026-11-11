@@ -3728,7 +3728,7 @@ function scopeChangeGate(req, res, secret, what, use) {
   const d = auth.decoded || {};
   const g = useApprovals.gate({ id: secret.id, did: secret.did, name: secret.name, ref_code: secret.ref_code, security_depth: 'critical', service_key: null, wrap_state: null },
     { did: auth.did, label: d.agent_label || d.username || '' },
-    { kind: 'scope', action: use.action, targetUrl: use.targetUrl || '', targetHost: use.targetHost || '', params: req.body || {} }, req.body || {});
+    { kind: 'scope', action: use.action, targetUrl: use.targetUrl || '', targetHost: use.targetHost || '', params: use.params || req.body || {} }, req.body || {});
   if (!g.ok) { res.status(g.status).json(g.body); return false; }
   return true;
 }
@@ -5403,6 +5403,10 @@ async function useRoute(req, res) {
           // FIX #4: use ONLY the token's pre-validated URL, never caller override
           const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'target_url must be set on the use-token for http_body action' });
+          {   // a method off the scope's list is refused before anything connects (#97 review)
+            const why = methodRefusal(tokenRow.context_id, bodyMethod);
+            if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'http_body', target: effectiveUrl, ip: req.ip, context: { secret: secret.name, method: bodyMethod } }); return res.status(403).json({ error: why }); }
+          }
 
           let urlHost;
           try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
@@ -6390,7 +6394,9 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     && (nextMethods === row.allowed_methods || (nextMethods !== null && (row.allowed_methods === null || subset(nextMethods, row.allowed_methods))));
   if (!narrowing && actor.mode !== 'admin') {
     const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
-    if (!scopeChangeGate(req, res, secret, 'scope', { action: 'context-edit', targetUrl: HTTP_SCOPE_ACTIONS.has(next.action_type) ? (next.target_url_pattern || '*') : '', targetHost: HTTP_SCOPE_ACTIONS.has(next.action_type) ? '' : (next.target_host_pattern || '*') })) return;
+    // The approval binds this scope's id and name (#97 review: two scopes with one pattern must not share an approval).
+    if (!scopeChangeGate(req, res, secret, 'scope', { action: 'context-edit', targetUrl: HTTP_SCOPE_ACTIONS.has(next.action_type) ? (next.target_url_pattern || '*') : '', targetHost: HTTP_SCOPE_ACTIONS.has(next.action_type) ? '' : (next.target_host_pattern || '*'),
+      params: { ...(req.body || {}), context_id: contextId, context_name: row.context_name } })) return;
   }
 
   const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
