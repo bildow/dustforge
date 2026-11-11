@@ -112,6 +112,14 @@ call POST /api/demipass/use "$B" '{"use_token":"'$T'","params":{"url":"https://s
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "allows only GET" && ok "B: POST → 403, named" || fail "B post: $CODE $BODY"
 [ "$(egress $SID)" = $((E0 + 1)) ] && [ "$(hits)" = $((H0 + 1)) ] && ok "…before any connection: no egress row, no upstream hit" || fail "post leaked: egress $(egress $SID) hits $(hits)"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='method_not_allowed'")" = 1 ] && ok "a method_not_allowed event" || fail "event"
+# on an elevated secret the refusal comes before the owner is asked: no approval request is made for a call that cannot run
+call POST /api/demipass/gate-policy "$A" '{"ref":"'$REF'","security_depth":"elevated"}'; [ "$CODE" = 200 ] || fail "set elevated: $CODE $BODY"
+call POST /api/demipass/request-token "$B" '{"ref":"'$REF'","context":"brain-panel","target_url":"https://server.dustroot.com/api/panel/brain"}'; T=$(echo "$BODY" | J use_token)
+call POST /api/demipass/use "$B" '{"use_token":"'$T'","params":{"url":"https://server.dustroot.com/api/panel/brain","method":"POST"}}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "allows only GET" && [ "$(Q "SELECT COUNT(*) FROM use_approvals WHERE kind='use'")" = 0 ] && ok "elevated: POST refused before any approval is requested" || fail "elevated post: $CODE $(Q "SELECT COUNT(*) FROM use_approvals WHERE kind='use'") $BODY"
+call POST /api/demipass/use "$AG" '{"ref":"'$REF'","context":"brain-panel","params":{"url":"https://server.dustroot.com/api/panel/brain","method":"POST"}}'
+[ "$CODE" = 403 ] && [ "$(Q "SELECT COUNT(*) FROM use_approvals WHERE kind='use'")" = 0 ] && ok "…on the one-call path too" || fail "elevated direct post: $CODE $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET security_depth='standard' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$SID"   # back to standard (lowering takes PIN + 2FA; test only)
 call POST /api/demipass/request-token "$B" '{"ref":"'$REF'","context":"brain-panel","target_url":"https://server.dustroot.com/api/panel/brain2b"}'
 [ "$CODE" = 403 ] && ok "B: the sibling path /api/panel/brain2b → 403 (exact pattern)" || fail "B brain2b: $CODE $BODY"
 call POST /api/demipass/request-token "$B" '{"ref":"'$REF'","context":"default","target_url":"https://repo.dustroot.com/anything"}'

@@ -5284,6 +5284,16 @@ async function useRoute(req, res) {
           return res.status(403).json({ error: why });
         }
       }
+      // So is a method off the scope's list (#97 review: the owner is never asked to approve a call that cannot run).
+      if (action === 'http_header' || action === 'http_body') {
+        const m = action_params.method || (action === 'http_body' ? 'POST' : 'GET');
+        const why = methodRefusal(tokenRow.context_id, m);
+        if (why) {
+          db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
+          logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: action, target: target_url, ip: req.ip, context: { secret: secret.name, method: m } });
+          return res.status(403).json({ error: why });
+        }
+      }
       // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call
       // (the raw body, top level and params as sent — see use_approvals.js).
       let approvedElevatedUse = false;
@@ -5697,6 +5707,11 @@ async function useRoute(req, res) {
     return res.status(403).json({ error: ctxCheck.error });
   }
   // A refused command neither runs nor counts against the scope's max_uses.
+  if (action === 'http_header' || action === 'http_body') {   // nor a method off the scope's list (#97 review)
+    const m = (params && params.method) || (req.body && req.body.method) || (action === 'http_body' ? 'POST' : 'GET');
+    const why = methodRefusal(ctxCheck.context_id, m);
+    if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: action, target: targetUrl, ip: req.ip, context: { secret: secret.name, method: m } }); return res.status(403).json({ error: why }); }
+  }
   if (action === 'ssh_exec') {
     const b2 = req.body || {};
     const why = commandRefusal(ctxCheck.context_id, b2.command, { sudo: b2.sudo, stdin: b2.stdin });
