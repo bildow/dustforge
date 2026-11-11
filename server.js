@@ -3394,7 +3394,7 @@ setInterval(() => {
 // Cleanup expired delegations every 60 seconds
 setInterval(() => {
   try {
-    db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at != '' AND expires_at < datetime('now')").run();
+    db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at != '' AND datetime(expires_at) < datetime('now')").run();
   } catch (e) { /* ignore cleanup errors */ }
 }, 60000);
 
@@ -4871,6 +4871,19 @@ function requestUseTokenHandler(req, res) {
         AND (context_id IS NULL OR context_id = ?)
       ORDER BY context_id DESC LIMIT 1
     `).get(owner_did, callerDid, secret.id, ctxId);
+    // Expired by time (the sweep runs on a schedule), or an outside agent's grant whose ground is gone: the agent left the
+    // vouching owner's fleet, or that owner and this person are no longer paired (#94 re-review L2/L4). Ended here.
+    if (delegation && delegation.expires_at && new Date(delegation.expires_at).getTime() <= Date.now()) {
+      db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ? AND status = 'active'").run(delegation.id);
+      delegation = null;
+    }
+    if (delegation) {
+      const ask = db.prepare("SELECT * FROM demipass_access_requests WHERE delegation_id = ? AND via_owner_did IS NOT NULL ORDER BY id DESC LIMIT 1").get(delegation.id);
+      if (ask && !outsideAskValid(ask)) {
+        db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ? AND status = 'active'").run(delegation.id);
+        delegation = null;
+      }
+    }
 
     if (!delegation) {
       db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
@@ -10412,13 +10425,6 @@ app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
     if (db.prepare("SELECT COUNT(*) AS n FROM demipass_access_requests WHERE owner_did = ? AND status = 'pending' AND via_owner_did IS NOT NULL").get(ownerRow.did).n >= OUTSIDE_PENDING_MAX) {
       return res.status(429).json({ error: `${ownerRow.username} has too many requests from agents outside their fleet waiting` });
     }
-    // The owner whose name the agent carries approves the ask first, in their app (#94 review M3): only then does the
-    // person see it.
-    const A = useApprovals;
-    const me = (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(auth.did) || {}).username || 'agent';
-    const g = A.gateService({ key: 'svc:demipass:outside-ask', name: `@${me} asks @${ownerRow.username} for ${cleanLabel(secret, 60) || 'a secret'}`, approverDid: viaOwner.owner_did, depth: 'elevated' },
-      { did: auth.did, label: cleanLabel(me, 40) }, { action: 'outside-ask', targetHost: ownerRow.username, params: { person: ownerRow.username, secret: cleanLabel(secret, 100), reason: cleanLabel(String(reason), 500) } }, req.body || {});
-    if (!g.ok) { const b = { ...(g.body || {}) }; delete b.owner; if (g.status === 202) b.next = `${viaOwner.username} approves this ask in their DemiPass app first; then call again with approval_id`; return res.status(g.status).json(b); }
   }
   expireAccessRequests();
   const hint = cleanLabel(secret, 100).trim(), why = cleanLabel(reason, 500).trim();
@@ -10428,6 +10434,16 @@ app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
   if (pair >= ACCESS_REQUEST_MAX_PENDING_PER_PAIR) return res.status(429).json({ error: `you already have ${pair} requests waiting on ${ownerRow.username}` });
   const all = db.prepare("SELECT COUNT(*) AS n FROM demipass_access_requests WHERE owner_did = ? AND status = 'pending'").get(ownerRow.did).n;
   if (all >= ACCESS_REQUEST_MAX_PENDING_PER_OWNER) return res.status(429).json({ error: `${ownerRow.username} has too many requests waiting; try again later` });
+  // Only once every limit has passed is the owner's approval spent (#94 re-review L1).
+  if (viaOwner) {
+    // The owner whose name the agent carries approves the ask first, in their app (#94 review M3): only then does the
+    // person see it.
+    const A = useApprovals;
+    const me = (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(auth.did) || {}).username || 'agent';
+    const g = A.gateService({ key: 'svc:demipass:outside-ask', name: `@${me} asks @${ownerRow.username} for ${cleanLabel(secret, 60) || 'a secret'}`, approverDid: viaOwner.owner_did, depth: 'elevated' },
+      { did: auth.did, label: cleanLabel(me, 40) }, { action: 'outside-ask', targetHost: ownerRow.username, params: { person: ownerRow.username, secret: cleanLabel(secret, 100), reason: cleanLabel(String(reason), 500) } }, req.body || {});
+    if (!g.ok) { const b = { ...(g.body || {}) }; delete b.owner; if (g.status === 202) b.next = `${viaOwner.username} approves this ask in their DemiPass app first; then call again with approval_id`; return res.status(g.status).json(b); }
+  }
   const expiresAt = new Date(Date.now() + ACCESS_REQUEST_TTL_DAYS * 86400000).toISOString();
   const id = db.prepare('INSERT INTO demipass_access_requests (requester_did, owner_did, secret_hint, reason, expires_at, via_owner_did) VALUES (?, ?, ?, ?, ?, ?)')
     .run(auth.did, ownerRow.did, hint, why, expiresAt, viaOwner ? viaOwner.owner_did : null).lastInsertRowid;
