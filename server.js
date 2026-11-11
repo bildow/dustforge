@@ -468,8 +468,10 @@ function badBody(req, res, err) {
   }
   return res.status(err && err.status >= 400 && err.status < 500 ? err.status : 400).json(body);
 }
-app.use((req, res, next) => (req.path === '/api/stripe/webhook' || isLeakScanPath(req.path) ? next() : (isUsePath(req.path) ? _useJsonParser : _jsonParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
-app.use((req, res, next) => (req.path === '/api/stripe/webhook' ? next() : (isUsePath(req.path) ? _useUrlencodedParser : _urlencodedParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
+// Signed webhooks read their own raw body (the signature covers the exact bytes): Stripe, and Resend's mail events.
+const RAW_BODY_PATHS = new Set(['/api/stripe/webhook', '/api/email/webhooks/resend']);
+app.use((req, res, next) => (RAW_BODY_PATHS.has(req.path) || isLeakScanPath(req.path) ? next() : (isUsePath(req.path) ? _useJsonParser : _jsonParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
+app.use((req, res, next) => (RAW_BODY_PATHS.has(req.path) ? next() : (isUsePath(req.path) ? _useUrlencodedParser : _urlencodedParser)(req, res, (err) => (err ? badBody(req, res, err) : next()))));
 // A "not enough DD" (402) answer to an agent paying for itself tells it how to ask its fleet owner for a top-up
 // (network_routes.js). Not for people, worker/silicon tokens, or a charge someone else pays.
 function topupHintFor(req, body) {
@@ -2196,11 +2198,12 @@ app.post('/api/billing/topup', (req, res) => {
 
 // Order: authenticate (no charge) → headers → validate → reserve a cap slot → charge → send. A send the mail server
 // refuses is refunded (it never became mail) and its slot given back.
+// Mail receipts (mail_receipts.js): registered below, once approvals exist; the send route uses it at request time.
+let mailReceiptsApi = null;
 app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, rateLimitStandard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db), billing.billingMiddleware(db, 'email_send'), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
-    const t = createEmailTransport();
     const senderWallet = db.prepare("SELECT username FROM identity_wallets WHERE did = ?").get(req.identity.did);
     const un = senderWallet ? senderWallet.username : null;
     let fromAddr = un ? un + "@dustforge.com" : "noreply@dustforge.com";
@@ -2211,9 +2214,13 @@ app.post('/api/email/send', mailHeaders, billing.billingMiddleware(db, 'email_se
       if (local === un || local.endsWith('.' + un)) fromAddr = from;
     }
     const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
-    const info = await t.sendMail({ from: fromAddr, to, subject, text: injectedBody });
-    console.log(`[email] sent: ${fromAddr} -> ${to} token=${req.billing.token_jti || '-'} msgid=${(info && info.messageId) || '-'}`);
-    res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code), message_id: (info && info.messageId) || null });
+    // Sent through the receipts layer: Resend's API when a Resend key is configured (its email id comes back and is
+    // logged, returned and kept, so delivered/bounced/complained can be asked for later), else the SMTP transport.
+    const sent = await mailReceiptsApi.send({ did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody });
+    console.log(`[email] sent: ${fromAddr} -> ${to} token=${req.billing.token_jti || '-'} send=${sent.send_id} ${sent.provider}=${sent.provider_id || '-'} msgid=${sent.message_id || '-'}`);
+    res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code),
+      send_id: sent.send_id, provider: sent.provider, resend_id: sent.provider_id, message_id: sent.message_id, status: 'accepted',
+      status_url: `/api/email/sends/${sent.send_id}` });
   } catch(e) {
     console.error(`[email] failed: token=${req.billing.token_jti || '-'} ${e.message}`);
     // Refused by the mail server: it never became mail, so the charge comes back (same token id on the refund row).
@@ -8647,6 +8654,10 @@ const useApprovals = require('./use_approvals')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, cleanLabel, billing, sendMail: fleetRoutes.sendMail, deviceKeys, cryptoDepth,
 });
+// Mail receipts: every /api/email/send names the provider's message id; Resend's delivery events come back signed.
+mailReceiptsApi = require('./mail_receipts')({ app, db, rateLimitStandard, getBearerIdentity, logSecurityEvent, approvals: () => useApprovals,
+  createEmailTransport, operatorAllowed: (did) => require('./fleet_billing').operatorGrantAllowed(did),
+  publicApi: (process.env.PUBLIC_API_URL || 'https://api.dustforge.com').replace(/\/$/, '') });
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
 require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
   approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });
