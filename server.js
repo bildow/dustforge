@@ -6659,6 +6659,12 @@ async function handleRowenDeliver(req, res) {
     const why = commandRefusal(ctxCheck.context_id, (action_params || {}).command);
     if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: requestor_did, capability: 'ssh_exec', target: targetHost, ip: req.ip, context: { secret: secret.name, mediated: true } }); return res.status(403).json({ error: why }); }
   }
+  // And the scope's methods, before the delivery is counted against its quota (#97 review).
+  if (action === 'http_header' || action === 'http_body') {
+    const m = (action_params || {}).method || (action === 'http_body' ? 'POST' : 'GET');
+    const why = methodRefusal(ctxCheck.context_id, m);
+    if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: requestor_did, capability: action, target: targetUrl, ip: req.ip, context: { secret: secret.name, method: m, mediated: true } }); return res.status(403).json({ error: why }); }
+  }
   const egressReq = { identity: { did: requestor_did } };
 
   // Generate the use-token (even though we'll redeem it immediately, it's an audit record)
@@ -6707,10 +6713,6 @@ async function handleRowenDeliver(req, res) {
         if (!askedUrl) return res.status(400).json({ error: 'action_params.url required for http_header action' });
         const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
         if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
-        {   // a method off the scope's list is refused before anything connects
-          const why = methodRefusal(ctxCheck.context_id, method);
-          if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: requestor_did, capability: 'http_header', target: url, ip: req.ip, context: { secret: secret.name, method } }); return res.status(403).json({ error: why }); }
-        }
 
         const ALLOWED_HOSTS = BLINDKEY_HTTP_HOSTS;
         let urlHost;
