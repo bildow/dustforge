@@ -1725,7 +1725,7 @@ function renderFillRequests(){
       // The owner picks which secret to share; the one the agent named is preselected when it exists.
       const want=accessPick[a.id]!==undefined?accessPick[a.id]:(a.match?a.match.ref:'');
       const opts=secrets.filter(x=>x.status==='active').map(x=>'<option value="'+esc(x.ref||x.name)+'"'+((x.ref||x.name)===want?' selected':'')+'>'+esc(x.name)+'</option>').join('');
-      return '<div class="fill-req"><div><b>@'+esc(a.requester)+'</b>'+(a.agent_of?' <span style="color:var(--yellow)">(an agent of @'+esc(a.agent_of)+', outside your fleet)</span>':'')+' asks to use '+(a.secret_hint?'<b>'+esc(a.secret_hint)+'</b>':'one of your secrets')+'</div>'
+      return '<div class="fill-req"><div><b>@'+esc(a.requester)+'</b>'+(a.agent_of?' <span style="color:var(--yellow)">— an agent in @'+esc(a.agent_of)+'\'s fleet, outside yours. @'+esc(a.agent_of)+' approved the ask; you decide. If you approve, it can use the secret you pick for '+Number(a.grant_days||30)+' days.</span>':'')+' asks to use '+(a.secret_hint?'<b>'+esc(a.secret_hint)+'</b>':'one of your secrets')+'</div>'
       +(a.reason?'<div style="margin-top:0.25rem">“'+esc(a.reason)+'”</div>':'')
       +'<div style="color:var(--text3);margin-top:0.25rem">They can use it through DemiPass without ever seeing it. You can revoke it any time.</div>'
       +'<select id="ar-secret-'+Number(a.id)+'" onchange="accessPick['+Number(a.id)+']=this.value" style="margin:0.4rem 0 0;width:100%"><option value="">choose a secret…</option>'+opts+'</select>'
@@ -1776,7 +1776,16 @@ async function loadShares(){
   try{ const r=await api('GET','/api/blindkey/shares'); if(epoch!==sessionEpoch||!vaultOpen) return; shareData=r; }
   catch(e){ if(sessionEnded(e)||e.status===429) return; }
   try{ const t=await api('GET','/api/blindkey/transfers'); if(epoch!==sessionEpoch||!vaultOpen) return; transferData=t; }catch(e){ if(sessionEnded(e)) return; }
+  try{ const g=await api('GET','/api/blindkey/access-requests/granted'); if(epoch!==sessionEpoch||!vaultOpen) return; outsideGrants=g.granted||[]; }catch(e){ if(sessionEnded(e)) return; }
   renderShareRequests();
+}
+// Agents from outside your fleets using your secrets through a request you approved (#94 review M2): see and revoke.
+var outsideGrants = [];
+async function loadOutsideGrants(){ try{ const r = await api('GET','/api/blindkey/access-requests/granted'); outsideGrants = r.granted || []; }catch(e){ outsideGrants = []; } renderShareRequests(); }
+async function revokeOutsideGrant(id){
+  if(!confirm('Stop this agent using your secret now?')) return;
+  try{ await api('POST','/api/demipass/delegate/revoke',{delegation_id:Number(id)}); }catch(e){ if(!sessionEnded(e)) alert(e.message); }
+  loadOutsideGrants();
 }
 async function cancelTransfer(id){
   if(shareBusy.has('t'+id)) return; shareBusy.add('t'+id); renderShareRequests();
@@ -1794,6 +1803,12 @@ function renderShareRequests(){
     +'<div style="color:var(--text3);margin-top:0.25rem">Use-only: your agents use it through DemiPass ('+esc(x.secret.ref||'')+'); nobody sees the value. Until '+esc(shareDate(x.expires_at))+'.</div>'
     +'<div class="fr-row"><button class="btn-primary" '+(shareBusy.has(x.id)?'disabled ':'')+'onclick="shareAct('+Number(x.id)+',\'accept\')">Accept</button>'
     +'<button class="btn-ghost" '+(shareBusy.has(x.id)?'disabled ':'')+'onclick="shareAct('+Number(x.id)+',\'decline\')">Decline</button></div></div>').join('');
+  if(outsideGrants.length){
+    h+='<div style="padding:0.5rem 1rem 0"><div class="section-title" style="font-size:0.75rem">Agents outside your fleet using your secrets</div>'+outsideGrants.map(g=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">'
+      +'<span><b>@'+esc(g.agent)+'</b> <span style="color:var(--text3)">(@'+esc(g.agent_of||'')+'\'s fleet) uses '+esc(g.secret_name)+' · until '+esc(shareDate(g.expires_at))+'</span></span>'
+      +'<button class="btn-ghost" style="font-size:0.7rem" onclick="revokeOutsideGrant('+Number(g.delegation_id)+')">Revoke</button></div>').join('')+'</div>';
+  }
   if(live.length){
     h+='<div style="padding:0.5rem 1rem 0"><div class="section-title" style="font-size:0.75rem">Shared with you</div>'+live.map(x=>
       '<div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem;padding:0.4rem 0;border-bottom:1px solid rgba(39,68,95,0.25);font-size:0.78rem">'

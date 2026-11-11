@@ -10352,14 +10352,28 @@ function ownSecretFor(did, pick) {
   if (pick.startsWith('DP-')) return db.prepare(`SELECT * FROM blindkey_secrets WHERE ref_code = ? AND did = ? AND ${REDEEMABLE_STATUS_SQL}`).get(pick, did) || null;
   return resolveLatestBlindkeySecret(did, pick) || null;
 }
+// An outside agent's ask stays valid only while the agent is still an active silicon in the vouching owner's fleet and the
+// owner and the person are still paired in person (#94 review M1): checked when the card is shown and when approved.
+function outsideAskValid(row) {
+  if (!row.via_owner_did) return true;
+  const inFleet = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
+    WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active'`).get(row.via_owner_did, row.requester_did);
+  return Boolean(inFleet) && secretSharing.isConfirmedPeer(row.via_owner_did, row.owner_did) && !secretSharing.isAgentWallet(row.owner_did);
+}
+const OUTSIDE_GRANT_DAYS = 30, OUTSIDE_PENDING_MAX = 10;
 // Pending requests waiting on an owner, for the app's approval cards (sent with GET /fill/pending).
 function pendingAccessRequests(ownerDid) {
   expireAccessRequests();
   return db.prepare(`SELECT r.*, w.username AS requester, v.username AS via_owner FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.requester_did
                      LEFT JOIN identity_wallets v ON v.did = r.via_owner_did
-                     WHERE r.owner_did = ? AND r.status = 'pending' ORDER BY r.id`).all(ownerDid).map(r => {
-    const match = ownSecretFor(ownerDid, r.secret_hint);
-    return { id: r.id, intent: `access:${r.id}`, requester: r.requester, ...(r.via_owner ? { agent_of: r.via_owner } : {}), secret_hint: r.secret_hint, reason: r.reason,
+                     WHERE r.owner_did = ? AND r.status = 'pending' ORDER BY r.id`).all(ownerDid).filter(r => {
+    if (outsideAskValid(r)) return true;
+    db.prepare("UPDATE demipass_access_requests SET status = 'cancelled', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(r.id);
+    return false;
+  }).map(r => {
+    // An outside ask preselects nothing: the person picks the secret themselves (#94 review L2).
+    const match = r.via_owner_did ? null : ownSecretFor(ownerDid, r.secret_hint);
+    return { id: r.id, intent: `access:${r.id}`, requester: r.requester, ...(r.via_owner ? { agent_of: r.via_owner, outside: true, grant_days: OUTSIDE_GRANT_DAYS } : {}), secret_hint: r.secret_hint, reason: r.reason,
              match: match ? { name: match.name, ref: match.ref_code } : null, created_at: r.created_at, expires_at: r.expires_at };
   });
 }
@@ -10380,12 +10394,32 @@ app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
   // stashed token"). The person sees whose agent asks and decides in their app with their PIN; a reason is required.
   let viaOwner = null;
   if (ownerRow && !askable.some(o => o.owner_did === ownerRow.did) && secretSharing.isAgentWallet(auth.did) && !secretSharing.isAgentWallet(ownerRow.did)) {
-    viaOwner = askable.find(o => secretSharing.isConfirmedPeer(o.owner_did, ownerRow.did)) || null;
+    // Only an owner whose fleet holds this agent as an active silicon (never a fleet_members row someone else wrote,
+    // #94 review L1), oldest fleet first.
+    const owners = db.prepare(`SELECT f.owner_did, w.username FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id JOIN identity_wallets w ON w.did = f.owner_did
+      WHERE s.member_did = ? AND s.status = 'active' AND f.status = 'active' AND f.owner_did != ? ORDER BY f.id`).all(auth.did, auth.did);
+    viaOwner = owners.find(o => secretSharing.isConfirmedPeer(o.owner_did, ownerRow.did)) || null;
   }
   if (!ownerRow || (!askable.some(o => o.owner_did === ownerRow.did) && !viaOwner)) {
     return res.status(403).json({ error: "you can ask the owner of a fleet you belong to, or a person your fleet's owner has confirmed in person", you_can_ask: askable.map(o => o.username) });
   }
   if (viaOwner && !String(reason || '').trim()) return res.status(400).json({ error: 'reason: asking someone outside your fleet needs a reason they can read' });
+  if (viaOwner) {
+    // A denial holds for a day; outside asks have their own, smaller limit per person (#94 review L3).
+    if (db.prepare("SELECT 1 FROM demipass_access_requests WHERE requester_did = ? AND owner_did = ? AND status = 'denied' AND decided_at > datetime('now', '-1 day')").get(auth.did, ownerRow.did)) {
+      return res.status(429).json({ error: `${ownerRow.username} declined your last request; ask again tomorrow` });
+    }
+    if (db.prepare("SELECT COUNT(*) AS n FROM demipass_access_requests WHERE owner_did = ? AND status = 'pending' AND via_owner_did IS NOT NULL").get(ownerRow.did).n >= OUTSIDE_PENDING_MAX) {
+      return res.status(429).json({ error: `${ownerRow.username} has too many requests from agents outside their fleet waiting` });
+    }
+    // The owner whose name the agent carries approves the ask first, in their app (#94 review M3): only then does the
+    // person see it.
+    const A = useApprovals;
+    const me = (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(auth.did) || {}).username || 'agent';
+    const g = A.gateService({ key: 'svc:demipass:outside-ask', name: `@${me} asks @${ownerRow.username} for ${cleanLabel(secret, 60) || 'a secret'}`, approverDid: viaOwner.owner_did, depth: 'elevated' },
+      { did: auth.did, label: cleanLabel(me, 40) }, { action: 'outside-ask', targetHost: ownerRow.username, params: { person: ownerRow.username, secret: cleanLabel(secret, 100), reason: cleanLabel(String(reason), 500) } }, req.body || {});
+    if (!g.ok) { const b = { ...(g.body || {}) }; delete b.owner; if (g.status === 202) b.next = `${viaOwner.username} approves this ask in their DemiPass app first; then call again with approval_id`; return res.status(g.status).json(b); }
+  }
   expireAccessRequests();
   const hint = cleanLabel(secret, 100).trim(), why = cleanLabel(reason, 500).trim();
   const same = db.prepare("SELECT id FROM demipass_access_requests WHERE requester_did = ? AND owner_did = ? AND secret_hint = ? AND status = 'pending'").get(auth.did, ownerRow.did, hint);
@@ -10431,6 +10465,10 @@ function accessDecision(req, res) {
 app.post('/api/blindkey/access-requests/:id/approve', rateLimitFill, (req, res) => {
   const d = accessDecision(req, res); if (!d) return;
   const { auth, row } = d;
+  if (!outsideAskValid(row)) {
+    db.prepare("UPDATE demipass_access_requests SET status = 'cancelled', decided_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'pending'").run(row.id);
+    return res.status(409).json({ error: 'this agent is no longer an agent of the owner it named, or that owner no longer vouches for you: the request is cancelled' });
+  }
   const pick = (req.body && req.body.secret) || row.secret_hint;
   if (!pick) return res.status(400).json({ error: 'choose the secret to share: {"secret":"<name or ref>"}' });
   const secret = ownSecretFor(auth.did, pick);
@@ -10445,7 +10483,9 @@ app.post('/api/blindkey/access-requests/:id/approve', rateLimitFill, (req, res) 
     db.transaction(() => {
       const claimed = db.prepare("UPDATE demipass_access_requests SET status = 'approved', decided_at = CURRENT_TIMESTAMP, secret_id = ? WHERE id = ? AND status = 'pending'").run(secret.id, row.id).changes;
       if (claimed !== 1) throw Object.assign(new Error('this access request was decided meanwhile'), { status: 409 });
-      delegationId = grantAllContextsDelegation(auth.did, row.requester_did, secret.id, auth.did);
+      // An agent from outside the person's own fleets gets a grant that ends by itself (#94 review M2).
+      delegationId = grantAllContextsDelegation(auth.did, row.requester_did, secret.id, auth.did,
+        row.via_owner_did ? { expiresAt: new Date(Date.now() + OUTSIDE_GRANT_DAYS * 86400000).toISOString() } : {});
       db.prepare('UPDATE demipass_access_requests SET delegation_id = ? WHERE id = ?').run(delegationId, row.id);
       db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
         .run('delegation_granted', auth.did, secret.id, '*', JSON.stringify({ delegation_id: delegationId, owner_did: auth.did, delegate_did: row.requester_did, via: 'access_request', request_id: row.id }));
@@ -10455,6 +10495,19 @@ app.post('/api/blindkey/access-requests/:id/approve', rateLimitFill, (req, res) 
   }
   logSecurityEvent('access_request_approved', 'warn', { caller_did: auth.did, capability: 'delegation', target: secret.name, ip: req.ip, context: { request_id: row.id, delegate_did: row.requester_did, delegation_id: delegationId } });
   res.json({ ok: true, id: row.id, status: 'approved', secret_name: secret.name, ref: secret.ref_code, delegation_id: delegationId });
+});
+
+// GET /api/blindkey/access-requests/granted — agents from outside my fleets using my secrets through an approved
+// request (a person who approved one sees it and revokes it here; #94 review M2).
+app.get('/api/blindkey/access-requests/granted', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (auth.silicon) return res.json({ ok: true, granted: [] });
+  const rows = db.prepare(`SELECT d.id AS delegation_id, d.expires_at, d.granted_at, s.name AS secret_name, s.ref_code AS ref, w.username AS agent, v.username AS agent_of
+    FROM demipass_access_requests r JOIN demipass_delegations d ON d.id = r.delegation_id JOIN blindkey_secrets s ON s.id = d.secret_id
+    JOIN identity_wallets w ON w.did = r.requester_did LEFT JOIN identity_wallets v ON v.did = r.via_owner_did
+    WHERE r.owner_did = ? AND r.via_owner_did IS NOT NULL AND d.status = 'active' AND (d.expires_at IS NULL OR d.expires_at > ?) ORDER BY d.granted_at DESC`).all(auth.did, new Date().toISOString());
+  res.json({ ok: true, granted: rows });
 });
 
 // POST /api/blindkey/access-requests/:id/deny

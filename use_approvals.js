@@ -150,6 +150,7 @@ module.exports = function registerUseApprovals(deps) {
         : action === 'owner-grant' ? `operator grant of ${q.amount_cents} DD to your own wallet`
         : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action + (c.follow_ups ? ` (then bills ${c.follow_ups.join('/')} later)` : '')).join(', ')}`
         : action === 'mail-webhook' ? `let Resend report delivered/bounced/complained to ${q.endpoint}`
+        : action === 'outside-ask' ? `your agent asks @${q.person} (your in-person contact) for ${q.secret || 'a secret'}: "${String(q.reason || '').slice(0, 60)}"`
         : action === 'margin' ? `${q.service}: margin ${q.was}% → ${q.margin_pct}% over cost on every call`
         : action === 'connect' ? `point callers of ${q.service} at ${q.endpoint || '(nothing)'}; agents run ${q.mcp_server || '(no MCP server)'}`
         : `${targetHost || ''}: ${action}`;
