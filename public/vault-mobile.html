@@ -3087,8 +3087,35 @@ async function loadScanTokens(){
     el.innerHTML=(live.length?live.map(t=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:0.3rem 0"><span>'+esc(t.label||('token '+t.id))+' <span style="color:var(--text3)">'+(t.last_used_at?'last scan '+esc(String(t.last_used_at).slice(0,16).replace('T',' ')):'never used')+'</span></span><button class="btn-ghost" style="font-size:0.65rem" onclick="revokeScanToken('+Number(t.id)+')">Revoke</button></div>').join(''):'<div style="color:var(--text3)">No scan tokens.</div>')
       +(r.hits||[]).slice(0,5).map(h=>'<div style="color:var(--orange);margin-top:0.3rem">'+esc(h.token_label||('token '+h.token_id))+' found '+esc(String(h.created_at).slice(0,16).replace('T',' '))+': '
         +(h.secrets||[]).map(esc).join(', ')+' <a href="#" style="color:var(--accent)" onclick="showScanHit('+Number(h.id)+');return false">where?</a><div id="scan-hit-'+Number(h.id)+'" style="color:var(--text3);font-size:0.68rem"></div></div>').join('')
-      +(hit.length&&!(r.hits||[]).length?hit.map(t=>'<div style="color:var(--orange);margin-top:0.2rem">'+esc(t.label||('token '+t.id))+' found a leak and was revoked</div>').join(''):'');
+      +(hit.length&&!(r.hits||[]).length?hit.map(t=>'<div style="color:var(--orange);margin-top:0.2rem">'+esc(t.label||('token '+t.id))+' found a leak and was revoked</div>').join(''):'')
+      // One approval for all of them: where every leak was found, optionally mailed to the forwarding address.
+      +((r.hits||[]).length?'<div style="margin-top:0.5rem;padding:0.5rem;border:1px solid var(--border);border-radius:8px">'
+        +'<button class="btn-primary" onclick="leakReport()" style="width:100%;font-size:0.75rem">Show where all leaks were found (last 30 days)</button>'
+        +(r.report_to?'<label style="display:flex;gap:0.4rem;align-items:center;margin-top:0.4rem;font-size:0.72rem"><input type="checkbox" id="leak-mail" style="width:auto;margin:0"> Also email the report to '+esc(r.report_to.masked)+' ('+(r.report_to.kind==='forwarding'?'your forwarding address':'your recovery email')+')</label>'
+          :'<div style="font-size:0.68rem;color:var(--text3);margin-top:0.3rem">No forwarding address (active 48 hours) or recovery email on file, so the report shows here only.</div>')
+        +'<div id="leak-report-out" style="margin-top:0.4rem"></div></div>':'');
   }catch(e){ if(!sessionEnded(e)) el.textContent=e.message; }
+}
+// Where every leak of the last 30 days was found, behind one approval (PIN or the phone's biometric); optionally mailed to
+// the forwarding (or recovery) address, never the @dustforge.com mailbox. Copy puts the plain text on the clipboard, ready
+// to paste to whoever fixes it.
+let leakReportText='';
+async function leakReport(){
+  const out=document.getElementById('leak-report-out'); const box=document.getElementById('leak-mail'); const mail=!!(box&&box.checked);
+  if(out){ out.style.color='var(--text3)'; out.textContent='Waiting for your approval…'; }
+  try{
+    const r=await apiGated('POST','/api/blindkey/leak-scan/hits-report',{days:30,mail},'Show where every leak was found'+(mail?' and email the report':'')+'? Your PIN or phone approves it.');
+    leakReportText=r.text||'';
+    if(!out) return;
+    out.style.color='var(--text)';
+    out.innerHTML=(r.mailed?'<div style="font-size:0.72rem;margin-bottom:0.3rem;color:'+(r.mailed.sent?'var(--green)':'var(--red)')+'">'+(r.mailed.sent?'Emailed to '+esc(r.mailed.to)+'.':'Not emailed: '+esc(r.mailed.error||'failed'))+'</div>':'')
+      +'<button class="btn-ghost" onclick="copyLeakReport()" style="font-size:0.72rem;padding:0.3rem 0.6rem">Copy report</button>'
+      +'<pre style="white-space:pre-wrap;word-break:break-word;font-size:0.66rem;margin-top:0.35rem;color:var(--text2,var(--text))">'+esc(leakReportText)+'</pre>';
+  }catch(e){ if(out){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)){ out.style.color='var(--red)'; out.textContent=e.message; } else out.textContent=''; } }
+}
+async function copyLeakReport(){
+  try{ await navigator.clipboard.writeText(leakReportText); alert('Report copied'); }
+  catch(_){ alert('Copy is not available here: select the text and copy it'); }
 }
 // Where a leak was found: the PIN shows it (an agent signed in as you cannot read it — it would be a guessing oracle).
 async function showScanHit(id){

@@ -1868,3 +1868,25 @@ test('item 8 (#73 review): background covers the vault; back within the grace pe
   assert.equal(pg.el('lock-screen').style.display, 'flex', 'past the grace period: locked');
   assert.equal(pg.appOpen(), false, 'vault hidden behind the lock');
 });
+
+test('leak report: one button for all hits, the email box names the masked forwarding address, ticked → mail: true', async () => {
+  const posts = [];
+  const pg = page({ storage: signedIn, routes: async (p, b) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/leak-scan/tokens') return { json: { tokens: [], hits: [{ id: 7, token_id: 1, token_label: 'pane-daily', created_at: '2026-11-09T12:36:00Z', secrets: ['stalwart-aaron-imap'] }], report_to: { masked: 'a***@example.com', kind: 'forwarding' } } };
+    if (p === '/api/blindkey/leak-scan/hits-report') { posts.push(b); return { json: { ok: true, hits: [], text: 'DemiPass leak scan: report\n#7 … in e9361b18.jsonl:41-41', mailed: b.mail ? { sent: true, to: 'a***@example.com', kind: 'forwarding' } : null } }; }
+    return { json: { ok: true } };
+  } });
+  await settle(12);
+  await pg.ctx.loadScanTokens();
+  const html = pg.el('scan-tokens').innerHTML;
+  assert.match(html, /Show where all leaks were found/);
+  assert.match(html, /Also email the report to a\*\*\*@example\.com \(your forwarding address\)/);
+  pg.el('leak-mail').checked = true;
+  await pg.ctx.leakReport(); await settle();
+  assert.deepEqual(posts, [{ days: 30, mail: true }]);
+  assert.match(pg.el('leak-report-out').innerHTML, /Emailed to a\*\*\*@example\.com/);
+  assert.match(pg.el('leak-report-out').innerHTML, /e9361b18\.jsonl:41-41/);
+  assert.match(pg.el('leak-report-out').innerHTML, /Copy report/);
+});
