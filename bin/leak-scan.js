@@ -50,7 +50,13 @@ async function claimOne(dir, file) {
   const c = await fetch(API + `/api/demipass/leak-scan/token-requests/${p.request_id}/claim`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ claim_secret: p.claim_secret }) });
   const cd = await c.json().catch(() => ({}));
   if (c.status === 202) return 'waiting';
-  if (!c.ok) { fs.rmSync(file, { force: true }); console.error(`leak-scan: request ${p.request_id} ended without tokens: ${cd.error || c.status}`); return 'gone'; }
+  // Only an answer that the request is over ends it; a busy or broken server keeps it for the next run (#92 review M3).
+  if (c.status === 404 || c.status === 410) {
+    fs.rmSync(file, { force: true });
+    if (/denied/i.test(cd.error || '')) for (const l of p.labels || []) fs.writeFileSync(path.join(dir, `.denied-${l}`), new Date().toISOString() + '\n', { mode: 0o600 });
+    console.error(`leak-scan: request ${p.request_id} ended without tokens: ${cd.error || c.status}`); return 'gone';
+  }
+  if (!c.ok) { console.error(`leak-scan: request ${p.request_id}: claim answered ${c.status}; kept for the next run`); return 'waiting'; }
   for (const t of cd.tokens || []) {
     const out = path.join(dir, t.label + '.token');
     fs.writeFileSync(out, t.token + '\n', { mode: 0o600 }); fs.chmodSync(out, 0o600);
@@ -122,12 +128,16 @@ function* chunks(file, from = 0) {
     }
   }
 }
-let leak = false, revokedNote = null;
+// After a hit the server lets the token finish the run ("draining"): the rest is scanned so the owner's "where?" names
+// every copy, and the answer no longer depends on what is sent. An older server answers 401 after a hit: then stop.
+let leak = false, revokedNote = null, draining = false, drainedFromStart = null;
 async function post(auth, batch) {
   const r = await fetch(API + '/api/demipass/leak-scan', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: JSON.stringify({ chunks: batch }) });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`scan refused: HTTP ${r.status}: ${d.error || ''}`);
+  if (drainedFromStart === null) drainedFromStart = Boolean(d.already_found);   // the token's hit was before this run
   if (d.leak) { leak = true; revokedNote = d.note || 'a vault value was found; the owner has the details'; }
+  draining = Boolean(d.draining);
 }
 (async () => {
   if (process.argv[2] === '--request') {
@@ -156,7 +166,7 @@ async function post(auth, batch) {
   let ending = [];
   const flush = async () => { if (batch.length) { await post(tok, batch); batch = []; bytes = 0; done.push(...ending); ending = []; saveState(); } };
   scan: for (const t of targets) for (const f of files(path.resolve(t))) {
-    if (leak) break scan;   // a hit revoked the token: stop
+    if (leak && !draining) break scan;   // a hit revoked the token and the server will not finish the run: stop
     let from = 0;
     if (stateFile) {
       const size = fs.statSync(f).size, seen = Number(state[f]) || 0;
@@ -166,16 +176,19 @@ async function post(auth, batch) {
     }
     nfiles++;
     for (const c of chunks(f, from)) {
-      if (leak) break scan;
+      if (leak && !draining) break scan;
       const b = Buffer.byteLength(c.text);
       if (bytes + b > BATCH_BYTES || batch.length >= 150) await flush();
       batch.push(c); bytes += b; total += b;
     }
     if (stateFile) ending.push(f);
   }
-  if (!leak) await flush();
+  if (!leak || draining) await flush();
   if (stateFile && !leak) { for (const f of Object.keys(next)) if (!(f in state) || state[f] !== next[f]) { if (!ending.includes(f) && !done.includes(f)) done.push(f); } saveState(); }
   for (const k of skipped) console.log(`SKIPPED  ${k}`);
-  console.log(`leak-scan: ${nfiles} files, ${total} bytes, ${leak ? 'LEAK — ' + revokedNote : 'clean'}`);
+  // A run on a token that was already draining says nothing about this tree: the owner reads "where?" instead.
+  const what = !leak ? 'clean' : drainedFromStart ? 'NOT CHECKED — this token found a leak earlier and only records copies for the owner now (DemiPass app → Settings → Leak scanner → "where?"); approve a new token to check this tree'
+    : 'LEAK — ' + revokedNote + (draining ? ' (the rest of the run was scanned; every copy is listed for the owner)' : '');
+  console.log(`leak-scan: ${nfiles} files, ${total} bytes, ${what}`);
   process.exit(leak ? 1 : (STRICT && skipped.length) ? 2 : 0);
 })().catch(e => { console.error('leak-scan: ' + e.message); process.exit(2); });

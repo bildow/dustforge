@@ -50,6 +50,10 @@ module.exports = function registerLeakScan(deps) {
     day TEXT DEFAULT '',
     bytes_today INTEGER DEFAULT 0
   )`);
+  // Copies found during a token's drain: shown only behind the PIN with the first hit ("where?"), never in the token
+  // listing an agent session can read (#92 review H1: a per-request row there was a guessing oracle), at most 50 a token.
+  db.exec(`CREATE TABLE IF NOT EXISTS leak_scan_drain_finds (id INTEGER PRIMARY KEY AUTOINCREMENT, token_id INTEGER NOT NULL, owner_did TEXT NOT NULL, found TEXT NOT NULL, created_at TEXT NOT NULL)`);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_lsdf_token ON leak_scan_drain_finds(token_id)');
   for (const c of ['revoked_reason TEXT DEFAULT NULL', 'request_id INTEGER DEFAULT NULL', 'requests_today INTEGER DEFAULT 0', 'drain_until TEXT DEFAULT NULL']) { try { db.exec('ALTER TABLE leak_scan_tokens ADD COLUMN ' + c); } catch (_) {} }
   // What a hit found, for the owner only (the app's Settings → leak scanner, and the mail).
   db.exec(`CREATE TABLE IF NOT EXISTS leak_scan_hits (
@@ -147,7 +151,11 @@ module.exports = function registerLeakScan(deps) {
     if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('scan-hits', ['pin'], ['pin'], intent));
     const spent = spendSingleUse(auth.did, 'scan-hits', ['pin'], auth, intent);
     if (spent) return res.status(spent.status || 403).json(spent);
-    res.json({ ok: true, id, token_label: h.token_label, created_at: h.created_at, found: JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk })) });
+    // Copies the same token found during its drain come with the first hit; their places were named by the scanner.
+    const drained = h.token_id ? db.prepare('SELECT found, created_at FROM leak_scan_drain_finds WHERE token_id = ? AND owner_did = ? ORDER BY id').all(h.token_id, auth.did) : [];
+    res.json({ ok: true, id, token_label: h.token_label, created_at: h.created_at, found: JSON.parse(h.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk })),
+      ...(drained.length ? { found_later_in_the_run: drained.flatMap(d => JSON.parse(d.found).map(f => ({ name: f.name, ref: f.ref, where: f.chunk, at: d.created_at }))),
+        note: 'places after the first are as the scanner named them' } : {}) });
   });
   // POST /api/blindkey/leak-scan/descriptions {redact_ids?} — which of my descriptions and notes hold one of my vault
   // values (by name, never the value), and with redact_ids (rows picked from a check), cut the values out of those. The owner's own session with the PIN
@@ -179,7 +187,8 @@ module.exports = function registerLeakScan(deps) {
     if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('scan-token', ['pin'], ['pin'], intent));
     const spent = spendSingleUse(auth.did, 'scan-token', ['pin'], auth, intent);
     if (spent) return res.status(spent.status || 403).json(spent);
-    const n = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'owner' WHERE id = ? AND owner_did = ? AND revoked_at IS NULL").run(nowIso(), Number(req.params.id), auth.did).changes;
+    // A draining token (revoked by its hit, still recording) is stopped too (#92 review M1).
+    const n = db.prepare("UPDATE leak_scan_tokens SET revoked_at = COALESCE(revoked_at, ?), revoked_reason = 'owner', drain_until = NULL WHERE id = ? AND owner_did = ? AND (revoked_at IS NULL OR (revoked_reason = 'hit' AND drain_until > ?))").run(nowIso(), Number(req.params.id), auth.did, nowIso()).changes;
     res.status(n ? 200 : 404).json(n ? { ok: true } : { error: 'scan token not found' });
   });
 
@@ -298,11 +307,12 @@ module.exports = function registerLeakScan(deps) {
     let revoked = false;
     if (caller.draining) {
       // The rest of a run after its first hit: found copies go to the owner; the answer never varies with what was sent.
-      if (hits.length) db.prepare('INSERT INTO leak_scan_hits (owner_did, token_id, token_label, found, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(caller.did, caller.tokenRow.id, caller.tokenRow.label || '', JSON.stringify(hits.slice(0, 200).map(h => ({ name: h.name, ref: h.ref, chunk: h.chunk }))), nowIso());
+      const kept = db.prepare('SELECT COUNT(*) AS n FROM leak_scan_drain_finds WHERE token_id = ?').get(caller.tokenRow.id).n;
+      if (hits.length && kept < 50) db.prepare('INSERT INTO leak_scan_drain_finds (token_id, owner_did, found, created_at) VALUES (?, ?, ?, ?)')
+        .run(caller.tokenRow.id, caller.did, JSON.stringify(hits.slice(0, 200).map(h => ({ name: h.name, ref: h.ref, chunk: h.chunk }))), nowIso());
       db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
         .run('leak_scan', caller.did, null, null, JSON.stringify({ bytes, chunks: chunks.length, hits: hits.length, token_id: caller.tokenRow.id, draining: true }));
-      return res.json({ ok: true, scanned_bytes: bytes, leak: true, token_revoked: true, draining: true,
+      return res.json({ ok: true, scanned_bytes: bytes, leak: true, token_revoked: true, draining: true, already_found: true,
         note: 'this token already found a leak: the rest of the run is recorded for the owner (DemiPass app → Settings → Leak scanner → "where?")' });
     }
     if (hits.length) {

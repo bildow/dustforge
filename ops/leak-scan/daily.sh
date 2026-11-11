@@ -15,10 +15,18 @@ T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 TOKDIR=$(dirname "$TOK"); LABEL=$(basename "$TOK" .token)
 node "$SCANNER" --claim "$TOKDIR" >/dev/null 2>&1
 ask_token(){
-  if ls "$TOKDIR"/.pending-*.json >/dev/null 2>&1; then fail "waiting for you to approve the $LABEL scan token in the DemiPass app (Settings → Leak scanner)"; fi
-  node "$SCANNER" --request --no-wait "$TOKDIR" "$LABEL" >/dev/null 2>&1; local r=$?
+  local p; p=$(ls "$TOKDIR"/.pending-*.json 2>/dev/null | head -1)
+  # The request number is named, so the owner approves this one and not a look-alike someone else filed (#92 review M5).
+  if [ -n "$p" ]; then fail "waiting for you to approve the $LABEL scan token — request #$(basename "$p" .json | sed 's/^.pending-//') in the DemiPass app (Settings → Leak scanner)"; fi
+  # A denial is respected for 7 days before this asks again (#92 review M4).
+  local d="$TOKDIR/.denied-$LABEL"
+  if [ -f "$d" ] && [ -z "$(find "$d" -mtime +7 2>/dev/null)" ]; then fail "$1 — you denied the last $LABEL scan token request; this asks again 7 days after that"; fi
+  rm -f "$d"
+  local out2 r; out2=$(node "$SCANNER" --request --no-wait "$TOKDIR" "$LABEL" 2>&1); r=$?
   [ $r = 0 ] && return 0
-  fail "$1 — a new $LABEL scan token was requested: approve it in the DemiPass app (Settings → Leak scanner); the next run picks it up"
+  if [ $r = 3 ]; then p=$(ls "$TOKDIR"/.pending-*.json 2>/dev/null | head -1)
+    fail "$1 — a new $LABEL scan token was requested (#$(basename "$p" .json | sed 's/^.pending-//')): approve it in the DemiPass app (Settings → Leak scanner); the next run picks it up"; fi
+  fail "$1 — asking for a new $LABEL scan token failed: $(echo "$out2" | tail -1)"
 }
 [ -s "$TOK" ] || ask_token "there was no scan token"
 # Transcripts are append-only: only what was added since the last run (--incremental). Tome files are edited in place:
@@ -31,7 +39,8 @@ run(){ local list=$1; shift; local targets=(); while IFS= read -r -d '' f; do ta
 run "$T/jsonl" --incremental "$ST/leak-offsets.json"; rc=$?
 [ $rc = 0 ] && { run "$T/tome"; rc=$?; }
 # A token revoked by an earlier hit (its drain window over): set it aside and ask for the next one.
-if [ $rc = 2 ] && echo "$out" | grep -q 'revoked'; then mv -f "$TOK" "$TOK.revoked" 2>/dev/null; ask_token "the scan token was revoked after an earlier hit"; fi
+# Only the server's own words for a token spent by a hit (not any line with "revoked" in it: a path, an owner revoke).
+if [ $rc = 2 ] && echo "$out" | grep -q 'HTTP 401: this scan token found a leak and was revoked'; then mv -f "$TOK" "$TOK.revoked" 2>/dev/null; ask_token "the scan token was spent by an earlier hit"; fi
 case $rc in
   0) rm -f "$ST/leak-daily-failed" ;;
   1) fail "the daily leak scan FOUND a vault value — details in the DemiPass app (Settings → Leak scanner, with your PIN) and mail" ;;
