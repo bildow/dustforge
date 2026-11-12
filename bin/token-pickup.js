@@ -3,17 +3,19 @@
 // token-pickup — an agent collects the token its fleet owner renewed for it (silicon_renew.js). Aaron 2026-11-12.
 //   node bin/token-pickup.js --init [--rotate] <dir>
 //        make this agent's delivery key: an X25519 keypair, the private key in <dir>/delivery.key (0600, never printed),
-//        and register its public key with the agent's OWN session — DEMIPASS_TOKEN, DEMIPASS_TOKEN_FILE (0600) or an
-//        existing <dir>/token. A token whose value was shown in clear (the owner's "Mint a token" button) is refused by
-//        the server. The first key is pinned at once; a later, different key (--rotate, or a new <dir>) waits for the
-//        fleet owner's approval in the app, and renewals go to the old key until then.
+//        and ask for it with a token of the agent — DEMIPASS_TOKEN, DEMIPASS_TOKEN_FILE (0600) or an existing
+//        <dir>/token. The fleet owner approves the key in the app (PIN + phone) before any renewal goes to it — the
+//        first key too — unless the token is the agent's own token request (see --help). A token someone else saw
+//        (the owner's "Mint a token", a request another member filed) is refused. While one key waits, asking for a
+//        different one answers 429; --rotate asks for a new key, renewals go to the old one until it is approved.
 //   node bin/token-pickup.js [--allow-narrower] <dir>
 //        fetch the newest delivery for this agent's DID, open it with <dir>/delivery.key, check the token's signature
 //        against the DID (did:key, Ed25519), that it is this DID's and not expired, and write it to <dir>/token (0600,
 //        replaced atomically) — only if it is newer (issued later) than the token there, or that one is expired or not
 //        valid; and never a narrower scope than the one held unless --allow-narrower. Then tell the server: "used" (the
-//        owner's card stops saying "awaiting pickup"), or "declined" when a newer token is kept (the delivered one is
-//        revoked). Never prints the token.
+//        owner's card stops saying "awaiting pickup"), or "declined" when the held token is kept (newer, or broader
+//        without --allow-narrower): the delivered one is revoked and the owner's card says so. Never prints the token.
+//   node bin/token-pickup.js --help
 //        exit 0 written / kept / already there, 3 nothing to pick up, 2 could not run.
 // The server only holds the sealed blob; the owner, the app and this program's output never carry the token.
 // DEMIPASS_URL overrides the server. Zero dependencies (Node ≥ 18).
@@ -104,7 +106,7 @@ async function init(dir, rotate) {
     else writeSecret(keyFile, priv.export({ format: 'pem', type: 'pkcs8' }));
   }
   fs.writeFileSync(path.join(dir, 'did'), d.did + '\n', { mode: 0o600 });
-  if (d.status === 'pending') console.log(`token-pickup: delivery key ${d.fingerprint} asked for ${d.did}: waiting for the fleet owner to approve it in the app (renewals go to the current key until then)`);
+  if (d.status === 'pending') console.log(`token-pickup: delivery key ${d.fingerprint} asked for ${d.did}: waiting for the fleet owner to approve it in the app — tell them this fingerprint${d.first_key ? '' : ' (renewals go to the current key until then)'}`);
   else console.log(`token-pickup: delivery key ${d.fingerprint} ${d.unchanged ? 'already registered' : 'registered'} for ${d.did}; private key in ${keyFile} (0600)`);
 }
 
@@ -137,10 +139,12 @@ async function pickup(dir, allowNarrower) {
   const keyFile = path.join(dir, 'delivery.key'), didFile = path.join(dir, 'did');
   if (!fs.existsSync(keyFile) || !fs.existsSync(didFile)) die(`no delivery key in ${dir}: run --init first`);
   const did = fs.readFileSync(didFile, 'utf8').trim();
-  // The approved new key, if one was waiting: try it too (it becomes the key once a delivery opens with it).
+  // The approved new key, if one was waiting, and the previous key (the owner may undo a change): tried too; the one
+  // that opens becomes delivery.key, the one it replaces delivery.key.prev.
   const keys = [[keyFile, crypto.createPrivateKey(readPrivate(keyFile))]];
-  const pend = path.join(dir, 'delivery.key.pending');
+  const pend = path.join(dir, 'delivery.key.pending'), prevFile = path.join(dir, 'delivery.key.prev');
   if (fs.existsSync(pend)) keys.push([pend, crypto.createPrivateKey(readPrivate(pend))]);
+  if (fs.existsSync(prevFile)) keys.push([prevFile, crypto.createPrivateKey(readPrivate(prevFile))]);
   const r = await fetch(API + '/api/identity/token-deliveries?did=' + encodeURIComponent(did));
   const d = await r.json().catch(() => ({}));
   if (!r.ok) die(`the server answered ${r.status}: ${d.error || 'no answer'}`);
@@ -150,7 +154,10 @@ async function pickup(dir, allowNarrower) {
   let payload = null, used = null;
   for (const [f, k] of keys) { try { payload = open(del, k, did); used = f; break; } catch (_) {} }
   if (!payload) die(`the newest delivery does not open with this agent's key (was the key rotated?)`);
-  if (used === pend) fs.renameSync(pend, keyFile);
+  if (used !== keyFile) {
+    const tmp = `${keyFile}.swap-${process.pid}`;
+    fs.renameSync(keyFile, tmp); fs.renameSync(used, keyFile); fs.renameSync(tmp, prevFile);
+  }
   const c = validToken(payload.token, did);
   if (!c) die('the newest delivery is not a live token signed for ' + did);
   const out = path.join(dir, 'token');
@@ -161,8 +168,9 @@ async function pickup(dir, allowNarrower) {
     await ack(payload.token, false); return;
   }
   if (cur && (SCOPE_RANK[c.scope] ?? -1) < (SCOPE_RANK[cur.scope] ?? -1) && !allowNarrower) {
-    console.log(`token-pickup: the delivery is ${c.scope}, narrower than the ${cur.scope} token held; kept (pass --allow-narrower to take it)`);
-    return;
+    // Declined, not left waiting: the owner's card says so, and the token nobody will hold is revoked (round-3 L5).
+    console.log(`token-pickup: the delivery is ${c.scope}, narrower than the ${cur.scope} token held; kept the held one and declined it (to take a narrower token, run with --allow-narrower after the owner renews again)`);
+    await ack(payload.token, false); return;
   }
   writeSecret(out, payload.token + '\n');
   await ack(payload.token, true);
@@ -170,7 +178,27 @@ async function pickup(dir, allowNarrower) {
   console.log(`token-pickup: wrote ${out} (0600): scope ${c.scope}, expires ${new Date(c.exp * 1000).toISOString()}`);
 }
 
+const HELP = `token-pickup — collect the token your fleet owner renews for this agent, sealed to its own key.
+
+  node bin/token-pickup.js --init [--rotate] <dir>   make <dir>/delivery.key (0600) and ask for it as this agent's
+                                                     delivery key (token: DEMIPASS_TOKEN, DEMIPASS_TOKEN_FILE or <dir>/token)
+  node bin/token-pickup.js [--allow-narrower] <dir>  pick up the newest renewal into <dir>/token (0600)
+
+Which key renewals go to is the fleet owner's decision: a key asked with the agent's sign-in (or any token but the one
+below) waits for the owner to approve it in the DemiPass app (Fleet -> @agent), PIN + phone. Tell the owner the
+fingerprint --init prints.
+
+A token whose value someone else saw is refused ("shown in clear": the owner's "Mint a token" button, or a token request
+another member filed or claimed). The way in for such an agent, which also sets its first key at once:
+  1. on the agent: keep a secret S (e.g. a 0600 file) and compute sha256(S) as hex;
+  2. the fleet owner files POST /api/fleet/<fleet>/silicons/<handle>/token-requests {"claim_secret_hash": "<hex>"}
+     (or the agent files it itself with any of its tokens) and approves it in the app;
+  3. the agent claims it: POST /api/silicon-token-requests/<id>/claim {"claim_secret": "S"} -> its token, into <dir>/token;
+  4. node bin/token-pickup.js --init <dir>   -> "registered" (no approval needed for this first key).
+
+DEMIPASS_URL overrides the server (https://api.dustforge.com).`;
 const args = process.argv.slice(2);
+if (args.includes('--help') || args.includes('-h')) { console.log(HELP); process.exit(0); }
 const flags = new Set(args.filter(a => a.startsWith('--') && a !== '--init'));
 const rest = args.filter(a => !flags.has(a));
 for (const f of flags) if (!['--rotate', '--allow-narrower'].includes(f)) die(`unknown option ${f}`);

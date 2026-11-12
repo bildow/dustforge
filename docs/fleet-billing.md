@@ -39,11 +39,16 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
    **Renew token** (every card of an agent the fleet holds the key of; Aaron 2026-11-12, `silicon_renew.js`): the
    owner's PIN (and linked phone) renews it without anyone seeing it — the server mints it and seals it to the
    agent's **delivery key**; the agent picks it up with `bin/token-pickup.js`:
-   - once, with its own sign-in (not a token whose value was shown, e.g. from "Mint a token"):
-     `DEMIPASS_TOKEN=… node bin/token-pickup.js --init <dir>` makes an X25519 keypair (`<dir>/delivery.key`, 0600)
-     and registers its public key (`POST /api/identity/delivery-key`). The first key is pinned; a different key later
-     waits for the owner (a card on the agent's page and a mail; approve with the PIN `silicon-key:<id>` + phone), and
-     renewals to a changed key start 6 hours after the change. The card says "key set / key changed <time>".
+   - once: `DEMIPASS_TOKEN=… node bin/token-pickup.js --init <dir>` makes an X25519 keypair (`<dir>/delivery.key`,
+     0600) and asks for its public key (`POST /api/identity/delivery-key`). Which key renewals go to is the owner's
+     decision: every key — the first too — waits for the owner (a card on the agent's page showing the fingerprint and
+     who asked — token kind and address — plus one mail per 3 h; approve with the PIN `silicon-key:<id>` + phone). One
+     ask waits at a time (another: 429). The one exception: a first key asked with the agent's OWN token request (it
+     filed it itself, or the owner filed it with the agent's `claim_secret_hash`; minted `agent_own`) is set at once.
+     A token someone else saw (the owner's "Mint a token", a request another member filed or claimed in clear) cannot
+     ask at all; `token-pickup.js --help` gives the way in. An ask whose token is revoked (jti, revoke-all, fleet cut)
+     ends. An approved change can be undone for 6 hours (PIN `silicon-key-revert:<id>` + phone); the tokens sealed to
+     the dropped key are revoked. The card says "key set / key changed <time>".
    - after a renewal (or from a timer): `node bin/token-pickup.js <dir>` fetches the newest sealed delivery
      (`GET /api/identity/token-deliveries?did=…`, no session, rate-limited per address+DID; only `{id, epk, iv, tag,
      ciphertext}`), opens it, checks the token's signature against the did:key, and writes `<dir>/token` (0600) only
@@ -77,8 +82,9 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
 | POST | `/api/fleet/:slug/silicons/:handle/refill` | `{amount_cents}` manual refill |
 | POST | `/api/fleet/:slug/silicons/:handle/token` | mint ≤transact ≤30d token (shown once) |
 | POST | `/api/fleet/:slug/silicons/:handle/renew-token` | owner only, PIN `silicon-renew:<id>` + linked phone; `{scope?, expires_in?}` (≤transact, default 30d) → `{ok, delivery_id, expires_at}`, sealed to the agent's delivery key, never the token; 409 without one |
-| POST | `/api/identity/delivery-key` | the agent's own session (not a shown, worker, device-login token): `{public_key}` (X25519, 32 bytes base64url); first key 201 set, a different one 202 pending |
+| POST | `/api/identity/delivery-key` | a token of the agent (not a shown, worker, device-login token): `{public_key}` (X25519, 32 bytes base64url); 202 pending for the owner (201 set only for a first key with an `agent_own` token); 429 while another waits |
 | POST | `/api/fleet/:slug/silicons/:handle/delivery-key/:change/approve\|deny` | owner only; approve: PIN `silicon-key:<id>` + linked phone |
+| POST | `/api/fleet/:slug/silicons/:handle/delivery-key/revert` | owner only, within 6 h of an approved change: PIN `silicon-key-revert:<id>` + phone |
 | GET | `/api/identity/token-deliveries?did=` | no auth: the newest 3 unexpired, unacknowledged sealed deliveries (non-consuming) |
 | POST | `/api/identity/token-deliveries/ack` | Bearer = the delivered token; `{used?}` (false: a newer token is kept, the delivery is revoked) |
 | POST | `/api/fleet/:slug/silicons/:handle/delegate` | owner delegates one of their secrets (`secret_name` or `ref`) |

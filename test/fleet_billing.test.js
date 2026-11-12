@@ -282,7 +282,12 @@ test('a renewal not picked up is not "token ok": the card keeps the held token a
   assert.equal(t.status, 'expiring'); assert.equal(t.jti, 'held'); assert.ok(t.awaiting_pickup && t.awaiting_pickup.since);
   db.prepare("UPDATE token_deliveries SET acked_at = ?, ack = 'used'").run(new Date(now).toISOString());
   t = fb.tokenStatus(db, BRAIN, now);
-  assert.equal(t.status, 'valid'); assert.equal(t.jti, 'renewed'); assert.equal(t.awaiting_pickup, undefined);
+  assert.equal(t.status, 'valid'); assert.equal(t.jti, 'renewed'); assert.equal(t.awaiting_pickup, undefined); assert.equal(t.renewal_declined, undefined);
+  // The agent kept another token and declined a newer renewal: not counted, and the card says it was declined (round 3 L5).
+  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at, revoked) VALUES (?, ?, ?, ?, ?, 1)').run('narrow', BRAIN, 'read', sec + 10, sec + 7200);
+  db.prepare("INSERT INTO token_deliveries (pub_id, did, token_jti, created_at, expires_at, acked_at, ack) VALUES (?, ?, ?, ?, ?, ?, 'declined')").run('y', BRAIN, 'narrow', new Date(now).toISOString(), new Date(now + 7200000).toISOString(), new Date(now).toISOString());
+  t = fb.tokenStatus(db, BRAIN, now);
+  assert.equal(t.jti, 'renewed'); assert.ok(t.renewal_declined && t.renewal_declined.at); assert.equal(t.awaiting_pickup, undefined);
 });
 
 test('threshold refill daily cap: rolling 24 h of automatic refills, manual refills not counted, alert once', () => {

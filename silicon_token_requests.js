@@ -63,6 +63,10 @@ module.exports = function registerSiliconTokenRequests(deps) {
   )`);
   try { db.exec("ALTER TABLE silicon_token_requests ADD COLUMN requester_role TEXT DEFAULT ''"); } catch (_) {}
   // Agent creation requests: the agent does not exist when asked for (silicon_row 0, member_did '' until approval).
+  // The filer gave the hash of a secret it keeps (claim_secret_hash): nobody else ever saw a claim secret. With the agent
+  // filing for itself, or the owner filing with the agent's hash, the token is the agent's own (`agent_own` at mint):
+  // only such a token may pin the agent's first delivery key (silicon_renew.js; PR #100 review round 3, M1).
+  try { db.exec('ALTER TABLE silicon_token_requests ADD COLUMN claim_hash_given INTEGER DEFAULT 0'); } catch (_) {}
   for (const col of ["creates INTEGER DEFAULT 0", "display_name TEXT DEFAULT ''", "username TEXT DEFAULT ''"]) {
     try { db.exec(`ALTER TABLE silicon_token_requests ADD COLUMN ${col}`); } catch (_) {}
   }
@@ -110,6 +114,10 @@ module.exports = function registerSiliconTokenRequests(deps) {
   // What the phone signs: a creation says so first, so a token for an existing agent and a new agent never share a text.
   const bindFor = (r) => `${r.creates ? 'create ' : ''}${r.fleet_slug}/${r.handle}:${r.scope}:${r.expires_in} asked by ${requesterName(r)}`;
   const fleetCreate = deps.fleetCreate || (() => ({}));
+  // The agent's own token: it asked for it itself, or the owner asked with a claim_secret_hash (the agent's secret).
+  // A token another member asked for, or one whose claim secret was handed out in clear, is not.
+  const agentOwn = (r, memberDid) => Boolean((r.requested_by_did && r.requested_by_did === memberDid)
+    || (r.requested_by_did === r.owner_did && Number(r.claim_hash_given) === 1));
 
   // ── file a request ──────────────────────────────────────────────────────────────────────────────────────────────
   app.post('/api/fleet/:slug/silicons/:handle/token-requests', rateLimitStandard, (req, res) => {
@@ -180,9 +188,9 @@ module.exports = function registerSiliconTokenRequests(deps) {
       // A member the fleet did not create (joined through the network or linked) is someone else's wallet: say so (#79 review).
       : db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1 AND COALESCE(joined_via, 'owner') != 'network'").get(fleet.id, auth.did) ? 'other_agent' : 'outside_agent';
     const id = Number(db.prepare(`INSERT INTO silicon_token_requests (fleet_id, fleet_slug, silicon_row, handle, member_did, owner_did, requested_by_did,
-        says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at, creates, display_name, username) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at, creates, display_name, username, claim_hash_given) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, role, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC),
-        creates ? 1 : 0, displayName, username).lastInsertRowid);
+        creates ? 1 : 0, displayName, username, claimSecret ? 0 : 1).lastInsertRowid);
     const who = role === 'outside_agent' ? 'A WALLET YOUR FLEET DID NOT CREATE, in' : role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in';
     if (creates) {
       mailOwner(fleet.owner_did, `DemiPass: a new agent @${s.handle} is asked for`,
@@ -244,7 +252,8 @@ module.exports = function registerSiliconTokenRequests(deps) {
         if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
         const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
           scope: r.scope, expiresIn: r.expires_in,
-          metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: r.fleet_slug, minted_by: auth.did, token_request: r.id },
+          metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: r.fleet_slug, minted_by: auth.did, token_request: r.id,
+                      ...(agentOwn(r, wallet.did) ? { agent_own: true } : {}) },
         });
         const jti = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).jti || null;
         const n = db.prepare("UPDATE silicon_token_requests SET status = 'approved', sealed = ?, token_jti = ?, decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
@@ -283,7 +292,8 @@ module.exports = function registerSiliconTokenRequests(deps) {
       const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(made.did);
       const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
         scope: r.scope, expiresIn: r.expires_in,
-        metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: r.fleet_slug, minted_by: auth.did, token_request: r.id },
+        metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: r.fleet_slug, minted_by: auth.did, token_request: r.id,
+                    ...(agentOwn(r, made.did) ? { agent_own: true } : {}) },
       });
       jti = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString()).jti || null;
       const n = db.prepare(`UPDATE silicon_token_requests SET status = 'approved', member_did = ?, silicon_row = ?, sealed = ?, token_jti = ?, decided_at = ?, expires_at = ?

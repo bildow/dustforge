@@ -464,35 +464,52 @@ function awaitingPickup(db, did, now = Date.now()) {
     return r ? { since: r.created_at, until: r.expires_at } : null;
   } catch (_) { return null; }
 }
+// The newest renewal was declined by the agent (it kept a newer or broader token): the card says so (round-3 L5).
+function renewalDeclined(db, did, now = Date.now()) {
+  try {
+    const r = db.prepare('SELECT ack, acked_at FROM token_deliveries WHERE did = ? AND expires_at > ? ORDER BY id DESC LIMIT 1').get(did, new Date(now).toISOString());
+    return r && r.ack === 'declined' ? { at: r.acked_at } : null;
+  } catch (_) { return null; }
+}
 
 // 'expiring' in the last TOKEN_WARN_HOURS (Aaron 2026-11-12: "an expiry warning 24 h before lapse"); the card shows
 // hours then. days_left stays for older readers. awaiting_pickup: a renewal the agent has not picked up yet; the status
 // is still the token it holds.
 function tokenStatus(db, did, now = Date.now()) {
   const t = latestToken(db, did);
-  const waiting = awaitingPickup(db, did, now);
-  if (!t) return { status: 'none', scope: null, expires_at: null, days_left: null, hours_left: null, ...(waiting ? { awaiting_pickup: waiting } : {}) };
+  const waiting = awaitingPickup(db, did, now), declined = waiting ? null : renewalDeclined(db, did, now);
+  const extra = { ...(waiting ? { awaiting_pickup: waiting } : {}), ...(declined ? { renewal_declined: declined } : {}) };
+  if (!t) return { status: 'none', scope: null, expires_at: null, days_left: null, hours_left: null, ...extra };
   const expMs = Number(t.expires_at) * 1000;
   const hoursLeft = (expMs - now) / 3600000;
   const status = hoursLeft <= 0 ? 'expired' : (hoursLeft <= TOKEN_WARN_HOURS ? 'expiring' : 'valid');
   return { status, scope: t.scope, expires_at: new Date(expMs).toISOString(), days_left: Math.floor(hoursLeft / 24 * 10) / 10,
-           hours_left: Math.floor(hoursLeft * 10) / 10, jti: t.jti, ...(waiting ? { awaiting_pickup: waiting } : {}) };
+           hours_left: Math.floor(hoursLeft * 10) / 10, jti: t.jti, ...extra };
 }
 
 // The agent's delivery key (silicon_renew.js): where an owner's renewal is sealed to. Fingerprint only. `changed_at`
-// when it replaced an earlier key; `pending` a change waiting for the owner (PR #100 review H1).
+// when it replaced an earlier key; `previous` while that change can still be undone; `pending` a key waiting for the
+// owner (the first one too), with who asked: the asking token's kind and address (PR #100 review rounds 2-3). An ask
+// whose token was revoked since (its jti, revoke-all, a fleet cut) is not shown.
 function deliveryKeyFingerprint(raw) { return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16); }
 function deliveryKeyView(db, did) {
   let pending = null;
   try {
-    const p = db.prepare("SELECT id, fingerprint, requested_at, expires_at FROM delivery_key_changes WHERE did = ? AND status = 'pending' AND expires_at > ? ORDER BY id DESC LIMIT 1").get(did, nowIso());
-    if (p) pending = { id: p.id, fingerprint: p.fingerprint, requested_at: p.requested_at, expires_at: p.expires_at };
+    const p = db.prepare(`SELECT c.id, c.fingerprint, c.requested_at, c.expires_at, c.auth_method, c.ip, c.first_key FROM delivery_key_changes c
+                           WHERE c.did = ? AND c.status = 'pending' AND c.expires_at > ?
+                             AND NOT EXISTS (SELECT 1 FROM issued_tokens t WHERE t.jti = c.ask_jti AND c.ask_jti != '' AND t.revoked = 1)
+                             AND NOT EXISTS (SELECT 1 FROM token_revocations r WHERE r.did = c.did AND c.ask_iat > 0 AND c.ask_iat < r.revoke_before)
+                             AND NOT EXISTS (SELECT 1 FROM fleet_token_cuts x WHERE x.did = c.did AND c.auth_method = 'fleet_owner_mint' AND x.fleet = c.ask_fleet AND c.ask_iat < x.revoke_before)
+                           ORDER BY c.id DESC LIMIT 1`).get(did, nowIso());
+    if (p) pending = { id: p.id, fingerprint: p.fingerprint, requested_at: p.requested_at, expires_at: p.expires_at, auth_method: p.auth_method || '', ip: p.ip || '', first: Boolean(p.first_key) };
   } catch (_) {}
   try {
-    const w = db.prepare('SELECT delivery_public_key, delivery_key_set_at, delivery_key_changed_at FROM identity_wallets WHERE did = ?').get(did);
+    const w = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
     if (!w || !w.delivery_public_key) return { set: false, pending };
+    const prev = w.delivery_key_previous && w.delivery_key_previous_until && Date.parse(w.delivery_key_previous_until) > Date.now()
+      ? { fingerprint: deliveryKeyFingerprint(Buffer.from(w.delivery_key_previous, 'base64url')), until: w.delivery_key_previous_until } : null;
     return { set: true, fingerprint: deliveryKeyFingerprint(Buffer.from(w.delivery_public_key, 'base64url')), set_at: w.delivery_key_set_at || null,
-             changed_at: w.delivery_key_changed_at || null, pending };
+             changed_at: w.delivery_key_changed_at || null, previous: prev, pending };
   } catch (_) { return { set: false, pending }; }   // a database without the columns (before silicon_renew.js ran)
 }
 

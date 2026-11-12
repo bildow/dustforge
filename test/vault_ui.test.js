@@ -1928,6 +1928,12 @@ function fleetRoutes(state) {
       state.pinFresh = false; state.keys = { claude: { set: true, fingerprint: 'eeeeffff00001111', set_at: '2026-11-10T08:00:00Z', changed_at: '2026-11-12T09:00:00Z', pending: null } };
       return { json: { ok: true } };
     }
+    if (p === '/api/fleet/aaron-agents/silicons/lapsed/delivery-key/revert') {
+      state.revertCalls = (state.revertCalls || 0) + 1;
+      if (!state.pinFresh) return { status: 403, json: { error: "undoing @lapsed's key change needs your PIN", missing: ['pin'], required: ['pin'], intent: 'silicon-key-revert:13' } };
+      state.pinFresh = false; state.keys = { lapsed: { set: true, fingerprint: '9999888877776666', set_at: '2026-11-01T08:00:00Z', changed_at: '2026-11-12T10:00:00Z', previous: null, pending: null } };
+      return { json: { ok: true, fingerprint: '9999888877776666', tokens_revoked: 2 } };
+    }
     if (p === '/api/fleet/aaron-agents/silicons/claude/delivery-key/5/deny') { state.denied = (state.denied || 0) + 1; state.keys = {}; return { json: { ok: true } }; }
     if (p === '/api/fleet/aaron-agents/silicons/nokey/renew-token') return { status: 409, json: { no_delivery_key: true, error: '@nokey has no delivery key, so a renewed token could reach nobody but you.' } };
     if (p === '/api/identity/gate/verify') { assert.equal(body.intent, state.intent || 'silicon-renew:12', 'the PIN opens this one action only'); state.pinFresh = body.pin === '2468'; return state.pinFresh ? { json: { ok: true } } : { status: 403, json: { error: 'incorrect PIN' } }; }
@@ -1994,7 +2000,7 @@ test('a renewal not picked up says so on the card, with the time left on the old
 });
 
 test('the card says where renewals go: key set / key changed / a new key waiting; Mint is hidden once a key is set (#100 H1, L4)', async () => {
-  const state = { keys: { claude: { set: true, fingerprint: 'aaaabbbbccccdddd', set_at: '2026-11-10T08:00:00Z', changed_at: null, pending: { id: 5, fingerprint: 'eeeeffff00001111', requested_at: '2026-11-12T08:00:00Z' } },
+  const state = { keys: { claude: { set: true, fingerprint: 'aaaabbbbccccdddd', set_at: '2026-11-10T08:00:00Z', changed_at: null, pending: { id: 5, fingerprint: 'eeeeffff00001111', requested_at: '2026-11-12T08:00:00Z', auth_method: 'fingerprint', ip: '203.0.113.7', first: false } },
                           lapsed: { set: true, fingerprint: '1111222233334444', set_at: '2026-11-01T08:00:00Z', changed_at: '2026-11-11T08:00:00Z', pending: null } },
                   intent: 'silicon-key:12' };
   const pg = page({ storage: signedIn, routes: fleetRoutes(state) });
@@ -2008,7 +2014,8 @@ test('the card says where renewals go: key set / key changed / a new key waiting
   // The silicon's page: the change to decide, and no Mint button (a delivery key is set).
   await pg.ctx.openSilicon('claude'); await settle();
   let sp = pg.el('silicon-content').innerHTML;
-  assert.match(sp, /asks to change its delivery key to <span[^>]*>eeeeffff00001111</);
+  assert.match(sp, /asks to change its delivery key: <span[^>]*>eeeeffff00001111</);
+  assert.match(sp, /class="key-asker"[^>]*>asked [^<]* with a fingerprint token from 203\.0\.113\.7</, 'who asked: the token kind and address');
   assert.match(sp, /current key aaaabbbbccccdddd/);
   assert.doesNotMatch(sp, /Mint a 30-day token/, 'with a delivery key the shown-once mint is gone');
   const handlers = [...sp.matchAll(/onclick="(decideKeyChange[^"]*)"/g)].map(m => m[1]);
@@ -2017,12 +2024,12 @@ test('the card says where renewals go: key set / key changed / a new key waiting
   const done = pg.ctx.decideKeyChange('claude', 5, true);
   await settle();
   assert.equal(pg.shown('modal-pin'), true);
-  assert.match(pg.el('pin-unlock-what').textContent, /renewals go to its new delivery key/);
+  assert.match(pg.el('pin-unlock-what').textContent, /renewals go to this delivery key/);
   pg.el('pin-unlock').value = '2468';
   await pg.ctx.submitPin();
   await done; await settle();
   assert.equal(state.keyCalls, 2, 'refused once for the PIN, approved after it');
-  assert.match(pg.el('fleet-content').innerHTML, /new delivery key is set\. Renewals to it start in a few hours\./);
+  assert.match(pg.el('fleet-content').innerHTML, /delivery key is set: renewals are sealed to it\./);
   assert.match(pg.el('fleet-content').innerHTML, /class="key-changed"/);
   // No key: Mint is still there for that agent.
   await pg.ctx.openSilicon('nokey'); await settle();
@@ -2038,4 +2045,48 @@ test('denying a key change asks for no PIN', async () => {
   assert.equal(state.denied, 1);
   assert.equal(pg.calls.filter(c => c.path === '/api/identity/gate/verify').length, 0);
   assert.match(pg.el('fleet-content').innerHTML, /Denied: @claude&#39;s renewals keep going to its current key\./);
+});
+
+test('a first key waits for the owner like a change: "key waiting for you", the card says no renewal goes anywhere yet (#100 round 3 H1)', async () => {
+  const state = { keys: { claude: { set: false, pending: { id: 5, fingerprint: 'eeeeffff00001111', requested_at: '2026-11-12T08:00:00Z', auth_method: 'fingerprint', ip: '198.51.100.4', first: true } } } };
+  const pg = page({ storage: signedIn, routes: fleetRoutes(state) });
+  await settle();
+  await pg.ctx.loadFleet();
+  assert.match(pg.el('fleet-content').innerHTML, /class="key-none">no delivery key<\/span> · <span class="key-pending"[^>]*>key waiting for you</);
+  await pg.ctx.openSilicon('claude'); await settle();
+  const sp = pg.el('silicon-content').innerHTML;
+  assert.match(sp, /asks to set its delivery key: <span[^>]*>eeeeffff00001111</);
+  assert.match(sp, /with a fingerprint token from 198\.51\.100\.4/);
+  assert.match(sp, /No renewal goes anywhere until you approve a key\./);
+});
+
+test('an approved key change can be undone in its window: PIN for silicon-key-revert:<id>, the note says what was revoked (#100 round 3 L2)', async () => {
+  const state = { intent: 'silicon-key-revert:13',
+    keys: { lapsed: { set: true, fingerprint: '1111222233334444', set_at: '2026-11-01T08:00:00Z', changed_at: '2026-11-12T08:00:00Z',
+                      previous: { fingerprint: '9999888877776666', until: '2026-11-12T14:00:00Z' }, pending: null } } };
+  const pg = page({ storage: signedIn, routes: fleetRoutes(state) });
+  await settle();
+  await pg.ctx.loadFleet();
+  await pg.ctx.openSilicon('lapsed'); await settle();
+  const sp = pg.el('silicon-content').innerHTML;
+  assert.match(sp, /onclick="revertKey\(&quot;lapsed&quot;\)"[^>]*>Undo: back to 9999888877776666</);
+  const done = pg.ctx.revertKey('lapsed');
+  await settle();
+  assert.equal(pg.shown('modal-pin'), true);
+  assert.match(pg.el('pin-unlock-what').textContent, /Undo @lapsed's key change\? Tokens sealed to the new key are revoked/);
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();
+  await done; await settle();
+  assert.equal(state.revertCalls, 2, 'refused once for the PIN, reverted after it');
+  assert.match(pg.el('fleet-content').innerHTML, /delivery key is back to 9999888877776666; 2 token\(s\) sealed to the other key revoked\./);
+});
+
+test('a renewal the agent declined shows on the chip instead of "awaiting pickup" (#100 round 3 L5)', async () => {
+  const state = { extra: [['decl', { status: 'valid', days_left: 20, hours_left: 480, renewal_declined: { at: '2026-11-12T09:00:00Z' } }]] };
+  const pg = page({ storage: signedIn, routes: fleetRoutes(state) });
+  await settle();
+  await pg.ctx.loadFleet();
+  const h = pg.el('fleet-content').innerHTML;
+  assert.match(h, /tok-valid[^>]*>token ok · 20d · renewal declined</);
+  assert.doesNotMatch(h, /awaiting pickup/);
 });
