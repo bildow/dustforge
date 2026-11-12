@@ -226,6 +226,10 @@ echo "$OUT" | grep -q "tui.log: 1 copy" && echo "$OUT" | grep -q "ja.md: 1 copy"
 echo "$OUT" | grep -q "mixed.txt: 1 copy" && ! grep -qF -- "$(head -c 12 "$S/nval")" "$S/tn/mixed.txt" && ok "a UTF-8 copy among stray bytes is masked exactly" || fail "mixed: $OUT"
 echo "$OUT" | grep -q "NOT READ.*old.log.gz (gzip" && echo "$OUT" | grep -q "not marked contained" && ok "a gzip file is not read and the run is not contained" || fail "N4: $OUT"
 [ $RC = 1 ] && ok "…and a file of continuation bytes does not stall the run" || fail "hi.bin: rc=$RC"
+# a bare repository (Forgejo's layout): its objects are zlib/pack — not read, so never contained (round 3 R1)
+mkdir -p "$S/gw"; ( cd "$S/gw" && git init -q && cp "$S/nval" v.txt && git add v.txt && git -c user.email=t@t -c user.name=t commit -qm v ) && git clone -q --bare "$S/gw" "$S/bare/repo.git" 2>/dev/null
+scrubtok sB "$NREF"; OUT=$(SCRUB "$S/sB.tok" --all "$S/bare"); RC=$?
+[ $RC = 1 ] && echo "$OUT" | grep -q "NOT READ.*git object" && echo "$OUT" | grep -q "not marked contained" && ok "a bare repo's objects are not read: not contained" || fail "bare repo: rc=$RC $OUT"
 python3 - "$DB_PATH" "$S" <<'PY' && ok "the stored fingerprints cannot be checked from the database alone, and a spent token keeps none" || fail "N3"
 import sqlite3,sys,hmac,hashlib; c=sqlite3.connect(sys.argv[1]); S=sys.argv[2]; v=open(S+'/nval').read().strip()
 rows=c.execute("SELECT token_hash, scrub_value_mac, revoked_at FROM leak_scan_tokens WHERE scrub_secret_id IS NOT NULL").fetchall()

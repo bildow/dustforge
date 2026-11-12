@@ -174,7 +174,7 @@ function* scrubWindows(buf, size, overlap, from = 0, to = buf.length) {
 }
 // Bytes that are not part of valid UTF-8 → 0x1A, one for one (so offsets in the text are offsets in the file).
 function utf8Clean(raw) {
-  const out = Buffer.from(raw); let bad = 0;
+  const out = Buffer.from(raw); let bad = 0; const at = [];
   for (let i = 0; i < out.length;) {
     const b = out[i];
     if (b < 0x80) { i++; continue; }
@@ -184,17 +184,20 @@ function utf8Clean(raw) {
     if (ok && n === 3) { const c = out[i + 1]; if ((b === 0xE0 && c < 0xA0) || (b === 0xED && c > 0x9F)) ok = false; }
     if (ok && n === 4) { const c = out[i + 1]; if ((b === 0xF0 && c < 0x90) || (b === 0xF4 && c > 0x8F)) ok = false; }
     if (ok) { i += n; continue; }
-    out[i] = 0x1A; bad++; i++;
+    out[i] = 0x1A; bad++; at.push(i); i++;
   }
-  return { out, bad };
+  return { out, bad, at };
 }
 // Compressed or packed data: a copy inside cannot be seen, so the file is not "read" (#98 re-review N4).
 function packed(p, head) {
-  if (/(^|[\/])\.git[\/]objects[\/]/.test(p)) return 'git object';
+  // Git objects in a work tree's .git or a bare repo (name.git/objects, Forgejo's layout), loose or packed (#98 round 3 R1).
+  if (/(^|[\/])[^\/]*\.git[\/]objects[\/]/.test(p) || /[\/]objects[\/]([0-9a-f]{2}[\/][0-9a-f]{38}|pack[\/])/.test(p)) return 'git object';
   const m = (sig) => head.length >= sig.length && sig.every((x, i) => head[i] === x);
   if (m([0x1f, 0x8b])) return 'gzip'; if (m([0x28, 0xb5, 0x2f, 0xfd])) return 'zstd'; if (m([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00])) return 'xz';
   if (m([0x42, 0x5a, 0x68])) return 'bzip2'; if (m([0x50, 0x4b, 0x03, 0x04])) return 'zip'; if (m([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])) return '7z';
-  if (m([0x04, 0x22, 0x4d, 0x18])) return 'lz4'; if (m([0x4c, 0x50, 0x4b, 0x53, 0x48, 0x48, 0x52, 0x48])) return 'journal';
+  if (m([0x04, 0x22, 0x4d, 0x18])) return 'lz4'; if (m([0x50, 0x41, 0x43, 0x4b])) return 'git pack';
+  if (head.length >= 2 && head[0] === 0x78 && ((head[0] << 8) | head[1]) % 31 === 0) return 'zlib';
+  if (m([0x25, 0x50, 0x44, 0x46])) return 'pdf (deflated)'; if (m([0x89, 0x50, 0x4e, 0x47])) return 'png (deflated)'; if (m([0x4c, 0x50, 0x4b, 0x53, 0x48, 0x48, 0x52, 0x48])) return 'journal';
   return null;
 }
 // The server counts UTF-8 bytes of the text it got; for latin1 text each raw byte ≥ 0x80 was two of them.
@@ -255,7 +258,7 @@ async function scrub(args) {
     // Windows, each with its texts; one too big for a request is split (the overlap keeps every copy whole in a half).
     const wins = [];
     const add = (a, b) => {
-      const raw = buf.subarray(a, b), { out, bad } = utf8Clean(raw);
+      const raw = buf.subarray(a, b), { out, bad, at: badAt } = utf8Clean(raw);
       const parts = [{ view: 'u', text: out.toString('utf8') }];
       if (bad) parts.push({ view: 'l', text: raw.toString('latin1') });
       const bytes = parts.reduce((n, p) => n + Buffer.byteLength(JSON.stringify(p.text)) + 32, 0);
@@ -266,9 +269,10 @@ async function scrub(args) {
         add(a, Math.min(b, mid + overlap)); add(mid, b); return;
       }
       if (bytes > SCRUB_BODY_MAX) throw new Error(`${f}: a piece of it does not fit one request`);
-      wins.push({ start: a, end: b, parts, bytes });
+      wins.push({ start: a, end: b, parts, bytes, badAt });
     };
-    for (const w of scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)) add(w.start, w.end);
+    try { for (const w of scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)) add(w.start, w.end); }
+    catch (e) { filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${e.message.replace(f + ': ', '')})`); continue; }   // round 3 L1: that file is not read; the run goes on
     const spans = new Map();                 // exact spans (absolute start → length): written, in a text file
     const binSeen = new Set();
     let batch = [], size = 0;
@@ -279,6 +283,8 @@ async function scrub(args) {
         const [wi, view] = String(m.chunk).split(':'); const w = wins[Number(wi)]; if (!w) continue;
         const raw = buf.subarray(w.start, w.end);
         for (const [off, len] of m.at || []) {
+          // A match over a byte that was replaced (0x1A) is not the value as written: never masked (round 3 L2).
+          if (view !== 'l' && w.badAt.length && w.badAt.some(x => x >= off && x < off + len)) continue;
           const a = view === 'l' ? latin1Offset(raw, off) : off;
           const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
           if (binary) { binSeen.add(w.start + a); continue; }
