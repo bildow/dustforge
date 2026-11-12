@@ -131,6 +131,15 @@ function answerCutOff(req, res, action, ms, { delegated = false } = {}) {
   if (delegated && ms < USE_TIMEOUT_MAX_S * 1000) body.hint = `the secret's owner can raise this delegation's limit (up to ${USE_TIMEOUT_MAX_S} s)`;
   return res.status(504).json(body);
 }
+// Give back this /use's charge once (a GitHub mint that handed out no token — #104 review L2). Returns the DD refunded.
+function refundUse(req, why) {
+  if (!req.billing || !(req.billing.deducted > 0) || req._useRefunded) return 0;
+  req._useRefunded = true;
+  try {
+    const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'api_call_compute_refund', `Refund: ${why}`, { tokenJti: req.billing.token_jti || null });
+    return r && r.ok ? req.billing.deducted : 0;
+  } catch (_) { return 0; }
+}
 // The owner approves, in the DemiPass app with the PIN, an act on their own entry that an agent session could otherwise
 // do in their name (#96 review H1: a device-flow MCP token is the owner's wallet, not the owner). Returns true to go on,
 // or answers (202 with the approval request, or the refusal) and returns false.
@@ -3203,6 +3212,12 @@ setInterval(eraseDeadValues, 10 * 60 * 1000).unref();
 function moveSecretAside(row, name) {
   db.prepare('UPDATE blindkey_secrets SET name = ? WHERE id = ?').run(`${name}~${row.id}~${crypto.randomBytes(4).toString('hex')}`, row.id);
 }
+// A stored GitHub App key is never overwritten by a deposit or a Rowen ingest (its value and type would be replaced
+// under its scopes — #104 round 2): only its owner re-stores or rotates it. Returns the refusal, or null.
+function appKeyOverwriteRefusal(did, name) {
+  const row = db.prepare("SELECT secret_type FROM blindkey_secrets WHERE did = ? AND name = ? AND status NOT IN ('deleted')").get(did, name);
+  return row && row.secret_type === 'github_app_key' ? `'${name}' is a GitHub App key — it is replaced only by its owner (store or rotate), never deposited over` : null;
+}
 function clearNameForStore(did, name) {
   const row = db.prepare('SELECT id, status, replaced_by FROM blindkey_secrets WHERE did = ? AND name = ?').get(did, name);
   if (!row || row.status === 'active') return null;
@@ -3251,7 +3266,7 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS blindkey_contexts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   secret_id INTEGER NOT NULL REFERENCES blindkey_secrets(id),
   context_name TEXT NOT NULL,
-  action_type TEXT NOT NULL CHECK(action_type IN ('http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect')),
+  action_type TEXT NOT NULL CHECK(action_type IN ('http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect', 'github_app_token')),
   target_url_pattern TEXT DEFAULT '*',
   target_host_pattern TEXT DEFAULT '*',
   allowed_by TEXT NOT NULL,
@@ -3621,9 +3636,12 @@ function urlPatternMatch(pattern, canonical) {
 
 // Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
 function insertBlindkeyContexts(secretId, contexts, allowedBy) {
+  // A GitHub App key has GitHub App scopes and nothing else, and only it has them (#104 review H1): enforced here, where
+  // every path that makes a scope ends — context/add, an approved context request, deposit, Rowen ingest.
+  const appKey = githubAppLib.isAppKey(db.prepare('SELECT secret_type FROM blindkey_secrets WHERE id = ?').get(secretId));
   const insertCtx = db.prepare(`
-    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, command_allowlist, allowed_methods)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, command_allowlist, allowed_methods, github_app)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(secret_id, context_name) DO UPDATE SET
       action_type = excluded.action_type,
       target_url_pattern = excluded.target_url_pattern,
@@ -3631,13 +3649,17 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       allowed_by = excluded.allowed_by,
       max_uses = excluded.max_uses,
       command_allowlist = excluded.command_allowlist,
-      allowed_methods = excluded.allowed_methods
+      allowed_methods = excluded.allowed_methods,
+      github_app = excluded.github_app
   `);
   let created = 0;
   for (const ctx of contexts) {
     if (!ctx.context_name || !ctx.action_type) continue;
     const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
-    if (!validActions.includes(ctx.action_type)) continue;
+    // A GitHub App scope only with its checked configuration (context/add passes it; deposit and Rowen never do).
+    const ghConfig = ctx.action_type === 'github_app_token' && typeof ctx.github_app === 'string' && githubAppLib.scopeOf(ctx.github_app) ? ctx.github_app : null;
+    if (!validActions.includes(ctx.action_type) && !ghConfig) continue;
+    if (appKey !== (ctx.action_type === 'github_app_token')) continue;
     insertCtx.run(
       secretId,
       ctx.context_name,
@@ -3648,7 +3670,8 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       ctx.max_uses || 0,
       ctx.action_type === 'ssh_exec' ? (parseAllowedCommands(ctx.allowed_commands).value || '[]') : null,   // invalid or absent → nothing runs
       // HTTP: absent → any method (as before); an unreadable list → nothing (never "any" by accident)
-      HTTP_SCOPE_ACTIONS.has(ctx.action_type) ? (parseAllowedMethods(ctx.allowed_methods).error ? '[]' : parseAllowedMethods(ctx.allowed_methods).value) : null
+      HTTP_SCOPE_ACTIONS.has(ctx.action_type) ? (parseAllowedMethods(ctx.allowed_methods).error ? '[]' : parseAllowedMethods(ctx.allowed_methods).value) : null,
+      ghConfig
     );
     created++;
   }
@@ -3665,6 +3688,15 @@ try { db.exec('ALTER TABLE blindkey_contexts ADD COLUMN command_allowlist TEXT D
 // NULL = any method (scopes made before 2026-11-12); a JSON array = only these. The method is the caller's choice on
 // every use, so a URL pattern alone never said "read only" — this does.
 try { db.exec('ALTER TABLE blindkey_contexts ADD COLUMN allowed_methods TEXT DEFAULT NULL'); } catch (_) {}
+// A GitHub App scope's configuration (github_app.js): installation, exact repositories, permissions, max token TTL (JSON).
+// NULL on every other scope. The table's CHECK on action_type is widened once to admit github_app_token (a rebuild:
+// a CHECK cannot be altered in place) — databases made before this branch only.
+try { db.exec('ALTER TABLE blindkey_contexts ADD COLUMN github_app TEXT DEFAULT NULL'); } catch (_) {}
+const githubAppLib = require('./github_app');
+// A rebuild that cannot complete rolls back and is logged; the server boots on the old table (GitHub scopes then cannot
+// be added until it is fixed) — it never stops the boot (#104 review M1).
+try { githubAppLib.widenContextActionCheck(db, (m) => console.log(m)); }
+catch (e) { console.error(`[github-app] blindkey_contexts NOT rebuilt (GitHub App scopes unavailable): ${e.message}`); }
 const HTTP_METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
 const HTTP_SCOPE_ACTIONS = new Set(['http_header', 'http_body']);
 function parseAllowedMethods(v) {
@@ -3689,7 +3721,8 @@ function methodRefusal(contextId, method) {
 function contextView(ctx) {
   return { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern,
     max_uses: ctx.max_uses, use_count: ctx.use_count, status: ctx.status, created_at: ctx.created_at,
-    allowed_commands: jsonList(ctx.command_allowlist), allowed_methods: jsonList(ctx.allowed_methods) };
+    allowed_commands: jsonList(ctx.command_allowlist), allowed_methods: jsonList(ctx.allowed_methods),
+    ...(ctx.action_type === 'github_app_token' ? { github_app: githubAppLib.scopeOf(ctx.github_app) } : {}) };
 }
 const PLAIN_WORDS_RE = /^[A-Za-z0-9._\/:=@%+,-]+( [A-Za-z0-9._\/:=@%+,-]+)*$/;
 function parseAllowedCommands(v) {
@@ -3839,6 +3872,10 @@ const HOST_ACTIONS = new Set(['ssh_exec', 'smtp_auth']);
 function enforceBlindkeyContext(secret, contextName, action, targetUrl, targetHost) {
   // A frozen secret is used by nothing — /use, request-token, key_name, Rowen, rotation (#43 re-review N5).
   if (secret.frozen) return { allowed: false, frozen: true, error: 'secret is frozen — its owner unfreezes it in the DemiPass app' };
+  // A GitHub App key only mints (github_app_token), and only it does: no scope row, however it got there, sends it out.
+  if (githubAppLib.isAppKey(secret) !== (action === 'github_app_token')) {
+    return { allowed: false, error: githubAppLib.isAppKey(secret) ? 'a GitHub App key is used only with action github_app_token' : 'action github_app_token: only on a GitHub App key' };
+  }
   const contexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(secret.id);
 
   // No scope, no use (red team item 12): a secret with no contexts used to be usable against every allow-listed host.
@@ -3973,7 +4010,7 @@ function authorizeSecretMediation({ requestorDid, secretName, contextName, actio
 // POST /api/blindkey/store — store a secret (requires transact scope)
 app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db, 'api_call_write', { cost: 0 }), (req, res) => {
   const { name, value, description, secret_type, ownership, rotatable, category, labels, rotation_interval_days, origins, login,
-          username, host, note, if_absent } = req.body || {};
+          username, host, note, if_absent, github_app_id } = req.body || {};
   if (!name || !value) return res.status(400).json({ error: 'name and value required' });
   if (typeof name !== 'string' || typeof value !== 'string') return res.status(400).json({ error: 'name and value: strings' });
   if (description !== undefined && description !== null && typeof description !== 'string') return res.status(400).json({ error: 'description: must be a string' });
@@ -3997,6 +4034,25 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     ? (db.prepare('SELECT secret_type FROM blindkey_secrets WHERE did = ? AND name = ?').get(req.identity.did, name) || {}).secret_type : null;
   const typeChoice = storedType ? { type: storedType, inferred: false } : secretTypes.resolveType(secret_type, value, { username: accountUsername || '' });
   if (typeChoice.error) return res.status(400).json(typeChoice);
+  // A GitHub App private key (github_app.js): the whole .pem, checked to be an RSA private key without echoing it, and
+  // the app's App ID kept with it (the JWT's iss). It gets no default scope and is never revealed, filled or wrapped.
+  // An entry changes to or from this type only by deleting it first: its scopes are of one kind or the other.
+  {
+    const prev = db.prepare("SELECT secret_type FROM blindkey_secrets WHERE did = ? AND name = ? AND status NOT IN ('deleted')").get(req.identity.did, name);
+    const isApp = typeChoice.type === 'github_app_key';
+    if (prev && (prev.secret_type === 'github_app_key') !== isApp) {
+      return res.status(409).json({ error: `'${name}' is ${prev.secret_type === 'github_app_key' ? 'a GitHub App key' : 'not a GitHub App key'} — delete it first, or store this under another name` });
+    }
+    if (isApp) {
+      const why = githubAppLib.pemRefusal(value) || githubAppLib.appIdRefusal(github_app_id);
+      if (why) return res.status(400).json({ error: why, field: /github_app_id/.test(why) ? 'github_app_id' : 'value' });
+      if ((origins !== undefined && origins !== null) || (login !== undefined && login !== null) || boundHost || accountUsername) {
+        return res.status(400).json({ error: 'a GitHub App key takes no origins, login, host or username: it only mints installation tokens' });
+      }
+    } else if (github_app_id !== undefined && github_app_id !== null && github_app_id !== '') {
+      return res.status(400).json({ error: 'github_app_id: only with secret_type github_app_key' });
+    }
+  }
   // if_absent: refuse instead of overwriting a secret already stored under this name (the app's manual entry sends it).
   if (if_absent === true && db.prepare(`SELECT 1 FROM blindkey_secrets WHERE did = ? AND name = ? AND status NOT IN ('deleted')`).get(req.identity.did, name)) {
     return res.status(409).json({ error: `you already have a secret named '${name}' — pick another name, or edit that one`, exists: true });
@@ -4126,6 +4182,9 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     if (login !== undefined && login !== null) db.prepare('UPDATE blindkey_secrets SET fill_username = ? WHERE id = ?').run(login, stored.id);
     if (accountUsername !== null) db.prepare('UPDATE blindkey_secrets SET account_username = ? WHERE id = ?').run(accountUsername, stored.id);
     if (note !== undefined && note !== null) db.prepare('UPDATE blindkey_secrets SET note = ? WHERE id = ?').run(cleanLabel(note, 500).trim(), stored.id);
+    if (resolvedType === 'github_app_key') {
+      db.prepare("UPDATE blindkey_secrets SET metadata = json_set(COALESCE(NULLIF(metadata, ''), '{}'), '$.github_app_id', ?) WHERE id = ?").run(String(github_app_id).trim(), stored.id);
+    }
 
     // Auto-create a default context so the secret is immediately usable.
     // Without this, secrets stored via the app have no context and can't get tokens.
@@ -4133,7 +4192,8 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
     // A host given with the secret binds the default context to that host (ssh) or that site (http), not to every host.
     const existingCtx = db.prepare('SELECT id FROM blindkey_contexts WHERE secret_id = ?').get(stored.id);
     const websiteLogin = browserFill.storedOrigins(db.prepare('SELECT fill_origins FROM blindkey_secrets WHERE id = ?').get(stored.id).fill_origins).length > 0;
-    if (!existingCtx && !websiteLogin) {
+    // A GitHub App key gets none: its scopes name an installation, repositories and permissions (context/add).
+    if (!existingCtx && !websiteLogin && resolvedType !== 'github_app_key') {
       const defaultAction = secretTypes.defaultAction(resolvedType);
       const hostPattern = boundHost && defaultAction === 'ssh_exec' ? boundHost.replace(/:\d+$/, '') : '*';
       const urlPattern = boundHost && ['http_header', 'http_body'].includes(defaultAction) ? `https://${boundHost}/*` : '*';
@@ -4159,6 +4219,7 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
       expires_at: expiresAt,
       buoy_tick: buoyTickId,
       ...(resolvedOrigins !== null ? { origins: JSON.parse(resolvedOrigins) } : {}),
+      ...(resolvedType === 'github_app_key' ? { github_app_id: String(github_app_id).trim(), next: 'add a scope: POST /api/demipass/context/add {secret_name, context_name, action_type:"github_app_token", github_app:{installation_id, repositories, permissions, max_ttl_seconds}}' } : {}),
       note: 'Secret stored. It will never be returned in any API response.',
     });
   } catch (e) {
@@ -4192,6 +4253,8 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
   }
   if (!secret) return res.status(404).json({ error: 'secret not found or not owned by you' });
   if (cryptoDepth.isWrapped(secret)) return res.status(409).json({ error: 'this secret is wrapped to your phone, so the server cannot reveal it — lower its depth to standard first (your phone unwraps it)', wrapped: true });
+  // A GitHub App key is never printed (github_app.js): it only signs mints. A lost key is replaced in GitHub's settings.
+  if (githubAppLib.isAppKey(secret)) return res.status(403).json({ error: "a GitHub App key is never revealed — it only mints installation tokens. To replace it, generate a new key in the app's GitHub settings and store it over this one" });
 
   // Critical depth: reveal also takes an approved request (its code), on top of the gate policy's PIN. Checked first
   // without spending it, then the PIN, then spent — so a PIN prompt never wastes an approval.
@@ -4376,6 +4439,7 @@ app.post('/api/blindkey/fill/redeem', rateLimitFill, (req, res) => {
   const secret = db.prepare(`SELECT * FROM blindkey_secrets WHERE id = ? AND did = ? AND status = 'active'`).get(row.secret_id, auth.did);
   if (!secret) return res.status(404).json({ error: 'the login was deleted or revoked since the request' });
   if (secret.frozen) return res.status(423).json({ error: 'secret is frozen — unfreeze before use', frozen: true });
+  if (githubAppLib.isAppKey(secret)) return res.status(403).json({ error: 'a GitHub App key is never filled into a page' });
   // Re-checked at redeem: an origin unbound, or an agent grant revoked, after approval stops the fill.
   if (!browserFill.storedOrigins(secret.fill_origins).includes(row.origin)) return res.status(403).json({ error: `this login is no longer bound to ${row.origin}` });
   if (auth.silicon && !siliconMayFill(auth.agent_name, secret)) return res.status(403).json({ error: `silicon '${auth.agent_name}' no longer holds action:browser_fill for this secret` });
@@ -4626,14 +4690,19 @@ app.get('/api/blindkey/expiring', rateLimitStandard, (req, res) => {
     return { ...s, rotation_due_at: new Date(dueTs).toISOString(), rotation_due_in_days: dueInDays, rotation_overdue: dueInDays < 0 };
   }).filter(s => s && s.rotation_due_in_days <= withinDays).sort((a, b) => a.rotation_due_in_days - b.rotation_due_in_days);
 
+  // Live GitHub App installation tokens (github_app.js): minted on this owner's keys, or by this caller. Never the token.
+  let githubTokens = [];
+  try { githubTokens = githubApp.liveTokens(ownerDid); } catch (_) {}
   res.json({
     did: ownerDid,
     within_days: withinDays,
     expiring,
     already_expired: expired,
     rotation_due: rotationDue,
+    github_tokens: githubTokens,
     total_expiring: expiring.length,
     total_expired: expired.length,
+    total_github_tokens: githubTokens.length,
   });
 });
 
@@ -4970,7 +5039,8 @@ function requestUseTokenHandler(req, res) {
         logSecurityEvent('silicon_permission_denied', 'alert', { caller_did: req.identity?.did, agent_name: auth.agent_name, capability: 'secret:use', target: refSecret.name, error: 'silicon lacks secret:use', ip: req.ip });
         return res.status(403).json({ error: 'silicon agent lacks secret:use permission for this secret', agent: auth.agent_name });
       }
-      const actionPerm = 'action:' + (action || 'ssh_exec');
+      // A GitHub App key acts only as github_app_token, so that is the permission a silicon needs for it when it names none.
+      const actionPerm = 'action:' + (action || (githubAppLib.isAppKey(refSecret) ? 'github_app_token' : 'ssh_exec'));
       if (!siliconHasPermission(auth.agent_name, actionPerm, '*')) {
         logSecurityEvent('silicon_permission_denied', 'alert', { caller_did: req.identity?.did, agent_name: auth.agent_name, capability: actionPerm, error: 'silicon lacks action permission', ip: req.ip });
         return res.status(403).json({ error: 'silicon agent lacks ' + actionPerm + ' permission', agent: auth.agent_name });
@@ -5242,7 +5312,8 @@ async function useRoute(req, res) {
   let { use_token } = req.body || {};
 
   const b = req.body || {};
-  if (!use_token && (b.ref || (b.name && typeof b.name === 'string' && ((b.owner_did && b.owner_did !== req.identity.did) || !resolveLatestBlindkeySecret(req.identity.did, b.name))))) {
+  // A GitHub App mint always goes through a use-token (one call: ref or name), never the legacy direct mode.
+  if (!use_token && (b.ref || (b.name && typeof b.name === 'string' && (b.action === 'github_app_token' || (b.owner_did && b.owner_did !== req.identity.did) || !resolveLatestBlindkeySecret(req.identity.did, b.name))))) {
     const p = (b.params && typeof b.params === 'object') ? b.params : {};
     const issueReq = Object.create(req);
     issueReq.body = { ref: b.ref, name: b.name, action: b.action, context: b.context, owner_did: b.owner_did,
@@ -5294,6 +5365,13 @@ async function useRoute(req, res) {
     if (secret.frozen) {
       db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
       return res.status(423).json({ error: 'secret is frozen — its owner unfreezes it in the DemiPass app', frozen: true });
+    }
+    // A GitHub App key only mints, and only it mints — checked before its value is decrypted (#104 review H1), whatever
+    // scope row the token was issued from.
+    if (githubAppLib.isAppKey(secret) !== (tokenRow.action_type === 'github_app_token')) {
+      db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ?").run(tokenRow.id);
+      logSecurityEvent('github_app_key_misuse', 'critical', { caller_did: req.identity.did, capability: tokenRow.action_type, target: secret.name, ip: req.ip, context: { secret: secret.name, context_id: tokenRow.context_id } });
+      return res.status(403).json({ error: githubAppLib.isAppKey(secret) ? 'a GitHub App key is used only with action github_app_token' : 'action github_app_token: only on a GitHub App key' });
     }
     let decryptedValue;
     // A wrapped secret (item 1) is opened only after the approval below, from the phone's unwrap.
@@ -5349,12 +5427,29 @@ async function useRoute(req, res) {
           return res.status(403).json({ error: why });
         }
       }
+      // A GitHub token request wider than its scope (a repository, a permission, a TTL) is refused here: before the
+      // owner is asked to approve it and before anything connects.
+      let ghRequest = null;
+      if (action === 'github_app_token') {
+        const ctxRow = tokenRow.context_id ? db.prepare('SELECT github_app FROM blindkey_contexts WHERE id = ?').get(tokenRow.context_id) : null;
+        const r = githubAppLib.requestFor(ctxRow && ctxRow.github_app, action_params);
+        if (r.error) {
+          db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
+          logSecurityEvent('github_scope_refused', 'alert', { caller_did: req.identity.did, capability: action, target: secret.name, ip: req.ip, error: r.error.slice(0, 300),
+            context: { secret: secret.name, scope_id: tokenRow.context_id, asked: { repositories: action_params.repositories, permissions: action_params.permissions, ttl_seconds: action_params.ttl_seconds } } });
+          return res.status(403).json({ error: r.error, refunded_dd: refundUse(req, 'GitHub token request refused before connecting') });   // nothing was minted (#104 review L2)
+        }
+        ghRequest = r.value;
+      }
       // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call
       // (the raw body, top level and params as sent — see use_approvals.js).
       let approvedElevatedUse = false;
       {
+        // A GitHub mint's approval names (and binds) the scope it is for and what it asks (#104 review L5): approving a
+        // mint under scope A never pays for one under scope B.
+        const ghTarget = ghRequest ? `scope #${tokenRow.context_id}: ${Object.entries(ghRequest.permissions).map(([k, l]) => `${k}:${l}`).join(', ')} on ${ghRequest.repositories.join(', ')}` : null;
         const g = useApprovals.gate(secret, approvalCaller(req),
-          { kind: 'use', action, targetHost: target_host, targetUrl: target_url, params: req.body || {}, delegationId: tokenRow.delegation_id },
+          { kind: 'use', action, targetHost: ghTarget || target_host, targetUrl: ghTarget ? '' : target_url, params: req.body || {}, delegationId: tokenRow.delegation_id },
           action_params);
         if (!g.ok) {
           // The token did not act: retire it, so parked calls never pile up against the concurrent-token limit.
@@ -5663,6 +5758,42 @@ async function useRoute(req, res) {
           });
           const dbRedacted = useLimits.redactedBody(await useLimits.readCapped(dbResponse), decryptedValue);
           result = { status: dbResponse.status, body: dbRedacted };
+          break;
+        }
+
+        case 'github_app_token': {
+          // An installation token from the custody key (github_app.js). The request is re-read from what was approved
+          // (an elevated key's call is the stored one) and checked against the scope again.
+          const ctxRow = db.prepare('SELECT context_name, github_app FROM blindkey_contexts WHERE id = ?').get(tokenRow.context_id);
+          const r = githubAppLib.requestFor(ctxRow && ctxRow.github_app, action_params);
+          if (r.error) return res.status(403).json({ error: r.error, refunded_dd: refundUse(req, 'GitHub token request refused before connecting') });
+          ghRequest = r.value;
+          let out;
+          try {
+            out = await githubApp.mint({ secret, pem: decryptedValue, contextId: tokenRow.context_id, delegationId: tokenRow.delegation_id,
+              callerDid: req.identity.did, request: ghRequest, timeoutMs: callTimeoutMs, egress: (u) => egressLog(req, secret, 'github_app_token', u) });
+          } catch (e) {
+            if (isCutOff(e) || e.code === 'upstream_redirect' || e.code === 'upstream_too_large') throw e;   // answered below (cut-off: refunded)
+            out = { ok: false, connected: false, status: 502, body: { error: 'GitHub could not be reached; no token was minted' } };   // #104 review L2
+          }
+          if (!out.ok) {
+            // No token was handed out, so the call is not charged (refunded here). The use-token is spent when GitHub
+            // answered (the request went out with the app's JWT), retired otherwise.
+            db.prepare(`UPDATE blindkey_use_tokens SET status = ? WHERE id = ? AND status = 'valid'`).run(out.connected ? 'used' : 'expired', tokenRow.id);
+            const refunded = refundUse(req, 'GitHub did not mint a token');
+            logSecurityEvent('github_app_token_refused', 'warn', { caller_did: req.identity.did, capability: action, target: `installation:${ghRequest.installation_id}`, ip: req.ip,
+              error: String(out.body && out.body.error || '').slice(0, 300), context: { secret: secret.name, scope: ctxRow && ctxRow.context_name, scope_id: tokenRow.context_id } });
+            return res.status(out.status).json({ ...out.body, refunded_dd: refunded });
+          }
+          const repositories = JSON.parse(out.row.repositories), permissions = JSON.parse(out.row.permissions);
+          // The mint as a security event: who (wallet), under what (scope), for what (repositories, permissions), until when.
+          logSecurityEvent('github_app_token_minted', 'info', { caller_did: req.identity.did, agent_name: getBearerIdentity(req)?.agent_name, capability: action,
+            target: `installation:${ghRequest.installation_id}`, ip: req.ip,
+            context: { wallet: req.identity.did, owner_did: secret.did, secret: secret.name, ref: secret.ref_code, scope: ctxRow && ctxRow.context_name, scope_id: tokenRow.context_id,
+                       delegation_id: tokenRow.delegation_id || null, token_id: out.row.id, repositories, permissions, expires_at: out.row.expires_at, github_expires_at: out.row.github_expires_at } });
+          result = { token: out.token, expires_at: out.row.expires_at, github_expires_at: out.row.github_expires_at, token_id: out.row.id, repositories, permissions,
+                     git: { username: 'x-access-token', how: 'HTTPS only: the token is the password (bin/git-credential-demipass.js does this for git)' },
+                     revoke_note: 'revoked when its scope, delegation or key is removed, or at expires_at' };
           break;
         }
 
@@ -5990,9 +6121,11 @@ app.delete('/api/blindkey/revoke', rateLimitStandard, (req, res) => {
   if (db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND (name = ? OR ref_code = ?)').all(ownerDid, String(name || ''), '').some(r => rotatingSecrets.has(r.id))) {
     return res.status(409).json({ error: 'this secret is being rotated right now — try again in a minute' });
   }
+  const revokedIds = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').all(ownerDid, name).map(r => r.id);
   const result = db.prepare(`UPDATE blindkey_secrets SET status = ?, ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?`)
     .run('revoked', ownerDid, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
+  for (const id of revokedIds) githubApp.revokeFor({ secretId: id }, 'key revoked');   // a GitHub App key's live tokens die with it
   res.json({ ok: true, name, did: ownerDid, status: 'revoked' });
 });
 
@@ -6022,10 +6155,12 @@ app.delete('/api/blindkey/delete', rateLimitStandard, (req, res) => {
     const g = checkGatePolicy(ownerDid, 'delete', target, getBearerIdentity(req));
     if (!g.ok) return res.status(g.status || 403).json(g);
   }
+  const deletedIds = db.prepare(`SELECT id FROM blindkey_secrets WHERE did = ? AND ${ref ? 'ref_code' : 'name'} = ? AND status != 'deleted'`).all(ownerDid, ref || name).map(r => r.id);
   const result = ref
     ? db.prepare(`UPDATE blindkey_secrets SET status = 'deleted', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND ref_code = ? AND status != 'deleted'`).run(ownerDid, ref)
     : db.prepare(`UPDATE blindkey_secrets SET status = 'deleted', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ? AND status != 'deleted'`).run(ownerDid, name);
   if (result.changes === 0) return res.status(404).json({ error: 'secret not found' });
+  for (const id of deletedIds) githubApp.revokeFor({ secretId: id }, 'key deleted');   // a GitHub App key's live tokens die with it
   res.json({ ok: true, ...(ref ? { ref } : { name }), did: ownerDid, status: 'deleted' });
 });
 
@@ -6076,6 +6211,8 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
 // retires after `graceMins` (value erased). Shared by POST /api/blindkey/rotate and the blind account-password rotation.
 // Returns { status, body }.
 function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
+  // A GitHub App key is replaced by another GitHub App key (the .pem GitHub generates); its App ID and scopes carry over.
+  if (githubAppLib.isAppKey(existing)) { const why = githubAppLib.pemRefusal(newValue); if (why) return { status: 400, body: { error: why } }; }
   const baseName = existing.name.replace(/_v\d+$/, '');
   const target = nextVersionName(ownerDid, existing.name.replace(/_v\d+$/, ''), existing.version);
   if (target.conflict) return { status: 409, body: { error: target.conflict } };
@@ -6117,9 +6254,9 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
     let contextsTransferred = 0;
     for (const ctx of oldContexts) {
       db.prepare(`
-        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist, allowed_methods)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
-      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null, ctx.allowed_methods ?? null);
+        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist, allowed_methods, github_app)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null, ctx.allowed_methods ?? null, ctx.github_app ?? null);
       contextsTransferred++;
     }
 
@@ -6233,6 +6370,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
   const typeChoice = secretTypes.resolveType(secret_type, value);
   if (typeChoice.error) return res.status(400).json(typeChoice);
   const resolvedType = typeChoice.type;
+  if (resolvedType === 'github_app_key') return res.status(400).json({ error: 'a GitHub App key is stored by its owner (POST /api/demipass/store, or the app) with its App ID — never deposited into another vault' });
 
   // Scope set by a fleet owner for its agent (red team item 13): the owner, as a person, with the PIN — checked before
   // anything is stored, so a first attempt without it leaves no scopeless secret behind and the retry just works. The
@@ -6252,7 +6390,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
 
   try {
     const encrypted = blindkeyEncrypt(value);
-    const nameRefused = clearNameForStore(resolvedTargetDid, name);
+    const nameRefused = appKeyOverwriteRefusal(resolvedTargetDid, name) || clearNameForStore(resolvedTargetDid, name);
     if (nameRefused) return res.status(409).json({ error: nameRefused });
     const metaJson = metadata ? JSON.stringify(metadata) : '{}';
     db.prepare(`
@@ -6321,11 +6459,12 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
       const typeChoice = secretTypes.resolveType(s.secret_type, s.value);
       if (typeChoice.error) { errors.push({ index: i, error: typeChoice.error, valid_types: typeChoice.valid_types }); continue; }
       const resolvedType = typeChoice.type;
+      if (resolvedType === 'github_app_key') { errors.push({ index: i, error: 'a GitHub App key is stored by its owner (POST /api/demipass/store), never deposited' }); continue; }
       try {
         const encrypted = blindkeyEncrypt(s.value);
         const metaJson = s.metadata ? JSON.stringify(s.metadata) : '{}';
-        const nameRefused = clearNameForStore(s.target_did, s.name);
-        if (nameRefused) { errors.push({ index: i, error: nameRefused }); continue; }
+        const nameRefused = appKeyOverwriteRefusal(s.target_did, s.name) || clearNameForStore(s.target_did, s.name);
+        if (nameRefused) { errors.push({ index: i, status: 409, error: nameRefused }); continue; }
         insertStmt.run(s.target_did, s.name, s.description || '', resolvedType, encrypted, metaJson);
         const inserted = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
         let refCode = inserted.ref_code;
@@ -6358,7 +6497,7 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   if (context_name.length > 100) return res.status(400).json({ error: 'context_name: max 100 characters' });
   if (secret_name.length > 100) return res.status(400).json({ error: 'secret_name: max 100 characters' });
 
-  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect', 'github_app_token'];
   if (!validActions.includes(action_type)) {
     return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
   }
@@ -6384,6 +6523,17 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   const methods = parseAllowedMethods((req.body || {}).allowed_methods);
   if (methods.error) return res.status(400).json({ error: methods.error });
   if (methods.value !== null && !HTTP_SCOPE_ACTIONS.has(action_type)) return res.status(400).json({ error: 'allowed_methods: only an http_header or http_body scope has methods' });
+  // A GitHub App key has GitHub App scopes and nothing else; such a scope names its installation, exact repositories,
+  // permissions and longest token life (github_app.js), checked here before anything is asked.
+  let ghScope = null;
+  if (githubAppLib.isAppKey(secret) !== (action_type === 'github_app_token')) {
+    return res.status(400).json({ error: githubAppLib.isAppKey(secret) ? "a GitHub App key's scopes are action_type github_app_token" : 'action_type github_app_token: only on a GitHub App key (secret_type github_app_key)' });
+  }
+  if (action_type === 'github_app_token') {
+    const g = githubAppLib.parseScope((req.body || {}).github_app);
+    if (g.error) return res.status(400).json({ error: g.error });
+    ghScope = g.value;
+  } else if ((req.body || {}).github_app !== undefined) return res.status(400).json({ error: 'github_app: only on a github_app_token scope' });
   // The scope may be handed to one agent in the same approval (delegate_did), bound to this scope alone.
   const { delegate_did } = req.body || {};
   const handTo = delegate_did !== undefined && delegate_did !== null && delegate_did !== '';
@@ -6395,9 +6545,11 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   const hostPattern = target_host_pattern || target_host || '*';
   // A new scope widens what the secret reaches: the owner's PIN (red team item 13) — in this session, or on the phone
   // as an approval of this exact scope (and hand-over) when the caller is the owner's own agent.
-  if (!scopeChangeGate(req, res, secret, 'scope', { action: 'context-add', targetUrl: HTTP_SCOPE_ACTIONS.has(action_type) ? pattern : '', targetHost: HTTP_SCOPE_ACTIONS.has(action_type) ? '' : hostPattern })) return;
+  if (!scopeChangeGate(req, res, secret, 'scope', { action: 'context-add', targetUrl: HTTP_SCOPE_ACTIONS.has(action_type) ? pattern : '', targetHost: HTTP_SCOPE_ACTIONS.has(action_type) || ghScope ? '' : hostPattern })) return;
 
   try {
+    // Adding over an existing GitHub scope of the same name replaces it: what it minted under the old terms is revoked.
+    const replaced = ghScope ? db.prepare('SELECT id, github_app FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, context_name) : null;
     const created = insertBlindkeyContexts(secret.id, [{
       context_name,
       action_type,
@@ -6406,11 +6558,13 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
       max_uses: max_uses || 0,
       allowed_commands: cmds.value ? JSON.parse(cmds.value) : undefined,
       allowed_methods: methods.value ? JSON.parse(methods.value) : undefined,
+      github_app: ghScope || undefined,
     }], isAdmin ? 'admin' : 'owner');
 
     if (created === 0) return res.status(400).json({ error: 'failed to create context' });
 
     const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, context_name);
+    if (replaced && replaced.github_app !== ctx.github_app) githubApp.revokeFor({ contextId: ctx.id }, 'scope replaced');
     let delegation = null;
     if (handTo) {
       const d = grantContextDelegation(secret.did, delegate_did, secret, ctx.id, actor.actor, { contextName: context_name });
@@ -6419,6 +6573,10 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
     }
     res.json({ ok: true, context: contextView(ctx), ...(delegation ? { delegation_id: delegation.id, delegate_did } : {}) });
   } catch (e) {
+    // The boot-time rebuild did not complete (logged then): this table still refuses the new kind of scope.
+    if (action_type === 'github_app_token' && /CHECK constraint failed/i.test(String(e.message))) {
+      return res.status(503).json({ error: 'GitHub scopes are unavailable until the next clean start of DemiPass (the scope table could not be upgraded; see the server log)' });
+    }
     res.status(500).json({ error: e.message });
   }
 });
@@ -6458,6 +6616,17 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
   const meths = parseAllowedMethods(req.body?.allowed_methods);
   if (meths.error) return res.status(400).json({ error: meths.error });
   const nextMethods = req.body && 'allowed_methods' in req.body ? meths.value : row.allowed_methods;
+  // A GitHub App scope stays one (and only one lives on a GitHub App key); its configuration narrows or widens as a whole.
+  if ((row.action_type === 'github_app_token') !== (next.action_type === 'github_app_token')) {
+    return res.status(400).json({ error: 'a scope does not change to or from github_app_token — add a new scope instead' });
+  }
+  let nextGithub = row.github_app ?? null;
+  if (req.body && 'github_app' in req.body) {
+    if (next.action_type !== 'github_app_token') return res.status(400).json({ error: 'github_app: only on a github_app_token scope' });
+    const g = githubAppLib.parseScope(req.body.github_app);
+    if (g.error) return res.status(400).json({ error: g.error });
+    nextGithub = g.value;
+  }
   // Narrowing stays open to the owner's tokens: revoking, a lower non-zero use cap, fewer allowed commands or methods.
   // Anything else (a new host, URL, action, a re-activation, more commands or methods, lifting the cap or a list)
   // needs the PIN — or, from an agent signed in as the owner, the owner's approval on the phone.
@@ -6467,7 +6636,9 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
     && (next.status === row.status || next.status === 'revoked')
     && (Number(next.max_uses) === Number(row.max_uses) || (Number(next.max_uses) > 0 && (Number(row.max_uses) === 0 || Number(next.max_uses) < Number(row.max_uses))))
     && (nextCommands === row.command_allowlist || (nextCommands !== null && (row.command_allowlist === null || subset(nextCommands, row.command_allowlist))))
-    && (nextMethods === row.allowed_methods || (nextMethods !== null && (row.allowed_methods === null || subset(nextMethods, row.allowed_methods))));
+    && (nextMethods === row.allowed_methods || (nextMethods !== null && (row.allowed_methods === null || subset(nextMethods, row.allowed_methods))))
+    // GitHub: fewer repositories, lower or fewer permissions, a shorter TTL, the same installation (github_app.js)
+    && (next.action_type !== 'github_app_token' || githubAppLib.isNarrowing(nextGithub, row.github_app));
   if (!narrowing && actor.mode !== 'admin') {
     const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
     // The approval binds this scope's id and name (#97 review: two scopes with one pattern must not share an approval).
@@ -6475,7 +6646,7 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
       params: { ...(req.body || {}), context_id: contextId, current_context_name: row.context_name } })) return;   // a requested rename stays bound as asked
   }
 
-  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
+  const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect', 'github_app_token'];
   if (!validActions.includes(next.action_type)) {
     return res.status(400).json({ error: `action_type must be one of: ${validActions.join(', ')}` });
   }
@@ -6485,13 +6656,18 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
 
   db.prepare(`
     UPDATE blindkey_contexts
-    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?, command_allowlist = ?, allowed_methods = ?
+    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?, command_allowlist = ?, allowed_methods = ?, github_app = ?
     WHERE id = ?
   `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status,
          next.action_type !== 'ssh_exec' ? null
            // a scope that becomes ssh_exec starts from "nothing runs", never the legacy "any command"
            : (row.action_type !== 'ssh_exec' ? (nextCommands ?? '[]') : (nextCommands ?? null)),
-         HTTP_SCOPE_ACTIONS.has(next.action_type) ? (nextMethods ?? null) : null, contextId);
+         HTTP_SCOPE_ACTIONS.has(next.action_type) ? (nextMethods ?? null) : null,
+         next.action_type === 'github_app_token' ? nextGithub : null, contextId);
+  // A scope revoked, or its GitHub reach narrowed: tokens it minted that are still live are revoked now.
+  if (row.action_type === 'github_app_token' && (next.status !== 'active' || nextGithub !== row.github_app)) {
+    githubApp.revokeFor({ contextId }, next.status !== 'active' ? `scope ${next.status}` : 'scope changed');
+  }
 
   const updated = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(contextId);
   res.json({ ok: true, context: updated });
@@ -6517,7 +6693,8 @@ app.delete('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
   }
 
   db.prepare(`UPDATE blindkey_contexts SET status = 'revoked' WHERE id = ?`).run(contextId);
-  res.json({ ok: true, id: contextId, status: 'revoked' });
+  const ghRevoking = githubApp.revokeFor({ contextId }, 'scope deleted');   // its live GitHub tokens die now, not within the hour
+  res.json({ ok: true, id: contextId, status: 'revoked', ...(ghRevoking ? { github_tokens_revoked: ghRevoking } : {}) });
 });
 
 // GET /api/blindkey/contexts — list approved contexts for a secret
@@ -6586,7 +6763,7 @@ function handleRowenIngest(req, res) {
 
   try {
     const encrypted = blindkeyEncrypt(value);
-    const nameRefused = clearNameForStore(target_did, name);
+    const nameRefused = appKeyOverwriteRefusal(target_did, name) || clearNameForStore(target_did, name);
     if (nameRefused) return res.status(409).json({ error: nameRefused });
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
@@ -6716,6 +6893,8 @@ async function handleRowenDeliver(req, res) {
     const why = commandRefusal(ctxCheck.context_id, (action_params || {}).command);
     if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: requestor_did, capability: 'ssh_exec', target: targetHost, ip: req.ip, context: { secret: secret.name, mediated: true } }); return res.status(403).json({ error: why }); }
   }
+  // A GitHub App key mints only through /use (github_app.js): never a mediated delivery.
+  if (action === 'github_app_token' || githubAppLib.isAppKey(secret)) return res.status(400).json({ error: 'GitHub App tokens are minted through POST /api/demipass/use, not mediated delivery' });
   // And the scope's methods, before the delivery is counted against its quota (#97 review).
   if (action === 'http_header' || action === 'http_body') {
     const m = (action_params || {}).method || (action === 'http_body' ? 'POST' : 'GET');
@@ -8908,6 +9087,7 @@ const secretSharing = require('./secret_sharing')({
   approvals: () => useApprovals,   // registered just below
   devices: () => deviceKeys,       // registered just below
   sendMail: fleetRoutes.sendMail,  // pending transfers: both sides are mailed at start and end (red team item 6)
+  onTransferred: (secretId) => githubApp.revokeFor({ secretId }, 'key transferred'),   // github_app.js: live installation tokens die with the old owner's grants
 });
 // Account holds (red team item 9): PIN reset by password, a new phone, a recovery-email change and guardian recovery
 // wait 48 hours while a phone is linked, cancelable from any eligible phone without a session (account_holds.js).
@@ -8970,6 +9150,26 @@ mailReceiptsApi = require('./mail_receipts')({ app, db, rateLimitStandard, getBe
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
 require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
   approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });
+// DemiPass as a GitHub App (github_app.js): installation tokens minted from a custody key, their expiry and revocation.
+// A minted token's grant still stands — the same rules request-token and /use apply (#104 review L4, L6): the key
+// redeemable, unfrozen and still the minting owner's (not transferred); the scope active; for an agent, its delegation
+// active, unexpired, from that owner to that agent, and an outside ask behind it still valid (the agent still in the
+// vouching owner's fleet, the pairing still there); for the owner's own mint, the caller still the owner.
+function githubGrantValid(t) {
+  const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(t.secret_id);
+  if (!secret || !isSecretRedeemable(secret) || secret.frozen || secret.did !== t.owner_did) return false;
+  const ctx = t.context_id ? db.prepare('SELECT status FROM blindkey_contexts WHERE id = ?').get(t.context_id) : null;
+  if (!ctx || ctx.status !== 'active') return false;
+  if (!t.delegation_id) return t.caller_did === secret.did;
+  const d = db.prepare('SELECT * FROM demipass_delegations WHERE id = ?').get(t.delegation_id);
+  if (!d || d.status !== 'active' || d.owner_did !== secret.did || d.delegate_did !== t.caller_did) return false;
+  if (d.expires_at && new Date(d.expires_at).getTime() <= Date.now()) return false;
+  const ask = db.prepare('SELECT * FROM demipass_access_requests WHERE delegation_id = ? AND via_owner_did IS NOT NULL ORDER BY id DESC LIMIT 1').get(d.id);
+  if (ask && !outsideAskValid(ask)) return false;
+  return true;
+}
+const githubApp = githubAppLib.register({ db, blindkeyEncrypt, blindkeyDecrypt, logSecurityEvent, secretFetch: useLimits.secretFetch, readCapped: useLimits.readCapped,
+  grantValid: githubGrantValid });
 // Who a /use caller is, for an approval request: the DID, and a label the owner recognises.
 function approvalCaller(req) {
   const d = (req.identity && req.identity.decoded) || {};
@@ -10250,8 +10450,10 @@ app.post('/api/blindkey/context/request', rateLimitStandard, (req, res) => {
   }
 
   // Verify the silicon owns a secret with that name
-  const secret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(did, secret_name, 'active');
+  const secret = db.prepare('SELECT id, secret_type FROM blindkey_secrets WHERE did = ? AND name = ? AND status = ?').get(did, secret_name, 'active');
   if (!secret) return res.status(404).json({ error: 'secret not found — you must own an active secret with that name' });
+  // A GitHub App key's scopes are added with context/add (github_app_token, owner-approved), never requested here (#104 review H1).
+  if (githubAppLib.isAppKey(secret)) return res.status(400).json({ error: "a GitHub App key's scopes are github_app_token scopes: POST /api/demipass/context/add with github_app and ask_owner:true" });
 
   try {
     const result = db.prepare(`
@@ -10517,6 +10719,7 @@ app.post('/api/blindkey/delegate/revoke', rateLimitStandard, (req, res) => {
     if (rows.length > 1) {
       for (const r of rows) {
         db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(r.id);
+        githubApp.revokeFor({ delegationId: r.id }, 'delegation revoked');
         db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
           'delegation_revoked', actor.actor, r.secret_id, null, JSON.stringify({ delegation_id: r.id, owner_did: r.owner_did, delegate_did: r.delegate_did }));
       }
@@ -10532,6 +10735,7 @@ app.post('/api/blindkey/delegate/revoke', rateLimitStandard, (req, res) => {
   if (delegation.status === 'revoked') return res.status(409).json({ error: 'delegation already revoked' });
 
   db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ?").run(delegation.id);
+  const ghRevoking = githubApp.revokeFor({ delegationId: delegation.id }, 'delegation revoked');   // live GitHub tokens it minted die now
 
   db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
     'delegation_revoked', actor.actor, delegation.secret_id, null,
@@ -10539,7 +10743,7 @@ app.post('/api/blindkey/delegate/revoke', rateLimitStandard, (req, res) => {
   );
 
   console.log(`[demipass] delegation revoked: id=${delegation.id} ${delegation.owner_did} -> ${delegation.delegate_did}`);
-  res.json({ ok: true, revoked: true, delegation_id: delegation.id });
+  res.json({ ok: true, revoked: true, delegation_id: delegation.id, ...(ghRevoking ? { github_tokens_revoked: ghRevoking } : {}) });
 });
 
 // GET /api/blindkey/delegations — list delegations (as owner or delegate)
@@ -10873,11 +11077,13 @@ function buildAgentMenu(did, { compact = false, auth = null } = {}) {
     return true;
   };
   const sql = REDEEMABLE_STATUS_SQL.replace(/\bstatus\b/g, 's.status');
-  const ctxOf = db.prepare("SELECT context_name, action_type, target_url_pattern, target_host_pattern, allowed_methods FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'");
+  const ctxOf = db.prepare("SELECT context_name, action_type, target_url_pattern, target_host_pattern, allowed_methods, github_app FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'");
   const describe = (s, extra) => {
     const ctx = ctxOf.all(s.id);
     const item = { name: s.name, ref: s.ref_code, type: s.secret_type, actions: [...new Set(ctx.map(c => c.action_type))], ...extra };
-    if (!compact) item.contexts = ctx.map(c => ({ name: c.context_name, action: c.action_type, url: c.target_url_pattern || undefined, host: c.target_host_pattern || undefined, methods: jsonList(c.allowed_methods) || undefined }));
+    if (!compact) item.contexts = ctx.map(c => (c.action_type === 'github_app_token'
+      ? { name: c.context_name, action: c.action_type, github: githubAppLib.scopeOf(c.github_app) || undefined }
+      : { name: c.context_name, action: c.action_type, url: c.target_url_pattern || undefined, host: c.target_host_pattern || undefined, methods: jsonList(c.allowed_methods) || undefined }));
     return item;
   };
   const restricted = !!(auth && (auth.silicon || (auth.decoded && auth.decoded.wrk)));
@@ -13180,8 +13386,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
     const ctxMap = new Map();
     for (const ctx of oldContexts) {
-      const ins = db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist, allowed_methods) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)')
-        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null, ctx.allowed_methods ?? null);
+      const ins = db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist, allowed_methods, github_app) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)')
+        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null, ctx.allowed_methods ?? null, ctx.github_app ?? null);
       ctxMap.set(ctx.id, Number(ins.lastInsertRowid));
     }
     // The owner's own agents keep the entry on the new version, like its contexts (2026-11-11): an agent that rotated its
@@ -14132,6 +14338,7 @@ const SILICON_PERMISSION_TYPES = [
   'action:http_body', // HTTP body injection
   'action:document',  // document retrieval
   'action:browser_fill', // the agent fill tool may receive this login for a bound origin (never via admin:full)
+  'action:github_app_token', // mint GitHub App installation tokens from a key's github_app_token scopes (github_app.js)
   'admin:full',       // full access (carbon equivalent)
 ];
 
@@ -15088,8 +15295,9 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
     // Contexts
     const contexts = db.prepare(
-      "SELECT id, context_name, action_type, target_host_pattern, target_url_pattern, command_allowlist, allowed_methods FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
-    ).all(s.id).map(c => ({ ...c, allowed_commands: jsonList(c.command_allowlist), allowed_methods: jsonList(c.allowed_methods), command_allowlist: undefined }));
+      "SELECT id, context_name, action_type, target_host_pattern, target_url_pattern, command_allowlist, allowed_methods, github_app FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
+    ).all(s.id).map(c => ({ ...c, allowed_commands: jsonList(c.command_allowlist), allowed_methods: jsonList(c.allowed_methods), command_allowlist: undefined,
+      github_app: c.action_type === 'github_app_token' ? githubAppLib.scopeOf(c.github_app) : undefined }));
 
     let parsedLabels = [];
     try { parsedLabels = JSON.parse(s.labels || '[]'); } catch(_) {}

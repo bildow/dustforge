@@ -147,9 +147,21 @@ module.exports = function registerUseApprovals(deps) {
       // the agent it is handed to; the owner approves the full bound change below it.
       const q = params || {};
       const who = (d) => String(d || '').replace(/^did:key:/, '').slice(0, 12) + '…';
+      // A GitHub App scope (github_app.js): repositories and permissions are what the owner is approving.
+      const g = q.github_app && typeof q.github_app === 'object' ? q.github_app : null;
+      // Permissions first, so they stay on the card when a long repository list is cut (#104 review L7).
+      const ghHead = (lead) => {
+        const perms = g.permissions && typeof g.permissions === 'object' ? Object.entries(g.permissions).map(([k, l]) => `${k}:${l}`).join(', ') : '?';
+        const repos = Array.isArray(g.repositories) ? g.repositories.join(', ') : '?';
+        const head = `${lead}${perms} on `, room = 120 - head.length;
+        return head + (repos.length <= room ? repos : repos.slice(0, Math.max(0, room - 1)) + '…');
+      };
+      const gh = g ? true : null;
       const methods = Array.isArray(q.allowed_methods) ? (q.allowed_methods.length ? q.allowed_methods.map(m => String(m).toUpperCase()).join('/') + ' only' : 'no method') : null;
       const what = action === 'delegate' ? `hand it to agent ${who(q.delegate_did)}${q.context_name ? ` for scope '${q.context_name}'` : ' for every scope'}`
+        : action === 'context-add' && gh ? ghHead(`new GitHub scope '${String(q.context_name).slice(0, 30)}'${q.delegate_did ? ` for agent ${who(q.delegate_did)}` : ''}: `)
         : action === 'context-add' ? `new scope '${q.context_name}': ${q.action_type}${methods ? ' ' + methods : ''} on ${targetUrl || targetHost || 'any host'}${q.delegate_did ? `, handed to agent ${who(q.delegate_did)}` : ''}`
+        : action === 'context-edit' && gh ? ghHead(`change GitHub scope${q.status ? ` (${q.status})` : ''}: `)
         : action === 'context-edit' ? `change scope: ${methods ? methods + ' on ' : ''}${targetUrl || targetHost || 'any host'}${q.status ? ` (${q.status})` : ''}`
         : `${action}: ${targetUrl || targetHost || ''}`;
       return cleanLabel(what, 120);

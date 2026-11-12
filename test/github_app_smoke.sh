@@ -1,0 +1,409 @@
+#!/bin/bash
+# Smoke of DemiPass as a GitHub App (github_app.js, Aaron 2026-11-12): a GitHub App private key in custody, scopes of
+# kind github_app_token, installation tokens minted per /use, recorded, revoked.
+# Legacy fixture first: the database is made by main's server before this branch (6de5e78), with a scope and a
+# delegation bound to it; this branch then opens it (blindkey_contexts rebuilt so its CHECK admits github_app_token —
+# same rows, same ids, the delegation still resolves, the legacy use still works).
+# api.github.com is a local stand-in (test/fixtures/github-standin.js behind TEST_UPSTREAM_HOSTS) that checks the
+# app JWT (RS256, iss, iat −60 s, exp ≤ 10 min) and mints/revokes ghs_ tokens. Owner A (PIN), A's own agent session AG
+# (no PIN), agent B (a linked silicon of A's fleet).
+#   - store: an RSA .pem with its App ID (a bad .pem or no App ID refused, the value never echoed); no default scope;
+#     never revealed; deposit refuses the type;
+#   - AG adds scope 'reviewers' (installation, two exact repos, contents+pull_requests write, ≤ 1800 s) handed to B:
+#     202 approval kind scope; the owner approves with the PIN; the same call with approval_id applies it, once;
+#   - B mints: a subset (one repo, contents:read) → a token for exactly that; the defaults → the whole scope; each a
+#     metered use (10 DD) and a security event naming wallet, scope, repos, permissions, expiry; expiry recorded and
+#     listed by /expiring; a wrong repo, a wider permission, a longer TTL refused before any connection;
+#   - widening the scope parks on the phone; narrowing applies and revokes the scope's live tokens;
+#   - the installation's ceiling: GitHub's 422 → 403 "reinstall", refunded; a token wider than asked is revoked, not
+#     handed out; an elevated key parks each mint as an approval and is never wrapped;
+#   - the git credential helper answers git with x-access-token and a fresh token, for github.com only;
+#   - revocation: our TTL passing, deleting the delegation, deleting the scope → DELETE /installation/token;
+#   - rotation carries the App ID and the scope; no key, JWT or token in the server log or the database in clear.
+set -u
+W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+S=$(mktemp -d /tmp/dustforge-github-app-smoke.XXXXXX)
+PORT=${PORT:-3871}; UP_PORT=${UP_PORT:-3872}; API=http://127.0.0.1:$PORT
+NM=/home/flimflam/project/dustforge/node_modules; [ -d "$W/node_modules" ] && NM=$W/node_modules
+export NODE_PATH=$NM
+export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
+  STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9 \
+  TEST_UPSTREAM=http://127.0.0.1:$UP_PORT TEST_UPSTREAM_HOSTS=repo.dustroot.com,api.github.com GITHUB_TOKEN_SWEEP_MS=1000 TRANSFER_SWEEP_MS=500 DUSTFORGE_ADMIN_KEY=gha-smoke-admin-$RANDOM$RANDOM
+LEGACY=6de5e78a0644a6934fa34db1d16f9c3c348b8311   # main before this branch
+SRV=; UP=
+trap 'kill $SRV $UP 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$S"' EXIT
+start(){ ( cd "$1" && exec node ${3:+--require "$W/test/fixtures/upstream-redirect.js"} server.js >>"$S/server-$2.log" 2>&1 ) & SRV=$!
+  for i in $(seq 1 60); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
+  kill -0 $SRV 2>/dev/null || { echo "server ($2) died:"; tail -5 "$S/server-$2.log"; exit 1; }; }
+stop(){ kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; SRV=; }
+fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
+J(){ python3 -c 'import json,sys; d=json.load(sys.stdin); v=d
+for k in sys.argv[1].split("."):
+    v = v[int(k)] if isinstance(v, list) else (v or {}).get(k)
+print(v)' "$1"; }
+Q(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); r=c.execute(sys.argv[2]).fetchone(); print(r[0] if r and r[0] is not None else '')" "$DB_PATH" "$1"; }
+call(){ local m=$1 p=$2 t=$3 b=${4:-}
+  BODY=$(curl -s -o - -w '\n%{http_code}' -X "$m" "$API$p" -H 'Content-Type: application/json' ${t:+-H "Authorization: Bearer $t"} ${b:+-d "$b"})
+  CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}; }
+# a body from a file (the .pem never goes on a command line)
+callf(){ BODY=$(curl -s -o - -w '\n%{http_code}' -X "$1" "$API$2" -H 'Content-Type: application/json' -H "Authorization: Bearer $3" -d @"$4"); CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}; rm -f "$4"; }
+login(){ call POST /api/identity/auth-fingerprint "" '{"username":"'$1'","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
+pin(){ call POST /api/identity/gate/verify "$1" '{"gate":"pin","pin":"'$2'","intent":"'$3'"}'; [ "$CODE" = 200 ] || fail "pin $3: $CODE $BODY"; }
+hits(){ local n=0; [ -f "$S/upstream.log" ] && n=$(grep -c -- "${1:-.}" "$S/upstream.log"); echo "${n:-0}"; }
+mints(){ hits 'access_tokens'; }
+revokes(){ hits 'DELETE /installation/token known'; }
+waitfor(){ for i in $(seq 1 40); do [ "$(eval "$1")" = "$2" ] && return 0; sleep 0.25; done; return 1; }
+# the response's token, written to a file (never printed); prints only whether it is one the stand-in minted
+keep_token(){ echo "$BODY" | python3 -c 'import json,sys; t=(json.load(sys.stdin).get("result") or {}).get("token") or ""; open(sys.argv[1],"w").write(t)' "$S/$1"
+  python3 -c 'import sys; t=open(sys.argv[1]).read(); print("minted" if t and t in open(sys.argv[2]).read().split() else "no")' "$S/$1" "$S/tokens" 2>/dev/null || echo no; }
+umask 077
+
+# ── keys: two RSA app keys (the second for rotation), public halves for the stand-in; never printed ──
+( cd "$W" && node -e '
+const c = require("crypto"), fs = require("fs"), d = process.argv[1];
+for (const n of ["", "2"]) { const k = c.generateKeyPairSync("rsa", { modulusLength: 2048, privateKeyEncoding: { type: "pkcs1", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
+  fs.writeFileSync(d + "/app" + n + ".pem", k.privateKey); fs.writeFileSync(d + "/app" + n + ".pub", k.publicKey); }
+const ec = c.generateKeyPairSync("ec", { namedCurve: "prime256v1", privateKeyEncoding: { type: "pkcs8", format: "pem" }, publicKeyEncoding: { type: "spki", format: "pem" } });
+fs.writeFileSync(d + "/ec.pem", ec.privateKey);' "$S" )
+echo 424242 > "$S/app_id"; : > "$S/tokens"
+node "$W/test/fixtures/github-standin.js" $UP_PORT "$S" & UP=$!
+
+# ── legacy: main's server makes the database: a scope, and a delegation bound to it ──
+mkdir -p "$S/old"; git -C "$W" archive $LEGACY | tar -x -C "$S/old"
+start "$S/old" old with-upstream
+H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
+( cd "$W" && node -e '
+const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
+for (const c of ["idempotency_key TEXT", "provenance TEXT DEFAULT '"'"'organic'"'"'"]) { try { db.exec("ALTER TABLE identity_transactions ADD COLUMN " + c); } catch (_) {} }
+const mk = (u) => { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
+  db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 100000, ?)").run(id.did, u, u + "@dustforge.com", enc, process.argv[1]);
+  db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 100000, ?, ?, 100000)").run(id.did, "topup", "smoke"); return id.did; };
+const a = mk("owner-a"), b = mk("agent-b"); mk("person-c");
+const f = db.prepare("INSERT INTO fleets (owner_did, name, slug) VALUES (?, ?, ?)").run(a, "Owner A", "owner-agents").lastInsertRowid;
+db.prepare("INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet, joined_via) VALUES (?, ?, ?, ?, ?, 0, ?)").run(f, b, "agent-b", "sil_gha_b", "active", "owner");' "$H" )
+A=$(login owner-a); B=$(login agent-b)
+BDID=$(Q "SELECT did FROM identity_wallets WHERE username='agent-b'")
+call POST /api/identity/pin "$A" '{"pin":"4321","password":"hunter22"}'
+call POST /api/demipass/store "$A" '{"name":"legacy-tok","value":"legacy-value-5c1e9a77b2","secret_type":"api_key"}'; LREF=$(echo "$BODY" | J ref)
+LSID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$LREF'")
+pin "$A" 4321 "scope:$LSID"; call POST /api/demipass/delegate "$A" '{"secret_name":"legacy-tok","delegate_did":"'$BDID'","context_name":"default"}'
+LCTX=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$LSID AND context_name='default'"); LDEL=$(Q "SELECT id FROM demipass_delegations WHERE secret_id=$LSID AND delegate_did='$BDID'")
+stop
+# a deleted scope (the AUTOINCREMENT counter is past the highest id) and an unrelated orphan row (a delegation to a
+# scope that no longer exists): the rebuild keeps the counter and does not trip over a problem it did not make
+python3 -c "
+import sqlite3,sys; c=sqlite3.connect(sys.argv[1])
+c.execute(\"INSERT INTO blindkey_contexts (secret_id, context_name, action_type, allowed_by) VALUES (?, 'gone', 'http_header', 'x')\", (int(sys.argv[2]),)); c.execute(\"DELETE FROM blindkey_contexts WHERE context_name='gone'\")
+c.execute(\"INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, granted_by) VALUES ('did:x:orphan', 'did:x:orphan2', ?, 987654, 'x')\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$LSID"
+SEQ=$(Q "SELECT seq FROM sqlite_sequence WHERE name='blindkey_contexts'"); NCTX=$(Q "SELECT COUNT(*) FROM blindkey_contexts")
+[ -n "$LCTX" ] && [ -n "$LDEL" ] && [ "$(Q "SELECT context_id FROM demipass_delegations WHERE id=$LDEL")" = "$LCTX" ] && Q "SELECT sql FROM sqlite_master WHERE name='blindkey_contexts'" | grep -q "'database_connect')" \
+  && ! Q "SELECT sql FROM sqlite_master WHERE name='blindkey_contexts'" | grep -q github_app_token \
+  && ok "legacy: main's server made the vault — a scope ($LCTX, CHECK without github_app_token) and a delegation bound to it ($LDEL)" || fail "legacy setup ($LCTX/$LDEL)"
+
+# ── this branch on the same database ──
+start "$W" new with-upstream
+A=$(login owner-a); AG=$(login owner-a); B=$(login agent-b)
+SQL=$(Q "SELECT sql FROM sqlite_master WHERE name='blindkey_contexts'")
+echo "$SQL" | grep -q "'database_connect', 'github_app_token')" && [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('blindkey_contexts') WHERE name='github_app'")" = 1 ] \
+  && ok "the legacy table is rebuilt: its CHECK admits github_app_token, the github_app column is there" || fail "migration: $SQL"
+[ "$(Q "SELECT COUNT(*) FROM blindkey_contexts")" = "$NCTX" ] && [ "$(Q "SELECT context_id FROM demipass_delegations WHERE id=$LDEL")" = "$LCTX" ] \
+  && [ "$(Q "SELECT context_name FROM blindkey_contexts WHERE id=$LCTX")" = default ] && [ "$(Q "SELECT COUNT(*) FROM pragma_foreign_key_check")" = 1 ] \
+  && [ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_bc_secret' AND tbl_name='blindkey_contexts'")" = 1 ] \
+  && ok "same scopes ($NCTX), same ids, the delegation still points at its scope, the index rebuilt — and no new foreign key problem" || fail "rows/ids after rebuild"
+grep -q "1 foreign key problem(s) already present" "$S/server-new.log" && ok "the orphan row that was already there is noted, not fatal (the server booted)" || fail "orphan note: $(grep github-app "$S/server-new.log")"
+[ "$(Q "SELECT seq FROM sqlite_sequence WHERE name='blindkey_contexts'")" = "$SEQ" ] && [ "$SEQ" -gt "$(Q "SELECT MAX(id) FROM blindkey_contexts")" ] && ok "the AUTOINCREMENT counter is carried ($SEQ): a deleted scope's id is never reused" || fail "sqlite_sequence: $SEQ → $(Q "SELECT seq FROM sqlite_sequence WHERE name='blindkey_contexts'")"
+python3 -c "
+import sqlite3,sys; c=sqlite3.connect(sys.argv[1])
+try: c.execute(\"INSERT INTO blindkey_contexts (secret_id, context_name, action_type, allowed_by) VALUES (1, 'junk', 'teleport', 'x')\"); print('accepted')
+except sqlite3.IntegrityError: print('refused')" "$DB_PATH" | grep -q refused && ok "…and the CHECK still refuses an unknown action" || fail "CHECK lost"
+grep -q "blindkey_contexts rebuilt to admit github_app_token" "$S/server-new.log" && ok "the rebuild is logged once" || fail "rebuild log"
+call POST /api/demipass/use "$B" '{"ref":"'$LREF'","action":"http_header","params":{"url":"https://repo.dustroot.com/legacy","method":"GET"}}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J result.body.path)" = /legacy ] && ok "B's legacy delegated use still acts after the rebuild" || fail "legacy use: $CODE $BODY"
+stop; start "$W" new2 with-upstream
+[ "$(grep -c 'rebuilt to admit' "$S/server-new2.log")" = 0 ] && ok "a second start leaves the rebuilt table alone" || fail "rebuilt twice"
+A=$(login owner-a); AG=$(login owner-a); B=$(login agent-b)
+
+# ── store the app key ──
+storebody(){ python3 -c 'import json,sys; d={"name":sys.argv[2],"value":open(sys.argv[1]).read(),"secret_type":"github_app_key"}
+if sys.argv[3]: d["github_app_id"]=sys.argv[3]
+print(json.dumps(d))' "$1" "$2" "$3" > "$S/st.json"; }
+storebody "$S/app.pem" demipass-app ""; callf POST /api/demipass/store "$A" "$S/st.json"
+[ "$CODE" = 400 ] && echo "$BODY" | grep -q "github_app_id" && ok "no App ID → 400 (field github_app_id)" || fail "no app id: $CODE $BODY"
+storebody "$S/ec.pem" demipass-app 424242; callf POST /api/demipass/store "$A" "$S/st.json"
+[ "$CODE" = 400 ] && echo "$BODY" | grep -q "RSA" && ! echo "$BODY" | grep -q "BEGIN PRIVATE\|MI" && ok "an EC key → 400, named, nothing of it echoed" || fail "ec key: $CODE $BODY"
+printf '{"name":"demipass-app","value":"-----BEGIN RSA PRIVATE KEY-----\\nnot-a-key-zz91\\n-----END RSA PRIVATE KEY-----","secret_type":"github_app_key","github_app_id":"424242"}' > "$S/st.json"; callf POST /api/demipass/store "$A" "$S/st.json"
+[ "$CODE" = 400 ] && ! echo "$BODY" | grep -q "not-a-key-zz91" && ok "a damaged .pem → 400, not echoed" || fail "bad pem: $CODE $BODY"
+storebody "$S/app.pem" demipass-app 424242; callf POST /api/demipass/store "$A" "$S/st.json"; REF=$(echo "$BODY" | J ref)
+SID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$REF'")
+[ "$CODE" = 200 ] && [[ "$REF" == DP-GHA-* ]] && [ "$(echo "$BODY" | J github_app_id)" = 424242 ] && ok "stored the app key ($REF) with its App ID" || fail "store: $CODE $BODY"
+[ "$(Q "SELECT json_extract(metadata,'$.github_app_id') FROM blindkey_secrets WHERE id=$SID")" = 424242 ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_contexts WHERE secret_id=$SID")" = 0 ] \
+  && ok "the App ID is on the entry; no default scope (a GitHub App key has none until its owner adds one)" || fail "metadata/default ctx"
+pin "$A" 4321 "reveal:$SID"; call POST /api/demipass/reveal "$A" '{"ref":"'$REF'"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "never revealed" && ok "reveal → 403: a GitHub App key is never shown" || fail "reveal: $CODE $BODY"
+storebody "$S/app.pem" demipass-app 424242; python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["secret_type"]="api_key"; d.pop("github_app_id"); json.dump(d,open(sys.argv[1],"w"))' "$S/st.json"; callf POST /api/demipass/store "$A" "$S/st.json"
+[ "$CODE" = 409 ] && ok "re-storing it as another type → 409 (delete it first)" || fail "type change: $CODE $BODY"
+storebody "$S/app.pem" pushed 424242; python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["target_did"]=sys.argv[2]; json.dump(d,open(sys.argv[1],"w"))' "$S/st.json" "$BDID"; callf POST /api/demipass/deposit "$A" "$S/st.json"
+[ "$CODE" = 400 ] && ok "deposit refuses the type (only its owner stores it)" || fail "deposit: $CODE $BODY"
+ADID=$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")
+acall(){ BODY=$(curl -s -o - -w '\n%{http_code}' -X POST "$API$1" -H 'Content-Type: application/json' -H "x-admin-key: $DUSTFORGE_ADMIN_KEY" -d "$2"); CODE=${BODY##*$'\n'}; BODY=${BODY%$'\n'*}; }
+VAL0=$(Q "SELECT encrypted_value FROM blindkey_secrets WHERE id=$SID")
+acall /api/demipass/deposit '{"target_did":"'$ADID'","name":"demipass-app","value":"overwrite-attempt-1","secret_type":"api_key"}'; C1=$CODE
+acall /api/demipass/deposit/batch '{"secrets":[{"target_did":"'$ADID'","name":"demipass-app","value":"overwrite-attempt-2","secret_type":"api_key"}]}'; C2=$CODE; B2=$BODY
+acall /api/rowen/ingest '{"depositor_type":"carbon","depositor_id":"smoke","target_did":"'$ADID'","name":"demipass-app","value":"overwrite-attempt-3","secret_type":"api_key"}'; C3=$CODE
+[ "$C1" = 409 ] && echo "$B2" | grep -q "GitHub App key" && [ "$C3" = 409 ] && [ "$(Q "SELECT encrypted_value FROM blindkey_secrets WHERE id=$SID")" = "$VAL0" ] && [ "$(Q "SELECT secret_type FROM blindkey_secrets WHERE id=$SID")" = github_app_key ] \
+  && ok "an admin deposit, a batch deposit and a Rowen ingest under the app key's name → 409; value and type untouched" || fail "overwrite: deposit $C1, batch $C2 $B2, rowen $C3"
+# silicon permission: action:github_app_token can be granted (Codex P2)
+call POST /api/demipass/silicon/register "$A" '{"agent_name":"gh-silicon","permissions":["secret:use","action:github_app_token"]}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT COUNT(*) FROM silicon_permissions WHERE agent_name='gh-silicon' AND permission_type='action:github_app_token'")" = 1 ] \
+  && ok "a scoped silicon can be granted action:github_app_token" || fail "silicon perm: $CODE $BODY"
+
+# ── the owner's agent adds a scope handed to B: a request on the phone ──
+GH='{"installation_id":"777","repositories":["bildow/brain","bildow/Dustforge"],"permissions":{"contents":"write","pull_requests":"write"},"max_ttl_seconds":1800}'
+call POST /api/demipass/context/add "$AG" '{"secret_name":"demipass-app","context_name":"x","action_type":"http_header","target_url_pattern":"https://api.github.com/*"}'
+[ "$CODE" = 400 ] && ok "an http_header scope on the app key → 400 (only github_app_token)" || fail "http on app key: $CODE $BODY"
+call POST /api/demipass/context/add "$AG" '{"secret_name":"legacy-tok","context_name":"x","action_type":"github_app_token","github_app":'"$GH"'}'
+[ "$CODE" = 400 ] && ok "github_app_token on another kind of entry → 400" || fail "gh on api key: $CODE $BODY"
+call POST /api/demipass/context/add "$AG" '{"secret_name":"demipass-app","context_name":"x","action_type":"github_app_token","github_app":{"installation_id":"777","repositories":["bildow/*"],"permissions":{"contents":"read"}}}'
+[ "$CODE" = 400 ] && ok "a wildcard repository → 400 (exact names)" || fail "wildcard: $CODE $BODY"
+call POST /api/demipass/context/add "$AG" '{"secret_name":"demipass-app","context_name":"x","action_type":"github_app_token","github_app":{"installation_id":"777","repositories":["bildow/brain"],"permissions":{"contents":"admin"}}}'
+[ "$CODE" = 400 ] && ok "a permission level other than read/write → 400" || fail "admin level: $CODE $BODY"
+for P in '{"constructor":"write"}' '{"__proto__":"read"}' '{"contents":"constructor"}' '{"toString":"read"}' '{"made_up_permission":"read"}'; do
+  call POST /api/demipass/context/add "$AG" '{"secret_name":"demipass-app","context_name":"x","action_type":"github_app_token","github_app":{"installation_id":"777","repositories":["bildow/brain"],"permissions":'"$P"'}}'
+  [ "$CODE" = 400 ] || fail "permissions $P accepted: $CODE $BODY"; done
+[ "$(Q "SELECT COUNT(*) FROM blindkey_contexts WHERE secret_id=$SID")" = 0 ] && ok "constructor / __proto__ / toString / an unknown name / a level 'constructor' → 400 (GitHub's own permission names only)" || fail "proto perms stored"
+
+# ── H1: an app key never gets, or acts under, any other kind of scope ──
+call POST /api/demipass/context/request "$AG" '{"secret_name":"demipass-app","context_name":"leak","action_type":"http_body","target_url_pattern":"https://repo.dustroot.com/*"}'
+[ "$CODE" = 400 ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_context_requests WHERE secret_name='demipass-app'")" = 0 ] && ok "a context request (http_body) on the app key → 400, nothing filed" || fail "context/request: $CODE $BODY"
+# a scope row that got there some other way (an old request approved before this branch, a hand edit), and a use-token for it
+python3 -c "
+import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); sid=int(sys.argv[2])
+cid=c.execute(\"INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, allowed_by) VALUES (?, 'forged', 'http_body', 'https://repo.dustroot.com/*', 'x')\", (sid,)).lastrowid
+did=c.execute('SELECT did FROM blindkey_secrets WHERE id=?', (sid,)).fetchone()[0]
+c.execute(\"INSERT INTO blindkey_use_tokens (token, did, secret_id, context_id, action_type, target_url, target_host, expires_at, status) VALUES ('forged-use-token-1', ?, ?, ?, 'http_body', 'https://repo.dustroot.com/x', '', datetime('now', '+60 seconds'), 'valid')\", (did, sid, cid)); c.commit()" "$DB_PATH" "$SID"
+H0=$(hits); E0=$(Q "SELECT COUNT(*) FROM blindkey_events WHERE event_type='egress' AND secret_id=$SID")
+call POST /api/demipass/request-token "$AG" '{"ref":"'$REF'","context":"forged","action":"http_body","target_url":"https://repo.dustroot.com/x"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "only with action github_app_token" && ok "request-token for that row → 403 (the app key only mints)" || fail "forged request-token: $CODE $BODY"
+call POST /api/demipass/use "$AG" '{"use_token":"forged-use-token-1","params":{"url":"https://repo.dustroot.com/x","body_template":{"k":"{{secret}}"}}}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "only with action github_app_token" && ! echo "$BODY" | grep -q "PRIVATE" && [ "$(hits)" = "$H0" ] \
+  && [ "$(Q "SELECT COUNT(*) FROM blindkey_events WHERE event_type='egress' AND secret_id=$SID")" = "$E0" ] && [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='github_app_key_misuse'")" = 1 ] \
+  && ok "/use with an http_body token on the app key → 403 before the key is decrypted: nothing sent, a critical event" || fail "forged use: $CODE $(echo "$BODY" | head -c 200)"
+call POST /api/demipass/use "$AG" '{"name":"demipass-app","action":"http_body","context":"forged","params":{"url":"https://repo.dustroot.com/x"}}'
+[ "$CODE" = 403 ] && [ "$(hits)" = "$H0" ] && ok "…and the owner's direct mode too" || fail "forged direct: $CODE $(echo "$BODY" | head -c 200)"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"DELETE FROM blindkey_contexts WHERE context_name='forged'\"); c.commit()" "$DB_PATH"
+ADD='{"secret_name":"demipass-app","context_name":"reviewers","action_type":"github_app_token","github_app":'"$GH"',"delegate_did":"'$BDID'","ask_owner":true}'
+call POST /api/demipass/context/add "$AG" "$ADD"; AP=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(Q "SELECT kind||'/'||depth FROM use_approvals WHERE id=$AP")" = scope/critical ] && ok "AG adds it → 202, approval $AP of kind scope" || fail "add parks: $CODE $BODY"
+SUMMARY=$(Q "SELECT summary FROM use_approvals WHERE id=$AP"); echo "$SUMMARY" | grep -q "new GitHub scope 'reviewers' for agent .*: contents:write, pull_requests:write on bildow/brain, " && ok "the card names permissions, then repos: $SUMMARY" || fail "summary: $SUMMARY"
+[ "$(Q "SELECT COUNT(*) FROM blindkey_contexts WHERE secret_id=$SID")" = 0 ] && ok "nothing granted yet" || fail "granted early"
+pin "$A" 4321 "approval-open:$AP"; call POST /api/demipass/approvals/$AP/open "$A"; K=$(echo "$BODY" | J code)
+[ "$(echo "$BODY" | J approval.call.body.github_app.installation_id)" = 777 ] && ok "opened with the PIN: the whole GitHub scope is on the screen" || fail "open: $CODE $BODY"
+call POST /api/demipass/approvals/$AP/approve "$A" '{"code":"'$K'"}'; [ "$CODE" = 200 ] || fail "approve: $CODE $BODY"
+call POST /api/demipass/context/add "$AG" "${ADD%\}},\"approval_id\":$AP}"
+CID=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID AND context_name='reviewers'")
+[ "$CODE" = 200 ] && [ -n "$CID" ] && [ "$(echo "$BODY" | J context.github_app.repositories.1)" = bildow/dustforge ] && [ "$(echo "$BODY" | J delegate_did)" = "$BDID" ] \
+  && ok "with approval_id: scope $CID created (repos as exact lower-case names), handed to B" || fail "apply: $CODE $BODY"
+[ "$(Q "SELECT context_id FROM demipass_delegations WHERE delegate_did='$BDID' AND secret_id=$SID")" = "$CID" ] && ok "the delegation is bound to that scope alone" || fail "delegation ctx"
+call POST /api/demipass/context/add "$AG" "${ADD%\}},\"approval_id\":$AP}"; [ "$CODE" = 410 ] && ok "…once" || fail "reuse: $CODE"
+
+# ── B mints ──
+BAL(){ Q "SELECT balance_cents FROM identity_wallets WHERE did='$BDID'"; }
+M0=$(mints); B0=$(BAL)
+call POST /api/demipass/request-token "$B" '{"ref":"'$REF'","context":"reviewers"}'; T=$(echo "$BODY" | J use_token)
+call POST /api/demipass/use "$B" '{"use_token":"'$T'","params":{"repositories":["bildow/brain"],"permissions":{"contents":"read"},"ttl_seconds":600}}'
+[ "$CODE" = 200 ] && [ "$(keep_token t1)" = minted ] && ok "B: request-token + use → an installation token the stand-in minted" || fail "mint: $CODE $(echo "$BODY" | head -c 300)"
+[ "$(echo "$BODY" | J result.repositories)" = "['bildow/brain']" ] && [ "$(echo "$BODY" | J result.permissions.contents)" = read ] && [ "$(echo "$BODY" | J result.git.username)" = x-access-token ] \
+  && ok "…covering exactly bildow/brain, contents:read; git user x-access-token" || fail "subset: $BODY"
+tail -1 "$S/upstream.log" | grep -q "POST /app/installations/777/access_tokens jwt=ok repos=brain perms=contents:read ua=DemiPass api=2022-11-28" \
+  && ok "GitHub saw a valid app JWT (RS256, iss 424242, iat −60 s, exp ≤ 10 min) and exactly that request" || fail "upstream: $(tail -1 "$S/upstream.log")"
+EXP=$(echo "$BODY" | J result.expires_at); TID=$(echo "$BODY" | J result.token_id)
+python3 -c "import sys,datetime; e=datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')); d=(e-datetime.datetime.now(datetime.timezone.utc)).total_seconds(); sys.exit(0 if 590<=d<=601 else 1)" "$EXP" \
+  && [ "$(Q "SELECT expires_at FROM github_app_tokens WHERE id=$TID")" = "$EXP" ] && ok "its expiry is the asked 600 s (under GitHub's hour), recorded ($EXP)" || fail "expiry: $EXP"
+[ "$(BAL)" = $((B0 - 10)) ] && ok "metered: B paid 10 DD for the mint" || fail "billing: $B0 → $(BAL)"
+EV=$(Q "SELECT context_json FROM demipass_security_events WHERE event_type='github_app_token_minted' ORDER BY id DESC LIMIT 1")
+python3 -c "import json,sys; c=json.loads(sys.argv[1]); sys.exit(0 if c['wallet']==sys.argv[2] and c['scope']=='reviewers' and c['repositories']==['bildow/brain'] and c['permissions'].get('contents')=='read' and c['expires_at']==sys.argv[3] else 1)" "$EV" "$BDID" "$EXP" \
+  && ok "a security event names wallet, scope, repositories, permissions and expiry" || fail "event: $EV"
+call GET /api/demipass/expiring "$A"; [ "$(echo "$BODY" | J github_tokens.0.id)" = "$TID" ] && [ "$(echo "$BODY" | J github_tokens.0.scope)" = reviewers ] && ! echo "$BODY" | grep -q ghs_ \
+  && ok "/expiring lists the live token for the owner (scope, expiry; never the token)" || fail "expiring A: $BODY"
+call GET /api/demipass/expiring "$B"; [ "$(echo "$BODY" | J total_github_tokens)" = 1 ] && ok "…and for the agent that minted it" || fail "expiring B: $BODY"
+call POST /api/demipass/use "$B" '{"ref":"'$REF'","context":"reviewers","action":"github_app_token"}'
+[ "$CODE" = 200 ] && [ "$(keep_token t2)" = minted ] && [ "$(echo "$BODY" | J result.permissions.pull_requests)" = write ] && [ "$(echo "$BODY" | J result.repositories)" = "['bildow/brain', 'bildow/dustforge']" ] \
+  && ok "one call (ref), nothing asked → the whole scope: both repos, contents+pull_requests write" || fail "defaults: $CODE $(echo "$BODY" | head -c 300)"
+
+# ── refused before any connection ──
+M1=$(mints); E1=$(Q "SELECT COUNT(*) FROM blindkey_events WHERE event_type='egress' AND secret_id=$SID"); BB=$(BAL)
+try(){ call POST /api/demipass/use "$B" '{"ref":"'$REF'","context":"reviewers","action":"github_app_token","params":'"$1"'}'; }
+try '{"repositories":["bildow/secrets"]}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "'bildow/secrets' is not in this scope" && ok "a repository off the scope → 403, named" || fail "wrong repo: $CODE $BODY"
+try '{"permissions":{"administration":"write"}}'; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "beyond this scope" && ok "a permission off the scope → 403" || fail "wider perm: $CODE $BODY"
+try '{"permissions":{"contents":"admin"}}'; [ "$CODE" = 403 ] && ok "a level above write → 403" || fail "admin level: $CODE $BODY"
+try '{"ttl_seconds":3600}'; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "at most 1800" && ok "a TTL beyond the scope's 1800 s → 403" || fail "ttl: $CODE $BODY"
+try '{"permissions":{"constructor":"read"}}'; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "not a GitHub App permission name" && ok "permissions {constructor} → 403" || fail "constructor: $CODE $BODY"
+try '{"permissions":{"contents":"constructor"}}'; [ "$CODE" = 403 ] && ok "a level named constructor → 403" || fail "level constructor: $CODE $BODY"
+[ "$(mints)" = "$M1" ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_events WHERE event_type='egress' AND secret_id=$SID")" = "$E1" ] \
+  && ok "…all before any connection: no egress row, no request to GitHub" || fail "leaked to github: $(mints)/$M1"
+[ "$(BAL)" = "$BB" ] && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && ok "…and none of them charged (refunded_dd 10 each)" || fail "refused charged: $BB → $(BAL) $BODY"
+[ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='github_scope_refused'")" = 6 ] && ok "six github_scope_refused events" || fail "refused events"
+
+# ── the git credential helper ──
+OUT=$(printf 'protocol=https\nhost=github.com\npath=bildow/brain.git\n\n' | DEMIPASS_URL=$API DEMIPASS_TOKEN=$B DEMIPASS_GITHUB_REF=$REF DEMIPASS_GITHUB_SCOPE=reviewers node "$W/bin/git-credential-demipass.js" get 2>&1)
+printf '%s' "$OUT" | python3 -c 'import sys; o=sys.stdin.read().splitlines(); t=open(sys.argv[1]).read().split(); sys.exit(0 if o[0]=="username=x-access-token" and o[1].startswith("password=") and o[1][9:] in t else 1)' "$S/tokens" \
+  && ok "credential helper: git gets username=x-access-token and a fresh token as the password" || fail "helper output (not shown)"
+tail -1 "$S/upstream.log" | grep -q "repos=brain perms=contents:write,pull_requests:write" && ok "…for just the repo git asked about (useHttpPath)" || fail "helper repos: $(tail -1 "$S/upstream.log")"
+OUT=$(printf 'protocol=https\nhost=gitlab.com\npath=x/y.git\n\n' | DEMIPASS_URL=$API DEMIPASS_TOKEN=$B DEMIPASS_GITHUB_REF=$REF node "$W/bin/git-credential-demipass.js" get 2>&1)
+[ -z "$OUT" ] && ok "…and nothing for another host" || fail "helper other host"
+HELP(){ printf 'protocol=https\nhost=github.com\npath=bildow/brain.git\n\n' | env DEMIPASS_URL=${URL:-$API} DEMIPASS_TOKEN=$B DEMIPASS_GITHUB_REF=$REF DEMIPASS_GITHUB_SCOPE=reviewers DEMIPASS_GITHUB_PERMISSIONS=contents:read ${CACHE:+DEMIPASS_GITHUB_CACHE_DIR=$CACHE} node "$W/bin/git-credential-demipass.js" get 2>"$S/helper.err"; }
+OUT=$(HELP); printf '%s' "$OUT" | python3 -c 'import sys,time; o=dict(l.split("=",1) for l in sys.stdin.read().splitlines()); e=int(o.get("password_expiry_utc","0")); sys.exit(0 if 1700 < e-time.time() <= 1800 and set(o)=={"username","password","password_expiry_utc"} else 1)' \
+  && ok "…with password_expiry_utc (the token's own expiry), and nothing else" || fail "helper expiry (not shown)"
+OUT=$(URL=http://demipass.example.com HELP); [ -z "$OUT" ] && grep -q "must be https" "$S/helper.err" && ok "…an http DEMIPASS_URL (not loopback) is refused: the DemiPass token never travels in clear" || fail "helper http url"
+mkdir -p "$S/ghcache"; chmod 755 "$S/ghcache"; OUT=$(CACHE=$S/ghcache HELP); [ -z "$OUT" ] && grep -q "chmod 700" "$S/helper.err" && ok "…a cache directory others can read is refused" || fail "helper loose cache"
+chmod 700 "$S/ghcache"; MC=$(mints); O1=$(CACHE=$S/ghcache HELP); O2=$(CACHE=$S/ghcache HELP)
+[ "$(mints)" = $((MC + 1)) ] && [ -n "$O1" ] && [ "$O1" = "$O2" ] && [ "$(stat -c %a "$S/ghcache"/gh-*.json)" = 600 ] \
+  && ok "…with DEMIPASS_GITHUB_CACHE_DIR two git calls make one mint (the token reused for its life, file 0600)" || fail "helper cache: $(mints)/$MC"
+# erase (git got a 401 with it): the cached token goes, the next get mints a fresh one
+O3=$(printf 'protocol=https\nhost=github.com\npath=bildow/brain.git\nusername=x-access-token\n%s\n\n' "$(printf '%s' "$O1" | grep '^password=')" | env DEMIPASS_URL=$API DEMIPASS_TOKEN=$B DEMIPASS_GITHUB_REF=$REF DEMIPASS_GITHUB_SCOPE=reviewers DEMIPASS_GITHUB_PERMISSIONS=contents:read DEMIPASS_GITHUB_CACHE_DIR=$S/ghcache node "$W/bin/git-credential-demipass.js" erase 2>&1)
+MC=$(mints); O4=$(CACHE=$S/ghcache HELP)
+[ -z "$O3" ] && [ "$(mints)" = $((MC + 1)) ] && [ -n "$O4" ] && [ "$O4" != "$O1" ] && ok "…erase drops the cached token: the next get mints a new one" || fail "helper erase: $(mints)/$MC"
+# another DemiPass identity under the same Unix user never gets this agent's cached token
+A2=$(login owner-a); MC=$(mints)
+O5=$(printf 'protocol=https\nhost=github.com\npath=bildow/brain.git\n\n' | env DEMIPASS_URL=$API DEMIPASS_TOKEN=$A2 DEMIPASS_GITHUB_REF=$REF DEMIPASS_GITHUB_SCOPE=reviewers DEMIPASS_GITHUB_PERMISSIONS=contents:read DEMIPASS_GITHUB_CACHE_DIR=$S/ghcache node "$W/bin/git-credential-demipass.js" get 2>&1)
+[ "$(mints)" = $((MC + 1)) ] && [ -n "$O5" ] && [ "$O5" != "$O4" ] && ok "…another DemiPass identity in the same cache directory makes its own mint (the cache key includes the identity)" || fail "helper identity: $(mints)/$MC"
+rm -rf "$S/ghcache"
+
+# ── widening parks, narrowing applies (and revokes what the scope minted) ──
+call PATCH /api/demipass/context/$CID "$AG" '{"github_app":{"installation_id":"777","repositories":["bildow/brain","bildow/dustforge","bildow/tome"],"permissions":{"contents":"write","pull_requests":"write"},"max_ttl_seconds":1800},"ask_owner":true}'
+[ "$CODE" = 202 ] && [ "$(Q "SELECT kind FROM use_approvals WHERE id=$(echo "$BODY" | J approval_id)")" = scope ] && ! Q "SELECT github_app FROM blindkey_contexts WHERE id=$CID" | grep -q tome \
+  && ok "a third repository → a request on the phone (kind scope); nothing changed" || fail "widen repos: $CODE $BODY"
+call PATCH /api/demipass/context/$CID "$AG" '{"github_app":{"installation_id":"777","repositories":["bildow/brain","bildow/dustforge"],"permissions":{"contents":"write","pull_requests":"write","issues":"write"},"max_ttl_seconds":1800},"ask_owner":true}'
+[ "$CODE" = 202 ] && ok "a new permission → a request on the phone" || fail "widen perms: $CODE $BODY"
+call PATCH /api/demipass/context/$CID "$AG" '{"github_app":{"installation_id":"778","repositories":["bildow/brain"],"permissions":{"contents":"read"},"max_ttl_seconds":600},"ask_owner":true}'
+[ "$CODE" = 202 ] && ok "another installation (however narrow) → a request on the phone" || fail "other installation: $CODE $BODY"
+LIVE=$(Q "SELECT COUNT(*) FROM github_app_tokens WHERE context_id=$CID AND status='live'"); R0=$(revokes)
+call PATCH /api/demipass/context/$CID "$AG" '{"github_app":{"installation_id":"777","repositories":["bildow/brain","bildow/dustforge"],"permissions":{"contents":"write","pull_requests":"read"},"max_ttl_seconds":1800}}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT json_extract(github_app,'$.permissions.pull_requests') FROM blindkey_contexts WHERE id=$CID")" = read ] && ok "write → read on pull_requests: a narrowing, applied without the PIN" || fail "narrow: $CODE $BODY"
+waitfor "Q \"SELECT COUNT(*) FROM github_app_tokens WHERE context_id=$CID AND status='live'\"" 0 && [ "$(revokes)" = $((R0 + LIVE)) ] \
+  && ok "…and the $LIVE tokens it had minted were revoked at GitHub (DELETE /installation/token)" || fail "narrow revoke: $(revokes)/$R0+$LIVE"
+[ "$(Q "SELECT COUNT(*) FROM github_app_tokens WHERE context_id=$CID AND token_enc IS NOT NULL")" = 0 ] && ok "…their ciphertext erased" || fail "token_enc kept"
+
+# ── the installation is the ceiling; a too-wide answer is never handed out ──
+pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_name":"demipass-app","context_name":"issues","action_type":"github_app_token","github_app":{"installation_id":"777","repositories":["bildow/brain"],"permissions":{"issues":"write"},"max_ttl_seconds":300}}'
+CID2=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID AND context_name='issues'"); [ "$CODE" = 200 ] && [ -n "$CID2" ] || fail "owner add issues: $CODE $BODY"
+echo issues > "$S/ceiling"; A0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'"); N0=$(Q "SELECT COUNT(*) FROM github_app_tokens")
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "reinstalls the app" && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$A0" ] \
+  && [ "$(Q "SELECT COUNT(*) FROM github_app_tokens")" = "$N0" ] && ok "beyond the installation: GitHub's 422 → 403 'the owner reinstalls', refunded, no token" || fail "ceiling: $CODE $BODY"
+rm -f "$S/ceiling"; touch "$S/wide"; R0=$(revokes)
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
+[ "$CODE" = 502 ] && echo "$BODY" | grep -q "wider than asked" && ! echo "$BODY" | grep -q ghs_ && [ "$(revokes)" = $((R0 + 1)) ] \
+  && [ "$(Q "SELECT status FROM github_app_tokens ORDER BY id DESC LIMIT 1")" = revoked ] && ok "a token wider than asked: revoked at once, not handed out" || fail "wide: $CODE $BODY"
+rm -f "$S/wide"
+
+# ── an elevated key: never wrapped; each mint waits for the owner ──
+call POST /api/demipass/gate-policy "$A" '{"ref":"'$REF'","security_depth":"elevated"}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT COALESCE(wrap_state,'') FROM blindkey_secrets WHERE id=$SID")" = "" ] && ok "elevated: the key stays unwrapped (mints are unattended) — $(echo "$BODY" | J wrap_note | head -c 90)" || fail "elevated: $CODE $BODY"
+M2=$(mints); call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
+[ "$CODE" = 202 ] && [ "$(mints)" = "$M2" ] && ok "…and a mint parks as an approval request; GitHub is not called" || fail "elevated mint: $CODE $BODY"
+EA1=$(echo "$BODY" | J approval_id)
+pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_name":"demipass-app","context_name":"issues-twin","action_type":"github_app_token","github_app":{"installation_id":"777","repositories":["bildow/brain"],"permissions":{"issues":"write"},"max_ttl_seconds":300}}'
+CIDT=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID AND context_name='issues-twin'")
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues-twin","action":"github_app_token"}'; EA2=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ -n "$EA2" ] && [ "$EA2" != "$EA1" ] && [ "$(Q "SELECT binding FROM use_approvals WHERE id=$EA1")" != "$(Q "SELECT binding FROM use_approvals WHERE id=$EA2")" ] \
+  && Q "SELECT summary FROM use_approvals WHERE id=$EA2" | grep -q "scope #$CIDT: issues:write on bildow/brain" \
+  && ok "the same mint on a twin scope is its own approval, bound to that scope ($(Q "SELECT summary FROM use_approvals WHERE id=$EA2"))" || fail "approval per scope: $CODE $EA1/$EA2 $(Q "SELECT summary FROM use_approvals WHERE id=$EA2")"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE blindkey_secrets SET security_depth='standard', gate_policy=NULL WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$SID"
+
+# ── revocation: our TTL, the delegation, the scope ──
+call POST /api/demipass/use "$B" '{"ref":"'$REF'","context":"reviewers","action":"github_app_token"}'; keep_token t3 >/dev/null; T3=$(echo "$BODY" | J result.token_id)
+R0=$(revokes); python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE github_app_tokens SET expires_at='2000-01-01T00:00:00.000Z' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$T3"
+waitfor "Q \"SELECT status FROM github_app_tokens WHERE id=$T3\"" revoked && [ "$(revokes)" = $((R0 + 1)) ] && [ "$(Q "SELECT revoke_wanted FROM github_app_tokens WHERE id=$T3")" = "expired (scope TTL)" ] \
+  && ok "the scope's TTL passing before GitHub's hour → revoked by the sweep" || fail "ttl revoke: $(Q "SELECT status FROM github_app_tokens WHERE id=$T3")"
+# the grant ends while GitHub is answering (the scope deactivated mid-mint): the token is revoked at once, not handed out
+DBX(){ python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()" "$DB_PATH" "$1"; }
+touch "$S/slow"; R0=$(revokes); AB0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")
+( call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'; printf '%s\n%s' "$CODE" "$BODY" > "$S/mid.out" ) &
+sleep 0.7; DBX "UPDATE blindkey_contexts SET status='revoked' WHERE id=$CID2"; wait $!; rm -f "$S/slow"
+[ "$(head -1 "$S/mid.out")" = 403 ] && grep -q "ended while GitHub minted" "$S/mid.out" && ! grep -q ghs_ "$S/mid.out" && [ "$(revokes)" = $((R0 + 1)) ] \
+  && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$AB0" ] && ok "a grant that ends during the mint: the token is revoked at once, refused, not charged" || fail "mid-mint: $(head -c 200 "$S/mid.out")"
+DBX "UPDATE blindkey_contexts SET status='active' WHERE id=$CID2"
+# the scope narrowed while GitHub is answering: the token (minted for the old, wider terms) is revoked, not handed out
+pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_name":"demipass-app","context_name":"two-repos","action_type":"github_app_token","github_app":{"installation_id":"777","repositories":["bildow/brain","bildow/dustforge"],"permissions":{"contents":"write"},"max_ttl_seconds":900}}'
+CID3=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID AND context_name='two-repos'")
+touch "$S/slow"; R0=$(revokes)
+( call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"two-repos","action":"github_app_token"}'; printf '%s\n%s' "$CODE" "$BODY" > "$S/mid2.out" ) &
+sleep 0.7; call PATCH /api/demipass/context/$CID3 "$A" '{"github_app":{"installation_id":"777","repositories":["bildow/brain"],"permissions":{"contents":"read"},"max_ttl_seconds":900}}'; NC=$CODE; wait $!; rm -f "$S/slow"
+[ "$NC" = 200 ] && [ "$(head -1 "$S/mid2.out")" = 403 ] && grep -q "narrowed while GitHub minted" "$S/mid2.out" && ! grep -q ghs_ "$S/mid2.out" && [ "$(revokes)" = $((R0 + 1)) ] \
+  && [ "$(Q "SELECT revoke_wanted FROM github_app_tokens ORDER BY id DESC LIMIT 1")" = "scope narrowed during the mint" ] && ok "a scope narrowed mid-mint: the wider token is revoked at once and refused" || fail "narrow mid-mint: $NC $(head -c 200 "$S/mid2.out")"
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"two-repos","action":"github_app_token"}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J result.repositories)" = "['bildow/brain']" ] && [ "$(echo "$BODY" | J result.permissions.contents)" = read ] && ok "…asking again gets the narrowed terms" || fail "after narrow: $CODE $BODY"
+# a frozen key, and a key that changed owner: the sweep revokes what was minted on it
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'; TF=$(echo "$BODY" | J result.token_id); R0=$(revokes)
+DBX "UPDATE blindkey_secrets SET frozen=1 WHERE id=$SID"
+waitfor "Q \"SELECT status FROM github_app_tokens WHERE id=$TF\"" revoked && [ "$(revokes)" -ge $((R0 + 1)) ] && [ "$(Q "SELECT COUNT(*) FROM github_app_tokens WHERE secret_id=$SID AND status='live'")" = 0 ] && ok "freezing the key → its live tokens revoked by the sweep" || fail "frozen: $(Q "SELECT status FROM github_app_tokens WHERE id=$TF")"
+DBX "UPDATE blindkey_secrets SET frozen=0 WHERE id=$SID"
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'; TX=$(echo "$BODY" | J result.token_id); R0=$(revokes)
+ADID=$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'"); DBX "UPDATE blindkey_secrets SET did='$BDID' WHERE id=$SID"
+waitfor "Q \"SELECT status FROM github_app_tokens WHERE id=$TX\"" revoked && [ "$(revokes)" = $((R0 + 1)) ] && ok "the key moving to another owner (a transfer) → tokens the old owner's grants minted are revoked" || fail "transfer: $(Q "SELECT status FROM github_app_tokens WHERE id=$TX")"
+DBX "UPDATE blindkey_secrets SET did='$ADID' WHERE id=$SID"
+call POST /api/demipass/use "$B" '{"ref":"'$REF'","context":"reviewers","action":"github_app_token"}'; T4=$(echo "$BODY" | J result.token_id)
+DID=$(Q "SELECT id FROM demipass_delegations WHERE delegate_did='$BDID' AND secret_id=$SID"); R0=$(revokes)
+call POST /api/demipass/delegate/revoke "$A" '{"delegation_id":'$DID'}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J github_tokens_revoked)" = 1 ] && waitfor "Q \"SELECT status FROM github_app_tokens WHERE id=$T4\"" revoked && [ "$(revokes)" = $((R0 + 1)) ] \
+  && ok "revoking B's delegation → its live token revoked at GitHub now" || fail "delegation revoke: $CODE $BODY"
+call POST /api/demipass/use "$B" '{"ref":"'$REF'","context":"reviewers","action":"github_app_token"}'; [ "$CODE" = 403 ] && ok "…and B mints nothing more" || fail "B after revoke: $CODE"
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"reviewers","action":"github_app_token","params":{"repositories":["bildow/dustforge"]}}'; T5=$(echo "$BODY" | J result.token_id)
+[ "$CODE" = 200 ] && [ -z "$(Q "SELECT delegation_id FROM github_app_tokens WHERE id=$T5")" ] || fail "owner mint: $CODE $BODY"
+R0=$(revokes); call DELETE /api/demipass/context/$CID "$A"
+[ "$CODE" = 200 ] && waitfor "Q \"SELECT status FROM github_app_tokens WHERE id=$T5\"" revoked && [ "$(revokes)" = $((R0 + 1)) ] && ok "deleting the scope → the owner's own live token revoked too" || fail "scope delete: $CODE $BODY"
+[ "$(Q "SELECT COUNT(*) FROM github_app_tokens WHERE status='live'")" = 0 ] && [ "$(Q "SELECT COUNT(*) FROM github_app_tokens WHERE token_enc IS NOT NULL")" = 0 ] && ok "no live token left, no token ciphertext kept" || fail "leftovers"
+
+# ── rotation carries the App ID and the scopes ──
+python3 -c 'import json,sys; print(json.dumps({"name":"demipass-app","new_value":"not a pem"}))' > "$S/rot.json"; callf POST /api/blindkey/rotate "$A" "$S/rot.json"
+[ "$CODE" = 400 ] && ok "rotating to something that is not a .pem → 400" || fail "rotate junk: $CODE $BODY"
+cp "$S/app2.pem" "$S/x"; python3 -c 'import json,sys; print(json.dumps({"name":"demipass-app","new_value":open(sys.argv[1]).read()}))' "$S/x" > "$S/rot.json"; rm -f "$S/x"; callf POST /api/blindkey/rotate "$A" "$S/rot.json"
+NSID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$REF'")
+[ "$CODE" = 200 ] && [ "$NSID" != "$SID" ] && [ "$(Q "SELECT json_extract(metadata,'$.github_app_id') FROM blindkey_secrets WHERE id=$NSID")" = 424242 ] \
+  && [ "$(Q "SELECT json_extract(github_app,'$.installation_id') FROM blindkey_contexts WHERE secret_id=$NSID AND context_name='issues'")" = 777 ] && ok "rotated: the new key keeps the App ID and the scope's GitHub configuration" || fail "rotate: $CODE $BODY"
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
+[ "$CODE" = 200 ] && tail -1 "$S/upstream.log" | grep -q "jwt=ok" && ok "…and mints, signed by the new key" || fail "mint after rotate: $CODE $(tail -1 "$S/upstream.log")"
+
+# ── a transfer: tokens minted from the key under the old owner's grants are revoked at once (not at the next sweep) ──
+C=$(login person-c); call POST /api/identity/pin "$C" '{"pin":"8765","password":"hunter22"}'
+. "$W/test/lib/pair_in_person.sh"; pair_in_person "$A" 4321 "$C" 8765 || fail "pairing"
+storebody "$S/app.pem" spare-app 424242; callf POST /api/demipass/store "$A" "$S/st.json"; SREF=$(echo "$BODY" | J ref); SSID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$SREF'")
+pin "$A" 4321 "scope:$SSID"; call POST /api/demipass/context/add "$A" '{"secret_name":"spare-app","context_name":"s","action_type":"github_app_token","github_app":{"installation_id":"777","repositories":["bildow/brain"],"permissions":{"contents":"read"}}}'
+call POST /api/demipass/use "$A" '{"ref":"'$SREF'","context":"s","action":"github_app_token"}'; TT=$(echo "$BODY" | J result.token_id); [ "$CODE" = 200 ] || fail "spare mint: $CODE $BODY"
+pin "$A" 4321 "transfer:$SSID"; call POST /api/demipass/transfer "$A" '{"secret":"spare-app","to":"person-c"}'; TRID=$(echo "$BODY" | J transfer.id)
+[ "$CODE" = 202 ] || fail "transfer start: $CODE $BODY"
+R0=$(revokes); DBX "UPDATE secret_transfers SET execute_at='2000-01-01T00:00:00.000Z' WHERE id=$TRID"
+waitfor "Q \"SELECT status FROM github_app_tokens WHERE id=$TT\"" revoked && [ "$(Q "SELECT status FROM secret_transfers WHERE id=$TRID")" = done ] \
+  && [ "$(Q "SELECT revoke_wanted FROM github_app_tokens WHERE id=$TT")" = "key transferred" ] && [ "$(revokes)" = $((R0 + 1)) ] \
+  && ok "transferring the key → its live token revoked by the transfer itself ('key transferred')" || fail "transfer revoke: $(Q "SELECT status||'|'||COALESCE(revoke_wanted,'') FROM github_app_tokens WHERE id=$TT") / $(Q "SELECT status||'|'||COALESCE(error,'') FROM secret_transfers WHERE id=$TRID")"
+
+# ── GitHub unreachable: no token, not charged ──
+kill $UP; wait $UP 2>/dev/null; UP=; AB0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")
+call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
+[ "$CODE" = 502 ] && echo "$BODY" | grep -q "could not be reached" && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$AB0" ] \
+  && ok "GitHub unreachable → 502, refunded" || fail "unreachable: $CODE $BODY"
+
+# ── nothing in clear: no key, JWT or token in the server log or the database ──
+stop
+python3 - "$S" <<'PY' && ok "no app key, JWT or installation token in the server logs or the database (incl. WAL) in clear" || fail "a credential leaked (which: above)"
+import sys, os, glob
+d = sys.argv[1]
+needles = []
+for f in ('app.pem', 'app2.pem'):
+    body = [l for l in open(os.path.join(d, f)).read().splitlines() if l and not l.startswith('-----')]
+    needles += [(f + ' line', body[3]), (f + ' line', body[-2])]
+needles += [('jwt', l.split('.')[2]) for l in open(os.path.join(d, 'jwt.seen')).read().split()]
+needles += [('jwt claims', l.split('.')[1]) for l in open(os.path.join(d, 'jwt.seen')).read().split()]
+needles += [('token', t) for t in open(os.path.join(d, 'tokens')).read().split()]
+files = glob.glob(os.path.join(d, 'server-*.log')) + glob.glob(os.path.join(d, 'dustforge.db*'))
+bad = 0
+for f in files:
+    data = open(f, 'rb').read()
+    for what, n in needles:
+        if n.encode() in data: print('  found a', what, 'in', os.path.basename(f)); bad += 1
+print('  checked %d needles (%d tokens, %d JWTs) in %d files' % (len(needles), sum(1 for w, _ in needles if w == 'token'), sum(1 for w, _ in needles if w == 'jwt'), len(files)))
+sys.exit(1 if bad else 0)
+PY
+[ $fails = 0 ] && echo "ALL OK" || { echo "$fails FAILED"; exit 1; }

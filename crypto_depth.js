@@ -102,6 +102,9 @@ module.exports = function registerCryptoDepth(deps) {
   // loses it, though no phone will open it (unusable either way; fails closed) — #56 re-review.
   function wrapSecret(secret, { inGrace = false } = {}) {
     if (isWrapped(secret)) return { ok: true, already: true, wrapped_for: Object.keys(wrapsOf(secret.id)).length };
+    // A GitHub App key mints installation tokens unattended (github_app.js): wrapped to a phone, every mint would wait on
+    // an unwrap. It stays host-readable; at elevated/critical each mint is still an approval request (the gate on /use).
+    if (secret.secret_type === 'github_app_key') return { ok: false, error: 'a GitHub App key is never wrapped to a phone (mints are unattended); at this depth every mint waits for your approval instead' };
     if (!inGrace && !phoneCanOpen(secret)) return { ok: false, error: 'this secret\'s name or ref is one the phone cannot show in its prompt, so it is not wrapped (it would be unopenable) — it stays approval-only' };
     const keys = activeWrapKeys(secret.did);
     if (!keys.length) return { ok: false, error: 'no linked phone with a wrap key (DemiPass app 1.5+): this secret is protected by approval only, and the host can still read it' };

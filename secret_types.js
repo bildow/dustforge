@@ -20,6 +20,9 @@ const TYPES = {
   connection_string: { prefix: 'CON', action: 'database_connect', label: 'Connection string' },
   certificate:       { prefix: 'CRT', action: 'http_header',      label: 'Certificate' },
   multi_string:      { prefix: 'SEC', action: 'http_body',        label: 'Several values' },
+  // A GitHub App's private key (github_app.js): never inferred from a value's shape (an RSA PEM stays ssh_credential
+  // unless named), stored with its App ID, used only to mint installation tokens.
+  github_app_key:    { prefix: 'GHA', action: 'github_app_token', label: 'GitHub App private key' },
   other:             { prefix: 'SEC', action: 'http_header',      label: 'Other' },
 };
 
@@ -31,6 +34,7 @@ const ALIASES = {
   pass: 'password', login: 'password',
   api: 'api_key', apikey: 'api_key', key: 'api_key',
   webhook: 'webhook_secret', dsn: 'connection_string', database_url: 'connection_string',
+  github_app: 'github_app_key',
 };
 
 const TYPE_NAMES = Object.keys(TYPES);

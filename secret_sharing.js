@@ -377,6 +377,7 @@ module.exports = function registerSecretSharing(deps) {
     if (secret.frozen) return res.status(423).json({ error: 'the owner froze this secret', frozen: true });
     // Critical: a reveal also takes the owner's approval of this recipient's request (checked, then the PIN, then spent).
     const approvals = deps.approvals && deps.approvals();
+    if (secret.secret_type === 'github_app_key') return res.status(403).json({ error: 'a GitHub App key is never revealed — it only mints installation tokens' });
     const critical = approvals && approvals.depthOf(secret) === 'critical';
     if (critical) {
       const g = approvals.gate(secret, { did: me.did, label: 'share reveal' }, { kind: 'reveal' }, req.body || {}, { peek: true });
@@ -546,6 +547,9 @@ module.exports = function registerSecretSharing(deps) {
       notify(t.from_did, `DemiPass: your transfer to ${to.username} did not happen`, `The transfer of ${t.final_name} to ${to.username} did not happen: ${e.message}. Nothing changed.\n`);
       return;
     }
+    // Whatever the old owner's grants had minted from it ends now (a GitHub App key's installation tokens: revoked at
+    // GitHub at once, not at the next sweep — Codex P1 on #104). Kept use-only access starts fresh, like every grant here.
+    try { if (deps.onTransferred) deps.onTransferred(t.secret_id); } catch (_) {}
     logSecurityEvent('secret_transferred', 'warn', { caller_did: t.from_did, capability: 'transfer', target: t.final_name,
       context: { ref: secret.ref_code, to: to.username, transfer_id: t.id, kept_delegation_id: keptId, ended_delegations: ended.length } });
     tick(t.to_did, `secret received from ${from.username}: ${t.final_name}`, ['demipass:transfer-in', `secret:${t.final_name}`]);

@@ -469,6 +469,85 @@ test('store: a depth the server refuses is reported and the sheet stays open', a
   assert.equal(pg.shown('modal-store'), true, 'not auto-closed over the error');
 });
 
+test('store: a GitHub App key goes in with its App ID (picked .pem or paste), checked first, never shown', async () => {
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p) => {
+    if (p === '/api/demipass/store') return { json: { ok: true, ref: 'DP-GHA-demipass-1', github_app_id: '123456' } };
+  }) });
+  await settle();
+  const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIfixture\nnotarealkey\n-----END RSA PRIVATE KEY-----\n';
+  const stores = () => pg.calls.filter(c => c.path === '/api/demipass/store');
+  pg.ctx.openModal('store');
+  pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  assert.equal(pg.el('s-app-fields').style.display, 'block', 'the App ID and .pem fields show for this type');
+  assert.equal(pg.el('s-key-fields').style.display, 'block', 'the masked key box too (paste)');
+  assert.equal(pg.el('s-user-fields').style.display, 'none');
+  // the .pem picked from the device lands in the masked box; the message names the file, never the key
+  const input = { files: [{ name: 'demipass.2026-11-12.private-key.pem', size: pem.length, text: async () => pem }], value: 'C:\\fakepath\\x.pem' };
+  await pg.ctx.pickPemFile(input);
+  assert.equal(pg.el('s-key-value').value, pem.trim());
+  assert.equal(input.value, '', 'the file input is cleared');
+  assert.match(pg.el('s-app-pem-msg').textContent, /Key loaded from demipass\.2026-11-12\.private-key\.pem \(not shown\)/);
+  assert.doesNotMatch(pg.el('s-app-pem-msg').textContent, /MIIfixture|BEGIN/);
+  // a file that is not a key is refused, and the box keeps what it had
+  await pg.ctx.pickPemFile({ files: [{ name: 'notes.txt', size: 5, text: async () => 'hello' }], value: 'x' });
+  assert.match(pg.el('s-app-pem-msg').textContent, /not a private key/);
+  assert.equal(pg.el('s-key-value').value, pem.trim());
+  pg.el('s-name').value = 'demipass-app';
+  pg.el('s-app-id').value = 'abc';
+  await pg.ctx.storeSecret();
+  assert.equal(stores().length, 0, 'a non-numeric App ID is refused before anything is sent');
+  assert.match(pg.el('s-msg').textContent, /App ID/);
+  pg.el('s-app-id').value = ' 123456 ';
+  pg.el('s-key-value').value = 'just-a-token';
+  await pg.ctx.storeSecret();
+  assert.equal(stores().length, 0, 'a value that is not a .pem is refused before anything is sent');
+  pg.el('s-key-value').value = pem; pg.el('s-host').value = 'github.com';
+  await pg.ctx.storeSecret();
+  assert.equal(stores().length, 1);
+  const b = stores()[0].body;
+  assert.equal(b.secret_type, 'github_app_key'); assert.equal(b.github_app_id, '123456'); assert.equal(b.value, pem.trim());
+  assert.equal(b.host, undefined, 'no host: the key has no default scope');
+  assert.equal(pg.el('s-key-value').value, '', 'the key is purged from the box once stored');
+  assert.match(pg.el('s-msg').textContent, /Stored — ref: DP-GHA-demipass-1/);
+});
+
+test('store: a .pem read still pending when the sheet is cancelled or the session ends never lands (Codex #104 P2)', async () => {
+  const pg = page({ storage: signedIn, routes: vaultRoutes(() => {}) });
+  await settle();
+  const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIfixture\n-----END RSA PRIVATE KEY-----\n';
+  let release; const slow = () => pg.ctx.pickPemFile({ files: [{ name: 'k.pem', size: pem.length, text: () => new Promise(r => { release = () => r(pem); }) }], value: 'x' });
+  pg.ctx.openModal('store'); pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  let p = slow(); pg.ctx.closeModal(); release(); await p;
+  assert.equal(pg.el('s-key-value').value, '', 'cancelled while reading: nothing written');
+  pg.ctx.openModal('store'); pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  p = slow(); pg.el('s-type').value = 'api_key'; pg.ctx.updateStoreFields(); release(); await p;
+  assert.equal(pg.el('s-key-value').value, '', 'type changed while reading: nothing written');
+  pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  p = slow(); pg.ctx.logout(); release(); await p;
+  assert.equal(pg.el('s-key-value').value, '', 'signed out while reading: nothing written');
+});
+
+test('store: a loaded GitHub App key is dropped on cancel and when the type changes away (#104 review L8)', async () => {
+  const pg = page({ storage: signedIn, routes: vaultRoutes(() => {}) });
+  await settle();
+  const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIfixture\n-----END RSA PRIVATE KEY-----\n';
+  const pick = () => pg.ctx.pickPemFile({ files: [{ name: 'k.pem', size: pem.length, text: async () => pem }], value: 'x' });
+  pg.ctx.openModal('store');
+  pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  await pick();
+  assert.equal(pg.el('s-key-value').value, pem.trim());
+  pg.el('s-type').value = 'api_key'; pg.ctx.updateStoreFields();
+  assert.equal(pg.el('s-key-value').value, '', 'switching to another type drops the key: never stored as an API key by a slip');
+  pg.el('s-key-value').value = 'sk-typed-by-hand'; pg.ctx.updateStoreFields();
+  assert.equal(pg.el('s-key-value').value, 'sk-typed-by-hand', 'other values are left as typed');
+  pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  await pick();
+  pg.ctx.closeModal();
+  assert.equal(pg.el('s-key-value').value, '', 'Cancel drops the loaded key');
+  assert.equal(pg.shown('modal-store'), false);
+  assert.equal(pg.calls.filter(c => c.path === '/api/demipass/store').length, 0);
+});
+
 test('Escape: the blocking PIN sheets stay; on the unlock sheet it cancels the waiting action', async () => {
   const setup = page({ storage: signedIn, routes: async (p) => {
     if (p.startsWith('/api/identity/trust')) return { json: trustOk };
