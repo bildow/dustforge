@@ -19,7 +19,8 @@ const OWNER_REFILL_MAX = 100000;   // DD a scheduled operator-grant run (the sam
 const REFILL_COOLDOWN_MS = 10 * 60 * 1000;                       // one threshold refill per silicon per 10 min
 const WORK_LINK_MAX_TTL_TICKS = 100000;
 const WORK_LINK_DEFAULT_TTL_SECONDS = 7 * 86400;                 // wall-clock cap on top of the tick window
-const TOKEN_WARN_DAYS = 7;
+const TOKEN_WARN_HOURS = 24;
+const TOKEN_WARN_DAYS = TOKEN_WARN_HOURS / 24;   // kept for older readers
 const PROJECT_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const HANDLE_RE = /^[a-z0-9][a-z0-9-]{1,30}$/;
 
@@ -444,13 +445,26 @@ function latestToken(db, did) {
   } catch (_) { return null; }
 }
 
+// 'expiring' in the last TOKEN_WARN_HOURS (Aaron 2026-11-12: "an expiry warning 24 h before lapse"); the card shows
+// hours then. days_left stays for older readers.
 function tokenStatus(db, did, now = Date.now()) {
   const t = latestToken(db, did);
-  if (!t) return { status: 'none', scope: null, expires_at: null, days_left: null };
+  if (!t) return { status: 'none', scope: null, expires_at: null, days_left: null, hours_left: null };
   const expMs = Number(t.expires_at) * 1000;
-  const daysLeft = (expMs - now) / 86400000;
-  const status = daysLeft <= 0 ? 'expired' : (daysLeft <= TOKEN_WARN_DAYS ? 'expiring' : 'valid');
-  return { status, scope: t.scope, expires_at: new Date(expMs).toISOString(), days_left: Math.floor(daysLeft * 10) / 10, jti: t.jti };
+  const hoursLeft = (expMs - now) / 3600000;
+  const status = hoursLeft <= 0 ? 'expired' : (hoursLeft <= TOKEN_WARN_HOURS ? 'expiring' : 'valid');
+  return { status, scope: t.scope, expires_at: new Date(expMs).toISOString(), days_left: Math.floor(hoursLeft / 24 * 10) / 10,
+           hours_left: Math.floor(hoursLeft * 10) / 10, jti: t.jti };
+}
+
+// The agent's delivery key (silicon_renew.js): where an owner's renewal is sealed to. Fingerprint only, never the key's use.
+function deliveryKeyFingerprint(raw) { return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16); }
+function deliveryKeyView(db, did) {
+  try {
+    const w = db.prepare('SELECT delivery_public_key, delivery_key_set_at FROM identity_wallets WHERE did = ?').get(did);
+    if (!w || !w.delivery_public_key) return { set: false };
+    return { set: true, fingerprint: deliveryKeyFingerprint(Buffer.from(w.delivery_public_key, 'base64url')), set_at: w.delivery_key_set_at || null };
+  } catch (_) { return { set: false }; }   // a database without the column (before silicon_renew.js ran)
 }
 
 function siliconView(db, billing, s, { fleet } = {}) {
@@ -476,6 +490,7 @@ function siliconView(db, billing, s, { fleet } = {}) {
               // the PIN (thresholdRefill); the card says so instead of failing silently.
               owned: ownedOutright(s), confirmed: ownedOutright(s) || !!Number(s.refill_confirmed) },
     token: tokenStatus(db, s.member_did),
+    delivery_key: deliveryKeyView(db, s.member_did),
     fleet: fleet ? { slug: fleet.slug, name: fleet.name } : undefined,
     status: s.status, created_at: s.created_at, joined_via: s.joined_via || 'owner',
   };
@@ -761,18 +776,25 @@ function refillAlert(db, billing, s, r, { now = Date.now(), mailer = null } = {}
   return true;
 }
 
-// Email the silicon's contact when its newest token is within TOKEN_WARN_DAYS of
-// expiry (or there is none). Once per 24h per silicon. `mailer({to, subject, text})`.
+// Email when an agent's newest token is in its last TOKEN_WARN_HOURS (or has lapsed, or there is none). The silicon's
+// contact hears of every state, as before; the fleet owner hears of the 24 h mark, with the Renew token button that
+// fixes it (Aaron 2026-11-12). Once per 24 h per silicon; a renewal starts the notices over. `mailer({to, subject, text})`.
 function runTokenWarnings(db, { now = Date.now(), mailer = null } = {}) {
   // Network agents sign in themselves: the fleet mints nothing for them, so it does not warn about its tokens.
-  const rows = db.prepare("SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id WHERE s.status = 'active' AND s.contact_email != '' AND COALESCE(s.joined_via, 'owner') != 'network'").all();
+  const rows = db.prepare(`SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name, w.email AS owner_email FROM fleet_silicons s
+                             JOIN fleets f ON f.id = s.fleet_id LEFT JOIN identity_wallets w ON w.did = f.owner_did
+                            WHERE s.status = 'active' AND COALESCE(s.joined_via, 'owner') != 'network'`).all();
   const out = [];
   for (const s of rows) {
     const t = tokenStatus(db, s.member_did, now);
     if (t.status === 'valid') continue;
+    const to = [];
+    if (s.contact_email) to.push(s.contact_email);
+    if (t.status === 'expiring' && s.owner_email && !to.includes(s.owner_email)) to.push(s.owner_email);
+    if (!to.length) continue;
     if (s.token_warned_at && now - new Date(s.token_warned_at + 'Z').getTime() < 86400000) continue;
     const text = tokenWarningEmail({ silicon: s, token: t });
-    if (mailer) { try { mailer({ to: s.contact_email, subject: `DemiPass: ${s.handle} token is ${t.status}`, text }); } catch (_) {} }
+    if (mailer) for (const addr of to) { try { mailer({ to: addr, subject: `DemiPass: ${s.handle} token is ${t.status}`, text }); } catch (_) {} }
     db.prepare("UPDATE fleet_silicons SET token_warned_at = datetime('now') WHERE id = ?").run(s.id);
     out.push({ handle: s.handle, status: t.status });
   }
@@ -1080,18 +1102,19 @@ function didRecordEmail({ silicon, fleet, wallet, apiBase = 'https://api.dustfor
 }
 
 function tokenWarningEmail({ silicon, token }) {
+  const left = token.hours_left != null && token.hours_left < 24 ? `${Math.max(0, Math.floor(token.hours_left))} hours left` : `${token.days_left} days left`;
   const line = token.status === 'none' ? 'has no live access token on record'
     : token.status === 'expired' ? `token expired at ${token.expires_at}`
-    : `token expires at ${token.expires_at} (${token.days_left} days left)`;
+    : `token expires at ${token.expires_at} (${left})`;
   return [
     `DemiPass fleet notice for "${silicon.display_name || silicon.handle}" (${silicon.fleet_slug}):`,
     ``,
     `  ${silicon.handle} ${line}.`,
     ``,
-    `Roll it over before it lapses: POST https://api.dustforge.com/api/identity/auth-fingerprint`,
-    `  {"username":"<username>","password":"<password>","scope":"transact","expires_in":"30d"}`,
-    `and replace the stored token wherever this silicon reads it. A rollover job that runs daily and`,
-    `re-mints when fewer than ${TOKEN_WARN_DAYS} days remain avoids this notice entirely.`,
+    `The fleet owner can renew it: DemiPass app → Fleet → @${silicon.handle} → "Renew token" (your PIN).`,
+    `The new token is sealed to the agent's delivery key and nobody sees it; the agent picks it up with`,
+    `  node bin/token-pickup.js <dir>      (once registered with: node bin/token-pickup.js --init <dir>)`,
+    `which writes <dir>/token (0600).`,
     ``,
     `You get at most one of these per day.`,
   ].join('\n');
@@ -1100,7 +1123,7 @@ function tokenWarningEmail({ silicon, token }) {
 module.exports = {
   ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed, OWNER_REFILL_MAX,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
-  getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken,
+  getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken, deliveryKeyFingerprint, deliveryKeyView,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, projectWalletOwned, removeProject, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
   runOwnerRefills, runSiliconRefills, runTokenWarnings, runRefills,
   attributionReport, recentSpend,
@@ -1109,5 +1132,5 @@ module.exports = {
   activeFleetOf, ownsFleetWithAgents, joinBlocker, clearStaleSiliconRows, cutFleetTokens, signOutEverywhere, revokeOwnerWorkers,
   workerId, createWorker, getWorker, listWorkers, revokeWorker, workerTokenClaims, recordWorkerToken, resolveWorker, workerMayUseSecret, workerView, siliconSecrets,
   didRecordEmail, tokenWarningEmail,
-  HANDLE_RE, PROJECT_RE, INITIATORS, TOKEN_WARN_DAYS, REFILL_COOLDOWN_MS,
+  HANDLE_RE, PROJECT_RE, INITIATORS, TOKEN_WARN_DAYS, TOKEN_WARN_HOURS, REFILL_COOLDOWN_MS,
 };

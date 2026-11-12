@@ -743,6 +743,7 @@ let pinSaveBusy=null, pinChangeBusy=null;   // a PIN setup (its flow) / PIN chan
 let vaultOpen=false;
 const lockState={after:300,last:Date.now(),locked:false,pingAt:0};   // dormancy lock (below); declared early so every loader can check it        // true only once the vault is past the PIN gate; the background refresh runs only then
 let dashboardData=null, vaultLoadedAt=0, vaultSeq=0, fleetSlug=null, fleetData=null, siliconHandle=null;   // per-account state (sign-out clears it)
+let fleetNote=null; const renewBusy=new Set();   // the fleet tab's renew result, and renewals in flight (sign-out clears both)
 let scanStream=null, scanInterval=null, revealTimer=null;
 
 // Sessions renew themselves: sign-in also returns a 90-day refresh token (rotated on every use). The 24 h access
@@ -904,17 +905,49 @@ function logout(){
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
   for(const i of ['df-fwd-banner','security-banner','panic','onboarding-wizard']){const e=document.getElementById(i);if(e)e.style.display='none'}
   updateStoreFields(); updateSiliconFields(); updateNetFields();   // the sheets' field sets follow their reset dropdowns
-  secrets=[]; dashboardData=null; document.getElementById('vault-note').textContent=''; fleetSlug=null; fleetData=null; siliconHandle=null; panic=false;
+  secrets=[]; dashboardData=null; document.getElementById('vault-note').textContent=''; fleetSlug=null; fleetData=null; siliconHandle=null; fleetNote=null; renewBusy.clear(); panic=false;
   goPage('vault');
   document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none';
   setTimeout(()=>{ try{ checkLoginHolds(); }catch(_){} },0)}
 
 // ── Fleet tab ──────────────────────────────────────────────────────────────
 function dd(c){return (Number(c)||0).toLocaleString()}
+// Time left on an agent's token: hours in its last day (the server's 24 h warning), days before that.
+function tokenLeft(t){
+  if(!t||t.status==='expired'||t.status==='none') return '';
+  if(t.hours_left!=null&&t.hours_left<24) return ' · '+(t.hours_left<1?'&lt;1h':Math.floor(t.hours_left)+'h')+' left';
+  return t.days_left!=null?' · '+t.days_left+'d':'';
+}
 function tokenChip(t){
   const m={valid:['var(--green)','token ok'],expiring:['var(--yellow)','token expiring'],expired:['var(--red)','token expired'],none:['var(--text3)','no token']};
-  const [c,l]=m[t&&t.status]||m.none;
-  return '<span style="color:'+c+';font-size:0.65rem;border:1px solid '+c+';border-radius:6px;padding:0.05rem 0.35rem">'+l+(t&&t.days_left!=null&&t.status!=='expired'?' · '+t.days_left+'d':'')+'</span>';
+  const st=(t&&m[t.status])?t.status:'none', [c,l]=m[st];
+  // Lapsed: filled, so it reads as a stop at a glance.
+  const look=st==='expired'?'background:'+c+';color:#fff;font-weight:700':'color:'+c;
+  return '<span class="tok-chip tok-'+st+'" style="'+look+';font-size:0.65rem;border:1px solid '+c+';border-radius:6px;padding:0.05rem 0.35rem">'+l+tokenLeft(t)+'</span>';
+}
+// Owner override (Aaron 2026-11-12): renew an agent's token from its card. The server mints it and seals it to the
+// agent's delivery key; the agent picks it up (bin/token-pickup.js). Nothing of the token reaches this page.
+function canRenew(s){ return !!(fleetData&&fleetData.fleet&&fleetData.fleet.owner_did===did&&s&&s.status==='active'&&s.joined_via!=='network'); }
+function renewButton(s){
+  return canRenew(s)?'<button class="btn-ghost renew-btn" '+(renewBusy.has(s.handle)?'disabled ':'')+'onclick="event.stopPropagation();renewSiliconToken('+jsArg(s.handle)+')" style="font-size:0.65rem;padding:0.15rem 0.5rem">Renew token</button>':'';
+}
+function fleetNoteHtml(){
+  if(!fleetNote) return '';
+  return '<div id="fleet-note" style="background:var(--card);border:1px solid '+(fleetNote.ok?'var(--green)':'var(--red)')+';border-radius:10px;padding:0.6rem 0.8rem;margin-bottom:0.75rem;font-size:0.75rem;color:'+(fleetNote.ok?'var(--green)':'var(--red)')+'">'+esc(fleetNote.text)+' <button class="btn-ghost" onclick="fleetNote=null;loadFleet()" style="font-size:0.6rem;padding:0.05rem 0.35rem">✕</button></div>';
+}
+async function renewSiliconToken(handle){
+  if(renewBusy.has(handle)||!fleetSlug) return; renewBusy.add(handle);
+  try{
+    const r=await apiGated('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(handle)+'/renew-token',{},
+      'Renew @'+handle+'\'s token? It is sealed to @'+handle+'\'s delivery key; nobody sees it. Your PIN approves it.');
+    fleetNote={ok:true,text:'Renewed: sealed to @'+handle+'\'s delivery key; it picks it up.'+(r&&r.expires_at?' Valid until '+new Date(r.expires_at).toLocaleString()+'.':'')};
+  }catch(e){
+    if(sessionEnded(e)) { renewBusy.delete(handle); return; }
+    if(!/cancelled/.test(e.message)) fleetNote={ok:false,text:e.message};   // e.g. the server's "no delivery key" answer
+  }finally{ renewBusy.delete(handle); }
+  await loadFleet();
+  const sp=document.getElementById('page-silicon');
+  if(siliconHandle===handle&&sp&&sp.classList.contains('active')) openSilicon(handle);
 }
 function goPage(p){document.querySelectorAll('.bn-item').forEach(x=>x.classList.toggle('active',x.dataset.page===p));document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById('page-'+p).classList.add('active')}
 async function pickFleet(){
@@ -939,7 +972,7 @@ async function loadFleet(){
     fleetData=d;
     document.getElementById('fleet-title').textContent=d.fleet.name;
     const owner=d.owner, rule=owner&&owner.refill_rule;
-    let h=net;
+    let h=fleetNoteHtml()+net;
     // Owner wallet + weekly refill
     if(owner){
       h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
@@ -961,6 +994,8 @@ async function loadFleet(){
       h+='<div '+(live?'onclick="openSilicon('+jsArg(s.handle)+')" ':'')+'style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.8rem 1rem;margin-bottom:0.5rem;cursor:'+(live?'pointer':'default')+(live?'':';opacity:0.7')+'">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center"><div><strong style="color:var(--accent)">'+esc(s.display_name||s.handle)+'</strong> <span style="color:var(--text3);font-size:0.7rem">@'+esc(s.handle)+'</span></div><div style="font-weight:700">'+dd(s.balance_cents)+' DD</div></div>';
       h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:0.35rem;font-size:0.68rem;color:var(--text3)"><span>'+(s.refill.enabled?('refill +'+dd(s.refill.amount_cents)+' below '+dd(s.refill.threshold_cents)):'no auto-refill')+(s.refill.last_error?' · <span style="color:var(--red)">'+esc(s.refill.last_error)+'</span>':'')+'</span>'+tokenChip(s.token)+'</div>';
+      const rb=renewButton(s);
+      if(rb) h+='<div style="display:flex;justify-content:flex-end;margin-top:0.35rem">'+rb+'</div>';
       h+='</div>';
     }
     // Projects: cards like the silicons above; tap one for its billing (Aaron 2026-11-07).
@@ -1112,6 +1147,7 @@ async function openSilicon(handle){
     h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:1rem">';
     h+='<div style="display:flex;justify-content:space-between;align-items:center"><div style="font-size:0.68rem;color:var(--text3);text-transform:uppercase;letter-spacing:0.05em">Access token</div>'+tokenChip(s.token)+'</div>';
     h+='<div style="font-size:0.72rem;margin-top:0.3rem">'+(s.token.expires_at?('scope '+esc(s.token.scope)+' · expires '+new Date(s.token.expires_at).toLocaleString()):'none on record')+'</div>';
+    if(canRenew(s)) h+='<div style="display:flex;gap:0.5rem;align-items:center;margin-top:0.6rem">'+renewButton(s)+'<span style="font-size:0.65rem;color:var(--text3)">'+(s.delivery_key&&s.delivery_key.set?'sealed to its delivery key '+esc(s.delivery_key.fingerprint):'no delivery key yet: the agent runs token-pickup.js --init')+'</span></div>';
     if(s.joined_via==='network')h+='<div style="font-size:0.7rem;color:var(--text3);margin-top:0.6rem">Joined through the network: it keeps its own key and signs in itself.</div>';
     else h+='<div style="display:flex;gap:0.5rem;margin-top:0.6rem"><button class="btn-ghost" onclick="mintSiliconToken()" style="font-size:0.72rem">Mint a 30-day token</button></div><div id="sil-token-out" style="display:none;margin-top:0.5rem"><div style="font-size:0.65rem;color:var(--red)">Shown once. Hand it to the silicon now.</div><textarea id="sil-token-text" readonly style="width:100%;height:4.5rem;font-family:monospace;font-size:0.6rem;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px"></textarea></div>';
     h+='</div>';

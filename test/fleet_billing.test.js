@@ -225,13 +225,22 @@ test('token status and expiry warnings', () => {
   assert.equal(fb.tokenStatus(db, BRAIN, now).status, 'none');
   db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('old', BRAIN, 'transact', 0, Math.floor(now / 1000) - 10);
   assert.equal(fb.tokenStatus(db, BRAIN, now).status, 'expired');
-  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('soon', BRAIN, 'transact', 0, Math.floor(now / 1000) + 3 * 86400);
-  const t = fb.tokenStatus(db, BRAIN, now);
-  assert.equal(t.status, 'expiring'); assert.equal(t.days_left, 3);
+  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('later', BRAIN, 'transact', 0, Math.floor(now / 1000) + 3 * 86400);
+  let t = fb.tokenStatus(db, BRAIN, now);
+  assert.equal(t.status, 'valid', '3 days left is no warning yet (the warning is at 24 h)'); assert.equal(t.days_left, 3); assert.equal(t.hours_left, 72);
   const sent = [];
-  const w1 = fb.runTokenWarnings(db, { now, mailer: m => sent.push(m) });
-  assert.equal(w1.length, 1); assert.equal(sent[0].to, 'brain@dustforge.com'); assert.match(sent[0].text, /3 days left/);
-  assert.equal(fb.runTokenWarnings(db, { now: now + 3600000, mailer: m => sent.push(m) }).length, 0, 'once per day');
+  assert.equal(fb.runTokenWarnings(db, { now, mailer: m => sent.push(m) }).length, 0, 'no mail before the 24 h mark');
+  t = fb.tokenStatus(db, BRAIN, now + 62 * 3600000);   // 10 h left
+  assert.equal(t.status, 'expiring'); assert.equal(t.hours_left, 10); assert.equal(t.days_left, 0.4);
+  const w1 = fb.runTokenWarnings(db, { now: now + 62 * 3600000, mailer: m => sent.push(m) });
+  assert.equal(w1.length, 1);
+  assert.deepEqual(sent.map(m => m.to), ['brain@dustforge.com', 'aaron@dustforge.com'], 'the contact and, at the 24 h mark, the fleet owner');
+  assert.match(sent[0].text, /10 hours left/); assert.match(sent[0].text, /Renew token/);
+  assert.equal(fb.runTokenWarnings(db, { now: now + 63 * 3600000, mailer: m => sent.push(m) }).length, 0, 'once per day');
+  // Lapsed: the contact hears of it; the owner already had the 24 h notice.
+  db.prepare('UPDATE fleet_silicons SET token_warned_at = NULL').run(); sent.length = 0;
+  fb.runTokenWarnings(db, { now: now + 73 * 3600000, mailer: m => sent.push(m) });
+  assert.deepEqual(sent.map(m => m.to), ['brain@dustforge.com']); assert.match(sent[0].text, /token expired at/);
   db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('fresh', BRAIN, 'transact', 0, Math.floor(now / 1000) + 30 * 86400);
   assert.equal(fb.tokenStatus(db, BRAIN, now).status, 'valid');
 });

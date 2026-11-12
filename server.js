@@ -8875,6 +8875,10 @@ const deviceKeys = require('./device_keys')({
 require('./silicon_token_requests')({ app, db, identity, crypto, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh,
   gateMissing, spendSingleUse, blindkeyEncrypt, blindkeyDecrypt, logSecurityEvent, devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a),
   fleetCreate: () => fleetRoutes });   // agent creation requests create the agent the way the owner's own create does
+// Owner renews an agent's token from the app (PIN + phone); it is sealed to the agent's delivery key and picked up by
+// the agent (bin/token-pickup.js) — no one else ever holds it. Aaron 2026-11-12 (silicon_renew.js).
+require('./silicon_renew')({ app, db, identity, crypto, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh,
+  gateMissing, spendSingleUse, logSecurityEvent, devices: () => deviceKeys });
 // Recovery guardians (red team item 9, step 2): 3 people paired in person, each accepting with PIN + phone.
 const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, devices: () => deviceKeys, holds: () => accountHolds, sendMail: (...a) => fleetRoutes.sendMail(...a),
@@ -14547,7 +14551,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|silicon-token|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|silicon-token|silicon-renew|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

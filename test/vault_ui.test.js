@@ -1890,3 +1890,81 @@ test('leak report: one button for all hits, the email box names the masked forwa
   assert.match(pg.el('leak-report-out').innerHTML, /e9361b18\.jsonl:41-41/);
   assert.match(pg.el('leak-report-out').innerHTML, /Copy report/);
 });
+
+// ── Renew token on a silicon card (Aaron 2026-11-12): owner override, PIN, sealed to the agent's delivery key ──
+function fleetRoutes(state) {
+  const sil = (handle, token, over = {}) => ({ handle, display_name: handle, did: 'did:key:z' + handle, status: 'active', joined_via: 'owner', balance_cents: 50,
+    refill: { enabled: false, threshold_cents: 0, amount_cents: 0, last_error: '' }, token, delivery_key: { set: handle !== 'nokey' }, ...over });
+  return async (p, body) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/blindkey/fill/pending') return { json: { ok: true, requests: [], grants: [] } };
+    if (p === '/api/network') return { json: { ok: true, me: { did: 'did:key:zFixture', username: 'fixture', pin_set: true, balance_cents: 900 }, fleet: null, member_of: null,
+                                               people: [], agents: [], incoming: [], outgoing: [], topups: { incoming: [], outgoing: [] } } };
+    if (p === '/api/fleets/mine') return { json: { ok: true, fleets: [{ slug: 'aaron-agents', name: 'Aaron Agents', role: state.role || 'owner' }] } };
+    if (p === '/api/fleet/aaron-agents/overview') {
+      state.overviews = (state.overviews || 0) + 1;
+      return { json: { ok: true, fleet: { slug: 'aaron-agents', name: 'Aaron Agents', owner_did: state.ownerDid || 'did:key:zFixture', max_agents: 5 }, owner: null,
+        silicons: [sil('claude', state.renewed ? { status: 'valid', days_left: 30, hours_left: 720 } : { status: 'expiring', days_left: 0.2, hours_left: 5.5 }),
+                   sil('lapsed', { status: 'expired', days_left: -1, hours_left: -30 }),
+                   sil('nokey', { status: 'expiring', days_left: 0, hours_left: 0.4 }),
+                   sil('netty', { status: 'valid', days_left: 12, hours_left: 290 }, { joined_via: 'network' })],
+        projects: [], attribution: { rows: [] }, work_links: [], current_tick: 1 } };
+    }
+    if (p === '/api/fleet/aaron-agents/silicons/claude/renew-token') {
+      state.renewBodies = [...(state.renewBodies || []), body];
+      if (!state.pinFresh) return { status: 403, json: { error: "renewing @claude's token needs your PIN", missing: ['pin'], required: ['pin'], intent: 'silicon-renew:12' } };
+      state.pinFresh = false; state.renewed = true;
+      return { json: { ok: true, delivery_id: 7, expires_at: '2026-12-12T00:00:00.000Z', handle: 'claude', scope: 'transact' } };
+    }
+    if (p === '/api/fleet/aaron-agents/silicons/nokey/renew-token') return { status: 409, json: { no_delivery_key: true, error: '@nokey has no delivery key, so a renewed token could reach nobody but you.' } };
+    if (p === '/api/identity/gate/verify') { assert.equal(body.intent, 'silicon-renew:12', 'the PIN opens this renewal only'); state.pinFresh = body.pin === '2468'; return state.pinFresh ? { json: { ok: true } } : { status: 403, json: { error: 'incorrect PIN' } }; }
+    throw new Error('unexpected ' + p);
+  };
+}
+
+test('silicon cards: hours left under 24 h, expired stands out, and every card of an owned agent has Renew token', async () => {
+  const state = {};
+  const pg = page({ storage: signedIn, routes: fleetRoutes(state) });
+  await settle();
+  await pg.ctx.loadFleet();
+  const h = pg.el('fleet-content').innerHTML;
+  assert.match(h, /token expiring · 5h left/, 'under 24 h the card counts hours');
+  assert.match(h, /token expiring · &lt;1h left/, 'under an hour: <1h (as HTML text)');
+  assert.doesNotMatch(h, /· 0\.2d/, 'not days in the last day');
+  assert.match(h, /class="tok-chip tok-expired" style="background:var\(--red\);color:#fff;font-weight:700[^"]*">token expired</, 'a lapsed token is a filled red chip');
+  assert.match(h, /token ok · 12d/, 'days before the last day');
+  const buttons = [...h.matchAll(/onclick="event\.stopPropagation\(\);renewSiliconToken\(&quot;([a-z-]+)&quot;\)"[^>]*>Renew token</g)].map(m => m[1]);
+  assert.deepEqual(buttons, ['claude', 'lapsed', 'nokey'], 'every owned agent but the network-joined one (it keeps its own key)');
+  // A fleet the viewer does not own: no renew buttons.
+  const other = page({ storage: signedIn, routes: fleetRoutes({ ownerDid: 'did:key:zSomeoneElse', role: 'agent' }) });
+  await settle();
+  await other.ctx.loadFleet();
+  assert.doesNotMatch(other.el('fleet-content').innerHTML, /Renew token/);
+});
+
+test('Renew token walks the PIN for silicon-renew:<id>, shows where the token went, never a value, and reloads the fleet', async () => {
+  const state = {};
+  const pg = page({ storage: signedIn, routes: fleetRoutes(state) });
+  await settle();
+  await pg.ctx.loadFleet();
+  const before = state.overviews;
+  const done = pg.ctx.renewSiliconToken('claude');
+  pg.ctx.renewSiliconToken('claude');   // a double tap renews once
+  await settle();
+  assert.equal(pg.shown('modal-pin'), true, 'PIN sheet opened by the 403');
+  assert.match(pg.el('pin-unlock-what').textContent, /Renew @claude's token\? It is sealed to @claude's delivery key/);
+  pg.el('pin-unlock').value = '2468';
+  await pg.ctx.submitPin();
+  await done; await settle();
+  assert.equal(state.renewBodies.length, 2, 'refused once for the PIN, renewed after it');
+  for (const b of state.renewBodies) assert.deepEqual({ ...b }, {}, 'the page asks for defaults; nothing to carry back');
+  assert.ok(state.overviews > before, 'the fleet reloaded');
+  const h = pg.el('fleet-content').innerHTML;
+  assert.match(h, /Renewed: sealed to @claude&#39;s delivery key; it picks it up\./);
+  assert.match(h, /token ok · 30d/, 'the card shows the renewed token');
+  assert.doesNotMatch(h, /eyJ|"token"/, 'no token value on the page');
+  // No delivery key: the server's message is what the owner sees.
+  await pg.ctx.renewSiliconToken('nokey'); await settle();
+  assert.match(pg.el('fleet-content').innerHTML, /@nokey has no delivery key, so a renewed token could reach nobody but you\./);
+});

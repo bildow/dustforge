@@ -33,9 +33,17 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
    daily/weekly/monthly operator-grant credit with an idempotency key per period. Operator grants are only
    honoured for DIDs listed in `OPERATOR_GRANT_DIDS` (env, comma-separated). Stripe-funded refills are
    declared but not implemented (the rule records the error).
-8. **Tokens.** The Fleet page shows each silicon's newest token (valid / expiring ≤7d / expired / none). The
-   scheduler emails the silicon's contact once per day while it is not valid. The owner can mint a ≤transact,
-   ≤30d token for a silicon from the subpage. The rollover itself is the silicon's job (see below).
+8. **Tokens.** The Fleet page shows each silicon's newest token (valid / expiring in its last 24 h, counted in
+   hours / expired / none). The scheduler emails the silicon's contact once per day while it is not valid, and
+   the fleet owner at the 24 h mark. The owner can mint a ≤transact, ≤30d token for a silicon from the subpage.
+   **Renew token** (every card of an agent the fleet holds the key of; Aaron 2026-11-12, `silicon_renew.js`): the
+   owner's PIN (and linked phone) renews it without anyone seeing it — the server mints it and seals it to the
+   agent's **delivery key**; the agent picks it up with `bin/token-pickup.js`:
+   - once, while it still has a live token: `DEMIPASS_TOKEN=… node bin/token-pickup.js --init <dir>` makes an
+     X25519 keypair (`<dir>/delivery.key`, 0600) and registers its public key (`POST /api/identity/delivery-key`);
+   - after a renewal (or from a timer): `node bin/token-pickup.js <dir>` fetches the newest sealed delivery
+     (`GET /api/identity/token-deliveries?did=…`, no session, rate-limited), opens it and writes `<dir>/token`
+     (0600). It never prints the token. Without a delivery key the renewal answers 409.
 9. **Onboarding.** `POST /api/fleet/:slug/silicons` with a handle, name, contact email: an existing identity is
    linked with consent (its own token, the admin key, or a one-time claim link emailed to its mailbox); otherwise
    a new identity (mailbox + wallet) is created for 1000 DD. Either way the DID record is emailed to the contact.
@@ -61,6 +69,9 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
 | GET/PATCH/DELETE | `/api/fleet/:slug/silicons/:handle` | subpage data / refill settings / unlink |
 | POST | `/api/fleet/:slug/silicons/:handle/refill` | `{amount_cents}` manual refill |
 | POST | `/api/fleet/:slug/silicons/:handle/token` | mint ≤transact ≤30d token (shown once) |
+| POST | `/api/fleet/:slug/silicons/:handle/renew-token` | owner only, PIN `silicon-renew:<id>` + linked phone; `{scope?, expires_in?}` (≤transact, default 30d) → `{ok, delivery_id, expires_at}`, sealed to the agent's delivery key, never the token; 409 without one |
+| POST | `/api/identity/delivery-key` | the agent's own session: `{public_key}` (X25519, 32 bytes base64url) |
+| GET | `/api/identity/token-deliveries?did=` | no auth: the newest 3 unexpired sealed deliveries (non-consuming) |
 | POST | `/api/fleet/:slug/silicons/:handle/delegate` | owner delegates one of their secrets (`secret_name` or `ref`) |
 | GET/PUT | `/api/fleet/:slug/owner-refill` | the owner's scheduled refill rule |
 | PATCH | `/api/fleet/:slug/projects/:project` | `{bill_mode: owner|project_wallet}` |
@@ -86,7 +97,9 @@ claims operator-initiated work on a project it is not listed on.
 
 - Keep the token in a file, read it per call, roll it over before expiry (daily job; re-mint when <7 days remain
   via `POST /api/identity/auth-fingerprint` with the silicon's own username/password, `scope: transact`,
-  `expires_in: 30d`). Environment variables are read once per process and go stale.
+  `expires_in: 30d`). Environment variables are read once per process and go stale. An agent without its own
+  password registers a delivery key once and runs `bin/token-pickup.js <dir>` on a timer: the owner's
+  **Renew token** then lands in `<dir>/token`.
 - Set the billing header from the turn's provenance: operator-initiated (the human asked) →
   `{"project": "...", "initiator": "operator"}`; think-loop / self-initiated → `"initiator": "autonomous"`;
   work for another silicon → `{"work_link": "..."}`. Add `X-DemiPass-Agent: <name>/<version>` for reporting.
