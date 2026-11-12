@@ -29,9 +29,28 @@ const GITHUB_API = 'https://api.github.com';
 const TTL_MIN_S = 60, TTL_MAX_S = 3600;            // GitHub's installation tokens live one hour
 const JWT_BACKDATE_S = 60, JWT_AHEAD_S = 540;      // iat −60 s (clock drift), exp +9 min: within GitHub's 10-minute cap
 const MAX_REPOS = 100, MAX_PERMS = 30;
-const LEVELS = { read: 1, write: 2 };
+// Null-prototype, and every lookup by own property (#104 review M2): "constructor" or "__proto__" is not a level.
+const LEVELS = Object.assign(Object.create(null), { read: 1, write: 2 });
+const levelOf = (l) => (typeof l === 'string' && Object.hasOwn(LEVELS, l) ? LEVELS[l] : 0);
+const has = (o, k) => o !== null && typeof o === 'object' && Object.hasOwn(o, k);
 const REPO_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
-const PERM_RE = /^[a-z][a-z_]{1,49}$/;
+// GitHub's permission names for an installation token (REST "Create an installation access token for an app",
+// permissions object). A name not on this list is refused before anything connects (#104 review M2).
+const KNOWN_PERMS = new Set([
+  // repository
+  'actions', 'administration', 'attestations', 'checks', 'codespaces', 'contents', 'dependabot_secrets', 'deployments',
+  'environments', 'issues', 'merge_queues', 'metadata', 'packages', 'pages', 'pull_requests', 'repository_custom_properties',
+  'repository_hooks', 'repository_projects', 'secret_scanning_alerts', 'secrets', 'security_events', 'single_file',
+  'statuses', 'vulnerability_alerts', 'workflows',
+  // organization
+  'members', 'organization_administration', 'organization_announcement_banners', 'organization_copilot_seat_management',
+  'organization_custom_org_roles', 'organization_custom_properties', 'organization_custom_roles', 'organization_events',
+  'organization_hooks', 'organization_packages', 'organization_personal_access_token_requests',
+  'organization_personal_access_tokens', 'organization_plan', 'organization_projects', 'organization_secrets',
+  'organization_self_hosted_runners', 'organization_user_blocking', 'team_discussions',
+  // account
+  'email_addresses', 'followers', 'git_ssh_keys', 'gpg_keys', 'interaction_limits', 'profile', 'starring',
+]);
 const SWEEP_MS = 60 * 1000;
 
 const isAppKey = (secret) => Boolean(secret) && secret.secret_type === 'github_app_key';
@@ -70,21 +89,29 @@ function parseScope(v) {
   if (!Object.keys(perms.value).length) return { error: 'github_app.permissions: at least one, e.g. { "contents": "read" }' };
   let ttl = v.max_ttl_seconds === undefined || v.max_ttl_seconds === null ? TTL_MAX_S : v.max_ttl_seconds;
   if (!Number.isInteger(ttl) || ttl < TTL_MIN_S || ttl > TTL_MAX_S) return { error: `github_app.max_ttl_seconds: a whole number from ${TTL_MIN_S} to ${TTL_MAX_S}` };
-  return { value: JSON.stringify({ installation_id: inst, repositories: list, permissions: perms.value, max_ttl_seconds: ttl }) };
+  return { value: JSON.stringify({ installation_id: inst, repositories: list, permissions: { ...perms.value }, max_ttl_seconds: ttl }) };
 }
 function permsOf(p) {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return { error: 'permissions: an object of name → "read" or "write"' };
   const keys = Object.keys(p);
   if (keys.length > MAX_PERMS) return { error: `permissions: at most ${MAX_PERMS}` };
-  const out = {};
+  const out = Object.create(null);
   for (const k of keys.sort()) {
     const level = typeof p[k] === 'string' ? p[k].trim().toLowerCase() : '';
-    if (!PERM_RE.test(k) || !LEVELS[level]) return { error: `permissions: "${String(k).slice(0, 50)}" must be a GitHub permission name with "read" or "write"` };
+    if (!KNOWN_PERMS.has(k)) return { error: `permissions: "${String(k).slice(0, 50)}" is not a GitHub App permission name (e.g. contents, pull_requests, issues, checks, statuses, actions)` };
+    if (!levelOf(level)) return { error: `permissions: ${k} must be "read" or "write"` };
     out[k] = level;
   }
   return { value: out };
 }
-const scopeOf = (raw) => { if (!raw) return null; try { const s = JSON.parse(raw); return s && s.installation_id ? s : null; } catch (_) { return null; } };
+// A stored scope, re-checked on every read (a hand-edited row never smuggles a name or a level in).
+const scopeOf = (raw) => {
+  if (!raw) return null;
+  let s; try { s = JSON.parse(raw); } catch (_) { return null; }
+  if (!s || typeof s !== 'object' || !/^\d{1,15}$/.test(String(s.installation_id || '')) || !Array.isArray(s.repositories) || !s.permissions || typeof s.permissions !== 'object') return null;
+  const perms = permsOf(s.permissions); if (perms.error) return null;
+  return { installation_id: String(s.installation_id), repositories: s.repositories.map(String), permissions: perms.value, max_ttl_seconds: Number(s.max_ttl_seconds) || TTL_MAX_S };
+};
 
 // Is `next` (canonical JSON) no wider than `cur`? Same installation, repositories a subset, every permission held at the
 // same or a lower level, the same or a shorter TTL. Anything else is a widening: the owner's approval (PR #97 path).
@@ -93,7 +120,7 @@ function isNarrowing(nextRaw, curRaw) {
   const n = scopeOf(nextRaw), c = scopeOf(curRaw);
   if (!n || !c || n.installation_id !== c.installation_id) return false;
   if (!n.repositories.every(r => c.repositories.includes(r))) return false;
-  if (!Object.entries(n.permissions).every(([k, l]) => c.permissions[k] && LEVELS[l] <= LEVELS[c.permissions[k]])) return false;
+  if (!Object.entries(n.permissions).every(([k, l]) => has(c.permissions, k) && levelOf(l) <= levelOf(c.permissions[k]))) return false;
   return n.max_ttl_seconds <= c.max_ttl_seconds;
 }
 function describe(raw) {
@@ -122,7 +149,7 @@ function requestFor(scopeRaw, params) {
     const asked = permsOf(p.permissions);
     if (asked.error) return { error: asked.error };
     if (!Object.keys(asked.value).length) return { error: 'permissions: at least one' };
-    const off = Object.entries(asked.value).filter(([k, l]) => !s.permissions[k] || LEVELS[l] > LEVELS[s.permissions[k]]);
+    const off = Object.entries(asked.value).filter(([k, l]) => !has(s.permissions, k) || levelOf(l) > levelOf(s.permissions[k]));
     if (off.length) return { error: `permission ${off.map(([k, l]) => `${k}:${l}`).join(', ')} is beyond this scope (${Object.entries(s.permissions).map(([k, l]) => `${k}:${l}`).join(', ')}) — its owner widens the scope in the DemiPass app` };
     perms = asked.value;
   }
@@ -144,8 +171,18 @@ function appJwt(pem, appId, now = Math.floor(Date.now() / 1000)) {
 
 // The rebuild that lets a scope be github_app_token: blindkey_contexts was made with CHECK(action_type IN (…)) and a
 // CHECK cannot be altered in place. Runs once, at boot, on a database made before this branch: the table is copied
-// into one whose CHECK also admits github_app_token (same columns, same ids, same indexes), in one transaction, with
-// foreign keys off for the swap (demipass_delegations and blindkey_use_tokens refer to it by id) and checked after.
+// into one whose CHECK also admits github_app_token (same columns, same ids, same indexes and triggers, the same
+// AUTOINCREMENT counter), in one transaction, with foreign keys off for the swap (demipass_delegations and
+// blindkey_use_tokens refer to it by id). Checked after: the same row count, and no foreign key problem on the tables
+// involved that was not there before (#104 review M1: an unrelated orphan row elsewhere never blocks the boot).
+// Throws (and rolls back) on a problem; the caller logs it and boots on the old table.
+function fkProblems(db, tables) {
+  const out = new Set();
+  for (const t of tables) {
+    for (const r of db.prepare(`SELECT * FROM pragma_foreign_key_check(?)`).all(t)) out.add(`${r.table}|${r.rowid}|${r.parent}|${r.fkid}`);
+  }
+  return out;
+}
 function widenContextActionCheck(db, log = () => {}) {
   const row = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'blindkey_contexts'").get();
   if (!row || !row.sql) return { rebuilt: false };
@@ -156,6 +193,13 @@ function widenContextActionCheck(db, log = () => {}) {
     .replace(/^CREATE TABLE\s+("blindkey_contexts"|blindkey_contexts)/i, 'CREATE TABLE blindkey_contexts_gha');
   if (!/^CREATE TABLE blindkey_contexts_gha/.test(newSql)) throw new Error('blindkey_contexts: unexpected schema, not rebuilt');
   const extras = db.prepare("SELECT type, name, sql FROM sqlite_master WHERE tbl_name = 'blindkey_contexts' AND type IN ('index', 'trigger') AND sql IS NOT NULL").all();
+  // the tables whose foreign keys point at blindkey_contexts, and blindkey_contexts itself
+  const involved = ['blindkey_contexts', ...db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name != 'blindkey_contexts'").all()
+    .map(t => t.name).filter(n => db.prepare('SELECT 1 FROM pragma_foreign_key_list(?) WHERE "table" = ?').get(n, 'blindkey_contexts'))];
+  const fkBefore = fkProblems(db, involved);
+  if (fkBefore.size) log(`[github-app] note: ${fkBefore.size} foreign key problem(s) already present on ${involved.join(', ')} — left as they are`);
+  const seqRow = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'").get()
+    ? db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'blindkey_contexts'").get() : null;
   const before = db.prepare('SELECT COUNT(*) AS n FROM blindkey_contexts').get().n;
   const fk = db.pragma('foreign_keys', { simple: true });
   db.pragma('foreign_keys = OFF');
@@ -168,21 +212,30 @@ function widenContextActionCheck(db, log = () => {}) {
       db.exec('DROP TABLE blindkey_contexts');
       db.exec('ALTER TABLE blindkey_contexts_gha RENAME TO blindkey_contexts');
       for (const x of extras) db.exec(x.sql);
+      // AUTOINCREMENT: ids of deleted scopes are never handed out again (#104 review L1)
+      if (seqRow && seqRow.seq != null) {
+        const n = db.prepare("UPDATE sqlite_sequence SET seq = MAX(seq, CAST(? AS INTEGER)) WHERE name = 'blindkey_contexts'").run(seqRow.seq).changes;
+        if (!n) db.prepare("INSERT INTO sqlite_sequence (name, seq) VALUES ('blindkey_contexts', CAST(? AS INTEGER))").run(seqRow.seq);
+      }
       const after = db.prepare('SELECT COUNT(*) AS n FROM blindkey_contexts').get().n;
       if (after !== before) throw new Error(`blindkey_contexts rebuild: ${before} rows before, ${after} after`);
-      const broken = db.pragma('foreign_key_check');
-      if (broken.length) throw new Error(`blindkey_contexts rebuild: ${broken.length} foreign key problems`);
+      const fresh = [...fkProblems(db, involved)].filter(k => !fkBefore.has(k));
+      if (fresh.length) throw new Error(`blindkey_contexts rebuild: ${fresh.length} new foreign key problem(s)`);
     })();
   } finally {
     db.pragma('legacy_alter_table = OFF');
     if (fk) db.pragma('foreign_keys = ON');
   }
   log(`[github-app] blindkey_contexts rebuilt to admit github_app_token (${before} scopes kept)`);
-  return { rebuilt: true, rows: before };
+  return { rebuilt: true, rows: before, preexisting_fk_problems: fkBefore.size };
 }
 
 function register(deps) {
   const { db, blindkeyEncrypt, blindkeyDecrypt, logSecurityEvent, secretFetch, readCapped } = deps;
+  // Is the grant behind a token still standing? (server.js: the key redeemable, unfrozen and still the minting owner's;
+  // the scope active; the delegation active, unexpired, still the owner's to the same agent, an outside ask still
+  // valid — the same rules request-token applies.) Default: yes.
+  const grantValid = deps.grantValid || (() => true);
 
   db.exec(`CREATE TABLE IF NOT EXISTS github_app_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,7 +296,7 @@ function register(deps) {
     const gotRepos = Array.isArray(body.repositories) ? body.repositories.map(r => String((r && r.full_name) || '').toLowerCase()) : null;
     const gotPerms = body.permissions && typeof body.permissions === 'object' ? body.permissions : {};
     const wider = !gotRepos || body.repository_selection === 'all' || gotRepos.some(r => !request.repositories.includes(r))
-      || Object.entries(gotPerms).some(([k, l]) => !(k === 'metadata' && l === 'read') && !(request.permissions[k] && LEVELS[l] && LEVELS[l] <= LEVELS[request.permissions[k]]));
+      || Object.entries(gotPerms).some(([k, l]) => !(k === 'metadata' && l === 'read') && !(has(request.permissions, k) && levelOf(l) && levelOf(l) <= levelOf(request.permissions[k])));
     const ghExp = Date.parse(body.expires_at);
     const ghExpIso = Number.isFinite(ghExp) ? new Date(ghExp).toISOString() : new Date(Date.now() + TTL_MAX_S * 1000).toISOString();
     const ourExp = new Date(Math.min(Number.isFinite(ghExp) ? ghExp : Infinity, Date.now() + request.ttl * 1000)).toISOString();
@@ -251,6 +304,12 @@ function register(deps) {
                                    token_enc, github_expires_at, expires_at, status, revoke_wanted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?)`)
       .run(secret.id, contextId || null, delegationId || null, secret.did, callerDid, request.installation_id,
            JSON.stringify(gotRepos || []), JSON.stringify(gotPerms), blindkeyEncrypt(token), ghExpIso, ourExp, wider ? 'wider than asked' : null, nowIso()).lastInsertRowid);
+    // The grant may have ended while GitHub answered (#104 review L4): then the token is revoked at once, not handed out.
+    if (!wider && !grantValid(db.prepare('SELECT * FROM github_app_tokens WHERE id = ?').get(id))) {
+      db.prepare("UPDATE github_app_tokens SET revoke_wanted = 'grant ended during the mint' WHERE id = ?").run(id);
+      await revokeRow(db.prepare('SELECT * FROM github_app_tokens WHERE id = ?').get(id));
+      return { ok: false, connected: true, status: 403, body: { error: 'the scope, delegation or key ended while GitHub minted the token; DemiPass revoked it and did not hand it out' } };
+    }
     if (wider) {
       logSecurityEvent('github_app_token_too_wide', 'critical', { caller_did: callerDid, capability: 'github_app_token', target: `installation:${request.installation_id}`,
         context: { secret: secret.name, scope_id: contextId, asked: { repositories: request.repositories, permissions: request.permissions }, got: { repositories: gotRepos, permissions: gotPerms, selection: body.repository_selection } } });
@@ -288,8 +347,10 @@ function register(deps) {
     }
   }
 
-  // Every live token whose grant has ended — revoke wanted, our TTL passed, scope gone or not active, delegation not
-  // active, key deleted or revoked — is revoked; past GitHub's own expiry it is just marked expired.
+  // Every live token whose grant has ended is revoked: a revoke wanted, our TTL passed, or grantValid() no longer holds
+  // (scope gone or not active; delegation revoked, expired, re-pointed, or an outside ask whose ground is gone — the
+  // agent left the vouching owner's fleet; key deleted, revoked, frozen, past its rotation grace, or transferred to
+  // another owner). Past GitHub's own expiry a token is just marked expired.
   let sweeping = null, again = false;
   async function sweep() {
     if (sweeping) { again = true; return sweeping; }
@@ -297,16 +358,10 @@ function register(deps) {
       do {
         again = false;
         const now = nowIso();
-        const rows = db.prepare(`SELECT t.* FROM github_app_tokens t
-            LEFT JOIN blindkey_contexts c ON c.id = t.context_id
-            LEFT JOIN demipass_delegations d ON d.id = t.delegation_id
-            LEFT JOIN blindkey_secrets s ON s.id = t.secret_id
-          WHERE t.status = 'live' AND (t.revoke_wanted IS NOT NULL OR t.expires_at <= ? OR t.github_expires_at <= ?
-            OR c.id IS NULL OR c.status != 'active'
-            OR (t.delegation_id IS NOT NULL AND (d.id IS NULL OR d.status != 'active' OR (d.expires_at IS NOT NULL AND datetime(d.expires_at) <= datetime('now'))))
-            OR s.id IS NULL OR s.status IN ('deleted', 'revoked'))`).all(now, now);
-        for (const r of rows) {
-          const why = r.revoke_wanted || (r.expires_at <= now ? 'expired (scope TTL)' : 'its grant ended');
+        for (const r of db.prepare("SELECT * FROM github_app_tokens WHERE status = 'live'").all()) {
+          let valid = true; try { valid = grantValid(r); } catch (_) { valid = false; }
+          const why = r.revoke_wanted || (r.expires_at <= now ? 'expired (scope TTL)' : r.github_expires_at <= now ? 'expired' : !valid ? 'its grant ended' : null);
+          if (!why) continue;
           try { await revokeRow(r, why); } catch (_) {}
         }
       } while (again);

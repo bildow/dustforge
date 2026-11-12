@@ -2811,6 +2811,9 @@ function updateStoreFields() {
   // A login and an SSH key both sign in as someone: the username is kept with the secret (ssh_exec's default user).
   document.getElementById('s-user-fields').style.display = (t === 'password' || t === 'ssh_credential') ? 'block' : 'none';
   // A GitHub App key: the App ID and the .pem (a file pick into the masked box, or a paste) — nothing else applies.
+  // Leaving that type drops a loaded key, so it is never stored as another type by a slip (#104 review L8).
+  if (storeTypeWas === 'github_app_key' && t !== 'github_app_key') dropPem();
+  storeTypeWas = t;
   document.getElementById('s-app-fields').style.display = t === 'github_app_key' ? 'block' : 'none';
   if (t === 'password') {
     loginFields.style.display = 'block';
@@ -2821,6 +2824,12 @@ function updateStoreFields() {
   }
 }
 
+let storeTypeWas = '';
+// Clears a private key from the store sheet's key box (cancel, type change); other values are left as typed.
+function dropPem(){
+  const box = document.getElementById('s-key-value');
+  if (/PRIVATE KEY-----/.test(box.value || '')) { box.value = ''; document.getElementById('s-app-pem-msg').textContent = 'Pick the .pem GitHub downloaded (or paste it below). It is never shown, and it mints tokens only — delete the downloaded file afterwards.'; }
+}
 // A GitHub App's .pem, picked from the device: read into the masked key box, never shown. Only its shape is checked
 // here (the server checks it is an RSA private key); the message names the file, not its contents.
 async function pickPemFile(input){
@@ -3743,7 +3752,7 @@ function openModal(id){document.getElementById('modal-'+id).classList.add('show'
 function closeSheet(id){document.getElementById('modal-'+id).classList.remove('show')}
 // Cancel / Escape / backdrop. The blocking PIN sheets (setup, status error) stay: only their own buttons or
 // sign-out end them. An open PIN unlock counts as cancelled, so the action waiting on it settles too.
-function closeModal(){document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error')m.classList.remove('show')});settleUnlock(false);if(apOpen&&!document.getElementById('modal-approval').classList.contains('show'))settleApproval(false)}
+function closeModal(){if(document.getElementById('modal-store').classList.contains('show'))dropPem();document.querySelectorAll('.modal-bg').forEach(m=>{if(m.id!=='modal-pin-setup'&&m.id!=='modal-pin-error')m.classList.remove('show')});settleUnlock(false);if(apOpen&&!document.getElementById('modal-approval').classList.contains('show'))settleApproval(false)}
 function closeAllSheets(){document.querySelectorAll('.modal-bg').forEach(m=>m.classList.remove('show'))}
 // HTML-escape for text AND attribute values (quotes included).
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}

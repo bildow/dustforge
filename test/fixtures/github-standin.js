@@ -3,7 +3,7 @@
 // POST /app/installations/:id/access_tokens — checks the app JWT (RS256 against <dir>/app*.pub, iss = <dir>/app_id,
 //   iat back-dated, exp ≤ 10 min after iat) and mints a ghs_ token for exactly the repositories and permissions asked.
 //   <dir>/ceiling (permission names, one per line): those are not granted to the installation → 422, as GitHub does.
-//   <dir>/wide: answer with a token wider than asked (repository_selection "all").
+//   <dir>/wide: answer with a token wider than asked (repository_selection "all"); <dir>/slow: answer after 1.5 s.
 // DELETE /installation/token — 204 for a token it minted (then forgotten), 401 otherwise.
 // Anything else — 200 JSON (the legacy http_header use).
 // It writes the JWTs it saw to <dir>/jwt.seen and the tokens it minted to <dir>/tokens so the smoke can assert neither
@@ -42,9 +42,10 @@ http.createServer((req, res) => {
       const token = 'ghs_' + crypto.randomBytes(18).toString('base64url');
       live.add(token); fs.appendFileSync(path.join(dir, 'tokens'), token + '\n');
       const wide = fs.existsSync(path.join(dir, 'wide'));
-      return send(201, { token, expires_at: new Date(Date.now() + 3600 * 1000).toISOString().replace(/\.\d+Z$/, 'Z'),
+      const later = fs.existsSync(path.join(dir, 'slow')) ? 1500 : 0;   // <dir>/slow: answer after 1.5 s (a grant ends meanwhile)
+      return setTimeout(() => send(201, { token, expires_at: new Date(Date.now() + 3600 * 1000).toISOString().replace(/\.\d+Z$/, 'Z'),
         permissions: { ...perms, metadata: 'read' }, repository_selection: wide ? 'all' : 'selected',
-        repositories: (wide ? [...names, 'everything-else'] : names).map(n => ({ name: n, full_name: 'bildow/' + n })) });
+        repositories: (wide ? [...names, 'everything-else'] : names).map(n => ({ name: n, full_name: 'bildow/' + n })) }), later);
     }
     if (req.method === 'DELETE' && req.url === '/installation/token') {
       const t = (/^Bearer (.+)$/.exec(req.headers.authorization || '') || [])[1];
