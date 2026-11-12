@@ -18,12 +18,12 @@ H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
 for (const c of ["idempotency_key TEXT", "provenance TEXT DEFAULT '"'"'organic'"'"'"]) { try { db.exec("ALTER TABLE identity_transactions ADD COLUMN " + c); } catch (_) {} }
-for (const u of ["wallet-a", "wallet-b"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
+for (const u of ["wallet-a", "wallet-b", "wallet-c"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 100000, ?)").run(id.did, u, u + "@dustforge.com", enc, process.argv[1]);
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 100000, ?, ?, 100000)").run(id.did, "topup", "smoke"); }' "$H"
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 login(){ curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'content-type: application/json' -d '{"username":"'$1'","password":"hunter22","scope":"transact","expires_in":"1h"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'; }
-A=$(login wallet-a); B=$(login wallet-b)
+A=$(login wallet-a); B=$(login wallet-b); Cw=$(login wallet-c)
 RT(){ curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/request-token" -H 'content-type: application/json' ${1:+-H "Authorization: Bearer $1"} -d '{"ref":"DP-NONE-xxxxxxxx-00000000","action":"http_header"}'; }
 codes=""; for i in 1 2 3 4 5; do codes="$codes $(RT "$A")"; done
 ! echo "$codes" | grep -q 429 && [ "$(RT "$A")" = 429 ] && ok "wallet A: 5 requests answered, the 6th refused (its own budget)" || fail "A: $codes"
@@ -33,7 +33,12 @@ U=$(curl -s -X POST "$API/api/demipass/use" -H 'content-type: application/json' 
 codes=""; for i in 1 2; do codes="$codes $(RT "")"; done
 ! echo "$codes" | grep -q 429 && ok "no token: limited by address, separately from the wallets" || fail "anon: $codes"
 X=$(RT "not-a-real-token"); [ "$X" != 429 ] && ok "an invalid token is keyed by address (cannot pick its own bucket)" || fail "fake token: $X"
-# 6+5+1+2+1 = 15 so far: the per-address ceiling (15) now refuses everyone from this address
-C=$(curl -s -X POST "$API/api/demipass/request-token" -H 'content-type: application/json' -H "Authorization: Bearer $B" -d '{}' -w ' %{http_code}')
+# A keeps retrying past its own limit: its refused retries must not use up the address (#103 review M1)
+for i in $(seq 1 20); do RT "$A" >/dev/null; done
+X=$(RT "$Cw"); [ "$X" != 429 ] && ok "wallet A retrying 20 times after its 429s does not lock out another wallet (C)" || fail "retry lockout: $X"
+# counted against the address: A 5 + B 5 + anon 2 + fake 1 + C 1 = 14 (A's refused retries and /use never reach it);
+# one more C passes (15), the next is over the ceiling
+RT "$Cw" >/dev/null
+C=$(curl -s -X POST "$API/api/demipass/request-token" -H 'content-type: application/json' -H "Authorization: Bearer $Cw" -d '{}' -w ' %{http_code}')
 echo "$C" | grep -q "429" && echo "$C" | grep -q "this address" && ok "the per-address ceiling still holds across wallets" || fail "ceiling: $C"
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails
