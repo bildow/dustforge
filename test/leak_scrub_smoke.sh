@@ -253,7 +253,8 @@ C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/
 scrubtok sM "$NREF"; mkdir -p "$S/many"
 python3 -c 'import sys; v=open(sys.argv[1]).read().strip(); [open(f"{sys.argv[2]}/f{i:03d}.txt","w").write(("pw "+v+"\n") if i%50==0 else f"nothing {i}\n") for i in range(300)]' "$S/nval" "$S/many"
 MT=$(Q "SELECT id FROM leak_scan_tokens WHERE token_hash='$(tr -d '\n' < "$S/sM.tok" | sha256sum | cut -d' ' -f1)'")
-OUT=$(SCRUB "$S/sM.tok" "$S/many"); RC=$?
+ln "$S/many/f050.txt" "$S/many/hardlink.txt"   # the same file twice: read once, not "1 left"
+OUT=$(SCRUB "$S/sM.tok" "$S/many" "$S/many/f100.txt"); RC=$?
 REQS=$(Q "SELECT requests_today FROM leak_scan_tokens WHERE id=$MT")
 [ $RC = 0 ] && echo "$OUT" | grep -q "masked 6, left 0" && [ "$REQS" -le 4 ] && ! grep -rqF -- "$(head -c 10 "$S/nval")" "$S/many" && ok "300 small files: 6 copies masked in $REQS requests (not 300), contained" || fail "batching: rc=$RC reqs=$REQS $OUT"
 

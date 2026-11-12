@@ -235,7 +235,7 @@ async function scrubPost(auth, batch) {
 // does not read is counted, so the run cannot claim "contained" over it (#98 review M2): a skipped directory, a file
 // too large, a symlink to something outside the roots.
 function scrubFiles(roots, all) {
-  const out = [], notRead = [];
+  const out = [], notRead = [], seen = new Set();   // dev:ino — a file reached twice (overlapping roots, a hard link) is read once
   const real = roots.map(r => { try { return fs.realpathSync(r); } catch (_) { return path.resolve(r); } });
   const inside = (p) => real.some(r => p === r || p.startsWith(r + path.sep));
   const walk = (p) => {
@@ -244,6 +244,7 @@ function scrubFiles(roots, all) {
     if (st.isDirectory()) { if (!all && SKIP_DIRS.has(path.basename(p))) { notRead.push(`${p} (skipped: --all reads it)`); return; } let es; try { es = fs.readdirSync(p).sort(); } catch (e) { notRead.push(`${p} (${e.code || e.message})`); return; } for (const e of es) walk(path.join(p, e)); return; }
     if (!st.isFile() || st.size === 0) return;
     if (st.size > MAX_FILE) { notRead.push(`${p} (${st.size} bytes, too large)`); return; }
+    const id = st.dev + ':' + st.ino; if (seen.has(id)) return; seen.add(id);
     out.push(p);
   };
   for (const r of roots) walk(path.resolve(r));
