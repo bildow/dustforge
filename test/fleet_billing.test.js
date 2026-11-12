@@ -225,15 +225,69 @@ test('token status and expiry warnings', () => {
   assert.equal(fb.tokenStatus(db, BRAIN, now).status, 'none');
   db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('old', BRAIN, 'transact', 0, Math.floor(now / 1000) - 10);
   assert.equal(fb.tokenStatus(db, BRAIN, now).status, 'expired');
-  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('soon', BRAIN, 'transact', 0, Math.floor(now / 1000) + 3 * 86400);
-  const t = fb.tokenStatus(db, BRAIN, now);
-  assert.equal(t.status, 'expiring'); assert.equal(t.days_left, 3);
+  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('later', BRAIN, 'transact', 0, Math.floor(now / 1000) + 3 * 86400);
+  let t = fb.tokenStatus(db, BRAIN, now);
+  assert.equal(t.status, 'valid', '3 days left is no warning yet (the warning is at 24 h)'); assert.equal(t.days_left, 3); assert.equal(t.hours_left, 72);
   const sent = [];
-  const w1 = fb.runTokenWarnings(db, { now, mailer: m => sent.push(m) });
-  assert.equal(w1.length, 1); assert.equal(sent[0].to, 'brain@dustforge.com'); assert.match(sent[0].text, /3 days left/);
-  assert.equal(fb.runTokenWarnings(db, { now: now + 3600000, mailer: m => sent.push(m) }).length, 0, 'once per day');
+  assert.equal(fb.runTokenWarnings(db, { now, mailer: m => sent.push(m) }).length, 0, 'no mail before the 24 h mark');
+  t = fb.tokenStatus(db, BRAIN, now + 62 * 3600000);   // 10 h left
+  assert.equal(t.status, 'expiring'); assert.equal(t.hours_left, 10); assert.equal(t.days_left, 0.4);
+  const w1 = fb.runTokenWarnings(db, { now: now + 62 * 3600000, mailer: m => sent.push(m) });
+  assert.equal(w1.length, 1);
+  assert.deepEqual(sent.map(m => m.to), ['brain@dustforge.com', 'aaron@dustforge.com'], 'the contact and, at the 24 h mark, the fleet owner');
+  assert.match(sent[0].text, /10 hours left/); assert.match(sent[0].text, /Renew token/);
+  assert.equal(fb.runTokenWarnings(db, { now: now + 63 * 3600000, mailer: m => sent.push(m) }).length, 0, 'once per day');
+  // Lapsed: the contact hears of it; the owner already had the 24 h notice.
+  db.prepare('UPDATE fleet_silicons SET token_warned_at = NULL').run(); sent.length = 0;
+  fb.runTokenWarnings(db, { now: now + 73 * 3600000, mailer: m => sent.push(m) });
+  assert.deepEqual(sent.map(m => m.to), ['brain@dustforge.com']); assert.match(sent[0].text, /token expired at/);
   db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('fresh', BRAIN, 'transact', 0, Math.floor(now / 1000) + 30 * 86400);
   assert.equal(fb.tokenStatus(db, BRAIN, now).status, 'valid');
+});
+
+test('token notices say hours in the last day, mail the owner once per token, also when the 24 h window was missed (#100 L5)', () => {
+  const db = mkdb();
+  const now = Date.parse('2026-10-03T00:00:00Z'), sec = Math.floor(now / 1000);
+  fb.upsertSilicon(db, { fleetId: 1, memberDid: BRAIN, handle: 'brain' });   // no contact: only the owner hears
+  const tok = (jti, exp) => db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run(jti, BRAIN, 'transact', 0, exp);
+  for (const [h, want] of [[24, '24 hours left'], [1.5, '1 hour left'], [0.5, 'less than an hour left'], [36, '1.5 days left']]) {
+    assert.equal(fb.timeLeftText({ hours_left: h, days_left: Math.floor(h / 24 * 10) / 10 }), want);
+  }
+  tok('t1', sec + 86400);   // exactly 24 h: expiring, said in hours
+  const sent = [];
+  fb.runTokenWarnings(db, { now, mailer: m => sent.push(m) });
+  assert.deepEqual(sent.map(m => m.to), ['aaron@dustforge.com']); assert.match(sent[0].text, /24 hours left/); assert.doesNotMatch(sent[0].text, /1 days|0 hours/);
+  fb.runTokenWarnings(db, { now: now + 2 * 86400000, mailer: m => sent.push(m) });
+  assert.equal(sent.length, 1, 'the owner is not told again when that same token lapses');
+  // A token whose 24 h window the scheduler never saw (minted short, the server down): its lapse mails the owner once.
+  tok('t2', sec + 3 * 86400);
+  fb.runTokenWarnings(db, { now: now + 4 * 86400000, mailer: m => sent.push(m) });
+  assert.equal(sent.length, 2); assert.match(sent[1].text, /token expired at/);
+  fb.runTokenWarnings(db, { now: now + 5 * 86400000, mailer: m => sent.push(m) });
+  assert.equal(sent.length, 2, 'once per token');
+  // Lapsed long ago (before this change was deployed): no owner mail.
+  const db2 = mkdb(); fb.upsertSilicon(db2, { fleetId: 1, memberDid: BRAIN, handle: 'brain' });
+  db2.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('old', BRAIN, 'transact', 0, sec - 30 * 86400);
+  const sent2 = []; fb.runTokenWarnings(db2, { now, mailer: m => sent2.push(m) }); assert.equal(sent2.length, 0);
+});
+
+test('a renewal not picked up is not "token ok": the card keeps the held token and says awaiting pickup (#100 M1)', () => {
+  const db = mkdb();
+  const now = Date.now(), sec = Math.floor(now / 1000);
+  db.exec(`CREATE TABLE token_deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, pub_id TEXT, did TEXT, token_jti TEXT, created_at TEXT, expires_at TEXT, acked_at TEXT, ack TEXT)`);
+  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('held', BRAIN, 'transact', sec - 86400, sec + 5 * 3600);
+  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('renewed', BRAIN, 'transact', sec, sec + 30 * 86400);
+  db.prepare('INSERT INTO token_deliveries (pub_id, did, token_jti, created_at, expires_at) VALUES (?, ?, ?, ?, ?)').run('x', BRAIN, 'renewed', new Date(now).toISOString(), new Date(now + 30 * 86400000).toISOString());
+  let t = fb.tokenStatus(db, BRAIN, now);
+  assert.equal(t.status, 'expiring'); assert.equal(t.jti, 'held'); assert.ok(t.awaiting_pickup && t.awaiting_pickup.since);
+  db.prepare("UPDATE token_deliveries SET acked_at = ?, ack = 'used'").run(new Date(now).toISOString());
+  t = fb.tokenStatus(db, BRAIN, now);
+  assert.equal(t.status, 'valid'); assert.equal(t.jti, 'renewed'); assert.equal(t.awaiting_pickup, undefined); assert.equal(t.renewal_declined, undefined);
+  // The agent kept another token and declined a newer renewal: not counted, and the card says it was declined (round 3 L5).
+  db.prepare('INSERT INTO issued_tokens (jti, did, scope, issued_at, expires_at, revoked) VALUES (?, ?, ?, ?, ?, 1)').run('narrow', BRAIN, 'read', sec + 10, sec + 7200);
+  db.prepare("INSERT INTO token_deliveries (pub_id, did, token_jti, created_at, expires_at, acked_at, ack) VALUES (?, ?, ?, ?, ?, ?, 'declined')").run('y', BRAIN, 'narrow', new Date(now).toISOString(), new Date(now + 7200000).toISOString(), new Date(now).toISOString());
+  t = fb.tokenStatus(db, BRAIN, now);
+  assert.equal(t.jti, 'renewed'); assert.ok(t.renewal_declined && t.renewal_declined.at); assert.equal(t.awaiting_pickup, undefined);
 });
 
 test('threshold refill daily cap: rolling 24 h of automatic refills, manual refills not counted, alert once', () => {
