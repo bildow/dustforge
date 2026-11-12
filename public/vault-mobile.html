@@ -916,6 +916,7 @@ async function rotatePasswordBlind(){
 function approveDevice(){const raw=(document.getElementById('device-code').value||'').toUpperCase().replace(/[^A-Z0-9]/g,'');const m=document.getElementById('device-msg');if(raw.length!==8){m.textContent='Enter the full 8-character code';return}m.textContent='';location.href='/device.html?code='+raw.slice(0,4)+'-'+raw.slice(4)}
 
 function logout(){
+  if(typeof pemReadGen !== 'undefined') pemReadGen++;   // a .pem read still pending never lands after sign-out
   if(typeof poolDrag !== 'undefined' && poolDrag.reset) poolDrag.reset();
   // Shared storage (and its refresh token) is revoked and cleared only while it is still this window's session:
   // if another window has since signed in as another account, that session is theirs and stays untouched.
@@ -2826,7 +2827,10 @@ function updateStoreFields() {
 
 let storeTypeWas = '';
 // Clears a private key from the store sheet's key box (cancel, type change); other values are left as typed.
+// A read still pending when the sheet is cancelled, the type changes or the session ends is discarded (Codex #104).
+var pemReadGen = 0;
 function dropPem(){
+  pemReadGen++;
   const box = document.getElementById('s-key-value');
   if (/PRIVATE KEY-----/.test(box.value || '')) { box.value = ''; document.getElementById('s-app-pem-msg').textContent = 'Pick the .pem GitHub downloaded (or paste it below). It is never shown, and it mints tokens only — delete the downloaded file afterwards.'; }
 }
@@ -2836,8 +2840,10 @@ async function pickPemFile(input){
   const f = input && input.files && input.files[0]; const m = document.getElementById('s-app-pem-msg');
   if (!f) return;
   if (f.size > 16384) { m.textContent = 'That file is too large for a GitHub App key'; input.value = ''; return; }
+  const gen = ++pemReadGen, epoch = sessionEpoch;
   let text = ''; try { text = await f.text(); } catch (_) { m.textContent = 'Could not read that file'; return; }
   input.value = '';
+  if (gen !== pemReadGen || epoch !== sessionEpoch || document.getElementById('s-type').value !== 'github_app_key') { text = ''; return; }
   if (!/-----BEGIN (RSA )?PRIVATE KEY-----[\s\S]+-----END (RSA )?PRIVATE KEY-----/.test(text)) { text = ''; m.textContent = 'That file is not a private key .pem'; return; }
   document.getElementById('s-key-value').value = text.trim(); text = '';
   m.textContent = 'Key loaded from ' + String(f.name || 'the file').slice(0, 60) + ' (not shown). Delete the downloaded file once stored.';

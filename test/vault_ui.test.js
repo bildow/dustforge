@@ -511,6 +511,22 @@ test('store: a GitHub App key goes in with its App ID (picked .pem or paste), ch
   assert.match(pg.el('s-msg').textContent, /Stored — ref: DP-GHA-demipass-1/);
 });
 
+test('store: a .pem read still pending when the sheet is cancelled or the session ends never lands (Codex #104 P2)', async () => {
+  const pg = page({ storage: signedIn, routes: vaultRoutes(() => {}) });
+  await settle();
+  const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIfixture\n-----END RSA PRIVATE KEY-----\n';
+  let release; const slow = () => pg.ctx.pickPemFile({ files: [{ name: 'k.pem', size: pem.length, text: () => new Promise(r => { release = () => r(pem); }) }], value: 'x' });
+  pg.ctx.openModal('store'); pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  let p = slow(); pg.ctx.closeModal(); release(); await p;
+  assert.equal(pg.el('s-key-value').value, '', 'cancelled while reading: nothing written');
+  pg.ctx.openModal('store'); pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  p = slow(); pg.el('s-type').value = 'api_key'; pg.ctx.updateStoreFields(); release(); await p;
+  assert.equal(pg.el('s-key-value').value, '', 'type changed while reading: nothing written');
+  pg.el('s-type').value = 'github_app_key'; pg.ctx.updateStoreFields();
+  p = slow(); pg.ctx.logout(); release(); await p;
+  assert.equal(pg.el('s-key-value').value, '', 'signed out while reading: nothing written');
+});
+
 test('store: a loaded GitHub App key is dropped on cancel and when the type changes away (#104 review L8)', async () => {
   const pg = page({ storage: signedIn, routes: vaultRoutes(() => {}) });
   await settle();
