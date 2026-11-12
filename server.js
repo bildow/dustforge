@@ -517,8 +517,8 @@ app.use((req, res, next) => {
 const _jsonParser = express.json();
 const _useJsonParser = express.json({ limit: useLimits.USE_MAX_REQUEST_BYTES }); // POST /use: see use_limits.js
 const isUsePath = (p) => /^\/api\/(demipass|blindkey)\/use\/?$/i.test(p);   // Express matches case- and trailing-slash-insensitively
-// The leak scanner parses its own (2 MiB) body: the global parser leaves it alone (leak_scan.js).
-const isLeakScanPath = (p) => /^\/api\/(demipass|blindkey)\/leak-scan\/?$/i.test(p);
+// The leak scanner and the scrubber parse their own (2 MiB) bodies: the global parser leaves them alone (leak_scan.js).
+const isLeakScanPath = (p) => /^\/api\/(demipass|blindkey)\/leak-scan(\/scrub)?\/?$/i.test(p);
 const _urlencodedParser = express.urlencoded({ extended: false });
 const _useUrlencodedParser = express.urlencoded({ extended: false, limit: useLimits.USE_MAX_REQUEST_BYTES });
 // A body the parser refuses is answered in JSON with what to fix (and the DemiPass menu), never Express's HTML page,
@@ -3057,6 +3057,9 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN provider TEXT DEFAULT ''"
 // (where it came from, who it really belongs to: "received raw over Matrix; Kyle rotates it").
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN account_username TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN note TEXT DEFAULT ''"); } catch(_) {}
+// Contained (leak_scan.js scrub): a leaked value overwritten wherever a scrubber found it, not rotated. Cleared by a later hit.
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_at TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_note TEXT DEFAULT NULL"); } catch(_) {}
 
 // Known provider patterns — auto-detect expiration hints
 const PROVIDER_PATTERNS = {
@@ -4446,7 +4449,7 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
 
   const secrets = db.prepare(
     `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick,
-            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels, last_rotated_at, rotation_interval_days
+            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels, last_rotated_at, rotation_interval_days, leak_contained_at
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
   ).all(ownerDid, 'active');
 
