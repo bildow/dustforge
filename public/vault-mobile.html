@@ -953,8 +953,8 @@ function keyChangeCard(s){
     +'<div class="key-asker" style="color:var(--text3);margin-top:0.2rem">asked '+esc(new Date(p.requested_at).toLocaleString())+' with a '+esc(p.auth_method||'sign-in')+' token from '+esc(p.ip||'?')+'</div>'
     +'<div style="color:var(--text3);margin-top:0.25rem">Renewed tokens are sealed to this key. Approve only if you set @'+esc(s.handle)+' up yourself just now and its setup printed this fingerprint; otherwise deny it — a copy of one of its tokens may have leaked. '+(k.set?'Until then they go to the current key '+esc(k.fingerprint)+'.':'No renewal goes anywhere until you approve a key.')+'</div>'
     +'<div class="fr-row" style="margin-top:0.4rem"><button class="btn-primary" onclick="decideKeyChange('+jsArg(s.handle)+','+Number(p.id)+',true)">Approve</button>'
-    +'<button class="btn-ghost" onclick="decideKeyChange('+jsArg(s.handle)+','+Number(p.id)+',false)">Deny</button></div></div>';
-  if(k.previous) h+='<div class="key-revert" style="font-size:0.7rem;margin-top:0.5rem;color:var(--text3)">The key changed '+esc(new Date(k.changed_at).toLocaleString())+'. <button class="btn-ghost" onclick="revertKey('+jsArg(s.handle)+')" style="font-size:0.65rem;padding:0.1rem 0.45rem">Undo: back to '+esc(k.previous.fingerprint)+'</button> (until '+esc(new Date(k.previous.until).toLocaleString())+'; revokes what the new key received)</div>';
+    +'<button class="btn-ghost" onclick="decideKeyChange('+jsArg(s.handle)+','+Number(p.id)+',false)">Deny and sign out this token</button></div></div>';
+  if(k.previous) h+='<div class="key-revert" style="font-size:0.7rem;margin-top:0.5rem;color:var(--text3)">The key changed '+esc(new Date(k.changed_at).toLocaleString())+'. <button class="btn-ghost" onclick="revertKey('+jsArg(s.handle)+')" style="font-size:0.65rem;padding:0.1rem 0.45rem">Undo: back to '+esc(k.previous.fingerprint)+'</button> (until '+esc(new Date(k.previous.until).toLocaleString())+'; revokes what the new key received and signs out the token that asked for it)</div>';
   return h;
 }
 async function revertKey(handle){
@@ -973,7 +973,7 @@ async function decideKeyChange(handle, id, ok){
   const base='/api/fleet/'+encodeURIComponent(fleetSlug)+'/silicons/'+encodeURIComponent(handle)+'/delivery-key/'+Number(id);
   try{
     if(ok){ await apiGated('POST',base+'/approve',{},'Let @'+handle+'\'s renewals go to this delivery key? Your PIN approves it.'); fleetNote={ok:true,text:'@'+handle+'\'s delivery key is set: renewals are sealed to it.'}; }
-    else { await api('POST',base+'/deny',{}); fleetNote={ok:true,text:'Denied: @'+handle+'\'s renewals keep going to its current key.'}; }
+    else { const r=await api('POST',base+'/deny',{}); fleetNote={ok:true,text:'Denied: @'+handle+'\'s renewals keep going to its current key; the token that asked is signed out'+(r&&r.tokens_signed_out?' ('+r.tokens_signed_out+')':'')+'.'}; }
   }catch(e){ if(sessionEnded(e)){ renewBusy.delete(k); return; } if(!/cancelled/.test(e.message)) fleetNote={ok:false,text:e.message}; }
   finally{ renewBusy.delete(k); }
   await loadFleet();
@@ -3121,6 +3121,7 @@ async function loadAgentTokenRequests(){
     +(q.requester_role==='other_agent'?'<div style="color:var(--red);margin-top:0.25rem">Another agent, @'+esc(q.requested_by||'?')+', asks for @'+esc(q.handle)+'\'s token. If approved, @'+esc(q.requested_by||'?')+' can act as @'+esc(q.handle)+'.</div>':'')
     +(q.requester_role==='outside_agent'?'<div style="color:var(--red);margin-top:0.25rem">@'+esc(q.requested_by||'?')+' is a wallet your fleet did not create (it joined or was linked). If approved, it can act as @'+esc(q.handle)+'.</div>':'')
     +(q.requested_by||q.says_it_is?'<div style="color:var(--text3);margin-top:0.25rem">asked by '+esc(q.requested_by||'?')+(q.says_it_is?', saying it is for “'+esc(q.says_it_is)+'”':'')+'</div>':'')
+    +(q.delivery_key_fp?'<div class="req-key" style="color:var(--red);margin-top:0.25rem">It also sets @'+esc(q.handle)+'\'s delivery key — where its renewed tokens are sealed — to <span style="font-family:monospace">'+esc(q.delivery_key_fp)+'</span>. Approve only if that is the fingerprint its setup printed.</div>':'')
     +'<div style="color:var(--text3);margin-top:0.25rem">The token acts as @'+esc(q.handle)+' (spends its DD, uses what it was given) until it expires. It goes only to whoever filed the request. Approve only if you expected it.</div>'
     +'<div class="fr-row"><button class="btn-primary" '+(agentTokBusy.has(q.id)?'disabled ':'')+'onclick="agentTokDecide('+Number(q.id)+',true)">Approve</button>'
     +'<button class="btn-ghost" '+(agentTokBusy.has(q.id)?'disabled ':'')+'onclick="agentTokDecide('+Number(q.id)+',false)">Deny</button></div></div>').join('');
@@ -3129,7 +3130,7 @@ async function agentTokDecide(id, ok){
   if(agentTokBusy.has(id)) return; agentTokBusy.add(id); loadAgentTokenRequests();
   const q=agentTokReqs.find(x=>x.id===id)||{};
   try{
-    if(ok) await apiGated('POST','/api/silicon-token-requests/'+id+'/approve',{},q.creates?'Create the new agent @'+(q.handle||'?')+' and give it a '+(q.scope||'')+' token? Your PIN approves it.':'Give @'+(q.handle||'the agent')+' a '+(q.scope||'')+' token? Your PIN approves it.');
+    if(ok) await apiGated('POST','/api/silicon-token-requests/'+id+'/approve',{},q.creates?'Create the new agent @'+(q.handle||'?')+' and give it a '+(q.scope||'')+' token? Your PIN approves it.':'Give @'+(q.handle||'the agent')+' a '+(q.scope||'')+' token'+(q.delivery_key_fp?' and set its delivery key to '+q.delivery_key_fp:'')+'? Your PIN approves it.');
     else await api('POST','/api/silicon-token-requests/'+id+'/deny',{});
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
   finally{ agentTokBusy.delete(id); }

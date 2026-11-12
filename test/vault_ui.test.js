@@ -1934,7 +1934,7 @@ function fleetRoutes(state) {
       state.pinFresh = false; state.keys = { lapsed: { set: true, fingerprint: '9999888877776666', set_at: '2026-11-01T08:00:00Z', changed_at: '2026-11-12T10:00:00Z', previous: null, pending: null } };
       return { json: { ok: true, fingerprint: '9999888877776666', tokens_revoked: 2 } };
     }
-    if (p === '/api/fleet/aaron-agents/silicons/claude/delivery-key/5/deny') { state.denied = (state.denied || 0) + 1; state.keys = {}; return { json: { ok: true } }; }
+    if (p === '/api/fleet/aaron-agents/silicons/claude/delivery-key/5/deny') { state.denied = (state.denied || 0) + 1; state.keys = {}; return { json: { ok: true, tokens_signed_out: 3 } }; }
     if (p === '/api/fleet/aaron-agents/silicons/nokey/renew-token') return { status: 409, json: { no_delivery_key: true, error: '@nokey has no delivery key, so a renewed token could reach nobody but you.' } };
     if (p === '/api/identity/gate/verify') { assert.equal(body.intent, state.intent || 'silicon-renew:12', 'the PIN opens this one action only'); state.pinFresh = body.pin === '2468'; return state.pinFresh ? { json: { ok: true } } : { status: 403, json: { error: 'incorrect PIN' } }; }
     throw new Error('unexpected ' + p);
@@ -2020,6 +2020,7 @@ test('the card says where renewals go: key set / key changed / a new key waiting
   assert.doesNotMatch(sp, /Mint a 30-day token/, 'with a delivery key the shown-once mint is gone');
   const handlers = [...sp.matchAll(/onclick="(decideKeyChange[^"]*)"/g)].map(m => m[1]);
   assert.deepEqual(handlers, ['decideKeyChange(&quot;claude&quot;,5,true)', 'decideKeyChange(&quot;claude&quot;,5,false)']);
+  assert.match(sp, />Deny and sign out this token</, 'deny says it signs the asking token out (round-4 M1)');
   // Approve: the PIN for silicon-key:<id>, then the change is set.
   const done = pg.ctx.decideKeyChange('claude', 5, true);
   await settle();
@@ -2044,7 +2045,7 @@ test('denying a key change asks for no PIN', async () => {
   await pg.ctx.decideKeyChange('claude', 5, false); await settle();
   assert.equal(state.denied, 1);
   assert.equal(pg.calls.filter(c => c.path === '/api/identity/gate/verify').length, 0);
-  assert.match(pg.el('fleet-content').innerHTML, /Denied: @claude&#39;s renewals keep going to its current key\./);
+  assert.match(pg.el('fleet-content').innerHTML, /Denied: @claude&#39;s renewals keep going to its current key; the token that asked is signed out \(3\)\./);
 });
 
 test('a first key waits for the owner like a change: "key waiting for you", the card says no renewal goes anywhere yet (#100 round 3 H1)', async () => {
@@ -2089,4 +2090,26 @@ test('a renewal the agent declined shows on the chip instead of "awaiting pickup
   const h = pg.el('fleet-content').innerHTML;
   assert.match(h, /tok-valid[^>]*>token ok · 20d · renewal declined</);
   assert.doesNotMatch(h, /awaiting pickup/);
+});
+
+test('an agent token request that carries a delivery key shows its fingerprint, and the PIN prompt names it (#100 round 4 H1)', async () => {
+  let approved = 0;
+  const pg = page({ storage: signedIn, routes: async (p, body) => {
+    if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+    if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+    if (p === '/api/silicon-token-requests') return { json: { ok: true, requests: [{ id: 7, fleet: 'aaron-agents', handle: 'claude', scope: 'transact', expires_in: '30d', status: 'pending',
+      requested_by: 'claude', requester_role: 'self', says_it_is: 'token-pickup', delivery_key_fp: 'abcd1234ef567890' }, { id: 8, fleet: 'aaron-agents', handle: 'bot2', scope: 'read', expires_in: '1h', status: 'pending', requested_by: 'aaron', requester_role: 'owner', says_it_is: '' }] } };
+    if (p === '/api/silicon-token-requests/7/approve') { approved++; if (approved === 1) return { status: 403, json: { error: 'needs your PIN', missing: ['pin'], required: ['pin'], intent: 'silicon-token:7' } }; return { json: { ok: true } }; }
+    if (p === '/api/identity/gate/verify') { assert.equal(body.intent, 'silicon-token:7'); return { json: { ok: true } }; }
+    return { json: { ok: true } };
+  } });
+  await settle();
+  await pg.ctx.loadAgentTokenRequests(); await settle();
+  const h = pg.el('agent-token-requests').innerHTML;
+  assert.match(h, /class="req-key"[^>]*>It also sets @claude's delivery key — where its renewed tokens are sealed — to <span[^>]*>abcd1234ef567890</);
+  assert.equal((h.match(/class="req-key"/g) || []).length, 1, 'only the request that carries a key says so');
+  const done = pg.ctx.agentTokDecide(7, true); await settle();
+  assert.match(pg.el('pin-unlock-what').textContent, /and set its delivery key to abcd1234ef567890\?/);
+  pg.el('pin-unlock').value = '2468'; await pg.ctx.submitPin(); await done; await settle();
+  assert.equal(approved, 2);
 });

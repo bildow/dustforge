@@ -492,16 +492,21 @@ function tokenStatus(db, did, now = Date.now()) {
 // owner (the first one too), with who asked: the asking token's kind and address (PR #100 review rounds 2-3). An ask
 // whose token was revoked since (its jti, revoke-all, a fleet cut) is not shown.
 function deliveryKeyFingerprint(raw) { return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16); }
+// silicon_renew.js registers the routes' own check (billing.checkTokenRevocation over the asking token): the card shows
+// exactly the asks the owner could approve (round-4 review L3). Without it, the SQL below approximates it.
+let askRevokedCheck = null;
+function setAskRevokedCheck(fn) { askRevokedCheck = fn; }
 function deliveryKeyView(db, did) {
   let pending = null;
   try {
-    const p = db.prepare(`SELECT c.id, c.fingerprint, c.requested_at, c.expires_at, c.auth_method, c.ip, c.first_key FROM delivery_key_changes c
+    const p = db.prepare(`SELECT c.* FROM delivery_key_changes c
                            WHERE c.did = ? AND c.status = 'pending' AND c.expires_at > ?
                              AND NOT EXISTS (SELECT 1 FROM issued_tokens t WHERE t.jti = c.ask_jti AND c.ask_jti != '' AND t.revoked = 1)
                              AND NOT EXISTS (SELECT 1 FROM token_revocations r WHERE r.did = c.did AND c.ask_iat > 0 AND c.ask_iat < r.revoke_before)
                              AND NOT EXISTS (SELECT 1 FROM fleet_token_cuts x WHERE x.did = c.did AND c.auth_method = 'fleet_owner_mint' AND x.fleet = c.ask_fleet AND c.ask_iat < x.revoke_before)
                            ORDER BY c.id DESC LIMIT 1`).get(did, nowIso());
-    if (p) pending = { id: p.id, fingerprint: p.fingerprint, requested_at: p.requested_at, expires_at: p.expires_at, auth_method: p.auth_method || '', ip: p.ip || '', first: Boolean(p.first_key) };
+    if (p && askRevokedCheck && askRevokedCheck(p)) { /* dead ask: not shown */ }
+    else if (p) pending = { id: p.id, fingerprint: p.fingerprint, requested_at: p.requested_at, expires_at: p.expires_at, auth_method: p.auth_method || '', ip: p.ip || '', first: Boolean(p.first_key) };
   } catch (_) {}
   try {
     const w = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did);
@@ -1183,7 +1188,7 @@ function tokenWarningEmail({ silicon, token }) {
 module.exports = {
   ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed, OWNER_REFILL_MAX,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
-  getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken, awaitingPickup, deliveryKeyFingerprint, deliveryKeyView,
+  getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken, awaitingPickup, deliveryKeyFingerprint, deliveryKeyView, setAskRevokedCheck,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, projectWalletOwned, removeProject, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
   runOwnerRefills, runSiliconRefills, runTokenWarnings, runRefills,
   attributionReport, recentSpend,

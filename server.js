@@ -8878,11 +8878,13 @@ const deviceKeys = require('./device_keys')({
 // phone), claimed once with a claim secret. Aaron 2026-11-08, for Conduit's tenant token.
 require('./silicon_token_requests')({ app, db, identity, crypto, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh,
   gateMissing, spendSingleUse, blindkeyEncrypt, blindkeyDecrypt, logSecurityEvent, devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a),
-  fleetCreate: () => fleetRoutes });   // agent creation requests create the agent the way the owner's own create does
+  fleetCreate: () => fleetRoutes,      // agent creation requests create the agent the way the owner's own create does
+  deliveryKeys: () => siliconRenew }); // a request may carry the agent's delivery key, set when it is claimed
 // Owner renews an agent's token from the app (PIN + phone); it is sealed to the agent's delivery key and picked up by
 // the agent (bin/token-pickup.js) — no one else ever holds it. Aaron 2026-11-12 (silicon_renew.js).
-renewedTokenUsed = require('./silicon_renew')({ app, db, identity, crypto, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh,
-  gateMissing, spendSingleUse, logSecurityEvent, devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a) }).noteUse;
+const siliconRenew = require('./silicon_renew')({ app, db, identity, crypto, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh,
+  gateMissing, spendSingleUse, logSecurityEvent, devices: () => deviceKeys, sendMail: (...a) => fleetRoutes.sendMail(...a) });
+renewedTokenUsed = siliconRenew.noteUse;
 // Recovery guardians (red team item 9, step 2): 3 people paired in person, each accepting with PIN + phone.
 const recoveryGuardians = require('./guardians')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, devices: () => deviceKeys, holds: () => accountHolds, sendMail: (...a) => fleetRoutes.sendMail(...a),

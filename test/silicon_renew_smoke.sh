@@ -188,14 +188,38 @@ OUT=$(DEMIPASS_TOKEN_FILE="$S/carl-owner-clear.tok" PICKUP --init "$S/carl-clear
 [ $RC = 2 ] && [ "$(claims "$S/carl-owner-clear.tok" agent_own)" = None ] && ok "nor the owner's request without a claim_secret_hash (its claim secret was handed out in clear)" || fail "owner clear: $RC $OUT"
 python3 -c 'import secrets;print(secrets.token_urlsafe(24))' > "$S/carl.secret"; CH_HASH=$(tr -d '\n' < "$S/carl.secret" | sha256sum | cut -d' ' -f1)
 REQ carl "$A" '{"claim_secret_hash":"'$CH_HASH'"}'; CLAIM "$(cat "$S/carl.secret")" "$S/carl-own.tok"
+CARL=$(Q "SELECT did FROM identity_wallets WHERE username='carl'")
 OUT=$(DEMIPASS_TOKEN_FILE="$S/carl-own.tok" PICKUP --init "$S/carl"); RC=$?
-[ $RC = 0 ] && [ "$(claims "$S/carl-own.tok" agent_own)" = True ] && echo "$OUT" | grep -q "registered for" && [ -n "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='carl'")" ] \
-  && ok "the owner's request with the agent's claim_secret_hash is the agent's own: its first key is set at once (the one exception)" || fail "owner hash: $RC $OUT"
-BR=$(login brief); REQ brief "$BR" '{"expires_in":"1h"}'; CLAIM "$SEC" "$S/brief-own.tok"
-OUT=$(DEMIPASS_TOKEN_FILE="$S/brief-own.tok" PICKUP --init "$S/brief"); RC=$?
-[ $RC = 0 ] && [ "$(claims "$S/brief-own.tok" agent_own)" = True ] && [ -n "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='brief'")" ] && ok "a request the agent filed for itself is its own too" || fail "self request: $RC $OUT"
-OUT=$(DEMIPASS_TOKEN_FILE="$S/carl-own.tok" PICKUP --init --rotate "$S/carl"); [ "$(Q "SELECT status FROM delivery_key_changes WHERE did=(SELECT did FROM identity_wallets WHERE username='carl') ORDER BY id DESC LIMIT 1")" = pending ] \
-  && ok "…but only for the FIRST key: a later change with it waits for the owner" || fail "own token change: $OUT"
+CHL=$(Q "SELECT id FROM delivery_key_changes WHERE did='$CARL' AND status='pending'")
+[ $RC = 0 ] && [ "$(claims "$S/carl-own.tok" agent_own)" = True ] && echo "$OUT" | grep -q "waiting for the fleet owner" && [ -z "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE did='$CARL'")" ] && [ -n "$CHL" ] \
+  && ok "the owner's request with the agent's claim_secret_hash is the agent's own (it may ask), but its first key still waits for the owner (round 4 H1)" || fail "owner hash: $RC $OUT"
+# Round-4 H1 attack: a leaked copy of carl's sign-in files a request "for itself" with the attacker's hash; the owner approves it.
+LEAKC=$(login carl); printf '%s' attacker-secret-456 > "$S/att.secret"; AH=$(printf '%s' attacker-secret-456 | sha256sum | cut -d' ' -f1)
+REQ carl "$LEAKC" '{"claim_secret_hash":"'$AH'","label":"claude pickup"}'; CLAIM attacker-secret-456 "$S/carl-att.tok"
+OUT=$(DEMIPASS_TOKEN_FILE="$S/carl-att.tok" PICKUP --init "$S/carl-att"); RC=$?
+[ $RC = 2 ] && echo "$OUT" | grep -q "(429)" && [ "$(Q "SELECT status FROM delivery_key_changes WHERE id=$CHL")" = pending ] && [ -z "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE did='$CARL'")" ] \
+  && ok "a self-filed request's token (agent_own) sets no key: it queues behind the waiting ask (429); the real ask is not superseded" || fail "self-request attack: $RC $OUT"
+# A key travels IN a request only with its fingerprint on the owner's card/phone; claimed, it supersedes a waiting ask — loudly.
+OUT=$(DEMIPASS_TOKEN="$LEAKC" PICKUP --request "$S/carl-att2" aaron-agents carl); RQ=$(cat "$S/carl-att2/request" 2>/dev/null); AFP=$(echo "$OUT" | sed -n 's/.*with key \([0-9a-f]*\).*/\1/p')
+call GET /api/silicon-token-requests "$A"
+[ -n "$AFP" ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; print([r for r in json.load(sys.stdin)["requests"] if r["id"]==int(sys.argv[1])][0].get("delivery_key_fp"))' "$RQ")" = "$AFP" ] \
+  && ok "a request carrying a key shows its fingerprint to the owner" || fail "request key fp: $OUT $BODY"
+PIN "silicon-token:$RQ"; call POST /api/silicon-token-requests/$RQ/approve "$A" '{}'
+OUT=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --claim "$S/carl-att2" 2>&1 | tee -a "$S/answers")
+[ "$(Q "SELECT status FROM delivery_key_changes WHERE id=$CHL")" = superseded ] && echo "$OUT" | grep -q "delivery key $AFP is set" \
+  && [ -n "$(Q "SELECT id FROM demipass_security_events WHERE event_type='delivery_key_set' AND instr(context_json, '\"superseded\":[{\"id\":$CHL') > 0")" ] \
+  && ok "claimed: the key the owner approved with the request is set; the waiting ask it overtook is logged (and the owner mailed), not silently dropped" || fail "claim key: $OUT"
+# The way in, proper: --material on the agent, the owner files with it, the agent claims.
+MAT=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --material "$S/brief" 2>/dev/null)
+BFP=$(echo "$MAT" | J fingerprint)
+REQ brief "$A" "$(echo "$MAT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"claim_secret_hash": d["claim_secret_hash"], "delivery_key": d["delivery_key"], "expires_in": "1h"}))')"
+OUT=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --claim "$S/brief" "$RQ" 2>&1 | tee -a "$S/answers"); RC=$?
+[ $RC = 0 ] && [ "$(stat -c %a "$S/brief/token")" = 600 ] && [ "$(claims "$S/brief/token" agent_own)" = True ] && [ ! -e "$S/brief/claim.secret" ] \
+  && [ "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='brief'")" != "" ] && echo "$OUT" | grep -q "delivery key $BFP is set" \
+  && ok "--material + an owner-filed request + --claim: the agent's token (0600) and its key set in one owner approval" || fail "material way in: $RC $OUT"
+OUT=$(DEMIPASS_TOKEN_FILE="$S/carl-own.tok" PICKUP --request "$S/carl-minted" aaron-agents carl); RC=$?
+[ $RC = 2 ] && echo "$OUT" | grep -q "403" && ok "a fleet-minted token cannot file a request (--help says so)" || fail "minted files: $RC $OUT"
+node "$W/bin/token-pickup.js" --help | grep -q "fleet-minted" && node "$W/bin/token-pickup.js" --help | grep -q 'carry no "agent_own" mark' && ok "--help: fleet-minted tokens cannot file; pre-change claimed tokens need a new request (L5)" || fail "--help L5"
 
 # ── the PIN, then the renewal: it goes to the pinned key ──
 call POST $R "$A" '{}'
@@ -317,6 +341,11 @@ call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CH1/approve "$CT
 call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CH1/approve "$O" '{}'; [ "$CODE" = 404 ] && ok "another wallet cannot (404)" || fail "outsider approves: $CODE"
 call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CH1/deny "$A" '{}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT status FROM delivery_key_changes WHERE id=$CH1")" = denied ] && [ "$(OV claude delivery_key.pending)" = None ] && ok "denied: the change is gone, the pinned key stays" || fail "deny: $CODE"
+call GET /api/demipass/list "$LEAK"; [ "$CODE" = 401 ] && ok "…and the token that asked is signed out: it cannot ask again (round-4 M1)" || fail "asker alive after deny: $CODE"
+call POST /api/identity/delivery-key "$LEAK" '{"public_key":"'$(node -e 'const c=require("crypto");console.log(c.createPublicKey(c.generateKeyPairSync("x25519").privateKey).export({format:"jwk"}).x)')'"}'; [ "$CODE" = 401 ] || fail "re-ask with the denied token: $CODE"
+LEAK3=$(login claude); call POST /api/identity/delivery-key "$LEAK3" '{"public_key":"'$(node -e 'const c=require("crypto");console.log(c.createPublicKey(c.generateKeyPairSync("x25519").privateKey).export({format:"jwk"}).x)')'"}'; CHM=$(echo "$BODY" | J change_id)
+[ "$CODE" = 202 ] && [ -n "$(Q "SELECT mailed_at FROM delivery_key_changes WHERE id=$CHM")" ] && ok "the next ask after a deny is always mailed (inside the 3 h cap)" || fail "mail after deny: $CODE $(Q "SELECT mailed_at FROM delivery_key_changes WHERE id=$CHM")"
+call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CHM/deny "$A" '{}'; [ "$CODE" = 200 ] || fail "deny 2: $CODE"
 OUT=$(DEMIPASS_TOKEN_FILE="$S/claude-own.tok" PICKUP --init --rotate "$S/agent"); CH2=$(Q "SELECT id FROM delivery_key_changes WHERE status='pending' ORDER BY id DESC LIMIT 1")
 [ -s "$S/agent/delivery.key.pending" ] && [ -n "$CH2" ] && ok "--rotate asks for a new key; the old one stays in use meanwhile" || fail "rotate: $OUT"
 call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CH2/approve "$A" '{}'
@@ -327,19 +356,36 @@ PIN "silicon-key:$SID"; call POST /api/fleet/aaron-agents/silicons/claude/delive
 [ "$(OV claude delivery_key.previous.fingerprint)" != None ] && ok "the previous key is kept, for the owner to undo the change" || fail "previous kept"
 sleep 1.1; RENEW; [ "$CODE" = 200 ] && ok "an owner-approved key takes renewals at once (no cooldown: the revert covers a wrong approval) (L2)" || fail "renew after approve: $CODE $BODY"
 JN=$(Q "SELECT token_jti FROM token_deliveries ORDER BY id DESC LIMIT 1")
+OLDKEY=$(sha256sum < "$S/agent/delivery.key"); NEWKEY=$(sha256sum < "$S/agent/delivery.key.pending")
+mv "$S/agent/delivery.key.pending" "$S/agent/delivery.key.new"   # as if a swap was cut off right after its first step
 OUT=$(PICKUP --allow-narrower "$S/agent"); RC=$?
-[ $RC = 0 ] && [ ! -e "$S/agent/delivery.key.pending" ] && [ -s "$S/agent/delivery.key.prev" ] && [ "$(claims "$S/agent/token" scope)" = transact ] && ok "the renewal opens with the new key (it replaced the old one locally, kept as .prev)" || fail "new key pickup: $RC $OUT"
+[ $RC = 0 ] && [ ! -e "$S/agent/delivery.key.new" ] && [ "$(sha256sum < "$S/agent/delivery.key")" = "$NEWKEY" ] && [ "$(sha256sum < "$S/agent/delivery.key.prev")" = "$OLDKEY" ] && [ "$(claims "$S/agent/token" scope)" = transact ] \
+  && ok "the renewal opens with the new key, even from a swap cut off midway (.new); the old key is kept as .prev (L4)" || fail "new key pickup: $RC $OUT"
 cp "$S/agent/token" "$S/tn"; keep "$S/tn"
+# whoever holds the new key asks for yet another key with the token it received
+call POST /api/identity/delivery-key "$(cat "$S/tn")" '{"public_key":"'$(node -e 'const c=require("crypto");console.log(c.createPublicKey(c.generateKeyPairSync("x25519").privateKey).export({format:"jwk"}).x)')'"}'; CHX=$(echo "$BODY" | J change_id)
+[ "$CODE" = 202 ] || fail "ask with the renewed token: $CODE $BODY"
 call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/revert "$A" '{}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "silicon-key-revert:$SID" ] && ok "undoing it needs the PIN (silicon-key-revert:$SID)" || fail "revert no pin: $CODE $BODY"
 PIN "silicon-key-revert:$SID"; call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/revert "$A" '{}'
 [ "$CODE" = 200 ] && [ "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='claude'")" = "$K1" ] && [ "$(Q "SELECT revoked FROM issued_tokens WHERE jti='$JN'")" = 1 ] && [ "$(OV claude delivery_key.previous)" = None ] \
   && ok "undone within 6 h: back to the previous key, and the token sealed to the dropped key is revoked" || fail "revert: $CODE $BODY"
 call GET /api/demipass/list "$(cat "$S/tn")"; [ "$CODE" = 401 ] && ok "…that token no longer works" || fail "reverted token: $CODE"
+[ "$(Q "SELECT status FROM delivery_key_changes WHERE id=$CHX")" = revoked ] && ok "…and an ask made with it ends at once (revoked)" || fail "ask after revert: $(Q "SELECT status FROM delivery_key_changes WHERE id=$CHX")"
+call GET /api/demipass/list "$(cat "$S/claude-own.tok")"; [ "$CODE" = 401 ] && [ "$(Q "SELECT status FROM delivery_key_changes WHERE id=$CH2")" = reverted ] \
+  && ok "…and the token (session) that asked for the dropped key is signed out; the change is marked undone (round-4 M1)" || fail "asker alive after revert: $CODE"
 PIN "silicon-key-revert:$SID"; call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/revert "$A" '{}'; [ "$CODE" = 409 ] && ok "nothing left to undo → 409" || fail "second revert: $CODE"
 sleep 1.1; RENEW; OUT=$(PICKUP "$S/agent"); RC=$?
 [ $RC = 0 ] && echo "$OUT" | grep -q "wrote" && ok "after the undo the agent's previous key (kept as .prev) opens the next renewal" || fail "pickup after revert: $RC $OUT"
 cp "$S/agent/token" "$S/tr"; keep "$S/tr"
+
+# ── a key that changes between the phone's yes and the mint is not sealed to (round-4 L1) ──
+OTHER=$(node -e 'const c=require("crypto");console.log(c.createPublicKey(c.generateKeyPairSync("x25519").privateKey).export({format:"jwk"}).x)')
+X "CREATE TRIGGER race_key AFTER DELETE ON gate_verifications WHEN old.intent = 'silicon-renew:$SID' BEGIN UPDATE identity_wallets SET delivery_public_key = '$OTHER' WHERE did = '$CDID'; END"
+N0=$(Q "SELECT COUNT(*) FROM token_deliveries"); RENEW
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "changed meanwhile" && [ "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE did='$CDID'")" = "$K1" ] && [ "$(Q "SELECT COUNT(*) FROM token_deliveries")" = "$N0" ] \
+  && ok "the key changed inside the renewal (after the PIN was spent): 409, nothing minted or sealed, all rolled back" || fail "race: $CODE $BODY"
+X "DROP TRIGGER race_key"
 
 # ── the card: under 24 h is 'expiring', in hours ──
 call POST /api/fleet/aaron-agents/silicons/brief/token "$A" '{"scope":"transact","expires_in":"5h"}'
@@ -360,6 +406,8 @@ PIN "silicon-key:$SID"; call POST /api/fleet/aaron-agents/silicons/claude/delive
 login claude > "$S/ask2.tok"; DEMIPASS_TOKEN_FILE="$S/ask2.tok" PICKUP --init "$S/l1b" >/dev/null
 CHR2=$(Q "SELECT id FROM delivery_key_changes WHERE did='$CDID' AND status='pending' ORDER BY id DESC LIMIT 1")
 sleep 1.1; call POST /api/identity/tokens/revoke-all "$(cat "$S/ask2.tok")" '{}'; [ "$CODE" = 200 ] || fail "revoke-all: $CODE $BODY"
+X "UPDATE delivery_key_changes SET ask_jti = '' WHERE id = $CHR2"   # only the revoke-all cut (by iat) can tell now
+[ "$(OV claude delivery_key.pending)" = None ] && ok "the card applies the routes' own check: an ask cut by revoke-all is not shown (round-4 L3)" || fail "card shows a dead ask"
 PIN "silicon-key:$SID"; call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CHR2/approve "$A" '{}'
 [ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM delivery_key_changes WHERE id=$CHR2")" = revoked ] && ok "revoke-all by the agent ends a waiting ask from before it" || fail "L1 revoke-all: $CODE $BODY"
 
@@ -390,6 +438,12 @@ login claude > "$S/leak2.tok"; DEMIPASS_TOKEN_FILE="$S/leak2.tok" PICKUP --init 
 CH3=$(Q "SELECT id FROM delivery_key_changes WHERE status='pending' ORDER BY id DESC LIMIT 1"); FP3=$(Q "SELECT fingerprint FROM delivery_key_changes WHERE id=$CH3")
 PIN "silicon-key:$SID"; call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CH3/approve "$A" '{}'
 [ "$CODE" = 428 ] && [ "$(echo "$BODY" | J challenge.bind)" = "key aaron-agents/claude to $FP3" ] && ok "…and a key change needs the phone to sign \"key aaron-agents/claude to $FP3\"" || fail "key 428: $CODE $BODY"
+
+# A request carrying a key: the phone signs its fingerprint with the request (round-4 H1).
+B2b=$(login bot2); MAT2=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --material "$S/bot2" 2>/dev/null); FP2=$(echo "$MAT2" | J fingerprint)
+call POST /api/fleet/aaron-agents/silicons/bot2/token-requests "$B2b" "$(echo "$MAT2" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"claim_secret_hash": d["claim_secret_hash"], "delivery_key": d["delivery_key"], "expires_in": "1h"}))')"; RQ2=$(echo "$BODY" | J request_id)
+PIN "silicon-token:$RQ2"; call POST /api/silicon-token-requests/$RQ2/approve "$A" '{}'
+[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J challenge.bind)" = "aaron-agents/bot2:transact:1h asked by bot2 key $FP2" ] && ok "…and a request carrying a key makes the phone sign \"… key $FP2\"" || fail "request key bind: $CODE $BODY"
 
 # ── the pickup listing is rate-limited per address + DID; another DID still answers (L3) ──
 for i in $(seq 1 70); do C=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/identity/token-deliveries?did=$CDID"); [ "$C" = 429 ] && break; done

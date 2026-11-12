@@ -18,14 +18,17 @@
 //        → 202 pending: the fleet owner approves it in the app (PIN silicon-key:<fleet_silicons id> + phone, bind
 //          "key <fleet>/<handle> to <fingerprint>") — the FIRST key too. One waiting ask per wallet: another while one
 //          waits is 429 (it names the waiting fingerprint); the owner is mailed at most once per MAIL_GAP_SEC per wallet.
-//        → 201 set, at once, only for the first key and only with an `agent_own` token: one from the agent's own token
-//          request (it filed it, or the owner filed it with the agent's claim_secret_hash), which the owner approved with
-//          PIN + phone and only the agent could claim (silicon_token_requests.js).
-//        A waiting ask ends when its token is revoked (revoke-all, a fleet cut, its jti) — checked again at approval.
+//        No key is ever set on an ask alone (round-4 review H1: a leaked sign-in could file a request "for itself").
+//        The other way a key is set: it travels IN an agent token request (delivery_key), the owner's phone signs
+//        "… key <fingerprint>" with the request, and the key is set when the request is claimed (setKeyFromRequest).
+//        A waiting ask ends when its token is revoked (revoke-all, a fleet cut, its jti) — checked again at approval;
+//        an ask a claimed request's key replaces is ended loudly (logged, the owner mailed), never silently.
 //   POST /api/fleet/:slug/silicons/:handle/delivery-key/:change/approve | /deny
+//        deny also signs out the token that asked (and its session): it cannot ask again at once (round-4 M1).
 //   POST /api/fleet/:slug/silicons/:handle/delivery-key/revert
 //        within REVERT_WINDOW_SEC of an approved change: back to the previous key (PIN silicon-key-revert:<id> + phone);
-//        every token sealed to the reverted key is revoked.
+//        every token sealed to the reverted key is revoked, and so is the token (and session) that asked for it.
+//        An ask after a deny or a revert always mails the owner (the 3 h mail cap does not hide it).
 //   POST /api/fleet/:slug/silicons/:handle/renew-token {scope?, expires_in?}
 //        the fleet owner's own person session, PIN (silicon-renew:<fleet_silicons id>) + linked phone
 //        → {ok, delivery_id (random), expires_at}; 409 while no key is approved
@@ -52,10 +55,26 @@ const MAIL_GAP_SEC = 3 * 60 * 60;            // key-ask mails: at most one per w
 const ALG = 'X25519-HKDF-SHA256-A256GCM';
 const INFO_PREFIX = 'demipass-token-delivery-v1:';
 // The way in for an agent whose tokens were all seen by someone else (review round 3, L3).
-const OWN_TOKEN_HOWTO = 'The way in: the fleet owner files an agent token request for this agent with the agent\'s claim_secret_hash ' +
-  '(POST /api/fleet/<fleet>/silicons/<handle>/token-requests {"claim_secret_hash": sha256 hex of a secret only the agent keeps}), approves it in the app, ' +
-  'and the agent claims it (POST /api/silicon-token-requests/<id>/claim {claim_secret}); that token registers the first key at once. ' +
-  'The agent\'s own sign-in also works, but its key then waits for the owner\'s approval.';
+const OWN_TOKEN_HOWTO = 'The way in: an agent token request that carries the agent\'s key — on the agent, "node bin/token-pickup.js --material <dir>" prints ' +
+  'its delivery_key and a claim_secret_hash; the fleet owner files POST /api/fleet/<fleet>/silicons/<handle>/token-requests {"claim_secret_hash", "delivery_key"} ' +
+  'and approves it in the app (the phone shows the key\'s fingerprint); the agent runs "node bin/token-pickup.js --claim <dir> <request id>": its token, and the key set. ' +
+  'With the agent\'s own sign-in, "node bin/token-pickup.js --request <dir> <fleet> <handle>" files that request itself.';
+
+// A public key the server can seal to: 32 bytes of base64url, and a working (not low-order) X25519 point. → raw or null.
+function parseDeliveryKey(s) {
+  const crypto = require('crypto');
+  const str = String(s == null ? '' : s).trim();
+  if (!/^[A-Za-z0-9_-]{43}$/.test(str)) return null;
+  const raw = Buffer.from(str, 'base64url');
+  if (raw.length !== 32) return null;
+  try {
+    const probe = crypto.generateKeyPairSync('x25519').privateKey;
+    const shared = crypto.diffieHellman({ privateKey: probe, publicKey: crypto.createPublicKey({ key: { kty: 'OKP', crv: 'X25519', x: str }, format: 'jwk' }) });
+    if (shared.every(b => b === 0)) return null;
+    shared.fill(0);
+  } catch (_) { return null; }
+  return raw;
+}
 
 // A token whose value someone other than the agent may have seen: a fleet-minted token that is neither the agent's
 // own request (`agent_own`, set at mint by silicon_token_requests.js) nor a sealed renewal.
@@ -93,7 +112,7 @@ module.exports = function registerSiliconRenew(deps) {
     did TEXT NOT NULL,
     public_key TEXT NOT NULL,
     fingerprint TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending', -- pending | approved | denied | expired | superseded | revoked
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | approved | denied | expired | superseded | revoked | reverted
     auth_method TEXT DEFAULT '',            -- of the token that asked
     ip TEXT DEFAULT '',
     requested_at TEXT NOT NULL,
@@ -101,7 +120,7 @@ module.exports = function registerSiliconRenew(deps) {
     decided_at TEXT DEFAULT NULL,
     decided_by TEXT DEFAULT NULL
   )`);
-  for (const col of ["ask_jti TEXT DEFAULT ''", 'ask_iat INTEGER DEFAULT 0', "ask_fleet TEXT DEFAULT ''", 'first_key INTEGER DEFAULT 0', 'mailed_at TEXT DEFAULT NULL']) {
+  for (const col of ["ask_jti TEXT DEFAULT ''", 'ask_iat INTEGER DEFAULT 0', "ask_fleet TEXT DEFAULT ''", "ask_sid TEXT DEFAULT ''", 'first_key INTEGER DEFAULT 0', 'mailed_at TEXT DEFAULT NULL']) {
     try { db.exec(`ALTER TABLE delivery_key_changes ADD COLUMN ${col}`); } catch (_) {}
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_dkc_did ON delivery_key_changes(did, status)');
@@ -147,21 +166,6 @@ module.exports = function registerSiliconRenew(deps) {
   const askRevoked = (c) => Boolean(billing && billing.checkTokenRevocation(db, { jti: c.ask_jti || undefined, sub: c.did, iat: c.ask_iat || 0,
     auth_method: c.auth_method, fleet: c.ask_fleet || undefined }).revoked);
 
-  // A public key the server can seal to: 32 bytes of base64url, and a working (not low-order) X25519 point.
-  function parseDeliveryKey(s) {
-    const str = String(s == null ? '' : s).trim();
-    if (!/^[A-Za-z0-9_-]{43}$/.test(str)) return null;
-    const raw = Buffer.from(str, 'base64url');
-    if (raw.length !== 32) return null;
-    try {
-      const probe = crypto.generateKeyPairSync('x25519').privateKey;
-      const shared = crypto.diffieHellman({ privateKey: probe, publicKey: x25519Public(raw) });
-      if (shared.every(b => b === 0)) return null;
-      shared.fill(0);
-    } catch (_) { return null; }
-    return raw;
-  }
-
   function seal(payload, recipientRaw, did, pubId) {
     const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
     const epk = Buffer.from(publicKey.export({ format: 'jwk' }).x, 'base64url');
@@ -176,6 +180,27 @@ module.exports = function registerSiliconRenew(deps) {
     pt.fill(0); key.fill(0);
     return { epk: epk.toString('base64url'), iv: iv.toString('base64url'), tag: c.getAuthTag().toString('base64url'), ciphertext: ct.toString('base64url') };
   }
+
+  // The token that asked for a key, and the session behind it (every token refreshed from that sign-in, its refresh
+  // chain): signed out when the owner denies the ask or undoes the change it got approved (round-4 review M1).
+  function endAsker(c) {
+    let n = 0;
+    try {
+      if (c.ask_jti) n += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0 AND jti = ?").run(c.did, c.ask_jti).changes;
+      if (c.ask_sid) n += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0 AND sid = ?").run(c.did, c.ask_sid).changes;
+      try { db.prepare('UPDATE refresh_tokens SET revoked = 1, rotated_to = NULL WHERE did = ? AND revoked = 0 AND ((session_id = ? AND ? != \'\') OR (access_jti = ? AND ? != \'\'))').run(c.did, c.ask_sid || '', c.ask_sid || '', c.ask_jti || '', c.ask_jti || ''); } catch (_) {}
+    } catch (_) {}
+    return n;
+  }
+  // The owner hears of an ask at most once per MAIL_GAP_SEC — except the first ask after a deny or an undo, which is
+  // always mailed (the deny loop: round-4 review M1).
+  function shouldMail(did) {
+    const last = db.prepare('SELECT MAX(mailed_at) AS t FROM delivery_key_changes WHERE did = ? AND mailed_at IS NOT NULL').get(did).t;
+    if (!last || Date.now() - Date.parse(last) >= MAIL_GAP_SEC * 1000) return true;
+    return Boolean(db.prepare("SELECT 1 FROM delivery_key_changes WHERE did = ? AND status IN ('denied','reverted') AND decided_at >= ?").get(did, last));
+  }
+  // The card hides an ask whose token was revoked, by the same check the routes use.
+  if (fb.setAskRevokedCheck) fb.setAskRevokedCheck(askRevoked);
 
   // Expired deliveries go; key asks past their day expire; an ask whose token was revoked since (revoke-all, a fleet
   // cut, its jti) ends — whoever held it is not trusted to choose a key any more (round-3 review L1).
@@ -226,17 +251,8 @@ module.exports = function registerSiliconRenew(deps) {
     const fp = fingerprint(raw), b64 = raw.toString('base64url');
     sweep();
     if (w.delivery_public_key === b64) return res.json({ ok: true, status: 'set', unchanged: true, did: auth.did, fingerprint: fp });
-    // The first key, asked with the agent's own token request (the owner approved that request with PIN + phone and
-    // only the agent could claim it): pinned at once. Concurrent firsts: only one wins.
-    if (!w.delivery_public_key && d.agent_own && d.auth_method === 'fleet_owner_mint') {
-      const n = db.prepare('UPDATE identity_wallets SET delivery_public_key = ?, delivery_key_set_at = ?, delivery_key_changed_at = NULL WHERE did = ? AND delivery_public_key IS NULL').run(b64, nowIso(), auth.did).changes;
-      if (n === 1) {
-        db.prepare("UPDATE delivery_key_changes SET status = 'superseded', decided_at = ? WHERE did = ? AND status = 'pending'").run(nowIso(), auth.did);
-        if (logSecurityEvent) logSecurityEvent('delivery_key_set', 'info', { caller_did: auth.did, ip: req.ip, target: auth.did, context: { fingerprint: fp, via: 'agent_own_token_request', token_request: d.token_request || null } });
-        return res.status(201).json({ ok: true, status: 'set', did: auth.did, fingerprint: fp });
-      }
-    }
-    // Everything else waits for the fleet owner — one ask at a time per wallet.
+    // Every ask waits for the fleet owner — one at a time per wallet. (A key is set without an ask only when it came
+    // inside an agent token request the owner approved with its fingerprint on the phone: setKeyFromRequest.)
     const waiting = db.prepare("SELECT * FROM delivery_key_changes WHERE did = ? AND status = 'pending' ORDER BY id DESC LIMIT 1").get(auth.did);
     if (waiting) {
       if (waiting.public_key === b64) return res.status(202).json({ ok: true, status: 'pending', change_id: waiting.id, did: auth.did, fingerprint: fp, already_asked: true });
@@ -244,15 +260,16 @@ module.exports = function registerSiliconRenew(deps) {
         error: `a delivery key ${waiting.fingerprint} is already waiting for the fleet owner (asked ${waiting.requested_at}). If it is not this agent's, tell the owner to deny it; then ask again.` });
     }
     const first = !w.delivery_public_key;
-    const id = Number(db.prepare(`INSERT INTO delivery_key_changes (did, public_key, fingerprint, auth_method, ip, requested_at, expires_at, ask_jti, ask_iat, ask_fleet, first_key)
-                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    const mailNow = shouldMail(auth.did);
+    const id = Number(db.prepare(`INSERT INTO delivery_key_changes (did, public_key, fingerprint, auth_method, ip, requested_at, expires_at, ask_jti, ask_iat, ask_fleet, ask_sid, first_key)
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(auth.did, b64, fp, String(d.auth_method || ''), String(req.ip || ''), nowIso(), later(KEY_CHANGE_TTL_SEC), String(d.jti || ''), Number(d.iat || 0),
-        String(d.fleet || ''), first ? 1 : 0).lastInsertRowid);
+        String(d.fleet || ''), String(d.sid || ''), first ? 1 : 0).lastInsertRowid);
     if (logSecurityEvent) logSecurityEvent('delivery_key_change_asked', 'warn', { caller_did: auth.did, ip: req.ip, target: auth.did,
       context: { change_id: id, fingerprint: fp, first_key: first, current: first ? null : fingerprint(Buffer.from(w.delivery_public_key, 'base64url')), auth_method: d.auth_method || null } });
-    // One mail per wallet per MAIL_GAP_SEC: a flood of asks is one notice (and only one ask waits anyway).
-    const lastMail = db.prepare('SELECT MAX(mailed_at) AS t FROM delivery_key_changes WHERE did = ? AND mailed_at IS NOT NULL').get(auth.did).t;
-    if (!lastMail || Date.now() - Date.parse(lastMail) >= MAIL_GAP_SEC * 1000) {
+    // One mail per wallet per MAIL_GAP_SEC (a flood of asks is one notice, and only one ask waits anyway) — but always
+    // the first ask after a deny or an undo.
+    if (mailNow) {
       db.prepare('UPDATE delivery_key_changes SET mailed_at = ? WHERE id = ?').run(nowIso(), id);
       for (const o of ownersOf(auth.did)) {
         mail(o.owner_email, `DemiPass: @${o.handle} asks to ${first ? 'set' : 'change'} its delivery key`,
@@ -330,10 +347,16 @@ module.exports = function registerSiliconRenew(deps) {
   app.post('/api/fleet/:slug/silicons/:handle/delivery-key/:change/deny', rateLimitStandard, (req, res) => {
     const auth = ownerAuth(req, res); if (!auth) return;
     const o = ownedSilicon(req, res, auth); if (!o) return;
-    const n = db.prepare("UPDATE delivery_key_changes SET status = 'denied', decided_at = ?, decided_by = ? WHERE id = ? AND did = ? AND status = 'pending'")
-      .run(nowIso(), auth.did, Number(req.params.change), o.s.member_did).changes;
-    if (n && logSecurityEvent) logSecurityEvent('delivery_key_change_denied', 'warn', { caller_did: auth.did, ip: req.ip, target: o.s.handle, context: { change_id: Number(req.params.change) } });
-    res.status(n ? 200 : 404).json(n ? { ok: true } : { error: 'no waiting key change by that id' });
+    const ch = db.prepare("SELECT * FROM delivery_key_changes WHERE id = ? AND did = ? AND status = 'pending'").get(Number(req.params.change), o.s.member_did);
+    if (!ch) return res.status(404).json({ error: 'no waiting key change by that id' });
+    let signedOut = 0;
+    db.transaction(() => {
+      db.prepare("UPDATE delivery_key_changes SET status = 'denied', decided_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'").run(nowIso(), auth.did, ch.id);
+      signedOut = endAsker(ch);   // "deny and sign out this token": it cannot just ask again
+    })();
+    try { sweep(); } catch (_) {}   // asks made with the tokens just signed out end now, not at the next sweep
+    if (logSecurityEvent) logSecurityEvent('delivery_key_change_denied', 'warn', { caller_did: auth.did, ip: req.ip, target: o.s.handle, context: { change_id: ch.id, fingerprint: ch.fingerprint, tokens_signed_out: signedOut } });
+    res.json({ ok: true, tokens_signed_out: signedOut });
   });
 
   // Undo an approved change while the previous key is kept: back to it, and every token sealed to the key being
@@ -364,8 +387,12 @@ module.exports = function registerSiliconRenew(deps) {
           revoked += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ? AND revoked = 0").run(r.token_jti).changes;
         }
         db.prepare("UPDATE token_deliveries SET acked_at = COALESCE(acked_at, ?), ack = COALESCE(ack, 'declined'), epk = '', iv = '', tag = '', ciphertext = '' WHERE did = ? AND key_fingerprint = ?").run(nowIso(), s.member_did, dropFp);
+        // Whoever asked for the dropped key is signed out too, and the change is marked undone.
+        const asked = db.prepare("SELECT * FROM delivery_key_changes WHERE did = ? AND public_key = ? AND status = 'approved' ORDER BY id DESC LIMIT 1").get(s.member_did, w.delivery_public_key);
+        if (asked) { revoked += endAsker(asked); db.prepare("UPDATE delivery_key_changes SET status = 'reverted', decided_at = ? WHERE id = ?").run(nowIso(), asked.id); }
       }).immediate();
     } catch (e) { return res.status(e.statusCode || 500).json(e.body || { error: e.message }); }
+    try { sweep(); } catch (_) {}   // e.g. an ask made with a token the dropped key received: ended now
     if (logSecurityEvent) logSecurityEvent('delivery_key_reverted', 'warn', { caller_did: auth.did, ip: req.ip, target: s.handle, context: { fleet: fleet.slug, did: s.member_did, to: prevFp, dropped: dropFp, tokens_revoked: revoked } });
     res.json({ ok: true, handle: s.handle, fingerprint: prevFp, tokens_revoked: revoked });
   });
@@ -410,6 +437,9 @@ module.exports = function registerSiliconRenew(deps) {
       out = db.transaction(() => {
         const spent = spendSingleUse(auth.did, 'silicon-renew', ['pin'], auth, intent);
         if (spent) throw Object.assign(new Error(spent.error), { statusCode: spent.status || 403, body: spent });
+        // The key the phone signed for must still be the key (an undo or an approval may have landed meanwhile).
+        const now = db.prepare('SELECT delivery_public_key FROM identity_wallets WHERE did = ?').get(wallet.did);
+        if (!now || now.delivery_public_key !== wallet.delivery_public_key) throw Object.assign(new Error(`@${s.handle}'s delivery key changed meanwhile: renew again`), { statusCode: 409 });
         // Minted like the owner's own mint for an agent (fleet_routes.js POST …/token): it acts as the agent's wallet
         // and never runs a fleet. The token recorder (server.js) puts it in issued_tokens, the revocation surface.
         const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
@@ -461,9 +491,41 @@ module.exports = function registerSiliconRenew(deps) {
     res.json({ ok: true, ack: used ? 'used' : 'declined' });
   });
 
-  return { sweep, noteUse, shownInClear, ALG, INFO_PREFIX, REVERT_WINDOW_SEC };
+  // A key that travelled inside an agent token request the owner approved (its fingerprint was on the phone), set when
+  // the request is claimed (silicon_token_requests.js). A different key replaces the current one like an approved
+  // change (the previous kept REVERT_WINDOW_SEC); a waiting ask it overtakes is ended loudly: logged, owner mailed.
+  function setKeyFromRequest(did, b64, { requestId, ownerDid, ip } = {}) {
+    const raw = parseDeliveryKey(b64);
+    if (!raw) return { ok: false, error: 'the request\'s delivery key is not a usable X25519 key' };
+    const fp = fingerprint(raw);
+    let superseded = [], prev = null;
+    db.transaction(() => {
+      const w = db.prepare('SELECT delivery_public_key FROM identity_wallets WHERE did = ?').get(did);
+      prev = w && w.delivery_public_key;
+      if (prev === b64) return;
+      if (prev) db.prepare('UPDATE identity_wallets SET delivery_public_key = ?, delivery_key_changed_at = ?, delivery_key_previous = ?, delivery_key_previous_until = ? WHERE did = ?').run(b64, nowIso(), prev, later(REVERT_WINDOW_SEC), did);
+      else db.prepare('UPDATE identity_wallets SET delivery_public_key = ?, delivery_key_set_at = ?, delivery_key_changed_at = NULL WHERE did = ?').run(b64, nowIso(), did);
+      superseded = db.prepare("SELECT * FROM delivery_key_changes WHERE did = ? AND status = 'pending'").all(did);
+      db.prepare("UPDATE delivery_key_changes SET status = 'superseded', decided_at = ? WHERE did = ? AND status = 'pending'").run(nowIso(), did);
+    })();
+    if (prev === b64) return { ok: true, fingerprint: fp, unchanged: true };
+    if (logSecurityEvent) logSecurityEvent(prev ? 'delivery_key_changed' : 'delivery_key_set', 'warn', { caller_did: ownerDid || null, ip, target: did,
+      context: { via: 'token_request', request_id: requestId || null, fingerprint: fp, superseded: superseded.map(c => ({ id: c.id, fingerprint: c.fingerprint })) } });
+    if (superseded.length || prev) {
+      for (const o of ownersOf(did)) {
+        mail(o.owner_email, `DemiPass: @${o.handle}'s delivery key was set by token request #${requestId}`,
+          `The agent token request #${requestId} you approved for @${o.handle} (fleet ${o.slug}) carried delivery key ${fp}; it was claimed and that key is now set.` +
+          (superseded.length ? `\nIt replaced ${superseded.length === 1 ? 'a waiting key ask' : superseded.length + ' waiting key asks'} (${superseded.map(c => c.fingerprint).join(', ')}).` : '') +
+          (prev ? `\nYou can undo it for ${REVERT_WINDOW_SEC / 3600} hours on @${o.handle}'s page.` : '') + `\nIf you did not expect this, undo it and revoke @${o.handle}'s tokens.\n`);
+      }
+    }
+    return { ok: true, fingerprint: fp, replaced: Boolean(prev), superseded: superseded.length };
+  }
+
+  return { sweep, noteUse, shownInClear, setKeyFromRequest, parseDeliveryKey, fingerprint, ALG, INFO_PREFIX, REVERT_WINDOW_SEC };
 };
 module.exports.ALG = ALG;
 module.exports.INFO_PREFIX = INFO_PREFIX;
 module.exports.shownInClear = shownInClear;
 module.exports.OWN_TOKEN_HOWTO = OWN_TOKEN_HOWTO;
+module.exports.parseDeliveryKey = parseDeliveryKey;
