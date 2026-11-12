@@ -506,12 +506,17 @@
     <h3>Store a Secret</h3>
     <label>Name</label><input type="text" id="s-name" placeholder="e.g. RackNerd SSH">
     <label>Type</label>
-    <select id="s-type" onchange="updateStoreFields()"><option value="password">Password / Login</option><option value="ssh_credential">SSH key</option><option value="api_key">API Key</option><option value="token">Token</option><option value="other">Other</option></select>
+    <select id="s-type" onchange="updateStoreFields()"><option value="password">Password / Login</option><option value="ssh_credential">SSH key</option><option value="api_key">API Key</option><option value="token">Token</option><option value="github_app_key">GitHub App private key</option><option value="other">Other</option></select>
     <div id="s-user-fields">
       <label>Username / Email</label><input type="text" id="s-username" placeholder="e.g. root or admin@example.com" autocapitalize="off" autocorrect="off" spellcheck="false">
     </div>
     <div id="s-login-fields">
       <label>Password</label><input type="password" id="s-value" placeholder="The secret value" autocomplete="off">
+    </div>
+    <div id="s-app-fields" style="display:none">
+      <label>App ID</label><input type="text" id="s-app-id" inputmode="numeric" placeholder="GitHub → the app's settings → General → App ID" autocomplete="off">
+      <label>Private key (.pem)</label><input type="file" id="s-app-pem-file" accept=".pem,application/x-pem-file,application/x-x509-ca-cert,text/plain" onchange="pickPemFile(this)">
+      <div id="s-app-pem-msg" style="font-size:0.7rem;color:var(--text3);margin:0.2rem 0 0.4rem">Pick the .pem GitHub downloaded (or paste it below). It is never shown, and it mints tokens only — delete the downloaded file afterwards.</div>
     </div>
     <div id="s-key-fields" style="display:none">
       <label>Key / Value</label><textarea id="s-key-value" rows="3" placeholder="API key, token, or the whole private key (-----BEGIN … KEY-----)" autocapitalize="off" autocorrect="off" spellcheck="false" style="width:100%;font-family:monospace;font-size:0.75rem;-webkit-text-security:disc"></textarea>
@@ -2805,6 +2810,8 @@ function updateStoreFields() {
   const keyFields = document.getElementById('s-key-fields');
   // A login and an SSH key both sign in as someone: the username is kept with the secret (ssh_exec's default user).
   document.getElementById('s-user-fields').style.display = (t === 'password' || t === 'ssh_credential') ? 'block' : 'none';
+  // A GitHub App key: the App ID and the .pem (a file pick into the masked box, or a paste) — nothing else applies.
+  document.getElementById('s-app-fields').style.display = t === 'github_app_key' ? 'block' : 'none';
   if (t === 'password') {
     loginFields.style.display = 'block';
     keyFields.style.display = 'none';
@@ -2812,6 +2819,19 @@ function updateStoreFields() {
     loginFields.style.display = 'none';
     keyFields.style.display = 'block';
   }
+}
+
+// A GitHub App's .pem, picked from the device: read into the masked key box, never shown. Only its shape is checked
+// here (the server checks it is an RSA private key); the message names the file, not its contents.
+async function pickPemFile(input){
+  const f = input && input.files && input.files[0]; const m = document.getElementById('s-app-pem-msg');
+  if (!f) return;
+  if (f.size > 16384) { m.textContent = 'That file is too large for a GitHub App key'; input.value = ''; return; }
+  let text = ''; try { text = await f.text(); } catch (_) { m.textContent = 'Could not read that file'; return; }
+  input.value = '';
+  if (!/-----BEGIN (RSA )?PRIVATE KEY-----[\s\S]+-----END (RSA )?PRIVATE KEY-----/.test(text)) { text = ''; m.textContent = 'That file is not a private key .pem'; return; }
+  document.getElementById('s-key-value').value = text.trim(); text = '';
+  m.textContent = 'Key loaded from ' + String(f.name || 'the file').slice(0, 60) + ' (not shown). Delete the downloaded file once stored.';
 }
 
 // Actions
@@ -2833,6 +2853,11 @@ async function storeSecret(){
   }
 
   if(!n||!v){m.textContent='Name and value required';m.className='modal-msg err';return}
+  const appId = t === 'github_app_key' ? (document.getElementById('s-app-id').value || '').trim() : '';
+  if (t === 'github_app_key') {
+    if (!/^\d{1,12}$/.test(appId)) { m.textContent='App ID: the number on the app\'s GitHub settings page (General → App ID)'; m.className='modal-msg err'; return; }
+    if (!/^-----BEGIN (RSA )?PRIVATE KEY-----[\s\S]+-----END (RSA )?PRIVATE KEY-----$/.test(v.trim())) { m.textContent='Private key: pick the .pem GitHub downloaded, or paste the whole file'; m.className='modal-msg err'; return; }
+  }
 
   // Build description from username + host
   let desc = '';
@@ -2846,9 +2871,10 @@ async function storeSecret(){
 
   // if_absent: a name already in the vault is refused, not overwritten. username and host travel as fields (the host
   // binds the default scope to that machine), not only as description text.
-  const body = { name: n, value: v, secret_type: t, if_absent: true };
+  const body = { name: n, value: t === 'github_app_key' ? v.trim() : v, secret_type: t, if_absent: true };
+  if (appId) body.github_app_id = appId;
   if (username) body.username = username;
-  if (host) body.host = host;
+  if (host && t !== 'github_app_key') body.host = host;
   if (note) body.note = note;
   if (exp && !/^\d+(m|h|d)$/.test(exp)) { m.textContent='Expires in: a number and m, h or d — e.g. 30d'; m.className='modal-msg err'; return; }
   if (exp) body.expires_in = exp;

@@ -377,6 +377,7 @@ module.exports = function registerSecretSharing(deps) {
     if (secret.frozen) return res.status(423).json({ error: 'the owner froze this secret', frozen: true });
     // Critical: a reveal also takes the owner's approval of this recipient's request (checked, then the PIN, then spent).
     const approvals = deps.approvals && deps.approvals();
+    if (secret.secret_type === 'github_app_key') return res.status(403).json({ error: 'a GitHub App key is never revealed — it only mints installation tokens' });
     const critical = approvals && approvals.depthOf(secret) === 'critical';
     if (critical) {
       const g = approvals.gate(secret, { did: me.did, label: 'share reveal' }, { kind: 'reveal' }, req.body || {}, { peek: true });
