@@ -82,6 +82,9 @@ SUB=$(python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; p+="="*(-
 call GET /api/demipass/list "$TOK"; [ "$CODE" = 200 ] && ok "…and works as conduit" || fail "use: $CODE $BODY"
 call POST /api/fleet/aaron-agents/silicons/conduit/token "$TOK" '{}'; [ "$CODE" = 403 ] && ok "…but cannot run the fleet (fleet_owner_mint)" || fail "fleet mint with it: $CODE"
 call POST /api/silicon-token-requests/$R1/claim "" '{"claim_secret":"'$SECRET'"}'; [ "$CODE" = 410 ] && ok "a second claim → 410" || fail "reclaim: $CODE"
+# #99 review M1: an agent token reads no decided-approval history and no 30-day scan-request history
+call GET "/api/demipass/approvals?limit=200" "$TOK"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["recent"]), len(d["incoming"]))')" = "0 0" ] && ! echo "$BODY" | grep -q '"call"\|"binding"\|"unwrap"\|"summary"\|"purpose"' && ok "an agent token gets no approval history (recent, incoming empty), limit or not; outgoing without calls" || fail "agent approvals: $CODE $(echo "$BODY" | head -c 200)"
+call GET "/api/demipass/leak-scan/token-requests?all=1" "$TOK"; [ "$CODE" = 200 ] && ! echo "$BODY" | grep -q '"status":"\(claimed\|denied\|expired\|approved\)"' && ok "…and ?all=1 shows it only what waits" || fail "agent scan history: $BODY"
 call POST /api/fleet/aaron-agents/silicons/sib/token-requests "$TOK" '{}'
 [ "$CODE" = 403 ] && [ "$(Q "SELECT COUNT(*) FROM silicon_token_requests WHERE handle='sib'")" = 0 ] && ok "a fleet-minted token cannot ask for a fleet-created sibling's token" || fail "minted asks: $CODE $BODY"
 call GET /api/silicon-token-requests "$TOK"; [ "$CODE" = 403 ] && ok "…nor list the owner's requests" || fail "minted lists: $CODE"

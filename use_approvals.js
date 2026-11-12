@@ -368,8 +368,18 @@ module.exports = function registerUseApprovals(deps) {
     expireOld();
     const incoming = db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC LIMIT 50").all(auth.did);
     const outgoing = db.prepare("SELECT * FROM use_approvals WHERE requester_did = ? ORDER BY id DESC LIMIT 20").all(auth.did);
-    const recent = db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status != 'pending' ORDER BY id DESC LIMIT 20").all(auth.did);
-    res.json({ ok: true, incoming: auth.silicon ? [] : incoming.map(r => view(r, auth.did)), outgoing: outgoing.map(r => view(r, auth.did)), recent: recent.map(r => view(r, auth.did)) });
+    // An agent token (a silicon, a worker, a fleet-owner mint) resolves to its owner's DID: it sees neither what waits on
+    // the owner nor the owner's decided history (#99 review M1). ?limit= (20–200) is for the owner's own session: the
+    // app's Requests page lists decided requests so one can be found by number (Aaron 2026-11-12).
+    const agent = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint')));
+    const lim = agent ? 0 : Math.min(200, Math.max(20, Number.parseInt(req.query.limit, 10) || 20));
+    const recent = lim ? db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status != 'pending' ORDER BY id DESC LIMIT ?").all(auth.did, lim) : [];
+    // An agent's own requests are filed under its owner's DID, so outgoing holds every agent's: without the bound call
+    // and binding for an agent token, one agent cannot read another's request details (#99 re-review L1).
+    // Nor the phone-wrap material, whether it was opened, what it does or why: an agent reads its own request in full
+    // with GET /approvals/:id.
+    const lean = (v) => { const { call, binding, unwrap, opened, summary, purpose, ...rest } = v; return rest; };
+    res.json({ ok: true, incoming: agent ? [] : incoming.map(r => view(r, auth.did)), outgoing: outgoing.map(r => agent ? lean(view(r, auth.did)) : view(r, auth.did)), recent: recent.map(r => view(r, auth.did)) });
   });
 
   // GET /api/blindkey/approvals/:id — status for the owner or the requester (never a code).

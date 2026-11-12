@@ -1890,3 +1890,78 @@ test('leak report: one button for all hits, the email box names the masked forwa
   assert.match(pg.el('leak-report-out').innerHTML, /e9361b18\.jsonl:41-41/);
   assert.match(pg.el('leak-report-out').innerHTML, /Copy report/);
 });
+
+// Aaron 2026-11-12: "no search in approvals or tokens … request 14 can't be found at all"; "pending approvals need a
+// count and a list at the top"; "pools collapse on their own and the view auto-scrolls upward while I'm reading".
+const reqRoutes = (extra) => async (p, b) => {
+  if (p.startsWith('/api/identity/trust')) return { json: trustOk };
+  if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
+  const x = extra && await extra(p, b); if (x) return x;
+  if (p === '/api/blindkey/approvals') return { json: { incoming: [{ id: 55, status: 'pending', requester: 'aaron', secret: { name: 'x' }, summary: 'delegation-widen', depth: 'elevated', expires_at: '2026-11-13T03:04:24Z', created_at: '2026-11-12T03:04:24Z' }], outgoing: [], recent: [] } };
+  if (p === '/api/blindkey/approvals?limit=200') return { json: { incoming: [{ id: 55, status: 'pending', requester: 'aaron', secret: { name: 'x' }, summary: 'delegation-widen', created_at: '2026-11-12T03:04:24Z', expires_at: '2026-11-13T03:04:24Z' }],
+    outgoing: [], recent: [{ id: 52, status: 'expired', requester: 'aaron', secret: { name: 'racknerd-root' }, summary: 'ssh : grep nginx', created_at: '2026-11-12T01:00:00Z' }, { id: 53, status: 'used', requester: 'aaron', secret: { name: 'racknerd-root' }, summary: 'ssh : bash -s', created_at: '2026-11-12T02:00:00Z' }] } };
+  if (p === '/api/blindkey/leak-scan/token-requests') return { json: { requests: [{ id: 15, labels: ['scrub-x'], requested_by: 'flimflam', status: 'pending', created_at: '2026-11-12T03:00:00Z' }] } };
+  if (p === '/api/blindkey/leak-scan/token-requests?all=1') return { json: { requests: [{ id: 15, labels: ['pane-start'], requested_by: 'flimflam', status: 'pending', created_at: '2026-11-12T03:00:00Z' }, { id: 14, labels: ['pane-daily'], requested_by: 'flimflam', status: 'claimed', created_at: '2026-11-11T09:44:07Z' }] } };
+  if (p === '/api/silicon-token-requests') return { json: { requests: [] } };
+  if (p === '/api/silicon-token-requests?all=1') return { json: { requests: [{ id: 8, fleet: 'aaron-agents', handle: 'brain-conduit', scope: 'transact', expires_in: '30d', requested_by: 'brain', creates: true, status: 'claimed', created_at: '2026-11-11T09:34:00Z' },
+    { id: 9, fleet: 'aaron-agents', handle: 'claude', scope: 'transact', expires_in: '30d', requested_by: 'brain', requester_role: 'other_agent', status: 'pending', created_at: '2026-11-12T03:30:00Z' }] } };
+  return { json: { ok: true } };
+};
+
+test('requests: the top bar counts what waits on you; the Requests page finds any request by number, state and requester', async () => {
+  const pg = page({ storage: signedIn, routes: reqRoutes() });
+  await settle(12);
+  await pg.ctx.loadApprovals(); await pg.ctx.loadScanRequests(); await settle();
+  assert.match(pg.el('req-badge').innerHTML, /Requests<b>2<\/b>/, 'one use approval + one scan request waiting');
+  assert.match(pg.el('req-badge').className, /waiting/);
+  await pg.ctx.loadRequestsAll(); await settle();
+  let list = pg.el('req-list').innerHTML;
+  assert.match(list, /Use approval #55/); assert.match(list, /Scan token #15/);
+  assert.doesNotMatch(list, /#14/, 'pending is the default filter');
+  vm.runInContext("reqFilter.status=''; reqFilter.q='#14'; renderRequests();", pg.ctx);
+  list = pg.el('req-list').innerHTML;
+  assert.match(list, /Scan token #14/, 'an approved and claimed request is found by number');
+  assert.doesNotMatch(list, /#15|#55|#8\b/);
+  vm.runInContext("reqFilter.q='8'; renderRequests();", pg.ctx);
+  assert.match(pg.el('req-list').innerHTML, /Agent token #8/); assert.match(pg.el('req-list').innerHTML, /create @brain-conduit/);
+  vm.runInContext("reqFilter.q=''; reqFilter.status='expired'; renderRequests();", pg.ctx);
+  assert.match(pg.el('req-list').innerHTML, /Use approval #52/); assert.doesNotMatch(pg.el('req-list').innerHTML, /#53/);
+  vm.runInContext("reqFilter.status=''; reqFilter.who='brain'; renderRequests();", pg.ctx);
+  assert.match(pg.el('req-list').innerHTML, /#8/); assert.doesNotMatch(pg.el('req-list').innerHTML, /#14|#52/);
+  assert.match(pg.el('req-who').innerHTML, /@brain/); assert.match(pg.el('req-who').innerHTML, /@flimflam/);
+  assert.match(pg.el('req-status').innerHTML, /Expired 1/);
+  vm.runInContext("reqFilter.who=''; reqFilter.q='<img src=x onerror=1>'; renderRequests();", pg.ctx);
+  assert.doesNotMatch(pg.el('req-list').innerHTML, /<img/);
+  // #99 review M2: from the badge's Pending view, a number finds the request in whatever state it is in
+  vm.runInContext("reqFilter.status='pending'; reqFilter.q='14'; renderRequests();", pg.ctx);
+  assert.match(pg.el('req-list').innerHTML, /Scan token #14/);
+  vm.runInContext("reqFilter.q='#014'; renderRequests();", pg.ctx);
+  assert.match(pg.el('req-list').innerHTML, /Scan token #14/, 'leading zeros');
+  // #99 review M3: another agent asking for an agent's token carries the same warning as its card
+  vm.runInContext("reqFilter.q='9'; renderRequests();", pg.ctx);
+  assert.match(pg.el('req-list').innerHTML, /Another agent, @brain, asks for @claude's token/);
+  assert.match(pg.el('req-list').innerHTML, /reqAgentDecide\(9,true\)/);
+  // #99 review M4: sign-out leaves nothing of this account's requests behind
+  pg.ctx.logout(); await settle();
+  assert.equal(pg.el('req-list').innerHTML, ''); assert.equal(pg.el('req-badge').innerHTML, 'Requests');
+  assert.equal(vm.runInContext('reqAll.length + approvals.length + scanReqs.length + agentTokReqs.length', pg.ctx), 0);
+  assert.equal(vm.runInContext('reqFilter.status + "|" + reqFilter.q + "|" + reqFilter.who', pg.ctx), 'pending||');
+});
+
+test('pools: one the owner opened stays open across refreshes, and a refresh with nothing new does not redraw', async () => {
+  const secretsNow = [{ name: 'quiet', type: 'api_key', health: 'green', category: 'api', use_count: 1 }];
+  const pg = page({ storage: { ...signedIn, 'dp.poolOpen.did:key:zFixture': JSON.stringify({ api: true }), 'dp.poolOpen.did:key:zSomeoneElse': JSON.stringify({ api: false }) }, routes: vaultRoutes((p) => (p === '/api/demipass/dashboard' ? { json: { balance_dd: 1, health_summary: {}, secrets: secretsNow } } : null)) });
+  await settle();
+  await pg.ctx.__realLoadVault();
+  const html = pg.el('secret-list').innerHTML;
+  assert.match(html, /data-group="api" style="display:block/, 'a healthy pool the owner opened is open (it used to fold back)');
+  assert.match(html, /data-chevron="api">▾/);
+  pg.el('secret-list').innerHTML = html;   // as the browser holds it
+  let writes = 0; const el = pg.el('secret-list'); let cur = el.innerHTML;
+  Object.defineProperty(el, 'innerHTML', { get: () => cur, set: (v) => { writes++; cur = v; }, configurable: true });
+  await pg.ctx.__realLoadVault();
+  assert.equal(writes, 0, 'same data: the list is not redrawn (no fold, no jump)');
+  secretsNow.push({ name: 'new-one', type: 'api_key', health: 'green', category: 'api', use_count: 0 });
+  await pg.ctx.__realLoadVault();
+  assert.equal(writes, 1, 'a real change redraws once'); assert.match(cur, /new-one/); assert.match(cur, /data-group="api" style="display:block/);
+});
