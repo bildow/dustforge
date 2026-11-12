@@ -539,7 +539,28 @@ app.use((req, res, next) => {
 // MTA hook above.
 const _jsonParser = express.json();
 const _useJsonParser = express.json({ limit: useLimits.USE_MAX_REQUEST_BYTES }); // POST /use: see use_limits.js
-const isUsePath = (p) => /^\/api\/(demipass|blindkey)\/use\/?$/i.test(p);   // Express matches case- and trailing-slash-insensitively
+const isUsePath = (p) => /^\/api\/(demipass|blindkey)\/use\/?$/i.test(p);
+// A secret's value never leaves in an error (2026-11-12, found reviewing #104): a header_prefix with a control
+// character made Node's fetch throw an error quoting the whole header (value included), and /use returned
+// `action failed: ${e.message}` to the agent and stored it in secret_outcomes. Header params are checked before any
+// request is built, and every error from a call that carried a secret is scrubbed before it is returned or stored.
+const USE_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/;
+function useHeaderParamsRefusal(name, prefix) {
+  if (typeof name !== 'string' || !USE_HEADER_NAME_RE.test(name)) return 'header_name: a plain HTTP header name (letters, digits and - . _ etc.; no spaces or control characters)';
+  if (typeof prefix !== 'string' || prefix.length > 256 || /[\x00-\x08\x0a-\x1f\x7f]/.test(prefix)) return 'header_prefix: printable text of at most 256 characters (no control characters)';
+  return null;
+}
+function scrubSecretFromError(msg, value) {
+  let m = String(msg == null ? '' : msg);
+  if (/invalid header (name|value)|Headers\.(append|set)|ERR_INVALID_CHAR|ERR_HTTP_INVALID_HEADER|header content/i.test(m)) return 'the request headers were refused (check header_name / header_prefix)';
+  if (typeof value === 'string' && value.length >= 4) {
+    const forms = new Set([value, JSON.stringify(value).slice(1, -1), encodeURIComponent(value), Buffer.from(value).toString('base64')]);
+    for (const f of forms) if (f && f.length >= 4) m = m.split(f).join('[secret]');
+    // any 12-character piece of the value still there (an escaped or partial copy): withhold the whole message
+    for (let i = 0; i + 12 <= value.length; i += 4) if (m.includes(value.slice(i, i + 12))) return 'details withheld (they included part of the secret)';
+  }
+  return m;
+}   // Express matches case- and trailing-slash-insensitively
 // The leak scanner and the scrubber parse their own (2 MiB) bodies: the global parser leaves them alone (leak_scan.js).
 const isLeakScanPath = (p) => /^\/api\/(demipass|blindkey)\/leak-scan(\/scrub)?\/?$/i.test(p);
 const _urlencodedParser = express.urlencoded({ extended: false });
@@ -5347,6 +5368,7 @@ async function useRoute(req, res) {
       switch (action) {
         case 'http_header': {
           const { method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params;
+          { const hr = useHeaderParamsRefusal(header_name, header_prefix); if (hr) return res.status(400).json({ error: hr }); }
           // FIX #4: use ONLY the token's pre-validated URL, never caller override
           const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'params.url or token target_url required for http_header action' });
@@ -5689,7 +5711,7 @@ async function useRoute(req, res) {
       // Track failure outcome
       try {
         db.prepare('INSERT INTO secret_outcomes (secret_id, did, action_type, outcome, error_summary, agent_name) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(secret.id, req.identity.did, action, 'failure', e.message.slice(0, 200), req.identity?.agent_name || '');
+          .run(secret.id, req.identity.did, action, 'failure', scrubSecretFromError(e.message, decryptedValue).slice(0, 200), req.identity?.agent_name || '');
       } catch(_) {}
 
       if (isCutOff(e)) {
@@ -5715,7 +5737,7 @@ async function useRoute(req, res) {
         } catch (_) {}
         return res.status(e.code === 'upstream_redirect' ? 502 : 413).json(e.body);
       }
-      return res.status(500).json({ error: `action failed: ${e.message}` });
+      return res.status(500).json({ error: `action failed: ${scrubSecretFromError(e.message, decryptedValue)}` });
     }
   }
 
@@ -5787,6 +5809,7 @@ async function useRoute(req, res) {
         // SECURITY: only allow requests to whitelisted API providers
         // The response body is REDACTED to prevent echo-based exfiltration
         const { url: askedUrl, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = params || {};
+        { const hr = useHeaderParamsRefusal(header_name, header_prefix); if (hr) return res.status(400).json({ error: hr }); }
         if (!askedUrl) return res.status(400).json({ error: 'params.url required for http_header action' });
         const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
         if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
@@ -5940,7 +5963,7 @@ async function useRoute(req, res) {
     if (isCutOff(e)) { countUse(); return answerCutOff(req, res, action, USE_TIMEOUT_DEFAULT_S * 1000); }   // #96 review M1
     if (e.code === 'upstream_too_large') { countUse(); return res.status(413).json(e.body); }
     if (e.code === 'upstream_redirect') { countUse(); return res.status(502).json(e.body); }   // the request went out
-    res.status(500).json({ error: `action failed: ${e.message}` });
+    res.status(500).json({ error: `action failed: ${scrubSecretFromError(e.message, decryptedValue)}` });
   } finally {
     if (reservedCtx && !counted) db.prepare('UPDATE blindkey_contexts SET use_count = MAX(use_count - 1, 0) WHERE id = ?').run(reservedCtx);
   }
@@ -6738,6 +6761,7 @@ async function handleRowenDeliver(req, res) {
     switch (action) {
       case 'http_header': {
         const { url: askedUrl, method = 'GET', header_name = 'Authorization', header_prefix = 'Bearer ', body: reqBody } = action_params || {};
+        { const hr = useHeaderParamsRefusal(header_name, header_prefix); if (hr) return res.status(400).json({ error: hr }); }
         if (!askedUrl) return res.status(400).json({ error: 'action_params.url required for http_header action' });
         const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
         if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
@@ -6851,7 +6875,7 @@ async function handleRowenDeliver(req, res) {
   } catch (e) {
     if (e.code === 'upstream_too_large') return res.status(413).json(e.body);
     if (e.code === 'upstream_redirect') return res.status(502).json(e.body);
-    res.status(500).json({ error: `action failed: ${e.message}` });
+    res.status(500).json({ error: `action failed: ${scrubSecretFromError(e.message, decryptedValue)}` });
   }
 }
 
@@ -14474,6 +14498,8 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS secret_outcomes (
   agent_name TEXT DEFAULT '',
   created_at TEXT DEFAULT CURRENT_TIMESTAMP
 )`); } catch(e) {}
+// Rows written before the 2026-11-12 fix could hold a header error that quoted the secret: rewritten once at start.
+try { db.prepare("UPDATE secret_outcomes SET error_summary = 'the request headers were refused (scrubbed)' WHERE error_summary LIKE 'Headers.%' OR error_summary LIKE '%invalid header%' OR error_summary LIKE '%ERR_INVALID_CHAR%'").run(); } catch (_) {}
 
 // Add frozen column to secrets
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN frozen INTEGER DEFAULT 0"); } catch(_) {}
