@@ -86,8 +86,9 @@ module.exports = function registerUseApprovals(deps) {
   // be used: end it here, so the requester can ask again at once instead of being handed the dead one back as
   // already_pending until it times out (Aaron 2026-11-08, approval 34 after the #80 deploy).
   try {
+    // A scope change (kind 'scope') uses no value and no key: it survives a restart whatever the secret's wrap state.
     const dead = db.prepare(`SELECT a.id, a.requester_did, a.secret_id FROM use_approvals a JOIN blindkey_secrets s ON s.id = a.secret_id
-        WHERE a.status IN ('pending', 'approved') AND (a.eph_pub IS NOT NULL OR s.wrap_state = 'device')`).all();
+        WHERE a.status IN ('pending', 'approved') AND a.kind != 'scope' AND (a.eph_pub IS NOT NULL OR s.wrap_state = 'device')`).all();
     const end = db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ?, unwrap_blob = NULL WHERE id = ? AND status IN ('pending', 'approved')");
     for (const r of dead) {
       end.run(new Date().toISOString(), r.id);
@@ -141,6 +142,18 @@ module.exports = function registerUseApprovals(deps) {
   // A one-line headline for the card. The owner approves the full bound call (`call`, shown as JSON), never this alone.
   function summaryOf({ kind, action, targetHost, targetUrl, params }) {
     if (kind === 'reveal') return 'reveal the value';
+    if (kind === 'scope') {
+      // A change to what the secret reaches (server.js scopeChangeGate): the card names the scope, the methods and
+      // the agent it is handed to; the owner approves the full bound change below it.
+      const q = params || {};
+      const who = (d) => String(d || '').replace(/^did:key:/, '').slice(0, 12) + '…';
+      const methods = Array.isArray(q.allowed_methods) ? (q.allowed_methods.length ? q.allowed_methods.map(m => String(m).toUpperCase()).join('/') + ' only' : 'no method') : null;
+      const what = action === 'delegate' ? `hand it to agent ${who(q.delegate_did)}${q.context_name ? ` for scope '${q.context_name}'` : ' for every scope'}`
+        : action === 'context-add' ? `new scope '${q.context_name}': ${q.action_type}${methods ? ' ' + methods : ''} on ${targetUrl || targetHost || 'any host'}${q.delegate_did ? `, handed to agent ${who(q.delegate_did)}` : ''}`
+        : action === 'context-edit' ? `change scope: ${methods ? methods + ' on ' : ''}${targetUrl || targetHost || 'any host'}${q.status ? ` (${q.status})` : ''}`
+        : `${action}: ${targetUrl || targetHost || ''}`;
+      return cleanLabel(what, 120);
+    }
     if (kind === 'service') {
       // Name what is granted, so two requests never look alike on the card (#77 review L2).
       const q = params || {};
@@ -241,16 +254,17 @@ module.exports = function registerUseApprovals(deps) {
     }
     // DemiPass grants wait a day, so they have their own queue (#77 review M3): they cannot crowd out uses of secrets,
     // and the owner's own DID — whatever labels it signs in under — holds at most MAX_PENDING_GRANTS_OWN of them.
-    const grant = isGrantKey(secret.service_key);
-    const pending = db.prepare(`SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending' AND ${grant ? "service_key LIKE 'svc:demipass:%'" : "COALESCE(service_key, '') NOT LIKE 'svc:demipass:%'"}`).get(secret.did).n;
+    const grant = isGrantKey(secret.service_key) || kind === 'scope';   // a scope change waits a day too (the owner's own grant)
+    const GRANT_SQL = "(COALESCE(service_key, '') LIKE 'svc:demipass:%' OR kind = 'scope')";   // NULL keys count as ordinary
+    const pending = db.prepare(`SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND status = 'pending' AND ${grant ? GRANT_SQL : 'NOT ' + GRANT_SQL}`).get(secret.did).n;
     if (pending >= MAX_PENDING_PER_OWNER) return { error: 'too many approvals are waiting on this owner; try again later', status: 429 };
-    if (grant && own && db.prepare("SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND requester_did = ? AND status = 'pending' AND service_key LIKE 'svc:demipass:%'").get(secret.did, requesterDid).n >= MAX_PENDING_GRANTS_OWN) {
+    if (grant && own && db.prepare(`SELECT COUNT(*) AS n FROM use_approvals WHERE owner_did = ? AND requester_did = ? AND status = 'pending' AND ${GRANT_SQL}`).get(secret.did, requesterDid).n >= MAX_PENDING_GRANTS_OWN) {
       return { error: `at most ${MAX_PENDING_GRANTS_OWN} of your own grant requests can wait at once`, status: 429 };
     }
     const id = Number(db.prepare(`INSERT INTO use_approvals (kind, secret_id, owner_did, requester_did, requester_label, delegation_id, depth, purpose, summary,
                                   binding, code_key, created_at, expires_at, bound_call, service_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),
-           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(isGrantKey(secret.service_key) ? GRANT_PENDING_TTL_SEC : PENDING_TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
+           summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(grant ? GRANT_PENDING_TTL_SEC : PENDING_TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
     // Item 1: a wrapped secret's request gets a one-use key (private half in memory only) the phone unwraps to.
     if (cryptoDepth) cryptoDepth.onRequestCreated({ id }, secret);
     const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id);
@@ -418,11 +432,12 @@ module.exports = function registerUseApprovals(deps) {
     // (the request id and the exact call's binding); a session token alone approves nothing.
     if (deviceKeys) { const r = deviceKeys.approvalRefusal(auth, 'approval', row.id, row.binding, req.body); if (r) return res.status(r.status).json(r.body); }
     // Item 1: a wrapped secret's approval carries the phone's unwrap (the data key, re-encrypted to the one-use key).
+    // A scope change (kind 'scope') uses no value, so a wrapped secret's scope is approved without one.
     const sec = secretOf(row.secret_id);
-    if (cryptoDepth) { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
-    if (cryptoDepth && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
+    if (cryptoDepth && row.kind !== 'scope') { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
+    if (cryptoDepth && row.kind !== 'scope' && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
-      .run(nowIso(), nowIso(), later(isGrantKey(row.service_key) ? GRANT_APPROVED_TTL_SEC : TTL_SEC), row.id).changes;
+      .run(nowIso(), nowIso(), later(isGrantKey(row.service_key) || row.kind === 'scope' ? GRANT_APPROVED_TTL_SEC : TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'this request was decided meanwhile' });
     event('approval_approved', auth.did, row.secret_id, { approval_id: row.id, requester_did: row.requester_did, via: 'app' });
     logSecurityEvent('approval_approved', 'info', { caller_did: auth.did, capability: row.kind, context: { approval_id: row.id, requester_did: row.requester_did } });

@@ -53,8 +53,15 @@ call POST /api/demipass/use "$AG" '{"ref":"'$REF'","params":{"url":"https://evil
 CID=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID")
 call POST /api/demipass/context/add "$AG" '{"secret_name":"svc","context_name":"gh","action_type":"http_header","target_url_pattern":"https://api.github.com/*"}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = "scope:$SID" ] && ok "the owner's own second token (device-login case) adding a scope → 403, PIN asked" || fail "agent add: $CODE $BODY"
+# Since 2026-11-12 an agent with no PIN to give may ask the owner instead: the widening parks as a request the owner opens
+# with the PIN and approves on the phone (kind 'scope', critical). Nothing changes until then.
+call POST /api/demipass/context/add "$AG" '{"secret_name":"svc","context_name":"gh","action_type":"http_header","target_url_pattern":"https://api.github.com/*","ask_owner":true}'
+[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = approval_pending ] && [ "$(Q "SELECT kind||'/'||depth FROM use_approvals WHERE id=$(echo "$BODY" | J approval_id)")" = "scope/critical" ] \
+  && [ "$(Q "SELECT COUNT(*) FROM blindkey_contexts WHERE secret_id=$SID")" = 1 ] && ok "…with ask_owner:true → 202, a request on the owner's phone; no scope yet" || fail "agent add ask_owner: $CODE $BODY"
 call PATCH /api/demipass/context/$CID "$AG" '{"target_url_pattern":"*"}'
 [ "$CODE" = 403 ] && ok "widening an existing scope to '*' without the PIN → 403" || fail "agent widen: $CODE $BODY"
+call PATCH /api/demipass/context/$CID "$AG" '{"target_url_pattern":"*","ask_owner":true}'
+[ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = approval_pending ] && ok "…with ask_owner:true → 202, a request on the phone" || fail "agent widen ask_owner: $CODE $BODY"
 [ "$(Q "SELECT target_url_pattern FROM blindkey_contexts WHERE id=$CID")" = "https://repo.dustroot.com/*" ] && ok "…and nothing changed" || fail "widen leaked"
 call PATCH /api/demipass/context/$CID "$AG" '{"max_uses":100}'
 [ "$CODE" = 200 ] && ok "narrowing (a use cap) stays open to the owner's tokens" || fail "narrow: $CODE $BODY"

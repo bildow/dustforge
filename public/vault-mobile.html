@@ -2413,6 +2413,15 @@ function showDetail(name) {
         else for (const cmd of cmds) h += `<div style="display:flex;justify-content:space-between;gap:0.4rem;padding:0.1rem 0"><code style="word-break:break-all">${esc(cmd)}</code><a href="#" style="color:var(--red)" onclick="setCommands(${Number(c.id)},${jsArg(JSON.stringify(cmds.filter(x=>x!==cmd)))},${jsArg(s.name)});return false">remove</a></div>`;
         h += `<a href="#" style="color:var(--accent)" onclick="addCommand(${Number(c.id)},${jsArg(JSON.stringify(cmds||[]))},${jsArg(s.name)});return false">+ allow a command</a></div>`;
       }
+      // HTTP: which methods the scope allows. Any (set before 2026-11-12) until the owner restricts it; adding one needs the PIN.
+      if ((c.action_type === 'http_header' || c.action_type === 'http_body') && c.id) {
+        const ms = c.allowed_methods;
+        h += `<div style="margin:0 0 0.4rem 1rem;font-size:0.7rem">`;
+        if (ms === null || ms === undefined) h += `<div style="color:var(--orange)">any method <a href="#" style="color:var(--accent)" onclick="setMethods(${Number(c.id)},['GET'],${jsArg(s.name)});return false">GET only</a></div>`;
+        else if (!ms.length) h += `<div style="color:var(--text3)">no methods allowed yet — nothing runs</div> <a href="#" style="color:var(--accent)" onclick="setMethods(${Number(c.id)},['GET'],${jsArg(s.name)});return false">allow GET</a>`;
+        else h += `<div style="display:flex;justify-content:space-between;gap:0.4rem;padding:0.1rem 0"><span>methods: <code>${esc(ms.join(' '))}</code></span><a href="#" style="color:var(--accent)" onclick="editMethods(${Number(c.id)},${jsArg(JSON.stringify(ms))},${jsArg(s.name)});return false">change</a></div>`;
+        h += `</div>`;
+      }
     }
   } else {
     h += `<div style="font-size:0.72rem;color:var(--text3)">No scope yet — this secret can't be used until you add one.</div>`;
@@ -3283,6 +3292,19 @@ async function apiGatedInner(method, path, body, what){
   return d;
 }
 
+// HTTP methods a scope allows (GET POST …). Adding one is widening (PIN); fewer is not.
+async function setMethods(contextId, list, name){
+  if(typeof list==='string') list=JSON.parse(list);
+  try{ await apiGated('PATCH','/api/blindkey/context/'+contextId,{allowed_methods:list},'Change which HTTP methods '+name+' may use? Your PIN approves adding one.'); await loadVault(); showDetail(name); }
+  catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
+}
+async function editMethods(contextId, current, name){
+  if(typeof current==='string') current=JSON.parse(current);
+  const v=prompt('HTTP methods this scope allows, separated by spaces (GET HEAD POST PUT PATCH DELETE OPTIONS):', (current||[]).join(' '));
+  if(v===null) return;
+  const list=v.toUpperCase().split(/[\s,]+/).filter(Boolean);
+  await setMethods(contextId, list, name);
+}
 // SSH forced commands: an exact command, or "prefix *" (plain words after it). Adding is widening (PIN).
 async function setCommands(contextId, list, name){
   if(typeof list==='string') list=JSON.parse(list);

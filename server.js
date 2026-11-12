@@ -43,7 +43,7 @@ const INNER_RING_CONFIG = {
 
 // DemiPass SSH host whitelist — only these hosts can be targeted via ssh_exec
 // Consolidated host whitelists — single source of truth for all DemiPass action types
-const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com', 'api.cloudflare.com', 'api.resend.com', 'flowhook.dustforge.com', 'api.dustforge.com', 'repo.dustroot.com', 'stringline.dustforge.com', 'stringline.dustroot.com', 'api.open.fec.gov'];
+const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.com', 'generativelanguage.googleapis.com', 'api.github.com', 'api.stripe.com', 'api.signalwire.com', 'api.cloudflare.com', 'api.resend.com', 'flowhook.dustforge.com', 'api.dustforge.com', 'repo.dustroot.com', 'stringline.dustforge.com', 'stringline.dustroot.com', 'api.open.fec.gov', 'server.dustroot.com'];
 const BLINDKEY_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
 const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
@@ -3567,15 +3567,16 @@ function urlPatternMatch(pattern, canonical) {
 // Insert contexts for a secret (used by deposit, context/add, and rowen/ingest)
 function insertBlindkeyContexts(secretId, contexts, allowedBy) {
   const insertCtx = db.prepare(`
-    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, command_allowlist)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, command_allowlist, allowed_methods)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(secret_id, context_name) DO UPDATE SET
       action_type = excluded.action_type,
       target_url_pattern = excluded.target_url_pattern,
       target_host_pattern = excluded.target_host_pattern,
       allowed_by = excluded.allowed_by,
       max_uses = excluded.max_uses,
-      command_allowlist = excluded.command_allowlist
+      command_allowlist = excluded.command_allowlist,
+      allowed_methods = excluded.allowed_methods
   `);
   let created = 0;
   for (const ctx of contexts) {
@@ -3590,7 +3591,9 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
       ctx.target_host_pattern || '*',
       allowedBy,
       ctx.max_uses || 0,
-      ctx.action_type === 'ssh_exec' ? (parseAllowedCommands(ctx.allowed_commands).value || '[]') : null   // invalid or absent → nothing runs
+      ctx.action_type === 'ssh_exec' ? (parseAllowedCommands(ctx.allowed_commands).value || '[]') : null,   // invalid or absent → nothing runs
+      // HTTP: absent → any method (as before); an unreadable list → nothing (never "any" by accident)
+      HTTP_SCOPE_ACTIONS.has(ctx.action_type) ? (parseAllowedMethods(ctx.allowed_methods).error ? '[]' : parseAllowedMethods(ctx.allowed_methods).value) : null
     );
     created++;
   }
@@ -3603,6 +3606,36 @@ function insertBlindkeyContexts(secretId, contexts, allowedBy) {
 // syntax). New ssh_exec contexts start as [] (nothing runs) until the owner lists commands with the PIN: the
 // forced-command pattern is the default.
 try { db.exec('ALTER TABLE blindkey_contexts ADD COLUMN command_allowlist TEXT DEFAULT NULL'); } catch (_) {}
+// An HTTP scope's methods (Aaron 2026-11-11: Brain's dashboard token reaches one path with GET and nothing else).
+// NULL = any method (scopes made before 2026-11-12); a JSON array = only these. The method is the caller's choice on
+// every use, so a URL pattern alone never said "read only" — this does.
+try { db.exec('ALTER TABLE blindkey_contexts ADD COLUMN allowed_methods TEXT DEFAULT NULL'); } catch (_) {}
+const HTTP_METHODS = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
+const HTTP_SCOPE_ACTIONS = new Set(['http_header', 'http_body']);
+function parseAllowedMethods(v) {
+  if (v === undefined || v === null) return { value: null };
+  if (!Array.isArray(v) || v.length > HTTP_METHODS.length || v.some(m => typeof m !== 'string' || !HTTP_METHODS.includes(m.trim().toUpperCase()))) {
+    return { error: `allowed_methods: an array of HTTP methods (${HTTP_METHODS.join(', ')})` };
+  }
+  return { value: JSON.stringify([...new Set(v.map(m => m.trim().toUpperCase()))]) };
+}
+const jsonList = (raw) => { if (raw === null || raw === undefined) return null; try { return JSON.parse(raw) || []; } catch (_) { return []; } };
+function methodRefusal(contextId, method) {
+  if (!contextId) return null;
+  const row = db.prepare('SELECT allowed_methods FROM blindkey_contexts WHERE id = ?').get(contextId);
+  if (!row || row.allowed_methods === null || row.allowed_methods === undefined) return null;   // legacy: any method
+  let list = [];
+  try { list = JSON.parse(row.allowed_methods) || []; } catch (_) { return 'this scope has an unreadable method list; its owner must set it again'; }
+  const m = String(method || 'GET').trim().toUpperCase();
+  if (list.includes(m)) return null;
+  return list.length ? `this scope allows only ${list.join('/')} here — its owner adds methods in the DemiPass app` : 'no methods are allowed for this scope yet — its owner adds them in the DemiPass app';
+}
+// A scope as the API shows it: the lists parsed, never the raw columns.
+function contextView(ctx) {
+  return { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern,
+    max_uses: ctx.max_uses, use_count: ctx.use_count, status: ctx.status, created_at: ctx.created_at,
+    allowed_commands: jsonList(ctx.command_allowlist), allowed_methods: jsonList(ctx.allowed_methods) };
+}
 const PLAIN_WORDS_RE = /^[A-Za-z0-9._\/:=@%+,-]+( [A-Za-z0-9._\/:=@%+,-]+)*$/;
 function parseAllowedCommands(v) {
   if (v === undefined || v === null) return { value: null };
@@ -3671,7 +3704,7 @@ function approvedBody(callJson) {
 
 // Creating, widening or approving a scope (red team item 13): the secret's owner, as a person in their own session, with
 // the PIN for intent scope:<secret id> — the one factor no agent holds. Admin key passes. Returns true or has answered.
-function scopeChangeGate(req, res, secret, what) {
+function scopeChangeGate(req, res, secret, what, use) {
   const actor = getDemiPassActor(req, null);
   if (actor.ok && actor.mode === 'admin') return true;
   const auth = getBearerIdentity(req);
@@ -3683,10 +3716,58 @@ function scopeChangeGate(req, res, secret, what) {
     return false;
   }
   const intent = `scope:${secret.id}`;
-  if (!gateFresh(auth.did, 'pin', auth, intent)) { res.status(403).json(gateMissing(what, ['pin'], ['pin'], intent)); return false; }
-  const refused = spendSingleUse(auth.did, what, ['pin'], auth, intent);
-  if (refused) { res.status(refused.status || 403).json(refused); return false; }
+  if (gateFresh(auth.did, 'pin', auth, intent)) {
+    const refused = spendSingleUse(auth.did, what, ['pin'], auth, intent);
+    if (refused) { res.status(refused.status || 403).json(refused); return false; }
+    return true;
+  }
+  // No PIN in this session. The app answers the challenge below with the PIN and retries. An agent signed in as the
+  // owner (a pane on a device login) has no PIN to give: with ask_owner:true the change is instead a request the owner
+  // opens with the PIN and approves on the phone, like every other grant (Aaron 2026-11-08) — it binds this exact
+  // change (the body as sent), waits a day, and the same call once more with approval_id applies it.
+  if (!use || !(req.body && req.body.ask_owner)) {
+    res.status(403).json({ ...gateMissing(what, ['pin'], ['pin'], intent), ...(use ? { ask_owner: 'no PIN here? send the same call with ask_owner:true — the owner approves it in the DemiPass app' } : {}) });
+    return false;
+  }
+  const d = auth.decoded || {};
+  const g = useApprovals.gate({ id: secret.id, did: secret.did, name: secret.name, ref_code: secret.ref_code, security_depth: 'critical', service_key: null, wrap_state: null },
+    { did: auth.did, label: d.agent_label || d.username || '' },
+    { kind: 'scope', action: use.action, targetUrl: use.targetUrl || '', targetHost: use.targetHost || '', params: use.params || req.body || {} }, req.body || {});
+  if (!g.ok) { res.status(g.status).json(g.body); return false; }
   return true;
+}
+// An agent a secret may be handed to (POST /api/blindkey/delegate, or a scope added with delegate_did): a wallet, not
+// the owner, not a person in the owner's network (they get a share), an active silicon of some fleet.
+function delegateEligibility(ownerDid, delegateDid) {
+  if (typeof delegateDid !== 'string' || delegateDid.length > 200) return { status: 400, error: 'delegate_did: string, max 200 chars' };
+  if (!db.prepare('SELECT did FROM identity_wallets WHERE did = ?').get(delegateDid)) return { status: 404, error: 'delegate_did not found in identity registry' };
+  if (delegateDid === ownerDid) return { status: 400, error: 'cannot delegate a secret to yourself' };
+  if (secretSharing.isPersonPeer(ownerDid, delegateDid)) return { status: 409, error: 'that DID is a person in your network — share with them through POST /api/demipass/shares {"secret","to"}; they accept it in their app' };
+  if (!secretSharing.isAgentWallet(delegateDid)) return { status: 403, error: 'a delegation goes to an agent (a silicon in a fleet) — to give a person access, share it (POST /api/demipass/shares); they accept it in their app' };
+  return {};
+}
+// A delegation bound to one scope. Returns { delegation } or { status, error } (a person's share sits on the same key).
+function grantContextDelegation(ownerDid, delegateDid, secret, contextId, grantedBy, { maxUses = 0, expiresAt = null, contextName = '' } = {}) {
+  db.prepare(`
+    INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
+      status = 'active', max_uses = excluded.max_uses, use_count = 0,
+      granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at, may_rotate = 0, timeout_seconds = NULL
+    WHERE COALESCE(demipass_delegations.delegate_kind, 'agent') = 'agent'
+  `).run(ownerDid, delegateDid, secret.id, contextId, maxUses || 0, grantedBy, expiresAt);
+  const delegation = db.prepare("SELECT id, COALESCE(delegate_kind, 'agent') AS kind FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?")
+    .get(ownerDid, delegateDid, secret.id, contextId);
+  // The upsert skips a person's share on the same key; then nothing was granted — say so, write no grant event.
+  if (delegation && delegation.kind === 'person') {
+    return { status: 409, error: 'that person holds a share of this secret for this context — manage it under shares (POST /api/demipass/shares/:id/…)', share_id: delegation.id };
+  }
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+    'delegation_granted', grantedBy, secret.id, contextName || '*',
+    JSON.stringify({ delegation_id: delegation.id, owner_did: ownerDid, delegate_did: delegateDid, max_uses: maxUses || 0, expires_at: expiresAt })
+  );
+  console.log(`[demipass] delegation granted: ${ownerDid} -> ${delegateDid} for secret "${secret.name}" context "${contextName || '*'}"`);
+  return { delegation };
 }
 
 // The outbound log: one blindkey_events row per connection /use makes, written right before it (red team item 2: a
@@ -5203,6 +5284,16 @@ async function useRoute(req, res) {
           return res.status(403).json({ error: why });
         }
       }
+      // So is a method off the scope's list (#97 review: the owner is never asked to approve a call that cannot run).
+      if (action === 'http_header' || action === 'http_body') {
+        const m = action_params.method || (action === 'http_body' ? 'POST' : 'GET');
+        const why = methodRefusal(tokenRow.context_id, m);
+        if (why) {
+          db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
+          logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: action, target: target_url, ip: req.ip, context: { secret: secret.name, method: m } });
+          return res.status(403).json({ error: why });
+        }
+      }
       // Security depth: an elevated or critical secret acts only on an approved request bound to this exact call
       // (the raw body, top level and params as sent — see use_approvals.js).
       let approvedElevatedUse = false;
@@ -5231,6 +5322,10 @@ async function useRoute(req, res) {
           // FIX #4: use ONLY the token's pre-validated URL, never caller override
           const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'params.url or token target_url required for http_header action' });
+          {   // a method off the scope's list is refused before anything connects
+            const why = methodRefusal(tokenRow.context_id, method);
+            if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'http_header', target: effectiveUrl, ip: req.ip, context: { secret: secret.name, method } }); return res.status(403).json({ error: why }); }
+          }
 
           const ALLOWED_HOSTS = BLINDKEY_HTTP_HOSTS;
           let urlHost;
@@ -5322,6 +5417,10 @@ async function useRoute(req, res) {
           // FIX #4: use ONLY the token's pre-validated URL, never caller override
           const effectiveUrl = target_url;
           if (!effectiveUrl) return res.status(400).json({ error: 'target_url must be set on the use-token for http_body action' });
+          {   // a method off the scope's list is refused before anything connects (#97 review)
+            const why = methodRefusal(tokenRow.context_id, bodyMethod);
+            if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'http_body', target: effectiveUrl, ip: req.ip, context: { secret: secret.name, method: bodyMethod } }); return res.status(403).json({ error: why }); }
+          }
 
           let urlHost;
           try { urlHost = new URL(effectiveUrl).hostname; } catch (_) { return res.status(400).json({ error: 'invalid URL' }); }
@@ -5608,6 +5707,11 @@ async function useRoute(req, res) {
     return res.status(403).json({ error: ctxCheck.error });
   }
   // A refused command neither runs nor counts against the scope's max_uses.
+  if (action === 'http_header' || action === 'http_body') {   // nor a method off the scope's list (#97 review)
+    const m = (params && params.method) || (req.body && req.body.method) || (action === 'http_body' ? 'POST' : 'GET');
+    const why = methodRefusal(ctxCheck.context_id, m);
+    if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: action, target: targetUrl, ip: req.ip, context: { secret: secret.name, method: m } }); return res.status(403).json({ error: why }); }
+  }
   if (action === 'ssh_exec') {
     const b2 = req.body || {};
     const why = commandRefusal(ctxCheck.context_id, b2.command, { sudo: b2.sudo, stdin: b2.stdin });
@@ -5658,6 +5762,10 @@ async function useRoute(req, res) {
         if (!askedUrl) return res.status(400).json({ error: 'params.url required for http_header action' });
         const url = ctxCheck.target_url;   // the canonical URL the scope was checked against (#43 re-review N1)
         if (!url) return res.status(403).json({ error: 'target URL not checked against a scope' });
+        {   // a method off the scope's list is refused before anything connects
+          const why = methodRefusal(ctxCheck.context_id, method);
+          if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'http_header', target: url, ip: req.ip, context: { secret: secret.name, method } }); return res.status(403).json({ error: why }); }
+        }
 
         // Whitelist: only known API providers — prevents exfiltration to attacker-controlled servers
         // Use the same consolidated whitelist as direct DemiPass use
@@ -5952,9 +6060,9 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
     let contextsTransferred = 0;
     for (const ctx of oldContexts) {
       db.prepare(`
-        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
+        INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist, allowed_methods)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+      `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null, ctx.allowed_methods ?? null);
       contextsTransferred++;
     }
 
@@ -6216,23 +6324,43 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
   if (!secret) return res.status(404).json({ error: 'secret not found' });
   const cmds = parseAllowedCommands((req.body || {}).allowed_commands);
   if (cmds.error) return res.status(400).json({ error: cmds.error });
-  // A new scope widens what the secret reaches: the owner's PIN (red team item 13).
-  if (!scopeChangeGate(req, res, secret, 'scope')) return;
+  const methods = parseAllowedMethods((req.body || {}).allowed_methods);
+  if (methods.error) return res.status(400).json({ error: methods.error });
+  if (methods.value !== null && !HTTP_SCOPE_ACTIONS.has(action_type)) return res.status(400).json({ error: 'allowed_methods: only an http_header or http_body scope has methods' });
+  // The scope may be handed to one agent in the same approval (delegate_did), bound to this scope alone.
+  const { delegate_did } = req.body || {};
+  const handTo = delegate_did !== undefined && delegate_did !== null && delegate_did !== '';
+  if (handTo) {
+    const e = delegateEligibility(secret.did, delegate_did);
+    if (e.error) return res.status(e.status).json({ error: e.error });
+  }
+  const pattern = target_url_pattern || target_url || '*';
+  const hostPattern = target_host_pattern || target_host || '*';
+  // A new scope widens what the secret reaches: the owner's PIN (red team item 13) — in this session, or on the phone
+  // as an approval of this exact scope (and hand-over) when the caller is the owner's own agent.
+  if (!scopeChangeGate(req, res, secret, 'scope', { action: 'context-add', targetUrl: HTTP_SCOPE_ACTIONS.has(action_type) ? pattern : '', targetHost: HTTP_SCOPE_ACTIONS.has(action_type) ? '' : hostPattern })) return;
 
   try {
     const created = insertBlindkeyContexts(secret.id, [{
       context_name,
       action_type,
-      target_url_pattern: target_url_pattern || target_url || '*',
-      target_host_pattern: target_host_pattern || target_host || '*',
+      target_url_pattern: pattern,
+      target_host_pattern: hostPattern,
       max_uses: max_uses || 0,
       allowed_commands: cmds.value ? JSON.parse(cmds.value) : undefined,
+      allowed_methods: methods.value ? JSON.parse(methods.value) : undefined,
     }], isAdmin ? 'admin' : 'owner');
 
     if (created === 0) return res.status(400).json({ error: 'failed to create context' });
 
     const ctx = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ? AND context_name = ?').get(secret.id, context_name);
-    res.json({ ok: true, context: { id: ctx.id, context_name: ctx.context_name, action_type: ctx.action_type, target_url_pattern: ctx.target_url_pattern, target_host_pattern: ctx.target_host_pattern, max_uses: ctx.max_uses, status: ctx.status, allowed_commands: ctx.command_allowlist ? JSON.parse(ctx.command_allowlist) : null } });
+    let delegation = null;
+    if (handTo) {
+      const d = grantContextDelegation(secret.did, delegate_did, secret, ctx.id, actor.actor, { contextName: context_name });
+      if (d.error) return res.status(d.status).json({ error: d.error, share_id: d.share_id, context: contextView(ctx) });
+      delegation = d.delegation;
+    }
+    res.json({ ok: true, context: contextView(ctx), ...(delegation ? { delegation_id: delegation.id, delegate_did } : {}) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -6270,17 +6398,24 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
   const cmds = parseAllowedCommands(req.body?.allowed_commands);
   if (cmds.error) return res.status(400).json({ error: cmds.error });
   const nextCommands = req.body && 'allowed_commands' in req.body ? cmds.value : row.command_allowlist;
-  // Narrowing stays open to the owner's tokens: revoking, a lower non-zero use cap, fewer allowed commands. Anything
-  // else (a new host, URL, action, a re-activation, more commands, lifting the cap or the list) needs the PIN.
+  const meths = parseAllowedMethods(req.body?.allowed_methods);
+  if (meths.error) return res.status(400).json({ error: meths.error });
+  const nextMethods = req.body && 'allowed_methods' in req.body ? meths.value : row.allowed_methods;
+  // Narrowing stays open to the owner's tokens: revoking, a lower non-zero use cap, fewer allowed commands or methods.
+  // Anything else (a new host, URL, action, a re-activation, more commands or methods, lifting the cap or a list)
+  // needs the PIN — or, from an agent signed in as the owner, the owner's approval on the phone.
   const subset = (a, b) => { try { const x = JSON.parse(a || '[]'), y = JSON.parse(b || '[]'); return x.every(c => y.includes(c)); } catch (_) { return false; } };
   const narrowing = next.context_name === row.context_name && next.action_type === row.action_type
     && (next.target_url_pattern || '*') === (row.target_url_pattern || '*') && (next.target_host_pattern || '*') === (row.target_host_pattern || '*')
     && (next.status === row.status || next.status === 'revoked')
     && (Number(next.max_uses) === Number(row.max_uses) || (Number(next.max_uses) > 0 && (Number(row.max_uses) === 0 || Number(next.max_uses) < Number(row.max_uses))))
-    && (nextCommands === row.command_allowlist || (nextCommands !== null && (row.command_allowlist === null || subset(nextCommands, row.command_allowlist))));
+    && (nextCommands === row.command_allowlist || (nextCommands !== null && (row.command_allowlist === null || subset(nextCommands, row.command_allowlist))))
+    && (nextMethods === row.allowed_methods || (nextMethods !== null && (row.allowed_methods === null || subset(nextMethods, row.allowed_methods))));
   if (!narrowing && actor.mode !== 'admin') {
     const secret = db.prepare('SELECT * FROM blindkey_secrets WHERE id = ?').get(row.secret_id);
-    if (!scopeChangeGate(req, res, secret, 'scope')) return;
+    // The approval binds this scope's id and name (#97 review: two scopes with one pattern must not share an approval).
+    if (!scopeChangeGate(req, res, secret, 'scope', { action: 'context-edit', targetUrl: HTTP_SCOPE_ACTIONS.has(next.action_type) ? (next.target_url_pattern || '*') : '', targetHost: HTTP_SCOPE_ACTIONS.has(next.action_type) ? '' : (next.target_host_pattern || '*'),
+      params: { ...(req.body || {}), context_id: contextId, current_context_name: row.context_name } })) return;   // a requested rename stays bound as asked
   }
 
   const validActions = ['http_header', 'ssh_exec', 'http_body', 'env_inject', 'git_clone', 'smtp_auth', 'database_connect'];
@@ -6293,12 +6428,13 @@ app.patch('/api/blindkey/context/:id', rateLimitStandard, (req, res) => {
 
   db.prepare(`
     UPDATE blindkey_contexts
-    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?, command_allowlist = ?
+    SET context_name = ?, action_type = ?, target_url_pattern = ?, target_host_pattern = ?, max_uses = ?, status = ?, command_allowlist = ?, allowed_methods = ?
     WHERE id = ?
   `).run(next.context_name, next.action_type, next.target_url_pattern || '*', next.target_host_pattern || '*', Number(next.max_uses) || 0, next.status,
          next.action_type !== 'ssh_exec' ? null
            // a scope that becomes ssh_exec starts from "nothing runs", never the legacy "any command"
-           : (row.action_type !== 'ssh_exec' ? (nextCommands ?? '[]') : (nextCommands ?? null)), contextId);
+           : (row.action_type !== 'ssh_exec' ? (nextCommands ?? '[]') : (nextCommands ?? null)),
+         HTTP_SCOPE_ACTIONS.has(next.action_type) ? (nextMethods ?? null) : null, contextId);
 
   const updated = db.prepare('SELECT * FROM blindkey_contexts WHERE id = ?').get(contextId);
   res.json({ ok: true, context: updated });
@@ -6358,9 +6494,7 @@ app.get('/api/blindkey/contexts', rateLimitStandard, (req, res) => {
   const secret = db.prepare('SELECT id, name FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, secret_name);
   if (!secret) return res.status(404).json({ error: 'secret not found' });
 
-  const contexts = db.prepare(
-    'SELECT id, context_name, action_type, target_url_pattern, target_host_pattern, status, max_uses, use_count, created_at FROM blindkey_contexts WHERE secret_id = ?'
-  ).all(secret.id);
+  const contexts = db.prepare('SELECT * FROM blindkey_contexts WHERE secret_id = ?').all(secret.id).map(contextView);
 
   res.json({ secret_name, contexts, total: contexts.length });
 });
@@ -6524,6 +6658,12 @@ async function handleRowenDeliver(req, res) {
   if (action === 'ssh_exec') {
     const why = commandRefusal(ctxCheck.context_id, (action_params || {}).command);
     if (why) { logSecurityEvent('command_not_allowed', 'alert', { caller_did: requestor_did, capability: 'ssh_exec', target: targetHost, ip: req.ip, context: { secret: secret.name, mediated: true } }); return res.status(403).json({ error: why }); }
+  }
+  // And the scope's methods, before the delivery is counted against its quota (#97 review).
+  if (action === 'http_header' || action === 'http_body') {
+    const m = (action_params || {}).method || (action === 'http_body' ? 'POST' : 'GET');
+    const why = methodRefusal(ctxCheck.context_id, m);
+    if (why) { logSecurityEvent('method_not_allowed', 'alert', { caller_did: requestor_did, capability: action, target: targetUrl, ip: req.ip, context: { secret: secret.name, method: m, mediated: true } }); return res.status(403).json({ error: why }); }
   }
   const egressReq = { identity: { did: requestor_did } };
 
@@ -10242,7 +10382,7 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
     // wallet is someone's own, which a token alone can bring in (#48 review): that counts as outside.
     const ownAgent = db.prepare(`SELECT 1 FROM fleets f JOIN fleet_silicons s ON s.fleet_id = f.id
         WHERE f.owner_did = ? AND f.status = 'active' AND s.member_did = ? AND s.status = 'active' AND s.created_by_fleet = 1 AND COALESCE(s.joined_via, 'owner') != 'network'`).get(ownerDid, delegate_did);
-    if (!ownAgent && !scopeChangeGate(req, res, secret, 'delegate')) return;
+    if (!ownAgent && !scopeChangeGate(req, res, secret, 'delegate', { action: 'delegate', targetUrl: '', targetHost: '' })) return;
   }
 
   // If context_name specified, validate it exists and is active on the secret
@@ -10264,28 +10404,17 @@ app.post('/api/blindkey/delegate', rateLimitStandard, (req, res) => {
     if (contextId === null) {
       delegation = { id: grantAllContextsDelegation(ownerDid, delegate_did, secret.id, actor.actor, { maxUses: max_uses || 0, expiresAt }) };
     } else {
-      db.prepare(`
-        INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id, context_id, max_uses, granted_by, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(owner_did, delegate_did, secret_id, context_id) DO UPDATE SET
-          status = 'active', max_uses = excluded.max_uses, use_count = 0,
-          granted_at = CURRENT_TIMESTAMP, revoked_at = NULL, expires_at = excluded.expires_at, may_rotate = 0, timeout_seconds = NULL
-        WHERE COALESCE(demipass_delegations.delegate_kind, 'agent') = 'agent'
-      `).run(ownerDid, delegate_did, secret.id, contextId, max_uses || 0, actor.actor, expiresAt);
-      delegation = db.prepare("SELECT id, COALESCE(delegate_kind, 'agent') AS kind FROM demipass_delegations WHERE owner_did = ? AND delegate_did = ? AND secret_id = ? AND context_id = ?")
-        .get(ownerDid, delegate_did, secret.id, contextId);
-      // The upsert skips a person's share on the same key; then nothing was granted — say so, write no grant event.
-      if (delegation && delegation.kind === 'person') {
-        return res.status(409).json({ error: 'that person holds a share of this secret for this context — manage it under shares (POST /api/demipass/shares/:id/…)', share_id: delegation.id });
-      }
+      const g = grantContextDelegation(ownerDid, delegate_did, secret, contextId, actor.actor, { maxUses: max_uses || 0, expiresAt, contextName: context_name });
+      if (g.error) return res.status(g.status).json({ error: g.error, share_id: g.share_id });
+      delegation = g.delegation;
     }
-
-    db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
-      'delegation_granted', actor.actor, secret.id, context_name || '*',
-      JSON.stringify({ delegation_id: delegation.id, owner_did: ownerDid, delegate_did, max_uses: max_uses || 0, expires_at: expiresAt })
-    );
-
-    console.log(`[demipass] delegation granted: ${ownerDid} -> ${delegate_did} for secret "${secret_name}" context "${context_name || '*'}"`);
+    if (contextId === null) {
+      db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+        'delegation_granted', actor.actor, secret.id, '*',
+        JSON.stringify({ delegation_id: delegation.id, owner_did: ownerDid, delegate_did, max_uses: max_uses || 0, expires_at: expiresAt })
+      );
+      console.log(`[demipass] delegation granted: ${ownerDid} -> ${delegate_did} for secret "${secret_name}" context "*"`);
+    }
     res.json({
       ok: true,
       delegation_id: delegation.id,
@@ -10680,11 +10809,11 @@ function buildAgentMenu(did, { compact = false, auth = null } = {}) {
     return true;
   };
   const sql = REDEEMABLE_STATUS_SQL.replace(/\bstatus\b/g, 's.status');
-  const ctxOf = db.prepare("SELECT context_name, action_type, target_url_pattern, target_host_pattern FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'");
+  const ctxOf = db.prepare("SELECT context_name, action_type, target_url_pattern, target_host_pattern, allowed_methods FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'");
   const describe = (s, extra) => {
     const ctx = ctxOf.all(s.id);
     const item = { name: s.name, ref: s.ref_code, type: s.secret_type, actions: [...new Set(ctx.map(c => c.action_type))], ...extra };
-    if (!compact) item.contexts = ctx.map(c => ({ name: c.context_name, action: c.action_type, url: c.target_url_pattern || undefined, host: c.target_host_pattern || undefined }));
+    if (!compact) item.contexts = ctx.map(c => ({ name: c.context_name, action: c.action_type, url: c.target_url_pattern || undefined, host: c.target_host_pattern || undefined, methods: jsonList(c.allowed_methods) || undefined }));
     return item;
   };
   const restricted = !!(auth && (auth.silicon || (auth.decoded && auth.decoded.wrk)));
@@ -12987,8 +13116,8 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(secret.id);
     const ctxMap = new Map();
     for (const ctx of oldContexts) {
-      const ins = db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)')
-        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null);
+      const ins = db.prepare('INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist, allowed_methods) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)')
+        .run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null, ctx.allowed_methods ?? null);
       ctxMap.set(ctx.id, Number(ins.lastInsertRowid));
     }
     // The owner's own agents keep the entry on the new version, like its contexts (2026-11-11): an agent that rotated its
@@ -14893,8 +15022,8 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 
     // Contexts
     const contexts = db.prepare(
-      "SELECT id, context_name, action_type, target_host_pattern, target_url_pattern, command_allowlist FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
-    ).all(s.id).map(c => ({ ...c, allowed_commands: c.command_allowlist === null ? null : (() => { try { return JSON.parse(c.command_allowlist); } catch (_) { return []; } })(), command_allowlist: undefined }));
+      "SELECT id, context_name, action_type, target_host_pattern, target_url_pattern, command_allowlist, allowed_methods FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'"
+    ).all(s.id).map(c => ({ ...c, allowed_commands: jsonList(c.command_allowlist), allowed_methods: jsonList(c.allowed_methods), command_allowlist: undefined }));
 
     let parsedLabels = [];
     try { parsedLabels = JSON.parse(s.labels || '[]'); } catch(_) {}
