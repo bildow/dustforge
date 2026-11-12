@@ -216,7 +216,7 @@ const useRateWallet = (req) => {
 };
 const rateLimitUseWallet = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_LIMIT_MAX) || 500,
   keyGenerator: (req) => { const w = useRateWallet(req); return w ? 'wallet:' + w : 'ip:' + useRateIpKey(req); },
-  message: { error: 'Rate limit exceeded (this wallet: per 15 minutes)' } });
+  handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: useRateWallet(req) ? 'Rate limit exceeded (this wallet: per 15 minutes)' : 'Rate limit exceeded (this address, no valid token: per 15 minutes)' }) });
 const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_IP_CEILING) || 5000,
   keyGenerator: useRateIpKey, message: { error: 'Rate limit exceeded (this address: per 15 minutes)' } });
 // Browser fill polls (the wallet every 4 s, a waiting fill every 2 s): its own budget, so polling never starves /use.
