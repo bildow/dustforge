@@ -71,7 +71,9 @@ module.exports = function registerSiliconTokenRequests(deps) {
   // A request may carry the agent's delivery key (silicon_renew.js): the owner's phone signs "… key <fingerprint>" with
   // the request, and the key is set when it is claimed — the one way a key is set without a separate key approval
   // (PR #100 review round 4, H1).
-  for (const col of ["delivery_key TEXT DEFAULT ''", "delivery_key_fp TEXT DEFAULT ''"]) {
+  // filer_*: the filing token and its session, so an undo of a key set by this request signs the filer out (round-5 M1).
+  for (const col of ["delivery_key TEXT DEFAULT ''", "delivery_key_fp TEXT DEFAULT ''", "filer_jti TEXT DEFAULT ''", "filer_sid TEXT DEFAULT ''",
+                     'filer_iat INTEGER DEFAULT 0', "filer_auth_method TEXT DEFAULT ''", "filer_fleet TEXT DEFAULT ''"]) {
     try { db.exec(`ALTER TABLE silicon_token_requests ADD COLUMN ${col}`); } catch (_) {}
   }
   for (const col of ["creates INTEGER DEFAULT 0", "display_name TEXT DEFAULT ''", "username TEXT DEFAULT ''"]) {
@@ -117,10 +119,17 @@ module.exports = function registerSiliconTokenRequests(deps) {
     requested_by: (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(r.requested_by_did) || {}).username || null,
     requester_role: r.requester_role || '', status: r.status, created_at: r.created_at, expires_at: r.expires_at, intent: `silicon-token:${r.id}`,
     creates: Boolean(r.creates), ...(r.creates ? { display_name: r.display_name, username: r.username, cost_dd: fleetCreate().PROVISION_COST || null } : {}),
-    ...(r.delivery_key_fp ? { delivery_key_fp: r.delivery_key_fp } : {}) });
+    ...(r.delivery_key_fp ? { delivery_key_fp: r.delivery_key_fp, ...(currentKeyFp(r) ? { current_key_fp: currentKeyFp(r) } : {}) } : {}) });
   const requesterName = (r) => (db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(r.requested_by_did) || {}).username || '?';
   // What the phone signs: a creation says so first, so a token for an existing agent and a new agent never share a text.
-  const bindFor = (r) => `${r.creates ? 'create ' : ''}${r.fleet_slug}/${r.handle}:${r.scope}:${r.expires_in} asked by ${requesterName(r)}${r.delivery_key_fp ? ` key ${r.delivery_key_fp}` : ''}`;
+  // The key the agent has now, if a request's key would replace it: said on the card and on the phone (round-5 L1).
+  const currentKeyFp = (r) => {
+    if (!r.member_did) return null;
+    const w = db.prepare('SELECT delivery_public_key FROM identity_wallets WHERE did = ?').get(r.member_did);
+    const dk = deliveryKeys();
+    return w && w.delivery_public_key && dk && w.delivery_public_key !== r.delivery_key ? dk.fingerprint(Buffer.from(w.delivery_public_key, 'base64url')) : null;
+  };
+  const bindFor = (r) => `${r.creates ? 'create ' : ''}${r.fleet_slug}/${r.handle}:${r.scope}:${r.expires_in} asked by ${requesterName(r)}${r.delivery_key_fp ? ` key ${r.delivery_key_fp}` : ''}${r.delivery_key_fp && currentKeyFp(r) ? ` replaces ${currentKeyFp(r)}` : ''}`;
   const fleetCreate = deps.fleetCreate || (() => ({}));
   // The agent's own token: it asked for it itself, or the owner asked with a claim_secret_hash (the agent's secret).
   // A token another member asked for, or one whose claim secret was handed out in clear, is not.
@@ -183,6 +192,8 @@ module.exports = function registerSiliconTokenRequests(deps) {
     // The agent's delivery key, optional: set when this request is claimed (its fingerprint is on the owner's phone).
     let deliveryKey = '', deliveryKeyFp = '';
     if (b.delivery_key !== undefined) {
+      // Only the agent itself or the fleet owner may say where the agent's renewals go (round-5 M2).
+      if (auth.did !== fleet.owner_did && (creates || auth.did !== s.member_did)) return res.status(400).json({ error: 'delivery_key: only the agent itself or the fleet owner may put a delivery key in a request' });
       const dk = deliveryKeys();
       const raw = dk ? dk.parseDeliveryKey(b.delivery_key) : null;
       if (!raw) return res.status(400).json({ error: 'delivery_key: an X25519 public key, 32 bytes, base64url' });
@@ -204,11 +215,15 @@ module.exports = function registerSiliconTokenRequests(deps) {
       // A member the fleet did not create (joined through the network or linked) is someone else's wallet: say so (#79 review).
       : db.prepare("SELECT 1 FROM fleet_silicons WHERE fleet_id = ? AND member_did = ? AND status = 'active' AND created_by_fleet = 1 AND COALESCE(joined_via, 'owner') != 'network'").get(fleet.id, auth.did) ? 'other_agent' : 'outside_agent';
     const id = Number(db.prepare(`INSERT INTO silicon_token_requests (fleet_id, fleet_slug, silicon_row, handle, member_did, owner_did, requested_by_did,
-        says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at, creates, display_name, username, claim_hash_given, delivery_key, delivery_key_fp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        says_it_is, requester_role, scope, expires_in, claim_hash, created_at, expires_at, creates, display_name, username, claim_hash_given, delivery_key, delivery_key_fp,
+        filer_jti, filer_sid, filer_iat, filer_auth_method, filer_fleet)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(fleet.id, fleet.slug, s.id, s.handle, s.member_did, fleet.owner_did, auth.did, says, role, scope, expiresIn, claimHash, nowIso(), later(REQUEST_TTL_SEC),
-        creates ? 1 : 0, displayName, username, claimSecret ? 0 : 1, deliveryKey, deliveryKeyFp).lastInsertRowid);
-    const keyLine = deliveryKeyFp ? ` It also SETS @${s.handle}'s delivery key (where its renewed tokens are sealed) to ${deliveryKeyFp}: approve only if that is the fingerprint its setup printed.` : '';
+        creates ? 1 : 0, displayName, username, claimSecret ? 0 : 1, deliveryKey, deliveryKeyFp,
+        String((auth.decoded && auth.decoded.jti) || ''), String((auth.decoded && auth.decoded.sid) || ''), Number((auth.decoded && auth.decoded.iat) || 0),
+        String((auth.decoded && auth.decoded.auth_method) || ''), String((auth.decoded && auth.decoded.fleet) || '')).lastInsertRowid);
+    const curFp = deliveryKeyFp ? currentKeyFp({ member_did: s.member_did, delivery_key: deliveryKey }) : null;
+    const keyLine = deliveryKeyFp ? ` It also SETS @${s.handle}'s delivery key (where its renewed tokens are sealed) to ${deliveryKeyFp}${curFp ? `, replacing ${curFp}` : ''}: approve only if that is the fingerprint its setup printed.` : '';
     const who = role === 'outside_agent' ? 'A WALLET YOUR FLEET DID NOT CREATE, in' : role === 'other_agent' ? 'ANOTHER AGENT of' : 'Someone in';
     if (creates) {
       mailOwner(fleet.owner_did, `DemiPass: a new agent @${s.handle} is asked for`,
@@ -358,7 +373,8 @@ module.exports = function registerSiliconTokenRequests(deps) {
     let keySet = null;
     if (r.delivery_key) {
       const dk = deliveryKeys();
-      const out = dk ? dk.setKeyFromRequest(r.member_did, r.delivery_key, { requestId: r.id, ownerDid: r.owner_did, ip: req.ip }) : { ok: false };
+      const out = dk ? dk.setKeyFromRequest(r.member_did, r.delivery_key, { requestId: r.id, ownerDid: r.owner_did, ip: req.ip, claimedJti: r.token_jti,
+        filer: { jti: r.filer_jti, sid: r.filer_sid, iat: r.filer_iat, auth_method: r.filer_auth_method, fleet: r.filer_fleet, did: r.requested_by_did } }) : { ok: false };
       keySet = out.ok ? out.fingerprint : null;
     }
     const keyPart = r.delivery_key ? { delivery_key_set: keySet } : {};

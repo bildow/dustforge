@@ -44,11 +44,16 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
        the owner — with its `claim_secret_hash` — filed, a renewed token) makes `<dir>/delivery.key` (0600) and ASKS
        (`POST /api/identity/delivery-key`). Every ask waits for the owner, the first too: a card on the agent's page
        (fingerprint, the asking token's kind and address) and a mail (at most one per 3 h, but always after a deny or
-       an undo); approve with the PIN `silicon-key:<id>` + phone. One ask waits at a time (another: 429). **Deny signs
-       out the token that asked** (and its session).
+       an undo); approve with the PIN `silicon-key:<id>` + phone; when the agent already has a key, the card and the phone say
+       "replaces <current fingerprint>". One ask waits at a time (another: 429). **Deny signs out the token that
+       asked** (and its session). Caution: if the real agent asked with its only token — a renewed token, which has no
+       session of its own — denying leaves it with none; it then comes back through a token request (`--material`).
      - The key travels IN an agent token request (`delivery_key` + `claim_secret_hash`; `--material` prints both for an
        owner-filed request, `--request <dir> <fleet> <handle>` files it with the agent's own sign-in): the owner's
-       phone signs "… key <fingerprint>" with the request, and `--claim <dir> [id]` sets the key and writes the token.
+       phone signs "… key <fingerprint>" (and "replaces <current>") with the request, and `--claim <dir> [id]` sets the
+       key and writes the token (refused if the request was for another DID or set another key). Only the agent itself
+       or the owner may put a key in a request. Undoing a key set this way revokes the token the request handed out and
+       signs out the agent session that filed it.
        A waiting ask it overtakes is logged and mailed, never dropped silently.
      An ask whose token is revoked (jti, revoke-all, fleet cut) ends. An approved change can be undone for 6 hours
      (PIN `silicon-key-revert:<id>` + phone): the tokens sealed to the dropped key, and the token that asked for it,

@@ -153,6 +153,11 @@ async function claim(dir, id) {
   if (r.status === 202) { console.log(`token-pickup: request #${rid} is ${d.status || 'waiting'}: the owner has not approved it yet`); process.exit(3); }
   if (!r.ok || typeof d.token !== 'string') die(`the claim failed (${r.status}): ${d.error || 'no answer'}`);
   if (!validToken(d.token, d.did)) die('the claimed token is not a live token signed for ' + d.did);
+  // The request must be for this agent, and the key it set must be this directory's (round-5 L2).
+  const didFile = path.join(dir, 'did');
+  if (fs.existsSync(didFile) && fs.readFileSync(didFile, 'utf8').trim() !== d.did) die(`request #${rid} was for ${d.did}, not this agent (${fs.readFileSync(didFile, 'utf8').trim()}): nothing written; ask the fleet owner to revoke that token`);
+  const mine = fingerprintOf(crypto.createPublicKey(crypto.createPrivateKey(readPrivate(path.join(dir, 'delivery.key')))).export({ format: 'jwk' }).x);
+  if (d.delivery_key_set !== undefined && d.delivery_key_set !== mine) die(`the key request #${rid} set (${d.delivery_key_set || 'none'}) is not this agent's key ${mine}: nothing written; ask the fleet owner to undo it and revoke that token`);
   writeSecret(path.join(dir, 'token'), d.token + '\n');
   fs.writeFileSync(path.join(dir, 'did'), d.did + '\n', { mode: 0o600 });
   fs.rmSync(secFile, { force: true }); fs.rmSync(path.join(dir, 'request'), { force: true });
@@ -248,7 +253,8 @@ const HELP = `token-pickup — collect the token your fleet owner renews for thi
 
 Which key renewals go to is the fleet owner's decision. Every key waits for the owner, the first one too:
   - asked with --init: the owner approves it on the agent's page in the DemiPass app (PIN + phone). Tell the owner the
-    fingerprint --init prints;
+    fingerprint --init prints. If the owner DENIES the ask, the token that asked is signed out — ask with a token you
+    can lose (your own sign-in), not your only renewed token;
   - or carried IN an agent token request (--material / --request): the owner's phone shows "... key <fingerprint>" when
     approving the request, and the key is set when the agent claims it (--claim).
 

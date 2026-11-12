@@ -120,7 +120,10 @@ module.exports = function registerSiliconRenew(deps) {
     decided_at TEXT DEFAULT NULL,
     decided_by TEXT DEFAULT NULL
   )`);
-  for (const col of ["ask_jti TEXT DEFAULT ''", 'ask_iat INTEGER DEFAULT 0', "ask_fleet TEXT DEFAULT ''", "ask_sid TEXT DEFAULT ''", 'first_key INTEGER DEFAULT 0', 'mailed_at TEXT DEFAULT NULL']) {
+  // request_id / claimed_jti: a key set by a claimed token request (setKeyFromRequest) is recorded as an approved change too,
+  // so an undo finds who filed it and the token it handed out (round-5 M1).
+  for (const col of ["ask_jti TEXT DEFAULT ''", 'ask_iat INTEGER DEFAULT 0', "ask_fleet TEXT DEFAULT ''", "ask_sid TEXT DEFAULT ''", 'first_key INTEGER DEFAULT 0', 'mailed_at TEXT DEFAULT NULL',
+                     'request_id INTEGER DEFAULT NULL', "claimed_jti TEXT DEFAULT ''", "asker_did TEXT DEFAULT ''"]) {
     try { db.exec(`ALTER TABLE delivery_key_changes ADD COLUMN ${col}`); } catch (_) {}
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_dkc_did ON delivery_key_changes(did, status)');
@@ -183,12 +186,17 @@ module.exports = function registerSiliconRenew(deps) {
 
   // The token that asked for a key, and the session behind it (every token refreshed from that sign-in, its refresh
   // chain): signed out when the owner denies the ask or undoes the change it got approved (round-4 review M1).
+  // A request filed by the fleet owner is the owner's own session: an undo does not sign the owner out (only what the
+  // request handed out is revoked). Note: a renewed token has no session, so denying an ask the agent made with its
+  // only (renewed) token leaves it without one — the owner renews again once it has a key (documented; round-5 L3).
   function endAsker(c) {
     let n = 0;
+    const who = c.asker_did || c.did;
+    if (c.request_id && who !== c.did) return 0;
     try {
-      if (c.ask_jti) n += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0 AND jti = ?").run(c.did, c.ask_jti).changes;
-      if (c.ask_sid) n += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0 AND sid = ?").run(c.did, c.ask_sid).changes;
-      try { db.prepare('UPDATE refresh_tokens SET revoked = 1, rotated_to = NULL WHERE did = ? AND revoked = 0 AND ((session_id = ? AND ? != \'\') OR (access_jti = ? AND ? != \'\'))').run(c.did, c.ask_sid || '', c.ask_sid || '', c.ask_jti || '', c.ask_jti || ''); } catch (_) {}
+      if (c.ask_jti) n += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0 AND jti = ?").run(who, c.ask_jti).changes;
+      if (c.ask_sid) n += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE did = ? AND revoked = 0 AND sid = ?").run(who, c.ask_sid).changes;
+      try { db.prepare('UPDATE refresh_tokens SET revoked = 1, rotated_to = NULL WHERE did = ? AND revoked = 0 AND ((session_id = ? AND ? != \'\') OR (access_jti = ? AND ? != \'\'))').run(who, c.ask_sid || '', c.ask_sid || '', c.ask_jti || '', c.ask_jti || ''); } catch (_) {}
     } catch (_) {}
     return n;
   }
@@ -310,7 +318,9 @@ module.exports = function registerSiliconRenew(deps) {
     if (ch.status !== 'pending') return res.status(409).json({ error: `this key change is ${ch.status}` });
     const intent = `silicon-key:${s.id}`;
     if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json({ ...gateMissing('silicon-key', ['pin'], ['pin'], intent), error: `a delivery key for @${s.handle} needs your PIN` });
-    const bind = `key ${fleet.slug}/${s.handle} to ${ch.fingerprint}`;
+    const curW = db.prepare('SELECT delivery_public_key FROM identity_wallets WHERE did = ?').get(s.member_did);
+    const curFp = curW && curW.delivery_public_key ? fingerprint(Buffer.from(curW.delivery_public_key, 'base64url')) : null;
+    const bind = `key ${fleet.slug}/${s.handle} to ${ch.fingerprint}${curFp ? ` replaces ${curFp}` : ''}`;   // round-5 L1
     const dk = devices();
     const refused = dk ? dk.approvalRefusal(auth, 'silicon-key', s.id, bind, req.body) : null;
     if (refused) return res.status(refused.status).json(refused.body);
@@ -389,7 +399,15 @@ module.exports = function registerSiliconRenew(deps) {
         db.prepare("UPDATE token_deliveries SET acked_at = COALESCE(acked_at, ?), ack = COALESCE(ack, 'declined'), epk = '', iv = '', tag = '', ciphertext = '' WHERE did = ? AND key_fingerprint = ?").run(nowIso(), s.member_did, dropFp);
         // Whoever asked for the dropped key is signed out too, and the change is marked undone.
         const asked = db.prepare("SELECT * FROM delivery_key_changes WHERE did = ? AND public_key = ? AND status = 'approved' ORDER BY id DESC LIMIT 1").get(s.member_did, w.delivery_public_key);
-        if (asked) { revoked += endAsker(asked); db.prepare("UPDATE delivery_key_changes SET status = 'reverted', decided_at = ? WHERE id = ?").run(nowIso(), asked.id); }
+        if (asked) {
+          revoked += endAsker(asked);
+          db.prepare("UPDATE delivery_key_changes SET status = 'reverted', decided_at = ? WHERE id = ?").run(nowIso(), asked.id);
+          if (asked.request_id) {
+            // The key came in a token request: the token it handed out goes too, and the request is marked undone.
+            if (asked.claimed_jti) revoked += db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ? AND revoked = 0").run(asked.claimed_jti).changes;
+            try { db.prepare("UPDATE silicon_token_requests SET status = 'undone' WHERE id = ?").run(asked.request_id); } catch (_) {}
+          }
+        }
       }).immediate();
     } catch (e) { return res.status(e.statusCode || 500).json(e.body || { error: e.message }); }
     try { sweep(); } catch (_) {}   // e.g. an ask made with a token the dropped key received: ended now
@@ -494,7 +512,7 @@ module.exports = function registerSiliconRenew(deps) {
   // A key that travelled inside an agent token request the owner approved (its fingerprint was on the phone), set when
   // the request is claimed (silicon_token_requests.js). A different key replaces the current one like an approved
   // change (the previous kept REVERT_WINDOW_SEC); a waiting ask it overtakes is ended loudly: logged, owner mailed.
-  function setKeyFromRequest(did, b64, { requestId, ownerDid, ip } = {}) {
+  function setKeyFromRequest(did, b64, { requestId, ownerDid, ip, claimedJti, filer } = {}) {
     const raw = parseDeliveryKey(b64);
     if (!raw) return { ok: false, error: 'the request\'s delivery key is not a usable X25519 key' };
     const fp = fingerprint(raw);
@@ -507,6 +525,12 @@ module.exports = function registerSiliconRenew(deps) {
       else db.prepare('UPDATE identity_wallets SET delivery_public_key = ?, delivery_key_set_at = ?, delivery_key_changed_at = NULL WHERE did = ?').run(b64, nowIso(), did);
       superseded = db.prepare("SELECT * FROM delivery_key_changes WHERE did = ? AND status = 'pending'").all(did);
       db.prepare("UPDATE delivery_key_changes SET status = 'superseded', decided_at = ? WHERE did = ? AND status = 'pending'").run(nowIso(), did);
+      // Recorded as an approved change (the owner approved the request with this fingerprint): an undo finds it.
+      const f = filer || {};
+      db.prepare(`INSERT INTO delivery_key_changes (did, public_key, fingerprint, status, auth_method, ip, requested_at, expires_at, decided_at, decided_by,
+                    ask_jti, ask_iat, ask_fleet, ask_sid, first_key, request_id, claimed_jti, asker_did) VALUES (?, ?, ?, 'approved', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(did, b64, fp, String(f.auth_method || ''), String(ip || ''), nowIso(), nowIso(), nowIso(), ownerDid || null, String(f.jti || ''), Number(f.iat || 0),
+          String(f.fleet || ''), String(f.sid || ''), prev ? 0 : 1, requestId || null, String(claimedJti || ''), String(f.did || ''));
     })();
     if (prev === b64) return { ok: true, fingerprint: fp, unchanged: true };
     if (logSecurityEvent) logSecurityEvent(prev ? 'delivery_key_changed' : 'delivery_key_set', 'warn', { caller_did: ownerDid || null, ip, target: did,

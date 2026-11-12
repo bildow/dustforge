@@ -217,6 +217,40 @@ OUT=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --claim "$S/brief" "$RQ" 2
 [ $RC = 0 ] && [ "$(stat -c %a "$S/brief/token")" = 600 ] && [ "$(claims "$S/brief/token" agent_own)" = True ] && [ ! -e "$S/brief/claim.secret" ] \
   && [ "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='brief'")" != "" ] && echo "$OUT" | grep -q "delivery key $BFP is set" \
   && ok "--material + an owner-filed request + --claim: the agent's token (0600) and its key set in one owner approval" || fail "material way in: $RC $OUT"
+# Round 5 M2: only the agent itself or the owner may put a key in a request.
+B2k=$(login bot2); call POST /api/fleet/aaron-agents/silicons/carl/token-requests "$B2k" '{"delivery_key":"'$(node -e 'const c=require("crypto");console.log(c.createPublicKey(c.generateKeyPairSync("x25519").privateKey).export({format:"jwk"}).x)')'","claim_secret_hash":"'$(printf x | sha256sum | cut -d' ' -f1)'"}'
+[ "$CODE" = 400 ] && echo "$BODY" | grep -q "only the agent itself or the fleet owner" && ok "a sibling cannot put its key in a request for @carl (400) (round-5 M2)" || fail "sibling key request: $CODE $BODY"
+# Round 5 M1 + L1: a leaked sign-in of brief files a request carrying ITS key; the card says it replaces brief's key;
+# the owner approves; it is claimed; the owner undoes it → the claimed token and the filing session are signed out.
+BKEY=$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='brief'"); BFP0=$BFP
+BLEAK=$(login brief); printf '%s\n' "$BLEAK" > "$S/bleak.tok"
+OUT=$(DEMIPASS_TOKEN="$BLEAK" PICKUP --request "$S/brief-att" aaron-agents brief); RQB=$(cat "$S/brief-att/request" 2>/dev/null)
+call GET /api/silicon-token-requests "$A"
+[ "$(echo "$BODY" | python3 -c 'import json,sys; print([r for r in json.load(sys.stdin)["requests"] if r["id"]==int(sys.argv[1])][0].get("current_key_fp"))' "$RQB")" = "$BFP0" ] \
+  && ok "the request card names the key it would replace (current_key_fp) (round-5 L1)" || fail "current_key_fp: $BODY"
+PIN "silicon-token:$RQB"; call POST /api/silicon-token-requests/$RQB/approve "$A" '{}'
+DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --claim "$S/brief-att" >/dev/null 2>&1
+BJ=$(Q "SELECT token_jti FROM silicon_token_requests WHERE id=$RQB")
+[ "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='brief'")" != "$BKEY" ] && [ -n "$(Q "SELECT id FROM delivery_key_changes WHERE request_id=$RQB AND status='approved'")" ] || fail "request key not set/recorded"
+BSID=$(Q "SELECT id FROM fleet_silicons WHERE handle='brief'")
+PIN "silicon-key-revert:$BSID"; call POST /api/fleet/aaron-agents/silicons/brief/delivery-key/revert "$A" '{}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J tokens_revoked)" -ge 2 ] && [ "$(Q "SELECT delivery_public_key FROM identity_wallets WHERE username='brief'")" = "$BKEY" ] \
+  && [ "$(Q "SELECT revoked FROM issued_tokens WHERE jti='$BJ'")" = 1 ] && [ "$(Q "SELECT status FROM silicon_token_requests WHERE id=$RQB")" = undone ] \
+  && ok "undoing a key set by a token request revokes the token it handed out and marks the request undone (round-5 M1)" || fail "request undo: $CODE $BODY"
+call GET /api/demipass/list "$BLEAK"; C1=$CODE; call GET /api/demipass/list "$(cat "$S/brief/token")"; C2=$CODE
+[ "$C1" = 401 ] && [ "$C2" = 200 ] && ok "…and the session that filed it is signed out, while the agent's own separate token keeps working" || fail "filer/legit after undo: $C1 $C2"
+# Round 5 L2: --claim refuses a request for another DID, and a key that is not the directory's.
+mkdir -p "$S/wrongdid"; cp "$S/brief/delivery.key" "$S/wrongdid/"; printf 'did:key:zSomeoneElse\n' > "$S/wrongdid/did"; chmod 600 "$S/wrongdid/did"
+MATW=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --material "$S/wrongdid" 2>/dev/null)
+REQ brief "$A" "$(echo "$MATW" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"claim_secret_hash": d["claim_secret_hash"], "expires_in": "1h"}))')"
+OUT=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --claim "$S/wrongdid" "$RQ" 2>&1); RC=$?
+[ $RC = 2 ] && echo "$OUT" | grep -q "not this agent" && [ ! -e "$S/wrongdid/token" ] && ok "--claim refuses a request for another DID than <dir>/did, writes nothing (round-5 L2)" || fail "claim wrong did: $RC $OUT"
+MATX=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --material "$S/wrongkey" 2>/dev/null); OTHERK=$(node -e 'const c=require("crypto");console.log(c.createPublicKey(c.generateKeyPairSync("x25519").privateKey).export({format:"jwk"}).x)')
+REQ brief "$A" "$(echo "$MATX" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps({"claim_secret_hash": d["claim_secret_hash"], "delivery_key": sys.argv[1], "expires_in": "1h"}))' "$OTHERK")"
+OUT=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --claim "$S/wrongkey" "$RQ" 2>&1); RC=$?
+[ $RC = 2 ] && echo "$OUT" | grep -q "is not this agent's key" && [ ! -e "$S/wrongkey/token" ] && ok "--claim refuses when the key the request set is not its own" || fail "claim wrong key: $RC $OUT"
+# put brief's key back for what follows
+PIN "silicon-key-revert:$BSID"; call POST /api/fleet/aaron-agents/silicons/brief/delivery-key/revert "$A" '{}'
 OUT=$(DEMIPASS_TOKEN_FILE="$S/carl-own.tok" PICKUP --request "$S/carl-minted" aaron-agents carl); RC=$?
 [ $RC = 2 ] && echo "$OUT" | grep -q "403" && ok "a fleet-minted token cannot file a request (--help says so)" || fail "minted files: $RC $OUT"
 node "$W/bin/token-pickup.js" --help | grep -q "fleet-minted" && node "$W/bin/token-pickup.js" --help | grep -q 'carry no "agent_own" mark' && ok "--help: fleet-minted tokens cannot file; pre-change claimed tokens need a new request (L5)" || fail "--help L5"
@@ -437,7 +471,8 @@ call POST $R "$A" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'; [ 
 login claude > "$S/leak2.tok"; DEMIPASS_TOKEN_FILE="$S/leak2.tok" PICKUP --init "$S/other" >/dev/null
 CH3=$(Q "SELECT id FROM delivery_key_changes WHERE status='pending' ORDER BY id DESC LIMIT 1"); FP3=$(Q "SELECT fingerprint FROM delivery_key_changes WHERE id=$CH3")
 PIN "silicon-key:$SID"; call POST /api/fleet/aaron-agents/silicons/claude/delivery-key/$CH3/approve "$A" '{}'
-[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J challenge.bind)" = "key aaron-agents/claude to $FP3" ] && ok "…and a key change needs the phone to sign \"key aaron-agents/claude to $FP3\"" || fail "key 428: $CODE $BODY"
+CURFP=$(Q "SELECT delivery_public_key FROM identity_wallets WHERE did='$CDID'" | python3 -c 'import sys,base64,hashlib; k=sys.stdin.read().strip(); print(hashlib.sha256(base64.urlsafe_b64decode(k+"="*(-len(k)%4))).hexdigest()[:16])')
+[ "$CODE" = 428 ] && [ "$(echo "$BODY" | J challenge.bind)" = "key aaron-agents/claude to $FP3 replaces $CURFP" ] && ok "…and a key change needs the phone to sign \"key aaron-agents/claude to $FP3 replaces $CURFP\" (round-5 L1)" || fail "key 428: $CODE $BODY"
 
 # A request carrying a key: the phone signs its fingerprint with the request (round-4 H1).
 B2b=$(login bot2); MAT2=$(DEMIPASS_URL=$API node "$W/bin/token-pickup.js" --material "$S/bot2" 2>/dev/null); FP2=$(echo "$MAT2" | J fingerprint)
