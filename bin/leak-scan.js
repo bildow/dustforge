@@ -210,10 +210,21 @@ function latin1Offset(raw, utf8Bytes) {
   return i;
 }
 let maxFormBytes = 0;
+// A scrub reads gigabytes over many minutes: a server restart (deploy) or a dropped connection is waited out, not the
+// end of the run (2026-11-12: one 502 during a deploy stopped the first live scrub). The same batch is sent again —
+// nothing was written for it yet.
 async function scrubPost(auth, batch) {
+  const body = JSON.stringify({ chunks: batch });
   for (let attempt = 0; ; attempt++) {
-    const r = await fetch(API + '/api/demipass/leak-scan/scrub', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: JSON.stringify({ chunks: batch }) });
-    const d = await r.json().catch(() => ({}));
+    let r, d;
+    const wait = () => new Promise(ok => setTimeout(ok, Math.min(60000, 5000 * (attempt + 1))));
+    // The body is read inside the try: a reply cut off mid-body is a failed request, never "no copies" (#101 review).
+    try { r = await fetch(API + '/api/demipass/leak-scan/scrub', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body, signal: AbortSignal.timeout(120000) }); const t = await r.text(); try { d = JSON.parse(t); } catch (_) { d = null; } }
+    catch (e) { if (attempt < 12) { await wait(); continue; } throw new Error(`scrub refused: the server could not be reached (${e.name})`); }
+    if ([502, 503, 504].includes(r.status) && attempt < 12) { await wait(); continue; }
+    // A 2xx answer counts only whole: {ok: true, matches: [...]}. Anything else is retried like a 502, then ends the run.
+    if (r.ok && !(d && d.ok === true && Array.isArray(d.matches))) { if (attempt < 12) { await wait(); continue; } throw new Error('scrub refused: the server\'s answers were incomplete'); }
+    d = d || {};
     if (r.status === 429 && /Rate limit/.test(d.error || '') && attempt < 20) { await new Promise(ok => setTimeout(ok, 60000)); continue; }
     if (!r.ok) throw new Error(`scrub refused: HTTP ${r.status}: ${d.error || ''}`);
     if (d.max_form_bytes) maxFormBytes = Math.max(maxFormBytes, d.max_form_bytes);
@@ -224,7 +235,7 @@ async function scrubPost(auth, batch) {
 // does not read is counted, so the run cannot claim "contained" over it (#98 review M2): a skipped directory, a file
 // too large, a symlink to something outside the roots.
 function scrubFiles(roots, all) {
-  const out = [], notRead = [];
+  const out = [], notRead = [], seen = new Set();   // dev:ino — a file reached twice (overlapping roots, a hard link) is read once
   const real = roots.map(r => { try { return fs.realpathSync(r); } catch (_) { return path.resolve(r); } });
   const inside = (p) => real.some(r => p === r || p.startsWith(r + path.sep));
   const walk = (p) => {
@@ -233,6 +244,7 @@ function scrubFiles(roots, all) {
     if (st.isDirectory()) { if (!all && SKIP_DIRS.has(path.basename(p))) { notRead.push(`${p} (skipped: --all reads it)`); return; } let es; try { es = fs.readdirSync(p).sort(); } catch (e) { notRead.push(`${p} (${e.code || e.message})`); return; } for (const e of es) walk(path.join(p, e)); return; }
     if (!st.isFile() || st.size === 0) return;
     if (st.size > MAX_FILE) { notRead.push(`${p} (${st.size} bytes, too large)`); return; }
+    const id = st.dev + ':' + st.ino; if (seen.has(id)) return; seen.add(id);
     out.push(p);
   };
   for (const r of roots) walk(path.resolve(r));
@@ -248,20 +260,82 @@ async function scrub(args) {
   if (overlap * 2 > SCRUB_BIN_WINDOW) throw new Error('the value is too long to look for in windows');
   const { out: list, notRead } = scrubFiles(args, all);
   let filesRead = 0, filesChanged = 0, masked = 0, left = 0, bytesRead = 0;
-  for (const f of list) {
+  // One request carries windows of many files (2026-11-12: one request per file could not get through ~70,000 files
+  // under the token's 12,000 requests a day). A file is finished (written) once every window of it has been answered.
+  const open = new Map();                 // file index → { i, f, buf, st, binary, wins, answered, queued, skip, spans, binSeen }
+  let batch = [], size = 0, batchWins = [];
+  const mapAnswer = (P, w, view, off, len) => {
+    const raw = P.buf.subarray(w.start, w.end);
+    // A match over a byte that was replaced (0x1A) is not the value as written: never masked (round 3 L2).
+    if (view !== 'l' && w.badAt && w.badAt.length && w.badAt.some(x => x >= off && x < off + len)) return;
+    const a = view === 'l' ? latin1Offset(raw, off) : off;
+    const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
+    if (P.binary) { P.binSeen.add(w.start + a); return; }
+    const s0 = w.start + a, prev = P.spans.get(s0); if (prev === undefined || l > prev) P.spans.set(s0, l);
+  };
+  const finishIfDone = (P) => { if (P.queued && P.answered === P.sent) { open.delete(P.i); if (!P.skip) finish(P); } };
+  const flush = async () => {
+    if (!batch.length) return;
+    const res = await scrubPost(auth, batch);
+    const sent = batchWins; batch = []; size = 0; batchWins = [];
+    for (const m of res) {
+      const [fi, wi, view] = String(m.chunk).split(':'); const P = open.get(Number(fi)); const w = P && P.wins[Number(wi)]; if (!w) continue;
+      for (const [off, len] of m.at || []) mapAnswer(P, w, view, off, len);
+    }
+    for (const [P, wi] of sent) { P.wins[wi].badAt = null; P.answered++; }   // answered: nothing more to map in these windows
+    for (const P of new Set(sent.map(x => x[0]))) finishIfDone(P);
+  };
+  const queue = async (P, wi) => {
+    const w = P.wins[wi];
+    if (size && (size + w.bytes > SCRUB_BODY_MAX || batch.length + w.parts.length > 150)) await flush();
+    for (const p of w.parts) batch.push({ id: P.i + ':' + wi + ':' + p.view, text: p.text });
+    size += w.bytes; w.parts = null; batchWins.push([P, wi]); P.sent++;
+  };
+  const finish = (P) => {
+    const f = P.f;
+    if (P.binary) {
+      const n = P.binSeen.size;
+      if (n) { left += n; console.log(`FOUND    ${f}: ${n} cop${n === 1 ? 'y' : 'ies'} in a binary file — not written (remove the file or rotate)`); }
+      return;
+    }
+    // Overlapping or touching spans become one, so a write never invalidates the check for the next (#98 review L2).
+    const merged = [];
+    for (const [a, l] of [...P.spans].sort((x, y) => x[0] - y[0])) { const last = merged[merged.length - 1]; if (last && a <= last[0] + last[1]) last[1] = Math.max(last[1], a + l - last[0]); else merged.push([a, l]); }
+    if (!merged.length) return;
+    if (dry) { masked += merged.length; console.log(`FOUND    ${f}: ${merged.length} cop${merged.length === 1 ? 'y' : 'ies'} (dry run)`); return; }
+    let n = 0, stale = 0, wfd;
+    try {
+      wfd = fs.openSync(f, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+      const ws = fs.fstatSync(wfd);
+      // The same file that was read (not one swapped in since: #98 review L3).
+      if (ws.ino !== P.st.ino || ws.dev !== P.st.dev) throw Object.assign(new Error('replaced since it was read'), { code: 'REPLACED' });
+      for (const [s0, l0] of merged) {
+        const now = Buffer.alloc(l0);
+        const got = fs.readSync(wfd, now, 0, l0, s0);
+        if (got !== l0 || !now.equals(P.buf.subarray(s0, s0 + l0))) { stale++; continue; }
+        fs.writeSync(wfd, Buffer.alloc(l0, '*'), 0, l0, s0); n++;
+      }
+      fs.fsyncSync(wfd);
+    } catch (e) { stale = merged.length - n; console.log(`LEFT     ${f}: cannot write (${e.code || e.message})`); }
+    finally { if (wfd !== undefined) fs.closeSync(wfd); }
+    masked += n; left += stale; if (n) filesChanged++;
+    if (n || stale) console.log(`MASKED   ${f}: ${n} cop${n === 1 ? 'y' : 'ies'}${stale ? `, ${stale} left (the file changed there since it was read: run again)` : ''}`);
+  };
+  for (let i = 0; i < list.length; i++) {
+    const f = list[i];
     let fd, st, buf;
     try {
       fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); st = fs.fstatSync(fd);
       buf = Buffer.alloc(st.size); let got = 0; while (got < st.size) { const n = fs.readSync(fd, buf, got, st.size - got, got); if (!n) break; got += n; } buf = buf.subarray(0, got);
     } catch (e) { notRead.push(`${f} (${e.code || e.message})`); continue; } finally { if (fd !== undefined) fs.closeSync(fd); }
-    filesRead++; bytesRead += buf.length;
+    if (!buf.length) continue;
     const kind = packed(f, buf.subarray(0, 16), buf.subarray(0, 1024));
-    if (kind) { filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); continue; }
-    const binary = buf.subarray(0, 8192).includes(0);
+    if (kind) { notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); continue; }
+    filesRead++; bytesRead += buf.length;
+    const P = { i, f, buf, st, binary: buf.subarray(0, 8192).includes(0), wins: [], answered: 0, sent: 0, queued: false, skip: false, spans: new Map(), binSeen: new Set() };
+    open.set(i, P);
     // Windows, each with its texts; one too big for a request is split (the overlap keeps every copy whole in a half).
-    // Windows are made and sent as the file is read, and each window's texts are dropped once sent (round 4 L-b: all
-    // of a 150 MB file's windows at once took 1.5 GB).
-    const wins = [];
+    // Windows are queued as they are made, and each window's texts are dropped once sent (round 4 L-b).
     const add = (a, b) => {
       const raw = buf.subarray(a, b), { out, bad, at: badAt } = utf8Clean(raw);
       const parts = [{ view: 'u', text: out.toString('utf8') }];
@@ -274,73 +348,37 @@ async function scrub(args) {
         add(a, Math.min(b, mid + overlap)); add(mid, b); return;
       }
       if (bytes > SCRUB_BODY_MAX) throw new Error(`${f}: a piece of it does not fit one request`);
-      wins.push({ start: a, end: b, parts, bytes, badAt: Uint32Array.from(badAt) });
+      P.wins.push({ start: a, end: b, parts, bytes, badAt: Uint32Array.from(badAt) });
     };
-    const spans = new Map();                 // exact spans (absolute start → length): written, in a text file
-    const binSeen = new Set();
-    let batch = [], size = 0, sent = 0, done = 0;
-    const flush = async () => {
-      if (!batch.length) return;
-      const res = await scrubPost(auth, batch); batch = []; size = 0;
-      for (const m of res) {
-        const [wi, view] = String(m.chunk).split(':'); const w = wins[Number(wi)]; if (!w) continue;
-        const raw = buf.subarray(w.start, w.end);
-        for (const [off, len] of m.at || []) {
-          // A match over a byte that was replaced (0x1A) is not the value as written: never masked (round 3 L2).
-          if (view !== 'l' && w.badAt && w.badAt.length && w.badAt.some(x => x >= off && x < off + len)) continue;
-          const a = view === 'l' ? latin1Offset(raw, off) : off;
-          const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
-          if (binary) { binSeen.add(w.start + a); continue; }
-          const s0 = w.start + a, prev = spans.get(s0); if (prev === undefined || l > prev) spans.set(s0, l);
-        }
-      }
-      for (; done < sent; done++) wins[done].badAt = null;   // answered: nothing more to map in these windows
-    };
-    const pump = async () => {
-      for (; sent < wins.length; sent++) {
-        const w = wins[sent];
-        if (size && (size + w.bytes > SCRUB_BODY_MAX || batch.length + w.parts.length > 150)) await flush();
-        for (const p of w.parts) batch.push({ id: sent + ':' + p.view, text: p.text });
-        size += w.bytes; w.parts = null;
-      }
-    };
-    try { for (const w of scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)) { add(w.start, w.end); await pump(); } await flush(); }
-    catch (e) { if (/^scrub refused|finish refused/.test(e.message)) throw e; filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${e.message.replace(f + ': ', '')})`); continue; }   // round 3 L1: that file is not read; the run goes on
-    if (binary) {
-      const n = binSeen.size;
-      if (n) { left += n; console.log(`FOUND    ${f}: ${n} cop${n === 1 ? 'y' : 'ies'} in a binary file — not written (remove the file or rotate)`); }
-      continue;
-    }
-    // Overlapping or touching spans become one, so a write never invalidates the check for the next (#98 review L2).
-    const merged = [];
-    for (const [a, l] of [...spans].sort((x, y) => x[0] - y[0])) { const last = merged[merged.length - 1]; if (last && a <= last[0] + last[1]) last[1] = Math.max(last[1], a + l - last[0]); else merged.push([a, l]); }
-    if (!merged.length) continue;
-    if (dry) { masked += merged.length; console.log(`FOUND    ${f}: ${merged.length} cop${merged.length === 1 ? 'y' : 'ies'} (dry run)`); continue; }
-    let n = 0, stale = 0, wfd;
     try {
-      wfd = fs.openSync(f, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
-      const ws = fs.fstatSync(wfd);
-      // The same file that was read (not one swapped in since: #98 review L3).
-      if (ws.ino !== st.ino || ws.dev !== st.dev) throw Object.assign(new Error('replaced since it was read'), { code: 'REPLACED' });
-      for (const [s0, l0] of merged) {
-        const now = Buffer.alloc(l0);
-        const got = fs.readSync(wfd, now, 0, l0, s0);
-        if (got !== l0 || !now.equals(buf.subarray(s0, s0 + l0))) { stale++; continue; }
-        fs.writeSync(wfd, Buffer.alloc(l0, '*'), 0, l0, s0); n++;
+      for (const w of scrubWindows(buf, P.binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)) {
+        const from = P.wins.length; add(w.start, w.end);
+        for (let wi = from; wi < P.wins.length; wi++) await queue(P, wi);
       }
-      fs.fsyncSync(wfd);
-    } catch (e) { stale = merged.length - n; console.log(`LEFT     ${f}: cannot write (${e.code || e.message})`); }
-    finally { if (wfd !== undefined) fs.closeSync(wfd); }
-    masked += n; left += stale; if (n) filesChanged++;
-    if (n || stale) console.log(`MASKED   ${f}: ${n} cop${n === 1 ? 'y' : 'ies'}${stale ? `, ${stale} left (the file changed there since it was read: run again)` : ''}`);
+    } catch (e) {
+      if (/^scrub refused|finish refused/.test(e.message)) throw e;
+      // round 3 L1: that file is not read (windows already sent are answered and ignored); the run goes on
+      P.skip = true; filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${e.message.replace(f + ': ', '')})`);
+    }
+    P.queued = true; finishIfDone(P);
   }
+  await flush();
+  for (const P of [...open.values()]) finishIfDone(P);
   for (const k of notRead) console.log(`NOT READ ${k}`);
   console.log(`leak-scan: scrub ${dry ? '(dry run) ' : ''}read ${filesRead} files, ${bytesRead} bytes; ${dry ? 'found' : 'masked'} ${masked}, left ${left}${notRead.length ? `, ${notRead.length} paths not read` : ''}`);
   if (dry) process.exit(masked || left ? 1 : 0);
-  const r = await fetch(API + '/api/demipass/leak-scan/scrub/finish', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth },
-    body: JSON.stringify({ files_read: filesRead, files_changed: filesChanged, copies_masked: masked, copies_left: left, paths_not_read: notRead.length }) });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`finish refused: HTTP ${r.status}: ${d.error || ''}`);
+  // The finish is retried through a restart too. The server spends the token on the first finish it processes, so a
+  // 401 after a lost reply means it was recorded: say so instead of failing (#101 review).
+  const finBody = JSON.stringify({ files_read: filesRead, files_changed: filesChanged, copies_masked: masked, copies_left: left, paths_not_read: notRead.length });
+  let r, d = {}, tried = false;
+  for (let attempt = 0; ; attempt++) {
+    try { r = await fetch(API + '/api/demipass/leak-scan/scrub/finish', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: finBody, signal: AbortSignal.timeout(60000) }); d = await r.json().catch(() => null); }
+    catch (_) { r = null; d = null; }
+    if (r && r.ok && d && d.ok === true) break;
+    if (r && r.status === 401 && tried) { console.log('leak-scan: the finish was recorded on an earlier try (its reply was lost): see the entry in the DemiPass app'); process.exit(left || notRead.length ? 1 : 0); }
+    if ((!r || [502, 503, 504].includes(r.status) || (r.ok && !(d && d.ok === true))) && attempt < 12) { tried = true; await new Promise(ok => setTimeout(ok, Math.min(60000, 5000 * (attempt + 1)))); continue; }
+    throw new Error(`finish refused: HTTP ${r ? r.status : 'unreachable'}: ${(d && d.error) || ''}`);
+  }
   console.log(d.contained ? `leak-scan: ${d.entry ? d.entry.name : 'the entry'} is contained (not rotated; backups still hold old copies)` : `leak-scan: not marked contained (${d.why || 'copies left'}); this scrub token is spent`);
   process.exit(d.contained ? 0 : 1);
 }

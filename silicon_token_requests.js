@@ -240,7 +240,10 @@ module.exports = function registerSiliconTokenRequests(deps) {
   app.get('/api/silicon-token-requests', rateLimitStandard, (req, res) => {
     const auth = ownerAuth(req, res); if (!auth) return;
     expireRequests();
-    const rows = db.prepare("SELECT * FROM silicon_token_requests WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC").all(auth.did);
+    // ?all=1: the last 30 days in every state (the app's Requests page: find one by number, filter by state or requester).
+    const rows = req.query.all === '1'
+      ? db.prepare("SELECT * FROM silicon_token_requests WHERE owner_did = ? AND julianday(created_at) >= julianday('now', '-30 days') ORDER BY id DESC LIMIT 200").all(auth.did)
+      : db.prepare("SELECT * FROM silicon_token_requests WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC").all(auth.did);
     res.json({ ok: true, requests: rows.map(view) });
   });
 

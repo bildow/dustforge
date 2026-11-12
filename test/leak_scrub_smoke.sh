@@ -1,6 +1,6 @@
 #!/bin/bash
 # Scrub smoke ("contained": a leaked value overwritten wherever the scrubber finds it, not rotated — Aaron 2026-11-11).
-# Legacy fixture first: the database is made by main's server (the leak tables and vault without the new columns, a scan
+# Legacy fixture first: the database is made by the server from before #98 (cbdfbd8) (the leak tables and vault without the new columns, a scan
 # token minted there); this branch's server then opens it. A scrub token is asked for one entry and approved with the
 # PIN; it finds only that entry (raw, JSON-escaped once and twice, \u-escaped), across window borders; the client
 # overwrites copies in place (same size, same inode, JSONL still parses), leaves binary copies, prints no value. Scan and
@@ -31,7 +31,7 @@ call(){ local m=$1 p=$2 t=$3 b=${4:-}
 login(){ call POST /api/identity/auth-fingerprint "" '{"username":"'$1'","password":"hunter22","scope":"transact","expires_in":"1h"}'; echo "$BODY" | J token; }
 
 # ── legacy: main's server makes the database ──
-mkdir -p "$S/old"; git -C "$W" archive origin/main | tar -x -C "$S/old"
+mkdir -p "$S/old"; git -C "$W" archive cbdfbd860efb9183e623400c0f94fdb474f4a404 | tar -x -C "$S/old"   # main before #98: no scrub columns
 start "$S/old" old
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 ( cd "$W" && node -e '
@@ -248,6 +248,15 @@ call POST /api/demipass/leak-scan/token-requests "$AG" '{"scrub_ref":"'$UREF'"}'
 C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub" -H 'content-type: application/json' -H "Authorization: Scan bogus-token" --data-binary @"$S/huge.json"); [ "$C" = 401 ] && ok "an unknown scan token is refused before the body is read" || fail "L1: $C"
 scrubtok sF "$NREF"
 C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub/finish" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/sF.tok")" -d '{"files_read":3,"files_changed":0,"copies_masked":0,"copies_left":0}'); [ "$C" = 400 ] && ok "finish must say how many paths were not read" || fail "paths_not_read: $C"
+
+# ── many small files share requests (2026-11-12: one request per file hit the 12,000/day cap on ~70,000 files) ──
+scrubtok sM "$NREF"; mkdir -p "$S/many"
+python3 -c 'import sys; v=open(sys.argv[1]).read().strip(); [open(f"{sys.argv[2]}/f{i:03d}.txt","w").write(("pw "+v+"\n") if i%50==0 else f"nothing {i}\n") for i in range(300)]' "$S/nval" "$S/many"
+MT=$(Q "SELECT id FROM leak_scan_tokens WHERE token_hash='$(tr -d '\n' < "$S/sM.tok" | sha256sum | cut -d' ' -f1)'")
+ln "$S/many/f050.txt" "$S/many/hardlink.txt"   # the same file twice: read once, not "1 left"
+OUT=$(SCRUB "$S/sM.tok" "$S/many" "$S/many/f100.txt"); RC=$?
+REQS=$(Q "SELECT requests_today FROM leak_scan_tokens WHERE id=$MT")
+[ $RC = 0 ] && echo "$OUT" | grep -q "masked 6, left 0" && [ "$REQS" -le 4 ] && ! grep -rqF -- "$(head -c 10 "$S/nval")" "$S/many" && ok "300 small files: 6 copies masked in $REQS requests (not 300), contained" || fail "batching: rc=$RC reqs=$REQS $OUT"
 
 # ── expiry ──
 scrubtok s8 "$NREF"

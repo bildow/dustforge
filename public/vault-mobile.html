@@ -48,6 +48,16 @@
   /* Panic button */
   .panic-strip { display:none; padding:0.6rem 1rem; background:rgba(224,108,117,0.1); border-bottom:1px solid rgba(224,108,117,0.3); text-align:center; }
 .panic-strip span { color:var(--red); font-weight:600; font-size:0.8rem; }
+  .secret-row:active { background:var(--surface); }
+  .req-badge { font-size:0.75rem; font-weight:600; cursor:pointer; padding:0.2rem 0.5rem; border:1px solid var(--border); border-radius:6px; color:var(--text2); white-space:nowrap; }
+  .req-badge.waiting { border-color:var(--orange); color:var(--orange); }
+  .req-badge b { display:inline-block; min-width:1.1rem; padding:0 0.3rem; margin-left:0.25rem; border-radius:9px; background:var(--orange); color:var(--bg); text-align:center; }
+  .req-chips { display:flex; gap:0.35rem; flex-wrap:wrap; margin:0.5rem 0; }
+  .req-chips button { font-size:0.7rem; padding:0.25rem 0.55rem; border-radius:12px; border:1px solid var(--border); background:var(--card); color:var(--text2); }
+  .req-chips button.on { border-color:var(--accent); color:var(--accent); }
+  .req-row { padding:0.6rem 0.7rem; border:1px solid var(--border); border-radius:10px; margin-bottom:0.5rem; font-size:0.78rem; background:var(--card); }
+  .req-row .rr-top { display:flex; justify-content:space-between; gap:0.5rem; }
+  .req-row .rr-st { font-size:0.65rem; font-weight:700; text-transform:uppercase; }
   .fill-req { margin:0.6rem 1rem 0; padding:0.75rem; border:1px solid var(--accent); border-radius:10px; font-size:0.8rem; }
   .fill-req .fr-origin { font-weight:700; word-break:break-all; }
   .fill-req .fr-row { display:flex; gap:0.5rem; margin-top:0.6rem; }
@@ -172,6 +182,7 @@
   <div class="topbar" style="padding-top:2rem;background:var(--surface)">
     <div class="topbar-left">Demi<span>Pass</span></div>
     <div class="topbar-right">
+      <span class="req-badge" id="req-badge" onclick="openRequests('pending')" title="Requests waiting on you">Requests</span>
       <span class="topbar-user" id="app-user"></span>
       <span class="topbar-out" onclick="logout()" style="color:var(--red);font-weight:600;cursor:pointer;padding:0.2rem 0.5rem;border:1px solid var(--red);border-radius:6px;font-size:0.75rem">Sign Out</span>
     </div>
@@ -231,6 +242,24 @@
   </div>
 
   <!-- Page: Secret Detail (hidden, shown on tap) -->
+  <!-- Requests (Aaron 2026-11-12): every request in one list — use approvals, scan tokens, agent tokens — searchable by
+       number, name or requester, filtered by state; pending first. Opened from the badge in the top bar. -->
+  <div id="page-requests" class="page">
+    <div style="padding:0.75rem 1rem 6rem">
+      <div style="display:flex;justify-content:space-between;align-items:center"><span class="section-title">Requests</span>
+        <button class="btn-ghost" style="font-size:0.7rem" onclick="loadRequestsAll()">Refresh</button></div>
+      <input id="req-q" type="search" placeholder="Search: number (14 or #14), name, requester" oninput="reqFilter.q=this.value;renderRequests()" style="width:100%;margin-top:0.5rem;padding:0.55rem 0.7rem;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.85rem">
+      <div class="req-chips" id="req-status"></div>
+      <div style="display:flex;gap:0.5rem">
+        <select id="req-kind" onchange="reqFilter.kind=this.value;renderRequests()" style="flex:1;padding:0.35rem;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.75rem">
+          <option value="">All kinds</option><option value="use">Use approvals</option><option value="scan">Scan tokens</option><option value="agent">Agent tokens</option></select>
+        <select id="req-who" onchange="reqFilter.who=this.value;renderRequests()" style="flex:1;padding:0.35rem;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.75rem"><option value="">Anyone</option></select>
+      </div>
+      <div id="req-note" style="font-size:0.7rem;color:var(--text3);margin:0.4rem 0"></div>
+      <div id="req-list"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
   <div id="page-detail" class="page">
     <div style="padding:1rem">
       <button onclick="closeDetail()" style="background:none;border:none;color:var(--accent);font-size:0.9rem;cursor:pointer;padding:0;margin-bottom:1rem">← Back to Vault</button>
@@ -905,7 +934,11 @@ function logout(){
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
   for(const i of ['df-fwd-banner','security-banner','panic','onboarding-wizard']){const e=document.getElementById(i);if(e)e.style.display='none'}
   updateStoreFields(); updateSiliconFields(); updateNetFields();   // the sheets' field sets follow their reset dropdowns
-  secrets=[]; dashboardData=null; document.getElementById('vault-note').textContent=''; fleetSlug=null; fleetData=null; siliconHandle=null; fleetNote=null; renewBusy.clear(); panic=false;
+  secrets=[]; dashboardData=null; document.getElementById('vault-note').textContent='';
+  // Requests and pools are this account's: none of it survives a sign-out (#99 review M4).
+  approvals=[]; scanReqs=[]; agentTokReqs=[]; reqAll=[]; reqFilter={q:'',status:'pending',kind:'',who:''}; reqLoading=null; reqAgain=false; reqLoadedAt=0; lastSecretsSig=''; poolOpenFor=null;
+  for(const i of ['req-list','req-status','scan-requests','agent-token-requests','approval-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}
+  { const w=document.getElementById('req-who'); if(w) w.innerHTML='<option value="">Anyone</option>'; const q=document.getElementById('req-q'); if(q) q.value=''; updateReqBadge(); } fleetSlug=null; fleetData=null; siliconHandle=null; fleetNote=null; renewBusy.clear(); panic=false;
   goPage('vault');
   document.getElementById('auth').style.display='flex';document.getElementById('app').style.display='none';
   setTimeout(()=>{ try{ checkLoginHolds(); }catch(_){} },0)}
@@ -2001,6 +2034,7 @@ async function loadApprovals(){
   renderApprovals();
 }
 function renderApprovals(){
+  updateReqBadge();
   const el=document.getElementById('approval-requests'); if(!el) return;
   el.innerHTML=approvals.map(a=>'<div class="fill-req"><div><b>@'+esc(a.requester)+'</b>'+(a.requester_label?' <span style="color:var(--text3)">('+esc(a.requester_label)+')</span>':'')+' wants to use <b>'+esc(a.secret.name||'')+'</b>'
     +' <span style="font-size:0.65rem;color:'+(a.depth==='critical'?'var(--red)':'var(--orange)')+'">'+esc(a.depth)+'</span></div>'
@@ -2214,7 +2248,7 @@ async function loadVault(){
     if(sessionEnded(e)||seq!==vaultSeq) return;
     // Keep the last good vault on screen; a dropped refresh is retried by the next poll or when the phone is back online.
     if(dashboardData){ document.getElementById('vault-note').textContent = e.dropped||/fetch|network|connection/i.test(e.message) ? 'Offline — showing your vault as of '+new Date(vaultLoadedAt).toLocaleTimeString() : 'Could not refresh: '+e.message; return; }
-    document.getElementById('secret-list').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
+    lastSecretsSig = ''; document.getElementById('secret-list').innerHTML = '<div class="empty">Error: ' + esc(e.message) + '</div>';
   }
 }
 
@@ -2241,13 +2275,19 @@ var vaultPools = { pools: [], uncategorized: 0 };
 // Grouped exactly as the server keeps them: a secret's category, or "uncategorized" (no guessing from names, #91 L3).
 const poolKey = (s) => (s.category ? String(s.category).toLowerCase() : 'uncategorized');
 const poolLabel = (k) => titleCase(String(k).replace(/-/g, ' '));
+var lastSecretsSig = '';
 function renderSecrets(){
   // A refresh never pulls the row out from under a finger: it waits for the hold or drag to end (#91 review M2).
   if(poolDrag.active || poolDrag.holding){ poolDrag.pendingRender = true; return; }
+  // A poll that brings nothing new changes nothing on screen (Aaron 2026-11-12: pools folded and the view jumped while
+  // he read): same data, same pools → no redraw.
+  const sig = JSON.stringify([secrets.map(s => [s.name, s.ref, s.category, s.health, s.frozen, s.use_count, s.type, s.recommendation, (s.recent_outcomes || []).slice(0, 3).map(o => o.outcome)]), vaultPools]);
+  if(sig === lastSecretsSig) return;   // every other writer of the list resets lastSecretsSig (#99 review M5)
+  lastSecretsSig = sig;
   const groups = {};
   for(const s of secrets){ const k = poolKey(s); (groups[k] = groups[k] || []).push(s); }
   for(const p of (vaultPools.pools || [])) if(!groups[p.name]) groups[p.name] = [];
-  if(!Object.keys(groups).length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}
+  if(!Object.keys(groups).length){document.getElementById('secret-list').innerHTML='<div class="empty">No secrets stored yet</div>';return}   // lastSecretsSig already says "empty"
 
   // Sort groups: groups with worst health first; empty pools last
   const healthPriority = {red:0, yellow:1, green:2, neutral:3};
@@ -2268,10 +2308,12 @@ function renderSecrets(){
     const pct = Math.round((healthy / total) * 100);
     const barColor = pct >= 80 ? 'var(--green)' : pct >= 50 ? 'var(--yellow)' : 'var(--red)';
     const hasIssues = items.some(s => s.health === 'red' || s.health === 'yellow');
+    // Open or closed as the owner left it; untouched, open only when something in it is failing or warning.
+    const showByDefault = poolIsOpen(poolK, hasIssues);
     const frozen = items.filter(s => s.frozen).length;
 
     h += '<div data-pool="'+esc(poolK)+'" data-pool-card="'+esc(poolK)+'" style="background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:0.75rem;overflow:hidden">';
-    h += '<div onclick="toggleGroup('+jsArg(groupName)+')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
+    h += '<div onclick="toggleGroup('+jsArg(poolK)+')" style="padding:0.75rem 1rem;cursor:pointer;display:flex;justify-content:space-between;align-items:center">';
     h += '<div>';
     h += '<div style="font-weight:700;font-size:0.9rem">'+esc(groupName)+'</div>';
     h += '<div style="font-size:0.7rem;color:var(--text3)">'+total+' secret'+(total!==1?'s':'')+(frozen?' &middot; '+frozen+' frozen':'')+'</div>';
@@ -2279,19 +2321,17 @@ function renderSecrets(){
     h += '<div style="display:flex;align-items:center;gap:0.75rem">';
     h += '<div style="width:60px;height:6px;background:var(--bg);border-radius:3px;overflow:hidden"><div style="width:'+pct+'%;height:100%;background:'+barColor+';border-radius:3px"></div></div>';
     h += '<span style="font-size:0.7rem;color:'+barColor+';font-weight:600;min-width:28px;text-align:right">'+pct+'%</span>';
-    h += '<span style="color:var(--text3);font-size:0.8rem" id="chevron-'+esc(groupName)+'">▸</span>';
+    h += '<span style="color:var(--text3);font-size:0.8rem" data-chevron="'+esc(poolK)+'">'+(showByDefault?'▾':'▸')+'</span>';
     h += '</div>';
     h += '</div>';
 
-    // Expandable secret list (hidden by default, shown if has issues)
-    const showByDefault = hasIssues;
-    h += '<div id="group-'+esc(groupName)+'" style="display:'+(showByDefault?'block':'none')+';border-top:1px solid var(--border);padding:0 0.5rem 0.5rem">';
+    h += '<div data-group="'+esc(poolK)+'" style="display:'+(showByDefault?'block':'none')+';border-top:1px solid var(--border);padding:0 0.5rem 0.5rem">';
     for(const s of items){
       const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
       const fr = s.frozen ? ' ❄' : '';
       const rec = s.recommendation ? ' <span style="color:var(--yellow);font-size:0.6rem">'+esc(s.recommendation)+'</span>' : '';
 
-      h += '<div data-ref="'+esc(s.ref||'')+'" data-from="'+esc(poolK)+'" onclick="event.stopPropagation();if(!poolDrag.justDropped)showDetail('+jsArg(s.name)+')" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px" ontouchstart="this.style.background=\'var(--surface)\'" ontouchend="this.style.background=\'none\'">';
+      h += '<div data-ref="'+esc(s.ref||'')+'" data-from="'+esc(poolK)+'" onclick="event.stopPropagation();if(!poolDrag.justDropped)showDetail('+jsArg(s.name)+')" class="secret-row" style="display:flex;align-items:center;gap:0.6rem;padding:0.4rem 0.5rem;cursor:pointer;border-radius:8px">';
       h += '<div style="width:10px;height:10px;border-radius:50%;flex-shrink:0;background:'+healthColor+'"></div>';
       h += '<div style="flex:1;min-width:0"><div style="font-size:0.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(s.name)+fr+'</div>';
       h += '<div style="font-size:0.65rem;color:var(--text3)">'+esc(s.type||'-')+' &middot; '+s.use_count+' uses'+rec+'</div></div>';
@@ -2303,7 +2343,10 @@ function renderSecrets(){
     }
     h += '</div></div>';
   }
-  document.getElementById('secret-list').innerHTML=h;
+  // Keep the reader where they were: a redraw (a real change) does not move the page.
+  const w = typeof window !== 'undefined' ? window : null, y = w ? w.scrollY : 0;
+  document.getElementById('secret-list').innerHTML = h;
+  if(w && w.scrollY !== y && w.scrollTo) w.scrollTo(0, y);
 }
 
 async function addPool(){
@@ -2380,11 +2423,113 @@ var poolDrag = { active:false, holding:false, justDropped:false, pendingRender:f
   window.addEventListener('mouseup', () => { cancelHold(); if(d) end(); });
 })();
 
-function toggleGroup(name){
-  const el = document.getElementById('group-'+name);
-  const chev = document.getElementById('chevron-'+name);
-  if(el.style.display==='none'){el.style.display='block';chev.textContent='▾'}
-  else{el.style.display='none';chev.textContent='▸'}
+// A pool stays open or closed as the owner left it; a refresh never folds it (Aaron 2026-11-12). Remembered per pool in
+// this browser; a pool never touched opens on its own only when it holds a failing or warning secret.
+// Per account (#99 review M4): another wallet signed in on this phone starts from its own pools.
+var poolOpenFor = null, poolOpen = Object.create(null);
+function poolOpenLoad(){
+  const who = (typeof did === 'string' && did) || '';
+  if(poolOpenFor === who) return poolOpen;
+  poolOpenFor = who; poolOpen = Object.create(null);
+  try { const o = JSON.parse(localStorage.getItem('dp.poolOpen.' + who) || '{}') || {}; for(const k of Object.keys(o)) poolOpen[k] = !!o[k]; } catch (_) {}
+  return poolOpen;
+}
+const poolIsOpen = (k, dflt) => { const m = poolOpenLoad(); return Object.prototype.hasOwnProperty.call(m, k) ? !!m[k] : dflt; };
+function toggleGroup(k){
+  const el = document.querySelector('[data-group="'+(window.CSS && CSS.escape ? CSS.escape(k) : k)+'"]');
+  const chev = document.querySelector('[data-chevron="'+(window.CSS && CSS.escape ? CSS.escape(k) : k)+'"]');
+  if(!el) return;
+  const open = el.style.display === 'none';
+  el.style.display = open ? 'block' : 'none'; if(chev) chev.textContent = open ? '▾' : '▸';
+  poolOpenLoad()[k] = open; try { localStorage.setItem('dp.poolOpen.' + poolOpenFor, JSON.stringify(poolOpen)); } catch (_) {}
+}
+
+// ── Requests page ─────────────────────────────────────────────────────────────────────────────────────────────────
+// Pending ones also show as cards above every page; this is where any of them can be found again, decided or not.
+let reqAll=[], reqFilter={q:'',status:'pending',kind:'',who:''}, reqLoadedAt=0, reqLoading=null;
+// The kinds the Requests page lists (fill, share and network requests keep their own cards above every page).
+function pendingCount(){ return (approvals||[]).length+(scanReqs||[]).length+(agentTokReqs||[]).length; }
+function updateReqBadge(){
+  const b=document.getElementById('req-badge'); if(!b) return;
+  const n=pendingCount();
+  b.className='req-badge'+(n?' waiting':''); b.innerHTML='Requests'+(n?'<b>'+n+'</b>':'');
+  b.title=n?n+' request'+(n===1?'':'s')+' waiting on you':'No request is waiting on you';
+  if(document.getElementById('page-requests').classList.contains('active')&&!reqLoading&&Date.now()-reqLoadedAt>15000) loadRequestsAll();
+}
+// Decide an agent-token request from this page with that row's own facts (the PIN prompt names the agent and scope),
+// even if the 16 s poll has not seen it yet (#99 review M3).
+async function reqAgentDecide(id, ok){
+  const it=reqAll.find(x=>x.kind==='agent'&&x.id===id); if(it&&it.raw&&!agentTokReqs.find(x=>x.id===id)) agentTokReqs=[...agentTokReqs,it.raw];
+  await agentTokDecide(id, ok); loadRequestsAll();
+}
+// Same for a scan or scrub request: the PIN prompt says "scrub <name>" even before the 16 s poll has seen it.
+async function reqScanDecide(id, ok){
+  const it=reqAll.find(x=>x.kind==='scan'&&x.id===id); if(it&&it.raw&&!scanReqs.find(x=>x.id===id)) scanReqs=[...scanReqs,it.raw];
+  await scanDecide(id, ok); loadRequestsAll();
+}
+function openRequests(status){
+  reqFilter.status=status||reqFilter.status; goPage('requests'); if(typeof window!=='undefined'&&window.scrollTo) window.scrollTo(0,0); loadRequestsAll();
+}
+// Agent-token states: creating (approved, the agent is being made) counts as approved; failed with denied.
+const reqStatusOf=(s)=>{ s=String(s||''); return s==='pending'?'pending':/^(approved|used|claimed|active|creating)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed)$/.test(s)?'denied':s==='expired'?'expired':s; };
+// One load at a time; a load asked for while one runs runs once more after it, so a decision is never shown stale
+// (#99 re-review L2), and a finished load clears only its own flag (L3: not the next account's).
+let reqAgain=false;
+function loadRequestsAll(){
+  if(reqLoading){ reqAgain=true; return reqLoading; }
+  const p=loadRequestsOnce().finally(()=>{ if(reqLoading===p){ reqLoading=null; if(reqAgain){ reqAgain=false; loadRequestsAll(); } } });
+  reqLoading=p; return p;
+}
+async function loadRequestsOnce(){
+  if(lockState.locked) return;
+  const epoch=sessionEpoch;   // a reply that lands after a sign-out writes nothing (#99 review M4)
+  reqLoadedAt=Date.now();
+  const note=document.getElementById('req-note'); note.textContent='Loading…';
+  const [ap,sc,ag]=await Promise.all([
+    api('GET','/api/blindkey/approvals?limit=200').catch(e=>({error:e})),
+    api('GET','/api/blindkey/leak-scan/token-requests?all=1').catch(e=>({error:e})),
+    api('GET','/api/silicon-token-requests?all=1').catch(e=>({error:e}))]);
+  if(epoch!==sessionEpoch||!vaultOpen) return;
+  const items=[], seen=new Set();
+  for(const a of [...(ap.incoming||[]),...(ap.recent||[]),...(ap.outgoing||[])]){
+    if(seen.has('use'+a.id)) continue; seen.add('use'+a.id);
+    items.push({kind:'use',id:a.id,status:a.status,who:a.requester||'',label:a.requester_label||'',what:(a.secret&&a.secret.name?a.secret.name+': ':'')+(a.summary||a.service||''),
+      why:a.purpose||'',created:a.created_at,expires:a.expires_at,mine:!!(ap.outgoing||[]).find(x=>x.id===a.id)&&!(ap.incoming||[]).concat(ap.recent||[]).find(x=>x.id===a.id)});
+  }
+  for(const q of (sc.requests||[])) items.push({kind:'scan',sub:q.kind==='scrub'?'scrub':'',id:q.id,status:q.status,who:q.requested_by||'',label:'',
+    what:q.kind==='scrub'&&q.scrub?'scrub '+q.scrub.name+' ('+q.scrub.ref+') from the files a scrubber reads':'scan token'+(q.labels.length===1?'':'s')+': '+q.labels.join(', '),why:'',created:q.created_at,expires:q.expires_at,raw:q});
+  for(const q of (ag.requests||[])) items.push({kind:'agent',id:q.id,status:q.status,who:q.requested_by||'',label:q.says_it_is||'',what:(q.creates?'create @':'token for @')+q.handle+' ('+q.fleet+'), '+q.scope+', '+q.expires_in,why:'',created:q.created_at,expires:q.expires_at,raw:q});
+  items.sort((x,y)=>(reqStatusOf(x.status)==='pending'?0:1)-(reqStatusOf(y.status)==='pending'?0:1)||String(y.created).localeCompare(String(x.created)));
+  reqAll=items;
+  const failed=[ap,sc,ag].filter(x=>x&&x.error&&!sessionEnded(x.error)).length;
+  note.textContent=(failed?failed+' list'+(failed===1?'':'s')+' could not be loaded. ':'')+'Last 30 days; decided use approvals: the latest 200.';
+  const who=document.getElementById('req-who'), cur=reqFilter.who;
+  who.innerHTML='<option value="">Anyone</option>'+[...new Set(items.map(i=>i.who).filter(Boolean))].sort().map(w=>'<option value="'+esc(w)+'"'+(w===cur?' selected':'')+'>@'+esc(w)+'</option>').join('');
+  renderRequests();
+}
+function renderRequests(){
+  const chips=[['pending','Pending'],['approved','Approved / used'],['denied','Denied'],['expired','Expired'],['','All']];
+  const count=(st)=>reqAll.filter(i=>!st||reqStatusOf(i.status)===st).length;
+  document.getElementById('req-status').innerHTML=chips.map(([v,l])=>'<button class="'+(reqFilter.status===v?'on':'')+'" onclick="reqFilter.status='+jsArg(v)+';renderRequests()">'+l+' '+count(v)+'</button>').join('');
+  const q=reqFilter.q.trim().toLowerCase(), num=q.replace(/^#/,''), byNum=/^\d+$/.test(num);
+  // A number is one request: found in whatever state it is in (#99 review M2: "14" from the badge's Pending view).
+  const rows=reqAll.filter(i=>(byNum||!reqFilter.status||reqStatusOf(i.status)===reqFilter.status)&&(!reqFilter.kind||i.kind===reqFilter.kind)&&(!reqFilter.who||i.who===reqFilter.who)
+    &&(!q||(byNum?Number(i.id)===Number(num):(i.kind+' '+i.who+' '+i.label+' '+i.what+' '+i.why+' '+i.status).toLowerCase().includes(q))));
+  const kindName={use:'Use approval',scan:'Scan token',agent:'Agent token'}, col={pending:'var(--orange)',approved:'var(--green)',denied:'var(--red)',expired:'var(--text3)'};
+  const el=document.getElementById('req-list');
+  if(!rows.length){ el.innerHTML='<div class="empty">'+(reqAll.length?'Nothing matches.':'No requests in the last 30 days.')+'</div>'; return; }
+  el.innerHTML=rows.map(i=>{ const st=reqStatusOf(i.status), pend=st==='pending'&&!i.mine;
+    const act=!pend?'':i.kind==='use'?'<button class="btn-primary" onclick="openApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Open</button><button class="btn-ghost" onclick="denyApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Deny</button>'
+      :i.kind==='scan'?'<button class="btn-primary" onclick="reqScanDecide('+Number(i.id)+',true)">Approve</button><button class="btn-ghost" onclick="reqScanDecide('+Number(i.id)+',false)">Deny</button>'
+      :'<button class="btn-primary" onclick="reqAgentDecide('+Number(i.id)+',true)">Approve</button><button class="btn-ghost" onclick="reqAgentDecide('+Number(i.id)+',false)">Deny</button>';
+    const r=i.raw||{}, warn=i.sub==='scrub'&&st==='pending'?'<div style="color:var(--red);margin-top:0.2rem">The scrubber learns where this value is in its files: in effect, the value. Approve only if you started it.</div>':i.kind!=='agent'?'':r.requester_role==='other_agent'?'<div style="color:var(--red);margin-top:0.2rem">Another agent, @'+esc(r.requested_by||'?')+', asks for @'+esc(r.handle||'?')+'\'s token. If approved, @'+esc(r.requested_by||'?')+' can act as @'+esc(r.handle||'?')+'.</div>'
+      :r.requester_role==='outside_agent'?'<div style="color:var(--red);margin-top:0.2rem">@'+esc(r.requested_by||'?')+' is a wallet your fleet did not create. If approved, it can act as @'+esc(r.handle||'?')+'.</div>':'';
+    return '<div class="req-row"><div class="rr-top"><span><b>'+(i.sub==='scrub'?'Scrub token':kindName[i.kind])+' #'+Number(i.id)+'</b>'+(i.mine?' <span style="color:var(--text3)">(yours, waiting on someone else)</span>':'')+'</span><span class="rr-st" style="color:'+(col[st]||'var(--text3)')+'">'+esc(i.status)+'</span></div>'
+      +'<div style="margin-top:0.2rem">'+esc(i.what)+'</div>'+warn
+      +(i.who||i.label?'<div style="color:var(--text3);margin-top:0.15rem">from @'+esc(i.who||'?')+(i.label?' ('+esc(i.label)+')':'')+'</div>':'')
+      +(i.why?'<div style="margin-top:0.15rem">“'+esc(i.why)+'”</div>':'')
+      +'<div style="color:var(--text3);font-size:0.68rem;margin-top:0.15rem">'+(i.created?'asked '+esc(new Date(i.created).toLocaleString()):'')+(st==='pending'&&i.expires?' · waits until '+esc(new Date(i.expires).toLocaleString()):'')+'</div>'
+      +(act?'<div class="fr-row">'+act+'</div>':'')+'</div>'; }).join('');
 }
 
 function showDetail(name) {
@@ -3096,6 +3241,7 @@ let scanReqs=[], scanBusy=new Set();
 async function loadScanRequests(){
   if(lockState.locked) return;
   try{ const r=await api('GET','/api/blindkey/leak-scan/token-requests'); scanReqs=r.requests||[]; }catch(e){ if(sessionEnded(e)) return; }
+  updateReqBadge();
   const el=document.getElementById('scan-requests'); if(!el) return;
   // A scrub request is not a scan token: it shows where one value sits in the scrubber's files — in effect, the value.
   el.innerHTML=scanReqs.map(q=>'<div class="fill-req">'+(q.kind==='scrub'&&q.scrub
@@ -3113,6 +3259,7 @@ let agentTokReqs=[], agentTokBusy=new Set();
 async function loadAgentTokenRequests(){
   if(lockState.locked) return;
   try{ const r=await api('GET','/api/silicon-token-requests'); agentTokReqs=r.requests||[]; }catch(e){ if(sessionEnded(e)) return; }
+  updateReqBadge();
   const el=document.getElementById('agent-token-requests'); if(!el) return;
   el.innerHTML=agentTokReqs.map(q=>'<div class="fill-req">'+(q.creates
       ?'<div><b>Create a new agent @'+esc(q.handle)+'</b> in fleet '+esc(q.fleet)+' (wallet and mailbox '+esc(q.username||q.handle)+'@dustforge.com'+(q.cost_dd?', '+esc(String(q.cost_dd))+' DD from the fleet, like a provision':'')+'), with a <b>'+esc(q.scope)+'</b> token lasting '+esc(q.expires_in)+'</div>'

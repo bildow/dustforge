@@ -164,6 +164,8 @@ call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"
 call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"'$CS'"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J tokens.1.label)" = ci-demipass ] && [ "$(Q "SELECT COALESCE(sealed,'') FROM leak_scan_token_requests WHERE id=$RQ")" = "" ] && ok "the asker claims both tokens once; nothing sealed is kept" || fail "claim: $CODE"
 call POST /api/demipass/leak-scan/token-requests/$RQ/claim "" '{"claim_secret":"'$CS'"}'; [ "$CODE" = 410 ] && ok "…a second claim gets nothing (410)" || fail "reclaim: $CODE"
+call GET "/api/demipass/leak-scan/token-requests?all=1" "$A"; echo "$BODY" | python3 -c 'import json,sys; r=[x for x in json.load(sys.stdin)["requests"] if x["id"]==int(sys.argv[1])]; sys.exit(0 if r and r[0]["status"]=="claimed" else 1)' "$RQ" && ok "?all=1 still lists a claimed request (the app finds it by number)" || fail "all=1: $BODY"
+call GET /api/demipass/leak-scan/token-requests "$A"; echo "$BODY" | grep -q "\"id\":$RQ," && fail "plain list shows a claimed request" || ok "…the plain list stays pending-only"
 # A request waits a day for the owner (not 15 minutes), and the scanner that asked picks it up on a later run:
 # --request --no-wait leaves a 0600 pending file and exits 3; --claim writes the token once approved (Aaron 2026-11-11).
 mkdir -p "$S/pend"; OUT=$(DEMIPASS_URL=$API DEMIPASS_TOKEN="$AG" node bin/leak-scan.js --request --no-wait "$S/pend" pane-later 2>&1); RC=$?
