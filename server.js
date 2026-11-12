@@ -200,6 +200,25 @@ const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
 const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 50, message: { error: 'Too many requests' } });
 const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 500, message: { error: 'Rate limit exceeded' } });
+// /request-token and /use: per wallet, not per address (Aaron 2026-11-12: the whole fleet behind phasewhip's NAT shared
+// one 500/15 min budget; an MCI burst got 332 refusals). The key is the VERIFIED token's own subject (a silicon has its
+// own bucket, not its owner's); a caller without a valid token is keyed by address, as before. A looser per-address
+// ceiling stays, so many wallets from one address cannot flood. The wallet limit is checked first: a wallet's own
+// refused retries never count against the address (#103 review M1). Both maxima can be lowered for tests.
+const useRateIpKey = (req) => (rateLimit.ipKeyGenerator ? rateLimit.ipKeyGenerator(req.ip || '') : String(req.ip || ''));
+const useRateWallet = (req) => {
+  if (req._useRateKey !== undefined) return req._useRateKey;
+  let k = null;
+  // A worker token (decoded.wrk) has its own sub-budget under its owner, so one runaway worker cannot starve the
+  // owner's other agents (#103 review L1).
+  try { const a = getBearerIdentity(req); if (a && a.ok) { const sub = (a.decoded && a.decoded.sub) || a.did || null; k = sub ? sub + (a.decoded && a.decoded.wrk ? ':wrk:' + a.decoded.wrk : '') : null; } } catch (_) { k = null; }
+  return (req._useRateKey = k);
+};
+const rateLimitUseWallet = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_LIMIT_MAX) || 500,
+  keyGenerator: (req) => { const w = useRateWallet(req); return w ? 'wallet:' + w : 'ip:' + useRateIpKey(req); },
+  handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: useRateWallet(req) ? 'Rate limit exceeded (this wallet: per 15 minutes)' : 'Rate limit exceeded (this address, no valid token: per 15 minutes)' }) });
+const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_IP_CEILING) || 5000,
+  keyGenerator: useRateIpKey, message: { error: 'Rate limit exceeded (this address: per 15 minutes)' } });
 // Browser fill polls (the wallet every 4 s, a waiting fill every 2 s): its own budget, so polling never starves /use.
 const rateLimitFill = rateLimit({ windowMs: 15*60*1000, max: 3000, message: { error: 'Rate limit exceeded' } });
 const rateLimitInvite = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many invite requests. Try again later.' } });
@@ -5168,7 +5187,7 @@ function requestUseTokenHandler(req, res) {
     res.status(500).json({ error: e.message });
   }
 }
-app.post('/api/blindkey/request-token', rateLimitStandard, billing.billingMiddleware(db, 'api_call_read'), requestUseTokenHandler);
+app.post('/api/blindkey/request-token', rateLimitUseWallet, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_read'), requestUseTokenHandler);
 
 // POST /api/blindkey/use — use a secret without seeing it (delegated execution)
 // Supports two modes:
@@ -5189,7 +5208,7 @@ function claimUseToken(id) {
     .run(until, id, now).changes === 1 ? { id, until } : null;
 }
 function releaseUseToken(c) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ? AND executing_until = ?').run(c.id, c.until); } catch (_) {} }
-app.post('/api/blindkey/use', rateLimitStandard, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
+app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
   try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); }
 });
 async function useRoute(req, res) {
