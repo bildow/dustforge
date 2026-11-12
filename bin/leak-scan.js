@@ -210,10 +210,21 @@ function latin1Offset(raw, utf8Bytes) {
   return i;
 }
 let maxFormBytes = 0;
+// A scrub reads gigabytes over many minutes: a server restart (deploy) or a dropped connection is waited out, not the
+// end of the run (2026-11-12: one 502 during a deploy stopped the first live scrub). The same batch is sent again —
+// nothing was written for it yet.
 async function scrubPost(auth, batch) {
+  const body = JSON.stringify({ chunks: batch });
   for (let attempt = 0; ; attempt++) {
-    const r = await fetch(API + '/api/demipass/leak-scan/scrub', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: JSON.stringify({ chunks: batch }) });
-    const d = await r.json().catch(() => ({}));
+    let r, d;
+    const wait = () => new Promise(ok => setTimeout(ok, Math.min(60000, 5000 * (attempt + 1))));
+    // The body is read inside the try: a reply cut off mid-body is a failed request, never "no copies" (#101 review).
+    try { r = await fetch(API + '/api/demipass/leak-scan/scrub', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body, signal: AbortSignal.timeout(120000) }); const t = await r.text(); try { d = JSON.parse(t); } catch (_) { d = null; } }
+    catch (e) { if (attempt < 12) { await wait(); continue; } throw new Error(`scrub refused: the server could not be reached (${e.name})`); }
+    if ([502, 503, 504].includes(r.status) && attempt < 12) { await wait(); continue; }
+    // A 2xx answer counts only whole: {ok: true, matches: [...]}. Anything else is retried like a 502, then ends the run.
+    if (r.ok && !(d && d.ok === true && Array.isArray(d.matches))) { if (attempt < 12) { await wait(); continue; } throw new Error('scrub refused: the server\'s answers were incomplete'); }
+    d = d || {};
     if (r.status === 429 && /Rate limit/.test(d.error || '') && attempt < 20) { await new Promise(ok => setTimeout(ok, 60000)); continue; }
     if (!r.ok) throw new Error(`scrub refused: HTTP ${r.status}: ${d.error || ''}`);
     if (d.max_form_bytes) maxFormBytes = Math.max(maxFormBytes, d.max_form_bytes);
@@ -337,10 +348,18 @@ async function scrub(args) {
   for (const k of notRead) console.log(`NOT READ ${k}`);
   console.log(`leak-scan: scrub ${dry ? '(dry run) ' : ''}read ${filesRead} files, ${bytesRead} bytes; ${dry ? 'found' : 'masked'} ${masked}, left ${left}${notRead.length ? `, ${notRead.length} paths not read` : ''}`);
   if (dry) process.exit(masked || left ? 1 : 0);
-  const r = await fetch(API + '/api/demipass/leak-scan/scrub/finish', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth },
-    body: JSON.stringify({ files_read: filesRead, files_changed: filesChanged, copies_masked: masked, copies_left: left, paths_not_read: notRead.length }) });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`finish refused: HTTP ${r.status}: ${d.error || ''}`);
+  // The finish is retried through a restart too. The server spends the token on the first finish it processes, so a
+  // 401 after a lost reply means it was recorded: say so instead of failing (#101 review).
+  const finBody = JSON.stringify({ files_read: filesRead, files_changed: filesChanged, copies_masked: masked, copies_left: left, paths_not_read: notRead.length });
+  let r, d = {}, tried = false;
+  for (let attempt = 0; ; attempt++) {
+    try { r = await fetch(API + '/api/demipass/leak-scan/scrub/finish', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: finBody, signal: AbortSignal.timeout(60000) }); d = await r.json().catch(() => null); }
+    catch (_) { r = null; d = null; }
+    if (r && r.ok && d && d.ok === true) break;
+    if (r && r.status === 401 && tried) { console.log('leak-scan: the finish was recorded on an earlier try (its reply was lost): see the entry in the DemiPass app'); process.exit(left || notRead.length ? 1 : 0); }
+    if ((!r || [502, 503, 504].includes(r.status) || (r.ok && !(d && d.ok === true))) && attempt < 12) { tried = true; await new Promise(ok => setTimeout(ok, Math.min(60000, 5000 * (attempt + 1)))); continue; }
+    throw new Error(`finish refused: HTTP ${r ? r.status : 'unreachable'}: ${(d && d.error) || ''}`);
+  }
   console.log(d.contained ? `leak-scan: ${d.entry ? d.entry.name : 'the entry'} is contained (not rotated; backups still hold old copies)` : `leak-scan: not marked contained (${d.why || 'copies left'}); this scrub token is spent`);
   process.exit(d.contained ? 0 : 1);
 }
