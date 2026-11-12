@@ -210,10 +210,16 @@ function latin1Offset(raw, utf8Bytes) {
   return i;
 }
 let maxFormBytes = 0;
+// A scrub reads gigabytes over many minutes: a server restart (deploy) or a dropped connection is waited out, not the
+// end of the run (2026-11-12: one 502 during a deploy stopped the first live scrub). The same batch is sent again —
+// nothing was written for it yet.
 async function scrubPost(auth, batch) {
+  const body = JSON.stringify({ chunks: batch });
   for (let attempt = 0; ; attempt++) {
-    const r = await fetch(API + '/api/demipass/leak-scan/scrub', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: JSON.stringify({ chunks: batch }) });
-    const d = await r.json().catch(() => ({}));
+    let r, d;
+    try { r = await fetch(API + '/api/demipass/leak-scan/scrub', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body, signal: AbortSignal.timeout(120000) }); d = await r.json().catch(() => ({})); }
+    catch (e) { if (attempt < 12) { await new Promise(ok => setTimeout(ok, Math.min(60000, 5000 * (attempt + 1)))); continue; } throw new Error(`scrub refused: the server could not be reached (${e.name})`); }
+    if ([502, 503, 504].includes(r.status) && attempt < 12) { await new Promise(ok => setTimeout(ok, Math.min(60000, 5000 * (attempt + 1)))); continue; }
     if (r.status === 429 && /Rate limit/.test(d.error || '') && attempt < 20) { await new Promise(ok => setTimeout(ok, 60000)); continue; }
     if (!r.ok) throw new Error(`scrub refused: HTTP ${r.status}: ${d.error || ''}`);
     if (d.max_form_bytes) maxFormBytes = Math.max(maxFormBytes, d.max_form_bytes);
