@@ -219,10 +219,12 @@ open(T+'/ja.md','w').write(('日本語のテキスト'*40+'\n')*6000 + 'pw '+v+'
 # a UTF-8 copy and a Latin-1-only neighbour in one window with stray bytes (re-review L: counts must not cancel)
 open(T+'/mixed.txt','wb').write(b'caf\xe9 \xff\n' + v.encode() + b'\n' + b'x\xe9y\n')
 open(T+'/hi.bin','wb').write(bytes([0x80])*1500000)                                    # no character boundary anywhere
+open(T+'/conf.py','w').write('x = 1\npw = "'+v+'"\n')                                   # starts like a zlib header: text (round 4 L-a)
 with gzip.open(T+'/old.log.gz','wt') as g: g.write('pw '+v+'\n')
 PY
 OUT=$(timeout 120 bash -c "DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE=$S/sN.tok node $W/bin/leak-scan.js --scrub $S/tn" 2>&1); RC=$?
 echo "$OUT" | grep -q "tui.log: 1 copy" && echo "$OUT" | grep -q "ja.md: 1 copy" && ! echo "$OUT" | grep -q 413 && ok "5–6 MB of multi-byte text goes through (batches counted in bytes) and its copies are masked" || fail "N1: rc=$RC $OUT"
+echo "$OUT" | grep -q "conf.py: 1 copy" && ok "a text file that starts like a zlib header is scrubbed, not skipped" || fail "zlib false positive: $OUT"
 echo "$OUT" | grep -q "mixed.txt: 1 copy" && ! grep -qF -- "$(head -c 12 "$S/nval")" "$S/tn/mixed.txt" && ok "a UTF-8 copy among stray bytes is masked exactly" || fail "mixed: $OUT"
 echo "$OUT" | grep -q "NOT READ.*old.log.gz (gzip" && echo "$OUT" | grep -q "not marked contained" && ok "a gzip file is not read and the run is not contained" || fail "N4: $OUT"
 [ $RC = 1 ] && ok "…and a file of continuation bytes does not stall the run" || fail "hi.bin: rc=$RC"

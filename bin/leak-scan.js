@@ -189,14 +189,17 @@ function utf8Clean(raw) {
   return { out, bad, at };
 }
 // Compressed or packed data: a copy inside cannot be seen, so the file is not "read" (#98 re-review N4).
-function packed(p, head) {
+function packed(p, head, start1k = head) {
   // Git objects in a work tree's .git or a bare repo (name.git/objects, Forgejo's layout), loose or packed (#98 round 3 R1).
   if (/(^|[\/])[^\/]*\.git[\/]objects[\/]/.test(p) || /[\/]objects[\/]([0-9a-f]{2}[\/][0-9a-f]{38}|pack[\/])/.test(p)) return 'git object';
   const m = (sig) => head.length >= sig.length && sig.every((x, i) => head[i] === x);
   if (m([0x1f, 0x8b])) return 'gzip'; if (m([0x28, 0xb5, 0x2f, 0xfd])) return 'zstd'; if (m([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00])) return 'xz';
   if (m([0x42, 0x5a, 0x68])) return 'bzip2'; if (m([0x50, 0x4b, 0x03, 0x04])) return 'zip'; if (m([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])) return '7z';
   if (m([0x04, 0x22, 0x4d, 0x18])) return 'lz4'; if (m([0x50, 0x41, 0x43, 0x4b])) return 'git pack';
-  if (head.length >= 2 && head[0] === 0x78 && ((head[0] << 8) | head[1]) % 31 === 0) return 'zlib';
+  // zlib: only when the header checks AND the start actually inflates (round 4 L-a: a file starting "x = 1" is text).
+  if (head.length >= 2 && head[0] === 0x78 && ((head[0] << 8) | head[1]) % 31 === 0) {
+    try { require('zlib').inflateSync(start1k, { finishFlush: require('zlib').constants.Z_SYNC_FLUSH }); return 'zlib'; } catch (_) {}
+  }
   if (m([0x25, 0x50, 0x44, 0x46])) return 'pdf (deflated)'; if (m([0x89, 0x50, 0x4e, 0x47])) return 'png (deflated)'; if (m([0x4c, 0x50, 0x4b, 0x53, 0x48, 0x48, 0x52, 0x48])) return 'journal';
   return null;
 }
@@ -252,10 +255,12 @@ async function scrub(args) {
       buf = Buffer.alloc(st.size); let got = 0; while (got < st.size) { const n = fs.readSync(fd, buf, got, st.size - got, got); if (!n) break; got += n; } buf = buf.subarray(0, got);
     } catch (e) { notRead.push(`${f} (${e.code || e.message})`); continue; } finally { if (fd !== undefined) fs.closeSync(fd); }
     filesRead++; bytesRead += buf.length;
-    const kind = packed(f, buf.subarray(0, 16));
+    const kind = packed(f, buf.subarray(0, 16), buf.subarray(0, 1024));
     if (kind) { filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); continue; }
     const binary = buf.subarray(0, 8192).includes(0);
     // Windows, each with its texts; one too big for a request is split (the overlap keeps every copy whole in a half).
+    // Windows are made and sent as the file is read, and each window's texts are dropped once sent (round 4 L-b: all
+    // of a 150 MB file's windows at once took 1.5 GB).
     const wins = [];
     const add = (a, b) => {
       const raw = buf.subarray(a, b), { out, bad, at: badAt } = utf8Clean(raw);
@@ -269,13 +274,11 @@ async function scrub(args) {
         add(a, Math.min(b, mid + overlap)); add(mid, b); return;
       }
       if (bytes > SCRUB_BODY_MAX) throw new Error(`${f}: a piece of it does not fit one request`);
-      wins.push({ start: a, end: b, parts, bytes, badAt });
+      wins.push({ start: a, end: b, parts, bytes, badAt: Uint32Array.from(badAt) });
     };
-    try { for (const w of scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)) add(w.start, w.end); }
-    catch (e) { filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${e.message.replace(f + ': ', '')})`); continue; }   // round 3 L1: that file is not read; the run goes on
     const spans = new Map();                 // exact spans (absolute start → length): written, in a text file
     const binSeen = new Set();
-    let batch = [], size = 0;
+    let batch = [], size = 0, sent = 0, done = 0;
     const flush = async () => {
       if (!batch.length) return;
       const res = await scrubPost(auth, batch); batch = []; size = 0;
@@ -284,21 +287,25 @@ async function scrub(args) {
         const raw = buf.subarray(w.start, w.end);
         for (const [off, len] of m.at || []) {
           // A match over a byte that was replaced (0x1A) is not the value as written: never masked (round 3 L2).
-          if (view !== 'l' && w.badAt.length && w.badAt.some(x => x >= off && x < off + len)) continue;
+          if (view !== 'l' && w.badAt && w.badAt.length && w.badAt.some(x => x >= off && x < off + len)) continue;
           const a = view === 'l' ? latin1Offset(raw, off) : off;
           const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
           if (binary) { binSeen.add(w.start + a); continue; }
           const s0 = w.start + a, prev = spans.get(s0); if (prev === undefined || l > prev) spans.set(s0, l);
         }
       }
+      for (; done < sent; done++) wins[done].badAt = null;   // answered: nothing more to map in these windows
     };
-    for (let i = 0; i < wins.length; i++) {
-      const w = wins[i];
-      if (size && (size + w.bytes > SCRUB_BODY_MAX || batch.length + w.parts.length > 150)) await flush();
-      for (const p of w.parts) batch.push({ id: i + ':' + p.view, text: p.text });
-      size += w.bytes;
-    }
-    await flush();
+    const pump = async () => {
+      for (; sent < wins.length; sent++) {
+        const w = wins[sent];
+        if (size && (size + w.bytes > SCRUB_BODY_MAX || batch.length + w.parts.length > 150)) await flush();
+        for (const p of w.parts) batch.push({ id: sent + ':' + p.view, text: p.text });
+        size += w.bytes; w.parts = null;
+      }
+    };
+    try { for (const w of scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)) { add(w.start, w.end); await pump(); } await flush(); }
+    catch (e) { if (/^scrub refused|finish refused/.test(e.message)) throw e; filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${e.message.replace(f + ': ', '')})`); continue; }   // round 3 L1: that file is not read; the run goes on
     if (binary) {
       const n = binSeen.size;
       if (n) { left += n; console.log(`FOUND    ${f}: ${n} cop${n === 1 ? 'y' : 'ies'} in a binary file — not written (remove the file or rotate)`); }
