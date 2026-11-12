@@ -517,8 +517,8 @@ app.use((req, res, next) => {
 const _jsonParser = express.json();
 const _useJsonParser = express.json({ limit: useLimits.USE_MAX_REQUEST_BYTES }); // POST /use: see use_limits.js
 const isUsePath = (p) => /^\/api\/(demipass|blindkey)\/use\/?$/i.test(p);   // Express matches case- and trailing-slash-insensitively
-// The leak scanner parses its own (2 MiB) body: the global parser leaves it alone (leak_scan.js).
-const isLeakScanPath = (p) => /^\/api\/(demipass|blindkey)\/leak-scan\/?$/i.test(p);
+// The leak scanner and the scrubber parse their own (2 MiB) bodies: the global parser leaves them alone (leak_scan.js).
+const isLeakScanPath = (p) => /^\/api\/(demipass|blindkey)\/leak-scan(\/scrub)?\/?$/i.test(p);
 const _urlencodedParser = express.urlencoded({ extended: false });
 const _useUrlencodedParser = express.urlencoded({ extended: false, limit: useLimits.USE_MAX_REQUEST_BYTES });
 // A body the parser refuses is answered in JSON with what to fix (and the DemiPass menu), never Express's HTML page,
@@ -3057,6 +3057,11 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN provider TEXT DEFAULT ''"
 // (where it came from, who it really belongs to: "received raw over Matrix; Kyle rotates it").
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN account_username TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN note TEXT DEFAULT ''"); } catch(_) {}
+// Contained (leak_scan.js scrub): a leaked value overwritten wherever a scrubber found it, not rotated. Cleared by a later hit.
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_at TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_note TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_seen_at TEXT DEFAULT NULL"); } catch(_) {}   // when a scan last found this row's value
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_seen_mac TEXT DEFAULT NULL"); } catch(_) {}  // keyed fingerprint of the value that scan found (leak_scan.js)
 
 // Known provider patterns — auto-detect expiration hints
 const PROVIDER_PATTERNS = {
@@ -4446,7 +4451,7 @@ app.get('/api/blindkey/list', rateLimitStandard, (req, res) => {
 
   const secrets = db.prepare(
     `SELECT id, did, name, description, secret_type, status, use_count, last_used_at, created_at, updated_at, version, ref_code, expires_at, provider, buoy_ingested_tick, buoy_last_used_tick,
-            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels, last_rotated_at, rotation_interval_days
+            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels, last_rotated_at, rotation_interval_days, leak_contained_at
      FROM blindkey_secrets WHERE did = ? AND status = ? ORDER BY updated_at DESC, name ASC`
   ).all(ownerDid, 'active');
 
@@ -14542,7 +14547,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|scan-descriptions|project-fund|project-remove|silicon-token|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|silicon-token|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
