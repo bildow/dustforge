@@ -2471,7 +2471,7 @@ function openRequests(status){
   reqFilter.status=status||reqFilter.status; goPage('requests'); if(typeof window!=='undefined'&&window.scrollTo) window.scrollTo(0,0); loadRequestsAll();
 }
 // Agent-token states: creating (approved, the agent is being made) counts as approved; failed with denied.
-const reqStatusOf=(s)=>{ s=String(s||''); return s==='pending'?'pending':/^(approved|used|claimed|active|creating)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed)$/.test(s)?'denied':s==='expired'?'expired':s; };
+const reqStatusOf=(s)=>{ s=String(s||''); return s==='pending'?'pending':/^(approved|used|claimed|active|creating)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed|undone)$/.test(s)?'denied':s==='expired'?'expired':s; };
 // One load at a time; a load asked for while one runs runs once more after it, so a decision is never shown stale
 // (#99 re-review L2), and a finished load clears only its own flag (L3: not the next account's).
 let reqAgain=false;
@@ -2526,6 +2526,8 @@ function renderRequests(){
       :r.requester_role==='outside_agent'?'<div style="color:var(--red);margin-top:0.2rem">@'+esc(r.requested_by||'?')+' is a wallet your fleet did not create. If approved, it can act as @'+esc(r.handle||'?')+'.</div>':'';
     return '<div class="req-row"><div class="rr-top"><span><b>'+(i.sub==='scrub'?'Scrub token':kindName[i.kind])+' #'+Number(i.id)+'</b>'+(i.mine?' <span style="color:var(--text3)">(yours, waiting on someone else)</span>':'')+'</span><span class="rr-st" style="color:'+(col[st]||'var(--text3)')+'">'+esc(i.status)+'</span></div>'
       +'<div style="margin-top:0.2rem">'+esc(i.what)+'</div>'+warn
+      // A request that also sets the agent's delivery key says so here too, as its card does (#100 merge review).
+      +(i.kind==='agent'&&r.delivery_key_fp&&st==='pending'?'<div class="req-key" style="color:var(--red);margin-top:0.2rem">It also sets @'+esc(r.handle||'?')+'\'s delivery key to <span style="font-family:monospace">'+esc(r.delivery_key_fp)+'</span>'+(r.current_key_fp?', <b>replacing</b> <span style="font-family:monospace">'+esc(r.current_key_fp)+'</span>':'')+'.</div>':'')
       +(i.who||i.label?'<div style="color:var(--text3);margin-top:0.15rem">from @'+esc(i.who||'?')+(i.label?' ('+esc(i.label)+')':'')+'</div>':'')
       +(i.why?'<div style="margin-top:0.15rem">“'+esc(i.why)+'”</div>':'')
       +'<div style="color:var(--text3);font-size:0.68rem;margin-top:0.15rem">'+(i.created?'asked '+esc(new Date(i.created).toLocaleString()):'')+(st==='pending'&&i.expires?' · waits until '+esc(new Date(i.expires).toLocaleString()):'')+'</div>'
