@@ -2377,6 +2377,11 @@ async function reqAgentDecide(id, ok){
   const it=reqAll.find(x=>x.kind==='agent'&&x.id===id); if(it&&it.raw&&!agentTokReqs.find(x=>x.id===id)) agentTokReqs=[...agentTokReqs,it.raw];
   await agentTokDecide(id, ok); loadRequestsAll();
 }
+// Same for a scan or scrub request: the PIN prompt says "scrub <name>" even before the 16 s poll has seen it.
+async function reqScanDecide(id, ok){
+  const it=reqAll.find(x=>x.kind==='scan'&&x.id===id); if(it&&it.raw&&!scanReqs.find(x=>x.id===id)) scanReqs=[...scanReqs,it.raw];
+  await scanDecide(id, ok); loadRequestsAll();
+}
 function openRequests(status){
   reqFilter.status=status||reqFilter.status; goPage('requests'); if(typeof window!=='undefined'&&window.scrollTo) window.scrollTo(0,0); loadRequestsAll();
 }
@@ -2407,7 +2412,7 @@ async function loadRequestsOnce(){
       why:a.purpose||'',created:a.created_at,expires:a.expires_at,mine:!!(ap.outgoing||[]).find(x=>x.id===a.id)&&!(ap.incoming||[]).concat(ap.recent||[]).find(x=>x.id===a.id)});
   }
   for(const q of (sc.requests||[])) items.push({kind:'scan',sub:q.kind==='scrub'?'scrub':'',id:q.id,status:q.status,who:q.requested_by||'',label:'',
-    what:q.kind==='scrub'&&q.scrub?'scrub '+q.scrub.name+' ('+q.scrub.ref+') from the files a scrubber reads':'scan token'+(q.labels.length===1?'':'s')+': '+q.labels.join(', '),why:'',created:q.created_at,expires:q.expires_at});
+    what:q.kind==='scrub'&&q.scrub?'scrub '+q.scrub.name+' ('+q.scrub.ref+') from the files a scrubber reads':'scan token'+(q.labels.length===1?'':'s')+': '+q.labels.join(', '),why:'',created:q.created_at,expires:q.expires_at,raw:q});
   for(const q of (ag.requests||[])) items.push({kind:'agent',id:q.id,status:q.status,who:q.requested_by||'',label:q.says_it_is||'',what:(q.creates?'create @':'token for @')+q.handle+' ('+q.fleet+'), '+q.scope+', '+q.expires_in,why:'',created:q.created_at,expires:q.expires_at,raw:q});
   items.sort((x,y)=>(reqStatusOf(x.status)==='pending'?0:1)-(reqStatusOf(y.status)==='pending'?0:1)||String(y.created).localeCompare(String(x.created)));
   reqAll=items;
@@ -2430,7 +2435,7 @@ function renderRequests(){
   if(!rows.length){ el.innerHTML='<div class="empty">'+(reqAll.length?'Nothing matches.':'No requests in the last 30 days.')+'</div>'; return; }
   el.innerHTML=rows.map(i=>{ const st=reqStatusOf(i.status), pend=st==='pending'&&!i.mine;
     const act=!pend?'':i.kind==='use'?'<button class="btn-primary" onclick="openApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Open</button><button class="btn-ghost" onclick="denyApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Deny</button>'
-      :i.kind==='scan'?'<button class="btn-primary" onclick="scanDecide('+Number(i.id)+',true).then(()=>loadRequestsAll())">Approve</button><button class="btn-ghost" onclick="scanDecide('+Number(i.id)+',false).then(()=>loadRequestsAll())">Deny</button>'
+      :i.kind==='scan'?'<button class="btn-primary" onclick="reqScanDecide('+Number(i.id)+',true)">Approve</button><button class="btn-ghost" onclick="reqScanDecide('+Number(i.id)+',false)">Deny</button>'
       :'<button class="btn-primary" onclick="reqAgentDecide('+Number(i.id)+',true)">Approve</button><button class="btn-ghost" onclick="reqAgentDecide('+Number(i.id)+',false)">Deny</button>';
     const r=i.raw||{}, warn=i.sub==='scrub'&&st==='pending'?'<div style="color:var(--red);margin-top:0.2rem">The scrubber learns where this value is in its files: in effect, the value. Approve only if you started it.</div>':i.kind!=='agent'?'':r.requester_role==='other_agent'?'<div style="color:var(--red);margin-top:0.2rem">Another agent, @'+esc(r.requested_by||'?')+', asks for @'+esc(r.handle||'?')+'\'s token. If approved, @'+esc(r.requested_by||'?')+' can act as @'+esc(r.handle||'?')+'.</div>'
       :r.requester_role==='outside_agent'?'<div style="color:var(--red);margin-top:0.2rem">@'+esc(r.requested_by||'?')+' is a wallet your fleet did not create. If approved, it can act as @'+esc(r.handle||'?')+'.</div>':'';
