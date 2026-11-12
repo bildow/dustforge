@@ -3060,6 +3060,7 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN note TEXT DEFAULT ''"); }
 // Contained (leak_scan.js scrub): a leaked value overwritten wherever a scrubber found it, not rotated. Cleared by a later hit.
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_at TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_note TEXT DEFAULT NULL"); } catch(_) {}
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_seen_at TEXT DEFAULT NULL"); } catch(_) {}   // when a scan last found this row's value
 
 // Known provider patterns — auto-detect expiration hints
 const PROVIDER_PATTERNS = {
@@ -14545,7 +14546,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scan-hits|scan-descriptions|project-fund|project-remove|silicon-token|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|silicon-token|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

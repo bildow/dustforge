@@ -151,92 +151,150 @@ async function post(auth, batch) {
   draining = Boolean(d.draining);
 }
 // ── scrub ────────────────────────────────────────────────────────────────────────────────────────────────────────────
-// Windows of CHUNK_BYTES with a 1 KiB overlap, cut on UTF-8 character boundaries, so the text sent decodes back to the
-// same bytes and the server's byte offsets land exactly. A file that is not valid UTF-8 is still sent; every write is
-// checked against the bytes read, so an offset that does not fit is never written.
-function* scrubWindows(buf) {
-  const OVER = 1024;
+// Windows cut on UTF-8 character boundaries, overlapping by more than the longest form the server looks for (it says how
+// long: max_form_bytes), so no copy is split unseen. A window whose bytes are valid UTF-8 is sent as text and the
+// server's byte offsets are exact. A window that is not (a stray Latin-1 byte, binary) is sent byte for byte (latin1),
+// whose offsets map back exactly — and as UTF-8 too, only to count copies with non-ASCII characters that the byte view
+// cannot see; those are left, never written (#98 review H2). Every write checks the bytes on disk are still the ones read.
+const SCRUB_TEXT_WINDOW = 192 * 1024, SCRUB_BIN_WINDOW = 96 * 1024;   // JSON escaping at most ×6: a window fits a request
+const SCRUB_BODY_MAX = 1400 * 1024;                                    // under nginx's and the server's body limits
+function* scrubWindows(buf, size, overlap) {
   let start = 0;
   while (start < buf.length) {
-    let end = Math.min(buf.length, start + CHUNK_BYTES);
+    let end = Math.min(buf.length, start + size);
     while (end < buf.length && end > start && (buf[end] & 0xC0) === 0x80) end--;
     yield { start, end };
     if (end >= buf.length) break;
-    let next = Math.max(start + 1, end - OVER);
+    let next = Math.max(start + 1, end - overlap);
     while (next < end && (buf[next] & 0xC0) === 0x80) next++;
     start = next;
   }
 }
+// The server counts UTF-8 bytes of the text it got; for latin1 text each raw byte ≥ 0x80 was two of them.
+function latin1Offset(raw, utf8Bytes) {
+  let b = 0, i = 0;
+  while (i < raw.length && b < utf8Bytes) { b += raw[i] < 0x80 ? 1 : 2; i++; }
+  return i;
+}
+let maxFormBytes = 0;
 async function scrubPost(auth, batch) {
   for (let attempt = 0; ; attempt++) {
     const r = await fetch(API + '/api/demipass/leak-scan/scrub', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth }, body: JSON.stringify({ chunks: batch }) });
     const d = await r.json().catch(() => ({}));
     if (r.status === 429 && /Rate limit/.test(d.error || '') && attempt < 20) { await new Promise(ok => setTimeout(ok, 60000)); continue; }
     if (!r.ok) throw new Error(`scrub refused: HTTP ${r.status}: ${d.error || ''}`);
+    if (d.max_form_bytes) maxFormBytes = Math.max(maxFormBytes, d.max_form_bytes);
     return d.matches || [];
   }
 }
+// What a scrub reads: every regular file under the roots (with --all, node_modules, .cache … and .git too). Whatever it
+// does not read is counted, so the run cannot claim "contained" over it (#98 review M2): a skipped directory, a file
+// too large, a symlink to something outside the roots.
+function scrubFiles(roots, all) {
+  const out = [], notRead = [];
+  const real = roots.map(r => { try { return fs.realpathSync(r); } catch (_) { return path.resolve(r); } });
+  const inside = (p) => real.some(r => p === r || p.startsWith(r + path.sep));
+  const walk = (p) => {
+    let st; try { st = fs.lstatSync(p); } catch (_) { return; }
+    if (st.isSymbolicLink()) { let t = null; try { t = fs.realpathSync(p); } catch (_) {} if (!t || !inside(t)) notRead.push(`${p} (a link to outside what was asked)`); return; }
+    if (st.isDirectory()) { if (!all && SKIP_DIRS.has(path.basename(p))) { notRead.push(`${p} (skipped: --all reads it)`); return; } let es; try { es = fs.readdirSync(p).sort(); } catch (e) { notRead.push(`${p} (${e.code || e.message})`); return; } for (const e of es) walk(path.join(p, e)); return; }
+    if (!st.isFile() || st.size === 0) return;
+    if (st.size > MAX_FILE) { notRead.push(`${p} (${st.size} bytes, too large)`); return; }
+    out.push(p);
+  };
+  for (const r of roots) walk(path.resolve(r));
+  return { out, notRead };
+}
 async function scrub(args) {
-  let dry = false;
-  for (;;) { if (args[0] === '--dry-run') { dry = true; args.shift(); continue; } if (args[0] === '--all') { STRICT = true; args.shift(); continue; } break; }
+  let dry = false, all = false;
+  for (;;) { if (args[0] === '--dry-run') { dry = true; args.shift(); continue; } if (args[0] === '--all') { all = true; args.shift(); continue; } break; }
   if (!args.length) { console.error('usage: leak-scan --scrub [--dry-run] [--all] <path>...'); process.exit(2); }
   const auth = authHeader();
+  await scrubPost(auth, [{ id: '-', text: '' }]);   // learns max_form_bytes (and that the token works) before reading anything
+  const overlap = Math.max(1024, maxFormBytes + 16);
+  if (overlap * 2 > SCRUB_BIN_WINDOW) throw new Error('the value is too long to look for in windows');
+  const { out: list, notRead } = scrubFiles(args, all);
   let filesRead = 0, filesChanged = 0, masked = 0, left = 0, bytesRead = 0;
-  for (const t of args) for (const f of files(path.resolve(t))) {
-    let buf; try { buf = fs.readFileSync(f); } catch (e) { skipped.push(`${f} (${e.code || e.message})`); continue; }
+  for (const f of list) {
+    let fd, st, buf;
+    try {
+      fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); st = fs.fstatSync(fd);
+      buf = Buffer.alloc(st.size); let got = 0; while (got < st.size) { const n = fs.readSync(fd, buf, got, st.size - got, got); if (!n) break; got += n; } buf = buf.subarray(0, got);
+    } catch (e) { notRead.push(`${f} (${e.code || e.message})`); continue; } finally { if (fd !== undefined) fs.closeSync(fd); }
     filesRead++; bytesRead += buf.length;
     const binary = buf.subarray(0, 8192).includes(0);
-    const wins = [...scrubWindows(buf)];
-    const spans = new Map();   // absolute start → length (text files: these are written)
-    const binHits = { u: new Set(), l: new Set() };   // binary files: only counted, never written
-    for (let i = 0; i < wins.length;) {
-      const batch = []; let size = 0;
-      while (i < wins.length && batch.length < 140 && (size === 0 || size + (wins[i].end - wins[i].start) * (binary ? 2 : 1) <= BATCH_BYTES)) {
-        const w = wins[i]; const part = buf.subarray(w.start, w.end);
-        batch.push({ id: String(i), text: part.toString('utf8') });
-        // A binary file is also sent byte for byte (latin1), so an ASCII value between invalid UTF-8 is found too.
-        if (binary) batch.push({ id: i + ':l', text: part.toString('latin1') });
-        size += part.length * (binary ? 2 : 1); i++;
-      }
-      for (const m of await scrubPost(auth, batch)) {
-        const [wi, form] = String(m.chunk).split(':'); const w = wins[Number(wi)]; if (!w) continue;
+    const wins = [...scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)];
+    const spans = new Map();                 // exact spans (absolute start → length): written, in a text file
+    const uOnly = new Map();                 // per window: copies seen only in the UTF-8 view of a window that is not valid UTF-8
+    const binSeen = new Set();
+    let batch = [], size = 0;
+    const flush = async () => {
+      if (!batch.length) return;
+      const res = await scrubPost(auth, batch); batch = []; size = 0;
+      const per = new Map();
+      for (const m of res) {
+        const [wi, view] = String(m.chunk).split(':'); const w = wins[Number(wi)]; if (!w) continue;
+        const raw = buf.subarray(w.start, w.end);
+        const e = per.get(wi) || { u: 0, l: 0, valid: !view }; per.set(wi, e);
         for (const [off, len] of m.at || []) {
-          if (binary) { binHits[form === 'l' ? 'l' : 'u'].add(w.start + off); continue; }
-          const s0 = w.start + off; const prev = spans.get(s0); if (prev === undefined || len > prev) spans.set(s0, len);
+          if (view === 'u') { e.u++; continue; }
+          const a = view === 'l' ? latin1Offset(raw, off) : off;
+          const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
+          if (view === 'l') e.l++;
+          if (binary) { binSeen.add(w.start + a); continue; }
+          const s0 = w.start + a, prev = spans.get(s0); if (prev === undefined || l > prev) spans.set(s0, l);
         }
       }
+      for (const [wi, e] of per) if (!e.valid && e.u > e.l) uOnly.set(wi, Math.max(uOnly.get(wi) || 0, e.u - e.l));
+    };
+    for (let i = 0; i < wins.length; i++) {
+      const raw = buf.subarray(wins[i].start, wins[i].end);
+      const t = raw.toString('utf8');
+      const parts = Buffer.from(t, 'utf8').equals(raw) ? [{ id: String(i), text: t }] : [{ id: i + ':l', text: raw.toString('latin1') }, { id: i + ':u', text: t }];
+      const js = parts.reduce((n, p) => n + JSON.stringify(p.text).length + p.id.length + 16, 0);
+      if (size && (size + js > SCRUB_BODY_MAX || batch.length + parts.length > 150)) await flush();
+      batch.push(...parts); size += js;
     }
+    await flush();
+    const extra = [...uOnly.values()].reduce((a, b) => a + b, 0);
     if (binary) {
-      const n = Math.max(binHits.u.size, binHits.l.size);
+      const n = binSeen.size + extra;
       if (n) { left += n; console.log(`FOUND    ${f}: ${n} cop${n === 1 ? 'y' : 'ies'} in a binary file — not written (remove the file or rotate)`); }
       continue;
     }
-    if (!spans.size) continue;
-    if (dry) { masked += spans.size; console.log(`FOUND    ${f}: ${spans.size} cop${spans.size === 1 ? 'y' : 'ies'} (dry run)`); continue; }
-    let fd; try { fd = fs.openSync(f, 'r+'); } catch (e) { left += spans.size; console.log(`LEFT     ${f}: ${spans.size} — cannot write (${e.code || e.message})`); continue; }
-    let n = 0, stale = 0;
+    // Overlapping or touching spans become one, so a write never invalidates the check for the next (#98 review L2).
+    const merged = [];
+    for (const [a, l] of [...spans].sort((x, y) => x[0] - y[0])) { const last = merged[merged.length - 1]; if (last && a <= last[0] + last[1]) last[1] = Math.max(last[1], a + l - last[0]); else merged.push([a, l]); }
+    if (extra) { left += extra; console.log(`LEFT     ${f}: ${extra} cop${extra === 1 ? 'y' : 'ies'} next to bytes that are not UTF-8 — not written`); }
+    if (!merged.length) continue;
+    if (dry) { masked += merged.length; console.log(`FOUND    ${f}: ${merged.length} cop${merged.length === 1 ? 'y' : 'ies'} (dry run)`); continue; }
+    let n = 0, stale = 0, wfd;
     try {
-      for (const [s0, l0] of [...spans].sort((a, b) => a[0] - b[0])) {
+      wfd = fs.openSync(f, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+      const ws = fs.fstatSync(wfd);
+      // The same file that was read (not one swapped in since: #98 review L3).
+      if (ws.ino !== st.ino || ws.dev !== st.dev) throw Object.assign(new Error('replaced since it was read'), { code: 'REPLACED' });
+      for (const [s0, l0] of merged) {
         const now = Buffer.alloc(l0);
-        const got = fs.readSync(fd, now, 0, l0, s0);
-        // Only bytes that are still exactly what was read (and sent) are overwritten.
+        const got = fs.readSync(wfd, now, 0, l0, s0);
         if (got !== l0 || !now.equals(buf.subarray(s0, s0 + l0))) { stale++; continue; }
-        fs.writeSync(fd, Buffer.alloc(l0, '*'), 0, l0, s0); n++;
+        fs.writeSync(wfd, Buffer.alloc(l0, '*'), 0, l0, s0); n++;
       }
-      fs.fsyncSync(fd);
-    } finally { fs.closeSync(fd); }
+      fs.fsyncSync(wfd);
+    } catch (e) { stale = merged.length - n; console.log(`LEFT     ${f}: cannot write (${e.code || e.message})`); }
+    finally { if (wfd !== undefined) fs.closeSync(wfd); }
     masked += n; left += stale; if (n) filesChanged++;
-    console.log(`MASKED   ${f}: ${n} cop${n === 1 ? 'y' : 'ies'}${stale ? `, ${stale} left (the file changed there since it was read: run again)` : ''}`);
+    if (n || stale) console.log(`MASKED   ${f}: ${n} cop${n === 1 ? 'y' : 'ies'}${stale ? `, ${stale} left (the file changed there since it was read: run again)` : ''}`);
   }
-  for (const k of skipped) console.log(`SKIPPED  ${k}`);
-  console.log(`leak-scan: scrub ${dry ? '(dry run) ' : ''}read ${filesRead} files, ${bytesRead} bytes; ${dry ? 'found' : 'masked'} ${masked}, left ${left}${skipped.length ? `, ${skipped.length} files not read` : ''}`);
+  for (const k of notRead) console.log(`NOT READ ${k}`);
+  console.log(`leak-scan: scrub ${dry ? '(dry run) ' : ''}read ${filesRead} files, ${bytesRead} bytes; ${dry ? 'found' : 'masked'} ${masked}, left ${left}${notRead.length ? `, ${notRead.length} paths not read` : ''}`);
   if (dry) process.exit(masked || left ? 1 : 0);
   const r = await fetch(API + '/api/demipass/leak-scan/scrub/finish', { method: 'POST', headers: { 'content-type': 'application/json', authorization: auth },
-    body: JSON.stringify({ files_read: filesRead, files_changed: filesChanged, copies_masked: masked, copies_left: left + skipped.length }) });
+    body: JSON.stringify({ files_read: filesRead, files_changed: filesChanged, copies_masked: masked, copies_left: left, paths_not_read: notRead.length }) });
   const d = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(`finish refused: HTTP ${r.status}: ${d.error || ''}`);
-  console.log(d.contained ? `leak-scan: ${d.entry ? d.entry.name : 'the entry'} is contained (not rotated; backups still hold old copies)` : 'leak-scan: copies were left or files not read — the entry is not marked contained; this scrub token is spent');
-  process.exit(left || skipped.length ? 1 : 0);
+  console.log(d.contained ? `leak-scan: ${d.entry ? d.entry.name : 'the entry'} is contained (not rotated; backups still hold old copies)` : `leak-scan: not marked contained (${d.why || 'copies left'}); this scrub token is spent`);
+  process.exit(d.contained ? 0 : 1);
 }
 (async () => {
   if (process.argv[2] === '--scrub-request') {
