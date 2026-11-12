@@ -312,7 +312,9 @@ module.exports = function registerLeakScan(deps) {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     expireRequests();
     // ?all=1: the last 30 days in every state, so an approved request can still be found by number (Aaron 2026-11-12).
-    const rows = req.query.all === '1'
+    // History is the owner's own session's to read; an agent of the owner sees what waits, as before (#99 review M1).
+    const agent = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint')));
+    const rows = req.query.all === '1' && !agent
       ? db.prepare("SELECT id, labels, requested_by, status, created_at, expires_at FROM leak_scan_token_requests WHERE owner_did = ? AND julianday(created_at) >= julianday('now', '-30 days') ORDER BY id DESC LIMIT 200").all(auth.did)
       : db.prepare("SELECT id, labels, requested_by, status, created_at, expires_at FROM leak_scan_token_requests WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC").all(auth.did);
     res.json({ ok: true, requests: rows.map(r => ({ ...r, says_it_is: r.requested_by, labels: JSON.parse(r.labels), intent: `scan-approve:${r.id}` })) });
