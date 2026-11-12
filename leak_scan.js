@@ -311,7 +311,10 @@ module.exports = function registerLeakScan(deps) {
   app.get('/api/blindkey/leak-scan/token-requests', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     expireRequests();
-    const rows = db.prepare("SELECT id, labels, requested_by, status, created_at, expires_at FROM leak_scan_token_requests WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC").all(auth.did);
+    // ?all=1: the last 30 days in every state, so an approved request can still be found by number (Aaron 2026-11-12).
+    const rows = req.query.all === '1'
+      ? db.prepare("SELECT id, labels, requested_by, status, created_at, expires_at FROM leak_scan_token_requests WHERE owner_did = ? AND julianday(created_at) >= julianday('now', '-30 days') ORDER BY id DESC LIMIT 200").all(auth.did)
+      : db.prepare("SELECT id, labels, requested_by, status, created_at, expires_at FROM leak_scan_token_requests WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC").all(auth.did);
     res.json({ ok: true, requests: rows.map(r => ({ ...r, says_it_is: r.requested_by, labels: JSON.parse(r.labels), intent: `scan-approve:${r.id}` })) });
   });
   // POST /api/blindkey/leak-scan/token-requests/:id/approve — the owner, PIN (scan-approve:<id>) + the linked phone.
