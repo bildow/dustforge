@@ -3012,9 +3012,13 @@ async function loadScanRequests(){
   if(lockState.locked) return;
   try{ const r=await api('GET','/api/blindkey/leak-scan/token-requests'); scanReqs=r.requests||[]; }catch(e){ if(sessionEnded(e)) return; }
   const el=document.getElementById('scan-requests'); if(!el) return;
-  el.innerHTML=scanReqs.map(q=>'<div class="fill-req"><div>A leak scanner asks for '+(q.labels.length===1?'a scan token':q.labels.length+' scan tokens')+': <b>'+q.labels.map(esc).join(', ')+'</b></div>'
+  // A scrub request is not a scan token: it shows where one value sits in the scrubber's files — in effect, the value.
+  el.innerHTML=scanReqs.map(q=>'<div class="fill-req">'+(q.kind==='scrub'&&q.scrub
+      ?'<div><b>Scrub '+esc(q.scrub.name)+'</b> ('+esc(q.scrub.ref)+') from the files a scrubber reads</div>'
+       +'<div style="color:var(--red);margin-top:0.25rem">The scrubber finds every copy of this value in its files and overwrites it. To do that it learns where the value is: in effect, the value. Approve only if you started this scrub yourself. The value is not rotated; backups, compressed files and other encodings (base64, URL-encoded) keep their copies.</div>'
+      :'<div>A leak scanner asks for '+(q.labels.length===1?'a scan token':q.labels.length+' scan tokens')+': <b>'+q.labels.map(esc).join(', ')+'</b></div>'
+       +'<div style="color:var(--text3);margin-top:0.25rem">A token only asks whether one of your values appears in some text; it never sees a value. Approve only if you started this (pane set-up, CI).</div>')
     +(q.requested_by?'<div style="color:var(--text3);margin-top:0.25rem">from '+esc(q.requested_by)+'</div>':'')
-    +'<div style="color:var(--text3);margin-top:0.25rem">A token only asks whether one of your values appears in some text; it never sees a value. Approve only if you started this (pane set-up, CI).</div>'
     +'<div class="fr-row"><button class="btn-primary" '+(scanBusy.has(q.id)?'disabled ':'')+'onclick="scanDecide('+Number(q.id)+',true)">Approve</button>'
     +'<button class="btn-ghost" '+(scanBusy.has(q.id)?'disabled ':'')+'onclick="scanDecide('+Number(q.id)+',false)">Deny</button></div></div>').join('');
 }
@@ -3049,7 +3053,8 @@ async function agentTokDecide(id, ok){
 async function scanDecide(id, ok){
   if(scanBusy.has(id)) return; scanBusy.add(id); loadScanRequests();
   try{
-    if(ok) await apiGated('POST','/api/blindkey/leak-scan/token-requests/'+id+'/approve',{},'Approve the leak-scan token request? Your PIN approves it.');
+    const q=scanReqs.find(x=>x.id===id)||{};
+    if(ok) await apiGated('POST','/api/blindkey/leak-scan/token-requests/'+id+'/approve',{},q.kind==='scrub'&&q.scrub?'Let a scrubber find and overwrite '+q.scrub.name+' in its files? It learns where the value is. Your PIN approves it.':'Approve the leak-scan token request? Your PIN approves it.');
     else await api('POST','/api/blindkey/leak-scan/token-requests/'+id+'/deny',{});
   }catch(e){ if(!/cancelled/.test(e.message)&&!sessionEnded(e)) alert(e.message); }
   finally{ scanBusy.delete(id); }
