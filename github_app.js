@@ -236,6 +236,22 @@ function register(deps) {
   // the scope active; the delegation active, unexpired, still the owner's to the same agent, an outside ask still
   // valid — the same rules request-token applies.) Default: yes.
   const grantValid = deps.grantValid || (() => true);
+  // Does a token (its repositories, permissions and expiry, as recorded) still fit its scope AS IT IS NOW? A scope
+  // narrowed while a mint was in flight, or after, no longer covers a token minted under its old terms (Codex P1).
+  function withinCurrentScope(row) {
+    if (!row || !row.context_id) return false;
+    const ctx = db.prepare('SELECT github_app FROM blindkey_contexts WHERE id = ?').get(row.context_id);
+    const s = scopeOf(ctx && ctx.github_app);
+    if (!s || s.installation_id !== String(row.installation_id)) return false;
+    let repos = [], perms = {};
+    try { repos = JSON.parse(row.repositories || '[]'); perms = JSON.parse(row.permissions || '{}'); } catch (_) { return false; }
+    if (!repos.length || !repos.every(r => s.repositories.includes(String(r).toLowerCase()))) return false;
+    // GitHub adds metadata:read to every token; it is not something the scope grants
+    if (!Object.entries(perms).every(([k, l]) => (k === 'metadata' && l === 'read') || (has(s.permissions, k) && levelOf(l) && levelOf(l) <= levelOf(s.permissions[k])))) return false;
+    // our expiry within the scope's current longest life, counted from the mint
+    return Date.parse(row.expires_at) - Date.parse(row.created_at) <= s.max_ttl_seconds * 1000 + 1000;
+  }
+  const standing = (row) => { try { return grantValid(row) && withinCurrentScope(row); } catch (_) { return false; } };
 
   db.exec(`CREATE TABLE IF NOT EXISTS github_app_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,11 +320,16 @@ function register(deps) {
                                    token_enc, github_expires_at, expires_at, status, revoke_wanted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'live', ?, ?)`)
       .run(secret.id, contextId || null, delegationId || null, secret.did, callerDid, request.installation_id,
            JSON.stringify(gotRepos || []), JSON.stringify(gotPerms), blindkeyEncrypt(token), ghExpIso, ourExp, wider ? 'wider than asked' : null, nowIso()).lastInsertRowid);
-    // The grant may have ended while GitHub answered (#104 review L4): then the token is revoked at once, not handed out.
-    if (!wider && !grantValid(db.prepare('SELECT * FROM github_app_tokens WHERE id = ?').get(id))) {
-      db.prepare("UPDATE github_app_tokens SET revoke_wanted = 'grant ended during the mint' WHERE id = ?").run(id);
+    // The grant may have ended, or the scope narrowed, while GitHub answered (#104 review L4, Codex P1): the token is
+    // checked against the grant and the scope as they are now, and revoked at once — not handed out — if it no longer fits.
+    if (!wider && !standing(db.prepare('SELECT * FROM github_app_tokens WHERE id = ?').get(id))) {
+      const row = db.prepare('SELECT * FROM github_app_tokens WHERE id = ?').get(id);
+      const ended = !grantValid(row);
+      db.prepare('UPDATE github_app_tokens SET revoke_wanted = ? WHERE id = ?').run(ended ? 'grant ended during the mint' : 'scope narrowed during the mint', id);
       await revokeRow(db.prepare('SELECT * FROM github_app_tokens WHERE id = ?').get(id));
-      return { ok: false, connected: true, status: 403, body: { error: 'the scope, delegation or key ended while GitHub minted the token; DemiPass revoked it and did not hand it out' } };
+      return { ok: false, connected: true, status: 403, body: { error: ended
+        ? 'the scope, delegation or key ended while GitHub minted the token; DemiPass revoked it and did not hand it out'
+        : 'the scope was narrowed while GitHub minted the token, which no longer fits it; DemiPass revoked it and did not hand it out — ask again' } };
     }
     if (wider) {
       logSecurityEvent('github_app_token_too_wide', 'critical', { caller_did: callerDid, capability: 'github_app_token', target: `installation:${request.installation_id}`,
@@ -360,7 +381,8 @@ function register(deps) {
         const now = nowIso();
         for (const r of db.prepare("SELECT * FROM github_app_tokens WHERE status = 'live'").all()) {
           let valid = true; try { valid = grantValid(r); } catch (_) { valid = false; }
-          const why = r.revoke_wanted || (r.expires_at <= now ? 'expired (scope TTL)' : r.github_expires_at <= now ? 'expired' : !valid ? 'its grant ended' : null);
+          const fits = valid && withinCurrentScope(r);
+          const why = r.revoke_wanted || (r.expires_at <= now ? 'expired (scope TTL)' : r.github_expires_at <= now ? 'expired' : !valid ? 'its grant ended' : !fits ? 'scope narrowed' : null);
           if (!why) continue;
           try { await revokeRow(r, why); } catch (_) {}
         }

@@ -15,7 +15,7 @@
 // Each `get` is one metered /use (one token, ≤ 1 h, the repositories and permissions of the scope or fewer) and counts
 // against the wallet's request budget (500 per 15 min, #103). A busy CI sets DEMIPASS_GITHUB_CACHE_DIR (a 0700 directory
 // of the agent's own): a token is then kept there (0600) for its life and reused until 5 minutes before it expires.
-// Without it nothing is written anywhere. `store` and `erase` do nothing. The token goes to git on stdout and nowhere
+// Without it nothing is written anywhere. `store` does nothing; `erase` (git refused the token) drops it from the cache. The token goes to git on stdout and nowhere
 // else, with password_expiry_utc so git drops it in time; errors go to stderr without it. Anything that is not
 // https://github.com gets no answer (git asks its next helper). DEMIPASS_URL must be https (loopback excepted).
 const fs = require('fs'), path = require('path'), crypto = require('crypto');
@@ -41,7 +41,7 @@ function demipassToken() {
 }
 
 async function main() {
-  if (op !== 'get') return;   // store / erase: nothing is kept
+  if (op !== 'get' && op !== 'erase') return;   // store: nothing is kept (git's own store helpers are cleared first)
   let input = '';
   for await (const chunk of process.stdin) input += chunk;
   const q = {};
@@ -65,13 +65,30 @@ async function main() {
     const exp = Math.floor(Date.parse(expiresAt) / 1000);
     process.stdout.write(`username=x-access-token\npassword=${token}\n${Number.isFinite(exp) ? `password_expiry_utc=${exp}\n` : ''}`);
   };
-  // the opt-in cache: one file per (ref, scope, repository, permissions), 0600 in a 0700 directory of this user
+  // the opt-in cache: one file per (DemiPass identity, server, ref, scope, repository, permissions), 0600 in a 0700
+  // directory of this user. The identity is a hash of the agent's DemiPass token (#104 round 2): a second agent under
+  // the same Unix user never gets the first one's GitHub token without its own call, charge and event.
   let cacheFile = null;
   const dir = process.env.DEMIPASS_GITHUB_CACHE_DIR;
   if (dir) {
     const st = fs.statSync(dir);
     if (!st.isDirectory() || (st.mode & 0o077) || (process.getuid && st.uid !== process.getuid())) fail(`${dir} must be a directory of yours, chmod 700`);
-    cacheFile = path.join(dir, 'gh-' + crypto.createHash('sha256').update(JSON.stringify([API, ref, body.context || '', params])).digest('hex').slice(0, 32) + '.json');
+    const who = crypto.createHash('sha256').update('demipass-identity:' + demipassToken()).digest('hex');
+    cacheFile = path.join(dir, 'gh-' + crypto.createHash('sha256').update(JSON.stringify([who, API, ref, body.context || '', params])).digest('hex').slice(0, 32) + '.json');
+  }
+  // erase: git was refused with this credential (a 401 — revoked, expired). The cached token goes, so the next get mints
+  // a fresh one (#104 round 2): the keyed file, and any other cached file holding that same token.
+  if (op === 'erase') {
+    if (!cacheFile) return;
+    try { fs.unlinkSync(cacheFile); } catch (_) {}
+    if (q.password) {
+      for (const f of fs.readdirSync(dir).filter(n => /^gh-[0-9a-f]{32}\.json$/.test(n))) {
+        try { if (JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8')).token === q.password) fs.unlinkSync(path.join(dir, f)); } catch (_) {}
+      }
+    }
+    return;
+  }
+  if (cacheFile) {
     try {
       const fst = fs.statSync(cacheFile);
       if (!(fst.mode & 0o077) && (!process.getuid || fst.uid === process.getuid())) {

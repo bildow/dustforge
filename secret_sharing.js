@@ -547,6 +547,9 @@ module.exports = function registerSecretSharing(deps) {
       notify(t.from_did, `DemiPass: your transfer to ${to.username} did not happen`, `The transfer of ${t.final_name} to ${to.username} did not happen: ${e.message}. Nothing changed.\n`);
       return;
     }
+    // Whatever the old owner's grants had minted from it ends now (a GitHub App key's installation tokens: revoked at
+    // GitHub at once, not at the next sweep — Codex P1 on #104). Kept use-only access starts fresh, like every grant here.
+    try { if (deps.onTransferred) deps.onTransferred(t.secret_id); } catch (_) {}
     logSecurityEvent('secret_transferred', 'warn', { caller_did: t.from_did, capability: 'transfer', target: t.final_name,
       context: { ref: secret.ref_code, to: to.username, transfer_id: t.id, kept_delegation_id: keptId, ended_delegations: ended.length } });
     tick(t.to_did, `secret received from ${from.username}: ${t.final_name}`, ['demipass:transfer-in', `secret:${t.final_name}`]);

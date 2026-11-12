@@ -3212,6 +3212,12 @@ setInterval(eraseDeadValues, 10 * 60 * 1000).unref();
 function moveSecretAside(row, name) {
   db.prepare('UPDATE blindkey_secrets SET name = ? WHERE id = ?').run(`${name}~${row.id}~${crypto.randomBytes(4).toString('hex')}`, row.id);
 }
+// A stored GitHub App key is never overwritten by a deposit or a Rowen ingest (its value and type would be replaced
+// under its scopes — #104 round 2): only its owner re-stores or rotates it. Returns the refusal, or null.
+function appKeyOverwriteRefusal(did, name) {
+  const row = db.prepare("SELECT secret_type FROM blindkey_secrets WHERE did = ? AND name = ? AND status NOT IN ('deleted')").get(did, name);
+  return row && row.secret_type === 'github_app_key' ? `'${name}' is a GitHub App key — it is replaced only by its owner (store or rotate), never deposited over` : null;
+}
 function clearNameForStore(did, name) {
   const row = db.prepare('SELECT id, status, replaced_by FROM blindkey_secrets WHERE did = ? AND name = ?').get(did, name);
   if (!row || row.status === 'active') return null;
@@ -5033,7 +5039,8 @@ function requestUseTokenHandler(req, res) {
         logSecurityEvent('silicon_permission_denied', 'alert', { caller_did: req.identity?.did, agent_name: auth.agent_name, capability: 'secret:use', target: refSecret.name, error: 'silicon lacks secret:use', ip: req.ip });
         return res.status(403).json({ error: 'silicon agent lacks secret:use permission for this secret', agent: auth.agent_name });
       }
-      const actionPerm = 'action:' + (action || 'ssh_exec');
+      // A GitHub App key acts only as github_app_token, so that is the permission a silicon needs for it when it names none.
+      const actionPerm = 'action:' + (action || (githubAppLib.isAppKey(refSecret) ? 'github_app_token' : 'ssh_exec'));
       if (!siliconHasPermission(auth.agent_name, actionPerm, '*')) {
         logSecurityEvent('silicon_permission_denied', 'alert', { caller_did: req.identity?.did, agent_name: auth.agent_name, capability: actionPerm, error: 'silicon lacks action permission', ip: req.ip });
         return res.status(403).json({ error: 'silicon agent lacks ' + actionPerm + ' permission', agent: auth.agent_name });
@@ -6383,7 +6390,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
 
   try {
     const encrypted = blindkeyEncrypt(value);
-    const nameRefused = clearNameForStore(resolvedTargetDid, name);
+    const nameRefused = appKeyOverwriteRefusal(resolvedTargetDid, name) || clearNameForStore(resolvedTargetDid, name);
     if (nameRefused) return res.status(409).json({ error: nameRefused });
     const metaJson = metadata ? JSON.stringify(metadata) : '{}';
     db.prepare(`
@@ -6456,8 +6463,8 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
       try {
         const encrypted = blindkeyEncrypt(s.value);
         const metaJson = s.metadata ? JSON.stringify(s.metadata) : '{}';
-        const nameRefused = clearNameForStore(s.target_did, s.name);
-        if (nameRefused) { errors.push({ index: i, error: nameRefused }); continue; }
+        const nameRefused = appKeyOverwriteRefusal(s.target_did, s.name) || clearNameForStore(s.target_did, s.name);
+        if (nameRefused) { errors.push({ index: i, status: 409, error: nameRefused }); continue; }
         insertStmt.run(s.target_did, s.name, s.description || '', resolvedType, encrypted, metaJson);
         const inserted = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
         let refCode = inserted.ref_code;
@@ -6566,6 +6573,10 @@ app.post('/api/blindkey/context/add', rateLimitStandard, (req, res) => {
     }
     res.json({ ok: true, context: contextView(ctx), ...(delegation ? { delegation_id: delegation.id, delegate_did } : {}) });
   } catch (e) {
+    // The boot-time rebuild did not complete (logged then): this table still refuses the new kind of scope.
+    if (action_type === 'github_app_token' && /CHECK constraint failed/i.test(String(e.message))) {
+      return res.status(503).json({ error: 'GitHub scopes are unavailable until the next clean start of DemiPass (the scope table could not be upgraded; see the server log)' });
+    }
     res.status(500).json({ error: e.message });
   }
 });
@@ -6752,7 +6763,7 @@ function handleRowenIngest(req, res) {
 
   try {
     const encrypted = blindkeyEncrypt(value);
-    const nameRefused = clearNameForStore(target_did, name);
+    const nameRefused = appKeyOverwriteRefusal(target_did, name) || clearNameForStore(target_did, name);
     if (nameRefused) return res.status(409).json({ error: nameRefused });
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata)
@@ -9076,6 +9087,7 @@ const secretSharing = require('./secret_sharing')({
   approvals: () => useApprovals,   // registered just below
   devices: () => deviceKeys,       // registered just below
   sendMail: fleetRoutes.sendMail,  // pending transfers: both sides are mailed at start and end (red team item 6)
+  onTransferred: (secretId) => githubApp.revokeFor({ secretId }, 'key transferred'),   // github_app.js: live installation tokens die with the old owner's grants
 });
 // Account holds (red team item 9): PIN reset by password, a new phone, a recovery-email change and guardian recovery
 // wait 48 hours while a phone is linked, cancelable from any eligible phone without a session (account_holds.js).
@@ -14326,6 +14338,7 @@ const SILICON_PERMISSION_TYPES = [
   'action:http_body', // HTTP body injection
   'action:document',  // document retrieval
   'action:browser_fill', // the agent fill tool may receive this login for a bound origin (never via admin:full)
+  'action:github_app_token', // mint GitHub App installation tokens from a key's github_app_token scopes (github_app.js)
   'admin:full',       // full access (carbon equivalent)
 ];
 
