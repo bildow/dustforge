@@ -50,7 +50,7 @@ python3 -c 'import secrets;print("xx-" + secrets.token_urlsafe(14))' > "$S/xval"
 store(){ python3 -c 'import json,sys; print(json.dumps({"name":sys.argv[2],"value":open(sys.argv[1]).read().rstrip("\n"),"secret_type":"password"}))' "$1" "$2" > "$S/st.json"
   curl -s -o /dev/null -X POST "$API/api/demipass/store" -H 'content-type: application/json' -H "Authorization: Bearer $3" -d @"$S/st.json"; rm -f "$S/st.json"; }
 store "$S/seed" leaky "$A"; store "$S/other" kept "$A"; store "$S/xval" xs "$X"
-REF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='leaky'"); XREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='xs'")
+REF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='leaky'"); echo "$REF" > "$S/ref"; XREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='xs'")
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"scan-token:0"}'; call POST /api/demipass/leak-scan/tokens "$A" '{"label":"legacy"}'
 echo "$BODY" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])' > "$S/legacy.tok"
 stop
@@ -169,7 +169,7 @@ scrubtok s3 "$REF"; mkdir -p "$S/bin"; mv "$S/blob.bin" "$S/bin/"
 OUT=$(SCRUB "$S/s3.tok" "$S/bin"); RC=$?
 [ $RC = 1 ] && echo "$OUT" | grep -q "not marked contained (1 copies were left)" && ok "a run that leaves a copy (binary) is not contained" || fail "left copies: rc=$RC $OUT"
 scrubtok s4 "$REF"
-C=$(curl -s -o "$S/fin.json" -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub/finish" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/s4.tok")" -d '{"files_read":0,"files_changed":0,"copies_masked":0,"copies_left":0}')
+C=$(curl -s -o "$S/fin.json" -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub/finish" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/s4.tok")" -d '{"files_read":0,"files_changed":0,"copies_masked":0,"copies_left":0,"paths_not_read":0}')
 [ "$C" = 200 ] && [ "$(J contained < "$S/fin.json")" = False ] && ok "a finish that read no files is not contained" || fail "zero finish: $C $(cat "$S/fin.json")"
 scrubtok s5 "$REF"; mkdir -p "$S/t5"; cp "$S/seed" "$S/t5/a.txt"; sleep 1
 mkdir -p "$S/again2"; cp "$S/seed" "$S/again2/b.txt"; scanhit "$S/again2"
@@ -208,8 +208,43 @@ mkdir -p "$S/tp"; python3 -c 'import sys; v=open(sys.argv[1]).read().strip(); op
 OUT=$(SCRUB "$S/sp.tok" --dry-run "$S/tp"); RC=$?
 [ $RC = 1 ] && echo "$OUT" | grep -q "long.txt: 1 copy" && ok "a 3 kB value straddling a window border is found" || fail "long value: rc=$RC $OUT"
 
+# ── re-review: N1 bytes not characters, N2 a value replaced after its hit, N3 no offline check, N4 packed files ──
+python3 -c 'import secrets;print("nl-" + secrets.token_urlsafe(14))' > "$S/nval"; store "$S/nval" nl "$A"; NREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='nl'"); echo "$NREF" > "$S/nref"
+mkdir -p "$S/hu"; cp "$S/nval" "$S/hu/f.txt"; scanhit "$S/hu"; scrubtok sN "$NREF"
+mkdir -p "$S/tn"
+python3 - "$S" <<'PY'
+import sys,gzip; S=sys.argv[1]; v=open(S+'/nval').read().strip(); T=S+'/tn'
+open(T+'/tui.log','w').write(('│'+'─'*200+'│\n')*9000 + 'pw '+v+'\n')               # 5.4 MB of 3-byte characters
+open(T+'/ja.md','w').write(('日本語のテキスト'*40+'\n')*6000 + 'pw '+v+'\n')
+# a UTF-8 copy and a Latin-1-only neighbour in one window with stray bytes (re-review L: counts must not cancel)
+open(T+'/mixed.txt','wb').write(b'caf\xe9 \xff\n' + v.encode() + b'\n' + b'x\xe9y\n')
+open(T+'/hi.bin','wb').write(bytes([0x80])*1500000)                                    # no character boundary anywhere
+with gzip.open(T+'/old.log.gz','wt') as g: g.write('pw '+v+'\n')
+PY
+OUT=$(timeout 120 bash -c "DEMIPASS_URL=$API DEMIPASS_SCAN_TOKEN_FILE=$S/sN.tok node $W/bin/leak-scan.js --scrub $S/tn" 2>&1); RC=$?
+echo "$OUT" | grep -q "tui.log: 1 copy" && echo "$OUT" | grep -q "ja.md: 1 copy" && ! echo "$OUT" | grep -q 413 && ok "5–6 MB of multi-byte text goes through (batches counted in bytes) and its copies are masked" || fail "N1: rc=$RC $OUT"
+echo "$OUT" | grep -q "mixed.txt: 1 copy" && ! grep -qF -- "$(head -c 12 "$S/nval")" "$S/tn/mixed.txt" && ok "a UTF-8 copy among stray bytes is masked exactly" || fail "mixed: $OUT"
+echo "$OUT" | grep -q "NOT READ.*old.log.gz (gzip" && echo "$OUT" | grep -q "not marked contained" && ok "a gzip file is not read and the run is not contained" || fail "N4: $OUT"
+[ $RC = 1 ] && ok "…and a file of continuation bytes does not stall the run" || fail "hi.bin: rc=$RC"
+python3 - "$DB_PATH" "$S" <<'PY' && ok "the stored fingerprints cannot be checked from the database alone, and a spent token keeps none" || fail "N3"
+import sqlite3,sys,hmac,hashlib; c=sqlite3.connect(sys.argv[1]); S=sys.argv[2]; v=open(S+'/nval').read().strip()
+rows=c.execute("SELECT token_hash, scrub_value_mac, revoked_at FROM leak_scan_tokens WHERE scrub_secret_id IS NOT NULL").fetchall()
+for th,mac,rev in rows:
+    if mac: assert mac not in (hmac.new(th.encode(), v.encode(), hashlib.sha256).hexdigest(),), 'mac keyed by the token hash'
+    if rev: assert mac is None, 'a spent token keeps its fingerprint'
+seen=c.execute("SELECT leak_seen_mac FROM blindkey_secrets WHERE ref_code=? AND status='active'", (open(S+'/nref').read().strip(),)).fetchone()[0]
+assert seen and seen != hashlib.sha256(v.encode()).hexdigest()
+PY
+store "$S/xval" up1 "$A"; mkdir -p "$S/hup"; cp "$S/xval" "$S/hup/f.txt"; scanhit "$S/hup"
+python3 -c 'import secrets; print("up2-" + secrets.token_urlsafe(14))' > "$S/up2"; sleep 1; store "$S/up2" up1 "$A"
+UREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='up1'")
+call POST /api/demipass/leak-scan/token-requests "$AG" '{"scrub_ref":"'$UREF'"}'; [ "$CODE" = 409 ] && ok "a value replaced in place after its hit cannot be scrubbed on the old value's record" || fail "N2: $CODE $BODY"
+C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub" -H 'content-type: application/json' -H "Authorization: Scan bogus-token" --data-binary @"$S/huge.json"); [ "$C" = 401 ] && ok "an unknown scan token is refused before the body is read" || fail "L1: $C"
+scrubtok sF "$NREF"
+C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub/finish" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/sF.tok")" -d '{"files_read":3,"files_changed":0,"copies_masked":0,"copies_left":0}'); [ "$C" = 400 ] && ok "finish must say how many paths were not read" || fail "paths_not_read: $C"
+
 # ── expiry ──
-scrubtok s8 "$REF"
+scrubtok s8 "$NREF"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE leak_scan_tokens SET expires_at='2000-01-01T00:00:00.000Z' WHERE token_hash=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$(tr -d '\n' < "$S/s8.tok" | sha256sum | cut -d' ' -f1)"
 C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/s8.tok")" -d @"$S/b.json"); [ "$C" = 401 ] && ok "an expired scrub token is refused" || fail "expired: $C"
 grep -qF -- "$(head -c 12 "$S/seed")" "$S"/server-new.log && fail "the value reached the server log" || ok "the value never reaches the server log"

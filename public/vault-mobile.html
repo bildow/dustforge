@@ -3015,7 +3015,7 @@ async function loadScanRequests(){
   // A scrub request is not a scan token: it shows where one value sits in the scrubber's files — in effect, the value.
   el.innerHTML=scanReqs.map(q=>'<div class="fill-req">'+(q.kind==='scrub'&&q.scrub
       ?'<div><b>Scrub '+esc(q.scrub.name)+'</b> ('+esc(q.scrub.ref)+') from the files a scrubber reads</div>'
-       +'<div style="color:var(--red);margin-top:0.25rem">The scrubber finds every copy of this value in its files and overwrites it. To do that it learns where the value is: in effect, the value. Approve only if you started this scrub yourself. The value is not rotated; backups keep their copies.</div>'
+       +'<div style="color:var(--red);margin-top:0.25rem">The scrubber finds every copy of this value in its files and overwrites it. To do that it learns where the value is: in effect, the value. Approve only if you started this scrub yourself. The value is not rotated; backups, compressed files and other encodings (base64, URL-encoded) keep their copies.</div>'
       :'<div>A leak scanner asks for '+(q.labels.length===1?'a scan token':q.labels.length+' scan tokens')+': <b>'+q.labels.map(esc).join(', ')+'</b></div>'
        +'<div style="color:var(--text3);margin-top:0.25rem">A token only asks whether one of your values appears in some text; it never sees a value. Approve only if you started this (pane set-up, CI).</div>')
     +(q.requested_by?'<div style="color:var(--text3);margin-top:0.25rem">from '+esc(q.requested_by)+'</div>':'')

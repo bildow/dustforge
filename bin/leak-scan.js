@@ -152,23 +152,50 @@ async function post(auth, batch) {
 }
 // ── scrub ────────────────────────────────────────────────────────────────────────────────────────────────────────────
 // Windows cut on UTF-8 character boundaries, overlapping by more than the longest form the server looks for (it says how
-// long: max_form_bytes), so no copy is split unseen. A window whose bytes are valid UTF-8 is sent as text and the
-// server's byte offsets are exact. A window that is not (a stray Latin-1 byte, binary) is sent byte for byte (latin1),
-// whose offsets map back exactly — and as UTF-8 too, only to count copies with non-ASCII characters that the byte view
-// cannot see; those are left, never written (#98 review H2). Every write checks the bytes on disk are still the ones read.
+// long: max_form_bytes), so no copy is split unseen. Every window is sent as UTF-8 with each byte that is not part of
+// valid UTF-8 replaced by one 0x1A — the same length, so the server's byte offsets are exact (#98 review H2, re-review).
+// A window that had such bytes is also sent byte for byte (latin1, mapped back exactly) to find a copy written in
+// Latin-1. A window too big for one request is split. Every write checks the bytes on disk are still the ones read.
 const SCRUB_TEXT_WINDOW = 192 * 1024, SCRUB_BIN_WINDOW = 96 * 1024;   // JSON escaping at most ×6: a window fits a request
 const SCRUB_BODY_MAX = 1400 * 1024;                                    // under nginx's and the server's body limits
-function* scrubWindows(buf, size, overlap) {
-  let start = 0;
-  while (start < buf.length) {
-    let end = Math.min(buf.length, start + size);
-    while (end < buf.length && end > start && (buf[end] & 0xC0) === 0x80) end--;
+function* scrubWindows(buf, size, overlap, from = 0, to = buf.length) {
+  let start = from;
+  while (start < to) {
+    let end = Math.min(to, start + size);
+    const cut = end;
+    while (end < to && end > start && (buf[end] & 0xC0) === 0x80) end--;
+    if (end <= start + overlap) end = cut;   // no character boundary near: cut where the window ends (re-review L)
     yield { start, end };
-    if (end >= buf.length) break;
+    if (end >= to) break;
     let next = Math.max(start + 1, end - overlap);
     while (next < end && (buf[next] & 0xC0) === 0x80) next++;
     start = next;
   }
+}
+// Bytes that are not part of valid UTF-8 → 0x1A, one for one (so offsets in the text are offsets in the file).
+function utf8Clean(raw) {
+  const out = Buffer.from(raw); let bad = 0;
+  for (let i = 0; i < out.length;) {
+    const b = out[i];
+    if (b < 0x80) { i++; continue; }
+    const n = b >= 0xC2 && b <= 0xDF ? 2 : b >= 0xE0 && b <= 0xEF ? 3 : b >= 0xF0 && b <= 0xF4 ? 4 : 0;
+    let ok = n > 0 && i + n <= out.length;
+    for (let k = 1; ok && k < n; k++) if ((out[i + k] & 0xC0) !== 0x80) ok = false;
+    if (ok && n === 3) { const c = out[i + 1]; if ((b === 0xE0 && c < 0xA0) || (b === 0xED && c > 0x9F)) ok = false; }
+    if (ok && n === 4) { const c = out[i + 1]; if ((b === 0xF0 && c < 0x90) || (b === 0xF4 && c > 0x8F)) ok = false; }
+    if (ok) { i += n; continue; }
+    out[i] = 0x1A; bad++; i++;
+  }
+  return { out, bad };
+}
+// Compressed or packed data: a copy inside cannot be seen, so the file is not "read" (#98 re-review N4).
+function packed(p, head) {
+  if (/(^|[\/])\.git[\/]objects[\/]/.test(p)) return 'git object';
+  const m = (sig) => head.length >= sig.length && sig.every((x, i) => head[i] === x);
+  if (m([0x1f, 0x8b])) return 'gzip'; if (m([0x28, 0xb5, 0x2f, 0xfd])) return 'zstd'; if (m([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00])) return 'xz';
+  if (m([0x42, 0x5a, 0x68])) return 'bzip2'; if (m([0x50, 0x4b, 0x03, 0x04])) return 'zip'; if (m([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])) return '7z';
+  if (m([0x04, 0x22, 0x4d, 0x18])) return 'lz4'; if (m([0x4c, 0x50, 0x4b, 0x53, 0x48, 0x48, 0x52, 0x48])) return 'journal';
+  return null;
 }
 // The server counts UTF-8 bytes of the text it got; for latin1 text each raw byte ≥ 0x80 was two of them.
 function latin1Offset(raw, utf8Bytes) {
@@ -222,50 +249,58 @@ async function scrub(args) {
       buf = Buffer.alloc(st.size); let got = 0; while (got < st.size) { const n = fs.readSync(fd, buf, got, st.size - got, got); if (!n) break; got += n; } buf = buf.subarray(0, got);
     } catch (e) { notRead.push(`${f} (${e.code || e.message})`); continue; } finally { if (fd !== undefined) fs.closeSync(fd); }
     filesRead++; bytesRead += buf.length;
+    const kind = packed(f, buf.subarray(0, 16));
+    if (kind) { filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); continue; }
     const binary = buf.subarray(0, 8192).includes(0);
-    const wins = [...scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)];
+    // Windows, each with its texts; one too big for a request is split (the overlap keeps every copy whole in a half).
+    const wins = [];
+    const add = (a, b) => {
+      const raw = buf.subarray(a, b), { out, bad } = utf8Clean(raw);
+      const parts = [{ view: 'u', text: out.toString('utf8') }];
+      if (bad) parts.push({ view: 'l', text: raw.toString('latin1') });
+      const bytes = parts.reduce((n, p) => n + Buffer.byteLength(JSON.stringify(p.text)) + 32, 0);
+      if (bytes > SCRUB_BODY_MAX && b - a > 4 * overlap) {
+        const half = a + Math.floor((b - a) / 2); let mid = half;
+        while (mid > a + overlap && (buf[mid] & 0xC0) === 0x80) mid--;
+        if (mid <= a + overlap) mid = half;   // no character boundary near: cut in the middle anyway
+        add(a, Math.min(b, mid + overlap)); add(mid, b); return;
+      }
+      if (bytes > SCRUB_BODY_MAX) throw new Error(`${f}: a piece of it does not fit one request`);
+      wins.push({ start: a, end: b, parts, bytes });
+    };
+    for (const w of scrubWindows(buf, binary ? SCRUB_BIN_WINDOW : SCRUB_TEXT_WINDOW, overlap)) add(w.start, w.end);
     const spans = new Map();                 // exact spans (absolute start → length): written, in a text file
-    const uOnly = new Map();                 // per window: copies seen only in the UTF-8 view of a window that is not valid UTF-8
     const binSeen = new Set();
     let batch = [], size = 0;
     const flush = async () => {
       if (!batch.length) return;
       const res = await scrubPost(auth, batch); batch = []; size = 0;
-      const per = new Map();
       for (const m of res) {
         const [wi, view] = String(m.chunk).split(':'); const w = wins[Number(wi)]; if (!w) continue;
         const raw = buf.subarray(w.start, w.end);
-        const e = per.get(wi) || { u: 0, l: 0, valid: !view }; per.set(wi, e);
         for (const [off, len] of m.at || []) {
-          if (view === 'u') { e.u++; continue; }
           const a = view === 'l' ? latin1Offset(raw, off) : off;
           const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
-          if (view === 'l') e.l++;
           if (binary) { binSeen.add(w.start + a); continue; }
           const s0 = w.start + a, prev = spans.get(s0); if (prev === undefined || l > prev) spans.set(s0, l);
         }
       }
-      for (const [wi, e] of per) if (!e.valid && e.u > e.l) uOnly.set(wi, Math.max(uOnly.get(wi) || 0, e.u - e.l));
     };
     for (let i = 0; i < wins.length; i++) {
-      const raw = buf.subarray(wins[i].start, wins[i].end);
-      const t = raw.toString('utf8');
-      const parts = Buffer.from(t, 'utf8').equals(raw) ? [{ id: String(i), text: t }] : [{ id: i + ':l', text: raw.toString('latin1') }, { id: i + ':u', text: t }];
-      const js = parts.reduce((n, p) => n + JSON.stringify(p.text).length + p.id.length + 16, 0);
-      if (size && (size + js > SCRUB_BODY_MAX || batch.length + parts.length > 150)) await flush();
-      batch.push(...parts); size += js;
+      const w = wins[i];
+      if (size && (size + w.bytes > SCRUB_BODY_MAX || batch.length + w.parts.length > 150)) await flush();
+      for (const p of w.parts) batch.push({ id: i + ':' + p.view, text: p.text });
+      size += w.bytes;
     }
     await flush();
-    const extra = [...uOnly.values()].reduce((a, b) => a + b, 0);
     if (binary) {
-      const n = binSeen.size + extra;
+      const n = binSeen.size;
       if (n) { left += n; console.log(`FOUND    ${f}: ${n} cop${n === 1 ? 'y' : 'ies'} in a binary file — not written (remove the file or rotate)`); }
       continue;
     }
     // Overlapping or touching spans become one, so a write never invalidates the check for the next (#98 review L2).
     const merged = [];
     for (const [a, l] of [...spans].sort((x, y) => x[0] - y[0])) { const last = merged[merged.length - 1]; if (last && a <= last[0] + last[1]) last[1] = Math.max(last[1], a + l - last[0]); else merged.push([a, l]); }
-    if (extra) { left += extra; console.log(`LEFT     ${f}: ${extra} cop${extra === 1 ? 'y' : 'ies'} next to bytes that are not UTF-8 — not written`); }
     if (!merged.length) continue;
     if (dry) { masked += merged.length; console.log(`FOUND    ${f}: ${merged.length} cop${merged.length === 1 ? 'y' : 'ies'} (dry run)`); continue; }
     let n = 0, stale = 0, wfd;

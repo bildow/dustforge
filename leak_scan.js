@@ -89,8 +89,12 @@ module.exports = function registerLeakScan(deps) {
   // gigabytes of logs: scrubbing has its own.
   const scrubLimit = require('express-rate-limit')({ windowMs: 15 * 60 * 1000, max: 3000, message: { error: 'Rate limit exceeded' } });
   // Before the 2 MiB body is parsed: only a scan/scrub token gets that far (#98 review L1).
-  const scanHeaderFirst = (req, res, next) => String(req.headers.authorization || '').startsWith('Scan ') ? next()
-    : res.status(403).json({ error: 'scanning takes a scan token (Authorization: Scan <token>)' });
+  const scanHeaderFirst = (req, res, next) => {
+    const h = String(req.headers.authorization || '');
+    if (!h.startsWith('Scan ')) return res.status(403).json({ error: 'scanning takes a scan token (Authorization: Scan <token>)' });
+    if (!db.prepare('SELECT 1 FROM leak_scan_tokens WHERE token_hash = ?').get(sha(h.slice(5).trim()))) return res.status(401).json({ error: 'invalid scan token' });
+    next();
+  };
   const sha = (t) => crypto.createHash('sha256').update(String(t)).digest('hex');
   const nowIso = () => new Date().toISOString();
   const later = (sec) => new Date(Date.now() + sec * 1000).toISOString();
@@ -158,9 +162,13 @@ module.exports = function registerLeakScan(deps) {
     return { hits, truncated, later_truncated: laterTruncated, text: lines.join('\n') };
   }
   const newToken = () => 'dpscan_' + crypto.randomBytes(24).toString('base64url');
-  // The value a scrub token was approved for, keyed by the token: a value changed since (rotation, an upsert under the
-  // same name) no longer matches and the token stops (#98 review H1).
-  const valueMac = (tokenHash, v) => crypto.createHmac('sha256', String(tokenHash)).update(String(v)).digest('hex');
+  // Value fingerprints, keyed with a server secret (#98 re-review N3: keyed by anything stored beside them, a copy of the
+  // database could test guesses offline). Which value a scan saw (leak_seen_mac), and which value a scrub token was
+  // approved for: a value changed since (rotation, an upsert under the same name) no longer matches (#98 review H1, N2).
+  const macKey = (() => { const m = process.env.IDENTITY_MASTER_KEY; return m ? Buffer.from(crypto.hkdfSync('sha256', Buffer.from(m, 'utf8'), Buffer.alloc(0), 'dustforge leak-scan value mac v1', 32)) : null; })();
+  const seenMac = (v) => macKey ? crypto.createHmac('sha256', macKey).update('seen\0' + String(v)).digest('hex') : null;
+  const valueMac = (tokenHash, v) => macKey ? crypto.createHmac('sha256', macKey).update('scrub\0' + String(tokenHash) + '\0' + String(v)).digest('hex') : null;
+  const sameHex = (a, b) => { if (!a || !b) return false; const x = Buffer.from(String(a), 'hex'), y = Buffer.from(String(b), 'hex'); return x.length === y.length && x.length > 0 && crypto.timingSafeEqual(x, y); };
   function mint(ownerDid, label, requestId, { scrubSecretId = null, scrubValue = null } = {}) {
     const token = newToken();
     const th = sha(token);
@@ -174,7 +182,9 @@ module.exports = function registerLeakScan(deps) {
   function expireRequests() {
     const t = nowIso();
     const lapsed = db.prepare("SELECT id FROM leak_scan_token_requests WHERE status = 'approved' AND expires_at <= ?").all(t);
-    for (const r of lapsed) db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'unclaimed' WHERE request_id = ? AND revoked_at IS NULL").run(t, r.id);
+    for (const r of lapsed) db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'unclaimed', scrub_value_mac = NULL WHERE request_id = ? AND revoked_at IS NULL").run(t, r.id);
+    // A scrub token past its time keeps no fingerprint of the value.
+    db.prepare('UPDATE leak_scan_tokens SET scrub_value_mac = NULL WHERE scrub_value_mac IS NOT NULL AND (revoked_at IS NOT NULL OR expires_at <= ?)').run(t);
     db.prepare("UPDATE leak_scan_token_requests SET status = 'expired', sealed = NULL, decided_at = COALESCE(decided_at, ?) WHERE status IN ('pending','approved') AND expires_at <= ?").run(t, t);
   }
   const sweeper = setInterval(() => { try { expireRequests(); } catch (_) {} }, 60000); if (sweeper.unref) sweeper.unref();
@@ -308,7 +318,7 @@ module.exports = function registerLeakScan(deps) {
     const spent = spendSingleUse(auth.did, 'scan-token', ['pin'], auth, intent);
     if (spent) return res.status(spent.status || 403).json(spent);
     // A draining token (revoked by its hit, still recording) is stopped too (#92 review M1).
-    const n = db.prepare("UPDATE leak_scan_tokens SET revoked_at = COALESCE(revoked_at, ?), revoked_reason = 'owner', drain_until = NULL WHERE id = ? AND owner_did = ? AND (revoked_at IS NULL OR (revoked_reason = 'hit' AND drain_until > ?))").run(nowIso(), Number(req.params.id), auth.did, nowIso()).changes;
+    const n = db.prepare("UPDATE leak_scan_tokens SET revoked_at = COALESCE(revoked_at, ?), revoked_reason = 'owner', drain_until = NULL, scrub_value_mac = NULL WHERE id = ? AND owner_did = ? AND (revoked_at IS NULL OR (revoked_reason = 'hit' AND drain_until > ?))").run(nowIso(), Number(req.params.id), auth.did, nowIso()).changes;
     res.status(n ? 200 : 404).json(n ? { ok: true } : { error: 'scan token not found' });
   });
 
@@ -328,9 +338,10 @@ module.exports = function registerLeakScan(deps) {
     const scrubRef = (req.body || {}).scrub_ref;
     if (scrubRef !== undefined) {
       if (typeof scrubRef !== 'string' || !/^[A-Za-z0-9-]{4,80}$/.test(scrubRef) || labels !== undefined) return res.status(400).json({ error: 'scrub_ref: the ref of one of your entries (and no labels)' });
-      scrub = db.prepare("SELECT id, name, ref_code, leak_seen_at, created_at FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status != 'deleted' ORDER BY id DESC LIMIT 1").get(auth.did, scrubRef);
+      if (!macKey) return res.status(503).json({ error: 'scrubbing is not available on this server' });
+      scrub = db.prepare("SELECT id, name, ref_code FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status != 'deleted' ORDER BY id DESC LIMIT 1").get(auth.did, scrubRef);
       if (!scrub) return res.status(404).json({ error: 'no entry of yours with that ref' });
-      if (!scrub.leak_seen_at && !foundLeaked(auth.did, scrub.ref_code, scrub.created_at)) return res.status(409).json({ error: 'the leak scanner has not found this entry: a scrub is for a value it found in your files' });
+      if (!leakedValue(auth.did, scrub.id)) return res.status(409).json({ error: 'the leak scanner has not found this value: a scrub is for a value it found in your files' });
       labels = ['scrub-' + scrub.ref_code];
     }
     if (!Array.isArray(labels) || !labels.length || labels.length > MAX_LABELS || labels.some(l => typeof l !== 'string' || !l.trim() || l.length > 80)) {
@@ -376,6 +387,8 @@ module.exports = function registerLeakScan(deps) {
       if (typeof scrubValue !== 'string') return res.status(409).json({ error: 'this value is wrapped to your phone: the server cannot look for it' });
       if (scrubValue.length < MIN_LEN) return res.status(409).json({ error: `values shorter than ${MIN_LEN} characters are not looked for (too many false matches)` });
       if (Math.max(...valueForms(scrubValue).map(f => Buffer.byteLength(f))) > MAX_SCRUB_FORM_BYTES) return res.status(409).json({ error: 'this value is too long to look for in pieces of text' });
+      // The value now must be the one the scanner found (it may have been replaced since the request: #98 re-review N2).
+      if (!leakedValue(auth.did, scrubRow.id)) return res.status(409).json({ error: 'the scanner has not found the value this entry holds now (it changed since it was found): scan again first' });
     }
     const kind = scrubRow ? 'scrub-approve' : 'scan-approve';
     const intent = `${kind}:${r.id}`;
@@ -452,7 +465,7 @@ module.exports = function registerLeakScan(deps) {
         for (const { r, forms } of needles) {
           let count = 0;
           for (const f of forms) { let i = 0; while ((i = c.text.indexOf(f, i)) !== -1) { count++; i += f.length; } }
-          if (count) hits.push({ chunk: cleanLabel(c.id || '', 300), ref: r.ref_code, name: r.name, count, sid: r.id });
+          if (count) hits.push({ chunk: cleanLabel(c.id || '', 300), ref: r.ref_code, name: r.name, count, sid: r.id, vmac: seenMac(forms[0]) });
         }
       }
     } finally { needles = null; }
@@ -495,16 +508,33 @@ module.exports = function registerLeakScan(deps) {
   // A value found again is no longer contained, and its row remembers when it was seen (by row id: #98 review H1).
   function uncontain(did, hits) {
     const t = nowIso();
-    for (const sid of [...new Set(hits.map(h => h.sid).filter(Boolean))]) {
-      try { db.prepare('UPDATE blindkey_secrets SET leak_contained_at = NULL, leak_contained_note = NULL, leak_seen_at = ? WHERE did = ? AND id = ?').run(t, did, sid); } catch (_) {}
+    const seen = new Map(); for (const h of hits) if (h.sid) seen.set(h.sid, h.vmac || null);
+    for (const [sid, vmac] of seen) {
+      try { db.prepare('UPDATE blindkey_secrets SET leak_contained_at = NULL, leak_contained_note = NULL, leak_seen_at = ?, leak_seen_mac = ? WHERE did = ? AND id = ?').run(t, vmac, did, sid); } catch (_) {}
     }
   }
+  // Is the value this row holds NOW one the scanner found? A fingerprint of the value seen is kept with each hit since
+  // this change; hits from before it name only the ref, so they count only if the row's value was not written after the
+  // hit (every value write sets updated_at; a rotation keeps the ref for the new value) (#98 re-review N2).
+  function leakedValue(did, sid) {
+    const row = db.prepare("SELECT ref_code, encrypted_value, leak_seen_mac, created_at, updated_at FROM blindkey_secrets WHERE id = ? AND did = ? AND status != 'deleted'").get(sid, did);
+    if (!row) return false;
+    if (row.leak_seen_mac) {
+      let v = null; try { v = blindkeyDecrypt(row.encrypted_value); } catch (_) { v = null; }
+      const ok = typeof v === 'string' && sameHex(seenMac(v), row.leak_seen_mac); v = null;
+      return ok;
+    }
+    const written = [row.created_at, row.updated_at].filter(Boolean).sort((a, b) => (julian(a) - julian(b))).pop();
+    return foundLeaked(did, row.ref_code, written);
+  }
+  const julian = (t) => db.prepare('SELECT julianday(?) AS j').get(t).j || 0;
   // Did a scan find this row's value (hits from before leak_seen_at existed)? A hit names the ref; a rotation keeps the
-  // ref for the new value, so only a hit made after this row was written counts — never the old value's.
+  // ref for the new value, so only a hit made after this row was written counts — never the old value's. The row's times
+  // are whole seconds, the hits' are not: a full second after, so a hit in the second of a rotation does not count.
   function foundLeaked(did, ref, rowCreatedAt) {
     const like = `%"ref":${JSON.stringify(ref)}%`;
-    return Boolean(db.prepare('SELECT 1 FROM leak_scan_hits WHERE owner_did = ? AND found LIKE ? AND julianday(created_at) >= julianday(?) LIMIT 1').get(did, like, rowCreatedAt)
-      || db.prepare('SELECT 1 FROM leak_scan_drain_finds WHERE owner_did = ? AND found LIKE ? AND julianday(created_at) >= julianday(?) LIMIT 1').get(did, like, rowCreatedAt));
+    return Boolean(db.prepare('SELECT 1 FROM leak_scan_hits WHERE owner_did = ? AND found LIKE ? AND julianday(created_at) > julianday(?, \'+1 second\') LIMIT 1').get(did, like, rowCreatedAt)
+      || db.prepare('SELECT 1 FROM leak_scan_drain_finds WHERE owner_did = ? AND found LIKE ? AND julianday(created_at) > julianday(?, \'+1 second\') LIMIT 1').get(did, like, rowCreatedAt));
   }
   // Every form a value takes in text: as it is, JSON-escaped once and twice (a tool call's JSON inside a transcript's
   // JSON), and with non-ASCII as \uXXXX (Python's json.dumps) — each once or twice escaped.
@@ -520,8 +550,7 @@ module.exports = function registerLeakScan(deps) {
     if (!row) return { gone: true };
     let v; try { v = blindkeyDecrypt(row.encrypted_value); } catch (_) { return { gone: true }; }
     if (typeof v !== 'string' || !caller.tokenRow.scrub_value_mac) return { gone: true };
-    const a = Buffer.from(valueMac(caller.tokenRow.token_hash, v), 'hex'), b = Buffer.from(String(caller.tokenRow.scrub_value_mac), 'hex');
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { changed: true };
+    if (!sameHex(valueMac(caller.tokenRow.token_hash, v), caller.tokenRow.scrub_value_mac)) return { changed: true };
     return { value: v };
   }
 
@@ -576,11 +605,11 @@ module.exports = function registerLeakScan(deps) {
     const caller = scanCaller(req, res, { scrub: true }); if (!caller) return;
     const b = req.body || {};
     const num = (x) => (Number.isInteger(x) && x >= 0 && x < 1e12 ? x : null);
-    const report = { files_read: num(b.files_read), files_changed: num(b.files_changed), copies_masked: num(b.copies_masked), copies_left: num(b.copies_left), paths_not_read: num(b.paths_not_read === undefined ? 0 : b.paths_not_read) };
+    const report = { files_read: num(b.files_read), files_changed: num(b.files_changed), copies_masked: num(b.copies_masked), copies_left: num(b.copies_left), paths_not_read: num(b.paths_not_read) };
     if (Object.values(report).some(v => v === null)) return res.status(400).json({ error: 'files_read, files_changed, copies_masked, copies_left, paths_not_read: whole numbers' });
     const sid = caller.tokenRow.scrub_secret_id;
     const e = db.prepare("SELECT id, name, ref_code, leak_seen_at FROM blindkey_secrets WHERE id = ? AND did = ? AND status != 'deleted'").get(sid, caller.did);
-    const spent = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'scrubbed' WHERE id = ? AND revoked_at IS NULL").run(nowIso(), caller.tokenRow.id).changes === 1;
+    const spent = db.prepare("UPDATE leak_scan_tokens SET revoked_at = ?, revoked_reason = 'scrubbed', scrub_value_mac = NULL WHERE id = ? AND revoked_at IS NULL").run(nowIso(), caller.tokenRow.id).changes === 1;
     if (!spent) return res.status(409).json({ error: 'this scrub token already finished' });
     const seenSince = Boolean(e && e.leak_seen_at && e.leak_seen_at > caller.tokenRow.created_at);
     const contained = Boolean(e) && report.files_read > 0 && report.copies_left === 0 && report.paths_not_read === 0 && !seenSince;
@@ -594,7 +623,7 @@ module.exports = function registerLeakScan(deps) {
     if (e) mailOwner(caller.did, `DemiPass: ${e.name} ${contained ? 'is contained' : 'was scrubbed, not contained'}`,
       `The scrubber for ${e.name} (${e.ref_code}) reports: ${report.copies_masked} copies overwritten in ${report.files_changed} of ${report.files_read} files read; ${report.copies_left} left; ${report.paths_not_read} paths not read.\n` +
       (contained ? 'The entry now shows as contained: not rotated, but no copy is left where the scrubber looked (its own report). ' : `Not contained: ${why}. `) +
-      'Copies in backups, and anywhere the scrubber could not read, are still there; rotating is the only full fix. A later scan that finds the value clears the mark.\n');
+      'Copies in backups, in compressed files, in other encodings (base64, URL-encoded), and anywhere the scrubber could not read, are still there; rotating is the only full fix. A later scan that finds the value clears the mark.\n');
     res.json({ ok: true, contained, ...(contained ? {} : { why }), entry: e ? { name: e.name, ref: e.ref_code } : null });
   });
 

@@ -3061,6 +3061,7 @@ try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN note TEXT DEFAULT ''"); }
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_at TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_contained_note TEXT DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_seen_at TEXT DEFAULT NULL"); } catch(_) {}   // when a scan last found this row's value
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN leak_seen_mac TEXT DEFAULT NULL"); } catch(_) {}  // keyed fingerprint of the value that scan found (leak_scan.js)
 
 // Known provider patterns — auto-detect expiration hints
 const PROVIDER_PATTERNS = {
