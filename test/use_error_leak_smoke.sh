@@ -56,6 +56,14 @@ for P in '"\u0000"' '"Bearer \r\nX-Evil: 1"'; do
 done
 call POST /api/demipass/use "$A" '{"ref":"'$REF'","action":"http_header","params":{"url":"https://server.dustroot.com/x","header_name":"X-A\r\nX-B"}}'
 [ "$CODE" = 400 ] && ! leaks "$BODY" && ok "direct /use, header_name with CR-LF: 400" || fail "direct name: $CODE $BODY"
+for P in '{"header_name":"Host"}' '{"header_name":"proxy-authorization"}' '{"header_prefix":"Bearer \u0100"}'; do
+  call POST /api/demipass/use "$A" '{"ref":"'$REF'","action":"http_header","params":{"url":"https://server.dustroot.com/x",'"${P:1:-1}"'}}'
+  [ "$CODE" = 400 ] && ! leaks "$BODY" && ok "refused: $P" || fail "not refused $P: $CODE $BODY"
+done
+for P in '{"header_name":"X-Api-Key","header_prefix":""}' '{"header_name":"Authorization","header_prefix":"token "}' '{"header_name":"Cookie","header_prefix":"session="}'; do
+  call POST /api/demipass/use "$A" '{"ref":"'$REF'","action":"http_header","params":{"url":"https://server.dustroot.com/x",'"${P:1:-1}"'}}'
+  [ "$CODE" = 200 ] && ok "still works: $P" || fail "legit broke $P: $CODE $BODY"
+done
 # use-token mode (as an agent would)
 call POST /api/demipass/request-token "$A" '{"ref":"'$REF'","action":"http_header","target_url":"https://server.dustroot.com/x"}'; UT=$(echo "$BODY" | J use_token)
 call POST /api/demipass/use "$A" '{"use_token":"'$UT'","action":"http_header","params":{"header_prefix":"\u0000"}}'

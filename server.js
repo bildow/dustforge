@@ -545,9 +545,15 @@ const isUsePath = (p) => /^\/api\/(demipass|blindkey)\/use\/?$/i.test(p);
 // `action failed: ${e.message}` to the agent and stored it in secret_outcomes. Header params are checked before any
 // request is built, and every error from a call that carried a secret is scrubbed before it is returned or stored.
 const USE_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}$/;
+// Headers a secret must never ride in: Host ends up in access logs, Proxy-Authorization goes to a proxy, and the
+// hop-by-hop ones are refused or rewritten by fetch (#105 review hardening). Cookie stays allowed: a session cookie is a
+// legitimate stored secret.
+const USE_HEADER_NAME_DENY = new Set(['host', 'proxy-authorization', 'connection', 'transfer-encoding', 'content-length', 'te', 'upgrade', 'keep-alive', 'expect', 'trailer']);
 function useHeaderParamsRefusal(name, prefix) {
   if (typeof name !== 'string' || !USE_HEADER_NAME_RE.test(name)) return 'header_name: a plain HTTP header name (letters, digits and - . _ etc.; no spaces or control characters)';
-  if (typeof prefix !== 'string' || prefix.length > 256 || /[\x00-\x08\x0a-\x1f\x7f]/.test(prefix)) return 'header_prefix: printable text of at most 256 characters (no control characters)';
+  if (USE_HEADER_NAME_DENY.has(name.toLowerCase())) return `header_name: a secret is not sent in the ${name} header`;
+  // printable ASCII and tab only: a wider character makes fetch name the position and value of a character (#105 review)
+  if (typeof prefix !== 'string' || prefix.length > 256 || !/^[\x09\x20-\x7e]*$/.test(prefix)) return 'header_prefix: printable ASCII text of at most 256 characters';
   return null;
 }
 function scrubSecretFromError(msg, value) {
