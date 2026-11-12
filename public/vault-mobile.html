@@ -935,7 +935,7 @@ function logout(){
   updateStoreFields(); updateSiliconFields(); updateNetFields();   // the sheets' field sets follow their reset dropdowns
   secrets=[]; dashboardData=null; document.getElementById('vault-note').textContent='';
   // Requests and pools are this account's: none of it survives a sign-out (#99 review M4).
-  approvals=[]; scanReqs=[]; agentTokReqs=[]; reqAll=[]; reqFilter={q:'',status:'pending',kind:'',who:''}; reqLoading=null; reqLoadedAt=0; lastSecretsSig=''; poolOpenFor=null;
+  approvals=[]; scanReqs=[]; agentTokReqs=[]; reqAll=[]; reqFilter={q:'',status:'pending',kind:'',who:''}; reqLoading=null; reqAgain=false; reqLoadedAt=0; lastSecretsSig=''; poolOpenFor=null;
   for(const i of ['req-list','req-status','scan-requests','agent-token-requests','approval-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}
   { const w=document.getElementById('req-who'); if(w) w.innerHTML='<option value="">Anyone</option>'; const q=document.getElementById('req-q'); if(q) q.value=''; updateReqBadge(); } fleetSlug=null; fleetData=null; siliconHandle=null; panic=false;
   goPage('vault');
@@ -2382,7 +2382,14 @@ function openRequests(status){
 }
 // Agent-token states: creating (approved, the agent is being made) counts as approved; failed with denied.
 const reqStatusOf=(s)=>{ s=String(s||''); return s==='pending'?'pending':/^(approved|used|claimed|active|creating)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed)$/.test(s)?'denied':s==='expired'?'expired':s; };
-function loadRequestsAll(){ if(!reqLoading) reqLoading=loadRequestsOnce().finally(()=>{ reqLoading=null; }); return reqLoading; }
+// One load at a time; a load asked for while one runs runs once more after it, so a decision is never shown stale
+// (#99 re-review L2), and a finished load clears only its own flag (L3: not the next account's).
+let reqAgain=false;
+function loadRequestsAll(){
+  if(reqLoading){ reqAgain=true; return reqLoading; }
+  const p=loadRequestsOnce().finally(()=>{ if(reqLoading===p){ reqLoading=null; if(reqAgain){ reqAgain=false; loadRequestsAll(); } } });
+  reqLoading=p; return p;
+}
 async function loadRequestsOnce(){
   if(lockState.locked) return;
   const epoch=sessionEpoch;   // a reply that lands after a sign-out writes nothing (#99 review M4)

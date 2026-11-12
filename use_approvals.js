@@ -374,7 +374,10 @@ module.exports = function registerUseApprovals(deps) {
     const agent = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint')));
     const lim = agent ? 0 : Math.min(200, Math.max(20, Number.parseInt(req.query.limit, 10) || 20));
     const recent = lim ? db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status != 'pending' ORDER BY id DESC LIMIT ?").all(auth.did, lim) : [];
-    res.json({ ok: true, incoming: agent ? [] : incoming.map(r => view(r, auth.did)), outgoing: outgoing.map(r => view(r, auth.did)), recent: recent.map(r => view(r, auth.did)) });
+    // An agent's own requests are filed under its owner's DID, so outgoing holds every agent's: without the bound call
+    // and binding for an agent token, one agent cannot read another's request details (#99 re-review L1).
+    const lean = (v) => { const { call, binding, ...rest } = v; return rest; };
+    res.json({ ok: true, incoming: agent ? [] : incoming.map(r => view(r, auth.did)), outgoing: outgoing.map(r => agent ? lean(view(r, auth.did)) : view(r, auth.did)), recent: recent.map(r => view(r, auth.did)) });
   });
 
   // GET /api/blindkey/approvals/:id — status for the owner or the requester (never a code).
