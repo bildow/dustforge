@@ -400,7 +400,7 @@ module.exports = function registerFleetRoutes(deps) {
     try {
       const token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
         scope, expiresIn: expires_in,
-        metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: a.fleet.slug, minted_by: a.did },
+        metadata: { email: wallet.email, username: wallet.username, auth_method: 'fleet_owner_mint', fleet: a.fleet.slug, minted_by: a.did, shown: true },   // its value is shown: it cannot choose a delivery key (silicon_renew.js)
       });
       const st = fb.tokenStatus(db, wallet.did);
       log(`token minted for ${s.handle} (${scope}, ${expires_in}) by ${a.did}`);

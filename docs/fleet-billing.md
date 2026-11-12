@@ -35,15 +35,22 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
    declared but not implemented (the rule records the error).
 8. **Tokens.** The Fleet page shows each silicon's newest token (valid / expiring in its last 24 h, counted in
    hours / expired / none). The scheduler emails the silicon's contact once per day while it is not valid, and
-   the fleet owner at the 24 h mark. The owner can mint a ≤transact, ≤30d token for a silicon from the subpage.
+   the fleet owner once per token at the 24 h mark (or at its lapse, if the pass missed that window). The owner can mint a ≤transact, ≤30d token for a silicon from the subpage.
    **Renew token** (every card of an agent the fleet holds the key of; Aaron 2026-11-12, `silicon_renew.js`): the
    owner's PIN (and linked phone) renews it without anyone seeing it — the server mints it and seals it to the
    agent's **delivery key**; the agent picks it up with `bin/token-pickup.js`:
-   - once, while it still has a live token: `DEMIPASS_TOKEN=… node bin/token-pickup.js --init <dir>` makes an
-     X25519 keypair (`<dir>/delivery.key`, 0600) and registers its public key (`POST /api/identity/delivery-key`);
+   - once, with its own sign-in (not a token whose value was shown, e.g. from "Mint a token"):
+     `DEMIPASS_TOKEN=… node bin/token-pickup.js --init <dir>` makes an X25519 keypair (`<dir>/delivery.key`, 0600)
+     and registers its public key (`POST /api/identity/delivery-key`). The first key is pinned; a different key later
+     waits for the owner (a card on the agent's page and a mail; approve with the PIN `silicon-key:<id>` + phone), and
+     renewals to a changed key start 6 hours after the change. The card says "key set / key changed <time>".
    - after a renewal (or from a timer): `node bin/token-pickup.js <dir>` fetches the newest sealed delivery
-     (`GET /api/identity/token-deliveries?did=…`, no session, rate-limited), opens it and writes `<dir>/token`
-     (0600). It never prints the token. Without a delivery key the renewal answers 409.
+     (`GET /api/identity/token-deliveries?did=…`, no session, rate-limited per address+DID; only `{id, epk, iv, tag,
+     ciphertext}`), opens it, checks the token's signature against the did:key, and writes `<dir>/token` (0600) only
+     if it is newer than the token held (never a narrower scope without `--allow-narrower`). It then acknowledges it
+     (`POST /api/identity/token-deliveries/ack`, the token itself as Bearer); until then — or the token's first use —
+     the card says "renewed, awaiting pickup". It never prints the token. Without a delivery key the renewal answers 409.
+   - "Mint a 30-day token" (value shown once) is hidden for an agent that has a delivery key.
 9. **Onboarding.** `POST /api/fleet/:slug/silicons` with a handle, name, contact email: an existing identity is
    linked with consent (its own token, the admin key, or a one-time claim link emailed to its mailbox); otherwise
    a new identity (mailbox + wallet) is created for 1000 DD. Either way the DID record is emailed to the contact.
@@ -70,8 +77,10 @@ Status: **built 2026-10-03** on `feat/fleet-silicon-wallets` (`fleet_billing.js`
 | POST | `/api/fleet/:slug/silicons/:handle/refill` | `{amount_cents}` manual refill |
 | POST | `/api/fleet/:slug/silicons/:handle/token` | mint ≤transact ≤30d token (shown once) |
 | POST | `/api/fleet/:slug/silicons/:handle/renew-token` | owner only, PIN `silicon-renew:<id>` + linked phone; `{scope?, expires_in?}` (≤transact, default 30d) → `{ok, delivery_id, expires_at}`, sealed to the agent's delivery key, never the token; 409 without one |
-| POST | `/api/identity/delivery-key` | the agent's own session: `{public_key}` (X25519, 32 bytes base64url) |
-| GET | `/api/identity/token-deliveries?did=` | no auth: the newest 3 unexpired sealed deliveries (non-consuming) |
+| POST | `/api/identity/delivery-key` | the agent's own session (not a shown, worker, device-login token): `{public_key}` (X25519, 32 bytes base64url); first key 201 set, a different one 202 pending |
+| POST | `/api/fleet/:slug/silicons/:handle/delivery-key/:change/approve\|deny` | owner only; approve: PIN `silicon-key:<id>` + linked phone |
+| GET | `/api/identity/token-deliveries?did=` | no auth: the newest 3 unexpired, unacknowledged sealed deliveries (non-consuming) |
+| POST | `/api/identity/token-deliveries/ack` | Bearer = the delivered token; `{used?}` (false: a newer token is kept, the delivery is revoked) |
 | POST | `/api/fleet/:slug/silicons/:handle/delegate` | owner delegates one of their secrets (`secret_name` or `ref`) |
 | GET/PUT | `/api/fleet/:slug/owner-refill` | the owner's scheduled refill rule |
 | PATCH | `/api/fleet/:slug/projects/:project` | `{bill_mode: owner|project_wallet}` |

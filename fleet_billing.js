@@ -154,6 +154,8 @@ function initSchema(db) {
   // delegating to it, refilling it and arming its auto-refill take the owner's PIN (red team items 15, 16; #48).
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN created_by_fleet INTEGER DEFAULT 0`); } catch (_) {}
   try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN refill_confirmed INTEGER DEFAULT 0`); } catch (_) {}
+  // The token the owner was last told about (its 24 h notice, or its lapse if the pass missed that): once per token.
+  try { db.exec(`ALTER TABLE fleet_silicons ADD COLUMN token_owner_warned_jti TEXT`); } catch (_) {}
   // Backfill: provisioned by THIS row's fleet (the slug is in the account-creation entry), not by any fleet (#48 L).
   try { db.exec(`UPDATE fleet_silicons SET created_by_fleet = 1 WHERE created_by_fleet = 0 AND EXISTS (
       SELECT 1 FROM identity_transactions t JOIN fleets f ON f.id = fleet_silicons.fleet_id
@@ -438,33 +440,60 @@ function updateSiliconSettings(db, siliconRow, patch) {
   return db.prepare('SELECT * FROM fleet_silicons WHERE id = ?').get(siliconRow.id);
 }
 
+// The agent's newest token that it holds: a renewal still sealed in token_deliveries (silicon_renew.js), not yet picked
+// up or refused, is not counted — the card would otherwise say "token ok" while the agent runs on the old one (PR #100
+// review M1).
 function latestToken(db, did) {
   try {
     return db.prepare(`SELECT jti, scope, issued_at, expires_at, revoked FROM issued_tokens
-                       WHERE did = ? AND revoked = 0 ORDER BY expires_at DESC LIMIT 1`).get(did) || null;
+                       WHERE did = ? AND revoked = 0
+                         AND jti NOT IN (SELECT token_jti FROM token_deliveries WHERE did = ? AND COALESCE(ack, '') != 'used')
+                       ORDER BY expires_at DESC LIMIT 1`).get(did, did) || null;
+  } catch (_) {
+    try {   // a database without token_deliveries
+      return db.prepare(`SELECT jti, scope, issued_at, expires_at, revoked FROM issued_tokens
+                         WHERE did = ? AND revoked = 0 ORDER BY expires_at DESC LIMIT 1`).get(did) || null;
+    } catch (_) { return null; }
+  }
+}
+// A renewal sealed for the agent and not picked up yet (newest), if any.
+function awaitingPickup(db, did, now = Date.now()) {
+  try {
+    const r = db.prepare(`SELECT created_at, expires_at FROM token_deliveries WHERE did = ? AND acked_at IS NULL AND expires_at > ?
+                          ORDER BY id DESC LIMIT 1`).get(did, new Date(now).toISOString());
+    return r ? { since: r.created_at, until: r.expires_at } : null;
   } catch (_) { return null; }
 }
 
 // 'expiring' in the last TOKEN_WARN_HOURS (Aaron 2026-11-12: "an expiry warning 24 h before lapse"); the card shows
-// hours then. days_left stays for older readers.
+// hours then. days_left stays for older readers. awaiting_pickup: a renewal the agent has not picked up yet; the status
+// is still the token it holds.
 function tokenStatus(db, did, now = Date.now()) {
   const t = latestToken(db, did);
-  if (!t) return { status: 'none', scope: null, expires_at: null, days_left: null, hours_left: null };
+  const waiting = awaitingPickup(db, did, now);
+  if (!t) return { status: 'none', scope: null, expires_at: null, days_left: null, hours_left: null, ...(waiting ? { awaiting_pickup: waiting } : {}) };
   const expMs = Number(t.expires_at) * 1000;
   const hoursLeft = (expMs - now) / 3600000;
   const status = hoursLeft <= 0 ? 'expired' : (hoursLeft <= TOKEN_WARN_HOURS ? 'expiring' : 'valid');
   return { status, scope: t.scope, expires_at: new Date(expMs).toISOString(), days_left: Math.floor(hoursLeft / 24 * 10) / 10,
-           hours_left: Math.floor(hoursLeft * 10) / 10, jti: t.jti };
+           hours_left: Math.floor(hoursLeft * 10) / 10, jti: t.jti, ...(waiting ? { awaiting_pickup: waiting } : {}) };
 }
 
-// The agent's delivery key (silicon_renew.js): where an owner's renewal is sealed to. Fingerprint only, never the key's use.
+// The agent's delivery key (silicon_renew.js): where an owner's renewal is sealed to. Fingerprint only. `changed_at`
+// when it replaced an earlier key; `pending` a change waiting for the owner (PR #100 review H1).
 function deliveryKeyFingerprint(raw) { return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16); }
 function deliveryKeyView(db, did) {
+  let pending = null;
   try {
-    const w = db.prepare('SELECT delivery_public_key, delivery_key_set_at FROM identity_wallets WHERE did = ?').get(did);
-    if (!w || !w.delivery_public_key) return { set: false };
-    return { set: true, fingerprint: deliveryKeyFingerprint(Buffer.from(w.delivery_public_key, 'base64url')), set_at: w.delivery_key_set_at || null };
-  } catch (_) { return { set: false }; }   // a database without the column (before silicon_renew.js ran)
+    const p = db.prepare("SELECT id, fingerprint, requested_at, expires_at FROM delivery_key_changes WHERE did = ? AND status = 'pending' AND expires_at > ? ORDER BY id DESC LIMIT 1").get(did, nowIso());
+    if (p) pending = { id: p.id, fingerprint: p.fingerprint, requested_at: p.requested_at, expires_at: p.expires_at };
+  } catch (_) {}
+  try {
+    const w = db.prepare('SELECT delivery_public_key, delivery_key_set_at, delivery_key_changed_at FROM identity_wallets WHERE did = ?').get(did);
+    if (!w || !w.delivery_public_key) return { set: false, pending };
+    return { set: true, fingerprint: deliveryKeyFingerprint(Buffer.from(w.delivery_public_key, 'base64url')), set_at: w.delivery_key_set_at || null,
+             changed_at: w.delivery_key_changed_at || null, pending };
+  } catch (_) { return { set: false, pending }; }   // a database without the columns (before silicon_renew.js ran)
 }
 
 function siliconView(db, billing, s, { fleet } = {}) {
@@ -777,8 +806,10 @@ function refillAlert(db, billing, s, r, { now = Date.now(), mailer = null } = {}
 }
 
 // Email when an agent's newest token is in its last TOKEN_WARN_HOURS (or has lapsed, or there is none). The silicon's
-// contact hears of every state, as before; the fleet owner hears of the 24 h mark, with the Renew token button that
-// fixes it (Aaron 2026-11-12). Once per 24 h per silicon; a renewal starts the notices over. `mailer({to, subject, text})`.
+// contact hears of every state, at most once per 24 h, as before. The fleet owner hears once per token: at the 24 h
+// mark, or — if the pass missed that window — when it has lapsed (within OWNER_LAPSE_NOTICE_DAYS), with the Renew token
+// button that fixes it (Aaron 2026-11-12; PR #100 review L5). A renewal picked up starts the notices over.
+const OWNER_LAPSE_NOTICE_DAYS = 7;
 function runTokenWarnings(db, { now = Date.now(), mailer = null } = {}) {
   // Network agents sign in themselves: the fleet mints nothing for them, so it does not warn about its tokens.
   const rows = db.prepare(`SELECT s.*, f.slug AS fleet_slug, f.name AS fleet_name, w.email AS owner_email FROM fleet_silicons s
@@ -788,15 +819,21 @@ function runTokenWarnings(db, { now = Date.now(), mailer = null } = {}) {
   for (const s of rows) {
     const t = tokenStatus(db, s.member_did, now);
     if (t.status === 'valid') continue;
-    const to = [];
-    if (s.contact_email) to.push(s.contact_email);
-    if (t.status === 'expiring' && s.owner_email && !to.includes(s.owner_email)) to.push(s.owner_email);
-    if (!to.length) continue;
-    if (s.token_warned_at && now - new Date(s.token_warned_at + 'Z').getTime() < 86400000) continue;
     const text = tokenWarningEmail({ silicon: s, token: t });
-    if (mailer) for (const addr of to) { try { mailer({ to: addr, subject: `DemiPass: ${s.handle} token is ${t.status}`, text }); } catch (_) {} }
-    db.prepare("UPDATE fleet_silicons SET token_warned_at = datetime('now') WHERE id = ?").run(s.id);
-    out.push({ handle: s.handle, status: t.status });
+    const subject = `DemiPass: ${s.handle} token is ${t.status}`;
+    let sent = false;
+    if (s.contact_email && !(s.token_warned_at && now - new Date(s.token_warned_at + 'Z').getTime() < 86400000)) {
+      if (mailer) { try { mailer({ to: s.contact_email, subject, text }); } catch (_) {} }
+      db.prepare("UPDATE fleet_silicons SET token_warned_at = datetime('now') WHERE id = ?").run(s.id);
+      sent = true;
+    }
+    const lapsedRecently = t.status === 'expired' && t.hours_left > -24 * OWNER_LAPSE_NOTICE_DAYS;
+    if (s.owner_email && t.jti && (t.status === 'expiring' || lapsedRecently) && s.token_owner_warned_jti !== t.jti) {
+      if (s.owner_email !== s.contact_email || !sent) { if (mailer) { try { mailer({ to: s.owner_email, subject, text }); } catch (_) {} } }
+      db.prepare('UPDATE fleet_silicons SET token_owner_warned_jti = ? WHERE id = ?').run(t.jti, s.id);
+      sent = true;
+    }
+    if (sent) out.push({ handle: s.handle, status: t.status });
   }
   return out;
 }
@@ -1101,15 +1138,21 @@ function didRecordEmail({ silicon, fleet, wallet, apiBase = 'https://api.dustfor
   ].join('\n');
 }
 
+// Time left, said plainly: hours in the last day (never "0 hours" or "1 days"), days before that.
+function timeLeftText(token) {
+  const h = token.hours_left;
+  if (h != null && h <= 24) return h < 1 ? 'less than an hour left' : `${Math.floor(h)} hour${Math.floor(h) === 1 ? '' : 's'} left`;
+  return `${token.days_left} days left`;
+}
 function tokenWarningEmail({ silicon, token }) {
-  const left = token.hours_left != null && token.hours_left < 24 ? `${Math.max(0, Math.floor(token.hours_left))} hours left` : `${token.days_left} days left`;
   const line = token.status === 'none' ? 'has no live access token on record'
     : token.status === 'expired' ? `token expired at ${token.expires_at}`
-    : `token expires at ${token.expires_at} (${left})`;
+    : `token expires at ${token.expires_at} (${timeLeftText(token)})`;
   return [
     `DemiPass fleet notice for "${silicon.display_name || silicon.handle}" (${silicon.fleet_slug}):`,
     ``,
     `  ${silicon.handle} ${line}.`,
+    ...(token.awaiting_pickup ? [``, `A renewal is waiting for ${silicon.handle} since ${token.awaiting_pickup.since}: it has not picked it up yet.`] : []),
     ``,
     `The fleet owner can renew it: DemiPass app → Fleet → @${silicon.handle} → "Renew token" (your PIN).`,
     `The new token is sealed to the agent's delivery key and nobody sees it; the agent picks it up with`,
@@ -1123,7 +1166,7 @@ function tokenWarningEmail({ silicon, token }) {
 module.exports = {
   ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed, OWNER_REFILL_MAX,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
-  getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken, deliveryKeyFingerprint, deliveryKeyView,
+  getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken, awaitingPickup, deliveryKeyFingerprint, deliveryKeyView,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, projectWalletOwned, removeProject, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
   runOwnerRefills, runSiliconRefills, runTokenWarnings, runRefills,
   attributionReport, recentSpend,
@@ -1131,6 +1174,6 @@ module.exports = {
   issueClaim, redeemClaim, claimEmail, hashToken,
   activeFleetOf, ownsFleetWithAgents, joinBlocker, clearStaleSiliconRows, cutFleetTokens, signOutEverywhere, revokeOwnerWorkers,
   workerId, createWorker, getWorker, listWorkers, revokeWorker, workerTokenClaims, recordWorkerToken, resolveWorker, workerMayUseSecret, workerView, siliconSecrets,
-  didRecordEmail, tokenWarningEmail,
+  didRecordEmail, tokenWarningEmail, timeLeftText,
   HANDLE_RE, PROJECT_RE, INITIATORS, TOKEN_WARN_DAYS, TOKEN_WARN_HOURS, REFILL_COOLDOWN_MS,
 };
