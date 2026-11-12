@@ -376,7 +376,9 @@ module.exports = function registerUseApprovals(deps) {
     const recent = lim ? db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status != 'pending' ORDER BY id DESC LIMIT ?").all(auth.did, lim) : [];
     // An agent's own requests are filed under its owner's DID, so outgoing holds every agent's: without the bound call
     // and binding for an agent token, one agent cannot read another's request details (#99 re-review L1).
-    const lean = (v) => { const { call, binding, ...rest } = v; return rest; };
+    // Nor the phone-wrap material, whether it was opened, what it does or why: an agent reads its own request in full
+    // with GET /approvals/:id.
+    const lean = (v) => { const { call, binding, unwrap, opened, summary, purpose, ...rest } = v; return rest; };
     res.json({ ok: true, incoming: agent ? [] : incoming.map(r => view(r, auth.did)), outgoing: outgoing.map(r => agent ? lean(view(r, auth.did)) : view(r, auth.did)), recent: recent.map(r => view(r, auth.did)) });
   });
 
