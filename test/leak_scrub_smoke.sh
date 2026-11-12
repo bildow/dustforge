@@ -249,6 +249,15 @@ C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/
 scrubtok sF "$NREF"
 C=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/leak-scan/scrub/finish" -H 'content-type: application/json' -H "Authorization: Scan $(cat "$S/sF.tok")" -d '{"files_read":3,"files_changed":0,"copies_masked":0,"copies_left":0}'); [ "$C" = 400 ] && ok "finish must say how many paths were not read" || fail "paths_not_read: $C"
 
+# ── many small files share requests (2026-11-12: one request per file hit the 12,000/day cap on ~70,000 files) ──
+scrubtok sM "$NREF"; mkdir -p "$S/many"
+python3 -c 'import sys; v=open(sys.argv[1]).read().strip(); [open(f"{sys.argv[2]}/f{i:03d}.txt","w").write(("pw "+v+"\n") if i%50==0 else f"nothing {i}\n") for i in range(300)]' "$S/nval" "$S/many"
+MT=$(Q "SELECT id FROM leak_scan_tokens WHERE token_hash='$(tr -d '\n' < "$S/sM.tok" | sha256sum | cut -d' ' -f1)'")
+ln "$S/many/f050.txt" "$S/many/hardlink.txt"   # the same file twice: read once, not "1 left"
+OUT=$(SCRUB "$S/sM.tok" "$S/many" "$S/many/f100.txt"); RC=$?
+REQS=$(Q "SELECT requests_today FROM leak_scan_tokens WHERE id=$MT")
+[ $RC = 0 ] && echo "$OUT" | grep -q "masked 6, left 0" && [ "$REQS" -le 4 ] && ! grep -rqF -- "$(head -c 10 "$S/nval")" "$S/many" && ok "300 small files: 6 copies masked in $REQS requests (not 300), contained" || fail "batching: rc=$RC reqs=$REQS $OUT"
+
 # ── expiry ──
 scrubtok s8 "$NREF"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE leak_scan_tokens SET expires_at='2000-01-01T00:00:00.000Z' WHERE token_hash=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$(tr -d '\n' < "$S/s8.tok" | sha256sum | cut -d' ' -f1)"
