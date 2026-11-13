@@ -137,33 +137,55 @@ alerts check, which app 1.12+ notifies.
 
 ## Charging on a Conduit request (no service token)
 
-A wallet can ask a tenant for work by posting it a Conduit message instead of sending a service token (FleetEngine
-F1b, tome `decisions/2026-11-12-DECISION-fleetengine-and-shadow-engine-redefinition.md`). **Needs an independent
-adversarial review before it merges.**
+A wallet can ask a tenant for work by posting it a Conduit message **that it marks as a request**, instead of sending
+a service token (FleetEngine F1b, tome `decisions/2026-11-12-DECISION-fleetengine-and-shadow-engine-redefinition.md`).
+**Needs an independent adversarial review before it merges** (round 1: REVISE, addressed below).
 
 - **Opt-in, per consent.** `POST /api/services/consent {service, daily_cap_dd, on_request_cap_dd}`. The person
-  approves it like any consent, and the card says "and on Conduit requests up to N DD each". A consent without
+  approves it like any consent. The card reads "…; each message you mark as a request, up to N DD". A consent without
   `on_request_cap_dd` (every consent made before this) is never charged this way.
-- **The proof is Conduit's own post charge.** Conduit verified the payer's service token for the post, and gives the
-  charge the idempotency key `cr1:` + sha256(`"conduit-request:v1\n"` + recipient wallet DID + `"\n"` + sha256 of the
-  message body + `"\n"` + nonce). The recipient is bound by **wallet**, not Conduit name: DemiPass cannot see Conduit's
-  name registry, and Conduit already binds each name to a wallet.
+- **Only a marked post is a request.** The sender marks it in the Conduit post body: `request: {max_dd}`, its price
+  ceiling. For that post only, Conduit gives its charge the idempotency key (key version **cr2**):
+
+      cr2: + sha256("conduit-request:v2\n" + recipient wallet DID + "\n" + sha256(body) + "\n" + max_dd + "\n" + nonce)
+
+  `requestKey(recipientDid, messageSha256, nonce, maxDd)` in `service_tenants.js` is exported for it. An ordinary post
+  keeps Conduit's own key, so it **never** authorizes a charge. The round-0 `cr1` key (no flag, no ceiling) is never
+  recomputed, so it can't start a new origin either.
+- **Conduit requirements:** a request-marked post must carry a `client_msg_id`, which is the nonce. Conduit refuses a
+  marked post without one, keys only posts addressed `to` exactly one agent, and delivers `charge_id`, `request_nonce`
+  and `request.max_dd` with the message the recipient reads.
+- The recipient is bound by **wallet**, not Conduit name. DemiPass can't see Conduit's name registry, and Conduit
+  already binds each name to a wallet.
 - `POST /api/services/charge-on-request {action, cost_dd, idempotency_key, request_charge_id, message_sha256,
-  request_nonce, dry_run?}`, as the tenant. Refused unless:
-  - the Conduit charge is a `post`, on record, its row signed by this server's meter key, and its key recomputes with
-    **the calling tenant's** wallet, that message hash and that nonce;
-  - it is at most 10 minutes old (a retry of a charge already made replays at any age);
+  request_nonce, request_max_dd, dry_run?}`, as the tenant. It is refused unless all of these hold:
+  - the Conduit charge is a `post`, on record, signed by this server's meter key, and its key recomputes (cr2) with
+    **the calling tenant's** wallet and the given message hash, nonce and ceiling;
+  - the charge is at most 10 minutes old (a retry of a charge already made replays at any age);
   - it has not already authorized an origin charge (one per Conduit charge, unique index);
   - the Conduit token that posted it is not revoked by any route;
-  - the payer has a live consent that opted in, and the charge fits `on_request_cap_dd`, the daily cap and the barrel
-    tier;
-  - the action is `standard` (an elevated action always needs a token and a person's approval).
-- **Follow-ups** bill as usual (`follow_up_of`), against a per-request verification row. That row has no ordinary
-  actions, so no `/charge` without `follow_up_of` can use it. Origin plus follow-ups stay within `on_request_cap_dd`.
-  Follow-ups stop when the consent is revoked or loses its opt-in, or when the Conduit token that posted the request
-  is revoked.
+  - the payer has a live consent that opted in;
+  - origin dd ≤ `request_max_dd`, ≤ `on_request_cap_dd`, and within the daily cap and the barrel tier;
+  - the action is `standard`.
+- **Budget per request:** origin plus follow-ups ≤ min(`request_max_dd`, `on_request_cap_dd`). Follow-ups bill as usual
+  (`follow_up_of`) against a per-request verification row with no ordinary actions. At each follow-up the budget is
+  re-derived as min(stored budget, the **current** `on_request_cap_dd` − origin dd), so lowering the cap bounds work
+  already in flight.
+- **Ending a request:** the origin records the consent it was charged under. A **revoke** of that consent (or of any
+  later consent of the same payer to the same tenant) ends the request permanently, and re-consenting does not revive
+  it. A **replacement** (a new consent made while the old one was active) carries over, at the new cap. A request also
+  ends when the Conduit token that posted it is revoked.
 - **Trust stated:** a compromised Conduit tenant (its key plus a payer's live Conduit token) could mint a matching
-  post charge. That exposure is bounded by each payer's `on_request_cap_dd` and daily cap, and only for payers who opted in.
+  marked post. Exposure is bounded by each opted-in payer's `on_request_cap_dd` and daily cap.
+- **Rollback.** Reverting this change leaves on-request origins whose follow-ups the older `charge()` would bill
+  without the request checks. **Before** rolling the code back, run against `data/dustforge.db`:
+
+      UPDATE service_verifications SET follow_up_dd = 0
+        WHERE token_jti IN (SELECT token_jti FROM service_charges WHERE request_charge_id IS NOT NULL);
+      UPDATE service_charges SET follow_ups = NULL WHERE request_charge_id IS NOT NULL;
+
+  The columns themselves (`on_request_cap_dd`, `request_charge_id`, `request_consent_id`) can stay; the old code
+  ignores them.
 
 ## Who may call an action
 

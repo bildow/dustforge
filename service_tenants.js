@@ -11,7 +11,8 @@
 //     POST /api/services/charge   {action, cost_dd, token_id, idempotency_key}   (an action this token was verified for)
 //     PUT  /api/services/:slug/actions  {actions:[…]}   weakening a gate waits on the tenant owner's approval
 //     POST /api/services/charge-on-request {action, cost_dd, idempotency_key, request_charge_id, message_sha256,
-//          request_nonce, dry_run?}   work a wallet asked for by a Conduit message, with no service token (below)
+//          request_nonce, request_max_dd, dry_run?}   work a wallet asked for by a Conduit message it MARKED as a
+//          request with a price ceiling, with no service token (below)
 //   caller side (Bearer = the caller's own token)
 //     POST /api/services/consent  {service, daily_cap_dd}   paying a service at all: approved on a phone (below)
 //     POST /api/services/token    {service, ttl?, scopes?, cap_dd?}  → a service token for that tenant
@@ -48,15 +49,20 @@ const MAX_PORTION_DD = 250;
 // Charging on a Conduit request (FleetEngine F1b; tome decisions/2026-11-12-DECISION-fleetengine-and-shadow-engine-
 // redefinition.md). A wallet may ask a tenant for work by posting it a Conduit message instead of sending a service
 // token. Conduit's own charge for that post is the proof: Conduit verified the payer's service token for it, and its
-// idempotency key is requestKey(recipient wallet, sha256 of the message body, nonce), which Conduit computes for a post
-// addressed to one agent. The tenant shows the message hash and nonce it received; this server recomputes the key with
+// idempotency key is requestKey(recipient wallet, sha256 of the message body, nonce, max_dd), which Conduit computes
+// ONLY for a post its sender marked as a request (`request: {max_dd}`, with a client_msg_id as the nonce). An ordinary
+// post never carries such a key, so it never authorizes a charge (#109 review H1: otherwise a tenant could elicit
+// "ok" replies from a wallet's agent and bill each one). The tenant shows the message hash and nonce it received; this server recomputes the key with
 // the CALLING tenant's own wallet DID, so a charge for a message to someone else, or for other bytes, never matches.
 // The recipient is bound by wallet DID, not by Conduit name: DemiPass has no view of Conduit's name registry, so a
 // name could be claimed by any tenant; Conduit already binds each name to the wallet that registered it.
 // Only a consent that opted in (on_request_cap_dd, approved on the phone with the consent) can be charged this way, at
-// most that much per request (origin + follow-ups); each Conduit charge authorizes one origin charge, within 10 min.
+// most min(max_dd, on_request_cap_dd) per request (origin + follow-ups); each Conduit charge authorizes one origin
+// charge, within 10 min. Key version cr2 binds max_dd; cr1 (round 0, no flag, no ceiling) is never recomputed, so no
+// cr1 key can authorize a new origin.
 const CONDUIT_SLUG = 'conduit';
-const REQUEST_KEY_DOMAIN = 'conduit-request:v1\n';
+const REQUEST_KEY_DOMAIN = 'conduit-request:v2\n';
+const REQUEST_MAX_DD = 100000;
 const REQUEST_MAX_AGE_MS = 10 * 60 * 1000;
 const NONCE_MAX = 128;
 const SVC_ISS = 'demipass-svc';
@@ -73,10 +79,10 @@ const CONSENT_CAP_MAX_DD = 100000;     // a day, per tenant ($100)
 const RECEIPT_VERSION = 1;
 
 const priceOf = (costDd, marginPct = SERVICE_MARGIN_PCT) => costDd + Math.ceil(costDd * marginPct / 100);
-// The idempotency key Conduit gives the post charge of a message to one agent (see CONDUIT_SLUG above). The fields are
-// fixed-format except the nonce, which comes last, so the hashed string parses one way only.
-const requestKey = (recipientDid, messageSha256, nonce) => 'cr1:' + crypto.createHash('sha256')
-  .update(REQUEST_KEY_DOMAIN + recipientDid + '\n' + messageSha256 + '\n' + nonce, 'utf8').digest('hex');
+// The idempotency key Conduit gives the post charge of a message its sender marked as a request (see CONDUIT_SLUG
+// above). The fields are fixed-format except the nonce, which comes last, so the hashed string parses one way only.
+const requestKey = (recipientDid, messageSha256, nonce, maxDd) => 'cr2:' + crypto.createHash('sha256')
+  .update(REQUEST_KEY_DOMAIN + recipientDid + '\n' + messageSha256 + '\n' + String(maxDd) + '\n' + nonce, 'utf8').digest('hex');
 
 module.exports = function registerServiceTenants(deps) {
   const { app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard, approvals, masterKey } = deps;
@@ -188,6 +194,9 @@ module.exports = function registerServiceTenants(deps) {
   // The Conduit post charge an origin charge was made on (NULL: an ordinary charge). Each authorizes at most one.
   try { db.exec('ALTER TABLE service_charges ADD COLUMN request_charge_id TEXT'); } catch (_) {}
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_svc_charges_request ON service_charges(request_charge_id) WHERE request_charge_id IS NOT NULL');
+  // The consent a request origin was charged under (#109 review L1): a REVOKE of it, or of any later consent of that
+  // payer to that tenant, ends the request's follow-ups for good; only a replacement (status 'replaced') carries over.
+  try { db.exec('ALTER TABLE service_charges ADD COLUMN request_consent_id INTEGER'); } catch (_) {}
 
   // ── keys ───────────────────────────────────────────────────────────────────────────────────────────────────────
   // Receipts are signed by the meter's key (same issuer did:key), over RECEIPT_DOMAIN + receipt, so neither kind
@@ -279,6 +288,13 @@ module.exports = function registerServiceTenants(deps) {
   const onRequestConsent = (did, tenant) => { const c = liveConsent(did, tenant); return c && Number.isInteger(c.on_request_cap_dd) && c.on_request_cap_dd > 0 ? c : null; };
   // Work started on a Conduit request stops when the Conduit token that posted it is revoked by any route (its own flag,
   // the token that minted it, the wallet's session or time cutoff, a fleet cut). → reason, or null.
+  // A revoke since the consent the request was charged under (that one or a later one) ends it permanently (L1).
+  const requestConsentRevoked = (originRow) => Boolean(originRow && originRow.request_charge_id && (!originRow.request_consent_id
+    || db.prepare("SELECT 1 FROM service_consents WHERE payer_did = ? AND tenant_id = ? AND id >= ? AND status = 'revoked' LIMIT 1")
+      .get(originRow.payer_did, originRow.tenant_id, originRow.request_consent_id)));
+  // What a request origin's follow-ups may still run up: the budget stored at the origin, but never more than the
+  // payer's CURRENT per-request cap allows (#109 review M1: lowering the cap bounds work already in flight).
+  const requestFollowUpBudget = (originRow, storedDd, consent) => Math.max(0, Math.min(storedDd, (consent && consent.on_request_cap_dd || 0) - originRow.dd));
   function requestStopped(originRow) {
     if (!originRow || !originRow.request_charge_id) return null;
     const ct = tenantBySlug(CONDUIT_SLUG);
@@ -429,7 +445,7 @@ module.exports = function registerServiceTenants(deps) {
       const ow = ov ? authority(tenant, action, ov.did, ov.svc_scopes ? jsonList(ov.svc_scopes) : null) : null;
       if (!ov || revoked({ jti: ov.token_jti, sub: ov.did, iat: ov.iat, src_auth: ov.src_auth, fleet: ov.fleet, parent_jti: ov.parent_jti }) || !liveConsent(ov.did, tenant)
           || !ow.ok || (ov.delegation_id && !(ow.delegation && ow.delegation.id === ov.delegation_id))
-          || (origin.request_charge_id && (requestStopped(origin) || !onRequestConsent(ov.did, tenant)))) {
+          || (origin.request_charge_id && (requestStopped(origin) || requestConsentRevoked(origin) || !onRequestConsent(ov.did, tenant)))) {
         return { status: 409, body: { error: 'this follow-up was charged, but its token or consent has since been withdrawn: stop the work', charge_id: prior.charge_id } };
       }
       return { status: 200, body: chargeView(prior, true) };
@@ -477,7 +493,10 @@ module.exports = function registerServiceTenants(deps) {
     if (v.did === tenant.service_did) return { status: 400, body: { error: 'a tenant does not charge itself' } };
     const consent = liveConsent(v.did, tenant);
     if (!consent) return { status: 402, body: { error: `the caller has no standing consent to pay ${tenant.slug}`, consent_required: true } };
+    if (followUp && requestConsentRevoked(origin)) return { status: 402, body: { error: 'the payer revoked its consent after this request was made: the request has ended (a new consent does not revive it)', request_ended: true } };
     if (followUp && origin.request_charge_id && !onRequestConsent(v.did, tenant)) return { status: 402, body: { error: `the caller's consent no longer covers ${tenant.slug} charging for Conduit requests`, consent_required: true, on_request_required: true } };
+    // The follow-up budget: the token's, or for a request origin the lower of that and the current per-request cap (M1).
+    const fuBudget = followUp ? (origin.request_charge_id ? requestFollowUpBudget(origin, v.follow_up_dd, consent) : v.follow_up_dd) : 0;
     const barrel = barrelRefusal(v.did, dd);
     if (barrel) return { status: barrel.statusCode || 403, body: barrel.body || { error: barrel.message } };
     // Follow-ups draw on the token's follow-up budget, apart from its cap for ordinary charges.
@@ -490,19 +509,19 @@ module.exports = function registerServiceTenants(deps) {
       // bills in ≤250 DD portions), up to what the token's follow-up budget could ever pay; an ordinary one, one portion.
       // (#57 review: surveying only one portion let a 250 DD wallet start a 1,000 DD call.)
       if (!followUp && cost > MAX_PORTION_DD) return { status: 400, body: { error: `a dry run asks about one portion: at most ${MAX_PORTION_DD} DD (cost)` } };
-      if (followUp && dd > v.follow_up_dd) return { status: 402, body: { ok: false, dry_run: true, would_charge_dd: dd, margin_pct: margin, refused: 'follow_up_budget' } };
+      if (followUp && dd > fuBudget) return { status: 402, body: { ok: false, dry_run: true, would_charge_dd: dd, margin_pct: margin, refused: 'follow_up_budget' } };
       const w = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(v.did);
       const today = spentToday(v.did, tenant);
       const bal = billing.getDerivedBalance(db, v.did);
       const why = (!w || w.status !== 'active') ? 'wallet_inactive' : (!followUp && ordinary() + chargeDd > v.cap_dd) ? 'token_cap'
-        : (today + chargeDd > consent.daily_cap_dd) ? 'daily_cap' : (followUp && followed() + chargeDd > v.follow_up_dd) ? 'follow_up_budget'
+        : (today + chargeDd > consent.daily_cap_dd) ? 'daily_cap' : (followUp && followed() + chargeDd > fuBudget) ? 'follow_up_budget'
         : (bal < chargeDd) ? 'insufficient' : null;
       return { status: why ? 402 : 200, body: { ok: !why, dry_run: true, would_charge_dd: chargeDd, margin_pct: chargeMargin, ...(why ? { refused: why } : {}) } };
     }
 
     const run = db.transaction(() => {
       if (!followUp) { const spent = ordinary(); if (spent + dd > v.cap_dd) { const e = new Error('cap'); e.cap = { kind: 'token', spent, cap: v.cap_dd }; throw e; } }
-      if (followUp) { const f = followed(); if (f + chargeDd > v.follow_up_dd) { const e = new Error('cap'); e.cap = { kind: 'follow_up', spent: f, cap: v.follow_up_dd }; throw e; } }
+      if (followUp) { const f = followed(); if (f + chargeDd > fuBudget) { const e = new Error('cap'); e.cap = { kind: 'follow_up', spent: f, cap: fuBudget }; throw e; } }
       const today = spentToday(v.did, tenant);
       if (today + dd > consent.daily_cap_dd) { const e = new Error('cap'); e.cap = { kind: 'daily', spent: today, cap: consent.daily_cap_dd }; throw e; }
       const charge_id = 'sc_' + crypto.randomBytes(12).toString('hex');
@@ -564,6 +583,7 @@ module.exports = function registerServiceTenants(deps) {
     if (typeof b.request_charge_id !== 'string' || !/^sc_[0-9a-f]{24}$/.test(b.request_charge_id)) return { status: 400, body: { error: 'request_charge_id: the charge_id of the Conduit post that asked for this work' } };
     if (typeof b.message_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(b.message_sha256)) return { status: 400, body: { error: 'message_sha256: lowercase hex sha256 of the message body (UTF-8) as Conduit delivered it' } };
     if (typeof b.request_nonce !== 'string' || !b.request_nonce.length || b.request_nonce.length > NONCE_MAX) return { status: 400, body: { error: `request_nonce: the nonce Conduit delivered with the message (1-${NONCE_MAX} characters)` } };
+    if (!Number.isInteger(b.request_max_dd) || b.request_max_dd < 1 || b.request_max_dd > REQUEST_MAX_DD) return { status: 400, body: { error: `request_max_dd: the price ceiling the sender marked the request with (1-${REQUEST_MAX_DD}), as Conduit delivered it` } };
 
     // (1) A Conduit post charge, on record and signed by this server's meter key, for THIS message to THIS tenant.
     const rc = db.prepare('SELECT * FROM service_charges WHERE charge_id = ? AND tenant_id = ?').get(b.request_charge_id, conduit.id);
@@ -576,8 +596,8 @@ module.exports = function registerServiceTenants(deps) {
       return { status: 403, body: { error: 'that Conduit charge\'s receipt does not verify against this server\'s key' } };
     }
     if (rc.action !== 'post' || rc.follows_charge_id || rc.request_charge_id) return { status: 403, body: { error: 'request_charge_id: name the charge for a Conduit post' } };
-    if (rc.idempotency_key !== requestKey(tenant.service_did, b.message_sha256, b.request_nonce)) {
-      return { status: 403, body: { error: 'that Conduit charge is not for this message to this tenant (the recipient wallet, message_sha256 and request_nonce must be the ones Conduit charged for)' } };
+    if (rc.idempotency_key !== requestKey(tenant.service_did, b.message_sha256, b.request_nonce, b.request_max_dd)) {
+      return { status: 403, body: { error: 'that Conduit charge is not a request to this tenant for this message (only a post its sender marked as a request carries one; the recipient wallet, message_sha256, request_nonce and request_max_dd must be the ones Conduit charged for)' } };
     }
     const payer = rc.payer_did;
     if (payer === tenant.service_did) return { status: 400, body: { error: 'a tenant does not charge itself' } };
@@ -591,7 +611,7 @@ module.exports = function registerServiceTenants(deps) {
     const prior = dry ? null : db.prepare('SELECT * FROM service_charges WHERE tenant_id = ? AND idempotency_key = ?').get(tenant.id, b.idempotency_key);
     if (prior) {
       if (prior.request_charge_id !== rc.charge_id || prior.action !== action.action || prior.cost_dd !== cost) return { status: 409, body: { error: 'this idempotency_key was already used for a different charge', charge_id: prior.charge_id } };
-      if (!onRequestConsent(payer, tenant)) return { status: 409, body: { error: 'this request was charged, but the payer has since withdrawn its consent: stop the work', charge_id: prior.charge_id } };
+      if (!onRequestConsent(payer, tenant) || requestConsentRevoked(prior)) return { status: 409, body: { error: 'this request was charged, but the payer has since withdrawn its consent: stop the work', charge_id: prior.charge_id } };
       return { status: 200, body: { ...chargeView(prior, true), payer } };
     }
     // (3) Fresh: within REQUEST_MAX_AGE_MS of Conduit's charge. (4) One origin charge per Conduit charge.
@@ -609,11 +629,13 @@ module.exports = function registerServiceTenants(deps) {
     if (!who.ok) return { status: 403, body: { error: who.error } };
     const margin = marginOf(tenant);
     const dd = priceOf(cost, margin);
+    if (dd > b.request_max_dd) return { status: 402, body: { error: `this charge (${dd} DD) is over the ceiling the sender marked the request with (${b.request_max_dd} DD)`, required_dd: dd, request_max_dd: b.request_max_dd, request_max_exceeded: true } };
     if (dd > consent.on_request_cap_dd) return { status: 402, body: { error: `this charge (${dd} DD) is over what the payer allows one Conduit request (${consent.on_request_cap_dd} DD)`, required_dd: dd, on_request_cap_dd: consent.on_request_cap_dd, on_request_cap_exceeded: true } };
+    const requestBudget = Math.min(b.request_max_dd, consent.on_request_cap_dd);   // origin + follow-ups
     const barrel = barrelRefusal(payer, dd);
     if (barrel) return { status: barrel.statusCode || 403, body: barrel.body || { error: barrel.message } };
     const followUps = jsonList(action.follow_ups);
-    const fuDd = followUps.length ? consent.on_request_cap_dd - dd : 0;   // origin + follow-ups ≤ on_request_cap_dd
+    const fuDd = followUps.length ? requestBudget - dd : 0;   // origin + follow-ups ≤ min(request_max_dd, on_request_cap_dd)
 
     if (dry) {
       const w = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(payer);
@@ -632,7 +654,7 @@ module.exports = function registerServiceTenants(deps) {
       const at = nowIso();
       db.prepare(`INSERT INTO service_verifications (tenant_id, token_jti, did, iat, exp, src_auth, fleet, parent_jti, svc_scopes, actions, cap_dd, delegation_id, first_at, last_at, follow_up_dd)
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '[]', ?, ?, ?, ?, ?)`)
-        .run(tenant.id, jti, payer, cv.iat, cv.exp, cv.src_auth, cv.fleet, cv.token_jti, consent.on_request_cap_dd, who.delegation ? who.delegation.id : null, at, at, fuDd);
+        .run(tenant.id, jti, payer, cv.iat, cv.exp, cv.src_auth, cv.fleet, cv.token_jti, requestBudget, who.delegation ? who.delegation.id : null, at, at, fuDd);
       const charge_id = 'sc_' + crypto.randomBytes(12).toString('hex');
       const what = `service ${tenant.slug}/${action.action} cost ${cost} + ${margin}% ${charge_id} (requested by conduit ${rc.charge_id})`;
       const debit = billing.deductBalance(db, payer, dd, 'service_transfer_out', what, { tokenJti: jti });
@@ -641,12 +663,12 @@ module.exports = function registerServiceTenants(deps) {
       if (!credit.ok) throw new Error('credit to the tenant wallet failed: ' + credit.error);
       const rcpt = JSON.stringify({ v: RECEIPT_VERSION, type: 'dustforge_service_charge', charge_id, issuer, service: tenant.slug,
         payer, payee: tenant.service_did, action: action.action, cost_dd: cost, margin_pct: margin, dd,
-        token_id: jti, idempotency_key: b.idempotency_key, requested_by: rc.charge_id, message_sha256: b.message_sha256, at });
+        token_id: jti, idempotency_key: b.idempotency_key, requested_by: rc.charge_id, message_sha256: b.message_sha256, request_max_dd: b.request_max_dd, at });
       const sig = crypto.sign(null, Buffer.from(RECEIPT_DOMAIN + rcpt, 'utf8'), meterKey.privateKey).toString('base64url');
       db.prepare(`INSERT INTO service_charges (charge_id, tenant_id, payer_did, payee_did, action, cost_dd, margin_pct, dd, token_jti, delegation_id,
-                  idempotency_key, receipt, sig, created_at, follows_charge_id, follow_ups, request_charge_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`)
+                  idempotency_key, receipt, sig, created_at, follows_charge_id, follow_ups, request_charge_id, request_consent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`)
         .run(charge_id, tenant.id, payer, tenant.service_did, action.action, cost, margin, dd, jti, who.delegation ? who.delegation.id : null,
-             b.idempotency_key, rcpt, sig, at, fuDd > 0 ? JSON.stringify(followUps) : null, rc.charge_id);
+             b.idempotency_key, rcpt, sig, at, fuDd > 0 ? JSON.stringify(followUps) : null, rc.charge_id, consent.id);
       return { row: db.prepare('SELECT * FROM service_charges WHERE charge_id = ?').get(charge_id), balance_after: debit.balance_after };
     });
     let out;
@@ -1066,3 +1088,4 @@ module.exports.SVC_ISS = SVC_ISS;
 module.exports.RECEIPT_DOMAIN = RECEIPT_DOMAIN;
 module.exports.requestKey = requestKey;
 module.exports.REQUEST_MAX_AGE_MS = REQUEST_MAX_AGE_MS;
+module.exports.REQUEST_KEY_DOMAIN = REQUEST_KEY_DOMAIN;

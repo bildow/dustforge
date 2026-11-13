@@ -1,11 +1,14 @@
 #!/bin/bash
 # Smoke of POST /api/services/charge-on-request (service_tenants.js; FleetEngine F1b) through the real server, throwaway DB.
 # A wallet asks a tenant for work by a Conduit message, not a service token. Conduit's post charge (idempotency key
-# requestKey(recipient wallet, message sha256, nonce)) is the proof; the payer's consent must have opted in
-# (on_request_cap_dd). People (PIN 4321): owner (fleet owner), ext (the payer), nocon (no consent to the tenant).
+# requestKey(recipient wallet, message sha256, nonce, max_dd), cr2: only a post its sender MARKED as a request) is the
+# proof; the payer's consent must have opted in (on_request_cap_dd). People (PIN 4321): owner (fleet owner), ext (the payer), nocon (no consent to the tenant).
 # Silicons of owner's fleet: fe (tenant fleetengine), cd (tenant conduit), ot (tenant othersvc).
 # Adversarial: forged receipt, a request for another tenant, other bytes, stale, replayed request id, no consent, a
 # consent without the opt-in, over the per-request cap, revoked consent, revoked Conduit token, elevated action.
+# Review round 1: an unflagged post or a cr1 key never authorizes (H1); a claimed max_dd other than the posted one, or a
+# charge over it; budget = min(max_dd, cap); lowering the cap bounds work in flight (M1); a revoke ends a request for
+# good, a replacement carries over (L1).
 # Legacy: service_consents / service_charges tables from before this change keep their rows and gain the columns (NULL).
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -105,11 +108,14 @@ asked POST /api/services/consent "$EXT" "$EXT" '{"service":"othersvc","daily_cap
 ctok(){ call POST /api/services/token "$1" '{"service":"conduit","cap_dd":500}'; CT=$(echo "$BODY" | J token); CTID=$(echo "$BODY" | J token_id)
   call POST /api/services/verify "$CD" "$(jbody token "$CT" action post)"; [ "$CODE" = 200 ] || fail "cd verify: $CODE $BODY"; }
 sha(){ printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
-rkey(){ node -e 'process.stdout.write(require("./service_tenants").requestKey(process.argv[1], process.argv[2], process.argv[3]))' "$1" "$2" "$3"; }
-# Conduit charges a post of message $1 with nonce $2 addressed to wallet $3, on token $CTID → RC (charge id).
-post(){ call POST /api/services/charge "$CD" "$(jbody action post cost_dd 1 token_id "$CTID" idempotency_key "$(rkey "$3" "$(sha "$1")" "$2")")"; RC=$(echo "$BODY" | J charge_id)
+rkey(){ node -e 'process.stdout.write(require("./service_tenants").requestKey(process.argv[1], process.argv[2], process.argv[3], Number(process.argv[4])))' "$1" "$2" "$3" "$4"; }
+# Conduit charges a post of message $1 with nonce $2 addressed to wallet $3, marked a request with max_dd $4 (default
+# 500), on token $CTID → RC (charge id). $5 overrides the key (an unflagged post, an old cr1 key).
+post(){ local k=${5:-$(rkey "$3" "$(sha "$1")" "$2" "${4:-500}")}
+  call POST /api/services/charge "$CD" "$(jbody action post cost_dd 1 token_id "$CTID" idempotency_key "$k")"; RC=$(echo "$BODY" | J charge_id)
   [ "$CODE" = 201 ] || fail "conduit post charge: $CODE $BODY"; }
-COR(){ call POST /api/services/charge-on-request "$1" "$2"; }
+# The tenant's call; request_max_dd defaults to 500 (what post() marks) unless the body names one.
+COR(){ call POST /api/services/charge-on-request "$1" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b.setdefault("request_max_dd", 500); print(json.dumps(b))' "$2")"; }
 ctok "$EXT"
 MSG='run audit on atlas/fleetengine main'; MS=$(sha "$MSG")
 post "$MSG" nonce-0001 "$(did fe)"; RC1=$RC
@@ -118,7 +124,7 @@ COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-0001 request_charge
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J on_request_required)" = True ] && ok "a consent that did not opt in is never charged on a Conduit request (402 on_request_required)" || fail "no opt-in: $CODE $BODY"
 call POST /api/services/consent "$EXT" '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":3001}'; [ "$CODE" = 400 ] && ok "on_request_cap_dd above the daily cap is refused" || fail "orc > cap: $CODE"
 call POST /api/services/consent "$EXT" '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":500}'; OQ=$(echo "$BODY" | J approval_id)
-[ "$CODE" = 202 ] && Q "SELECT summary FROM use_approvals WHERE id=$OQ" | grep -q "Conduit requests up to 500 DD each" && ok "the opt-in is part of what the person approves (named on the card)" || fail "opt-in card: $CODE $(Q "SELECT summary FROM use_approvals WHERE id=$OQ")"
+[ "$CODE" = 202 ] && Q "SELECT summary FROM use_approvals WHERE id=$OQ" | grep -q "each message you mark as a request, up to 500 DD" && ok "the opt-in is part of what the person approves (named on the card)" || fail "opt-in card: $CODE $(Q "SELECT summary FROM use_approvals WHERE id=$OQ")"
 call POST /api/services/consent "$EXT" "$(withid '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":900}' "$OQ")"; A1=$CODE
 approve "$EXT" "$OQ"; call POST /api/services/consent "$EXT" "$(withid '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":500}' "$OQ")"
 [ "$A1" != 201 ] && [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J on_request_cap_dd)" = 500 ] && ok "approved as asked (500 DD a request); a different cap on the same approval is not accepted" || fail "opt-in consent: $A1 $CODE $BODY"
@@ -153,6 +159,35 @@ C "$(jbody action job cost_dd 10 token_id "$TJ" idempotency_key cor-ord-0001)"; 
 C "$(jbody action step cost_dd 10 token_id "$TJ" dry_run true)"; A2=$CODE
 [ "$A1" = 403 ] && [ "$A2" = 403 ] && ok "the per-request row cannot be used for an ordinary charge (never verified for any action)" || fail "ordinary on request row: $A1 $A2"
 
+# ── review round 1, H1: only a post marked as a request, with its ceiling ───────────────────────────────────────
+MH='just ok'; MSH=$(sha "$MH")
+post "$MH" nonce-h1a "$(did fe)" 500 "post:ext-agent:$(python3 -c 'import uuid;print(uuid.uuid4())')"; RCU=$RC   # Conduit's ordinary key
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-h1-0001 request_charge_id "$RCU" message_sha256 "$MSH" request_nonce nonce-h1a)"; A1=$CODE
+CR1=$(node -e 'const c=require("crypto"); process.stdout.write("cr1:"+c.createHash("sha256").update("conduit-request:v1\n"+process.argv[1]+"\n"+process.argv[2]+"\n"+process.argv[3]).digest("hex"))' "$(did fe)" "$MSH" nonce-h1b)
+post "$MH" nonce-h1b "$(did fe)" 500 "$CR1"; RCV1=$RC
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-h1-0002 request_charge_id "$RCV1" message_sha256 "$MSH" request_nonce nonce-h1b)"; A2=$CODE
+[ "$A1" = 403 ] && [ "$A2" = 403 ] && [ "$(Q "SELECT COUNT(*) FROM service_charges WHERE request_charge_id IN ('$RCU','$RCV1')")" = 0 ] \
+  && ok "an unflagged post (Conduit's ordinary key) or an old cr1 key never authorizes a charge" || fail "H1 unflagged/cr1: $A1 $A2"
+post "$MH" nonce-h1c "$(did fe)" 50; RCM=$RC; E1=$(bal ext)
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-h1-0003 request_charge_id "$RCM" message_sha256 "$MSH" request_nonce nonce-h1c request_max_dd 500)"; A1=$CODE
+COR "$FE" "$(jbody action job cost_dd 50 idempotency_key cor-h1-0004 request_charge_id "$RCM" message_sha256 "$MSH" request_nonce nonce-h1c request_max_dd 50)"; A2=$CODE; R2=$(echo "$BODY" | J request_max_exceeded)
+[ "$A1" = 403 ] && [ "$A2" = 402 ] && [ "$R2" = True ] && [ "$(bal ext)" = "$E1" ] && ok "a claimed ceiling other than the posted one: 403; a charge over the sender's ceiling (60 > 50): 402" || fail "H1 max: $A1 $A2"
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-h1-0005 request_charge_id "$RCM" message_sha256 "$MSH" request_nonce nonce-h1c request_max_dd 50)"; OM=$(echo "$BODY" | J charge_id)
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follow_up_dd)" = 38 ] || fail "H1 budget origin: $CODE $BODY"
+call POST /api/services/charge "$FE" "$(jbody action step cost_dd 35 follow_up_of "$OM" idempotency_key cor-h1-0006)"
+[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J follow_up_budget_exceeded)" = True ] && ok "the request's budget is min(sender's ceiling, consent cap): 50 − 12 = 38 left; 42 more refused" || fail "H1 budget: $CODE $BODY"
+
+# ── review round 1, M1: lowering the per-request cap bounds work already in flight; a replacement carries over ──
+post "$MH" nonce-m1 "$(did fe)"; RCQ=$RC
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-m1-0001 request_charge_id "$RCQ" message_sha256 "$MSH" request_nonce nonce-m1)"; OQ1=$(echo "$BODY" | J charge_id)
+[ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follow_up_dd)" = 488 ] || fail "M1 origin: $CODE $BODY"
+asked POST /api/services/consent "$EXT" "$EXT" '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":20}'; [ "$CODE" = 201 ] || fail "M1 lower: $CODE $BODY"
+call POST /api/services/charge "$FE" "$(jbody action step cost_dd 100 follow_up_of "$OQ1" idempotency_key cor-m1-0002)"; A1=$CODE
+call POST /api/services/charge "$FE" "$(jbody action step cost_dd 10 follow_up_of "$OQ1" idempotency_key cor-m1-0003 dry_run true)"; A2=$CODE
+call POST /api/services/charge "$FE" "$(jbody action step cost_dd 5 follow_up_of "$OQ1" idempotency_key cor-m1-0004)"; A3=$CODE
+[ "$A1" = 402 ] && [ "$A2" = 402 ] && [ "$A3" = 201 ] && ok "cap lowered to 20 mid-flight: follow-ups bounded by 20 − 12 = 8 (120 and 12 refused, 6 passes); the replacement consent carries the request over" || fail "M1: $A1 $A2 $A3"
+asked POST /api/services/consent "$EXT" "$EXT" '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":500}'; [ "$CODE" = 201 ] || fail "M1 restore: $CODE"
+
 # ── adversarial ─────────────────────────────────────────────────────────────────────────────────────────────────
 M2='second request'; MS2=$(sha "$M2")
 post "$M2" nonce-0002 "$(did ot)"; RCO=$RC          # a message to othersvc
@@ -164,7 +199,7 @@ COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-adv-0003 request_ch
 COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-adv-0004 request_charge_id "$RC3" message_sha256 "$MS2" request_nonce nonce-9999)"; A2=$CODE
 [ "$A1" = 403 ] && [ "$A2" = 403 ] && ok "other message bytes, or another nonce: 403 (the Conduit charge binds both)" || fail "bytes/nonce: $A1 $A2"
 # Forged: a row nobody here signed, keyed exactly right; and a real row whose payer was rewritten.
-FK=$(rkey "$(did fe)" "$MS2" nonce-forged)
+FK=$(rkey "$(did fe)" "$MS2" nonce-forged 500)
 SQ "INSERT INTO service_charges (charge_id, tenant_id, payer_did, payee_did, action, cost_dd, margin_pct, dd, token_jti, idempotency_key, receipt, sig, created_at)
     VALUES ('sc_f0f0f0f0f0f0f0f0f0f0f0f0', (SELECT id FROM service_tenants WHERE slug='conduit'), '$(did ext)', '$(did cd)', 'post', 1, 20, 2, '$CTID', '$FK',
     '{\"charge_id\":\"sc_f0f0f0f0f0f0f0f0f0f0f0f0\",\"service\":\"conduit\",\"payer\":\"$(did ext)\",\"action\":\"post\",\"idempotency_key\":\"$FK\",\"token_id\":\"$CTID\"}', 'AAAA', strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
@@ -181,10 +216,10 @@ COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-0001 request_charge
 SQ "UPDATE service_charges SET created_at='2026-01-01T00:00:00.000Z' WHERE charge_id='$RC1'"
 COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-0001 request_charge_id "$RC1" message_sha256 "$MS" request_nonce nonce-0001)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && ok "…but a retry of a charge already made still replays after the window" || fail "late replay: $CODE $BODY"
-post "$M2" nonce-0006 "$(did fe)"; RC6=$RC
-COR "$FE" "$(jbody action job cost_dd 450 idempotency_key cor-adv-0008 request_charge_id "$RC6" message_sha256 "$MS2" request_nonce nonce-0006)"
-[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J on_request_cap_exceeded)" = True ] && ok "over the per-request cap (450 → 540 > 500): 402" || fail "over cap: $CODE $BODY"
-COR "$FE" "$(jbody action admin cost_dd 5 idempotency_key cor-adv-0009 request_charge_id "$RC6" message_sha256 "$MS2" request_nonce nonce-0006)"
+post "$M2" nonce-0006 "$(did fe)" 1000; RC6=$RC
+COR "$FE" "$(jbody action job cost_dd 450 idempotency_key cor-adv-0008 request_charge_id "$RC6" message_sha256 "$MS2" request_nonce nonce-0006 request_max_dd 1000)"
+[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J on_request_cap_exceeded)" = True ] && ok "over the consent's per-request cap (450 → 540 > 500, sender ceiling 1000): 402" || fail "over cap: $CODE $BODY"
+COR "$FE" "$(jbody action admin cost_dd 5 idempotency_key cor-adv-0009 request_charge_id "$RC6" message_sha256 "$MS2" request_nonce nonce-0006 request_max_dd 1000)"
 [ "$CODE" = 403 ] && ok "an elevated action is never charged on a Conduit request" || fail "elevated: $CODE $BODY"
 COR "$CD" "$(jbody action post cost_dd 1 idempotency_key cor-adv-0010 request_charge_id "$RC6" message_sha256 "$MS2" request_nonce nonce-0006)"; A1=$CODE
 COR "$EXT" "$(jbody action job cost_dd 10 idempotency_key cor-adv-0011 request_charge_id "$RC6" message_sha256 "$MS2" request_nonce nonce-0006)"; A2=$CODE
@@ -207,9 +242,15 @@ COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-w-0001 request_char
 [ "$A1" = 402 ] && [ "$A2" = 402 ] && [ "$A3" = 409 ] && ok "consent revoked: follow-ups and new requests 402; the origin's replay is no go-ahead (409)" || fail "revoked consent: $A1 $A2 $A3"
 asked POST /api/services/consent "$EXT" "$EXT" '{"service":"fleetengine","daily_cap_dd":3000}'; [ "$CODE" = 201 ] || fail "re-consent w/o opt-in: $CODE"
 C "$(jbody action step cost_dd 10 follow_up_of "$ORG8" idempotency_key cor-w-0004)"
-[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J on_request_required)" = True ] && ok "a new consent without the opt-in does not revive request work" || fail "opt-in dropped: $CODE $BODY"
+[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J request_ended)" = True ] && ok "a new consent without the opt-in does not revive request work" || fail "opt-in dropped: $CODE $BODY"
 asked POST /api/services/consent "$EXT" "$EXT" '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":500}'; [ "$CODE" = 201 ] || fail "re-consent: $CODE"
-C "$(jbody action step cost_dd 10 follow_up_of "$ORG8" idempotency_key cor-w-0005)"; [ "$CODE" = 201 ] || fail "follow-up after re-consent: $CODE $BODY"
+C "$(jbody action step cost_dd 10 follow_up_of "$ORG8" idempotency_key cor-w-0005)"; A1=$CODE; R1=$(echo "$BODY" | J request_ended)
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-w-0001 request_charge_id "$RC8" message_sha256 "$MS2" request_nonce nonce-0008)"; A2=$CODE
+[ "$A1" = 402 ] && [ "$R1" = True ] && [ "$A2" = 409 ] && ok "L1: re-consenting WITH the opt-in after a revoke does not revive the request (follow-up 402 request_ended, replay 409)" || fail "L1 revive: $A1 $A2 $BODY"
+post "$M2" nonce-0011 "$(did fe)"; RC11=$RC
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-w-0008 request_charge_id "$RC11" message_sha256 "$MS2" request_nonce nonce-0011)"; ORG11=$(echo "$BODY" | J charge_id)
+[ "$CODE" = 201 ] && ok "…while a new request under the new consent is charged" || fail "new request after re-consent: $CODE $BODY"
+ORG8=$ORG11
 post "$M2" nonce-0010 "$(did fe)"; RC10=$RC
 call POST /api/services/token/revoke "$EXT" "$(jbody token_id "$CTID")"; [ "$CODE" = 200 ] || fail "revoke conduit token: $CODE"
 COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-w-0006 request_charge_id "$RC10" message_sha256 "$MS2" request_nonce nonce-0010)"; A1=$CODE
