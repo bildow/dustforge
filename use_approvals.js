@@ -169,7 +169,9 @@ module.exports = function registerUseApprovals(deps) {
     if (kind === 'service') {
       // Name what is granted, so two requests never look alike on the card (#77 review L2).
       const q = params || {};
-      const what = action === 'consent' ? `let ${String(q.wallet || '').slice(0, 24)}… pay ${q.service} up to ${q.daily_cap_dd} DD a day`
+      const what = action === 'consent' ? (q.on_request_cap_dd
+          ? `let ${String(q.wallet || '').slice(0, 16)}… pay ${q.service} ${q.daily_cap_dd} DD/day; each message you mark as a request, up to ${q.on_request_cap_dd} DD`
+          : `let ${String(q.wallet || '').slice(0, 24)}… pay ${q.service} up to ${q.daily_cap_dd} DD a day`)
         : action === 'register' ? `register service ${q.slug} (${q.name})`
         : action === 'owner-refill' ? `scheduled refill of ${q.amount_cents} DD ${q.cadence} to your own wallet`
         : action === 'owner-grant' ? `operator grant of ${q.amount_cents} DD to your own wallet`

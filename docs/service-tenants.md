@@ -135,6 +135,61 @@ Nothing should ask the owner to create an agent in their own session either.
 Pending requests of both kinds, and agent token requests, reach the owner's still-linked phone through its signed
 alerts check, which app 1.12+ notifies.
 
+## Charging on a Conduit request (no service token)
+
+A wallet can ask a tenant for work by posting it a Conduit message **that it marks as a request**, instead of sending
+a service token (FleetEngine F1b, tome `decisions/2026-11-12-DECISION-fleetengine-and-shadow-engine-redefinition.md`).
+**Needs an independent adversarial review before it merges** (round 1: REVISE, addressed below).
+
+- **Opt-in, per consent.** `POST /api/services/consent {service, daily_cap_dd, on_request_cap_dd}`. The person
+  approves it like any consent. The card reads "…; each message you mark as a request, up to N DD". A consent without
+  `on_request_cap_dd` (every consent made before this) is never charged this way.
+- **Only a marked post is a request.** The sender marks it in the Conduit post body: `request: {max_dd}`, its price
+  ceiling. For that post only, Conduit gives its charge the idempotency key (key version **cr2**):
+
+      cr2: + sha256("conduit-request:v2\n" + recipient wallet DID + "\n" + sha256(body) + "\n" + max_dd + "\n" + nonce)
+
+  `requestKey(recipientDid, messageSha256, nonce, maxDd)` in `service_tenants.js` is exported for it. An ordinary post
+  keeps Conduit's own key, so it **never** authorizes a charge. The round-0 `cr1` key (no flag, no ceiling) is never
+  recomputed, so it can't start a new origin either.
+- **Conduit requirements:** a request-marked post must carry a `client_msg_id`, which is the nonce. Conduit refuses a
+  marked post without one, keys only posts addressed `to` exactly one agent, and delivers `charge_id`, `request_nonce`
+  and `request.max_dd` with the message the recipient reads.
+- The recipient is bound by **wallet**, not Conduit name. DemiPass can't see Conduit's name registry, and Conduit
+  already binds each name to a wallet.
+- `POST /api/services/charge-on-request {action, cost_dd, idempotency_key, request_charge_id, message_sha256,
+  request_nonce, request_max_dd, dry_run?}`, as the tenant. It is refused unless all of these hold:
+  - the Conduit charge is a `post`, on record, signed by this server's meter key, and its key recomputes (cr2) with
+    **the calling tenant's** wallet and the given message hash, nonce and ceiling;
+  - the charge is at most 10 minutes old (a retry of a charge already made replays at any age);
+  - it has not already authorized an origin charge (one per Conduit charge, unique index);
+  - the Conduit token that posted it is not revoked by any route;
+  - the payer has a live consent that opted in;
+  - origin dd ≤ `request_max_dd`, ≤ `on_request_cap_dd`, and within the daily cap and the barrel tier;
+  - the action is `standard`.
+- **Budget per request:** origin plus follow-ups ≤ min(`request_max_dd`, `on_request_cap_dd`). Follow-ups bill as usual
+  (`follow_up_of`) against a per-request verification row with no ordinary actions. At each follow-up the budget is
+  re-derived as min(stored budget, the **current** `on_request_cap_dd` − origin dd), so lowering the cap bounds work
+  already in flight.
+- **Ending a request:** the origin records the consent it was charged under. The request ends permanently, and a later
+  consent or re-opt-in never revives it, when, since that consent, the payer:
+  - **revokes** that consent or any later consent of the same payer to the same tenant, or
+  - **replaces** it with a consent that has **no opt-in** (`on_request_cap_dd` absent or 0).
+
+  Only replacements that each keep an opt-in carry a request over, at the current cap. A request also ends when the
+  Conduit token that posted it is revoked.
+- **Trust stated:** a compromised Conduit tenant (its key plus a payer's live Conduit token) could mint a matching
+  marked post. Exposure is bounded by each opted-in payer's `on_request_cap_dd` and daily cap.
+- **Rollback.** Reverting this change leaves on-request origins whose follow-ups the older `charge()` would bill
+  without the request checks. **Before** rolling the code back, run against `data/dustforge.db`:
+
+      UPDATE service_verifications SET follow_up_dd = 0
+        WHERE token_jti IN (SELECT token_jti FROM service_charges WHERE request_charge_id IS NOT NULL);
+      UPDATE service_charges SET follow_ups = NULL WHERE request_charge_id IS NOT NULL;
+
+  The columns themselves (`on_request_cap_dd`, `request_charge_id`, `request_consent_id`) can stay; the old code
+  ignores them.
+
 ## Who may call an action
 
 - **Own account.** Any wallet may call an `open` action, paying for it itself. The tenant owner may also call closed actions.
