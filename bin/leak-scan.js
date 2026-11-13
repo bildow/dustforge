@@ -33,6 +33,11 @@ const fs = require('fs'), path = require('path');
 
 const API = (process.env.DEMIPASS_URL || 'https://api.dustforge.com').replace(/\/$/, '');
 const CHUNK_BYTES = 256 * 1024, BATCH_BYTES = 1536 * 1024, MAX_FILE = 200 * 1024 * 1024;
+// A scrub reads a file larger than SCRUB_SEGMENT in segments of that size (overlapping by more than any copy), so a
+// multi-gigabyte transcript never has to fit in memory (2026-11-13: the 946 MB live transcript was skipped as "too
+// large"). Files above SCRUB_MAX_FILE are still not read.
+// LEAK_SCRUB_SEGMENT (bytes) lowers the segment size for tests only; it must stay well above the window overlap.
+const SCRUB_SEGMENT = Math.max(64 * 1024, Number(process.env.LEAK_SCRUB_SEGMENT) || 64 * 1024 * 1024), SCRUB_MAX_FILE = 8 * 1024 * 1024 * 1024;
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.cache', '__pycache__', '.venv', 'dist', 'build']);
 
 // The scan token ("Scan <token>").
@@ -243,7 +248,7 @@ function scrubFiles(roots, all) {
     if (st.isSymbolicLink()) { let t = null; try { t = fs.realpathSync(p); } catch (_) {} if (!t || !inside(t)) notRead.push(`${p} (a link to outside what was asked)`); return; }
     if (st.isDirectory()) { if (!all && SKIP_DIRS.has(path.basename(p))) { notRead.push(`${p} (skipped: --all reads it)`); return; } let es; try { es = fs.readdirSync(p).sort(); } catch (e) { notRead.push(`${p} (${e.code || e.message})`); return; } for (const e of es) walk(path.join(p, e)); return; }
     if (!st.isFile() || st.size === 0) return;
-    if (st.size > MAX_FILE) { notRead.push(`${p} (${st.size} bytes, too large)`); return; }
+    if (st.size > SCRUB_MAX_FILE) { notRead.push(`${p} (${st.size} bytes, too large)`); return; }
     const id = st.dev + ':' + st.ino; if (seen.has(id)) return; seen.add(id);
     out.push(p);
   };
@@ -270,7 +275,8 @@ async function scrub(args) {
     if (view !== 'l' && w.badAt && w.badAt.length && w.badAt.some(x => x >= off && x < off + len)) return;
     const a = view === 'l' ? latin1Offset(raw, off) : off;
     const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
-    if (P.binary) { P.binSeen.add(w.start + a); return; }
+    if (w.start + a >= P.ownLen) return;   // starts in the next segment's own part: that segment masks it, once
+    if (P.binary) { P.binSeen.add(P.base + w.start + a); return; }
     const s0 = w.start + a, prev = P.spans.get(s0); if (prev === undefined || l > prev) P.spans.set(s0, l);
   };
   const finishIfDone = (P) => { if (P.queued && P.answered === P.sent) { open.delete(P.i); if (!P.skip) finish(P); } };
@@ -311,9 +317,9 @@ async function scrub(args) {
       if (ws.ino !== P.st.ino || ws.dev !== P.st.dev) throw Object.assign(new Error('replaced since it was read'), { code: 'REPLACED' });
       for (const [s0, l0] of merged) {
         const now = Buffer.alloc(l0);
-        const got = fs.readSync(wfd, now, 0, l0, s0);
+        const got = fs.readSync(wfd, now, 0, l0, P.base + s0);
         if (got !== l0 || !now.equals(P.buf.subarray(s0, s0 + l0))) { stale++; continue; }
-        fs.writeSync(wfd, Buffer.alloc(l0, '*'), 0, l0, s0); n++;
+        fs.writeSync(wfd, Buffer.alloc(l0, '*'), 0, l0, P.base + s0); n++;
       }
       fs.fsyncSync(wfd);
     } catch (e) { stale = merged.length - n; console.log(`LEFT     ${f}: cannot write (${e.code || e.message})`); }
@@ -321,18 +327,29 @@ async function scrub(args) {
     masked += n; left += stale; if (n) filesChanged++;
     if (n || stale) console.log(`MASKED   ${f}: ${n} cop${n === 1 ? 'y' : 'ies'}${stale ? `, ${stale} left (the file changed there since it was read: run again)` : ''}`);
   };
-  for (let i = 0; i < list.length; i++) {
-    const f = list[i];
+  // Each file is one unit, or several segments (base, own part) when larger than SCRUB_SEGMENT. A segment reads its own
+  // part plus `overlap` bytes of the next, and keeps only copies that START in its own part.
+  let unitIdx = 0;
+  for (let fi = 0; fi < list.length; fi++) {
+   const f = list[fi];
+   let size; try { size = fs.lstatSync(f).size; } catch (e) { notRead.push(`${f} (${e.code || e.message})`); continue; }
+   let fileBinary = null, fileSkipped = false;
+   for (let base = 0; base === 0 || base < size; base += SCRUB_SEGMENT) {
+    const i = unitIdx++;
+    const ownLen = Math.min(SCRUB_SEGMENT, Math.max(0, size - base)), want = Math.min(ownLen + (size > SCRUB_SEGMENT ? overlap : 0), Math.max(0, size - base));
     let fd, st, buf;
     try {
       fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); st = fs.fstatSync(fd);
-      buf = Buffer.alloc(st.size); let got = 0; while (got < st.size) { const n = fs.readSync(fd, buf, got, st.size - got, got); if (!n) break; got += n; } buf = buf.subarray(0, got);
-    } catch (e) { notRead.push(`${f} (${e.code || e.message})`); continue; } finally { if (fd !== undefined) fs.closeSync(fd); }
-    if (!buf.length) continue;
-    const kind = packed(f, buf.subarray(0, 16), buf.subarray(0, 1024));
-    if (kind) { notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); continue; }
-    filesRead++; bytesRead += buf.length;
-    const P = { i, f, buf, st, binary: buf.subarray(0, 8192).includes(0), wins: [], answered: 0, sent: 0, queued: false, skip: false, spans: new Map(), binSeen: new Set() };
+      buf = Buffer.alloc(want); let got = 0; while (got < want) { const n = fs.readSync(fd, buf, got, want - got, base + got); if (!n) break; got += n; } buf = buf.subarray(0, got);
+    } catch (e) { notRead.push(`${f} (${e.code || e.message})`); fileSkipped = true; break; } finally { if (fd !== undefined) fs.closeSync(fd); }
+    if (!buf.length) break;
+    if (base === 0) {
+      const kind = packed(f, buf.subarray(0, 16), buf.subarray(0, 1024));
+      if (kind) { notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); fileSkipped = true; break; }
+      filesRead++; fileBinary = buf.subarray(0, 8192).includes(0);
+    }
+    bytesRead += Math.min(ownLen, buf.length);
+    const P = { i, f, buf, st, base, ownLen, binary: fileBinary, wins: [], answered: 0, sent: 0, queued: false, skip: false, spans: new Map(), binSeen: new Set() };
     open.set(i, P);
     // Windows, each with its texts; one too big for a request is split (the overlap keeps every copy whole in a half).
     // Windows are queued as they are made, and each window's texts are dropped once sent (round 4 L-b).
@@ -358,9 +375,12 @@ async function scrub(args) {
     } catch (e) {
       if (/^scrub refused|finish refused/.test(e.message)) throw e;
       // round 3 L1: that file is not read (windows already sent are answered and ignored); the run goes on
-      P.skip = true; filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${e.message.replace(f + ': ', '')})`);
+      P.skip = true; if (base === 0) filesRead--; bytesRead -= Math.min(ownLen, buf.length); notRead.push(`${f} (${e.message.replace(f + ': ', '')})`);
     }
     P.queued = true; finishIfDone(P);
+    if (P.skip) break;   // a piece that did not fit: the rest of this file is not read either
+   }
+   void fileSkipped;
   }
   await flush();
   for (const P of [...open.values()]) finishIfDone(P);
