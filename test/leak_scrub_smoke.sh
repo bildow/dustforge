@@ -274,6 +274,7 @@ OUT=$(LEAK_SCRUB_SEGMENT=65536 SCRUB "$S/sG.tok" "$S/seg"); RC=$?
 [ $RC = 0 ] && echo "$OUT" | grep -q "masked 4, left 0" && ! grep -qF -- "$(head -c 10 "$S/nval")" "$S/seg/big.jsonl" && [ "$(stat -c %s "$S/seg/big.jsonl")" = "$SZ0" ] \
   && python3 -c 'import json,sys; [json.loads(l) for l in open(sys.argv[1])]' "$S/seg/big.jsonl" \
   && ok "a file of $(( SZ0 / 1024 )) KiB read in 64 KiB segments: copies across segment borders masked once each, every line still parses" || fail "segments: rc=$RC $OUT"
+[ "$(Q "SELECT json_extract(detail,'\$.files_changed') || '/' || json_extract(detail,'\$.files_read') FROM blindkey_events WHERE event_type='leak_contained' ORDER BY id DESC LIMIT 1")" = "1/1" ] && [ "$(echo "$OUT" | grep -c '^MASKED')" -ge 1 ] && ok "…and it is reported as 1 file changed of 1 read (not one per segment)" || fail "files_changed: $(Q "SELECT detail FROM blindkey_events WHERE event_type='leak_contained' ORDER BY id DESC LIMIT 1")"
 
 # ── expiry ──
 scrubtok s8 "$NREF"
