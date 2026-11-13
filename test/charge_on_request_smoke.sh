@@ -188,6 +188,22 @@ call POST /api/services/charge "$FE" "$(jbody action step cost_dd 5 follow_up_of
 [ "$A1" = 402 ] && [ "$A2" = 402 ] && [ "$A3" = 201 ] && ok "cap lowered to 20 mid-flight: follow-ups bounded by 20 − 12 = 8 (120 and 12 refused, 6 passes); the replacement consent carries the request over" || fail "M1: $A1 $A2 $A3"
 asked POST /api/services/consent "$EXT" "$EXT" '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":500}'; [ "$CODE" = 201 ] || fail "M1 restore: $CODE"
 
+# ── review round 2: a replacement WITHOUT the opt-in ends requests like a revoke; re-opting in revives nothing ─────
+post "$MH" nonce-r2a "$(did fe)"; RCR=$RC
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-r2-0001 request_charge_id "$RCR" message_sha256 "$MSH" request_nonce nonce-r2a)"; OR2=$(echo "$BODY" | J charge_id)
+[ "$CODE" = 201 ] || fail "r2 origin: $CODE $BODY"
+asked POST /api/services/consent "$EXT" "$EXT" '{"service":"fleetengine","daily_cap_dd":3000}'; [ "$CODE" = 201 ] || fail "r2 drop opt-in: $CODE $BODY"
+call POST /api/services/charge "$FE" "$(jbody action step cost_dd 5 follow_up_of "$OR2" idempotency_key cor-r2-0002)"
+[ "$CODE" = 402 ] && [ "$(echo "$BODY" | J request_ended)" = True ] && ok "round 2: replacing the consent without the opt-in ends the request (402 request_ended)" || fail "r2 drop: $CODE $BODY"
+asked POST /api/services/consent "$EXT" "$EXT" '{"service":"fleetengine","daily_cap_dd":3000,"on_request_cap_dd":500}'; [ "$CODE" = 201 ] || fail "r2 re-opt-in: $CODE $BODY"
+call POST /api/services/charge "$FE" "$(jbody action step cost_dd 5 follow_up_of "$OR2" idempotency_key cor-r2-0003)"; A1=$CODE; R1=$(echo "$BODY" | J request_ended)
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-r2-0001 request_charge_id "$RCR" message_sha256 "$MSH" request_nonce nonce-r2a)"; A2=$CODE
+post "$MH" nonce-r2b "$(did fe)"; RCR2=$RC
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-r2-0004 request_charge_id "$RCR2" message_sha256 "$MSH" request_nonce nonce-r2b)"; A3=$CODE; OR3=$(echo "$BODY" | J charge_id)
+call POST /api/services/charge "$FE" "$(jbody action step cost_dd 5 follow_up_of "$OR3" idempotency_key cor-r2-0005)"; A4=$CODE
+[ "$A1" = 402 ] && [ "$R1" = True ] && [ "$A2" = 409 ] && [ "$A3" = 201 ] && [ "$A4" = 201 ] \
+  && ok "round 2: re-opting in does not revive the old request (402 request_ended, replay 409); a new request and its follow-up are charged" || fail "r2 re-opt-in: $A1 $A2 $A3 $A4"
+
 # ── adversarial ─────────────────────────────────────────────────────────────────────────────────────────────────
 M2='second request'; MS2=$(sha "$M2")
 post "$M2" nonce-0002 "$(did ot)"; RCO=$RC          # a message to othersvc
@@ -212,9 +228,8 @@ post "$M2" nonce-0005 "$(did fe)"; RC5=$RC
 SQ "UPDATE service_charges SET created_at='$(python3 -c 'import datetime as d; print((d.datetime.utcnow()-d.timedelta(minutes=11)).isoformat()+"Z")')' WHERE charge_id='$RC5'"
 COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-adv-0007 request_charge_id "$RC5" message_sha256 "$MS2" request_nonce nonce-0005)"
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q 'older than 10 minutes' && ok "a Conduit request older than 10 minutes: 403" || fail "stale: $CODE $BODY"
-COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-0001 request_charge_id "$RC1" message_sha256 "$MS" request_nonce nonce-0001)"
-SQ "UPDATE service_charges SET created_at='2026-01-01T00:00:00.000Z' WHERE charge_id='$RC1'"
-COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-0001 request_charge_id "$RC1" message_sha256 "$MS" request_nonce nonce-0001)"
+SQ "UPDATE service_charges SET created_at='2026-01-01T00:00:00.000Z' WHERE charge_id='$RCR2'"   # a request charged under the live consent
+COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-r2-0004 request_charge_id "$RCR2" message_sha256 "$MSH" request_nonce nonce-r2b)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && ok "…but a retry of a charge already made still replays after the window" || fail "late replay: $CODE $BODY"
 post "$M2" nonce-0006 "$(did fe)" 1000; RC6=$RC
 COR "$FE" "$(jbody action job cost_dd 450 idempotency_key cor-adv-0008 request_charge_id "$RC6" message_sha256 "$MS2" request_nonce nonce-0006 request_max_dd 1000)"

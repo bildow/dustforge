@@ -171,10 +171,13 @@ a service token (FleetEngine F1b, tome `decisions/2026-11-12-DECISION-fleetengin
   (`follow_up_of`) against a per-request verification row with no ordinary actions. At each follow-up the budget is
   re-derived as min(stored budget, the **current** `on_request_cap_dd` − origin dd), so lowering the cap bounds work
   already in flight.
-- **Ending a request:** the origin records the consent it was charged under. A **revoke** of that consent (or of any
-  later consent of the same payer to the same tenant) ends the request permanently, and re-consenting does not revive
-  it. A **replacement** (a new consent made while the old one was active) carries over, at the new cap. A request also
-  ends when the Conduit token that posted it is revoked.
+- **Ending a request:** the origin records the consent it was charged under. The request ends permanently, and a later
+  consent or re-opt-in never revives it, when, since that consent, the payer:
+  - **revokes** that consent or any later consent of the same payer to the same tenant, or
+  - **replaces** it with a consent that has **no opt-in** (`on_request_cap_dd` absent or 0).
+
+  Only replacements that each keep an opt-in carry a request over, at the current cap. A request also ends when the
+  Conduit token that posted it is revoked.
 - **Trust stated:** a compromised Conduit tenant (its key plus a payer's live Conduit token) could mint a matching
   marked post. Exposure is bounded by each opted-in payer's `on_request_cap_dd` and daily cap.
 - **Rollback.** Reverting this change leaves on-request origins whose follow-ups the older `charge()` would bill

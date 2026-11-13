@@ -288,9 +288,13 @@ module.exports = function registerServiceTenants(deps) {
   const onRequestConsent = (did, tenant) => { const c = liveConsent(did, tenant); return c && Number.isInteger(c.on_request_cap_dd) && c.on_request_cap_dd > 0 ? c : null; };
   // Work started on a Conduit request stops when the Conduit token that posted it is revoked by any route (its own flag,
   // the token that minted it, the wallet's session or time cutoff, a fleet cut). → reason, or null.
-  // A revoke since the consent the request was charged under (that one or a later one) ends it permanently (L1).
+  // A request ends permanently (#109 review L1, round 2) when, since the consent it was charged under, the payer either
+  // REVOKED a consent (that one or a later one) or REPLACED it with one that has no opt-in (on_request_cap_dd null/0).
+  // A later re-opt-in revives nothing: the ending row stays in the history. Only a chain of replacements that each keep
+  // an opt-in carries a request over (at the current cap, M1).
   const requestConsentRevoked = (originRow) => Boolean(originRow && originRow.request_charge_id && (!originRow.request_consent_id
-    || db.prepare("SELECT 1 FROM service_consents WHERE payer_did = ? AND tenant_id = ? AND id >= ? AND status = 'revoked' LIMIT 1")
+    || db.prepare(`SELECT 1 FROM service_consents WHERE payer_did = ? AND tenant_id = ? AND id >= ?
+        AND (status = 'revoked' OR COALESCE(on_request_cap_dd, 0) <= 0) LIMIT 1`)
       .get(originRow.payer_did, originRow.tenant_id, originRow.request_consent_id)));
   // What a request origin's follow-ups may still run up: the budget stored at the origin, but never more than the
   // payer's CURRENT per-request cap allows (#109 review M1: lowering the cap bounds work already in flight).
@@ -493,7 +497,7 @@ module.exports = function registerServiceTenants(deps) {
     if (v.did === tenant.service_did) return { status: 400, body: { error: 'a tenant does not charge itself' } };
     const consent = liveConsent(v.did, tenant);
     if (!consent) return { status: 402, body: { error: `the caller has no standing consent to pay ${tenant.slug}`, consent_required: true } };
-    if (followUp && requestConsentRevoked(origin)) return { status: 402, body: { error: 'the payer revoked its consent after this request was made: the request has ended (a new consent does not revive it)', request_ended: true } };
+    if (followUp && requestConsentRevoked(origin)) return { status: 402, body: { error: 'the payer revoked its consent, or replaced it without the opt-in, after this request was made: the request has ended (a new consent does not revive it)', request_ended: true } };
     if (followUp && origin.request_charge_id && !onRequestConsent(v.did, tenant)) return { status: 402, body: { error: `the caller's consent no longer covers ${tenant.slug} charging for Conduit requests`, consent_required: true, on_request_required: true } };
     // The follow-up budget: the token's, or for a request origin the lower of that and the current per-request cap (M1).
     const fuBudget = followUp ? (origin.request_charge_id ? requestFollowUpBudget(origin, v.follow_up_dd, consent) : v.follow_up_dd) : 0;
