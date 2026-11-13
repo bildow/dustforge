@@ -135,6 +135,36 @@ Nothing should ask the owner to create an agent in their own session either.
 Pending requests of both kinds, and agent token requests, reach the owner's still-linked phone through its signed
 alerts check, which app 1.12+ notifies.
 
+## Charging on a Conduit request (no service token)
+
+A wallet can ask a tenant for work by posting it a Conduit message instead of sending a service token (FleetEngine
+F1b, tome `decisions/2026-11-12-DECISION-fleetengine-and-shadow-engine-redefinition.md`). **Needs an independent
+adversarial review before it merges.**
+
+- **Opt-in, per consent.** `POST /api/services/consent {service, daily_cap_dd, on_request_cap_dd}`. The person
+  approves it like any consent, and the card says "and on Conduit requests up to N DD each". A consent without
+  `on_request_cap_dd` (every consent made before this) is never charged this way.
+- **The proof is Conduit's own post charge.** Conduit verified the payer's service token for the post, and gives the
+  charge the idempotency key `cr1:` + sha256(`"conduit-request:v1\n"` + recipient wallet DID + `"\n"` + sha256 of the
+  message body + `"\n"` + nonce). The recipient is bound by **wallet**, not Conduit name: DemiPass cannot see Conduit's
+  name registry, and Conduit already binds each name to a wallet.
+- `POST /api/services/charge-on-request {action, cost_dd, idempotency_key, request_charge_id, message_sha256,
+  request_nonce, dry_run?}`, as the tenant. Refused unless:
+  - the Conduit charge is a `post`, on record, its row signed by this server's meter key, and its key recomputes with
+    **the calling tenant's** wallet, that message hash and that nonce;
+  - it is at most 10 minutes old (a retry of a charge already made replays at any age);
+  - it has not already authorized an origin charge (one per Conduit charge, unique index);
+  - the Conduit token that posted it is not revoked by any route;
+  - the payer has a live consent that opted in, and the charge fits `on_request_cap_dd`, the daily cap and the barrel
+    tier;
+  - the action is `standard` (an elevated action always needs a token and a person's approval).
+- **Follow-ups** bill as usual (`follow_up_of`), against a per-request verification row. That row has no ordinary
+  actions, so no `/charge` without `follow_up_of` can use it. Origin plus follow-ups stay within `on_request_cap_dd`.
+  Follow-ups stop when the consent is revoked or loses its opt-in, or when the Conduit token that posted the request
+  is revoked.
+- **Trust stated:** a compromised Conduit tenant (its key plus a payer's live Conduit token) could mint a matching
+  post charge. That exposure is bounded by each payer's `on_request_cap_dd` and daily cap, and only for payers who opted in.
+
 ## Who may call an action
 
 - **Own account.** Any wallet may call an `open` action, paying for it itself. The tenant owner may also call closed actions.
