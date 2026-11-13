@@ -8,7 +8,7 @@ S=$(mktemp -d /tmp/dustforge-userate-smoke.XXXXXX)
 PORT=${PORT:-3931}; API=http://127.0.0.1:$PORT
 [ -d "$W/node_modules" ] || export NODE_PATH=${NODE_PATH:-/home/flimflam/project/dustforge/node_modules}
 export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
-  STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9 USE_RATE_LIMIT_MAX=5 USE_RATE_IP_CEILING=15 RATE_STANDARD_MAX=4 RATE_STRICT_MAX=3
+  STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9 USE_RATE_LIMIT_MAX=5 USE_RATE_WALLET_TOTAL=12 USE_RATE_IP_CEILING=15 RATE_STANDARD_MAX=4 RATE_STRICT_MAX=3
 cd "$W"
 ( exec node server.js >"$S/server.log" 2>&1 ) & SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -rf "$S"' EXIT
@@ -18,12 +18,12 @@ H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
 for (const c of ["idempotency_key TEXT", "provenance TEXT DEFAULT '"'"'organic'"'"'"]) { try { db.exec("ALTER TABLE identity_transactions ADD COLUMN " + c); } catch (_) {} }
-for (const u of ["wallet-a", "wallet-b", "wallet-c"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
+for (const u of ["wallet-a", "wallet-b", "wallet-c", "wallet-d"]) { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 100000, ?)").run(id.did, u, u + "@dustforge.com", enc, process.argv[1]);
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 100000, ?, ?, 100000)").run(id.did, "topup", "smoke"); }' "$H"
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 login(){ curl -s -X POST "$API/api/identity/auth-fingerprint" -H 'content-type: application/json' -d '{"username":"'$1'","password":"hunter22","scope":"transact","expires_in":"1h"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])'; }
-A=$(login wallet-a); B=$(login wallet-b); Cw=$(login wallet-c)
+A=$(login wallet-a); B=$(login wallet-b); Cw=$(login wallet-c); Dw=$(login wallet-d)
 RT(){ curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/demipass/request-token" -H 'content-type: application/json' ${1:+-H "Authorization: Bearer $1"} -d '{"ref":"DP-NONE-xxxxxxxx-00000000","action":"http_header"}'; }
 codes=""; for i in 1 2 3 4 5; do codes="$codes $(RT "$A")"; done
 ! echo "$codes" | grep -q 429 && [ "$(RT "$A")" = 429 ] && ok "wallet A: 5 requests answered, the 6th refused (its own budget)" || fail "A: $codes"
@@ -75,5 +75,12 @@ SIL=""; for i in 1 2; do SIL="$SIL $(curl -s -X POST "$API/api/blindkey/silicon/
 codes=""; for t in $SIL; do for i in 1 2; do codes="$codes $(LT "$t")"; done; done; codes="$codes $(LT "$Cw")"
 echo "$codes" | grep -q 429 && ok "wallet C's silicons share C's standard budget (registering silicons does not multiply it): $codes" || fail "silicon multiplication: $codes"
 
+
+# ── free workers cannot fan one wallet out on /request-token: a total per wallet (#107 re-review M) ──
+# Wallet D makes 3 workers; each has its own 5 (15 in all), but the wallet's total is 12.
+WK=""; for i in 1 2 3; do WK="$WK $(curl -s -X POST "$API/api/silicons/workers" -H 'content-type: application/json' -H "Authorization: Bearer $Dw" -d '{"name":"rl-wk'$i'","mint":true}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("minted") or {}).get("token",""))')"; done
+[ "$(echo $WK | wc -w)" = 3 ] || fail "could not mint workers"
+n=0; for t in $WK; do for i in 1 2 3 4 5; do [ "$(RT "$t")" != 429 ] && n=$((n+1)); done; done
+[ "$n" = 12 ] && ok "three workers of wallet D get the wallet's total of 12 between them, not 3 × 5 = 15" || fail "worker fan-out: $n answered"
 
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails

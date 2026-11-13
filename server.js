@@ -250,6 +250,10 @@ const rateLimitStrict = rateLimitByWallet(Number(process.env.RATE_STRICT_MAX) ||
 const rateLimitStandard = rateLimitByWallet(Number(process.env.RATE_STANDARD_MAX) || 500, 'Rate limit exceeded');
 // /request-token and /use: their own budget (both maxima can be lowered for tests).
 const rateLimitUseWallet = rateLimitByWallet(Number(process.env.USE_RATE_LIMIT_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'use');
+// …and a total for the whole wallet behind those per-agent budgets: workers are free to make, so without it one wallet
+// could fan out past the old per-address ceiling (#107 re-review M). Checked after the agent's own limiter, so an agent's
+// refused retries never use up the wallet's total.
+const rateLimitUseWalletTotal = rateLimitByWallet(Number(process.env.USE_RATE_WALLET_TOTAL) || 5000, 'Rate limit exceeded (all agents of this wallet)');
 // The per-address floor: only traffic that is not signed in (one address cannot flood /use with forged tokens).
 // Signed-in traffic skips it, so many wallets behind one NAT never share it.
 const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_IP_CEILING) || 5000,
@@ -5310,7 +5314,7 @@ function requestUseTokenHandler(req, res) {
     res.status(500).json({ error: e.message });
   }
 }
-app.post('/api/blindkey/request-token', rateLimitUseWallet, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_read'), requestUseTokenHandler);
+app.post('/api/blindkey/request-token', rateLimitUseWallet, rateLimitUseWalletTotal, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_read'), requestUseTokenHandler);
 
 // POST /api/blindkey/use — use a secret without seeing it (delegated execution)
 // Supports two modes:
@@ -5331,7 +5335,7 @@ function claimUseToken(id) {
     .run(until, id, now).changes === 1 ? { id, until } : null;
 }
 function releaseUseToken(c) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ? AND executing_until = ?').run(c.id, c.until); } catch (_) {} }
-app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
+app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseWalletTotal, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
   try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); }
 });
 async function useRoute(req, res) {
