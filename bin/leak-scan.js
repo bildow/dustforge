@@ -336,17 +336,20 @@ async function scrub(args) {
   // after its last segment is read on from just before the old end (a copy cut off there is caught once).
   let unitIdx = 0;
   for (let fi = 0; fi < list.length; fi++) {
-   const f = list[fi], rec = { counted: false, changed: false };
-   const giveUp = (why) => { notRead.push(`${f} (${why})`); if (rec.counted) { filesRead--; rec.counted = false; } };
+   const f = list[fi], rec = { counted: false, changed: false, bytes: 0 };
+   const giveUp = (why) => { notRead.push(`${f} (${why})`); if (rec.counted) { filesRead--; rec.counted = false; } bytesRead -= rec.bytes; rec.bytes = 0; };
    let fd, st0;
    try { fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); st0 = fs.fstatSync(fd); }
    catch (e) { if (fd !== undefined) fs.closeSync(fd); notRead.push(`${f} (${e.code || e.message})`); continue; }
    try {
     if (st0.size > SCRUB_MAX_FILE) { notRead.push(`${f} (${st0.size} bytes, too large)`); continue; }
-    let fileBinary = null, base = 0, prevTail = null, minEnd = 0, planned = st0.size, grew = 0;
+    let fileBinary = null, base = 0, prevTail = null, minEnd = 0, planned = st0.size, grew = 0, prevSt = st0;
     for (;;) {
-     const fsz = fs.fstatSync(fd).size;
+     const stNow = fs.fstatSync(fd), fsz = stNow.size;
      if (fsz < planned) { giveUp('shrank while it was read'); break; }
+     // Same size but written since the last segment: a rewrite in place, not an append (#106 re-review L1).
+     if (base > 0 && fsz === planned && (stNow.mtimeMs !== prevSt.mtimeMs || stNow.ctimeMs !== prevSt.ctimeMs)) { giveUp('changed while it was read'); break; }
+     prevSt = stNow;
      if (base > 0 && base >= fsz) break;
      const want = Math.min(SCRUB_SEGMENT + overlap, fsz - base);
      let buf;
@@ -361,7 +364,7 @@ async function scrub(args) {
        filesRead++; rec.counted = true; fileBinary = buf.subarray(0, 8192).includes(0);
      }
      const atEnd = base + buf.length >= fsz, ownLen = atEnd ? buf.length : SCRUB_SEGMENT;
-     bytesRead += ownLen - minEnd;
+     bytesRead += ownLen - minEnd; rec.bytes += ownLen - minEnd;
      const i = unitIdx++, st = st0;
      const P = { i, f, buf, st, base, ownLen, minEnd, rec, binary: fileBinary, wins: [], answered: 0, sent: 0, queued: false, skip: false, spans: new Map(), binSeen: new Set() };
     open.set(i, P);
@@ -389,7 +392,7 @@ async function scrub(args) {
     } catch (e) {
       if (/^scrub refused|finish refused/.test(e.message)) throw e;
       // round 3 L1: that file is not read (windows already sent are answered and ignored); the run goes on
-      P.skip = true; bytesRead -= ownLen - minEnd; giveUp(e.message.replace(f + ': ', ''));
+      P.skip = true; giveUp(e.message.replace(f + ': ', ''));
     }
      P.queued = true; finishIfDone(P);
      if (P.skip) break;   // a piece that did not fit: the rest of this file is not read either
