@@ -57,4 +57,23 @@ codes=""; for i in 1 2 3 4; do codes="$codes $(LT "forged.$i.token")"; done
 FP(){ curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/identity/forgot-password" -H 'content-type: application/json' -d '{"username":"nobody-'$1'"}'; }
 codes=""; for i in 1 2 3; do codes="$codes $(FP $i)"; done
 ! echo "$codes" | grep -q 429 && [ "$(FP 4)" = 429 ] && ok "a not-signed-in strict route is limited per address" || fail "strict anon: $codes"
+
+# ── a validly signed token the server never issued is not "signed in" (#107 review CRITICAL) ──
+# A did:key JWT verifies against the key in its own sub, so anyone can sign one: it must count by address.
+MINT(){ node -e '
+const crypto = require("crypto"); const identity = require(process.argv[1] + "/identity");
+const { publicKey, privateKey } = crypto.generateKeyPairSync("ed25519", { publicKeyEncoding: { type: "spki", format: "der" }, privateKeyEncoding: { type: "pkcs8", format: "der" } });
+const b = (o) => Buffer.from(JSON.stringify(o)).toString("base64url"), now = Math.floor(Date.now() / 1000);
+const si = b({ alg: "EdDSA", typ: "JWT" }) + "." + b({ sub: identity.publicKeyToDID(publicKey), scope: "transact", iss: "civitasvox", iat: now, exp: now + 3600, jti: crypto.randomBytes(8).toString("hex") });
+process.stdout.write(si + "." + crypto.sign(null, Buffer.from(si), crypto.createPrivateKey({ key: privateKey, format: "der", type: "pkcs8" })).toString("base64url"));' "$PWD"; }
+FP2(){ curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/identity/forgot-password" -H 'content-type: application/json' -H "Authorization: Bearer $(MINT)" -d '{"username":"nobody-self"}'; }
+codes=""; for i in 1 2 3 4; do codes="$codes $(FP2)"; done
+[ -z "$(echo $codes | tr " " "\n" | grep -v "^429$")" ] && ok "self-signed did:key tokens (never issued) get the address's spent strict budget, not fresh ones: $codes" || fail "self-minted bypass: $codes"
+
+# ── silicons count under their owner wallet on the general limiters (#107 review HIGH) ──
+SIL=""; for i in 1 2; do SIL="$SIL $(curl -s -X POST "$API/api/blindkey/silicon/register" -H 'content-type: application/json' -H "Authorization: Bearer $Cw" -d '{"agent_name":"rl-bot'$i'"}' | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')"; done
+codes=""; for t in $SIL; do for i in 1 2; do codes="$codes $(LT "$t")"; done; done; codes="$codes $(LT "$Cw")"
+echo "$codes" | grep -q 429 && ok "wallet C's silicons share C's standard budget (registering silicons does not multiply it): $codes" || fail "silicon multiplication: $codes"
+
+
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails

@@ -210,40 +210,46 @@ const nodemailer = require('nodemailer');
 // Rate limits count per wallet; the address is the key only for traffic that is not signed in (Aaron 2026-11-13: "Rate
 // limits count per wallet, with a per-IP floor only for traffic that isn't signed in"). Before, every limiter but
 // /use counted per address, so the whole fleet behind phasewhip's NAT shared one budget (2026-11-12: 332 refusals).
-// The identity is a VERIFIED one only — a forged or revoked token is counted by its address — and is worked out
-// without side effects (no last_active writes, no renewal pickup), once per request:
-//   a session/agent JWT → its subject (a worker token, decoded.wrk, gets its own sub-budget: #103 review L1);
-//   a legacy silicon:… token → that silicon; a scan/scrub token (Authorization: Scan …) → that token.
+// The identity is one the server ISSUED and still honours — never just a valid signature: a did:key JWT verifies
+// against the key in its own sub, so anyone can sign one (#107 review CRITICAL). A Bearer JWT counts only with an
+// issued_tokens row for its jti and that same DID, not revoked; a legacy silicon:… token only while its agent is
+// active; a scan/scrub token only while not revoked or expired. Anything else is counted by its address. No side
+// effects (no last_active writes, no renewal pickup); worked out once per request.
+// Two keys: `wallet` (the owner: a legacy silicon counts as its carbon, a worker as its wallet) for every limiter, so
+// free silicons/workers cannot multiply a wallet's budget on login/strict routes (#107 review HIGH); `use` keeps the
+// per-agent sub-budgets on /use and /request-token (#103 review L1).
 const rateIpKey = (req) => (rateLimit.ipKeyGenerator ? rateLimit.ipKeyGenerator(req.ip || '') : String(req.ip || ''));
 const sha256hex = (t) => crypto.createHash('sha256').update(t).digest('hex');
 const rateIdentity = (req) => {
-  if (req._rateKey !== undefined) return req._rateKey;
-  let k = null;
+  if (req._rateId !== undefined) return req._rateId;
+  let id = null;
   try {
     const h = String(req.headers.authorization || '');
     if (h.startsWith('Bearer silicon:')) {
-      const row = db.prepare("SELECT did FROM silicon_agents WHERE token_hash = ? AND status = 'active'").get(sha256hex(h.slice(7)));
-      if (row && row.did) k = 'silicon:' + row.did;
+      const row = db.prepare("SELECT did, carbon_did FROM silicon_agents WHERE token_hash = ? AND status = 'active'").get(sha256hex(h.slice(7)));
+      if (row && row.carbon_did) id = { wallet: row.carbon_did, use: 'silicon:' + (row.did || row.carbon_did) };
     } else if (h.startsWith('Bearer ')) {
-      const v = identity.verifyTokenStandalone(h.slice(7));
-      if (v.valid && v.decoded && v.decoded.sub && !billing.checkTokenRevocation(db, v.decoded).revoked)
-        k = v.decoded.sub + (v.decoded.wrk ? ':wrk:' + v.decoded.wrk : '');
+      const v = identity.verifyTokenStandalone(h.slice(7)), d = v && v.valid ? v.decoded : null;
+      const it = d && d.sub && d.jti ? db.prepare('SELECT did, revoked FROM issued_tokens WHERE jti = ?').get(String(d.jti)) : null;
+      if (it && !it.revoked && it.did === d.sub && !billing.checkTokenRevocation(db, d).revoked)
+        id = { wallet: d.sub, use: d.sub + (d.wrk ? ':wrk:' + d.wrk : '') };
     } else if (h.startsWith('Scan ')) {
-      const row = db.prepare('SELECT id FROM leak_scan_tokens WHERE token_hash = ?').get(sha256hex(h.slice(5).trim()));
-      if (row) k = 'scan:' + row.id;
+      const row = db.prepare('SELECT id, owner_did FROM leak_scan_tokens WHERE token_hash = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)')
+        .get(sha256hex(h.slice(5).trim()), new Date().toISOString());
+      if (row && row.owner_did) id = { wallet: row.owner_did, use: 'scan:' + row.id };
     }
-  } catch (_) { k = null; }
-  return (req._rateKey = k);
+  } catch (_) { id = null; }
+  return (req._rateId = id);
 };
 // A limiter keyed by wallet when signed in, by address otherwise. Each limiter has its own store, so the budgets of the
 // route groups stay separate, as before.
-const rateLimitByWallet = (max, error, windowMs = 15*60*1000) => rateLimit({ windowMs, max,
-  keyGenerator: (req) => { const w = rateIdentity(req); return w ? 'wallet:' + w : 'ip:' + rateIpKey(req); },
+const rateLimitByWallet = (max, error, windowMs = 15*60*1000, which = 'wallet') => rateLimit({ windowMs, max,
+  keyGenerator: (req) => { const w = rateIdentity(req); return w ? 'wallet:' + w[which] : 'ip:' + rateIpKey(req); },
   handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: `${error} (${rateIdentity(req) ? 'this wallet' : 'this address, not signed in'}: per ${windowMs >= 3600000 ? windowMs / 3600000 + ' hour' : windowMs / 60000 + ' minutes'})` }) });
 const rateLimitStrict = rateLimitByWallet(Number(process.env.RATE_STRICT_MAX) || 50, 'Too many requests');   // maxima lowered only by tests
 const rateLimitStandard = rateLimitByWallet(Number(process.env.RATE_STANDARD_MAX) || 500, 'Rate limit exceeded');
 // /request-token and /use: their own budget (both maxima can be lowered for tests).
-const rateLimitUseWallet = rateLimitByWallet(Number(process.env.USE_RATE_LIMIT_MAX) || 500, 'Rate limit exceeded');
+const rateLimitUseWallet = rateLimitByWallet(Number(process.env.USE_RATE_LIMIT_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'use');
 // The per-address floor: only traffic that is not signed in (one address cannot flood /use with forged tokens).
 // Signed-in traffic skips it, so many wallets behind one NAT never share it.
 const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_IP_CEILING) || 5000,
@@ -9099,7 +9105,7 @@ require('./pairing')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh,
 // Browser extension install page (public/extension.html): the Chrome waitlist while the store listing is pending.
 require('./extension_routes')({ app, db });
 // Meter: priced, Ed25519-signed charges for service calls that are not a /use (eval rig provisioning; meter.js).
-require('./meter').registerRoutes({ app, db, billing, identity, getBearerIdentity, rateIdentity });
+require('./meter').registerRoutes({ app, db, billing, identity, getBearerIdentity, rateIdentity: (req) => { const r = rateIdentity(req); return r ? r.wallet : null; } });
 // Person-to-person shares and ownership transfer (docs/sharing.md).
 const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
