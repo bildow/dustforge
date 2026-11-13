@@ -258,6 +258,24 @@ OUT=$(SCRUB "$S/sM.tok" "$S/many" "$S/many/f100.txt"); RC=$?
 REQS=$(Q "SELECT requests_today FROM leak_scan_tokens WHERE id=$MT")
 [ $RC = 0 ] && echo "$OUT" | grep -q "masked 6, left 0" && [ "$REQS" -le 4 ] && ! grep -rqF -- "$(head -c 10 "$S/nval")" "$S/many" && ok "300 small files: 6 copies masked in $REQS requests (not 300), contained" || fail "batching: rc=$RC reqs=$REQS $OUT"
 
+# ── a file larger than one segment is read in pieces (2026-11-13: the 946 MB live transcript was "too large") ──
+scrubtok sG "$NREF"; mkdir -p "$S/seg"
+python3 - "$S/nval" "$S/seg/big.jsonl" <<'PY'
+import json,sys; v=open(sys.argv[1]).read().strip(); seg=65536
+line=lambda t: json.dumps({"type":"x","content":t})+"\n"
+out=""; spots=[seg-5, 2*seg-len(v)//2, 3*seg, 4*seg+100]          # straddling, inside the overlap, on the border, plain
+for at in spots:
+    out+=line("p"*max(0, at-len(out)-24)); out+=line("pw "+v)
+out+=line("end")
+open(sys.argv[2],"w").write(out)
+PY
+SZ0=$(stat -c %s "$S/seg/big.jsonl")
+OUT=$(LEAK_SCRUB_SEGMENT=65536 SCRUB "$S/sG.tok" "$S/seg"); RC=$?
+[ $RC = 0 ] && echo "$OUT" | grep -q "masked 4, left 0" && ! grep -qF -- "$(head -c 10 "$S/nval")" "$S/seg/big.jsonl" && [ "$(stat -c %s "$S/seg/big.jsonl")" = "$SZ0" ] \
+  && python3 -c 'import json,sys; [json.loads(l) for l in open(sys.argv[1])]' "$S/seg/big.jsonl" \
+  && ok "a file of $(( SZ0 / 1024 )) KiB read in 64 KiB segments: copies across segment borders masked once each, every line still parses" || fail "segments: rc=$RC $OUT"
+[ "$(Q "SELECT json_extract(detail,'\$.files_changed') || '/' || json_extract(detail,'\$.files_read') FROM blindkey_events WHERE event_type='leak_contained' ORDER BY id DESC LIMIT 1")" = "1/1" ] && [ "$(echo "$OUT" | grep -c '^MASKED')" -ge 1 ] && ok "…and it is reported as 1 file changed of 1 read (not one per segment)" || fail "files_changed: $(Q "SELECT detail FROM blindkey_events WHERE event_type='leak_contained' ORDER BY id DESC LIMIT 1")"
+
 # ── expiry ──
 scrubtok s8 "$NREF"
 python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE leak_scan_tokens SET expires_at='2000-01-01T00:00:00.000Z' WHERE token_hash=?\", (sys.argv[2],)); c.commit()" "$DB_PATH" "$(tr -d '\n' < "$S/s8.tok" | sha256sum | cut -d' ' -f1)"

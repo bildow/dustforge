@@ -33,6 +33,11 @@ const fs = require('fs'), path = require('path');
 
 const API = (process.env.DEMIPASS_URL || 'https://api.dustforge.com').replace(/\/$/, '');
 const CHUNK_BYTES = 256 * 1024, BATCH_BYTES = 1536 * 1024, MAX_FILE = 200 * 1024 * 1024;
+// A scrub reads a file larger than SCRUB_SEGMENT in segments of that size (overlapping by more than any copy), so a
+// multi-gigabyte transcript never has to fit in memory (2026-11-13: the 946 MB live transcript was skipped as "too
+// large"). Files above SCRUB_MAX_FILE are still not read.
+// LEAK_SCRUB_SEGMENT (bytes) lowers the segment size for tests only; it must stay well above the window overlap.
+const SCRUB_SEGMENT = Math.max(64 * 1024, Number(process.env.LEAK_SCRUB_SEGMENT) || 64 * 1024 * 1024), SCRUB_MAX_FILE = 4 * 1024 * 1024 * 1024;   // below the token's 8 GiB a day: windows overlap, and a latin1 view can double a window (#106 review L3)
 const SKIP_DIRS = new Set(['.git', 'node_modules', '.cache', '__pycache__', '.venv', 'dist', 'build']);
 
 // The scan token ("Scan <token>").
@@ -243,7 +248,7 @@ function scrubFiles(roots, all) {
     if (st.isSymbolicLink()) { let t = null; try { t = fs.realpathSync(p); } catch (_) {} if (!t || !inside(t)) notRead.push(`${p} (a link to outside what was asked)`); return; }
     if (st.isDirectory()) { if (!all && SKIP_DIRS.has(path.basename(p))) { notRead.push(`${p} (skipped: --all reads it)`); return; } let es; try { es = fs.readdirSync(p).sort(); } catch (e) { notRead.push(`${p} (${e.code || e.message})`); return; } for (const e of es) walk(path.join(p, e)); return; }
     if (!st.isFile() || st.size === 0) return;
-    if (st.size > MAX_FILE) { notRead.push(`${p} (${st.size} bytes, too large)`); return; }
+    if (st.size > SCRUB_MAX_FILE) { notRead.push(`${p} (${st.size} bytes, too large)`); return; }
     const id = st.dev + ':' + st.ino; if (seen.has(id)) return; seen.add(id);
     out.push(p);
   };
@@ -270,7 +275,9 @@ async function scrub(args) {
     if (view !== 'l' && w.badAt && w.badAt.length && w.badAt.some(x => x >= off && x < off + len)) return;
     const a = view === 'l' ? latin1Offset(raw, off) : off;
     const l = view === 'l' ? latin1Offset(raw.subarray(a), len) : len;
-    if (P.binary) { P.binSeen.add(w.start + a); return; }
+    if (w.start + a >= P.ownLen) return;   // starts in the next segment's own part: that segment masks it, once
+    if (w.start + a + l <= P.minEnd) return;   // whole in the part the previous read already had: masked there, once
+    if (P.binary) { P.binSeen.add(P.base + w.start + a); return; }
     const s0 = w.start + a, prev = P.spans.get(s0); if (prev === undefined || l > prev) P.spans.set(s0, l);
   };
   const finishIfDone = (P) => { if (P.queued && P.answered === P.sent) { open.delete(P.i); if (!P.skip) finish(P); } };
@@ -311,28 +318,55 @@ async function scrub(args) {
       if (ws.ino !== P.st.ino || ws.dev !== P.st.dev) throw Object.assign(new Error('replaced since it was read'), { code: 'REPLACED' });
       for (const [s0, l0] of merged) {
         const now = Buffer.alloc(l0);
-        const got = fs.readSync(wfd, now, 0, l0, s0);
+        const got = fs.readSync(wfd, now, 0, l0, P.base + s0);
+        if (got === l0 && P.base && now.every(b => b === 0x2a)) continue;   // masked by the segment before (touching copies: #106 review L2)
         if (got !== l0 || !now.equals(P.buf.subarray(s0, s0 + l0))) { stale++; continue; }
-        fs.writeSync(wfd, Buffer.alloc(l0, '*'), 0, l0, s0); n++;
+        fs.writeSync(wfd, Buffer.alloc(l0, '*'), 0, l0, P.base + s0); n++;
       }
       fs.fsyncSync(wfd);
     } catch (e) { stale = merged.length - n; console.log(`LEFT     ${f}: cannot write (${e.code || e.message})`); }
     finally { if (wfd !== undefined) fs.closeSync(wfd); }
-    masked += n; left += stale; if (n) filesChanged++;
+    masked += n; left += stale; if (n && !P.rec.changed) { P.rec.changed = true; filesChanged++; }   // per file, not per segment (#106 review L1)
     if (n || stale) console.log(`MASKED   ${f}: ${n} cop${n === 1 ? 'y' : 'ies'}${stale ? `, ${stale} left (the file changed there since it was read: run again)` : ''}`);
   };
-  for (let i = 0; i < list.length; i++) {
-    const f = list[i];
-    let fd, st, buf;
-    try {
-      fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); st = fs.fstatSync(fd);
-      buf = Buffer.alloc(st.size); let got = 0; while (got < st.size) { const n = fs.readSync(fd, buf, got, st.size - got, got); if (!n) break; got += n; } buf = buf.subarray(0, got);
-    } catch (e) { notRead.push(`${f} (${e.code || e.message})`); continue; } finally { if (fd !== undefined) fs.closeSync(fd); }
-    if (!buf.length) continue;
-    const kind = packed(f, buf.subarray(0, 16), buf.subarray(0, 1024));
-    if (kind) { notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); continue; }
-    filesRead++; bytesRead += buf.length;
-    const P = { i, f, buf, st, binary: buf.subarray(0, 8192).includes(0), wins: [], answered: 0, sent: 0, queued: false, skip: false, spans: new Map(), binSeen: new Set() };
+  // Each file is read through one descriptor, in segments when larger than SCRUB_SEGMENT. A segment reads its own part
+  // plus `overlap` bytes of the next and keeps only copies that START in its own part. The next segment must begin
+  // with the bytes the previous one read there, and the file must not shrink or be replaced: otherwise it is "changed
+  // while it was read" and not read (#106 review M: a rewrite between segments could hide a copy). A file that grew
+  // after its last segment is read on from just before the old end (a copy cut off there is caught once).
+  let unitIdx = 0;
+  for (let fi = 0; fi < list.length; fi++) {
+   const f = list[fi], rec = { counted: false, changed: false, bytes: 0 };
+   const giveUp = (why) => { notRead.push(`${f} (${why})`); if (rec.counted) { filesRead--; rec.counted = false; } bytesRead -= rec.bytes; rec.bytes = 0; };
+   let fd, st0;
+   try { fd = fs.openSync(f, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); st0 = fs.fstatSync(fd); }
+   catch (e) { if (fd !== undefined) fs.closeSync(fd); notRead.push(`${f} (${e.code || e.message})`); continue; }
+   try {
+    if (st0.size > SCRUB_MAX_FILE) { notRead.push(`${f} (${st0.size} bytes, too large)`); continue; }
+    let fileBinary = null, base = 0, prevTail = null, minEnd = 0, planned = st0.size, grew = 0, prevSt = st0;
+    for (;;) {
+     const stNow = fs.fstatSync(fd), fsz = stNow.size;
+     if (fsz < planned) { giveUp('shrank while it was read'); break; }
+     // Same size but written since the last segment: a rewrite in place, not an append (#106 re-review L1).
+     if (base > 0 && fsz === planned && (stNow.mtimeMs !== prevSt.mtimeMs || stNow.ctimeMs !== prevSt.ctimeMs)) { giveUp('changed while it was read'); break; }
+     prevSt = stNow;
+     if (base > 0 && base >= fsz) break;
+     const want = Math.min(SCRUB_SEGMENT + overlap, fsz - base);
+     let buf;
+     try { buf = Buffer.alloc(want); let got = 0; while (got < want) { const n = fs.readSync(fd, buf, got, want - got, base + got); if (!n) break; got += n; } buf = buf.subarray(0, got); }
+     catch (e) { giveUp(e.code || e.message); break; }
+     if (buf.length < want) { giveUp('shrank while it was read'); break; }
+     if (prevTail && !buf.subarray(0, prevTail.length).equals(prevTail)) { giveUp('changed while it was read'); break; }
+     if (!buf.length) break;
+     if (base === 0) {
+       const kind = packed(f, buf.subarray(0, 16), buf.subarray(0, 1024));
+       if (kind) { notRead.push(`${f} (${kind}: compressed or packed, copies inside cannot be seen)`); break; }
+       filesRead++; rec.counted = true; fileBinary = buf.subarray(0, 8192).includes(0);
+     }
+     const atEnd = base + buf.length >= fsz, ownLen = atEnd ? buf.length : SCRUB_SEGMENT;
+     bytesRead += ownLen - minEnd; rec.bytes += ownLen - minEnd;
+     const i = unitIdx++, st = st0;
+     const P = { i, f, buf, st, base, ownLen, minEnd, rec, binary: fileBinary, wins: [], answered: 0, sent: 0, queued: false, skip: false, spans: new Map(), binSeen: new Set() };
     open.set(i, P);
     // Windows, each with its texts; one too big for a request is split (the overlap keeps every copy whole in a half).
     // Windows are queued as they are made, and each window's texts are dropped once sent (round 4 L-b).
@@ -358,9 +392,23 @@ async function scrub(args) {
     } catch (e) {
       if (/^scrub refused|finish refused/.test(e.message)) throw e;
       // round 3 L1: that file is not read (windows already sent are answered and ignored); the run goes on
-      P.skip = true; filesRead--; bytesRead -= buf.length; notRead.push(`${f} (${e.message.replace(f + ': ', '')})`);
+      P.skip = true; giveUp(e.message.replace(f + ': ', ''));
     }
-    P.queued = true; finishIfDone(P);
+     P.queued = true; finishIfDone(P);
+     if (P.skip) break;   // a piece that did not fit: the rest of this file is not read either
+     planned = fsz;
+     if (!atEnd) { prevTail = Buffer.from(buf.subarray(SCRUB_SEGMENT)); base += SCRUB_SEGMENT; minEnd = 0; continue; }
+     const now = fs.fstatSync(fd).size;
+     if (now === fsz) break;
+     if (now < fsz) { giveUp('shrank while it was read'); break; }
+     if (++grew > 64) { giveUp('kept growing while it was read'); break; }
+     const back = Math.min(buf.length, overlap);   // grew: on from just before the old end
+     prevTail = Buffer.from(buf.subarray(buf.length - back)); base += buf.length - back; minEnd = back;
+    }
+    // Renamed over since it was opened: what is at the path now was never read (#106 review M).
+    let cur; try { cur = fs.lstatSync(f); } catch (_) { cur = null; }
+    if (rec.counted && (!cur || cur.ino !== st0.ino || cur.dev !== st0.dev)) giveUp('replaced while it was read');
+   } finally { fs.closeSync(fd); }
   }
   await flush();
   for (const P of [...open.values()]) finishIfDone(P);
