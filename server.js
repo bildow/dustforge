@@ -15493,10 +15493,11 @@ const HOST = process.env.HOST || '127.0.0.1';
 // the first request can meet the current prices (one-time; a no-op afterwards).
 require('./dd_redenominate').migrate(db, { log: console.log });
 
-// Before taking requests: every use_inflight row is from an earlier process (this one has served none yet), so each is
-// a call a restart or crash killed. Refund it once, in the same transaction that removes the row.
+// Once this process owns the port (so no earlier server is still running: #110 review M1), every use_inflight row is
+// from a process that died mid-call. Refund each once, in the same transaction that removes the row.
+function refundLeftoverUses() {
 try {
-  const left = db.prepare('SELECT * FROM use_inflight WHERE pid IS NULL OR pid != ?').all(process.pid);
+  const left = db.prepare('SELECT * FROM use_inflight').all();
   let n = 0, dd = 0;
   for (const row of left) {
     try { db.transaction(() => {
@@ -15508,4 +15509,9 @@ try {
   }
   if (left.length) console.log(`use_inflight: refunded ${n} of ${left.length} /use calls a restart ended (${dd} DD)`);
 } catch (e) { console.error('use_inflight: startup refund:', e.message); }
-app.listen(PORT, HOST, () => console.log(`Dustforge running on ${HOST}:${PORT}`));
+}
+app.listen(PORT, HOST, (err) => {
+  if (err) { console.error(`Dustforge could not listen on ${HOST}:${PORT}: ${err.message}`); process.exit(1); }
+  refundLeftoverUses();
+  console.log(`Dustforge running on ${HOST}:${PORT}`);
+});
