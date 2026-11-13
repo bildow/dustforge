@@ -1,14 +1,14 @@
 #!/bin/bash
-# /request-token and /use are limited per wallet, not per address (Aaron 2026-11-12): two wallets behind one address
-# each get their own budget; a caller without a valid token is limited by address; a per-address ceiling still holds.
-# Limits are lowered for the test (USE_RATE_LIMIT_MAX=5, USE_RATE_IP_CEILING=15). No schema change.
+# Rate limits count per wallet; the address counts only traffic that is not signed in (Aaron 2026-11-12/13). Two
+# wallets behind one address each get their own budget, on /use and on every other limiter; a caller without a valid
+# token is limited by address. Limits are lowered for the test. No schema change.
 set -u
 W=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 S=$(mktemp -d /tmp/dustforge-userate-smoke.XXXXXX)
 PORT=${PORT:-3931}; API=http://127.0.0.1:$PORT
 [ -d "$W/node_modules" ] || export NODE_PATH=${NODE_PATH:-/home/flimflam/project/dustforge/node_modules}
 export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
-  STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9 USE_RATE_LIMIT_MAX=5 USE_RATE_IP_CEILING=15
+  STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9 USE_RATE_LIMIT_MAX=5 USE_RATE_IP_CEILING=15 RATE_STANDARD_MAX=4 RATE_STRICT_MAX=3
 cd "$W"
 ( exec node server.js >"$S/server.log" 2>&1 ) & SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -rf "$S"' EXIT
@@ -36,9 +36,25 @@ X=$(RT "not-a-real-token"); [ "$X" != 429 ] && ok "an invalid token is keyed by 
 # A keeps retrying past its own limit: its refused retries must not use up the address (#103 review M1)
 for i in $(seq 1 20); do RT "$A" >/dev/null; done
 X=$(RT "$Cw"); [ "$X" != 429 ] && ok "wallet A retrying 20 times after its 429s does not lock out another wallet (C)" || fail "retry lockout: $X"
-# counted against the address: A 5 + B 5 + anon 2 + fake 1 + C 1 = 14 (A's refused retries and /use never reach it);
-# one more C passes (15), the next is over the ceiling
-RT "$Cw" >/dev/null
-C=$(curl -s -X POST "$API/api/demipass/request-token" -H 'content-type: application/json' -H "Authorization: Bearer $Cw" -d '{}' -w ' %{http_code}')
-echo "$C" | grep -q "429" && echo "$C" | grep -q "this address" && ok "the per-address ceiling still holds across wallets" || fail "ceiling: $C"
+# Signed-in traffic never counts against the address: wallets A, B and C have made 30+ requests from it, yet the
+# not-signed-in budget (5) has only anon 2 + fake 1 = 3 used: two more pass, the next is refused as "this address".
+codes=""; for i in 1 2; do codes="$codes $(RT "")"; done
+X=$(curl -s -X POST "$API/api/demipass/request-token" -H 'content-type: application/json' -d '{}' -w ' %{http_code}')
+! echo "$codes" | grep -q 429 && echo "$X" | grep -q 429 && echo "$X" | grep -q "this address, not signed in" && ok "the address counts only traffic that is not signed in (30+ signed-in requests did not use it up)" || fail "anon floor: $codes / $X"
+X=$(RT "$Cw"); [ "$X" != 429 ] && ok "…and a signed-in wallet with budget left is still answered from that address" || fail "C after anon floor: $X"
+
+# ── every other limiter (rateLimitStandard here, max 4) counts per wallet too ──
+LT(){ curl -s -o /dev/null -w '%{http_code}' "$API/api/blindkey/leak-scan/tokens" ${1:+-H "Authorization: Bearer $1"}; }
+codes=""; for i in 1 2 3 4; do codes="$codes $(LT "$A")"; done
+! echo "$codes" | grep -q 429 && [ "$(LT "$A")" = 429 ] && ok "a standard-limited route: wallet A gets its 4, the 5th is refused" || fail "standard A: $codes"
+codes=""; for i in 1 2 3 4; do codes="$codes $(LT "$B")"; done
+! echo "$codes" | grep -q 429 && ok "…wallet B from the same address still gets its own 4 (was: one budget per address)" || fail "standard B: $codes"
+M=$(curl -s "$API/api/blindkey/leak-scan/tokens" -H "Authorization: Bearer $A"); echo "$M" | grep -q "this wallet" && ok "…and the refusal says it is the wallet's budget" || fail "standard msg: $M"
+codes=""; for i in 1 2 3 4; do codes="$codes $(LT "forged.$i.token")"; done
+[ "$(LT "forged.9.token")" = 429 ] && ok "forged tokens are counted by address: they cannot each pick a fresh budget" || fail "forged: $codes"
+
+# ── a strict-limited route (max 3) that is not signed in: per address ──
+FP(){ curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/identity/forgot-password" -H 'content-type: application/json' -d '{"username":"nobody-'$1'"}'; }
+codes=""; for i in 1 2 3; do codes="$codes $(FP $i)"; done
+! echo "$codes" | grep -q 429 && [ "$(FP 4)" = 429 ] && ok "a not-signed-in strict route is limited per address" || fail "strict anon: $codes"
 echo; [ $fails = 0 ] && echo "ALL OK" || echo "$fails FAILED"; exit $fails

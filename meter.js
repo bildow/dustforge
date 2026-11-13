@@ -168,7 +168,7 @@ function createMeter({ db, billing, identity, masterKey }) {
 }
 
 // Routes. Registered from server.js: require('./meter').registerRoutes({ app, db, billing, identity, getBearerIdentity }).
-function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterKey = process.env.IDENTITY_MASTER_KEY }) {
+function registerRoutes({ app, db, billing, identity, getBearerIdentity, rateIdentity = () => null, masterKey = process.env.IDENTITY_MASTER_KEY }) {
   const rateLimit = require('express-rate-limit');
   const meter = createMeter({ db, billing, identity, masterKey });
   // Charges and listings are counted per wallet (after auth), so hosts sharing an address don't share a budget and
@@ -176,10 +176,15 @@ function registerRoutes({ app, db, billing, identity, getBearerIdentity, masterK
   const perWallet = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false,
     keyGenerator: (req) => 'did:' + req.meterAuth.did,
     message: { error: 'Too many meter requests for this wallet. Try again in a minute.' } });
+  // Public verify: per wallet when the caller is signed in, per address otherwise (Aaron 2026-11-13).
+  const ipKey = (req) => (rateLimit.ipKeyGenerator ? rateLimit.ipKeyGenerator(req.ip || '') : String(req.ip || ''));
   const perAddress = rateLimit({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => { const w = rateIdentity(req); return w ? 'wallet:' + w : 'ip:' + ipKey(req); },
     message: { error: 'Too many verify requests. Try again in a minute.' } });
   // In front of auth, so requests with a bad token are also counted (there is no global limiter).
+  // The per-address floor counts only traffic that is not signed in (a verified token skips it; perWallet counts it).
   const preAuth = rateLimit({ windowMs: 60 * 1000, max: 240, standardHeaders: false, legacyHeaders: false,
+    skip: (req) => Boolean(rateIdentity(req)),
     message: { error: 'Too many meter requests from this address. Try again in a minute.' } });
   function walletAuth(req, res, next) {
     const auth = getBearerIdentity(req);
