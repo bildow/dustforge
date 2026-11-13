@@ -119,7 +119,7 @@ function isCutOff(e) {
 function answerCutOff(req, res, action, ms, { delegated = false } = {}) {
   let refunded = 0;
   if (req.billing && req.billing.deducted > 0 && !req._useRefunded) {
-    req._useRefunded = true;
+    req._useRefunded = true; useInflightDone(req);
     try {
       const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'api_call_compute_refund',
         `Refund: ${action} cut off at ${ms / 1000} s`, { tokenJti: req.billing.token_jti || null });
@@ -134,11 +134,28 @@ function answerCutOff(req, res, action, ms, { delegated = false } = {}) {
 // Give back this /use's charge once (a GitHub mint that handed out no token — #104 review L2). Returns the DD refunded.
 function refundUse(req, why) {
   if (!req.billing || !(req.billing.deducted > 0) || req._useRefunded) return 0;
-  req._useRefunded = true;
+  req._useRefunded = true; useInflightDone(req);
   try {
     const r = billing.refundCharge(db, req.billing.payer_did || req.identity.did, req.billing.deducted, 'api_call_compute_refund', `Refund: ${why}`, { tokenJti: req.billing.token_jti || null });
     return r && r.ok ? req.billing.deducted : 0;
   } catch (_) { return 0; }
+}
+// A charged /use that a restart or crash kills is refunded (EVAL 2026-11-13: eight calls killed by two deploys kept
+// their charge). Each charged call holds a row in use_inflight while it runs; the row goes when the answer has been
+// handed over (res 'finish'), when the call refunds itself, or when the handler ends. A row still there at startup
+// belongs to a process that died mid-call: its charge is given back once (startup, below).
+function useInflightOpen(req, res) {
+  if (!req.billing || !(req.billing.deducted > 0)) return;
+  try {
+    req._useInflight = db.prepare('INSERT INTO use_inflight (payer_did, amount, token_jti, started_at, pid) VALUES (?, ?, ?, ?, ?)')
+      .run(req.billing.payer_did || req.identity.did, req.billing.deducted, req.billing.token_jti || null, new Date().toISOString(), process.pid).lastInsertRowid;
+  } catch (_) { return; }
+  res.on('finish', () => useInflightDone(req));
+}
+function useInflightDone(req) {
+  if (!req._useInflight) return;
+  const id = req._useInflight; req._useInflight = null;
+  try { db.prepare('DELETE FROM use_inflight WHERE id = ?').run(id); } catch (_) {}
 }
 // The owner approves, in the DemiPass app with the PIN, an act on their own entry that an agent session could otherwise
 // do in their name (#96 review H1: a device-flow MCP token is the owner's wallet, not the owner). Returns true to go on,
@@ -549,6 +566,15 @@ try { db.exec('CREATE INDEX IF NOT EXISTS idx_it_did ON issued_tokens(did)'); } 
 try { db.exec(`CREATE TABLE IF NOT EXISTS token_revocations (
   did TEXT PRIMARY KEY,
   revoke_before INTEGER NOT NULL
+)`); } catch (e) {}
+// Charged /use calls in progress (useInflightOpen). Rows left by a process that died mid-call are refunded at startup.
+try { db.exec(`CREATE TABLE IF NOT EXISTS use_inflight (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  payer_did TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  token_jti TEXT,
+  started_at TEXT NOT NULL,
+  pid INTEGER
 )`); } catch (e) {}
 identity.setTokenRecorder((p) => {
   if (!p.jti) return;
@@ -5336,7 +5362,8 @@ function claimUseToken(id) {
 }
 function releaseUseToken(c) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ? AND executing_until = ?').run(c.id, c.until); } catch (_) {} }
 app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseWalletTotal, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
-  try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); }
+  useInflightOpen(req, res);
+  try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); useInflightDone(req); }
 });
 async function useRoute(req, res) {
   let { use_token } = req.body || {};
@@ -15466,4 +15493,19 @@ const HOST = process.env.HOST || '127.0.0.1';
 // the first request can meet the current prices (one-time; a no-op afterwards).
 require('./dd_redenominate').migrate(db, { log: console.log });
 
+// Before taking requests: every use_inflight row is from an earlier process (this one has served none yet), so each is
+// a call a restart or crash killed. Refund it once, in the same transaction that removes the row.
+try {
+  const left = db.prepare('SELECT * FROM use_inflight WHERE pid IS NULL OR pid != ?').all(process.pid);
+  let n = 0, dd = 0;
+  for (const row of left) {
+    try { db.transaction(() => {
+      if (db.prepare('DELETE FROM use_inflight WHERE id = ?').run(row.id).changes !== 1) return;
+      const r = billing.refundCharge(db, row.payer_did, row.amount, 'api_call_compute_refund', `Refund: /use ended by a server restart (started ${row.started_at})`, { tokenJti: row.token_jti || null });
+      if (!r || !r.ok) throw new Error('refund failed');
+      n++; dd += row.amount;
+    })(); } catch (e) { console.error(`use_inflight: refund of row ${row.id} failed (kept for the next start): ${e.message}`); }
+  }
+  if (left.length) console.log(`use_inflight: refunded ${n} of ${left.length} /use calls a restart ended (${dd} DD)`);
+} catch (e) { console.error('use_inflight: startup refund:', e.message); }
 app.listen(PORT, HOST, () => console.log(`Dustforge running on ${HOST}:${PORT}`));
