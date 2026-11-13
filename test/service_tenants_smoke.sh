@@ -157,6 +157,10 @@ bad=0; for e in 'http://evil.example/door' 'https://u:p@repo.example/door' 'http
 call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass fleetgate"}'; [ "$CODE" = 400 ] || bad=1
 call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"evilpkg#x"}'; [ "$CODE" = 403 ] || { bad=1; echo "  third-party mcp → $CODE"; }
 [ $bad = 0 ] && ok "endpoint: https (http only on *.ts.net), plain normal-form ASCII, no credentials/query/backslash; mcp_server first-party package#bin" || fail "connect validation"
+call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass#fleetengine-mcp"}'; FEQ_CODE=$CODE
+call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass#fleetengine-mcpx"}'; FEX_CODE=$CODE
+[ "$FEQ_CODE" = 202 ] && [ "$FEX_CODE" = 403 ] && [ "$(Q "SELECT mcp_server FROM service_tenants WHERE slug='fleetgate'")" = "" ] \
+  && ok "demipass#fleetengine-mcp is first-party (asks the owner, 202); a lookalike is still refused (403); nothing set unapproved" || fail "fleetengine-mcp: $FEQ_CODE / $FEX_CODE"
 CB='{"endpoint":"https://repo.example/-/fleetgate/door/","mcp_server":"demipass#fleetgate-mcp"}'
 call PUT /api/services/fleetgate/connect "$FG" "$CB"; CQ=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$(Q "SELECT owner_did FROM use_approvals WHERE id=$CQ")" = "$(did owner)" ] && [ "$(Q "SELECT endpoint FROM service_tenants WHERE slug='fleetgate'")" = "" ] \
