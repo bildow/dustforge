@@ -603,7 +603,9 @@ module.exports = function registerServiceTenants(deps) {
   }
   // Which MCP server callers' machines run for a tenant is code on their machines, run with their DemiPass session
   // nearby: first-party only (the demipass package's own servers) until there is a trust model for others (#87 M2).
-  const MCP_FIRST_PARTY_SERVERS = new Set(['demipass#demipass-mcp', 'demipass#fleetgate-mcp']);   // the MCP servers the demipass package ships
+  // demipass#fleetengine-mcp: the FleetEngine client (tome decisions/2026-11-12-DECISION-fleetengine-and-shadow-engine-redefinition.md),
+  // shipped by the demipass package like fleetgate-mcp; still first-party, still the same trust model.
+  const MCP_FIRST_PARTY_SERVERS = new Set(['demipass#demipass-mcp', 'demipass#fleetgate-mcp', 'demipass#fleetengine-mcp']);   // the MCP servers the demipass package ships
   const MCP_FIRST_PARTY = { test: (v) => MCP_FIRST_PARTY_SERVERS.has(v) };
   app.put('/api/services/:slug/connect', lim, (req, res) => {
     const auth = walletAuth(req, res); if (!auth) return;
