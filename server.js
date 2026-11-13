@@ -207,30 +207,60 @@ const passwords = require('./passwords');   // account password hashing: salted 
 const browserFill = require('./browser_fill');   // which page may receive a stored login (docs/browser-fill-api.md)
 const rateLimit = require('express-rate-limit');
 const nodemailer = require('nodemailer');
-const rateLimitStrict = rateLimit({ windowMs: 15*60*1000, max: 50, message: { error: 'Too many requests' } });
-const rateLimitStandard = rateLimit({ windowMs: 15*60*1000, max: 500, message: { error: 'Rate limit exceeded' } });
-// /request-token and /use: per wallet, not per address (Aaron 2026-11-12: the whole fleet behind phasewhip's NAT shared
-// one 500/15 min budget; an MCI burst got 332 refusals). The key is the VERIFIED token's own subject (a silicon has its
-// own bucket, not its owner's); a caller without a valid token is keyed by address, as before. A looser per-address
-// ceiling stays, so many wallets from one address cannot flood. The wallet limit is checked first: a wallet's own
-// refused retries never count against the address (#103 review M1). Both maxima can be lowered for tests.
-const useRateIpKey = (req) => (rateLimit.ipKeyGenerator ? rateLimit.ipKeyGenerator(req.ip || '') : String(req.ip || ''));
-const useRateWallet = (req) => {
-  if (req._useRateKey !== undefined) return req._useRateKey;
-  let k = null;
-  // A worker token (decoded.wrk) has its own sub-budget under its owner, so one runaway worker cannot starve the
-  // owner's other agents (#103 review L1).
-  try { const a = getBearerIdentity(req); if (a && a.ok) { const sub = (a.decoded && a.decoded.sub) || a.did || null; k = sub ? sub + (a.decoded && a.decoded.wrk ? ':wrk:' + a.decoded.wrk : '') : null; } } catch (_) { k = null; }
-  return (req._useRateKey = k);
+// Rate limits count per wallet; the address is the key only for traffic that is not signed in (Aaron 2026-11-13: "Rate
+// limits count per wallet, with a per-IP floor only for traffic that isn't signed in"). Before, every limiter but
+// /use counted per address, so the whole fleet behind phasewhip's NAT shared one budget (2026-11-12: 332 refusals).
+// The identity is one the server ISSUED and still honours — never just a valid signature: a did:key JWT verifies
+// against the key in its own sub, so anyone can sign one (#107 review CRITICAL). A Bearer JWT counts only with an
+// issued_tokens row for its jti and that same DID, not revoked; a legacy silicon:… token only while its agent is
+// active; a scan/scrub token only while not revoked or expired. Anything else is counted by its address. No side
+// effects (no last_active writes, no renewal pickup); worked out once per request.
+// Two keys: `wallet` (the owner: a legacy silicon counts as its carbon, a worker as its wallet) for every limiter, so
+// free silicons/workers cannot multiply a wallet's budget on login/strict routes (#107 review HIGH); `use` keeps the
+// per-agent sub-budgets on /use and /request-token (#103 review L1).
+const rateIpKey = (req) => (rateLimit.ipKeyGenerator ? rateLimit.ipKeyGenerator(req.ip || '') : String(req.ip || ''));
+const sha256hex = (t) => crypto.createHash('sha256').update(t).digest('hex');
+const rateIdentity = (req) => {
+  if (req._rateId !== undefined) return req._rateId;
+  let id = null;
+  try {
+    const h = String(req.headers.authorization || '');
+    if (h.startsWith('Bearer silicon:')) {
+      const row = db.prepare("SELECT did, carbon_did FROM silicon_agents WHERE token_hash = ? AND status = 'active'").get(sha256hex(h.slice(7)));
+      if (row && row.carbon_did) id = { wallet: row.carbon_did, use: 'silicon:' + (row.did || row.carbon_did) };
+    } else if (h.startsWith('Bearer ')) {
+      const v = identity.verifyTokenStandalone(h.slice(7)), d = v && v.valid ? v.decoded : null;
+      const it = d && d.sub && d.jti ? db.prepare('SELECT did, revoked FROM issued_tokens WHERE jti = ?').get(String(d.jti)) : null;
+      if (it && !it.revoked && it.did === d.sub && !billing.checkTokenRevocation(db, d).revoked)
+        id = { wallet: d.sub, use: d.sub + (d.wrk ? ':wrk:' + d.wrk : '') };
+    } else if (h.startsWith('Scan ')) {
+      const row = db.prepare('SELECT id, owner_did FROM leak_scan_tokens WHERE token_hash = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)')
+        .get(sha256hex(h.slice(5).trim()), new Date().toISOString());
+      if (row && row.owner_did) id = { wallet: row.owner_did, use: 'scan:' + row.id };
+    }
+  } catch (_) { id = null; }
+  return (req._rateId = id);
 };
-const rateLimitUseWallet = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_LIMIT_MAX) || 500,
-  keyGenerator: (req) => { const w = useRateWallet(req); return w ? 'wallet:' + w : 'ip:' + useRateIpKey(req); },
-  handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: useRateWallet(req) ? 'Rate limit exceeded (this wallet: per 15 minutes)' : 'Rate limit exceeded (this address, no valid token: per 15 minutes)' }) });
+// A limiter keyed by wallet when signed in, by address otherwise. Each limiter has its own store, so the budgets of the
+// route groups stay separate, as before.
+const rateLimitByWallet = (max, error, windowMs = 15*60*1000, which = 'wallet') => rateLimit({ windowMs, max,
+  keyGenerator: (req) => { const w = rateIdentity(req); return w ? 'wallet:' + w[which] : 'ip:' + rateIpKey(req); },
+  handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: `${error} (${rateIdentity(req) ? 'this wallet' : 'this address, not signed in'}: per ${windowMs >= 3600000 ? windowMs / 3600000 + ' hour' : windowMs / 60000 + ' minutes'})` }) });
+const rateLimitStrict = rateLimitByWallet(Number(process.env.RATE_STRICT_MAX) || 50, 'Too many requests');   // maxima lowered only by tests
+const rateLimitStandard = rateLimitByWallet(Number(process.env.RATE_STANDARD_MAX) || 500, 'Rate limit exceeded');
+// /request-token and /use: their own budget (both maxima can be lowered for tests).
+const rateLimitUseWallet = rateLimitByWallet(Number(process.env.USE_RATE_LIMIT_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'use');
+// …and a total for the whole wallet behind those per-agent budgets: workers are free to make, so without it one wallet
+// could fan out past the old per-address ceiling (#107 re-review M). Checked after the agent's own limiter, so an agent's
+// refused retries never use up the wallet's total.
+const rateLimitUseWalletTotal = rateLimitByWallet(Number(process.env.USE_RATE_WALLET_TOTAL) || 5000, 'Rate limit exceeded (all agents of this wallet)');
+// The per-address floor: only traffic that is not signed in (one address cannot flood /use with forged tokens).
+// Signed-in traffic skips it, so many wallets behind one NAT never share it.
 const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_IP_CEILING) || 5000,
-  keyGenerator: useRateIpKey, message: { error: 'Rate limit exceeded (this address: per 15 minutes)' } });
+  skip: (req) => Boolean(rateIdentity(req)), keyGenerator: rateIpKey, message: { error: 'Rate limit exceeded (this address, not signed in: per 15 minutes)' } });
 // Browser fill polls (the wallet every 4 s, a waiting fill every 2 s): its own budget, so polling never starves /use.
-const rateLimitFill = rateLimit({ windowMs: 15*60*1000, max: 3000, message: { error: 'Rate limit exceeded' } });
-const rateLimitInvite = rateLimit({ windowMs: 15*60*1000, max: 10, message: { error: 'Too many invite requests. Try again later.' } });
+const rateLimitFill = rateLimitByWallet(3000, 'Rate limit exceeded');
+const rateLimitInvite = rateLimitByWallet(10, 'Too many invite requests. Try again later');
 
 function createEmailTransport() {
   // An authenticated provider carries outbound mail when the direct-send IP
@@ -5284,7 +5314,7 @@ function requestUseTokenHandler(req, res) {
     res.status(500).json({ error: e.message });
   }
 }
-app.post('/api/blindkey/request-token', rateLimitUseWallet, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_read'), requestUseTokenHandler);
+app.post('/api/blindkey/request-token', rateLimitUseWallet, rateLimitUseWalletTotal, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_read'), requestUseTokenHandler);
 
 // POST /api/blindkey/use — use a secret without seeing it (delegated execution)
 // Supports two modes:
@@ -5305,7 +5335,7 @@ function claimUseToken(id) {
     .run(until, id, now).changes === 1 ? { id, until } : null;
 }
 function releaseUseToken(c) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ? AND executing_until = ?').run(c.id, c.until); } catch (_) {} }
-app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
+app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseWalletTotal, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
   try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); }
 });
 async function useRoute(req, res) {
@@ -9079,7 +9109,7 @@ require('./pairing')({ app, db, rateLimitStandard, getBearerIdentity, gateFresh,
 // Browser extension install page (public/extension.html): the Chrome waitlist while the store listing is pending.
 require('./extension_routes')({ app, db });
 // Meter: priced, Ed25519-signed charges for service calls that are not a /use (eval rig provisioning; meter.js).
-require('./meter').registerRoutes({ app, db, billing, identity, getBearerIdentity });
+require('./meter').registerRoutes({ app, db, billing, identity, getBearerIdentity, rateIdentity: (req) => { const r = rateIdentity(req); return r ? r.wallet : null; } });
 // Person-to-person shares and ownership transfer (docs/sharing.md).
 const secretSharing = require('./secret_sharing')({
   app, db, rateLimitStandard, rateLimitFill, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
@@ -12509,7 +12539,7 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS support_tickets (
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_st_status ON support_tickets(status)"); } catch(e) {}
 
 // POST /api/support/ticket — submit a support ticket (no auth required for suspended users)
-app.post('/api/support/ticket', rateLimit({ windowMs: 60*60*1000, max: 5, message: { error: 'max 5 tickets per hour' } }), (req, res) => {
+app.post('/api/support/ticket', rateLimitByWallet(5, 'max 5 tickets', 60*60*1000), (req, res) => {
   const { subject, body: ticketBody, category, username, email, source } = req.body || {};
   if (!subject) return res.status(400).json({ error: 'subject required' });
 
