@@ -320,9 +320,16 @@ function checkTokenRevocation(db, decoded) {
         : db.prepare('SELECT MAX(revoke_before) AS revoke_before FROM fleet_token_cuts WHERE did = ?').get(decoded.sub);
       if (fc && fc.revoke_before && (!decoded.iat || decoded.iat < fc.revoke_before)) return { revoked: true, reason: 'token revoked: the wallet left that fleet' };
     }
-  } catch (_) {}
+  } catch (e) {
+    // Fail CLOSED (G2, 2026-11-14): a lookup that could not run cannot say the token is alive. Every caller turns
+    // revoked into a refusal, so a database fault refuses tokens instead of letting a revoked one through.
+    const now = Date.now();
+    if (now - _revocationErrAt > 60000) { _revocationErrAt = now; console.error('[revocation] lookup failed, refusing the token:', e && e.message); }
+    return { revoked: true, reason: 'token status could not be checked; try again', lookup_failed: true };
+  }
   return { revoked: false };
 }
+let _revocationErrAt = 0;
 
 // Registered by the host once ./fleet_billing is loaded (keeps this module free of circular requires).
 let _attribution = null;

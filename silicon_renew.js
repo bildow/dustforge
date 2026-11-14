@@ -166,8 +166,10 @@ module.exports = function registerSiliconRenew(deps) {
                                          WHERE s.member_did = ? AND s.status = 'active' AND COALESCE(s.joined_via, 'owner') != 'network'
                                            AND COALESCE(f.status, 'active') = 'active'`).all(did);
   const mail = (to, subject, text) => { try { if (to) Promise.resolve(sendMail({ to, subject, text })).catch(() => {}); } catch (_) {} };
-  const askRevoked = (c) => Boolean(billing && billing.checkTokenRevocation(db, { jti: c.ask_jti || undefined, sub: c.did, iat: c.ask_iat || 0,
-    auth_method: c.auth_method, fleet: c.ask_fleet || undefined }).revoked);
+  // {revoked, lookup_failed}: a lookup that could not run refuses (G2) but is never written down as a revocation.
+  const askState = (c) => (billing && billing.checkTokenRevocation(db, { jti: c.ask_jti || undefined, sub: c.did, iat: c.ask_iat || 0,
+    auth_method: c.auth_method, fleet: c.ask_fleet || undefined })) || { revoked: false };
+  const askRevoked = (c) => Boolean(askState(c).revoked);   // display only (the owner's card hides it); never persisted
 
   function seal(payload, recipientRaw, did, pubId) {
     const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
@@ -217,7 +219,9 @@ module.exports = function registerSiliconRenew(deps) {
     db.prepare('DELETE FROM token_deliveries WHERE expires_at <= ?').run(t);
     db.prepare("UPDATE delivery_key_changes SET status = 'expired', decided_at = ? WHERE status = 'pending' AND expires_at <= ?").run(t, t);
     for (const c of db.prepare("SELECT * FROM delivery_key_changes WHERE status = 'pending'").all()) {
-      if (askRevoked(c)) db.prepare("UPDATE delivery_key_changes SET status = 'revoked', decided_at = ? WHERE id = ? AND status = 'pending'").run(t, c.id);
+      const r = askState(c);
+      if (r.lookup_failed) continue;   // a database fault is not a revocation: leave the ask pending (G2 review M1)
+      if (r.revoked) db.prepare("UPDATE delivery_key_changes SET status = 'revoked', decided_at = ? WHERE id = ? AND status = 'pending'").run(t, c.id);
     }
   }
   const sweeper = setInterval(() => { try { sweep(); } catch (_) {} }, 10 * 60 * 1000); if (sweeper.unref) sweeper.unref();
@@ -325,7 +329,9 @@ module.exports = function registerSiliconRenew(deps) {
     const refused = dk ? dk.approvalRefusal(auth, 'silicon-key', s.id, bind, req.body) : null;
     if (refused) return res.status(refused.status).json(refused.body);
     // The token that asked may have been revoked since the sweep (revoke-all, a fleet cut): checked once more, now.
-    if (askRevoked(ch)) {
+    const askNow = askState(ch);
+    if (askNow.lookup_failed) return res.status(503).json({ error: 'token status could not be checked; try again', code: 'unavailable' });
+    if (askNow.revoked) {
       db.prepare("UPDATE delivery_key_changes SET status = 'revoked', decided_at = ? WHERE id = ? AND status = 'pending'").run(nowIso(), ch.id);
       return res.status(409).json({ error: 'the token that asked for this key has been revoked since: it can no longer be approved' });
     }

@@ -9869,54 +9869,62 @@ app.get('/api/fleet/:slug/board', (req, res) => {
   });
 });
 
-// POST /api/fleet/:slug/board/:project/operators — add an operator DID (fleet owner/admin)
-app.post('/api/fleet/:slug/board/:project/operators', (req, res) => {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Bearer token required' });
-  const v = identity.verifyTokenStandalone(token);
-  if (!v.valid) return res.status(401).json({ error: v.error });
-  const caller_did = v.decoded.sub;
+// Who may change a project's operators. An operator spends the fleet OWNER's DD (X-DemiPass-Billing project
+// routing, fleet_billing.findProjectForCaller), uncapped, so the token must be live (revocation checked), the owner's
+// own sign-in (never a worker, silicon or fleet-minted token) and at least transact scope (2026-11-14, a defect found
+// in the FLEETGATE facts check: the route checked only the signature and a fleet_members role).
+function operatorAuth(req, res) {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error || 'Bearer token required' }); return null; }
+  if (auth.silicon) { res.status(403).json({ error: "an agent token cannot change a project's operators" }); return null; }
+  const d = auth.decoded || {};
+  if (billing.checkTokenRevocation(db, d).revoked) { res.status(401).json({ error: 'token revoked' }); return null; }
+  if (d.wrk || d.auth_method === 'worker' || d.auth_method === 'fleet_owner_mint') { res.status(403).json({ error: "only the owner's own sign-in can change a project's operators" }); return null; }
+  if (!identity.scopeAtLeast(d.scope || 'read', 'transact')) { res.status(403).json({ error: `scope '${d.scope || 'read'}' insufficient`, required_scope: 'transact' }); return null; }
+  const fleet = db.prepare('SELECT id, slug, owner_did FROM fleets WHERE slug = ?').get(req.params.slug);
+  if (!fleet) { res.status(404).json({ error: 'fleet not found' }); return null; }
+  return { auth, did: auth.did, fleet };
+}
 
+// POST /api/fleet/:slug/board/:project/operators — add an operator DID. The fleet OWNER only (an operator spends the
+// owner's DD), with the owner's PIN (intent project-operator:<project id>: one use, within the PIN's minute).
+app.post('/api/fleet/:slug/board/:project/operators', rateLimitStandard, (req, res) => {
+  const a = operatorAuth(req, res); if (!a) return;
+  if (a.fleet.owner_did !== a.did) return res.status(403).json({ error: "only the fleet's owner can add an operator: an operator spends the owner's DD" });
   const { operator_did } = req.body || {};
-  if (!operator_did) return res.status(400).json({ error: 'operator_did required' });
-
-  const fleet = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(req.params.slug);
-  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
-
-  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
-  if (!membership || !['owner', 'admin'].includes(membership.role)) {
-    return res.status(403).json({ error: 'owner or admin role required' });
-  }
-
-  const project = db.prepare('SELECT id FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(fleet.id, req.params.project);
+  if (typeof operator_did !== 'string' || !operator_did || operator_did.length > 200) return res.status(400).json({ error: 'operator_did required' });
+  const w = db.prepare('SELECT did, status FROM identity_wallets WHERE did = ?').get(operator_did);
+  if (!w) return res.status(404).json({ error: 'operator_did is not a wallet' });
+  if (['suspended', 'closed', 'deleted'].includes(w.status)) return res.status(409).json({ error: `that wallet is ${w.status}` });   // active and founder wallets are live
+  if (operator_did === a.did) return res.status(400).json({ error: 'the owner already pays for their own calls' });
+  const project = db.prepare('SELECT id, project FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(a.fleet.id, req.params.project);
   if (!project) return res.status(404).json({ error: 'project not found on this fleet board' });
-
+  if (db.prepare('SELECT 1 FROM fleet_project_operators WHERE project_id = ? AND operator_did = ?').get(project.id, operator_did)) return res.json({ ok: true, already: true });
+  const intent = `project-operator:${project.id}`;
+  if (!gateFresh(a.did, 'pin', a.auth, intent)) {
+    return res.status(403).json({ ...gateMissing('project-operator', ['pin'], ['pin'], intent), error: `an operator of ${project.project} spends your DD: adding one takes your PIN` });
+  }
+  const refused = spendSingleUse(a.did, 'project-operator', ['pin'], a.auth, intent);
+  if (refused) return res.status(refused.status || 403).json(refused);
   try {
     db.prepare('INSERT OR IGNORE INTO fleet_project_operators (project_id, operator_did) VALUES (?, ?)').run(project.id, operator_did);
     db.prepare("UPDATE fleet_projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(project.id);
+    logSecurityEvent('project_operator_added', 'info', { caller_did: a.did, capability: 'project-operator', target: project.project, ip: req.ip, context: { fleet: a.fleet.slug, operator_did } });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// DELETE /api/fleet/:slug/board/:project/operators/:did — remove an operator DID (fleet owner/admin)
-app.delete('/api/fleet/:slug/board/:project/operators/:did', (req, res) => {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'Bearer token required' });
-  const v = identity.verifyTokenStandalone(token);
-  if (!v.valid) return res.status(401).json({ error: v.error });
-  const caller_did = v.decoded.sub;
-
-  const fleet = db.prepare('SELECT id FROM fleets WHERE slug = ?').get(req.params.slug);
-  if (!fleet) return res.status(404).json({ error: 'fleet not found' });
-  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(fleet.id, caller_did);
-  if (!membership || !['owner', 'admin'].includes(membership.role)) {
+// DELETE /api/fleet/:slug/board/:project/operators/:did — remove an operator DID. Removing narrows who spends the
+// owner's DD, so no PIN; still a live, non-agent token of the owner or a fleet admin.
+app.delete('/api/fleet/:slug/board/:project/operators/:did', rateLimitStandard, (req, res) => {
+  const a = operatorAuth(req, res); if (!a) return;
+  const membership = db.prepare('SELECT role FROM fleet_members WHERE fleet_id = ? AND member_did = ?').get(a.fleet.id, a.did);
+  if (a.fleet.owner_did !== a.did && !(membership && ['owner', 'admin'].includes(membership.role))) {
     return res.status(403).json({ error: 'owner or admin role required' });
   }
-  const project = db.prepare('SELECT id FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(fleet.id, req.params.project);
+  const project = db.prepare('SELECT id FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(a.fleet.id, req.params.project);
   if (!project) return res.status(404).json({ error: 'project not found' });
 
   db.prepare('DELETE FROM fleet_project_operators WHERE project_id = ? AND operator_did = ?').run(project.id, req.params.did);
@@ -14982,7 +14990,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
