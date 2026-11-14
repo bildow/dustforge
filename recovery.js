@@ -146,7 +146,7 @@ module.exports = function registerRecovery(deps) {
   // ── guardians ──────────────────────────────────────────────────────────────────────────────────────────────────
   function guardianAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) { res.status(403).json({ error: 'guardians decide in the app, not with an agent token' }); return null; }
     return auth;
   }

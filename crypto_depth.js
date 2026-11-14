@@ -184,7 +184,7 @@ module.exports = function registerCryptoDepth(deps) {
   // ── routes ──────────────────────────────────────────────────────────────────────────────────────────────────────
   function ownerAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) { res.status(403).json({ error: 'only the owner, in their own session' }); return null; }
     if (!gateSession(auth)) { res.status(403).json({ error: 'sign in again' }); return null; }
     return auth;
@@ -220,7 +220,7 @@ module.exports = function registerCryptoDepth(deps) {
 
   // GET /api/blindkey/wrap — the owner's wrap keys, and which elevated/critical secrets are wrapped or not yet.
   app.get('/api/blindkey/wrap', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const keys = activeWrapKeys(auth.did).map(k => ({ device_id: k.device_id, fp: k.fp.slice(0, 16), enrolled_at: k.enrolled_at,
       wrapped_secrets: db.prepare('SELECT COUNT(*) AS n FROM secret_wraps WHERE key_fp = ?').get(k.fp).n }));
     const secrets = db.prepare("SELECT id, name, ref_code, security_depth, wrap_state FROM blindkey_secrets WHERE did = ? AND status = 'active' AND security_depth IN ('elevated','critical')").all(auth.did)

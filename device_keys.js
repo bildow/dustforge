@@ -76,7 +76,7 @@ module.exports = function registerDeviceKeys(deps) {
 
   function personAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (isAgent(auth)) { res.status(403).json({ error: 'device keys belong to the owner\'s phone, not to an agent token' }); return null; }
     if (!gateSession(auth)) { res.status(403).json({ error: 'sign in again' }); return null; }
     return auth;
@@ -301,7 +301,7 @@ module.exports = function registerDeviceKeys(deps) {
 
   // GET /api/identity/devices — linked phones, and phones waiting to be linked (E1).
   app.get('/api/identity/devices', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const rows = db.prepare("SELECT device_id, label, MIN(enrolled_at) AS enrolled_at, MAX(last_used_at) AS last_used_at FROM device_keys WHERE did = ? AND revoked_at IS NULL GROUP BY device_id, label ORDER BY enrolled_at").all(auth.did);
     const H = holds();
     const pending = H && !auth.silicon ? H.openHolds(auth.did, 'enrol').map(h => { let p = {}; try { p = JSON.parse(h.payload); } catch (_) {} return { device_id: p.device_id, label: p.label, hold_id: h.id, active_at: h.ready_at }; }) : [];
@@ -365,7 +365,7 @@ module.exports = function registerDeviceKeys(deps) {
 
   // GET/PUT /api/identity/lock — the dormancy setting. Shortening is free; lengthening takes the PIN (lock-setting:0).
   app.get('/api/identity/lock', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     res.json({ ok: true, lock_after_sec: lockAfter(auth.did), min: LOCK_MIN, max: LOCK_MAX, unlocked: unlockFresh(auth) });
   });
   app.put('/api/identity/lock', rateLimitStandard, (req, res) => {
@@ -390,7 +390,7 @@ module.exports = function registerDeviceKeys(deps) {
   });
   // POST /api/identity/lock/now — lock this session at once (the app's lock button, or idle timeout).
   app.post('/api/identity/lock/now', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     db.prepare('DELETE FROM session_unlocks WHERE session = ?').run(gateSession(auth) || '');
     res.json({ ok: true, unlocked: false });
   });

@@ -37,7 +37,7 @@ module.exports = function registerGuardians(deps) {
   // The owner's or guardian's own sign-in (not an agent), a PIN set. Returns auth or null (answer sent).
   function personAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint')) || isAgentWallet(auth.did)) {
       res.status(403).json({ error: 'guardians are set and accepted by the person, in the app' }); return null;
     }
@@ -81,7 +81,7 @@ module.exports = function registerGuardians(deps) {
 
   // GET /api/identity/guardians — mine (names and states) and the people I guard (owner names only).
   app.get('/api/identity/guardians', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     if (auth.silicon) return res.json({ ok: true, guardians: [], guarding: [] });
     const mine = db.prepare("SELECT id, guardian_did, status, change_id, invited_at, accepted_at FROM recovery_guardians WHERE owner_did = ? AND status IN ('invited', 'accepted', 'active') ORDER BY id").all(auth.did);
     const theirs = db.prepare("SELECT id, owner_did, status, change_id, invited_at FROM recovery_guardians WHERE guardian_did = ? AND status IN ('invited', 'accepted', 'active') ORDER BY id").all(auth.did);

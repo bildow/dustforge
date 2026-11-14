@@ -268,7 +268,7 @@ module.exports = function registerServiceTenants(deps) {
   // tokens share their parent's DID, so neither is locked to the wallet that would pay: refused here.
   function walletAuth(req, res, { minScope = 'transact' } = {}) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker'))) {
       res.status(403).json({ error: "a service call takes a wallet's own token (silicon: and worker tokens act for another wallet)" }); return null;
     }

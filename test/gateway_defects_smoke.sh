@@ -44,7 +44,9 @@ PIN(){ call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","int
 call GET /api/identity/ledger "$A"; [ "$CODE" = 200 ] && ok "a live token works" || fail "baseline: $CODE $BODY"
 X "ALTER TABLE token_revocations RENAME TO token_revocations_away"
 call GET /api/identity/ledger "$A"
-[ "$CODE" = 401 ] && echo "$BODY" | grep -q "could not be checked" && ok "while the revocation lookup fails, the token is refused (fails closed; was: let through)" || fail "G2 open: $CODE $BODY"
+[ "$CODE" = 503 ] && [ "$(echo "$BODY" | J code)" = unavailable ] && ok "while the revocation lookup fails, the token is refused with 503 {code: unavailable} (fails closed; was: let through)" || fail "G2 open: $CODE $BODY"
+call GET /api/fleets/mine "$A"; [ "$CODE" = 503 ] && [ "$(echo "$BODY" | J code)" = unavailable ] && ok "…on fleet routes too (503 unavailable, not 401 revoked)" || fail "fleet route: $CODE $BODY"
+call GET "/api/identity/balance?did=$(Q "SELECT did FROM identity_wallets WHERE username='owner-a'")" "$A"; [ "$CODE" = 503 ] && ok "…and a private read answers 503, not 'private' as if signed out" || fail "privacy: $CODE $BODY"
 grep -q "\[revocation\] lookup failed" "$S/server.log" && ok "…and the server logs it" || fail "no log line"
 # A lookup failure is never written down as a revocation (review M1): a pending delivery-key ask survives a sweep that
 # runs while the lookup fails (the unauthenticated pickup route runs the sweep).
@@ -76,7 +78,7 @@ WK=$(curl -s -X POST "$API/api/silicons/workers" -H 'content-type: application/j
 [ -n "$WK" ] && { ADD "$WK" "$C"; [ "$CODE" = 403 ] && [ "$(OPS)" = 0 ] && ok "the owner's worker token → 403 (was: accepted)" || fail "worker: $CODE $BODY"; } || fail "could not mint a worker"
 RV=$(login owner-a); RJ=$(python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["jti"])' "$RV")
 call POST /api/identity/tokens/revoke "$RV" '{"jti":"'$RJ'"}'; [ "$CODE" = 200 ] || fail "revoke: $CODE $BODY"
-ADD "$RV" "$C"; [ "$CODE" = 401 ] && [ "$(OPS)" = 0 ] && ok "a revoked owner token → 401 (was: accepted)" || fail "revoked: $CODE $BODY"
+ADD "$RV" "$C"; [ "$CODE" = 401 ] && [ "$(echo "$BODY" | J code)" != unavailable ] && [ "$(OPS)" = 0 ] && ok "a revoked owner token → 401, no 'unavailable' code: a real revocation reads differently from an outage (was: accepted)" || fail "revoked: $CODE $BODY"
 PIN "project-operator:$PID"; [ "$CODE" = 200 ] || fail "pin verify: $CODE $BODY"
 ADD "$A" "$C"; [ "$CODE" = 200 ] && [ "$(OPS)" = 1 ] && ok "the owner with a fresh PIN for this grant → added" || fail "with pin: $CODE $BODY"
 ADD "$A" "$BD"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q '"missing":\["pin"\]' && [ "$(OPS)" = 1 ] && ok "the PIN opens one grant: the next operator asks again" || fail "pin reuse: $CODE $BODY"

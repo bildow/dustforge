@@ -69,7 +69,7 @@ module.exports = function registerPairing(deps) {
   // A person's own wallet token, with a PIN set. Returns { auth, wallet } or null (answer sent).
   function personAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) {
       res.status(403).json({ error: "pairing in person needs the wallet's own sign-in" }); return null;
     }
@@ -163,7 +163,7 @@ module.exports = function registerPairing(deps) {
   // ── state, for either side (the screen polls it) ────────────────────────────────────────────────────────────────
   app.get('/api/network/pair/:id', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     expireOld();
     const row = rowFor(req, res, auth.did); if (!row) return;
     res.json({ ok: true, ...view(row, auth.did) });
@@ -231,7 +231,7 @@ module.exports = function registerPairing(deps) {
   // ── cancel: either side, any time before both confirmed (the codes differ, wrong person, changed mind) ──────────
   app.post('/api/network/pair/:id/cancel', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const row = rowFor(req, res, auth.did); if (!row) return;
     const n = db.prepare("UPDATE contact_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = ?, code = NULL WHERE id = ? AND status IN ('open','joined')")
       .run(nowIso(), auth.did, row.id).changes;
@@ -343,7 +343,7 @@ module.exports = function registerPairing(deps) {
   // GET /api/network/vouches — introductions you made or that name you.
   app.get('/api/network/vouches', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     expireVouches();
     const rows = db.prepare('SELECT * FROM contact_vouches WHERE voucher_did = ? OR did_a = ? OR did_b = ? ORDER BY id DESC LIMIT 100').all(auth.did, auth.did, auth.did);
     const v = rows.map(r => vouchView(r, auth.did));
@@ -405,7 +405,7 @@ module.exports = function registerPairing(deps) {
   // POST /api/network/vouches/:id/decline — either introduced person declines; the voucher withdraws. No PIN.
   app.post('/api/network/vouches/:id/decline', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const v = vouchFor(req, res, auth.did); if (!v) return;
     const st = auth.did === v.voucher_did ? 'withdrawn' : 'declined';
     const n = db.prepare("UPDATE contact_vouches SET status = ?, decided_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'").run(st, nowIso(), auth.did, v.id).changes;

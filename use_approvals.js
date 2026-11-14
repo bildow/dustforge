@@ -407,7 +407,7 @@ module.exports = function registerUseApprovals(deps) {
   const isAgentAuth = (auth) => !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint')));
   function ownerAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) { res.status(403).json({ error: 'approvals are decided by the owner in their own session, not by an agent token' }); return null; }
     if (!gateSession(auth)) { res.status(403).json({ error: 'this token cannot hold a session — sign in again' }); return null; }
     return auth;
@@ -422,7 +422,7 @@ module.exports = function registerUseApprovals(deps) {
   // GET /api/blindkey/approvals — incoming (waiting on you), outgoing (yours), recent (decided, both sides): the audit.
   app.get('/api/blindkey/approvals', rateLimitFill || rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     expireOld();
     const incoming = db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status = 'pending' ORDER BY id DESC LIMIT 50").all(auth.did);
     const outgoing = db.prepare("SELECT * FROM use_approvals WHERE requester_did = ? ORDER BY id DESC LIMIT 20").all(auth.did);
@@ -443,7 +443,7 @@ module.exports = function registerUseApprovals(deps) {
   // GET /api/blindkey/approvals/:id — status for the owner or the requester (never a code).
   app.get('/api/blindkey/approvals/:id', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     expireOld();
     const id = Number(req.params.id);
     const row = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id) : null;
