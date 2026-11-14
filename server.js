@@ -192,9 +192,15 @@ function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } 
   // command that called this API back (the deploy leak gate's scan, a scan-token claim) deadlocked until the kill.
   // Resolves with stdout; rejects with { stdout, stderr, status } as execFileSync threw (status 255 is ssh's own).
   return new Promise((resolve, reject) => {
+    // The stored password is the only way in (#111 review M2): ssh tries public keys first by default — this server's
+    // own (~/.ssh/id_*, an agent) — and a key a target accepts would log in as whatever user the caller names, the
+    // stored password unused, its rotation or removal cutting nothing; an authorized_keys command= would run, too.
+    const { SSH_AUTH_SOCK, ...env } = process.env;   // eslint-disable-line no-unused-vars
     const child = require('child_process').spawn('sshpass',
-      ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '--', `${user}@${host}`, remoteCommand],
-      { env: { ...process.env, SSHPASS: password }, stdio: ['pipe', 'pipe', 'pipe'] });
+      ['-e', 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
+        '-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password,keyboard-interactive', '-o', 'GSSAPIAuthentication=no',
+        '--', `${user}@${host}`, remoteCommand],
+      { env: { ...env, SSHPASS: password }, stdio: ['pipe', 'pipe', 'pipe'] });
     const MAX = 1024 * 1024, out = [], err = [];
     let outLen = 0, errLen = 0, why = null, settled = false, hard = null;
     // SIGTERM, then SIGKILL 5 s later; and the promise settles by then whatever the child does (#58 review L1).
