@@ -51,6 +51,10 @@ if command -v tailscale >/dev/null; then
   [[ "$prefs" =~ \"RunSSH\":[[:space:]]*true ]] && fail "Tailscale SSH is on: tailnet port 22 would bypass sshd"
 fi
 echo "tailscale: kernel interface present, Tailscale SSH off"
+# Forwarding goes off for everyone: a remote forward in use today shows as an sshd-owned listener other than :22.
+fwd=$(ss -ltnpH 2>/dev/null | awk '/"sshd/ && $4 !~ /:22$/ {print $4}' | sort -u | tr '\n' ' ')
+[ -z "$fwd" ] || fail "sshd holds forwarded listeners ($fwd): someone tunnels through this box today; DisableForwarding would cut them"
+echo "forwarding: no sshd-held listener besides :22"
 # Who logs in by password today: auth.log, else the journal (Debian 12 / no rsyslog); neither readable → refuse.
 LOGS=""
 if ls /var/log/auth.log* >/dev/null 2>&1; then LOGS=$(zcat -f /var/log/auth.log* 2>/dev/null || true); SRC=auth.log

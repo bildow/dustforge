@@ -69,8 +69,8 @@ const BLINDKEY_SSH_HOSTS = new Set([
 // only, where one sshd Match allows root's password (ops/root-lane/). Loopback is never in the host set: every wallet
 // could then try passwords against this box's accounts from 127.0.0.1, which fail2ban does not ban. Only this alias
 // reaches it, only in the /use token path, and only for the root lane's owner in their own session, with the entry
-// wrapped to their phone (each call a tap) and logging in as root by password alone. SELF_SSH_ALIAS is declared above
-// the host set, which uses isSelfHostName while it is built.
+// wrapped to their phone (each call a tap) and logging in as root by password alone. SELF_SSH_ALIAS and SELF_ADDRESSES
+// are declared above the host set, which calls extraSshHostOk while it is built.
 // Aaron's wallet. The environment (root-only on the host) may name another one: the smoke tests do.
 const ROOT_LANE_OWNER_DID = process.env.DUSTFORGE_ROOT_LANE_OWNER_DID || 'did:key:u7QGkcLsNaXM-_aJLhtMuNwfZT4xDl23kZFohcAfOHfwEQg';
 function extraSshHostOk(h) {   // SELF_ADDRESSES is declared above the host set, which calls this while it is built
@@ -13456,11 +13456,17 @@ app.post('/api/blindkey/operator-act', rateLimitStandard, (req, res) => {
   if (companions_sha256 !== undefined && (!Array.isArray(companions_sha256) || companions_sha256.length > 4 || companions_sha256.some(h => typeof h !== 'string' || !/^[0-9a-f]{64}$/.test(h)))) return res.status(400).json({ error: 'companions_sha256: up to 4 sha256s of the scripts it runs' });
   // The purpose is part of what is approved (the card shows it): bound, recorded, never free text beside the binding.
   if (purpose !== undefined && (typeof purpose !== 'string' || purpose.length > 200)) return res.status(400).json({ error: 'purpose: at most 200 characters' });
-  const name = OPERATOR_ACT_HOSTS[host], companions = companions_sha256 || [], why = purpose || '';
+  // The root-lane apply runs two scripts in turn (confirm.sh, rollback.sh), as root too: both are approved with it.
+  if (/\/ops\/root-lane\/apply\.sh$/.test(script_path) && (!Array.isArray(companions_sha256) || companions_sha256.length !== 2)) return res.status(400).json({ error: 'companions_sha256: the sha256s of confirm.sh and rollback.sh' });
+  const name = OPERATOR_ACT_HOSTS[host], companions = companions_sha256 || [];
   // Root on a server is critical depth: the PIN on every approval, never a recent unlock (#119 review).
   if (!ownerApproves(req, res, auth.did, 'svc:demipass:operator-act', `Root on ${name}`, 'operator-act', host,
-      { host_name: name, script_path, script_sha256, route, commit, companions_sha256: companions, purpose: why }, { depth: 'critical' })) return;
-  const approvalId = req._approvalId || (req.body && req.body.approval_id) || null;
+      { host_name: name, script_path, script_sha256, route, commit, companions_sha256: companions }, { depth: 'critical' })) return;
+  const approvalId = Number.isInteger(Number(req.body && req.body.approval_id)) ? Number(req.body.approval_id) : null;
+  // The purpose recorded is the one the owner saw on the card when they approved, never the redeeming call's (`purpose`
+  // is not part of the binding: #119 re-review — a card saying "if the lane login fails" could be recorded as anything).
+  let why = '';
+  try { const row = approvalId ? db.prepare('SELECT purpose FROM use_approvals WHERE id = ?').get(approvalId) : null; why = (row && row.purpose) || ''; } catch (_) {}
   logSecurityEvent('operator_act_approved', 'alert', { caller_did: auth.did, capability: 'operator-act', target: host, ip: req.ip, context: { script_path, script_sha256, route, commit, companions_sha256: companions, purpose: why, approval_id: approvalId } });
   try {
     db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')

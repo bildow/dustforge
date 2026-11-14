@@ -184,15 +184,21 @@ echo "$SUM" | grep -q "ops/root-lane/apply.sh as root on racknerd via phasewhip-
 OB=$(WITH "$OA" "$OAP")
 call POST /api/demipass/operator-act "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["script_sha256"]="0"*64; print(json.dumps(b))' "$OB")"
 [ "$CODE" != 200 ] && ok "an approval id redeemed with another sha256 does not pass ($CODE)" || fail "oa swap: $CODE $BODY"
-for f in '"purpose":"dry run only"' '"commit":"'"$(printf '1%.0s' {1..40})"'"' '"companions_sha256":[]'; do
+for f in '"commit":"'"$(printf '1%.0s' {1..40})"'"' '"companions_sha256":["'$SR'","'$SC'"]'; do
   call POST /api/demipass/operator-act "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b.update(json.loads("{"+sys.argv[2]+"}")); print(json.dumps(b))' "$OB" "$f")"
-  [ "$CODE" != 200 ] || fail "oa swap $f passed"
+  [ "$CODE" = 409 ] || fail "oa swap $f: $CODE"
 done
-ok "…nor with another purpose, commit or companion list (all bound)"
+ok "…nor with another commit or companion list (409: both bound)"
+call POST /api/demipass/operator-act "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); del b["companions_sha256"]; print(json.dumps(b))' "$OA")"
+[ "$CODE" = 400 ] && ok "…and the root-lane apply is never approved without its two companion scripts (400)" || fail "oa no companions: $CODE $BODY"
 [ "$(Q "SELECT depth FROM use_approvals WHERE id=$OAP")" = critical ] && ok "…and it is asked at critical depth (the PIN every time)" || fail "oa depth: $(Q "SELECT depth FROM use_approvals WHERE id=$OAP")"
 approve "$OAP"
-call POST /api/demipass/operator-act "$A" "$OB"
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J approved)" = True ] && [ "$(echo "$BODY" | J script_sha256)" = "$SHA" ] && ok "…approved: the answer is the consent record (script, sha256, route)" || fail "oa approved: $CODE $BODY"
+# Redeemed with another purpose (purpose is not part of the binding): the record keeps the one the card showed (#119 re-review).
+call POST /api/demipass/operator-act "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["purpose"]="dry run only - nothing changes"; print(json.dumps(b))' "$OB")"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J approved)" = True ] && [ "$(echo "$BODY" | J script_sha256)" = "$SHA" ] && [ "$(echo "$BODY" | J purpose)" = "if the lane login fails" ] \
+  && ok "…approved: the answer is the consent record (script, sha256, route, commit), with the purpose the card showed" || fail "oa approved: $CODE $BODY"
+T=$(Q "SELECT note FROM ticks WHERE note LIKE 'Operator act approved%' ORDER BY id DESC LIMIT 1")
+echo "$T" | grep -q "if the lane login fails" && ! echo "$T" | grep -q "dry run" && ok "…and the ledger tick records the card's purpose, not the redeeming call's" || fail "oa tick: $T"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='operator_act_approved'")" = 1 ] && ok "…logged once as a security event" || fail "oa event"
 call POST /api/demipass/operator-act "$A" "$OB"; [ "$CODE" != 200 ] && ok "…and the approval is spent ($CODE on reuse)" || fail "oa reuse: $CODE"
 
