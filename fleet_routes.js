@@ -579,10 +579,13 @@ module.exports = function registerFleetRoutes(deps) {
   });
   // Daily spend per wallet (calls, DD, by action), from each wallet's ledger. The fleet OWNER only: like
   // /api/identity/transactions, a ledger is shown to the wallet's carbon (an active silicon of this fleet) and, for a
-  // project wallet, to the owner who made it (fleet_projects.owner_did = the fleet owner). ?wallets=mci,brain,bench
+  // project wallet, to the fleet that made it (projectWalletOwned). ?wallets=mci,brain,bench
   // (silicon handles or project names; default all), ?days=1..31 (default 7).
+  const DAILY_SPEND_MAX_WALLETS = 50;
   app.get('/api/fleet/:slug/spend/daily', rateLimitStandard, (req, res) => {
     const a = fleetAuth(req, res, { roles: ['owner'] }); if (!a) return;
+    // A worker acts as its wallet but reads no ledger (as /api/identity/transactions, #72 review).
+    if (a.decoded.wrk || a.decoded.auth_method === 'worker') return res.status(403).json({ error: 'a worker token cannot read ledgers; sign in as the owner' });
     const days = Math.min(fb.DAILY_SPEND_MAX_DAYS, Math.max(1, parseInt(req.query.days, 10) || 7));
     const want = typeof req.query.wallets === 'string' && req.query.wallets.trim()
       ? [...new Set(req.query.wallets.split(',').map(x => x.trim().replace(/^@/, '')).filter(Boolean))].slice(0, 50) : null;
@@ -592,11 +595,15 @@ module.exports = function registerFleetRoutes(deps) {
       if (seen.has(s.member_did) || (want && !want.includes(s.handle))) continue;
       seen.add(s.member_did); wallets.push({ name: s.handle, kind: 'silicon', did: s.member_did });
     }
-    for (const p of db.prepare('SELECT project, wallet_did FROM fleet_projects WHERE fleet_id = ? AND owner_did = ? ORDER BY project').all(a.fleet.id, a.fleet.owner_did)) {
+    // Project wallets this fleet made (the board's minted project-<name> wallet, or one in wallet_creators): never a
+    // wallet that is someone's own account, and never the owner's own wallet.
+    for (const p of db.prepare('SELECT project, owner_did, wallet_did FROM fleet_projects WHERE fleet_id = ? ORDER BY project').all(a.fleet.id)) {
       if (!p.wallet_did || seen.has(p.wallet_did) || (want && !want.includes(p.project))) continue;
+      if (!fb.projectWalletOwned(db, a.fleet, p)) continue;
       seen.add(p.wallet_did); wallets.push({ name: p.project, kind: 'project', did: p.wallet_did });
     }
     if (want) wallets.sort((x, y) => want.indexOf(x.name) - want.indexOf(y.name));
+    wallets.splice(DAILY_SPEND_MAX_WALLETS);
     const found = new Set(wallets.map(w => w.name));
     let since = null;
     const out = wallets.map(w => { const r = fb.dailySpend(db, w.did, days); since = r.since; return { ...w, days: r.days }; });

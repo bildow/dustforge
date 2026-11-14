@@ -1122,15 +1122,15 @@ async function loadFleet(){
   }catch(e){if(!sessionEnded(e))el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 // One line per wallet per day: calls, DD, then each action's calls and DD (UTC days, last 7).
-let spendAll=false;
+let spendAll=false, spendSeq=0;
 const SPEND_WALLETS='mci,brain,bench';
 async function loadDailySpend(){
   const box=document.getElementById('fleet-spend'); if(!box||!fleetSlug)return;
   const t=document.getElementById('spend-toggle'); if(t)t.textContent=spendAll?'mci · brain · bench':'all wallets';
-  const epoch=sessionEpoch;
+  const epoch=sessionEpoch, seq=++spendSeq;   // only the latest request draws (a quick toggle or reload starts more)
   try{
     const r=await api('GET','/api/fleet/'+encodeURIComponent(fleetSlug)+'/spend/daily?days=7'+(spendAll?'':'&wallets='+SPEND_WALLETS));
-    if(epoch!==sessionEpoch)return;
+    if(epoch!==sessionEpoch||seq!==spendSeq)return;
     let h='';
     for(const w of r.wallets||[]){
       h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.7rem 1rem;margin-bottom:0.5rem">';
@@ -1144,9 +1144,9 @@ async function loadDailySpend(){
     }
     if(r.not_found&&r.not_found.length)h+='<div style="font-size:0.68rem;color:var(--text3)">not in this fleet: '+esc(r.not_found.join(', '))+'</div>';
     if(!h)h='<div class="empty" style="font-size:0.75rem">No wallets to show.</div>';
-    h+='<div style="font-size:0.65rem;color:var(--text3);margin:0.2rem 0 0.5rem">calls/DD per action, UTC days; refunds netted; transfers and refills are not spend.</div>';
+    h+='<div style="font-size:0.65rem;color:var(--text3);margin:0.2rem 0 0.5rem">calls/DD per action, UTC days; a refund nets on the day it is made; transfers and refills are not spend.</div>';
     box.innerHTML=h;
-  }catch(e){ if(!sessionEnded(e)) box.innerHTML='<div class="empty" style="font-size:0.75rem">'+esc(e.message)+'</div>'; }
+  }catch(e){ if(!sessionEnded(e)&&seq===spendSeq) box.innerHTML='<div class="empty" style="font-size:0.75rem">'+esc(e.message)+'</div>'; }
 }
 function workLinkRow(l,tick){
   const live=l.status==='active';

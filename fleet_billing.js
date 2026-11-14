@@ -1190,8 +1190,12 @@ function tokenWarningEmail({ silicon, token }) {
 // funding, escrow) is not spend. Days are UTC. Actions: a /use is `use`; a service charge is `<tenant>/<action>` and a
 // meter charge `meter:<tenant>/<sku>` (read from the row's description, which the server writes); anything else is
 // the ledger type. A refund row counts against its action: its DD comes back and the call is counted as refunded.
+// A refund counts on the day it was written (a call refunded after UTC midnight nets into the next day). A chargeback
+// clawback is not spend, and neither is the refund of a movement (an escrow or provisioning coming back).
 const NOT_SPEND_TYPES = ['transfer_out', 'fleet_transfer_refill_out', 'fleet_project_removed_transfer_out', 'fleet_fund',
-  'escrow_lock', 'fleet_provision', 'fleet_bulk_provision'];
+  'escrow_lock', 'fleet_provision', 'fleet_bulk_provision', 'clawback_evaporation'];
+// Movements coming back (an escrow released, a bulk provisioning undone) are not refunds of spend.
+const NOT_SPEND_REFUND_TYPES = ['escrow_refund', 'fleet_bulk_provision_refund'];
 const DAILY_SPEND_MAX_DAYS = 31;
 function dailySpend(db, did, days = 7) {
   const n = Math.min(DAILY_SPEND_MAX_DAYS, Math.max(1, parseInt(days, 10) || 7));
@@ -1213,8 +1217,8 @@ function dailySpend(db, did, days = 7) {
     FROM identity_transactions
     WHERE did = ? AND date(created_at) >= ?
       AND ((amount_cents < 0 AND type NOT IN (${NOT_SPEND_TYPES.map(() => '?').join(',')}))
-           OR (amount_cents > 0 AND substr(type, -7) = '_refund'))
-    GROUP BY day, action ORDER BY day DESC, dd DESC`).all(did, since, ...NOT_SPEND_TYPES);
+           OR (amount_cents > 0 AND substr(type, -7) = '_refund' AND type NOT IN (${NOT_SPEND_REFUND_TYPES.map(() => '?').join(',')})))
+    GROUP BY day, action ORDER BY day DESC, dd DESC`).all(did, since, ...NOT_SPEND_TYPES, ...NOT_SPEND_REFUND_TYPES);
   const byDay = new Map();
   for (const r of rows) {
     const d = byDay.get(r.day) || { date: r.day, calls: 0, refunded: 0, dd: 0, by_action: {} };
@@ -1226,7 +1230,7 @@ function dailySpend(db, did, days = 7) {
 }
 
 module.exports = {
-  dailySpend, NOT_SPEND_TYPES, DAILY_SPEND_MAX_DAYS,
+  dailySpend, NOT_SPEND_TYPES, NOT_SPEND_REFUND_TYPES, DAILY_SPEND_MAX_DAYS,
   ownedOutright, fleetExitRefusal, endOwnerDelegations, creatorOf, operatorGrantAllowed, OWNER_REFILL_MAX,
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken, awaitingPickup, deliveryKeyFingerprint, deliveryKeyView, setAskRevokedCheck,
