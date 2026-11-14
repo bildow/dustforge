@@ -13382,7 +13382,7 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
   const actor = getDemiPassActor(req, res);
   if (!actor.ok) return;
 
-  const { ref, target_host, target_user, reason } = req.body || {};
+  const { ref, target_host, target_user, reason, context } = req.body || {};
   if (!ref) return res.status(400).json({ error: 'ref (current ref code) required' });
   if (!target_host) return res.status(400).json({ error: 'target_host required' });
 
@@ -13445,7 +13445,12 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     // An agent's grant limited to one scope rotates only within it.
     const grantCtx = viaDelegation && viaDelegation.context_id != null ? db.prepare('SELECT context_name FROM blindkey_contexts WHERE id = ?').get(viaDelegation.context_id) : null;
     if (viaDelegation && viaDelegation.context_id != null && !grantCtx) return res.status(403).json({ error: "the scope of this agent's grant no longer exists" });
-    const picked = grantCtx ? { context: grantCtx.context_name } : soleContext(secret, { action: 'ssh_exec', targetHost: target_host });
+    // The caller may name the scope (the refusal below asks for one when a secret has several ssh_exec contexts; the
+    // route used to ignore it, so such a secret could not be rotated at all — skypie-sudo, 2026-11-14). A grant pinned
+    // to one scope rotates only within it. enforceBlindkeyContext still checks the named scope's action and host.
+    const asked = typeof context === 'string' && context ? context.slice(0, 100) : null;
+    if (grantCtx && asked && asked !== grantCtx.context_name) return res.status(403).json({ error: `this agent's grant covers only the '${grantCtx.context_name}' scope` });
+    const picked = grantCtx ? { context: grantCtx.context_name } : asked ? { context: asked } : soleContext(secret, { action: 'ssh_exec', targetHost: target_host });
     const chk = enforceBlindkeyContext(secret, picked.context, 'ssh_exec', null, typeof target_host === 'string' ? target_host : null);
     if (!chk.allowed) {
       logSecurityEvent('rotate_scope_denied', 'alert', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), ip: req.ip, error: chk.error, context: { secret: secret.name } });
