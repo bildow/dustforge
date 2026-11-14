@@ -61,6 +61,11 @@ for (const [name, ref, acct] of [["box", "DP-PWD-box-0001", "deploy"], ["laptop"
   const sid = db.prepare("SELECT id FROM blindkey_secrets WHERE ref_code = ?").get(ref).id;
   db.prepare("INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, ?, ?, ?, ?, ?)").run(sid, "default", "ssh_exec", "*", "100.83.112.88", dids.owner);
 }
+// "twin": two ssh_exec scopes that both cover the host (as skypie-sudo had: default + ssh_exec-<host>), so the scope is
+// ambiguous unless the caller names one.
+db.prepare("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, status, ref_code, account_username) VALUES (?, ?, ?, ?, ?, ?, ?)").run(dids.owner, "twin", "password", seal("twinpass-1"), "active", "DP-PWD-twin-0001", "aaron");
+{ const tw = db.prepare("SELECT id FROM blindkey_secrets WHERE ref_code = ?").get("DP-PWD-twin-0001").id;
+  for (const cn of ["default", "ssh_exec-100.83.112.88"]) db.prepare("INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES (?, ?, ?, ?, ?, ?)").run(tw, cn, "ssh_exec", "*", "100.83.112.88", dids.owner); }
 const box = db.prepare("SELECT id FROM blindkey_secrets WHERE ref_code = ?").get("DP-PWD-box-0001").id;
 // An outside agent holding a delegation (made as the PIN path would): it never gets rotation.
 db.prepare("INSERT INTO demipass_delegations (owner_did, delegate_did, secret_id) VALUES (?, ?, ?)").run(dids.owner, dids.outsider, box);
@@ -142,6 +147,15 @@ ROT "$O" DP-PWD-laptop-0001 aaron
 [ "$CODE" = 202 ] && ok "the owner's wallet token alone does not rotate the login: 202, an approval request" || fail "owner unapproved: $CODE $BODY"
 APPROVED POST /api/demipass/rotate-blind '{"ref":"DP-PWD-laptop-0001","target_host":"100.83.112.88","target_user":"aaron"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J rotated_by)" = owner ] && ok "…approved in the app: the owner's login is rotated" || fail "owner: $CODE $BODY"
+# Two scopes cover the host: the owner names one (2026-11-14: the refusal asked for a context the route never read)
+call POST /api/demipass/rotate-blind "$O" '{"ref":"DP-PWD-twin-0001","target_host":"100.83.112.88","target_user":"aaron"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q '"contexts":\["default","ssh_exec-100.83.112.88"\]' && ok "two scopes cover the host and none is named: 403 listing the scopes to name" || fail "ambiguous: $CODE $BODY"
+call POST /api/demipass/rotate-blind "$O" '{"ref":"DP-PWD-twin-0001","target_host":"100.83.112.88","target_user":"aaron","context":"nope"}'
+[ "$CODE" = 403 ] && ok "a named scope that does not exist is refused" || fail "bad context: $CODE $BODY"
+call POST /api/demipass/rotate-blind "$O" '{"ref":"DP-PWD-twin-0001","target_host":"100.83.112.88","target_user":"aaron","context":"ssh_exec-100.83.112.88"}'
+[ "$CODE" = 202 ] && ok "naming one of the two scopes passes the scope check and goes to the owner's approval (202; was: impossible)" || fail "named context: $CODE $BODY"
+call POST /api/demipass/rotate-blind "$O" '{"ref":"DP-PWD-twin-0001","target_host":"10.9.9.9","target_user":"aaron","context":"ssh_exec-100.83.112.88"}'
+[ "$CODE" = 403 ] && ok "a named scope still binds the host: another host is refused" || fail "named context, wrong host: $CODE $BODY"
 # M3: a delegate never names the account
 node -e 'const db=new (require("better-sqlite3"))(process.env.DB_PATH); db.prepare("UPDATE blindkey_secrets SET account_username = NULL WHERE ref_code = ?").run(process.argv[1])' "$NEWREF"
 ROT "$A" "$NEWREF" aaron
