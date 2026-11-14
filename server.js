@@ -11665,7 +11665,7 @@ app.get('/api/tick/stats', (req, res) => {
 // GET /api/tick/ledger — member only, read your tick history
 app.get('/api/tick/ledger', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required. Ledger access is a member benefit.' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required. Ledger access is a member benefit.' });
 
   const limit = Math.min(100, Number(req.query.limit) || 50);
   const offset = Number(req.query.offset) || 0;
@@ -11772,7 +11772,7 @@ function summarizePath(method, path, status) {
 // GET /api/ledger — read your auto-ledger (10 DD per page)
 app.get('/api/ledger', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required. Your ledger is a member benefit.' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required. Your ledger is a member benefit.' });
 
   const limit = Math.min(100, Number(req.query.limit) || 50);
   const offset = Number(req.query.offset) || 0;
