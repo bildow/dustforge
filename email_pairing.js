@@ -85,7 +85,7 @@ module.exports = function registerEmailPairing(deps) {
   // A person's own sign-in with a PIN set (as pairing.js). → { auth, wallet } or null (answered).
   function personAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint' || auth.decoded.auth_method === 'worker'))) {
       res.status(403).json({ error: "pairing needs the wallet's own sign-in" }); return null;
     }
@@ -223,14 +223,14 @@ module.exports = function registerEmailPairing(deps) {
   // ── either side: list / state ──────────────────────────────────────────────────────────────────────────────────
   app.get('/api/network/pair/email', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     expireOld();
     const rows = db.prepare("SELECT * FROM email_pairings WHERE (inviter_did = ? OR joiner_did = ?) AND status IN ('sent','joined') ORDER BY created_at DESC LIMIT 20").all(auth.did, auth.did);
     res.json({ ok: true, pairings: rows.map(r => viewFor(r, auth.did)) });
   });
   app.get('/api/network/pair/email/:id', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     expireOld();
     const row = rowFor(req, res, auth.did); if (!row) return;
     res.json({ ok: true, ...viewFor(row, auth.did) });
@@ -293,7 +293,7 @@ module.exports = function registerEmailPairing(deps) {
   // ── either side: cancel ────────────────────────────────────────────────────────────────────────────────────────
   app.post('/api/network/pair/email/:id/cancel', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const row = rowFor(req, res, auth.did); if (!row) return;
     const n = db.prepare("UPDATE email_pairings SET status = 'cancelled', decided_at = ?, cancelled_by = ?, code = NULL WHERE id = ? AND status IN ('sent','joined')").run(nowIso(), auth.did, row.id).changes;
     if (n !== 1) return res.status(409).json({ error: `this pairing is ${db.prepare('SELECT status FROM email_pairings WHERE id = ?').get(row.id).status}` });

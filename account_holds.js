@@ -291,7 +291,7 @@ module.exports = function registerAccountHolds(deps) {
 
   // GET /api/identity/holds — the signed-in owner's open holds (the app's cards). Agents see none.
   app.get('/api/identity/holds', deps.rateLimitStandard, (req, res) => {
-    const auth = deps.getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = deps.getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     if (auth.silicon) return res.json({ ok: true, holds: [] });
     sweep();
     res.json({ ok: true, holds: openHolds(auth.did).map(view), notices: notices(auth.did) });

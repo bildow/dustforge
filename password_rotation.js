@@ -230,7 +230,7 @@ module.exports = function registerPasswordRotation(deps) {
   // ── the route ──────────────────────────────────────────────────────────────────────────────────────────────────
   app.post('/api/identity/password/rotate-blind', rateLimitStrict, async (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const d = auth.decoded || {};
     // The owner's own sign-in only: no agent token of any kind — fleet-minted, worker, silicon, an agent's device login
     // or anything carrying an agent label (#69 review L1).

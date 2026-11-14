@@ -246,7 +246,7 @@ module.exports = function registerSiliconRenew(deps) {
   // ── 1. the agent asks for its delivery key ──────────────────────────────────────────────────────────────────────
   app.post('/api/identity/delivery-key', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const d = auth.decoded || {};
     // A silicon: token acts for its carbon owner, a worker token for a sub-agent, a device login for an agent signed in
     // as a person: none is the wallet itself.
@@ -297,7 +297,7 @@ module.exports = function registerSiliconRenew(deps) {
   // ── the owner's side ────────────────────────────────────────────────────────────────────────────────────────────
   function ownerAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (agentToken(auth)) { res.status(403).json({ error: 'an agent\'s token is renewed by the fleet owner in their own session (not an agent, worker, fleet-minted or device-login token)' }); return null; }
     if (gateSession && !gateSession(auth)) { res.status(403).json({ error: 'sign in again' }); return null; }
     return auth;
@@ -509,7 +509,7 @@ module.exports = function registerSiliconRenew(deps) {
     const h = req.headers.authorization || '';
     const v = h.startsWith('Bearer ') ? identity.verifyTokenStandalone(h.slice(7)) : { valid: false, error: 'Bearer token required' };
     if (!v.valid) return res.status(401).json({ error: v.error });
-    if (billing && billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+    { const dead = billing ? billing.checkTokenRevocation(db, v.decoded) : { revoked: false }; if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
     const used = (req.body || {}).used !== false;
     if (!acknowledge(v.decoded.jti, v.decoded.sub, used)) return res.status(404).json({ error: 'no delivery waiting for this token' });
     res.json({ ok: true, ack: used ? 'used' : 'declined' });

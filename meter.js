@@ -188,7 +188,7 @@ function registerRoutes({ app, db, billing, identity, getBearerIdentity, rateIde
     message: { error: 'Too many meter requests from this address. Try again in a minute.' } });
   function walletAuth(req, res, next) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     if (auth.silicon || (auth.decoded && auth.decoded.wrk)) return res.status(403).json({ error: "only a wallet's own token can use the meter" });
     req.meterAuth = auth;
     next();

@@ -490,7 +490,7 @@ function getBearerIdentity(req) {
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return { ok: false, status: 401, error: v.error };
   const dead = billing.checkTokenRevocation(db, v.decoded);
-  if (dead.revoked) return { ok: false, status: 401, error: dead.reason };
+  if (dead.revoked) return { ok: false, status: billing.revokedStatus(dead), error: dead.reason, ...billing.revokedCode(dead) };
   if (v.decoded.renewed && renewedTokenUsed) renewedTokenUsed(v.decoded);   // an owner-renewed token in use: it was picked up
   const scope = v.decoded.scope || 'read';
   if (!identity.scopeAtLeast(scope, 'transact')) {
@@ -514,7 +514,7 @@ function getReadIdentity(req) {
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return { ok: false, status: 401, error: v.error };
   const dead = billing.checkTokenRevocation(db, v.decoded);
-  if (dead.revoked) return { ok: false, status: 401, error: dead.reason };
+  if (dead.revoked) return { ok: false, status: billing.revokedStatus(dead), error: dead.reason, ...billing.revokedCode(dead) };
   if (v.decoded.renewed && renewedTokenUsed) renewedTokenUsed(v.decoded);
   return { ok: true, did: v.decoded.sub, scope: v.decoded.scope || 'read', decoded: v.decoded, silicon: false };
 }
@@ -538,7 +538,9 @@ function getDemiPassActor(req, res, options = {}) {
     }
   }
   if (res) {
-    if (allowAdmin && ADMIN_API_KEY) {
+    if (auth.code === 'unavailable') {
+      res.status(503).json({ error: auth.error, code: 'unavailable' });   // an outage, not a missing or revoked token
+    } else if (allowAdmin && ADMIN_API_KEY) {
       res.status(403).json({ error: 'admin access or Bearer token required' });
     } else {
       res.status(auth.status || 401).json({ error: auth.error || 'Bearer token required' });
@@ -1498,7 +1500,7 @@ app.post('/api/identity/login-code/verify', rateLimitStrict, (req, res) => {
 // plus what the SMS/phone situation is. Drives the vault app's gate UI.
 app.get('/api/identity/gate/status', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const wallet = db.prepare('SELECT phone, pin_hash, pin_locked_until FROM identity_wallets WHERE did = ?').get(auth.did);
   const fresh = {};
   for (const g of GATE_TYPES) fresh[g] = g === 'pin' ? pinProofPending(auth.did, auth) : gateFresh(auth.did, g, auth);
@@ -1526,7 +1528,7 @@ app.get('/api/identity/gate/status', rateLimitStandard, (req, res) => {
 // silently repoint the second factor.
 app.post('/api/identity/phone', rateLimitStrict, async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const { phone, password } = req.body || {};
   if (!phone || typeof phone !== 'string' || !/^\+[1-9]\d{7,14}$/.test(phone.trim())) {
     return res.status(400).json({ error: 'phone required in E.164 format, e.g. +15551234567' });
@@ -1546,7 +1548,7 @@ app.post('/api/identity/phone', rateLimitStrict, async (req, res) => {
 // POST /api/identity/gate/sms/request — send an SMS code to the stored number.
 app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const wallet = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(auth.did);
   if (!wallet || !wallet.phone) return res.status(400).json({ error: 'no phone on file — set one via POST /api/identity/phone', phone_set: false });
   // Not set up: nothing to send, so no code and no budget spent (#57 review L8).
@@ -1576,7 +1578,7 @@ app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => 
 // Wrong answers are 403, never 401: the vault app reads 401 as an expired session and signs out.
 app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const { gate } = req.body || {};
   // Biometric: the enrolled phone's presence key signs a gate challenge — a PIN proof for that intent (device_keys.js).
   if (gate === 'device') return deviceKeys.verifyDeviceGate(req, res, auth);
@@ -1676,7 +1678,7 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
 //   { gate:'pin', intent[, attempt] }
 app.post('/api/identity/gate/discard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const { gate, intent, attempt } = req.body || {};
   if (gate !== 'pin') return res.status(400).json({ error: "only gate 'pin' proofs can be discarded" });
   if (typeof intent !== 'string' || !PIN_INTENT_RE.test(intent)) return res.status(400).json({ error: 'intent required' });
@@ -1701,7 +1703,7 @@ app.post('/api/identity/gate/discard', rateLimitStandard, (req, res) => {
 //   { pin, password }  |  { pin, current_pin }
 app.post('/api/identity/pin', rateLimitStrict, async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   if (auth.silicon) return res.status(403).json({ error: 'silicon agents cannot set the owner PIN' });
   const { pin, password, current_pin } = req.body || {};
   if (!pinGate.validPin(String(pin ?? ''))) return res.status(400).json({ error: 'pin must be 4 to 8 digits' });
@@ -1872,7 +1874,7 @@ app.post('/api/blindkey/gate-policy', rateLimitStandard, (req, res) => {
 // Older tokens have no jti and are only covered by revoke-all.
 app.get('/api/identity/tokens', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const rows = db.prepare('SELECT jti, scope, issued_at, expires_at, revoked, revoked_at FROM issued_tokens WHERE did = ? ORDER BY issued_at DESC LIMIT 200').all(auth.did);
   const cut = db.prepare('SELECT revoke_before FROM token_revocations WHERE did = ?').get(auth.did);
   res.json({ ok: true, did: auth.did, tokens: rows, revoke_all_before: cut ? cut.revoke_before : null });
@@ -1880,7 +1882,7 @@ app.get('/api/identity/tokens', rateLimitStandard, (req, res) => {
 
 app.post('/api/identity/tokens/revoke', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const { jti } = req.body || {};
   if (!jti) return res.status(400).json({ error: 'jti required' });
   const result = db.prepare("UPDATE issued_tokens SET revoked = 1, revoked_at = datetime('now') WHERE jti = ? AND did = ?").run(jti, auth.did);
@@ -1925,7 +1927,7 @@ function cutSessions(did) {
 
 app.post('/api/identity/tokens/revoke-all', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const now = cutSessions(auth.did);
   res.json({ ok: true, revoke_before: now, warning: 'ALL tokens for this DID issued before now are dead, including the one that made this call. Re-mint via request-2fa + verify.' });
 });
@@ -1955,7 +1957,9 @@ app.get('/api/identity/lookup', rateLimitStandard, (req, res) => {
   let callerDid = null;
   if (bearer) {
     const v = identity.verifyTokenStandalone(bearer);
-    if (v.valid && !billing.checkTokenRevocation(db, v.decoded).revoked) callerDid = v.decoded.sub;
+    if (v.valid) { const dead = billing.checkTokenRevocation(db, v.decoded);
+      if (dead.lookup_failed) return res.status(503).json({ error: dead.reason, code: 'unavailable' });
+      if (!dead.revoked) callerDid = v.decoded.sub; }
   }
   const isOwner = callerDid && callerDid === wallet.did;
   const isAdmin = req.headers['x-admin-key'] && safeSecretEqual(req.headers['x-admin-key'], ADMIN_API_KEY);
@@ -2182,7 +2186,9 @@ app.get('/api/identity/balance', rateLimitStandard, (req, res) => {
   const bearer = (req.headers.authorization || '').startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
   if (bearer) {
     const v = identity.verifyTokenStandalone(bearer);
-    if (v.valid && !billing.checkTokenRevocation(db, v.decoded).revoked) callerDid = v.decoded.sub;
+    if (v.valid) { const dead = billing.checkTokenRevocation(db, v.decoded);
+      if (dead.lookup_failed) return res.status(503).json({ error: dead.reason, code: 'unavailable' });
+      if (!dead.revoked) callerDid = v.decoded.sub; }
   }
   const vis = wallet.balance_visibility || 'private';
   let allowed = false;
@@ -2214,7 +2220,9 @@ app.get('/api/identity/transactions', rateLimitStandard, (req, res) => {
   const bearer = (req.headers.authorization || '').startsWith('Bearer ') ? req.headers.authorization.slice(7) : null;
   if (bearer) {
     const v = identity.verifyTokenStandalone(bearer);
-    if (v.valid && !billing.checkTokenRevocation(db, v.decoded).revoked) callerDid = v.decoded.sub;
+    if (v.valid) { const dead = billing.checkTokenRevocation(db, v.decoded);
+      if (dead.lookup_failed) return res.status(503).json({ error: dead.reason, code: 'unavailable' });
+      if (!dead.revoked) callerDid = v.decoded.sub; }
   }
   // Agent tokens act as their wallet: a worker (sub = its parent) or a fleet-minted token reads nothing here (#72 review).
   let agentTok = false;
@@ -2230,7 +2238,7 @@ app.get('/api/identity/transactions', rateLimitStandard, (req, res) => {
 // app's Diamond Dust activity view.
 app.get('/api/identity/ledger', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const limit = Math.min(100, Number(req.query.limit) || 40);
   const txns = db.prepare('SELECT amount_cents, type, description, balance_after, created_at FROM identity_transactions WHERE did = ? ORDER BY id DESC LIMIT ?').all(auth.did, limit);
   // Spend-by-category (debits only) + credit total, over the full history.
@@ -2689,7 +2697,7 @@ app.post('/api/mail/mta-hook', (req, res) => {
 // GET /api/mail/forward-events — recent forwarding activity for the app (verbose status)
 app.get('/api/mail/forward-events', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const events = db.prepare('SELECT outcome, forward_to, from_addr, subject, detail, created_at FROM forward_events WHERE did = ? ORDER BY id DESC LIMIT 30').all(auth.did);
   const blocked = events.filter(e => e.outcome === 'blocked_insufficient_balance').length;
   res.json({ events, total: events.length, blocked });
@@ -4407,7 +4415,7 @@ function siliconMayFill(agentName, secret) {
 function fillExpired(row) { return new Date(row.expires_at).getTime() <= Date.now(); }
 function fillAuth(req, res) {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+  if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
   // A worker token is scoped to its allowed_secrets for /use; fill has no such list, so workers do not fill.
   if (auth.decoded && auth.decoded.wrk) { res.status(403).json({ error: 'worker tokens cannot use browser fill' }); return null; }
   if (!gateSession(auth)) { res.status(403).json({ error: 'this token cannot hold a fill request — sign in again' }); return null; }
@@ -7633,7 +7641,7 @@ app.get('/api/prepaid/link', (req, res) => {
 // referral DD it earned inviting others (deposited one-time). Authed as the claimer.
 app.post('/api/referral/claim', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const { claim_hash } = req.body || {};
   if (!claim_hash) return res.status(400).json({ error: 'claim_hash required' });
   try {
@@ -7882,7 +7890,7 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
   const v = identity.verifyTokenStandalone(auth);
   if (!v.valid) return res.status(401).json({ error: 'invalid operator token' });
   const _deadApprover = billing.checkTokenRevocation(db, v.decoded);
-  if (_deadApprover.revoked) return res.status(401).json({ error: _deadApprover.reason });
+  if (_deadApprover.revoked) return res.status(billing.revokedStatus(_deadApprover)).json({ error: _deadApprover.reason, ...billing.revokedCode(_deadApprover) });
   const approverDid = v.decoded && v.decoded.sub;
   if (!approverDid) return res.status(401).json({ error: 'operator token has no DID' });
   // A device login is a new session of the approver's wallet: only the wallet's own session may open one, not a
@@ -8000,7 +8008,7 @@ app.post('/api/wallet/transfer', rateLimitStandard, (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required' });
 
@@ -9367,7 +9375,7 @@ app.post('/api/fleet/create', (req, res) => {
   if (!v.valid) return res.status(401).json({ error: v.error });
   const owner_did = v.decoded.sub;
   if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required' });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   if (v.decoded.auth_method === 'fleet_owner_mint') return res.status(403).json({ error: 'a fleet-minted token cannot create a fleet; sign in as this wallet' });
 
   const { name, slug, description } = req.body || {};
@@ -9441,7 +9449,7 @@ app.post('/api/fleet/:slug/invite', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   const caller_did = v.decoded.sub;
 
   const { did } = req.body || {};
@@ -9511,7 +9519,7 @@ app.post('/api/fleet/:slug/upgrade', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   const caller_did = v.decoded.sub;
 
   const { tier } = req.body || {};
@@ -9551,7 +9559,7 @@ app.post('/api/fleet/:slug/fund', (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
@@ -9612,7 +9620,7 @@ app.post('/api/fleet/:slug/provision', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   const caller_did = v.decoded.sub;
 
   const { username, password } = req.body || {};
@@ -9689,7 +9697,7 @@ app.post('/api/fleet/:slug/provision/bulk', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   const caller_did = v.decoded.sub;
 
   const { prefix, count, password } = req.body || {};
@@ -9776,7 +9784,7 @@ app.post('/api/fleet/:slug/fund/qr', async (req, res) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   const caller_did = v.decoded.sub;
 
   const { amount_cents } = req.body || {};
@@ -9875,10 +9883,10 @@ app.get('/api/fleet/:slug/board', (req, res) => {
 // in the FLEETGATE facts check: the route checked only the signature and a fleet_members role).
 function operatorAuth(req, res) {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error || 'Bearer token required' }); return null; }
+  if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error || 'Bearer token required', ...(auth.code ? { code: auth.code } : {}) }); return null; }
   if (auth.silicon) { res.status(403).json({ error: "an agent token cannot change a project's operators" }); return null; }
   const d = auth.decoded || {};
-  if (billing.checkTokenRevocation(db, d).revoked) { res.status(401).json({ error: 'token revoked' }); return null; }
+  { const dead = billing.checkTokenRevocation(db, d); if (dead.revoked) { res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); return null; } }
   if (d.wrk || d.auth_method === 'worker' || d.auth_method === 'fleet_owner_mint') { res.status(403).json({ error: "only the owner's own sign-in can change a project's operators" }); return null; }
   if (!identity.scopeAtLeast(d.scope || 'read', 'transact')) { res.status(403).json({ error: `scope '${d.scope || 'read'}' insufficient`, required_scope: 'transact' }); return null; }
   const fleet = db.prepare('SELECT id, slug, owner_did FROM fleets WHERE slug = ?').get(req.params.slug);
@@ -10169,7 +10177,7 @@ app.post('/api/wallet/transfer/secure', rateLimitStandard, (req, res, next) => {
   if (!token) return res.status(401).json({ error: 'Bearer token required' });
   const v = identity.verifyTokenStandalone(token);
   if (!v.valid) return res.status(401).json({ error: v.error });
-  if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(401).json({ error: 'token revoked' });
+  { const dead = billing.checkTokenRevocation(db, v.decoded); if (dead.revoked) return res.status(billing.revokedStatus(dead)).json({ error: dead.lookup_failed ? dead.reason : 'token revoked', ...billing.revokedCode(dead) }); }
   if (v.decoded.sub !== from_did) return res.status(403).json({ error: 'token mismatch' });
   // Progressive Barrel: require transact-or-above scope for secure transfers (double barrel tier)
   if (!identity.scopeAtLeast(v.decoded.scope || 'read', 'transact')) return res.status(403).json({ error: 'transact scope required (double barrel)' });
@@ -11088,7 +11096,7 @@ function pendingAccessRequests(ownerDid) {
 // POST /api/blindkey/access-requests — { owner: username or DID, secret: name or ref you need, reason }
 app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   if (auth.silicon) return res.status(403).json({ error: "a silicon agent already acts with its owner's secrets; ask the owner for a grant instead" });
   const { owner, secret = '', reason = '' } = req.body || {};
   if (!owner || typeof owner !== 'string' || owner.length > 200) return res.status(400).json({ error: "owner required: the username of the secret's owner" });
@@ -11149,7 +11157,7 @@ app.post('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
 // GET /api/blindkey/access-requests — { incoming: waiting on you (owners only), outgoing: the ones you sent }
 app.get('/api/blindkey/access-requests', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   expireAccessRequests();
   const outgoing = db.prepare(`SELECT r.id, w.username AS owner, r.secret_hint, r.status, s.name AS secret_name, s.ref_code AS ref, r.created_at, r.decided_at, r.expires_at
                                FROM demipass_access_requests r JOIN identity_wallets w ON w.did = r.owner_did LEFT JOIN blindkey_secrets s ON s.id = r.secret_id
@@ -11211,7 +11219,7 @@ app.post('/api/blindkey/access-requests/:id/approve', rateLimitFill, (req, res) 
 // request (a person who approved one sees it and revokes it here; #94 review M2).
 app.get('/api/blindkey/access-requests/granted', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   if (auth.silicon) return res.json({ ok: true, granted: [] });
   const rows = db.prepare(`SELECT d.id AS delegation_id, d.expires_at, d.granted_at, s.name AS secret_name, s.ref_code AS ref, w.username AS agent, v.username AS agent_of
     FROM demipass_access_requests r JOIN demipass_delegations d ON d.id = r.delegation_id JOIN blindkey_secrets s ON s.id = d.secret_id
@@ -11621,7 +11629,7 @@ app.post('/api/tick/verify', (req, res) => {
 // GET /api/tick/stats — member aggregate stats
 app.get('/api/tick/stats', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const total = db.prepare('SELECT COUNT(*) as n FROM ticks WHERE did = ?').get(auth.did).n;
   const first = db.prepare('SELECT created_at FROM ticks WHERE did = ? ORDER BY id ASC LIMIT 1').get(auth.did);
@@ -11657,7 +11665,7 @@ app.get('/api/tick/stats', (req, res) => {
 // GET /api/tick/ledger — member only, read your tick history
 app.get('/api/tick/ledger', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required. Ledger access is a member benefit.' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required. Ledger access is a member benefit.' });
 
   const limit = Math.min(100, Number(req.query.limit) || 50);
   const offset = Number(req.query.offset) || 0;
@@ -11764,7 +11772,7 @@ function summarizePath(method, path, status) {
 // GET /api/ledger — read your auto-ledger (10 DD per page)
 app.get('/api/ledger', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required. Your ledger is a member benefit.' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required. Your ledger is a member benefit.' });
 
   const limit = Math.min(100, Number(req.query.limit) || 50);
   const offset = Number(req.query.offset) || 0;
@@ -11790,7 +11798,7 @@ app.get('/api/ledger', (req, res) => {
 // GET /api/ledger/summary — free summary (total entries, date range, no detail)
 app.get('/api/ledger/summary', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const total = db.prepare('SELECT COUNT(*) as n FROM auto_ledger WHERE did = ?').get(auth.did).n;
   const first = db.prepare('SELECT created_at FROM auto_ledger WHERE did = ? ORDER BY id ASC LIMIT 1').get(auth.did);
@@ -11833,7 +11841,7 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_ct_status ON chrono_triggers(statu
 // POST /api/chrono/create — schedule a trigger
 app.post('/api/chrono/create', async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { name, payload = {}, action = 'webhook', target, fire_in, fire_at } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
@@ -11900,7 +11908,7 @@ app.post('/api/chrono/create', async (req, res) => {
 // POST /api/chrono/extend — push back the fire time (dead man's switch reset)
 app.post('/api/chrono/extend', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { trigger_id, extend_by } = req.body || {};
   if (!trigger_id) return res.status(400).json({ error: 'trigger_id required' });
@@ -11928,7 +11936,7 @@ app.post('/api/chrono/extend', (req, res) => {
 // POST /api/chrono/cancel — disarm a trigger
 app.post('/api/chrono/cancel', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { trigger_id } = req.body || {};
   if (!trigger_id) return res.status(400).json({ error: 'trigger_id required' });
@@ -11944,7 +11952,7 @@ app.post('/api/chrono/cancel', (req, res) => {
 // GET /api/chrono/list — list your triggers
 app.get('/api/chrono/list', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const status = req.query.status || null;
   let triggers;
@@ -12139,7 +12147,7 @@ setInterval(() => {
 // GET /api/buoy/probes — view probe telemetry
 app.get('/api/buoy/probes', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const probes = [];
   for (const [host, entry] of probeCounters) {
@@ -12418,7 +12426,7 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_nt_initiator ON notarized_ticks(in
 // POST /api/buoy/notarize — create a notarized intent
 app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
   if (suspendedDids.has(auth.did)) return res.status(403).json({ error: 'account suspended — cannot create notarizations. Contact support@dustforge.com' });
 
   const { counterparty_did, claim, asset_ref, amount, unit, expires_in, prior_tick_ref } = req.body || {};
@@ -12488,7 +12496,7 @@ app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
 // GET /api/buoy/notarized/:id — inspect a notarization before signing
 app.get('/api/buoy/notarized/:id', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const record = db.prepare('SELECT * FROM notarized_ticks WHERE id = ?').get(req.params.id);
   if (!record) return res.status(404).json({ error: 'not found' });
@@ -12521,7 +12529,7 @@ app.get('/api/buoy/notarized/:id', rateLimitStandard, (req, res) => {
 // POST /api/buoy/cosign — counterparty co-signs a notarized intent
 app.post('/api/buoy/cosign', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { notarized_id, payload_hash } = req.body || {};
   if (!notarized_id || !payload_hash) return res.status(400).json({ error: 'notarized_id and payload_hash required. Inspect the payload first via GET /api/buoy/notarized/:id' });
@@ -12566,7 +12574,7 @@ app.post('/api/buoy/cosign', rateLimitStandard, (req, res) => {
 // POST /api/buoy/reject — counterparty rejects a notarization
 app.post('/api/buoy/reject', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { notarized_id, reason } = req.body || {};
   if (!notarized_id) return res.status(400).json({ error: 'notarized_id required' });
@@ -12588,7 +12596,7 @@ app.post('/api/buoy/reject', rateLimitStandard, (req, res) => {
 // GET /api/buoy/notarized — list notarized ticks involving this DID
 app.get('/api/buoy/notarized', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { status } = req.query;
   let records;
@@ -12812,7 +12820,7 @@ function structuralHash(text) {
 // POST /api/identity/genesis — agent submits its origin refraction
 app.post('/api/identity/genesis', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { refraction } = req.body || {};
   if (!refraction || typeof refraction !== 'string') return res.status(400).json({ error: 'refraction required — your response to the ODT seed' });
@@ -12855,7 +12863,7 @@ app.get('/api/identity/genesis/seed', (_req, res) => {
 // POST /api/identity/genesis/verify — verify a refraction matches the origin
 app.post('/api/identity/genesis/verify', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { refraction } = req.body || {};
   if (!refraction) return res.status(400).json({ error: 'refraction required' });
@@ -12987,7 +12995,7 @@ function expireInsightClaims() {
 // POST /api/insights/claim — append a new claim to the ledger
 app.post('/api/insights/claim', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { claim_type, claim, source, provenance, weight, ttl_hours } = req.body || {};
   if (!claim_type || !claim) return res.status(400).json({ error: 'claim_type and claim required' });
@@ -13010,7 +13018,7 @@ app.post('/api/insights/claim', rateLimitStandard, (req, res) => {
 // GET /api/insights/score — the scorer: returns why_now, why_not, what_changed
 app.get('/api/insights/score', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   expireInsightClaims();
 
@@ -13079,7 +13087,7 @@ app.get('/api/insights/score', rateLimitStandard, (req, res) => {
 // GET /api/insights/claims — list active claims (the ledger)
 app.get('/api/insights/claims', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   expireInsightClaims();
 
@@ -13097,7 +13105,7 @@ app.get('/api/insights/claims', rateLimitStandard, (req, res) => {
 // PATCH /api/insights/claims/:id — supersede or reject a claim
 app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { status, reason } = req.body || {};
   if (!['superseded', 'rejected'].includes(status)) {
@@ -13635,7 +13643,7 @@ console.log('[BOOT] registering cruise routes...');
 // POST /api/insights/cruise/engage — start a cruise session
 app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   // Check for existing active session
   const existing = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status = 'engaged'").get(auth.did);
@@ -13672,7 +13680,7 @@ app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
 // POST /api/insights/cruise/cycle — execute one cycle of the current session
 app.post('/api/insights/cruise/cycle', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status = 'engaged'").get(auth.did);
   if (!session) return res.status(404).json({ error: 'No active cruise session. Engage first.' });
@@ -13754,7 +13762,7 @@ app.post('/api/insights/cruise/cycle', rateLimitStandard, (req, res) => {
 // POST /api/insights/cruise/outcome — report the outcome of a cycle
 app.post('/api/insights/cruise/outcome', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   // Accept outcomes for active OR recently completed sessions (outcome may arrive after final cycle auto-completes)
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status IN ('engaged', 'paused', 'completed') ORDER BY id DESC LIMIT 1").get(auth.did);
@@ -13793,7 +13801,7 @@ app.post('/api/insights/cruise/outcome', rateLimitStandard, (req, res) => {
 // POST /api/insights/cruise/disengage — stop cruise control
 app.post('/api/insights/cruise/disengage', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND (status = 'engaged' OR status = 'paused')").get(auth.did);
   if (!session) return res.status(404).json({ error: 'No active cruise session' });
@@ -13813,7 +13821,7 @@ app.post('/api/insights/cruise/disengage', rateLimitStandard, (req, res) => {
 // GET /api/insights/cruise/status — check current cruise state
 app.get('/api/insights/cruise/status', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? ORDER BY id DESC LIMIT 1").get(auth.did);
   if (!session) return res.json({ status: 'disengaged', message: 'No cruise sessions found' });
@@ -14030,7 +14038,7 @@ app.post('/api/identity/forgot-password', rateLimitStrict, (req, res) => {
 // itself (a token alone is not enough), and the old addresses are told.
 app.post('/api/identity/set-recovery-email', rateLimitStrict, async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   if (auth.silicon) return res.status(403).json({ error: 'silicon agents cannot change the owner recovery email' });
 
   const { recovery_email, password } = req.body || {};
@@ -15356,12 +15364,12 @@ function poolsOf(did) {
 }
 app.get('/api/blindkey/pools', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   res.json({ ok: true, ...poolsOf(auth.did) });
 });
 app.post('/api/blindkey/pools', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   { const no = poolOwnerRefusal(auth); if (no) return res.status(403).json({ error: no }); }
   const name = poolName((req.body || {}).name);
   if (!POOL_RE.test(name) || name === 'uncategorized') return res.status(400).json({ error: 'name: letters, digits and dashes, up to 40 (spaces become dashes)' });
@@ -15372,7 +15380,7 @@ app.post('/api/blindkey/pools', rateLimitStandard, (req, res) => {
 });
 app.delete('/api/blindkey/pools/:name', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   { const no = poolOwnerRefusal(auth); if (no) return res.status(403).json({ error: no }); }
   const name = poolName(req.params.name);
   if (!POOL_RE.test(name)) return res.status(400).json({ error: 'name' });
@@ -15385,7 +15393,7 @@ app.delete('/api/blindkey/pools/:name', rateLimitStandard, (req, res) => {
 // Move one of my secrets (by ref) into a pool; '' or 'uncategorized' takes it out of every pool.
 app.post('/api/blindkey/secrets/:ref/pool', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   { const no = poolOwnerRefusal(auth); if (no) return res.status(403).json({ error: no }); }
   const ref = String(req.params.ref || '');
   if (!/^DP-[A-Z]+-[A-Za-z0-9]{0,16}-[0-9a-f]{8}$/.test(ref)) return res.status(400).json({ error: 'ref: a DP-… ref code' });
@@ -15406,7 +15414,7 @@ app.post('/api/blindkey/secrets/:ref/pool', rateLimitStandard, (req, res) => {
 // GET /api/demipass/dashboard — secret health dashboard for the mobile app
 app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const secrets = db.prepare(`
     SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
@@ -15547,7 +15555,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 // POST /api/demipass/freeze — freeze/unfreeze a secret
 app.post('/api/blindkey/freeze', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
   const { name, ref, freeze } = req.body || {};
 
   let secret;
@@ -15583,7 +15591,7 @@ app.post('/api/demipass/freeze', rateLimitStandard, (req, res) => {
 // POST /api/demipass/outcome — record a use-token outcome (success/failure)
 app.post('/api/blindkey/outcome', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
   const { secret_id, action_type, outcome, error_summary } = req.body || {};
   if (!secret_id || !outcome) return res.status(400).json({ error: 'secret_id and outcome required' });
   if (!['success', 'failure'].includes(outcome)) return res.status(400).json({ error: 'outcome must be success or failure' });

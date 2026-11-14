@@ -192,7 +192,7 @@ module.exports = function registerLeakScan(deps) {
   // The owner, in their own session (a person's wallet token that can hold a PIN proof).
   function personAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) { res.status(403).json({ error: 'scan tokens are approved by the owner in their own session' }); return null; }
     if (!gateSession(auth)) { res.status(403).json({ error: 'sign in again' }); return null; }
     return auth;
@@ -227,7 +227,7 @@ module.exports = function registerLeakScan(deps) {
   });
   // GET /api/blindkey/leak-scan/tokens — the owner's scan tokens (never the token).
   app.get('/api/blindkey/leak-scan/tokens', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     // The hits (what was found where) only to a person's own session — an agent of the owner sees the tokens, not them.
     const person = !(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) && gateSession(auth);
     // Which secrets a token found, by name — never where or how often: an agent signed in as the owner reads this too,
@@ -325,7 +325,7 @@ module.exports = function registerLeakScan(deps) {
   // ── token requests: asked for by whoever acts for the owner, approved in the owner's app ─────────────────────────
   // POST /api/blindkey/leak-scan/token-requests {labels: [..1–8]} → {request_id, claim_secret} (the secret only here).
   app.post('/api/blindkey/leak-scan/token-requests', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) return res.status(403).json({ error: 'ask with a token of the wallet whose values are scanned' });
     expireRequests();
     let labels = (req.body || {}).labels;
@@ -362,7 +362,7 @@ module.exports = function registerLeakScan(deps) {
   });
   // GET /api/blindkey/leak-scan/token-requests — the owner's waiting requests (for the app).
   app.get('/api/blindkey/leak-scan/token-requests', rateLimitStandard, (req, res) => {
-    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     expireRequests();
     // ?all=1: the last 30 days in every state, so an approved request can still be found by number (Aaron 2026-11-12).
     // History is the owner's own session's to read; an agent of the owner sees what waits, as before (#99 review M1).

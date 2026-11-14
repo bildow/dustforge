@@ -330,6 +330,10 @@ function checkTokenRevocation(db, decoded) {
   return { revoked: false };
 }
 let _revocationErrAt = 0;
+// How a refusal from checkTokenRevocation is answered: a real revocation is 401; a lookup that could not run is 503
+// {code: 'unavailable'}, so a caller (FLEETGATE's 60 s re-check) can tell an outage from a withdrawn grant.
+const revokedStatus = (dead) => (dead && dead.lookup_failed ? 503 : 401);
+const revokedCode = (dead) => (dead && dead.lookup_failed ? { code: 'unavailable' } : {});
 
 // Registered by the host once ./fleet_billing is loaded (keeps this module free of circular requires).
 let _attribution = null;
@@ -354,7 +358,7 @@ function billingMiddleware(db, actionType, options = {}) {
 
     const dead = checkTokenRevocation(db, result.decoded);
     if (dead.revoked) {
-      return res.status(401).json({ error: dead.reason, action: actionType });
+      return res.status(revokedStatus(dead)).json({ error: dead.reason, action: actionType, ...revokedCode(dead) });
     }
 
     const did = result.decoded.sub;
@@ -423,6 +427,8 @@ module.exports = {
   refundCharge,
   setAttribution,
   RATE_TABLE,
+  revokedStatus,
+  revokedCode,
   RATE_CHANGES,
   deductBalance,
   creditBalance,

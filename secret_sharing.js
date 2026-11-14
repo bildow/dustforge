@@ -133,7 +133,7 @@ module.exports = function registerSecretSharing(deps) {
   // minted for an agent, and a session a PIN proof can be bound to.
   function personAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) {
       res.status(403).json({ error: "sharing between people is done by the people themselves, in their own session — an agent token cannot share, accept, transfer or reveal" });
       return null;
@@ -276,7 +276,7 @@ module.exports = function registerSecretSharing(deps) {
   // ── GET /api/blindkey/shares — shares you gave and shares given to you ──────────────────────────────────────
   app.get('/api/blindkey/shares', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const given = db.prepare(`SELECT * FROM demipass_delegations WHERE owner_did = ? AND delegate_kind = 'person' ORDER BY id DESC LIMIT ?`).all(auth.did, MAX_LIST);
     const received = db.prepare(`SELECT * FROM demipass_delegations WHERE delegate_did = ? AND delegate_kind = 'person' ORDER BY id DESC LIMIT ?`).all(auth.did, MAX_LIST);
     const g = given.map(r => view(r, auth.did)), r = received.map(x => view(x, auth.did));
@@ -409,7 +409,7 @@ module.exports = function registerSecretSharing(deps) {
   // Offer, accept, decline, every use, every reveal grant and every reveal, from blindkey_events. Never a value.
   app.get('/api/blindkey/shares/:id/audit', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const row = shareRow(req.params.id);
     if (!row || (row.owner_did !== auth.did && row.delegate_did !== auth.did)) return res.status(404).json({ error: 'share not found' });
     const rows = db.prepare(`SELECT event_type, actor, detail, created_at FROM blindkey_events
@@ -587,7 +587,7 @@ module.exports = function registerSecretSharing(deps) {
   // ── GET /api/blindkey/transfers — transfers you started or are receiving ───────────────────────────────────────
   app.get('/api/blindkey/transfers', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     completeDueTransfers();
     const rows = db.prepare('SELECT * FROM secret_transfers WHERE from_did = ? OR to_did = ? ORDER BY id DESC LIMIT ?').all(auth.did, auth.did, MAX_LIST);
     const v = rows.map(t => transferView(t, auth.did));
@@ -614,7 +614,7 @@ module.exports = function registerSecretSharing(deps) {
   // Raising it is free; lowering it takes the PIN (intent transfer-delay:0). 5 minutes to 7 days, default 1 hour.
   app.get('/api/identity/transfer-delay', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     const cur = transferDelay(auth.did);
     const w = db.prepare('SELECT transfer_delay_next_sec, transfer_delay_next_at FROM identity_wallets WHERE did = ?').get(auth.did) || {};
     res.json({ ok: true, delay_sec: cur, ...(w.transfer_delay_next_at ? { next_delay_sec: w.transfer_delay_next_sec, next_from: w.transfer_delay_next_at } : {}),

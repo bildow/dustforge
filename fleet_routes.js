@@ -40,7 +40,7 @@ module.exports = function registerFleetRoutes(deps) {
     const v = identity.verifyTokenStandalone(token);
     if (!v.valid) { res.status(401).json({ error: v.error }); return null; }
     const dead = billing.checkTokenRevocation(db, v.decoded);
-    if (dead.revoked) { res.status(401).json({ error: dead.reason }); return null; }
+    if (dead.revoked) { res.status(billing.revokedStatus(dead)).json({ error: dead.reason, ...billing.revokedCode(dead) }); return null; }
     return { did: v.decoded.sub, scope: v.decoded.scope || 'read', decoded: v.decoded, token };
   }
   function fleetAuth(req, res, { roles = null, minScope = 'read' } = {}) {
@@ -245,7 +245,7 @@ module.exports = function registerFleetRoutes(deps) {
         if (b.member_token) {
           const v = identity.verifyTokenStandalone(String(b.member_token));
           if (!v.valid || v.decoded.sub !== wallet.did) return res.status(403).json({ error: 'member_token does not belong to that identity' });
-          if (billing.checkTokenRevocation(db, v.decoded).revoked) return res.status(403).json({ error: 'member_token is revoked' });
+          { const md = billing.checkTokenRevocation(db, v.decoded); if (md.revoked) return md.lookup_failed ? res.status(503).json({ error: md.reason, code: 'unavailable' }) : res.status(403).json({ error: 'member_token is revoked' }); }
           // Consent comes from the wallet itself, not from a token some fleet owner minted for it.
           // An agent's device login (auth_method device, an agent_label) is not the wallet consenting either (#70 round-2):
           // it would let any agent signed in as a person link that person into a fleet.

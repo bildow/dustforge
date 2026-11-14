@@ -110,7 +110,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
   // The fleet owner deciding, in their own session (a person's wallet token that can hold a PIN proof).
   function ownerAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) { res.status(403).json({ error: 'agent tokens are approved by the fleet owner in their own session' }); return null; }
     if (gateSession && !gateSession(auth)) { res.status(403).json({ error: 'sign in again' }); return null; }
     return auth;
@@ -139,7 +139,7 @@ module.exports = function registerSiliconTokenRequests(deps) {
   // ── file a request ──────────────────────────────────────────────────────────────────────────────────────────────
   app.post('/api/fleet/:slug/silicons/:handle/token-requests', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+    if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
     // A fleet-minted token acts as its agent but never reaches the agent's other fleets or its siblings through that
     // fleet's owner (fleet_routes.js fleetAuth; leak_scan.js does the same) — #78 review M.
     if (auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint'))) return res.status(403).json({ error: 'ask with a fleet member\'s own wallet token (not a fleet-minted or worker token)' });

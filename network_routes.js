@@ -109,7 +109,7 @@ module.exports = function registerNetworkRoutes(deps) {
   // worker tokens cannot connect wallets, move DD or decide requests.
   function walletAuth(req, res) {
     const auth = getBearerIdentity(req);
-    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
+    if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) }); return null; }
     if (auth.silicon || (auth.decoded && auth.decoded.wrk)) { res.status(403).json({ error: "only a wallet's own token can use the network" }); return null; }
     const wallet = db.prepare('SELECT did, username, email, status, pin_hash FROM identity_wallets WHERE did = ?').get(auth.did);
     if (!wallet) { res.status(404).json({ error: 'no wallet for this token' }); return null; }
