@@ -6380,7 +6380,7 @@ app.get('/api/blindkey/types', (_req, res) => {
       encryption: 'AES-256-GCM at rest',
       access: 'Bearer token with transact scope required',
       exposure: 'Secret values are NEVER returned in any API response',
-      billing: 'Store/revoke: free. List: free. Use: 10 DD (1¢) per action (api_call_compute)',
+      billing: `Store/revoke: free. List: free. Request-token: free. Use: ${billing.RATE_TABLE.api_call_compute} DD per action (api_call_compute; dated table: /api/billing/price-table)`,
     },
   });
 });

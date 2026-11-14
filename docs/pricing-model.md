@@ -30,7 +30,7 @@
 | Email send (bulk) | 1¢ each | ~0.01¢ | ~1¢ | 99% |
 | Round dispatch | 10¢ | ~7¢ (OpenRouter) | ~17¢ | 59% |
 | Collaboration round | 25¢ | ~20¢ (4 passes) | ~45¢ | 56% |
-| API call (compute) | 1¢ | negligible | 1¢ | ~100% |
+| API call (compute, /use) | 0.1¢ (1 DD since 2026-11-14) | negligible | 0.1¢ | ~100% |
 | API call (read) | free | negligible | free | — |
 
 ### 3. Wallet Topup

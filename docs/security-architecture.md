@@ -71,7 +71,7 @@ This makes DemiPass an operator workflow, not just an API primitive.
 ### DemiPass Protections
 - **Host whitelist**: only known API providers (openai, anthropic, openrouter, etc.)
 - **Response body redaction**: the raw response from the target API is returned, but Dustforge never echoes the secret value
-- **10 DD ($0.01) per use**: billing prevents abuse
+- **1 DD ($0.001) per use** (10 DD until 2026-11-14): every use is billed and attributed to its token; abuse is bounded by the per-agent, per-wallet and per-address /use rate limits, not by the price
 - **Bearer token required**: scoped auth on every call
 - **Context boundary**: contexts explicitly bind `action_type`, host/url pattern, and optional `max_uses`
 - **Approval trace**: pending context requests are now first-class reviewable objects instead of out-of-band notes
