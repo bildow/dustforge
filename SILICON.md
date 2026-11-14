@@ -45,7 +45,7 @@ Human? Read [dustforge.com/for-agents](https://dustforge.com/for-agents).
 
   POST /api/demipass/use  [Bearer token]
     {"name":"<name>","action":"http_header","target_url":"<url>","header_name":"Authorization","header_prefix":"Bearer "}
-    → Injects secret into request header, returns response. Cost: 10 DD.
+    → Injects secret into request header, returns response. Cost: 1 DD.
 
   POST /api/demipass/context/request  [Bearer token]
     {"secret_name":"<name>","context_name":"<ctx>","action_type":"http_header","target_url_pattern":"<pattern>","target_host_pattern":"<pattern>","reason":"<why>"}
@@ -70,7 +70,7 @@ Human? Read [dustforge.com/for-agents](https://dustforge.com/for-agents).
     {"amount_cents": 500|1000|5000|10000}
     → Stripe checkout URL
 
-  Account: $1 (loads 950 DD) | Email: 10 DD | DemiPass: 10 DD | Referral: 100 DD payout
+  Account: $1 (loads 950 DD) | Email: 10 DD | DemiPass /use: 1 DD | Referral: 100 DD payout
   1 DD = $0.001; a deposit buys 950 DD per dollar. Top-up amount_cents are US cents.
 -->
 

@@ -161,7 +161,7 @@ call POST /api/demipass/use "$A" '{"ref":"'$NEWREF'","action":"ssh_exec","target
 dt=$(( $(date +%s) - t0 )); B1=$(BAL "$AG")
 [ "$CODE" = 504 ] && [ "$(echo "$BODY" | J cut_off)" = True ] && [ "$(echo "$BODY" | J timeout_seconds)" = 5 ] && [ $dt -ge 5 ] && [ $dt -lt 15 ] \
   && ok "a call past the 5 s limit is cut off: 504 after ${dt}s" || fail "cut off: $CODE ${dt}s $BODY"
-[ "$B0" = "$B1" ] && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && ok "the cut-off call is not charged (balance $B0 → $B1, 10 DD back)" || fail "charged: $B0 → $B1 $BODY"
+[ "$B0" = "$B1" ] && [ "$(echo "$BODY" | J refunded_dd)" = 1 ] && ok "the cut-off call is not charged (balance $B0 → $B1, 1 DD back)" || fail "charged: $B0 → $B1 $BODY"
 echo "$BODY" | grep -q WORK-DONE && fail "a cut-off call returned partial output: $BODY" || ok "a cut-off call returns no partial output"
 R=$(SQ "SELECT type, amount_cents FROM identity_transactions WHERE did = '$AG' ORDER BY id DESC LIMIT 2")
 echo "$R" | grep -q api_call_compute_refund && ok "the refund is its own ledger row" || fail "ledger: $R"
@@ -170,7 +170,7 @@ call POST /api/demipass/use "$A2" '{"ref":"'$NEWREF'","action":"ssh_exec","targe
 B0=$(BAL "$AG")
 call POST /api/demipass/use "$A" '{"ref":"'$NEWREF'","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo quick"}'
 B1=$(BAL "$AG")
-[ "$CODE" = 200 ] && [ $((B0 - B1)) = 10 ] && ok "a call that completes is charged as before (10 DD)" || fail "normal charge: $CODE $B0 → $B1"
+[ "$CODE" = 200 ] && [ $((B0 - B1)) = 1 ] && ok "a call that completes is charged as before (1 DD)" || fail "normal charge: $CODE $B0 → $B1"
 
 # M1: the owner's direct call (by name) is cut off at 30 s and not charged either
 B0=$(BAL "$(DID owner)")

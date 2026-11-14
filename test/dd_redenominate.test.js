@@ -13,7 +13,7 @@ test('deposits buy 950 DD per dollar; prices are the old prices ×10', () => {
   assert.equal(units.ddForUsdCents(10000), 95000);
   assert.equal(units.ddForUsdCents('1000'), 9500);           // Stripe metadata is a string
   assert.equal(units.usdLabel(10), '$0.010');
-  assert.equal(billing.RATE_TABLE.api_call_compute, 10);      // DemiPass /use: still 1¢
+  assert.equal(billing.RATE_TABLE.api_call_compute, 1);       // DemiPass /use: 1 DD since 2026-11-14 (RATE_CHANGES)
   assert.equal(billing.RATE_TABLE.email_send, 10);
   assert.equal(billing.RATE_TABLE.identity_create, 1000);
   assert.equal(require('../referral').REFERRAL_PAYOUT_CENTS, 100);
@@ -97,4 +97,13 @@ test('a fresh database (no wallets yet) just records the marker', () => {
   db.exec('CREATE TABLE identity_wallets (did TEXT, balance_cents INTEGER DEFAULT 0); CREATE TABLE identity_transactions (did TEXT, amount_cents INTEGER, balance_after INTEGER)');
   assert.equal(migrate(db).applied, true);
   assert.equal(migrate(db).applied, false);
+});
+
+test('the price table is dated: /use went 10 → 1 DD on 2026-11-14, and the change matches today\'s rate', () => {
+  const last = billing.RATE_CHANGES.filter((c) => c.action === 'api_call_compute').slice(-1)[0];
+  assert.deepEqual([last.from_dd, last.to_dd, last.effective], [10, 1, '2026-11-14']);
+  assert.equal(billing.RATE_TABLE[last.action], last.to_dd);
+  for (const c of billing.RATE_CHANGES) assert.match(c.effective, /^\d{4}-\d{2}-\d{2}$/);
+  assert.equal(units.DD_PER_USD, 1000);                          // not re-denominated: 1 DD is still $0.001
+  assert.equal(billing.RATE_TABLE.api_call_read, 0);             // request-token stays free (Aaron 2026-11-14)
 });

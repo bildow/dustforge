@@ -12,7 +12,7 @@
 #   - AG adds scope 'reviewers' (installation, two exact repos, contents+pull_requests write, ≤ 1800 s) handed to B:
 #     202 approval kind scope; the owner approves with the PIN; the same call with approval_id applies it, once;
 #   - B mints: a subset (one repo, contents:read) → a token for exactly that; the defaults → the whole scope; each a
-#     metered use (10 DD) and a security event naming wallet, scope, repos, permissions, expiry; expiry recorded and
+#     metered use (1 DD) and a security event naming wallet, scope, repos, permissions, expiry; expiry recorded and
 #     listed by /expiring; a wrong repo, a wider permission, a longer TTL refused before any connection;
 #   - widening the scope parks on the phone; narrowing applies and revokes the scope's live tokens;
 #   - the installation's ceiling: GitHub's 422 → 403 "reinstall", refunded; a token wider than asked is revoked, not
@@ -219,7 +219,7 @@ tail -1 "$S/upstream.log" | grep -q "POST /app/installations/777/access_tokens j
 EXP=$(echo "$BODY" | J result.expires_at); TID=$(echo "$BODY" | J result.token_id)
 python3 -c "import sys,datetime; e=datetime.datetime.fromisoformat(sys.argv[1].replace('Z','+00:00')); d=(e-datetime.datetime.now(datetime.timezone.utc)).total_seconds(); sys.exit(0 if 590<=d<=601 else 1)" "$EXP" \
   && [ "$(Q "SELECT expires_at FROM github_app_tokens WHERE id=$TID")" = "$EXP" ] && ok "its expiry is the asked 600 s (under GitHub's hour), recorded ($EXP)" || fail "expiry: $EXP"
-[ "$(BAL)" = $((B0 - 10)) ] && ok "metered: B paid 10 DD for the mint" || fail "billing: $B0 → $(BAL)"
+[ "$(BAL)" = $((B0 - 1)) ] && ok "metered: B paid 1 DD for the mint (a /use)" || fail "billing: $B0 → $(BAL)"
 EV=$(Q "SELECT context_json FROM demipass_security_events WHERE event_type='github_app_token_minted' ORDER BY id DESC LIMIT 1")
 python3 -c "import json,sys; c=json.loads(sys.argv[1]); sys.exit(0 if c['wallet']==sys.argv[2] and c['scope']=='reviewers' and c['repositories']==['bildow/brain'] and c['permissions'].get('contents')=='read' and c['expires_at']==sys.argv[3] else 1)" "$EV" "$BDID" "$EXP" \
   && ok "a security event names wallet, scope, repositories, permissions and expiry" || fail "event: $EV"
@@ -242,7 +242,7 @@ try '{"permissions":{"constructor":"read"}}'; [ "$CODE" = 403 ] && echo "$BODY" 
 try '{"permissions":{"contents":"constructor"}}'; [ "$CODE" = 403 ] && ok "a level named constructor → 403" || fail "level constructor: $CODE $BODY"
 [ "$(mints)" = "$M1" ] && [ "$(Q "SELECT COUNT(*) FROM blindkey_events WHERE event_type='egress' AND secret_id=$SID")" = "$E1" ] \
   && ok "…all before any connection: no egress row, no request to GitHub" || fail "leaked to github: $(mints)/$M1"
-[ "$(BAL)" = "$BB" ] && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && ok "…and none of them charged (refunded_dd 10 each)" || fail "refused charged: $BB → $(BAL) $BODY"
+[ "$(BAL)" = "$BB" ] && [ "$(echo "$BODY" | J refunded_dd)" = 1 ] && ok "…and none of them charged (refunded_dd 1 each)" || fail "refused charged: $BB → $(BAL) $BODY"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='github_scope_refused'")" = 6 ] && ok "six github_scope_refused events" || fail "refused events"
 
 # ── the git credential helper ──
@@ -290,7 +290,7 @@ pin "$A" 4321 "scope:$SID"; call POST /api/demipass/context/add "$A" '{"secret_n
 CID2=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID AND context_name='issues'"); [ "$CODE" = 200 ] && [ -n "$CID2" ] || fail "owner add issues: $CODE $BODY"
 echo issues > "$S/ceiling"; A0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'"); N0=$(Q "SELECT COUNT(*) FROM github_app_tokens")
 call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
-[ "$CODE" = 403 ] && echo "$BODY" | grep -q "reinstalls the app" && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$A0" ] \
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "reinstalls the app" && [ "$(echo "$BODY" | J refunded_dd)" = 1 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$A0" ] \
   && [ "$(Q "SELECT COUNT(*) FROM github_app_tokens")" = "$N0" ] && ok "beyond the installation: GitHub's 422 → 403 'the owner reinstalls', refunded, no token" || fail "ceiling: $CODE $BODY"
 rm -f "$S/ceiling"; touch "$S/wide"; R0=$(revokes)
 call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
@@ -382,7 +382,7 @@ waitfor "Q \"SELECT status FROM github_app_tokens WHERE id=$TT\"" revoked && [ "
 # ── GitHub unreachable: no token, not charged ──
 kill $UP; wait $UP 2>/dev/null; UP=; AB0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")
 call POST /api/demipass/use "$A" '{"ref":"'$REF'","context":"issues","action":"github_app_token"}'
-[ "$CODE" = 502 ] && echo "$BODY" | grep -q "could not be reached" && [ "$(echo "$BODY" | J refunded_dd)" = 10 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$AB0" ] \
+[ "$CODE" = 502 ] && echo "$BODY" | grep -q "could not be reached" && [ "$(echo "$BODY" | J refunded_dd)" = 1 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner-a'")" = "$AB0" ] \
   && ok "GitHub unreachable → 502, refunded" || fail "unreachable: $CODE $BODY"
 
 # ── nothing in clear: no key, JWT or token in the server log or the database ──

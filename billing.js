@@ -93,12 +93,22 @@ const RATE_TABLE = {
   // API calls (per-call billing)
   'api_call_read':          0,  // free — read operations
   'api_call_write':         0,  // free — write operations (future)
-  'api_call_compute':      10,  // $0.01 — compute-heavy operations (DemiPass /use)
+  'api_call_compute':       1,  // $0.001 — DemiPass /use: pure traffic (was 10 until 2026-11-14, see RATE_CHANGES)
 
   // Platform actions
   'round_dispatch':       100,  // $0.10 — dispatching a round (covers model costs)
   'round_collaboration':  250,  // $0.25 — collaboration round (multi-pass)
 };
+
+// ── Dated price changes (oldest first). A price change is a reviewed PR that appends a row here, so the table always
+// says what a call cost on a given day. 1 DD stays $0.001 (dd_units.js); no change here re-denominates DD.
+//   Pure-traffic calls (Aaron, 2026-11-14): request-token, /use, services/verify, and Conduit post/read/ack cost at
+//   most 1 DD each. request-token and services/verify stay free; Conduit's actions are the `conduit` tenant's rows
+//   (1 DD per recipient, margin 0). Model-backed calls stay at measured cost plus margin (service tenants, rounds).
+const RATE_CHANGES = Object.freeze([
+  Object.freeze({ action: 'api_call_compute', call: 'POST /api/blindkey/use (= /api/demipass/use)', from_dd: 10, to_dd: 1,
+    effective: '2026-11-14', ruling: 'Aaron 2026-11-14: pure-traffic calls cost 1 DD (request-token and services/verify stay free); DD stays $0.001, not re-denominated' }),
+]);
 
 /**
  * Get the true balance by summing transactions (source of truth).
@@ -406,6 +416,7 @@ module.exports = {
   refundCharge,
   setAttribution,
   RATE_TABLE,
+  RATE_CHANGES,
   deductBalance,
   creditBalance,
   evaporate,

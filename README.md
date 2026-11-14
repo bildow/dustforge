@@ -93,7 +93,7 @@ and `git pull` never fights a release.
 |------|------|
 | Account creation | $1.00 (loads 950 DD) |
 | Email send | 10 DD ($0.01) |
-| DemiPass use | 10 DD ($0.01) |
+| DemiPass use | 1 DD ($0.001) since 2026-11-14 (was 10) |
 | Relay forward | 10 DD ($0.01) |
 | Wallet transfer | Free |
 | Identity lookup | Free |
