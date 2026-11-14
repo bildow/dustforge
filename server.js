@@ -5378,7 +5378,7 @@ app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseWalletTotal, rateL
 function approvalAnswer(req, res, b) {
   const id = req._approvalId;
   if (!id || req._egressed || res.statusCode < 300 || !b || typeof b !== 'object' || Array.isArray(b) || b.approval) return b;
-  const r = useApprovals.release(id, req.identity && req.identity.did, b.error || `answered ${res.statusCode}`);
+  const r = useApprovals.release(id, req.identity && req.identity.did, b.error || `answered ${res.statusCode}`, req._approvalUsedAt);
   return r ? { ...b, approval: { id, spent: false, approved_until: r.until, note: 'nothing ran, so the approval was not spent: make the same call again with approval_id' } }
            : { ...b, approval: { id, spent: true } };
 }
@@ -5387,47 +5387,52 @@ function settleApproval(req, res) {
   if (!id) return;
   const b = req._useAnswer || {};
   try {
-    if (!req._egressed && !(res.headersSent && res.statusCode < 300)) { useApprovals.release(id, req.identity && req.identity.did, b.error || 'not answered'); return; }
+    if (!req._egressed && !(res.headersSent && res.statusCode < 300)) { useApprovals.release(id, req.identity && req.identity.did, b.error || 'not answered', req._approvalUsedAt); return; }
     const r = b.result || {};
     const exitCode = Number.isInteger(r.exit_code) ? r.exit_code : null;
     const firstLine = (t) => String(t || '').split('\n').map(x => x.trim()).find(Boolean) || '';
     const note = exitCode ? firstLine(r.stderr) || firstLine(r.stdout)
       : res.statusCode >= 300 ? String(b.error || '')
-      : (Number.isInteger(r.status) && r.status >= 400) ? `upstream answered ${r.status}` : '';
+      : (Number.isInteger(r.status) && r.status >= 400) ? `upstream answered ${r.status}`
+      : r.sent === false ? `not sent${r.error ? ': ' + String(r.error) : ''}` : '';
     useApprovals.recordOutcome(id, { ran: true, http: res.statusCode, exitCode, note });
   } catch (_) {}
 }
 
-// The pre-flight of an approved ssh_exec. When the command runs one script by its path (`PATH [args]` with a / in
-// PATH, or `bash|sh PATH [args]`), a no-op `test` on that path runs first, as the same login and with the same sudo.
-// If it fails (the file is gone, unreadable or not executable, sudo refuses, the host is unreachable) nothing has
-// been launched: the call is answered 409, its charge refunded and the approval handed back. Only the command's own
-// first path is checked — exit 127 alone cannot tell a missing script from a script that ran and then failed.
+// The pre-flight of an approved ssh_exec. When the command runs one script by its path (`PATH [args]` or
+// `bash|sh PATH [args]`, PATH holding a /), a no-op check on that path runs first, as the same login: if the host says
+// the file is not there (not readable for bash|sh, not executable run directly), nothing has been launched — the call
+// is answered 409, its charge refunded and the approval handed back. Only the command's own first path is checked:
+// exit 127 alone cannot tell a missing script from a script that ran and then failed.
+//   - It is a second ssh login. DemiPass logs in with a password, so authorized_keys command= never applies; an sshd
+//     ForceCommand would run in place of the check — so the check answers with a one-time marker, anything else is
+//     inconclusive (the call goes ahead) and that host+user is not checked again (#111 review M1).
+//   - Not with sudo: a NOPASSWD rule for the script itself does not cover `test` (#111 review H1).
+//   - Only a definite "missing" refuses; an unreachable host, a refusal of the check itself → the call goes ahead.
 const PREFLIGHT_RE = /^\s*(?:(bash|sh)\s+)?([A-Za-z0-9._\/][A-Za-z0-9._\/-]*)(?:\s|$)/;
+const preflightSkip = new Set();   // host|user where the check did not answer with its marker (a forced command)
 function preflightOf(command) {
   const m = PREFLIGHT_RE.exec(String(command || ''));
-  if (!m) return null;
-  if (!m[1] && !m[2].includes('/')) return null;   // a bare name (id, systemctl …) is found on PATH: nothing to check
-  return { path: m[2], test: `test ${m[1] ? '-r' : '-x'} ${m[2]}`, want: m[1] ? 'readable' : 'executable' };
+  if (!m || !m[2].includes('/')) return null;   // a bare name is found on PATH (bash, too, searches PATH): not checked
+  return { path: m[2], flag: m[1] ? '-r' : '-x', want: m[1] ? 'readable' : 'executable' };
 }
-async function sshPreflight(req, secret, { user, host, password, command, sudo, values = [] }) {
+async function sshPreflight(req, secret, { user, host, password, command, sudo, keySecret = null, values = [] }) {
   const p = preflightOf(command);
-  if (!p) return null;
-  const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' : undefined;
+  if (!p || sudo || preflightSkip.has(host + '|' + user)) return null;
+  const n = crypto.randomBytes(9).toString('hex');
   egressLog(req, secret, 'ssh_exec_preflight', host, { launch: false });
-  try { await sshRun(user, host, password, sudo ? sudoWrap(p.test, sudo) : p.test, { input, timeout: 20000 }); return null; }
-  catch (e) {
-    let why = String(e.stderr || '').split('\n').map(x => x.trim()).find(Boolean) || '';
-    for (const v of values) why = scrubSecretFromError(why, v);
-    const error = why
-      ? `nothing ran: the check before running ${p.path} failed (${why.slice(0, 200)})`
-      : `nothing ran: ${p.path} is not on ${host} or not ${p.want} for ${user}${sudo ? ' with sudo' : ''}`;
-    const refunded = refundUse(req, 'nothing ran: the pre-flight check failed');
-    const r = req._approvalId ? useApprovals.release(req._approvalId, req.identity && req.identity.did, error) : null;
-    logSecurityEvent('ssh_preflight_failed', 'info', { caller_did: req.identity && req.identity.did, capability: 'ssh_exec', target: host, ip: req.ip, context: { secret: secret.name, path: p.path, approval_id: req._approvalId || null } });
-    return { status: 409, body: { error, preflight: 'failed', path: p.path, refunded_dd: refunded,
-      ...(req._approvalId ? { approval: r ? { id: req._approvalId, spent: false, approved_until: r.until, note: 'make the same call again with approval_id once the file is in place' } : { id: req._approvalId, spent: true } } : {}) } };
-  }
+  if (keySecret) egressLog(req, keySecret, 'ssh_exec_preflight', host, { launch: false });
+  let out;
+  try { out = String(await sshRun(user, host, password, `test ${p.flag} ${p.path} && echo DPPF-ok-${n} || echo DPPF-no-${n}`, { timeout: 20000 })).trim(); }
+  catch (_) { return null; }   // the check itself failed (unreachable, refused): inconclusive, the call goes ahead
+  if (out === `DPPF-ok-${n}`) return null;
+  if (out !== `DPPF-no-${n}`) { preflightSkip.add(host + '|' + user); return null; }
+  const error = `nothing ran: ${p.path} is not on ${host} or not ${p.want} for ${user}`;
+  const refunded = refundUse(req, 'nothing ran: the pre-flight check found no script');
+  const r = req._approvalId ? useApprovals.release(req._approvalId, req.identity && req.identity.did, error, req._approvalUsedAt) : null;
+  logSecurityEvent('ssh_preflight_failed', 'info', { caller_did: req.identity && req.identity.did, capability: 'ssh_exec', target: host, ip: req.ip, context: { secret: secret.name, path: p.path, approval_id: req._approvalId || null } });
+  return { status: 409, body: { error, preflight: 'failed', path: p.path, refunded_dd: refunded,
+    ...(req._approvalId ? { approval: r ? { id: req._approvalId, spent: false, approved_until: r.until, note: 'make the same call again with approval_id once the file is in place' } : { id: req._approvalId, spent: true } } : {}) } };
 }
 async function useRoute(req, res) {
   let { use_token } = req.body || {};
@@ -5582,7 +5587,7 @@ async function useRoute(req, res) {
         const approved = approvedBody(g.call);
         if (approved) action_params = { ...approved, ...(approved.params || {}) };
         approvedElevatedUse = Boolean(g.approval_id) && !g.peeked;
-        if (approvedElevatedUse) req._approvalId = g.approval_id;   // spent only if the call launches (settleApproval)
+        if (approvedElevatedUse) { req._approvalId = g.approval_id; req._approvalUsedAt = g.used_at; }   // spent only if the call launches (settleApproval)
         if (cryptoDepth.isWrapped(secret)) {
           try { decryptedValue = cryptoDepth.plaintextFor(secret, g.approval_id); }
           catch (e) { return res.status(e.status || 409).json({ error: e.message, wrapped: true }); }
@@ -5662,7 +5667,7 @@ async function useRoute(req, res) {
           }
 
           if (req._approvalId) {   // an approved call: check the script is there before the approval is spent on it
-            const pf = await sshPreflight(req, secret, { user: effectiveUser, host: target_host, password, command, sudo, values: [password, decryptedValue] });
+            const pf = await sshPreflight(req, secret, { user: effectiveUser, host: target_host, password, command, sudo, keySecret });
             if (pf) return res.status(pf.status).json(pf.body);
           }
           try {
@@ -6036,7 +6041,7 @@ async function useRoute(req, res) {
     const approved = approvedBody(g.call);   // red team item 14: run what was approved, as stored
     if (approved) params = approved.params;
     var useApprovalId = g.approval_id || null;   // eslint-disable-line no-var
-    if (useApprovalId) req._approvalId = useApprovalId;   // spent only if the call launches (settleApproval)
+    if (useApprovalId) { req._approvalId = useApprovalId; req._approvalUsedAt = g.used_at; }   // spent only if the call launches (settleApproval)
   }
 
   let decryptedValue;
@@ -6191,7 +6196,7 @@ async function useRoute(req, res) {
         }
 
         if (req._approvalId) {   // an approved call: check the script is there before the approval is spent on it
-          const pf = await sshPreflight(req, secret, { user: target_user, host: target_host, password, command, sudo, values: [password, decryptedValue] });
+          const pf = await sshPreflight(req, secret, { user: target_user, host: target_host, password, command, sudo, keySecret });
           if (pf) return res.status(pf.status).json(pf.body);
         }
         try {
