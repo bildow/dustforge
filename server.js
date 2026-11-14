@@ -9895,7 +9895,7 @@ app.post('/api/fleet/:slug/board/:project/operators', rateLimitStandard, (req, r
   if (typeof operator_did !== 'string' || !operator_did || operator_did.length > 200) return res.status(400).json({ error: 'operator_did required' });
   const w = db.prepare('SELECT did, status FROM identity_wallets WHERE did = ?').get(operator_did);
   if (!w) return res.status(404).json({ error: 'operator_did is not a wallet' });
-  if (w.status && w.status !== 'active') return res.status(409).json({ error: `that wallet is ${w.status}` });
+  if (['suspended', 'closed', 'deleted'].includes(w.status)) return res.status(409).json({ error: `that wallet is ${w.status}` });   // active and founder wallets are live
   if (operator_did === a.did) return res.status(400).json({ error: 'the owner already pays for their own calls' });
   const project = db.prepare('SELECT id, project FROM fleet_projects WHERE fleet_id = ? AND project = ?').get(a.fleet.id, req.params.project);
   if (!project) return res.status(404).json({ error: 'project not found on this fleet board' });

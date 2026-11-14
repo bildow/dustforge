@@ -46,6 +46,12 @@ X "ALTER TABLE token_revocations RENAME TO token_revocations_away"
 call GET /api/identity/ledger "$A"
 [ "$CODE" = 401 ] && echo "$BODY" | grep -q "could not be checked" && ok "while the revocation lookup fails, the token is refused (fails closed; was: let through)" || fail "G2 open: $CODE $BODY"
 grep -q "\[revocation\] lookup failed" "$S/server.log" && ok "…and the server logs it" || fail "no log line"
+# A lookup failure is never written down as a revocation (review M1): a pending delivery-key ask survives a sweep that
+# runs while the lookup fails (the unauthenticated pickup route runs the sweep).
+OD=$(Q "SELECT did FROM identity_wallets WHERE username='op-c'")
+X "INSERT INTO delivery_key_changes (did, public_key, fingerprint, status, requested_at, expires_at, ask_jti, ask_iat) VALUES ('$OD', 'pk', 'fp', 'pending', datetime('now'), datetime('now', '+1 day'), 'jti-smoke', 1)"
+curl -s -o /dev/null "$API/api/identity/token-deliveries?did=$OD"
+[ "$(Q "SELECT status FROM delivery_key_changes WHERE ask_jti='jti-smoke'")" = pending ] && ok "a sweep during the failure leaves a pending key ask pending (not persisted as revoked)" || fail "ask persisted: $(Q "SELECT status FROM delivery_key_changes WHERE ask_jti='jti-smoke'")"
 X "ALTER TABLE token_revocations_away RENAME TO token_revocations"
 call GET /api/identity/ledger "$A"; [ "$CODE" = 200 ] && ok "once the lookup works again, the same token works" || fail "recovery: $CODE $BODY"
 R=$(node -e 'const b=require("./billing"); const db={prepare(){throw new Error("SQLITE_IOERR")}}; process.stdout.write(JSON.stringify(b.checkTokenRevocation(db,{jti:"x",sub:"did:x",iat:1})))')
@@ -64,6 +70,8 @@ ADD "$A" "$C"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "project-operator:$PI
 ADD "$AR" "$C"; [ "$CODE" = 403 ] && [ "$(OPS)" = 0 ] && ok "a read-scope owner token → 403 (was: accepted)" || fail "read scope: $CODE $BODY"
 ADD "$B" "$C"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "owner" && [ "$(OPS)" = 0 ] && ok "a fleet admin → 403: an operator spends the owner's DD (was: accepted)" || fail "admin: $CODE $BODY"
 ADD "$A" "did:key:zNotAWallet"; [ "$CODE" = 404 ] && ok "an operator that is not a wallet → 404 (was: stored)" || fail "nonexistent: $CODE $BODY"
+X "UPDATE identity_wallets SET status='suspended' WHERE username='op-c'"; ADD "$A" "$C"; [ "$CODE" = 409 ] && ok "a suspended wallet → 409" || fail "suspended: $CODE $BODY"
+X "UPDATE identity_wallets SET status='founder' WHERE username='op-c'"; ADD "$A" "$C"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q '"missing":\["pin"\]' && ok "a founder wallet is live: it reaches the PIN step (review L2)" || fail "founder: $CODE $BODY"
 WK=$(curl -s -X POST "$API/api/silicons/workers" -H 'content-type: application/json' -H "Authorization: Bearer $A" -d '{"name":"op-wk","mint":true}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("minted") or {}).get("token",""))')
 [ -n "$WK" ] && { ADD "$WK" "$C"; [ "$CODE" = 403 ] && [ "$(OPS)" = 0 ] && ok "the owner's worker token → 403 (was: accepted)" || fail "worker: $CODE $BODY"; } || fail "could not mint a worker"
 RV=$(login owner-a); RJ=$(python3 -c 'import sys,json,base64; p=sys.argv[1].split(".")[1]; print(json.loads(base64.urlsafe_b64decode(p+"="*(-len(p)%4)))["jti"])' "$RV")
@@ -71,7 +79,7 @@ call POST /api/identity/tokens/revoke "$RV" '{"jti":"'$RJ'"}'; [ "$CODE" = 200 ]
 ADD "$RV" "$C"; [ "$CODE" = 401 ] && [ "$(OPS)" = 0 ] && ok "a revoked owner token → 401 (was: accepted)" || fail "revoked: $CODE $BODY"
 PIN "project-operator:$PID"; [ "$CODE" = 200 ] || fail "pin verify: $CODE $BODY"
 ADD "$A" "$C"; [ "$CODE" = 200 ] && [ "$(OPS)" = 1 ] && ok "the owner with a fresh PIN for this grant → added" || fail "with pin: $CODE $BODY"
-ADD "$A" "$BD"; [ "$CODE" = 403 ] && [ "$(OPS)" = 1 ] && ok "the PIN opens one grant: the next operator asks again" || fail "pin reuse: $CODE $BODY"
+ADD "$A" "$BD"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q '"missing":\["pin"\]' && [ "$(OPS)" = 1 ] && ok "the PIN opens one grant: the next operator asks again" || fail "pin reuse: $CODE $BODY"
 call DELETE "/api/fleet/fleet-one/board/bench/operators/$C" "$AR"; [ "$CODE" = 403 ] && [ "$(OPS)" = 1 ] && ok "removing needs a live transact sign-in too (read scope → 403)" || fail "delete read: $CODE $BODY"
 call DELETE "/api/fleet/fleet-one/board/bench/operators/$C" "$B"; [ "$CODE" = 200 ] && [ "$(OPS)" = 0 ] && ok "an admin may remove an operator (narrows spending; no PIN)" || fail "delete admin: $CODE $BODY"
 

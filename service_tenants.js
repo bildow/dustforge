@@ -336,6 +336,9 @@ module.exports = function registerServiceTenants(deps) {
   }
   function revoked({ jti, sub, iat, src_auth, fleet, parent_jti }) {
     const r = billing.checkTokenRevocation(db, { jti, sub, iat, auth_method: src_auth || 'service_token', ...(fleet ? { fleet } : {}) });
+    // A lookup that could not run is neither "alive" nor "withdrawn": stop this call with 503 (the routes catch it),
+    // never tell a tenant to drop work it was paid for (G2 review L3).
+    if (r.lookup_failed) throw Object.assign(new Error(r.reason), { unavailable: true });
     if (r.revoked) return r.reason;
     if (parent_jti) {
       const p = db.prepare('SELECT revoked FROM issued_tokens WHERE jti = ?').get(parent_jti);
@@ -1058,18 +1061,18 @@ module.exports = function registerServiceTenants(deps) {
 
   app.post('/api/services/verify', lim, (req, res) => {
     const a = tenantAuth(req, res); if (!a) return;
-    const r = verify(a.tenant, req.body);
+    let r; try { r = verify(a.tenant, req.body); } catch (e) { if (e && e.unavailable) return res.status(503).json({ error: e.message, code: 'unavailable' }); throw e; }
     res.status(r.status).json(r.body);
   });
   app.post('/api/services/charge', lim, (req, res) => {
     const a = tenantAuth(req, res); if (!a) return;
-    const r = charge(a.tenant, req.body);
+    let r; try { r = charge(a.tenant, req.body); } catch (e) { if (e && e.unavailable) return res.status(503).json({ error: e.message, code: 'unavailable' }); throw e; }
     res.status(r.status).json(r.body);
   });
 
   app.post('/api/services/charge-on-request', lim, (req, res) => {
     const a = tenantAuth(req, res); if (!a) return;
-    const r = chargeOnRequest(a.tenant, req.body);
+    let r; try { r = chargeOnRequest(a.tenant, req.body); } catch (e) { if (e && e.unavailable) return res.status(503).json({ error: e.message, code: 'unavailable' }); throw e; }
     res.status(r.status).json(r.body);
   });
 
