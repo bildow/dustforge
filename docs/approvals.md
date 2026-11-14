@@ -46,6 +46,27 @@ A `/use` on an elevated/critical secret without an approval creates a request an
 - `POST /approvals/:id/deny`. `GET /approvals` → `{incoming, outgoing, recent}` (the audit on both accounts);
   `GET /approvals/:id` → status for owner or requester (never a code).
 
+## Spent on launch, outcome shown (2026-11-14, approval 59)
+- An approval is spent when its call **launches** (the first connection the call makes), not when the gate lets it
+  through. A call answered with a refusal before anything connected (a disallowed pattern, a pre-flight that failed)
+  hands the approval back: it is `approved` again for at most 5 more minutes, the answer carries
+  `approval: {id, spent: false, approved_until}`, and `approval_released` is in the audit. A wrapped secret's approval
+  is not handed back (its unwrap is used up decrypting).
+- **Pre-flight** (ssh_exec, approved calls only): when the command runs one script by its path (`PATH [args]` or
+  `bash|sh PATH [args]`, PATH holding a `/`), `test -r PATH` (`test -x` for a direct path) runs first over a second ssh
+  login as the same user, answering with a one-time marker. Only a definite "missing" refuses: 409 `{preflight:
+  "failed"}`, nothing ran, the /use charge refunded, the approval handed back. Anything else goes ahead: an unreachable
+  host or a refused check; no marker back (an sshd `ForceCommand` ran instead — that host+user is then not checked again
+  until restart; password logins never meet `authorized_keys command=`). Not with `sudo` (a NOPASSWD rule for the
+  script doesn't cover `test`). Only the command's own first path is checked; exit 127 alone can't tell a missing
+  script from one that ran and then failed.
+- A deny tapped while a call's pre-flight runs finds the request `used`; if the check then hands it back, it is
+  `approved` again for what is left of its 5 minutes.
+- **Outcome**: a call that ran stores `{ran, http, exit_code, note}` on its request (note = the first stderr line, as
+  redacted for the caller). The owner's app shows it on the request, and a new request for the same call (same
+  requester, secret and binding, within a day) carries `previous: {id, status, outcome}` on its card. An agent token's
+  list leaves it out.
+
 ## The code (channel-independent)
 `code = HMAC-SHA256(code_key of the request, "dp-approval:<id>:<floor(t/30)>")` → 6 digits; the current and the
 previous 30-s step are accepted. It exists only after the request is opened. A channel only *delivers* it: the app

@@ -79,6 +79,9 @@ module.exports = function registerUseApprovals(deps) {
   // Service tenants (service_tenants.js): an elevated service action is approved like an elevated secret's use. Its row
   // has secret_id 0 and service_key 'svc:<tenant>:<action>' (no secret exists; /use never matches it: secret ids are > 0).
   try { db.exec('ALTER TABLE use_approvals ADD COLUMN service_key TEXT DEFAULT NULL'); } catch (_) {}
+  // What an approved call did (Aaron 2026-11-14, approval 59): JSON {at, ran, http, exit_code, note}. The owner's app
+  // shows it on the request, and on the next request for the same call, so a second ask is never a surprise.
+  try { db.exec('ALTER TABLE use_approvals ADD COLUMN outcome TEXT DEFAULT NULL'); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_owner ON use_approvals(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_requester ON use_approvals(requester_did, status)');
   // A wrapped secret's request needs its one-use key, which lives only in this process's memory (crypto_depth.js). At
@@ -227,7 +230,44 @@ module.exports = function registerUseApprovals(deps) {
       ...(owner && cryptoDepth && row.eph_pub ? (() => { const u = cryptoDepth.approvalView(row, secretOf(row.secret_id)); return u ? { unwrap: u } : {}; })() : {}),
       ...(row.approved_at ? { approved_at: row.approved_at, approved_via: row.approved_via } : {}),
       ...(row.used_at ? { used_at: row.used_at } : {}), ...(row.wrong_codes ? { wrong_codes: row.wrong_codes } : {}),
+      ...(outcomeOf(row) ? { outcome: outcomeOf(row) } : {}),
+      ...(owner && row.status === 'pending' ? (() => { const p = previousOf(row); return p ? { previous: p } : {}; })() : {}),
     };
+  }
+  function outcomeOf(row) { try { return row.outcome ? JSON.parse(row.outcome) : null; } catch (_) { return null; } }
+  // The last request for this same call (requester, secret, exact binding) in the past day that reached an outcome:
+  // a request that repeats one whose command failed says so on its card.
+  function previousOf(row) {
+    const p = db.prepare("SELECT id, status, outcome FROM use_approvals WHERE requester_did = ? AND COALESCE(requester_label, '') = ? AND secret_id = ? AND binding = ? AND id < ? AND outcome IS NOT NULL AND created_at > ? ORDER BY id DESC LIMIT 1")
+      .get(row.requester_did, row.requester_label || '', row.secret_id, row.binding, row.id, new Date(Date.now() - 86400000).toISOString());
+    return p ? { id: p.id, status: p.status, outcome: outcomeOf(p) } : null;
+  }
+
+  // An approval is spent when its call is launched, not when the gate lets it through (Aaron 2026-11-14, approval 59:
+  // a root command whose script was gone used the approval and ran nothing). /use hands a used approval back here when
+  // the call ended before anything connected: refused on the way, or its pre-flight found nothing to run. The approval
+  // returns to 'approved' (at most TTL_SEC more), so the same call can be made again. A wrapped secret's approval is not
+  // handed back: its unwrap was used up in decrypting (crypto_depth.plaintextFor), so no retry could act with it.
+  // `usedAt` is the used_at this call's own spend wrote (gate returns it): a late release never hands back a spend made
+  // by another call meanwhile (#111 review L1). The window never outlasts TTL_SEC from the approval itself — a code
+  // approval keeps its pending expiry, so repeated refusals could otherwise stretch it toward an hour (#111 review L3).
+  function release(id, actorDid, note, usedAt) {
+    const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(Number(id));
+    if (!row || row.status !== 'used' || row.eph_pub || !usedAt || row.used_at !== usedAt) return false;
+    const until = new Date(Math.min(Date.parse(row.expires_at) || 0, (Date.parse(row.approved_at) || 0) + TTL_SEC * 1000)).toISOString();
+    if (isPast(until)) return false;
+    const out = JSON.stringify({ at: nowIso(), ran: false, note: String(note || '').slice(0, 200) });
+    const took = db.prepare("UPDATE use_approvals SET status = 'approved', used_at = NULL, expires_at = ?, outcome = ? WHERE id = ? AND status = 'used' AND used_at = ?").run(until, out, row.id, usedAt).changes;
+    if (took !== 1) return false;
+    event('approval_released', actorDid || row.requester_did, row.secret_id, { approval_id: row.id, reason: String(note || '').slice(0, 200), until });
+    return { until };
+  }
+  // What the approved call did, stored on the request: ran, the HTTP status /use answered, an ssh exit code and the
+  // first line of what failed (already redacted by /use; cut short here).
+  function recordOutcome(id, { ran = true, http = null, exitCode = null, note = '' } = {}) {
+    const o = { at: nowIso(), ran: !!ran, ...(http ? { http } : {}), ...(exitCode !== null && exitCode !== undefined ? { exit_code: exitCode } : {}),
+      ...(note ? { note: String(note).slice(0, 200) } : {}) };
+    try { db.prepare("UPDATE use_approvals SET outcome = ? WHERE id = ? AND status = 'used'").run(JSON.stringify(o), Number(id)); } catch (_) {}
   }
   // The owner's notice: that an approval is pending, nothing else (it may show on a locked phone).
   function notifyOwner(row) {
@@ -317,10 +357,11 @@ module.exports = function registerUseApprovals(deps) {
       if (row.binding !== binding) return { status: 409, body: { error: 'this approval was for a different call (action, target or parameters); make the approved call exactly, or ask anew without approval_id', approval_id: row.id } };
       if (row.status === 'approved') {
         if (peek) return { ok: true, approval_id: row.id, peeked: true };
-        const took = db.prepare("UPDATE use_approvals SET status = 'used', used_at = ? WHERE id = ? AND status = 'approved'").run(nowIso(), row.id).changes;
+        const usedAt = nowIso();
+        const took = db.prepare("UPDATE use_approvals SET status = 'used', used_at = ? WHERE id = ? AND status = 'approved'").run(usedAt, row.id).changes;
         if (took !== 1) return { status: 410, body: { error: 'this approval was already used' } };
         event('approval_used', caller.did, secret.id, { approval_id: row.id, via: row.approved_via });
-        return { ok: true, approval_id: row.id, call: row.bound_call || null };
+        return { ok: true, approval_id: row.id, used_at: usedAt, call: row.bound_call || null };
       }
       if (row.status === 'pending') {
         const code = body.approval_code;
@@ -329,12 +370,13 @@ module.exports = function registerUseApprovals(deps) {
         if (cryptoDepth && cryptoDepth.isWrapped(secret)) return { status: 409, body: { error: 'this secret is wrapped to its owner\'s phone: a code cannot open it — the owner taps Approve in the app on that phone', approval_id: row.id, wrapped: true } };
         if (codeMatches(row, String(code))) {
           if (peek) return { ok: true, approval_id: row.id, peeked: true };
+          const usedAt = nowIso();
           const took = db.prepare("UPDATE use_approvals SET status = 'used', approved_at = ?, approved_via = 'code', used_at = ?, decided_at = ? WHERE id = ? AND status = 'pending'")
-            .run(nowIso(), nowIso(), nowIso(), row.id).changes;
+            .run(usedAt, usedAt, usedAt, row.id).changes;
           if (took !== 1) return { status: 410, body: { error: 'this request was decided meanwhile' } };
           event('approval_used', caller.did, secret.id, { approval_id: row.id, via: 'code' });
           logSecurityEvent('approval_code_accepted', 'info', { caller_did: caller.did, capability: kind, target: secret.name, context: { approval_id: row.id, owner_did: row.owner_did } });
-          return { ok: true, approval_id: row.id, call: row.bound_call || null };
+          return { ok: true, approval_id: row.id, used_at: usedAt, call: row.bound_call || null };
         }
         const wrong = db.prepare('UPDATE use_approvals SET wrong_codes = wrong_codes + 1 WHERE id = ? RETURNING wrong_codes').get(row.id).wrong_codes;
         event('approval_code_wrong', caller.did, secret.id, { approval_id: row.id, wrong_codes: wrong });
@@ -361,6 +403,8 @@ module.exports = function registerUseApprovals(deps) {
 
   // ── routes ─────────────────────────────────────────────────────────────────────────────────────────────────────
   // The owner, acting as a person in their own session (not an agent token).
+  // A token that acts for an agent (a silicon, a worker, a fleet-owner mint), as server.js agentToken() reads it.
+  const isAgentAuth = (auth) => !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint')));
   function ownerAuth(req, res) {
     const auth = getBearerIdentity(req);
     if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
@@ -385,14 +429,14 @@ module.exports = function registerUseApprovals(deps) {
     // An agent token (a silicon, a worker, a fleet-owner mint) resolves to its owner's DID: it sees neither what waits on
     // the owner nor the owner's decided history (#99 review M1). ?limit= (20–200) is for the owner's own session: the
     // app's Requests page lists decided requests so one can be found by number (Aaron 2026-11-12).
-    const agent = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint')));
+    const agent = isAgentAuth(auth);
     const lim = agent ? 0 : Math.min(200, Math.max(20, Number.parseInt(req.query.limit, 10) || 20));
     const recent = lim ? db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status != 'pending' ORDER BY id DESC LIMIT ?").all(auth.did, lim) : [];
     // An agent's own requests are filed under its owner's DID, so outgoing holds every agent's: without the bound call
     // and binding for an agent token, one agent cannot read another's request details (#99 re-review L1).
     // Nor the phone-wrap material, whether it was opened, what it does or why: an agent reads its own request in full
     // with GET /approvals/:id.
-    const lean = (v) => { const { call, binding, unwrap, opened, summary, purpose, ...rest } = v; return rest; };
+    const lean = (v) => { const { call, binding, unwrap, opened, summary, purpose, outcome, previous, ...rest } = v; return rest; };
     res.json({ ok: true, incoming: agent ? [] : incoming.map(r => view(r, auth.did)), outgoing: outgoing.map(r => agent ? lean(view(r, auth.did)) : view(r, auth.did)), recent: recent.map(r => view(r, auth.did)) });
   });
 
@@ -404,7 +448,10 @@ module.exports = function registerUseApprovals(deps) {
     const id = Number(req.params.id);
     const row = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id) : null;
     if (!row || (row.owner_did !== auth.did && row.requester_did !== auth.did)) return res.status(404).json({ error: 'approval request not found' });
-    res.json({ ok: true, approval: view(row, auth.did) });
+    // An agent token reads what its call asked, not what an earlier one did (#111 review L2): it had its own result.
+    const agent = isAgentAuth(auth);
+    const v = view(row, auth.did); if (agent) { delete v.outcome; delete v.previous; }
+    res.json({ ok: true, approval: v });
   });
 
   // POST /api/blindkey/approvals/:id/open — the request screen. Starts (and then returns) the current code.
@@ -499,5 +546,5 @@ module.exports = function registerUseApprovals(deps) {
       .map(r => { const v = view(r, ownerDid); return { id: r.id, title: v.secret.name || '', requester: v.requester || v.requester_label || '', summary: v.summary || '', depth: r.depth, expires_at: r.expires_at }; });
   }
 
-  return { gate, gateService, depthOf, bindingOf, pendingFor, _codeAt: codeAt, STEP_SEC, TTL_SEC, PENDING_TTL_SEC };
+  return { gate, gateService, depthOf, bindingOf, pendingFor, release, recordOutcome, _codeAt: codeAt, STEP_SEC, TTL_SEC, PENDING_TTL_SEC };
 };
