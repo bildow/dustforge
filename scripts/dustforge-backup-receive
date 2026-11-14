@@ -17,14 +17,15 @@ umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 unset SSH_ORIGINAL_COMMAND
 
-MAX_BYTES=$((256 * 1024 * 1024))
-QUOTA_BYTES=$((2 * 1024 * 1024 * 1024))
+MAX_BYTES=$((128 * 1024 * 1024))
+QUOTA_BYTES=$((3 * 1024 * 1024 * 1024))   # > (KEEP + 4) * MAX_BYTES: never locks up by itself
 KEEP=14
 MIN_AGE_DAYS=7
 MIN_GAP_S=600
 CONTAINER=prism
 DEST_DIR=/opt/dustforge-backups
 TAG=dustforge-backup-receive
+STATE=/var/lib/dustforge-backup-receive   # host-side; created root-owned, apple-writable, at install
 
 exec 9>/run/lock/dustforge-backup-receive.lock
 flock -n 9 || { echo "receive: another push is running" >&2; exit 5; }
@@ -37,11 +38,33 @@ NAME="dustforge-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
 # prune list) before we read it.
 INC() { sudo -n /usr/bin/incus "$@" < /dev/null; }
 
+# UNTRUSTED: anything printed by a process inside the container (find, du) is attacker-controlled if the container is.
+# It is only ever validated as digits before use, never put into $(( )), eval, or an unquoted command (re-review H1).
+digits() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+
+# The gap is measured on the HOST (time of our own last push), not from the container's file times.
+LAST=$(stat -c %Y "$STATE/last" 2>/dev/null || echo 0)
+if [ $(( $(date +%s) - LAST )) -lt "$MIN_GAP_S" ]; then echo "receive: a push landed less than ${MIN_GAP_S}s ago, refused" >&2; exit 6; fi
+
 INC exec "$CONTAINER" -- mkdir -p "$DEST_DIR"
-NEWEST=$(INC exec "$CONTAINER" -- find "$DEST_DIR" -maxdepth 1 -type f -name 'dustforge-*.tar.gz' -printf '%T@\n' | sort -rn | head -1 | cut -d. -f1)
-if [ -n "$NEWEST" ] && [ $(( $(date +%s) - NEWEST )) -lt "$MIN_GAP_S" ]; then echo "receive: a push landed less than ${MIN_GAP_S}s ago, refused" >&2; exit 6; fi
+prune() {   # keep the newest KEEP; of the rest delete only those older than MIN_AGE_DAYS. Runs before the quota check
+            # too, so the quota frees itself as archives age (re-review L2).
+  local cutoff=$(( $(date +%s) - MIN_AGE_DAYS * 86400 )) ts path base
+  INC exec "$CONTAINER" -- find "$DEST_DIR" -maxdepth 1 -type f -name 'dustforge-*.tar.gz' -printf '%T@ %p\n' \
+    | sort -rn | tail -n +$((KEEP + 1)) \
+    | while read -r ts path; do
+        ts=${ts%%.*}; digits "$ts" || continue
+        [ "$ts" -lt "$cutoff" ] || continue
+        base=${path##*/}
+        [[ "$path" == "$DEST_DIR/$base" && "$base" =~ ^dustforge-[0-9]{8}T[0-9]{6}Z(-[0-9]+)?\.tar\.gz$ ]] || continue
+        INC exec "$CONTAINER" -- rm -f -- "$DEST_DIR/$base"
+        logger -t "$TAG" "pruned $base"
+      done
+}
+prune
 USED=$(INC exec "$CONTAINER" -- du -sb "$DEST_DIR" | cut -f1)
-if [ "${USED:-0}" -gt "$QUOTA_BYTES" ]; then echo "receive: ${DEST_DIR} is over its quota, refused" >&2; exit 7; fi
+digits "$USED" || USED=$((QUOTA_BYTES + 1))   # unreadable size: refuse rather than trust
+if [ "$USED" -gt "$QUOTA_BYTES" ]; then echo "receive: ${DEST_DIR} is over its quota, refused" >&2; logger -t "$TAG" "ALERT quota exceeded ($USED bytes)"; exit 7; fi
 
 # Read at most MAX_BYTES + 1 bytes; one byte more than the cap means the input was too large.
 head -c $((MAX_BYTES + 1)) > "$IN"
@@ -53,15 +76,8 @@ SUM=$(sha256sum "$IN" | cut -d' ' -f1)
 
 INC file push --uid 0 --gid 0 --mode 0600 "$IN" "$CONTAINER$DEST_DIR/$NAME" >/dev/null
 logger -t "$TAG" "filed $NAME size=$SIZE sha256=$SUM"
+touch "$STATE/last"
 
-# Keep the newest KEEP; of the rest, delete only those older than MIN_AGE_DAYS.
-CUTOFF=$(( $(date +%s) - MIN_AGE_DAYS * 86400 ))
-INC exec "$CONTAINER" -- find "$DEST_DIR" -maxdepth 1 -type f -name 'dustforge-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +$((KEEP + 1)) \
-  | while read -r ts path; do
-      [ "${ts%%.*}" -lt "$CUTOFF" ] || continue
-      INC exec "$CONTAINER" -- rm -f -- "$path"
-      logger -t "$TAG" "pruned $path"
-    done
+prune
 
 echo "received $NAME ($SIZE bytes)"
