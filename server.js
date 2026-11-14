@@ -874,6 +874,8 @@ try { db.exec("ALTER TABLE identity_transactions ADD COLUMN idempotency_key TEXT
 // The token that made each charge/refund (billing.js; Aaron 2026-11-06: every send row carries its token id).
 try { db.exec("ALTER TABLE identity_transactions ADD COLUMN token_jti TEXT"); } catch(_) {}
 try { db.exec("CREATE INDEX IF NOT EXISTS idx_it_token_jti ON identity_transactions(token_jti)"); } catch(_) {}
+// A wallet's ledger by day (fleet daily spend, #114) and every per-wallet read (balance sums, ledger pages).
+try { db.exec("CREATE INDEX IF NOT EXISTS idx_it_did_created ON identity_transactions(did, created_at)"); } catch(_) {}
 
 // ── Invite Keys ──
 db.exec(`CREATE TABLE IF NOT EXISTS invite_keys (
