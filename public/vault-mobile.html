@@ -1106,6 +1106,11 @@ async function loadFleet(){
     for(const r of rows.slice(0,25)){
       h+='<div style="display:flex;justify-content:space-between;padding:0.35rem 0;border-bottom:1px solid rgba(39,68,95,0.2);font-size:0.75rem"><span>'+name(r.actor_did)+' → '+(r.project?esc(r.project):'—')+' <span style="color:var(--text3)">'+esc(r.initiator)+'</span></span><span><span style="color:var(--text3)">'+name(r.payer_did)+' paid</span> <strong>'+dd(r.cents)+' DD</strong> <span style="color:var(--text3)">('+r.calls+')</span></span></div>';
     }
+    // Daily spend per wallet, from the ledger (Aaron 2026-11-14), starting with mci, brain and bench. Owner only.
+    if(d.fleet.owner_did===did){
+      h+='<div class="section-head" style="padding:1rem 0 0.5rem"><span class="section-title">Daily spend</span><span style="font-size:0.7rem;color:var(--text3)"><a href="#" onclick="spendAll=!spendAll;loadDailySpend();return false" id="spend-toggle" style="color:var(--text3)">'+(spendAll?'mci · brain · bench':'all wallets')+'</a></span></div>';
+      h+='<div id="fleet-spend"><div class="empty" style="font-size:0.75rem">Loading…</div></div>';
+    }
     // Work links
     const links=d.work_links||[];
     if(links.length){
@@ -1113,7 +1118,35 @@ async function loadFleet(){
       for(const l of links.slice(0,20))h+=workLinkRow(l,d.current_tick);
     }
     el.innerHTML=h;
+    if(d.fleet.owner_did===did) loadDailySpend();
   }catch(e){if(!sessionEnded(e))el.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
+}
+// One line per wallet per day: calls, DD, then each action's calls and DD (UTC days, last 7).
+let spendAll=false;
+const SPEND_WALLETS='mci,brain,bench';
+async function loadDailySpend(){
+  const box=document.getElementById('fleet-spend'); if(!box||!fleetSlug)return;
+  const t=document.getElementById('spend-toggle'); if(t)t.textContent=spendAll?'mci · brain · bench':'all wallets';
+  const epoch=sessionEpoch;
+  try{
+    const r=await api('GET','/api/fleet/'+encodeURIComponent(fleetSlug)+'/spend/daily?days=7'+(spendAll?'':'&wallets='+SPEND_WALLETS));
+    if(epoch!==sessionEpoch)return;
+    let h='';
+    for(const w of r.wallets||[]){
+      h+='<div style="background:var(--card);border:1px solid var(--border);border-radius:12px;padding:0.7rem 1rem;margin-bottom:0.5rem">';
+      h+='<div style="font-size:0.8rem"><strong style="color:var(--accent)">'+esc(w.kind==='silicon'?'@'+w.name:w.name)+'</strong> <span style="color:var(--text3);font-size:0.68rem">'+esc(w.kind)+'</span></div>';
+      if(!w.days.length)h+='<div style="font-size:0.7rem;color:var(--text3);margin-top:0.3rem">no spend since '+esc(r.since)+'</div>';
+      for(const day of w.days){
+        const acts=Object.entries(day.by_action).sort((x,y)=>y[1].dd-x[1].dd).map(([k,v])=>esc(k)+' '+dd(v.calls)+'/'+dd(v.dd)+(v.refunded?' <span style="color:var(--text3)">('+dd(v.refunded)+' refunded)</span>':'')).join(' · ');
+        h+='<div style="font-size:0.72rem;padding:0.3rem 0;border-top:1px solid rgba(39,68,95,0.2);margin-top:0.3rem"><span style="color:var(--text3)">'+esc(day.date.slice(5))+'</span> · <strong>'+dd(day.calls)+'</strong> calls · <strong>'+dd(day.dd)+'</strong> DD<div style="color:var(--text2,var(--text3));font-size:0.68rem;margin-top:0.1rem;overflow-wrap:anywhere">'+acts+'</div></div>';
+      }
+      h+='</div>';
+    }
+    if(r.not_found&&r.not_found.length)h+='<div style="font-size:0.68rem;color:var(--text3)">not in this fleet: '+esc(r.not_found.join(', '))+'</div>';
+    if(!h)h='<div class="empty" style="font-size:0.75rem">No wallets to show.</div>';
+    h+='<div style="font-size:0.65rem;color:var(--text3);margin:0.2rem 0 0.5rem">calls/DD per action, UTC days; refunds netted; transfers and refills are not spend.</div>';
+    box.innerHTML=h;
+  }catch(e){ if(!sessionEnded(e)) box.innerHTML='<div class="empty" style="font-size:0.75rem">'+esc(e.message)+'</div>'; }
 }
 function workLinkRow(l,tick){
   const live=l.status==='active';
