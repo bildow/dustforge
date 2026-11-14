@@ -17,7 +17,7 @@ export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(
 mkdir -p "$S/bin" "$S/remote"
 cat >"$S/bin/sshpass" <<'SH'
 #!/bin/bash
-echo "ARGV $*" >>"$FAKE_DIR/ssh.log"; echo "SSHPASS_SET ${SSHPASS:+yes}" >>"$FAKE_DIR/ssh.log"
+echo "ARGV $*" >>"$FAKE_DIR/ssh.log"; echo "SSHPASS_SET ${SSHPASS:+yes}" >>"$FAKE_DIR/ssh.log"; echo "AGENT_SOCK ${SSH_AUTH_SOCK:-none}" >>"$FAKE_DIR/ssh.log"
 last="${@: -1}"
 if [ "$last" = "bash -s" ]; then PATH=$FAKE_DIR/remote:$PATH bash -s; else PATH=$FAKE_DIR/remote:$PATH bash -c "$last"; fi
 SH
@@ -41,7 +41,7 @@ SH
 chmod +x "$S/bin/sshpass" "$S/remote/sudo" "$S/remote/chpasswd"
 export PATH="$S/bin:$PATH" FAKE_DIR=$S
 cd "$W"
-node server.js >"$S/server.log" 2>&1 & SRV=$!
+SSH_AUTH_SOCK=/tmp/dp-smoke-agent.sock node server.js >"$S/server.log" 2>&1 & SRV=$!
 trap 'kill $SRV 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$S"' EXIT
 for i in $(seq 1 40); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
 kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -5 "$S/server.log"; exit 1; }
@@ -106,7 +106,8 @@ use(){ curl -s -o "$S/use.json" -w '%{http_code}' -X POST "$API/api/blindkey/use
 C=$(use "{\"name\":\"box\",\"action\":\"ssh_exec\",\"target_host\":\"100.83.112.88\",\"target_user\":\"deploy\",\"command\":\"-oProxyCommand=sh -c 'touch $MARK'\"}")
 [ "$C" = 400 ] && [ ! -e "$MARK" ] && [ ! -s "$S/ssh.log" ] && ok "command starting with - refused (400), ssh never ran" || fail "leading-dash command: $C $(cat "$S/use.json")"
 C=$(use '{"name":"box","action":"ssh_exec","target_host":"100.83.112.88","target_user":"deploy","command":"echo hi"}')
-grep -q '^ARGV -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -- deploy@100.83.112.88 echo hi$' "$S/ssh.log" && ok "ssh gets -- before user@host" || fail "ssh argv: $(cat "$S/ssh.log") ($C)"
+grep -q '^ARGV -e ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o GSSAPIAuthentication=no -- deploy@100.83.112.88 echo hi$' "$S/ssh.log" && ok "ssh gets -- before user@host, and logs in only with the stored password (no keys, no agent)" || fail "ssh argv: $(cat "$S/ssh.log") ($C)"
+grep -q '^AGENT_SOCK none$' "$S/ssh.log" && ! grep -q '^AGENT_SOCK /' "$S/ssh.log" && ok "the server's ssh agent socket is not passed to ssh" || fail "agent sock: $(grep AGENT_SOCK "$S/ssh.log" | sort -u)"
 # sudo modes. stdin carries text the command reads; the password is sent only in the owner's sudo:'password' mode.
 J1(){ python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); r=d.get("result") or {}; print(r.get(sys.argv[2], d.get(sys.argv[2], "")))' "$S/use.json" "$1" 2>/dev/null; }
 : >"$S/ssh.log"; rm -f "$S/sudo.pw" "$S/sudo.ts"
