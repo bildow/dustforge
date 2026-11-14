@@ -14,7 +14,7 @@ PORT=${PORT:-3871}; API=http://127.0.0.1:$PORT
 [ -d "$W/node_modules" ] || export NODE_PATH=${NODE_PATH:-/home/flimflam/project/dustforge/node_modules}
 export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))') DB_PATH=$S/dustforge.db PORT \
   STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9 \
-  BLINDKEY_SSH_HOSTS_EXTRA='127.0.0.1,localhost,racknerd-self,::1,127.0.1.1,10.0.0.9'
+  BLINDKEY_SSH_HOSTS_EXTRA='127.0.0.1,localhost,racknerd-self,::1,127.0.1.1,10.0.0.9,0,2130706433,0x7f000001,0177.0.0.1,localhost.,ip6-localhost,localtest.me,100.73.251.12,010.0.0.9'
 mkdir -p "$S/bin"
 cat >"$S/bin/sshpass" <<'SH'
 #!/bin/bash
@@ -109,6 +109,7 @@ WITH(){ python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["approval_id"]
 approve(){ local ap=$1 ref=${2:-} name=${3:-} BIND UN EPH WD UW extra=""
   for i in $(seq 1 20); do [ -n "$(Q "SELECT COALESCE(eph_pub,'') FROM use_approvals WHERE id=$ap")" ] && break; [ -z "$ref" ] && break; sleep 0.2; done
   BIND=$(Q "SELECT binding FROM use_approvals WHERE id=$ap")
+  [ "$(Q "SELECT depth FROM use_approvals WHERE id=$ap")" = critical ] && pin "$A" "approval-open:$ap"   # critical: the PIN every time
   devsign "$A" "approval-open:$ap" "$BIND"; call POST /api/demipass/approvals/$ap/open "$A" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'; local CODEV; CODEV=$(echo "$BODY" | J code)
   if [ -n "$ref" ]; then
     call GET /api/demipass/approvals "$A"; UN=$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x for x in d["incoming"] if x["id"]=='$ap'][0]; print(json.dumps(a.get("unwrap")))')
@@ -128,12 +129,14 @@ call POST /api/demipass/use "$A" "$(WITH "$B" "$AP")"
   && ok "…approved with the phone's unwrap: it logs in to root@127.0.0.1 with the stored password, never shown" || fail "lane: $CODE $BODY $(cat $S/ssh.log)"
 grep -q -- "-o PubkeyAuthentication=no" "$S/ssh.log" && ok "…by password alone (no key is offered)" || fail "pubkey: $(cat $S/ssh.log)"
 
-# refusals after the phone's approval: the lane still says no (wrong user, sudo, key_name)
-for v in 'aaron||' 'root|{"sudo":true}|sudo' 'root|{"key_name":"somekey"}|key_name'; do
-  IFS='|' read -r u p why <<<"$v"
-  : > "$S/ssh.log"; B=$(USE "$RREF" self racknerd-self "$u" "$p"); call POST /api/demipass/use "$A" "$B"; AP=$(echo "$BODY" | J approval_id)
-  if [ "$CODE" = 202 ]; then approve "$AP" "$RREF" rootlane; call POST /api/demipass/use "$A" "$(WITH "$B" "$AP")"; fi
-  [ "$CODE" = 403 ] || [ "$CODE" = 400 ] && [ ! -s "$S/ssh.log" ] && ok "root lane as user '$u' ${why:+with $why }→ $CODE, nothing connects" || fail "lane $u $why: $CODE $BODY"
+# refusals BEFORE the phone is asked (#119 review M5): a call that could never run pages nobody and unwraps nothing
+X "INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES ($RID, 'wild', 'ssh_exec', '*', '*', 'smoke')"
+for v in 'self|aaron||' 'self|root|{"sudo":true}|sudo' 'self|root|{"key_name":"somekey"}|key_name' 'wild|root||a wildcard scope'; do
+  IFS='|' read -r cx u p why <<<"$v"
+  n0=$(Q "SELECT COUNT(*) FROM use_approvals")
+  : > "$S/ssh.log"; B=$(USE "$RREF" "$cx" racknerd-self "$u" "$p"); call POST /api/demipass/use "$A" "$B"
+  [ "$CODE" = 403 ] && [ "$(Q "SELECT COUNT(*) FROM use_approvals")" = "$n0" ] && [ ! -s "$S/ssh.log" ] \
+    && ok "root lane as '$u'${why:+ with $why} → 403 before the phone is asked (no approval filed, nothing connects)" || fail "lane $u $why: $CODE $BODY"
 done
 
 : > "$S/ssh.log"
@@ -146,34 +149,47 @@ call POST /api/demipass/use "$N" "$(USE "$OREF" self racknerd-self root)"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='root_lane_refused'")" -ge 2 ] && ok "…each refusal is a critical security event" || fail "events: $(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='root_lane_refused'")"
 
 # ── loopback is not a host otherwise ──
-call POST /api/demipass/use "$A" "$(USE "$PREF" lo 127.0.0.1 root)"
-[ "$CODE" = 403 ] && echo "$BODY" | grep -q "not in SSH whitelist" && [ ! -s "$S/ssh.log" ] && ok "127.0.0.1 named in BLINDKEY_SSH_HOSTS_EXTRA is still refused" || fail "loopback extra: $CODE $BODY"
-call POST /api/demipass/use "$A" "$(USE "$PREF" lan 10.0.0.9 root)"
-[ "$CODE" = 200 ] && grep -q -- "-- root@10.0.0.9" "$S/ssh.log" && ok "…while another host in it is accepted (the filter takes only self names)" || fail "extra host: $CODE $BODY"
+bad=0
+for h in 127.0.0.1 0 2130706433 0x7f000001 0177.0.0.1 localhost. ip6-localhost localtest.me 127.0.1.1 100.73.251.12 010.0.0.9; do
+  X "INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES ($PID, 'h-$h', 'ssh_exec', '*', '$h', 'smoke')"
+  : > "$S/ssh.log"; call POST /api/demipass/use "$A" "$(USE "$PREF" "h-$h" "$h" root)"
+  { [ "$CODE" = 200 ] || [ -s "$S/ssh.log" ]; } && { bad=1; echo "  $h → $CODE connected=$([ -s "$S/ssh.log" ] && echo yes || echo no)"; }
+done
+[ $bad = 0 ] && ok "loopback in any spelling (0, 2130706433, 0x7f000001, 0177.0.0.1, localhost., ip6-localhost, a name), the box's own tailnet IP, an octal-looking IP: refused although named in BLINDKEY_SSH_HOSTS_EXTRA" || fail "loopback extra"
+[ "$(grep -c "BLINDKEY_SSH_HOSTS_EXTRA: '" "$S/server.log")" -ge 26 ] && ok "…each ignored entry is named in the server log at start" || fail "boot warnings: $(grep -c "BLINDKEY_SSH_HOSTS_EXTRA: '" "$S/server.log")"
+: > "$S/ssh.log"; call POST /api/demipass/use "$A" "$(USE "$PREF" lan 10.0.0.9 root)"
+[ "$CODE" = 200 ] && grep -q -- "-- root@10.0.0.9" "$S/ssh.log" && ok "…while a plain public-or-private IPv4 in it is accepted" || fail "extra host: $CODE $BODY"
 : > "$S/ssh.log"
 call POST /api/demipass/rotate-blind "$A" '{"ref":"'$PREF'","target_host":"racknerd-self","target_user":"root","context":"self"}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q "not in SSH whitelist" && [ ! -s "$S/ssh.log" ] && ok "rotate-blind refuses the alias (it is not a host)" || fail "rotate alias: $CODE $BODY"
 
 # ── operator act ──
 SHA=$(printf 'apply' | sha256sum | cut -d' ' -f1)
-OA='{"host":"192.3.84.103","script_path":"/opt/dustforge/ops/root-lane/apply.sh","script_sha256":"'$SHA'","route":"phasewhip-mirror-key","purpose":"if the lane login fails"}'
+C40=$(printf 'commit' | sha1sum | cut -d' ' -f1); SC=$(printf 'confirm' | sha256sum | cut -d' ' -f1); SR=$(printf 'rollback' | sha256sum | cut -d' ' -f1)
+OA='{"host":"192.3.84.103","script_path":"/opt/dustforge/ops/root-lane/apply.sh","script_sha256":"'$SHA'","route":"phasewhip-mirror-key","commit":"'$C40'","companions_sha256":["'$SC'","'$SR'"],"purpose":"if the lane login fails"}'
 call POST /api/demipass/operator-act "" "$OA"; [ "$CODE" = 401 ] && ok "operator act: no token → 401" || fail "oa anon: $CODE"
 call POST /api/demipass/operator-act "$N" "$OA"; [ "$CODE" = 403 ] && ok "another wallet cannot ask for an operator act" || fail "oa other: $CODE $BODY"
 call POST /api/demipass/operator-act "$SIL" "$OA"; [ "$CODE" = 403 ] && ok "an agent token on the owner's wallet cannot either" || fail "oa silicon: $CODE $BODY"
 bad=0
-for b in '"host":"10.0.0.9"' '"script_path":"/opt/dustforge/ops/../../etc/x"' '"script_path":"/tmp/x.sh"' '"script_sha256":"ABC"' '"route":"curl"'; do
+for b in '"host":"10.0.0.9"' '"script_path":"/opt/dustforge/ops/../../etc/x"' '"script_path":"/tmp/x.sh"' '"script_sha256":"ABC"' '"route":"curl"' '"commit":"abc"' '"companions_sha256":["xyz"]' '"purpose":"'"$(printf 'p%.0s' {1..201})"'"'; do
   call POST /api/demipass/operator-act "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b.update(json.loads("{"+sys.argv[2]+"}")); print(json.dumps(b))' "$OA" "$b")"
   [ "$CODE" = 400 ] || { bad=1; echo "  $b → $CODE"; }
 done
-[ $bad = 0 ] && ok "operator act: another host, a path outside ops/ or scripts/ (or with ..), a bad sha256, an unknown route → 400" || fail "oa validation"
+[ $bad = 0 ] && ok "operator act: another host, a path outside ops/ or scripts/ (or with ..), a bad sha256, an unknown route, a bad commit or companion sha256, a purpose over 200 → 400" || fail "oa validation"
 call POST /api/demipass/operator-act "$A" "$OA"; OAP=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && ok "the owner's operator act parks for the phone" || fail "oa park: $CODE $BODY"
 call GET /api/demipass/approvals "$A"; SUM=$(echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x for x in d["incoming"] if x["id"]=='$OAP'][0]; print(a.get("summary","") + " | " + a.get("purpose",""))')
-echo "$SUM" | grep -q "apply.sh as root on racknerd via phasewhip-mirror-key" && echo "$SUM" | grep -q "${SHA:0:12}" && echo "$SUM" | grep -q "if the lane login fails" \
-  && ok "…its card names the script, the host, the route, the sha256 and the purpose" || fail "oa card: $SUM"
+echo "$SUM" | grep -q "ops/root-lane/apply.sh as root on racknerd via phasewhip-mirror-key" && echo "$SUM" | grep -q "${SHA:0:12}" && echo "$SUM" | grep -q "${C40:0:10}" && echo "$SUM" | grep -q "if the lane login fails" \
+  && ok "…its card names the script, the host, the route, the commit, the sha256 and the purpose" || fail "oa card: $SUM"
 OB=$(WITH "$OA" "$OAP")
 call POST /api/demipass/operator-act "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b["script_sha256"]="0"*64; print(json.dumps(b))' "$OB")"
 [ "$CODE" != 200 ] && ok "an approval id redeemed with another sha256 does not pass ($CODE)" || fail "oa swap: $CODE $BODY"
+for f in '"purpose":"dry run only"' '"commit":"'"$(printf '1%.0s' {1..40})"'"' '"companions_sha256":[]'; do
+  call POST /api/demipass/operator-act "$A" "$(python3 -c 'import json,sys; b=json.loads(sys.argv[1]); b.update(json.loads("{"+sys.argv[2]+"}")); print(json.dumps(b))' "$OB" "$f")"
+  [ "$CODE" != 200 ] || fail "oa swap $f passed"
+done
+ok "…nor with another purpose, commit or companion list (all bound)"
+[ "$(Q "SELECT depth FROM use_approvals WHERE id=$OAP")" = critical ] && ok "…and it is asked at critical depth (the PIN every time)" || fail "oa depth: $(Q "SELECT depth FROM use_approvals WHERE id=$OAP")"
 approve "$OAP"
 call POST /api/demipass/operator-act "$A" "$OB"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J approved)" = True ] && [ "$(echo "$BODY" | J script_sha256)" = "$SHA" ] && ok "…approved: the answer is the consent record (script, sha256, route)" || fail "oa approved: $CODE $BODY"

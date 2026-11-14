@@ -48,6 +48,7 @@ const BLINDKEY_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
 const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
 const SELF_SSH_ALIAS = 'racknerd-self';   // the root lane's host name (see selfLaneRefusal)
+const SELF_ADDRESSES = new Set(['192.3.84.103', '100.73.251.12']);   // this box's own addresses: never an extra host
 const BLINDKEY_SSH_HOSTS = new Set([
   '192.3.84.103',      // RackNerd
   '100.83.112.88',     // phasewhip
@@ -56,8 +57,13 @@ const BLINDKEY_SSH_HOSTS = new Set([
   '100.103.90.79',     // flimflam
   '100.73.92.12',      // skypie (Aaron's laptop, tailnet)
   // More hosts from the environment, comma-separated IPs or names (e.g. a box a person shares through DemiPass).
-  // Never loopback or this box's own sshd by another name: see SELF_SSH_ALIAS.
-  ...String(process.env.BLINDKEY_SSH_HOSTS_EXTRA || '').split(',').map(h => h.trim()).filter(h => /^[A-Za-z0-9.:-]{1,253}$/.test(h) && !isSelfHostName(h)),
+  // Canonical public IPv4 only (#119 review H1): a name, or a number written another way (0, 2130706433, 0x7f000001,
+  // localhost., a shared box's DNS repointed later), could reach this box's own sshd on loopback. See SELF_SSH_ALIAS.
+  ...String(process.env.BLINDKEY_SSH_HOSTS_EXTRA || '').split(',').map(h => h.trim()).filter(Boolean).filter(h => {
+    if (extraSshHostOk(h)) return true;
+    console.warn(`[ssh] BLINDKEY_SSH_HOSTS_EXTRA: '${h.slice(0, 80)}' ignored (only a public IPv4 address, written plainly, that is not this box)`);
+    return false;
+  }),
 ]);
 // The root lane (2026-11-14, root-lane adversarial review). The gateway reaches its own sshd as root over loopback
 // only, where one sshd Match allows root's password (ops/root-lane/). Loopback is never in the host set: every wallet
@@ -67,17 +73,25 @@ const BLINDKEY_SSH_HOSTS = new Set([
 // the host set, which uses isSelfHostName while it is built.
 // Aaron's wallet. The environment (root-only on the host) may name another one: the smoke tests do.
 const ROOT_LANE_OWNER_DID = process.env.DUSTFORGE_ROOT_LANE_OWNER_DID || 'did:key:u7QGkcLsNaXM-_aJLhtMuNwfZT4xDl23kZFohcAfOHfwEQg';
-function isSelfHostName(h) {
-  const s = String(h).toLowerCase();
-  return s === SELF_SSH_ALIAS || s === 'localhost' || s.startsWith('127.') || s === '::1' || s === '0.0.0.0' || s === '::' || s.startsWith('::ffff:127.');
+function extraSshHostOk(h) {   // SELF_ADDRESSES is declared above the host set, which calls this while it is built
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (!m) return false;
+  const parts = m.slice(1), o = parts.map(Number);
+  if (parts.some(x => x.length > 1 && x[0] === '0') || o.some(x => x > 255)) return false;   // no octal-looking or out-of-range parts
+  if (o[0] === 0 || o[0] === 127 || o[0] >= 224 || (o[0] === 169 && o[1] === 254)) return false;   // this-network, loopback, multicast/reserved, link-local
+  return !SELF_ADDRESSES.has(h);
 }
-function selfLaneRefusal(secret, { owner, user, keyName, sudo }) {
+// Checked before the owner's phone is asked (#119 review M5) and again where the call connects.
+function selfLaneRefusal(secret, { owner, user, keyName, sudo, contextId }) {
   if (!owner) return 'the root lane is used only by its owner, in their own session (no delegation, no agent token)';
   if (secret.did !== ROOT_LANE_OWNER_DID) return 'the root lane belongs to one wallet; this secret is not its entry';
   if (secret.wrap_state !== 'device' || !['elevated', 'critical'].includes(secret.security_depth)) return 'the root lane needs an entry wrapped to the owner\'s phone (elevated or critical depth)';
   if (user !== 'root' || (secret.account_username && secret.account_username !== 'root')) return 'the root lane logs in as root only, with the root entry';
   if (keyName) return 'the root lane logs in with its own password: no key_name';
   if (sudo !== undefined && sudo !== false) return 'the root lane is root already: no sudo';
+  // Only a scope made for the lane (its host pattern exactly the alias): a wildcard scope never grants it (#119 review).
+  const ctx = contextId != null ? db.prepare('SELECT target_host_pattern FROM blindkey_contexts WHERE id = ?').get(contextId) : null;
+  if (!ctx || ctx.target_host_pattern !== SELF_SSH_ALIAS) return `the root lane needs a scope whose host is exactly '${SELF_SSH_ALIAS}'`;
   return null;
 }
 // ssh with a password, and no shell on this server: sshpass gets user@host and the remote command as separate
@@ -183,9 +197,9 @@ function useInflightDone(req) {
 // The owner approves, in the DemiPass app with the PIN, an act on their own entry that an agent session could otherwise
 // do in their name (#96 review H1: a device-flow MCP token is the owner's wallet, not the owner). Returns true to go on,
 // or answers (202 with the approval request, or the refusal) and returns false.
-function ownerApproves(req, res, ownerDid, key, name, action, target, params) {
+function ownerApproves(req, res, ownerDid, key, name, action, target, params, { depth = 'elevated' } = {}) {
   const auth = getBearerIdentity(req);
-  const g = useApprovals.gateService({ key, name, approverDid: ownerDid, depth: 'elevated' },
+  const g = useApprovals.gateService({ key, name, approverDid: ownerDid, depth },
     { did: auth.did, label: cleanLabel(auth.agent_name || (auth.decoded && auth.decoded.agent_label) || 'session', 40) },
     { action, targetHost: String(target || '').slice(0, 200), params }, req.body || {});
   if (g.ok) return true;
@@ -5604,6 +5618,16 @@ async function useRoute(req, res) {
           logSecurityEvent('command_not_allowed', 'alert', { caller_did: req.identity.did, capability: 'ssh_exec', target: target_host, ip: req.ip, context: { secret: secret.name } });
           return res.status(403).json({ error: why });
         }
+        // So is a root-lane call that could never run (#119 review M5): the phone is not paged, the entry not unwrapped.
+        if (target_host === SELF_SSH_ALIAS) {
+          const lane = selfLaneRefusal(secret, { owner: !tokenRow.delegation_id && secret.did === req.identity.did && !agentToken(req),
+            user: action_params.target_user || secret.account_username || 'claude', keyName: action_params.key_name, sudo: action_params.sudo, contextId: tokenRow.context_id });
+          if (lane) {
+            db.prepare("UPDATE blindkey_use_tokens SET status = 'expired' WHERE id = ? AND status = 'valid'").run(tokenRow.id);
+            logSecurityEvent('root_lane_refused', 'critical', { caller_did: req.identity.did, capability: 'ssh_exec', target: target_host, ip: req.ip, error: lane, context: { secret: secret.name } });
+            return res.status(403).json({ error: lane });
+          }
+        }
       }
       // So is a method off the scope's list (#97 review: the owner is never asked to approve a call that cannot run).
       if (action === 'http_header' || action === 'http_body') {
@@ -5706,7 +5730,7 @@ async function useRoute(req, res) {
           // the alias, since it is not in the host set.
           const selfLane = target_host === SELF_SSH_ALIAS;
           if (selfLane) {
-            const why = selfLaneRefusal(secret, { owner: !tokenRow.delegation_id && secret.did === req.identity.did && !agentToken(req), user: effectiveUser, keyName: key_name, sudo });
+            const why = selfLaneRefusal(secret, { owner: !tokenRow.delegation_id && secret.did === req.identity.did && !agentToken(req), user: effectiveUser, keyName: key_name, sudo, contextId: tokenRow.context_id });
             if (why) {
               logSecurityEvent('root_lane_refused', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: why, ip: req.ip, context: { secret: secret.name } });
               return res.status(403).json({ error: why });
@@ -13422,19 +13446,27 @@ app.post('/api/blindkey/operator-act', rateLimitStandard, (req, res) => {
   if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
   if (isAgentAuth(auth)) return res.status(403).json({ error: 'an operator act is asked from the owner\'s own session, not an agent token' });
   if (auth.did !== ROOT_LANE_OWNER_DID) return res.status(403).json({ error: 'operator acts belong to the infrastructure\'s owner' });
-  const { host, script_path, script_sha256, route } = req.body || {};
+  const { host, script_path, script_sha256, route, commit, companions_sha256, purpose } = req.body || {};
   if (typeof host !== 'string' || !Object.prototype.hasOwnProperty.call(OPERATOR_ACT_HOSTS, host)) return res.status(400).json({ error: 'host: one of ' + Object.keys(OPERATOR_ACT_HOSTS).join(', ') });
   if (typeof script_path !== 'string' || !/^\/opt\/dustforge\/(ops|scripts)\/[A-Za-z0-9._\/-]{1,160}$/.test(script_path) || script_path.includes('..') || script_path.includes('//')) return res.status(400).json({ error: 'script_path: a script under /opt/dustforge/ops/ or /opt/dustforge/scripts/' });
   if (typeof script_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(script_sha256)) return res.status(400).json({ error: 'script_sha256: 64 lowercase hex' });
   if (typeof route !== 'string' || !OPERATOR_ACT_ROUTES.has(route)) return res.status(400).json({ error: 'route: one of ' + [...OPERATOR_ACT_ROUTES].join(', ') });
-  const name = OPERATOR_ACT_HOSTS[host];
-  if (!ownerApproves(req, res, auth.did, 'svc:demipass:operator-act', `Root on ${name}`, 'operator-act', host, { host_name: name, script_path, script_sha256, route })) return;
-  logSecurityEvent('operator_act_approved', 'alert', { caller_did: auth.did, capability: 'operator-act', target: host, ip: req.ip, context: { script_path, script_sha256, route, approval_id: req._approvalId || (req.body && req.body.approval_id) || null } });
+  // The reviewed commit the script comes from, and the scripts it runs in turn (#119 review: those run as root too).
+  if (typeof commit !== 'string' || !/^[0-9a-f]{40}$/.test(commit)) return res.status(400).json({ error: 'commit: the 40-hex commit the script comes from' });
+  if (companions_sha256 !== undefined && (!Array.isArray(companions_sha256) || companions_sha256.length > 4 || companions_sha256.some(h => typeof h !== 'string' || !/^[0-9a-f]{64}$/.test(h)))) return res.status(400).json({ error: 'companions_sha256: up to 4 sha256s of the scripts it runs' });
+  // The purpose is part of what is approved (the card shows it): bound, recorded, never free text beside the binding.
+  if (purpose !== undefined && (typeof purpose !== 'string' || purpose.length > 200)) return res.status(400).json({ error: 'purpose: at most 200 characters' });
+  const name = OPERATOR_ACT_HOSTS[host], companions = companions_sha256 || [], why = purpose || '';
+  // Root on a server is critical depth: the PIN on every approval, never a recent unlock (#119 review).
+  if (!ownerApproves(req, res, auth.did, 'svc:demipass:operator-act', `Root on ${name}`, 'operator-act', host,
+      { host_name: name, script_path, script_sha256, route, commit, companions_sha256: companions, purpose: why }, { depth: 'critical' })) return;
+  const approvalId = req._approvalId || (req.body && req.body.approval_id) || null;
+  logSecurityEvent('operator_act_approved', 'alert', { caller_did: auth.did, capability: 'operator-act', target: host, ip: req.ip, context: { script_path, script_sha256, route, commit, companions_sha256: companions, purpose: why, approval_id: approvalId } });
   try {
     db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(auth.did, `Operator act approved: ${script_path} (sha256 ${script_sha256}) as root on ${name} via ${route}`, req.ip || '', 'UTC', 'decision', JSON.stringify(['operator-act', 'host:' + host]));
+      .run(auth.did, `Operator act approved (#${approvalId}): ${script_path} (sha256 ${script_sha256}, commit ${commit.slice(0, 12)}) as root on ${name} via ${route}${why ? ' — ' + why : ''}`, req.ip || '', 'UTC', 'decision', JSON.stringify(['operator-act', 'host:' + host]));
   } catch (_) {}
-  res.json({ ok: true, approved: true, host, host_name: name, script_path, script_sha256, route,
+  res.json({ ok: true, approved: true, approval_id: approvalId, host, host_name: name, script_path, script_sha256, route, commit, companions_sha256: companions, purpose: why,
     note: 'Approved once: run exactly this script, after checking its sha256, by this route; then record the outcome.' });
 });
 
