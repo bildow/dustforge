@@ -33,7 +33,7 @@ if sqlite3 /opt/dustforge/data/dustforge.db ".backup '$WORK/dustforge.db'"; then
   # and the receiver files stdin into prism:/opt/dustforge-backups (keep 14). The old unrestricted key (racknerd-backup,
   # apple + sudo = root on phasewhip) is used only until the new key exists, then it is removed from phasewhip.
   if [ -r "$PUSH_KEY" ]; then
-    ssh $SSH_OPTS -i "$PUSH_KEY" -o IdentitiesOnly=yes "apple@$PHASEWHIP" < "$DEST/$DF" || { echo "[backup] WARN: dustforge push (restricted key) failed"; fail=1; }
+    ssh $SSH_OPTS -F /dev/null -i "$PUSH_KEY" -o IdentitiesOnly=yes "apple@$PHASEWHIP" < "$DEST/$DF" || { echo "[backup] WARN: dustforge push (restricted key) failed"; fail=1; }
   elif scp $SSH_OPTS "$DEST/$DF" "apple@$PHASEWHIP:/tmp/$DF"; then
     ssh $SSH_OPTS "apple@$PHASEWHIP" "sudo incus exec prism -- mkdir -p /opt/dustforge-backups && sudo incus file push /tmp/$DF prism/opt/dustforge-backups/$DF && rm -f /tmp/$DF && sudo incus exec prism -- sh -c 'cd /opt/dustforge-backups && ls -1t dustforge-*.tar.gz | tail -n +$((KEEP+1)) | xargs -r rm -f'" || { echo "[backup] WARN: dustforge->container push failed"; fail=1; }
   else echo "[backup] WARN: dustforge scp to phasewhip failed"; fail=1; fi

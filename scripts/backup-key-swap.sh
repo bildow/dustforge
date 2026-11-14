@@ -35,14 +35,26 @@ done
 ssh $SSHO -i "$OLD" apple@$PW test -x /usr/local/sbin/dustforge-backup-receive \
   && echo "ok   phasewhip has the receiver" || { echo "phasewhip has no receiver — stop"; exit 1; }
 
-echo "== 2. new key"
-if [ -e "$NEW" ]; then echo "kept existing $NEW"; else ssh-keygen -q -t ed25519 -N '' -C dustforge-backup-push -f "$NEW"; echo "generated $NEW"; fi
-ssh-keygen -lf "$NEW.pub"
-KEYTEXT=$(awk '{print $1" "$2" dustforge-backup-push"}' "$NEW.pub")
-KEYBODY=$(awk '{print $2}' "$NEW.pub")
+echo "== 2. new key (generated under a temporary name; it takes its real name only once phasewhip accepts it, so a"
+echo "      half-finished swap never leaves backup-all.sh pointing at a key phasewhip does not know — review M2)"
+if [ -e "$NEW" ]; then echo "kept existing $NEW"; KEYF="$NEW"
+else
+  rm -f "$NEW.tmp" "$NEW.tmp.pub"
+  ssh-keygen -q -t ed25519 -N '' -C dustforge-backup-push -f "$NEW.tmp"; echo "generated $NEW.tmp"; KEYF="$NEW.tmp"
+fi
+ssh-keygen -lf "$KEYF.pub"
+KEYTEXT=$(awk '{print $1" "$2" dustforge-backup-push"}' "$KEYF.pub")
+LINE="restrict,from=\"100.73.251.12\",command=\"/usr/local/sbin/dustforge-backup-receive\" $KEYTEXT"
 
 echo "== 3. authorize it on phasewhip (restricted), over the old key"
-ssh $SSHO -i "$OLD" apple@$PW "grep -qF $KEYBODY ~/.ssh/authorized_keys && echo 'already present' || { printf '%s\n' 'restrict,from=\"100.73.251.12\",command=\"/usr/local/sbin/dustforge-backup-receive\" $KEYTEXT' >> ~/.ssh/authorized_keys && echo added; }"
+# Whole-line match (review M3); a newline first if the file does not end with one, so the line is never glued on.
+ssh $SSHO -i "$OLD" apple@$PW "f=~/.ssh/authorized_keys; if grep -qxF '$LINE' \$f; then echo 'already present'; else [ -z \"\$(tail -c1 \$f)\" ] || echo >> \$f; printf '%s\n' '$LINE' >> \$f && echo added; fi"
+# The restricted key must now work on its own and reach only the receiver: an empty input is refused by it with exit
+# 2 (or 6 if a scheduled push landed in the last 10 minutes). Anything else (255 = not accepted) stops the swap.
+rc=0; ssh $SSHO -F /dev/null -i "$KEYF" apple@$PW < /dev/null >/dev/null 2>&1 || rc=$?
+if [ "$rc" = 2 ] || [ "$rc" = 6 ]; then echo "ok   phasewhip accepts the new key and runs the receiver (exit $rc)"
+else echo "the new key does not reach the receiver (exit $rc) — stop; backup-all.sh still uses the old path"; exit 1; fi
+if [ "$KEYF" = "$NEW.tmp" ]; then mv "$NEW.tmp.pub" "$NEW.pub"; mv "$NEW.tmp" "$NEW"; echo "installed $NEW"; fi
 
 echo "== 4. one real backup run through the new key"
 rc=0; /opt/dustforge/scripts/backup-all.sh || rc=$?

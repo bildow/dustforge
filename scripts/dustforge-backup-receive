@@ -2,27 +2,46 @@
 # /usr/local/sbin/dustforge-backup-receive — the ONLY thing the gateway's backup key can run on phasewhip.
 # Installed as the forced command of one authorized key of `apple`:
 #   restrict,from="100.73.251.12",command="/usr/local/sbin/dustforge-backup-receive" ssh-ed25519 … dustforge-backup-push
-# It takes one gzip archive on stdin and files it in the prism container, keeping the newest 14. That is all.
+# It takes one gzip archive on stdin and files it in the prism container. That is all.
 #   - SSH_ORIGINAL_COMMAND (whatever the client asked to run) is ignored: no argument, path or name comes from outside.
-#   - The file name is made here from the time; the destination is fixed.
-#   - Input is capped (MAX_BYTES); anything larger is refused and discarded.
+#   - The file name is made here (time + pid); the destination is fixed; filed root-owned, mode 0600.
+#   - Input is capped (MAX_BYTES); one push at a time (lock); none within MIN_GAP_S of the last; the directory has a
+#     byte quota. A flood can only block new pushes, never delete history:
+#   - pruning keeps the newest KEEP and never deletes an archive younger than MIN_AGE_DAYS.
 #   - The archive is never extracted or parsed here: only its first two bytes are checked (gzip magic).
-#   - Only these incus calls run: exec mkdir, file push, exec prune (fixed arguments).
-# Exit 0 on success; non-zero with one line on stderr otherwise. No input is echoed back.
+#   - Only these incus calls run: exec mkdir, exec find/du/stat, file push, exec rm (fixed arguments).
+#   - Each push is logged (syslog tag dustforge-backup-receive) with its size and sha256.
+# (adversarial review 2026-11-14: lock, unique names, uid 0, age-floored pruning, gap, quota, logger, LC_ALL)
 set -euo pipefail
 umask 077
-export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
 unset SSH_ORIGINAL_COMMAND
 
 MAX_BYTES=$((256 * 1024 * 1024))
+QUOTA_BYTES=$((2 * 1024 * 1024 * 1024))
 KEEP=14
+MIN_AGE_DAYS=7
+MIN_GAP_S=600
 CONTAINER=prism
 DEST_DIR=/opt/dustforge-backups
-NAME="dustforge-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+TAG=dustforge-backup-receive
+
+exec 9>/run/lock/dustforge-backup-receive.lock
+flock -n 9 || { echo "receive: another push is running" >&2; exit 5; }
 
 TMP=$(mktemp -d /tmp/dustforge-backup-receive.XXXXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 IN="$TMP/in.tar.gz"
+NAME="dustforge-$(date -u +%Y%m%dT%H%M%SZ)-$$.tar.gz"
+# incus exec forwards stdin into the container: every call reads /dev/null, or it would eat the archive (or the
+# prune list) before we read it.
+INC() { sudo -n /usr/bin/incus "$@" < /dev/null; }
+
+INC exec "$CONTAINER" -- mkdir -p "$DEST_DIR"
+NEWEST=$(INC exec "$CONTAINER" -- find "$DEST_DIR" -maxdepth 1 -type f -name 'dustforge-*.tar.gz' -printf '%T@\n' | sort -rn | head -1 | cut -d. -f1)
+if [ -n "$NEWEST" ] && [ $(( $(date +%s) - NEWEST )) -lt "$MIN_GAP_S" ]; then echo "receive: a push landed less than ${MIN_GAP_S}s ago, refused" >&2; exit 6; fi
+USED=$(INC exec "$CONTAINER" -- du -sb "$DEST_DIR" | cut -f1)
+if [ "${USED:-0}" -gt "$QUOTA_BYTES" ]; then echo "receive: ${DEST_DIR} is over its quota, refused" >&2; exit 7; fi
 
 # Read at most MAX_BYTES + 1 bytes; one byte more than the cap means the input was too large.
 head -c $((MAX_BYTES + 1)) > "$IN"
@@ -30,11 +49,19 @@ SIZE=$(stat -c %s "$IN")
 if [ "$SIZE" -eq 0 ]; then echo "receive: empty input" >&2; exit 2; fi
 if [ "$SIZE" -gt "$MAX_BYTES" ]; then echo "receive: input over ${MAX_BYTES} bytes, refused" >&2; exit 3; fi
 if [ "$(head -c 2 "$IN" | od -An -tx1 | tr -d ' \n')" != "1f8b" ]; then echo "receive: not a gzip archive, refused" >&2; exit 4; fi
+SUM=$(sha256sum "$IN" | cut -d' ' -f1)
 
-sudo -n /usr/bin/incus exec "$CONTAINER" -- mkdir -p "$DEST_DIR"
-sudo -n /usr/bin/incus file push --mode 0600 "$IN" "$CONTAINER$DEST_DIR/$NAME"
-sudo -n /usr/bin/incus exec "$CONTAINER" -- find "$DEST_DIR" -maxdepth 1 -type f -name 'dustforge-*.tar.gz' -printf '%T@ %p\n' \
-  | sort -rn | tail -n +$((KEEP + 1)) | cut -d' ' -f2- \
-  | while IFS= read -r old; do sudo -n /usr/bin/incus exec "$CONTAINER" -- rm -f -- "$old"; done
+INC file push --uid 0 --gid 0 --mode 0600 "$IN" "$CONTAINER$DEST_DIR/$NAME" >/dev/null
+logger -t "$TAG" "filed $NAME size=$SIZE sha256=$SUM"
+
+# Keep the newest KEEP; of the rest, delete only those older than MIN_AGE_DAYS.
+CUTOFF=$(( $(date +%s) - MIN_AGE_DAYS * 86400 ))
+INC exec "$CONTAINER" -- find "$DEST_DIR" -maxdepth 1 -type f -name 'dustforge-*.tar.gz' -printf '%T@ %p\n' \
+  | sort -rn | tail -n +$((KEEP + 1)) \
+  | while read -r ts path; do
+      [ "${ts%%.*}" -lt "$CUTOFF" ] || continue
+      INC exec "$CONTAINER" -- rm -f -- "$path"
+      logger -t "$TAG" "pruned $path"
+    done
 
 echo "received $NAME ($SIZE bytes)"
