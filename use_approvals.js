@@ -183,6 +183,7 @@ module.exports = function registerUseApprovals(deps) {
         : action === 'outside-ask' ? `your agent asks @${q.person} (your in-person contact) for ${q.secret || 'a secret'}: "${String(q.reason || '').slice(0, 60)}"`
         : action === 'rotate-blind' ? `rotate the password of ${q.target_user}@${targetHost || ''} blind (a new random one, stored in your vault)`
         : action === 'delegation-widen' ? `widen agent delegation #${q.delegation_id}: ${[q.may_rotate === true ? 'it may rotate the password' : '', q.timeout_seconds ? `calls may wait up to ${q.timeout_seconds} s` : ''].filter(Boolean).join('; ')}`
+        : action === 'operator-act' ? `run ${String(q.script_path || '').replace(/^\/opt\/dustforge\//, '')} as root on ${q.host_name} via ${q.route} (commit ${String(q.commit || '').slice(0, 10)}, sha256 ${String(q.script_sha256 || '').slice(0, 12)}…)`
         : action === 'rotate-forgejo' ? `rotate the Forgejo login of ${q.username} blind (a new random one, stored in your vault)`
         : action === 'margin' ? `${q.service}: margin ${q.was}% → ${q.margin_pct}% over cost on every call`
         : action === 'connect' ? `point callers of ${q.service} at ${q.endpoint || '(nothing)'}; agents run ${q.mcp_server || '(no MCP server)'}`
