@@ -13453,8 +13453,9 @@ app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
     const picked = grantCtx ? { context: grantCtx.context_name } : asked ? { context: asked } : soleContext(secret, { action: 'ssh_exec', targetHost: target_host });
     const chk = enforceBlindkeyContext(secret, picked.context, 'ssh_exec', null, typeof target_host === 'string' ? target_host : null);
     if (!chk.allowed) {
-      logSecurityEvent('rotate_scope_denied', 'alert', { caller_did: ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), ip: req.ip, error: chk.error, context: { secret: secret.name } });
-      return res.status(403).json({ error: `rotation goes only to a host this secret's scope covers: ${chk.error}` });
+      logSecurityEvent('rotate_scope_denied', 'alert', { caller_did: (callerAuth && callerAuth.did) || ownerDid, capability: 'rotate_blind', target: String(target_host).slice(0, 200), ip: req.ip, error: chk.error, context: { secret: secret.name, ...(asked ? { context_asked: asked } : {}) } });
+      // The owner is told which scopes exist, so an ambiguous one can be named (review L1); a delegate is not.
+      return res.status(403).json({ error: `rotation goes only to a host this secret's scope covers: ${chk.error}`, ...(!viaDelegation && Array.isArray(picked.contexts) ? { contexts: picked.contexts } : {}) });
     }
   }
 

@@ -149,7 +149,7 @@ APPROVED POST /api/demipass/rotate-blind '{"ref":"DP-PWD-laptop-0001","target_ho
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J rotated_by)" = owner ] && ok "…approved in the app: the owner's login is rotated" || fail "owner: $CODE $BODY"
 # Two scopes cover the host: the owner names one (2026-11-14: the refusal asked for a context the route never read)
 call POST /api/demipass/rotate-blind "$O" '{"ref":"DP-PWD-twin-0001","target_host":"100.83.112.88","target_user":"aaron"}'
-[ "$CODE" = 403 ] && echo "$BODY" | grep -q "context" && ok "two scopes cover the host and none is named: 403 asking for a context" || fail "ambiguous: $CODE $BODY"
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q '"contexts":\["default","ssh_exec-100.83.112.88"\]' && ok "two scopes cover the host and none is named: 403 listing the scopes to name" || fail "ambiguous: $CODE $BODY"
 call POST /api/demipass/rotate-blind "$O" '{"ref":"DP-PWD-twin-0001","target_host":"100.83.112.88","target_user":"aaron","context":"nope"}'
 [ "$CODE" = 403 ] && ok "a named scope that does not exist is refused" || fail "bad context: $CODE $BODY"
 call POST /api/demipass/rotate-blind "$O" '{"ref":"DP-PWD-twin-0001","target_host":"100.83.112.88","target_user":"aaron","context":"ssh_exec-100.83.112.88"}'
