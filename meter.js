@@ -32,7 +32,7 @@ const RECEIPT_VERSION = 1;
 const MAX_UNITS = 100;
 const SHA256_RE = /^[0-9a-f]{64}$/;
 
-// DD per unit (1 DD = $0.001). 10 DD matches one /use (api_call_compute).
+// DD per unit (1 DD = $0.001). Set when one /use was 10 DD; /use is 1 DD since 2026-11-14 (billing.js RATE_CHANGES).
 const METER_RATES = Object.freeze({
   'eval-rig': Object.freeze({
     provision: 10,   // one subject container provisioned from a packed artifact

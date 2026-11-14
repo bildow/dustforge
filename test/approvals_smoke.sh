@@ -75,7 +75,7 @@ B0=$(bal owner-a)
 call POST /api/demipass/use "$AG" "$(USE deploy "" "" "deploy the site")"
 AP=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J status)" = approval_pending ] && [ -n "$AP" ] && echo "$BODY" | grep -q "Park this task" && ok "elevated: the first /use parks — 202 approval_pending, request $AP, told to park" || fail "park: $CODE $BODY"
-[ "$(bal owner-a)" = "$((B0-10))" ] && ok "a parked /use is charged like any /use (10 DD; no refund, so the DD ledger stays whole)" || fail "charge: $B0 → $(bal owner-a)"
+[ "$(bal owner-a)" = "$((B0-1))" ] && ok "a parked /use is charged like any /use (1 DD; no refund, so the DD ledger stays whole)" || fail "charge: $B0 → $(bal owner-a)"
 [ "$(Q "SELECT summary FROM use_approvals WHERE id=$AP")" = "http_header https://repo.dustroot.com/deploy" ] && [ "$(Q "SELECT json_extract(bound_call,'$.body.params.url') FROM use_approvals WHERE id=$AP")" = "https://repo.dustroot.com/deploy" ] && [ "$(Q "SELECT purpose FROM use_approvals WHERE id=$AP")" = "deploy the site" ] && ok "the request names the exact call and the purpose" || fail "summary: $(Q "SELECT summary||' | '||purpose FROM use_approvals WHERE id=$AP")"
 [ -n "$(Q "SELECT notified_at FROM use_approvals WHERE id=$AP")" ] && ok "the owner was notified (mail: an approval is pending, nothing else)" || fail "notify"
 call POST /api/demipass/use "$AG" "$(USE deploy)"; [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J approval_id)" = "$AP" ] && ok "the same call again returns the same request (no pile of requests)" || fail "dedupe: $CODE $BODY"

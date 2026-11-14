@@ -2367,6 +2367,17 @@ app.get('/api/directory/stats', (req, res) => {
 // ============================================================
 
 app.get('/api/billing/rates', (req, res) => res.json(billing.RATE_TABLE));
+// The dated price table: today's rates plus every change and the day it took effect (billing.js RATE_CHANGES).
+app.get('/api/billing/price-table', (req, res) => res.json({
+  unit: 'DD', dd_usd: 1 / ddUnits.DD_PER_USD, rates: billing.RATE_TABLE, changes: billing.RATE_CHANGES,
+  pure_traffic: {
+    'POST /api/blindkey/request-token': billing.RATE_TABLE.api_call_read,
+    'POST /api/blindkey/use': billing.RATE_TABLE.api_call_compute,
+    'POST /api/services/verify': 0,
+    'conduit post / read / ack / forward': 'per recipient, the conduit tenant\'s price (GET /api/services/conduit)',
+  },
+  model_backed: 'measured cost plus the tenant margin (GET /api/services); rounds: round_dispatch / round_collaboration',
+}));
 
 // INTERNAL ONLY — requires admin key. Never expose publicly.
 app.post('/api/billing/topup', (req, res) => {

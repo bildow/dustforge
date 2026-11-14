@@ -83,7 +83,7 @@ use /bytes/304587
 
 B0=$(BAL); use /bytes/$((LIMIT + 1))
 [ "$CODE" = 413 ] && [ "$(J limit_bytes < "$S/out")" = "$LIMIT" ] && [ "$(J declared_bytes < "$S/out")" = $((LIMIT + 1)) ] && ok "over the limit with Content-Length → 413 naming the $LIMIT-byte limit" || fail "over CL: $CODE $(head -c 300 "$S/out")"
-[ $((B0 - $(BAL))) = 10 ] && ok "the refused-but-made upstream call is charged 10 DD" || fail "charge: $B0 → $(BAL)"
+[ $((B0 - $(BAL))) = 1 ] && ok "the refused-but-made upstream call is charged 1 DD" || fail "charge: $B0 → $(BAL)"
 use "/bytes/$((LIMIT + 1))?chunked"
 [ "$CODE" = 413 ] && [ "$(J limit_bytes < "$S/out")" = "$LIMIT" ] && [ -n "$(J read_bytes < "$S/out")" ] && ok "over the limit, chunked (no Content-Length) → 413 too" || fail "over chunked: $CODE $(head -c 300 "$S/out")"
 grep -q "Internal\|<html" "$S/out" && fail "an HTML/500 body leaked" || ok "the 413 is JSON, not an HTML page"
