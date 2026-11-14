@@ -2039,6 +2039,18 @@ async function loadApprovals(){
   catch(e){ if(sessionEnded(e)||e.status===429) return; }
   renderApprovals();
 }
+// What an approved call did (Aaron 2026-11-14, approval 59: a request repeating one whose command failed must not be a surprise).
+function outcomeLine(o){
+  if(!o) return '';
+  const when=o.at?' <span style="color:var(--text3)">'+esc(new Date(o.at).toLocaleTimeString())+'</span>':'';
+  if(o.ran===false) return '<span style="color:var(--orange)">Nothing ran'+(o.note?': '+esc(o.note):'')+'</span>'+when;
+  const bad=(o.exit_code!=null&&o.exit_code!==0)||(o.http&&o.http>=300)||!!o.note;
+  const head=o.exit_code!=null?'exit '+Number(o.exit_code):o.http&&o.http>=300?'failed (HTTP '+Number(o.http)+')':'ran';
+  return '<span style="color:'+(bad?'var(--red)':'var(--green)')+'">'+(bad?'Ran, then failed: ':'Ran: ')+esc(head)+(o.note?' · '+esc(o.note):'')+'</span>'+when;
+}
+function previousLine(p){
+  return p&&p.outcome?'<div style="margin-top:0.25rem">The same call, request #'+Number(p.id)+' ('+esc(p.status)+'): '+outcomeLine(p.outcome)+'</div>':'';
+}
 function renderApprovals(){
   updateReqBadge();
   const el=document.getElementById('approval-requests'); if(!el) return;
@@ -2046,6 +2058,7 @@ function renderApprovals(){
     +' <span style="font-size:0.65rem;color:'+(a.depth==='critical'?'var(--red)':'var(--orange)')+'">'+esc(a.depth)+'</span></div>'
     +'<div class="fr-origin">'+esc(a.summary||'')+'</div>'
     +(a.purpose?'<div style="margin-top:0.25rem">“'+esc(a.purpose)+'”</div>':'')
+    +previousLine(a.previous)
     +'<div style="color:var(--text3);margin-top:0.25rem">Waits until '+esc(new Date(a.expires_at).toLocaleTimeString())+' · your PIN opens it, then you see the full call</div>'
     +'<div class="fr-row"><button class="btn-primary" onclick="openApproval('+Number(a.id)+')">Open</button><button class="btn-ghost" onclick="denyApproval('+Number(a.id)+')">Deny</button></div></div>').join('');
 }
@@ -2066,7 +2079,7 @@ async function refreshApproval(first){
     const a=d.approval||{};
     apOpen.code=d.code; apOpen.unwrap=a.unwrap||null; apOpen.name=(a.secret&&a.secret.name)||'';
     document.getElementById('ap-title').textContent=(a.kind==='reveal'?'Reveal ':'Approve ')+(a.secret&&a.secret.name||'')+'?';
-    document.getElementById('ap-what').innerHTML='<b>@'+esc(a.requester||'')+'</b>'+(a.requester_label?' ('+esc(a.requester_label)+')':'')+'<br>'+esc(a.summary||'')+(a.purpose?'<br>“'+esc(a.purpose)+'”':'');
+    document.getElementById('ap-what').innerHTML='<b>@'+esc(a.requester||'')+'</b>'+(a.requester_label?' ('+esc(a.requester_label)+')':'')+'<br>'+esc(a.summary||'')+(a.purpose?'<br>“'+esc(a.purpose)+'”':'')+previousLine(a.previous);
     document.getElementById('ap-call').textContent=a.call?JSON.stringify(a.call,null,1):'';
     document.getElementById('ap-code').textContent=d.code;
     document.getElementById('ap-timer').textContent='code changes at '+new Date(d.code_valid_until).toLocaleTimeString()+' · request ends '+new Date(a.expires_at).toLocaleTimeString();
@@ -2500,7 +2513,7 @@ async function loadRequestsOnce(){
   for(const a of [...(ap.incoming||[]),...(ap.recent||[]),...(ap.outgoing||[])]){
     if(seen.has('use'+a.id)) continue; seen.add('use'+a.id);
     items.push({kind:'use',id:a.id,status:a.status,who:a.requester||'',label:a.requester_label||'',what:(a.secret&&a.secret.name?a.secret.name+': ':'')+(a.summary||a.service||''),
-      why:a.purpose||'',created:a.created_at,expires:a.expires_at,mine:!!(ap.outgoing||[]).find(x=>x.id===a.id)&&!(ap.incoming||[]).concat(ap.recent||[]).find(x=>x.id===a.id)});
+      why:a.purpose||'',created:a.created_at,expires:a.expires_at,outcome:a.outcome||null,previous:a.previous||null,mine:!!(ap.outgoing||[]).find(x=>x.id===a.id)&&!(ap.incoming||[]).concat(ap.recent||[]).find(x=>x.id===a.id)});
   }
   for(const q of (sc.requests||[])) items.push({kind:'scan',sub:q.kind==='scrub'?'scrub':'',id:q.id,status:q.status,who:q.requested_by||'',label:'',
     what:q.kind==='scrub'&&q.scrub?'scrub '+q.scrub.name+' ('+q.scrub.ref+') from the files a scrubber reads':'scan token'+(q.labels.length===1?'':'s')+': '+q.labels.join(', '),why:'',created:q.created_at,expires:q.expires_at,raw:q});
@@ -2532,6 +2545,7 @@ function renderRequests(){
       :r.requester_role==='outside_agent'?'<div style="color:var(--red);margin-top:0.2rem">@'+esc(r.requested_by||'?')+' is a wallet your fleet did not create. If approved, it can act as @'+esc(r.handle||'?')+'.</div>':'';
     return '<div class="req-row"><div class="rr-top"><span><b>'+(i.sub==='scrub'?'Scrub token':kindName[i.kind])+' #'+Number(i.id)+'</b>'+(i.mine?' <span style="color:var(--text3)">(yours, waiting on someone else)</span>':'')+'</span><span class="rr-st" style="color:'+(col[st]||'var(--text3)')+'">'+esc(i.status)+'</span></div>'
       +'<div style="margin-top:0.2rem">'+esc(i.what)+'</div>'+warn
+      +(i.outcome?'<div style="margin-top:0.2rem">'+outcomeLine(i.outcome)+'</div>':'')+(st==='pending'?previousLine(i.previous):'')
       // A request that also sets the agent's delivery key says so here too, as its card does (#100 merge review).
       +(i.kind==='agent'&&r.delivery_key_fp&&st==='pending'?'<div class="req-key" style="color:var(--red);margin-top:0.2rem">It also sets @'+esc(r.handle||'?')+'\'s delivery key to <span style="font-family:monospace">'+esc(r.delivery_key_fp)+'</span>'+(r.current_key_fp?', <b>replacing</b> <span style="font-family:monospace">'+esc(r.current_key_fp)+'</span>':'')+'.</div>':'')
       +(i.who||i.label?'<div style="color:var(--text3);margin-top:0.15rem">from @'+esc(i.who||'?')+(i.label?' ('+esc(i.label)+')':'')+'</div>':'')

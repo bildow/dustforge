@@ -3916,7 +3916,10 @@ function grantContextDelegation(ownerDid, delegateDid, secret, contextId, grante
 
 // The outbound log: one blindkey_events row per connection /use makes, written right before it (red team item 2: a
 // refused use must show no row). Never holds a value — the action and the target only.
-function egressLog(req, secret, action, target) {
+// It also marks the /use call as launched (req._egressed): an approval is spent only by a call that got this far
+// (settleApproval). A pre-flight's own connection is logged with { launch: false }.
+function egressLog(req, secret, action, target, { launch = true } = {}) {
+  if (launch && req && typeof req === 'object') req._egressed = true;
   try {
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)')
       .run('egress', (req.identity && req.identity.did) || '', secret ? secret.id : null, null, JSON.stringify({ action, target: String(target || '').slice(0, 300) }));
@@ -5363,8 +5366,69 @@ function claimUseToken(id) {
 function releaseUseToken(c) { try { db.prepare('UPDATE blindkey_use_tokens SET executing_until = NULL WHERE id = ? AND executing_until = ?').run(c.id, c.until); } catch (_) {} }
 app.post('/api/blindkey/use', rateLimitUseWallet, rateLimitUseWalletTotal, rateLimitUseIpCeiling, billing.billingMiddleware(db, 'api_call_compute'), async (req, res) => {
   useInflightOpen(req, res);
-  try { return await useRoute(req, res); } finally { if (req._useClaim) releaseUseToken(req._useClaim); useInflightDone(req); }
+  const json = res.json.bind(res);
+  res.json = (b) => { req._useAnswer = b; return json(approvalAnswer(req, res, b)); };
+  try { return await useRoute(req, res); } finally { settleApproval(req, res); if (req._useClaim) releaseUseToken(req._useClaim); useInflightDone(req); }
 });
+
+// An approval is spent when its call is launched (Aaron 2026-11-14, approval 59: "An approval whose command fails at
+// launch should not be spent, or the app should show the failure"). The gate marks it used as it lets the call through
+// (req._approvalId); a call answered with a refusal before anything connected (egressLog never ran) hands it back, and
+// the answer says so. A call that ran has its outcome stored on the request, for the owner's app.
+function approvalAnswer(req, res, b) {
+  const id = req._approvalId;
+  if (!id || req._egressed || res.statusCode < 300 || !b || typeof b !== 'object' || Array.isArray(b) || b.approval) return b;
+  const r = useApprovals.release(id, req.identity && req.identity.did, b.error || `answered ${res.statusCode}`);
+  return r ? { ...b, approval: { id, spent: false, approved_until: r.until, note: 'nothing ran, so the approval was not spent: make the same call again with approval_id' } }
+           : { ...b, approval: { id, spent: true } };
+}
+function settleApproval(req, res) {
+  const id = req._approvalId;
+  if (!id) return;
+  const b = req._useAnswer || {};
+  try {
+    if (!req._egressed && !(res.headersSent && res.statusCode < 300)) { useApprovals.release(id, req.identity && req.identity.did, b.error || 'not answered'); return; }
+    const r = b.result || {};
+    const exitCode = Number.isInteger(r.exit_code) ? r.exit_code : null;
+    const firstLine = (t) => String(t || '').split('\n').map(x => x.trim()).find(Boolean) || '';
+    const note = exitCode ? firstLine(r.stderr) || firstLine(r.stdout)
+      : res.statusCode >= 300 ? String(b.error || '')
+      : (Number.isInteger(r.status) && r.status >= 400) ? `upstream answered ${r.status}` : '';
+    useApprovals.recordOutcome(id, { ran: true, http: res.statusCode, exitCode, note });
+  } catch (_) {}
+}
+
+// The pre-flight of an approved ssh_exec. When the command runs one script by its path (`PATH [args]` with a / in
+// PATH, or `bash|sh PATH [args]`), a no-op `test` on that path runs first, as the same login and with the same sudo.
+// If it fails (the file is gone, unreadable or not executable, sudo refuses, the host is unreachable) nothing has
+// been launched: the call is answered 409, its charge refunded and the approval handed back. Only the command's own
+// first path is checked — exit 127 alone cannot tell a missing script from a script that ran and then failed.
+const PREFLIGHT_RE = /^\s*(?:(bash|sh)\s+)?([A-Za-z0-9._\/][A-Za-z0-9._\/-]*)(?:\s|$)/;
+function preflightOf(command) {
+  const m = PREFLIGHT_RE.exec(String(command || ''));
+  if (!m) return null;
+  if (!m[1] && !m[2].includes('/')) return null;   // a bare name (id, systemctl …) is found on PATH: nothing to check
+  return { path: m[2], test: `test ${m[1] ? '-r' : '-x'} ${m[2]}`, want: m[1] ? 'readable' : 'executable' };
+}
+async function sshPreflight(req, secret, { user, host, password, command, sudo, values = [] }) {
+  const p = preflightOf(command);
+  if (!p) return null;
+  const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' : undefined;
+  egressLog(req, secret, 'ssh_exec_preflight', host, { launch: false });
+  try { await sshRun(user, host, password, sudo ? sudoWrap(p.test, sudo) : p.test, { input, timeout: 20000 }); return null; }
+  catch (e) {
+    let why = String(e.stderr || '').split('\n').map(x => x.trim()).find(Boolean) || '';
+    for (const v of values) why = scrubSecretFromError(why, v);
+    const error = why
+      ? `nothing ran: the check before running ${p.path} failed (${why.slice(0, 200)})`
+      : `nothing ran: ${p.path} is not on ${host} or not ${p.want} for ${user}${sudo ? ' with sudo' : ''}`;
+    const refunded = refundUse(req, 'nothing ran: the pre-flight check failed');
+    const r = req._approvalId ? useApprovals.release(req._approvalId, req.identity && req.identity.did, error) : null;
+    logSecurityEvent('ssh_preflight_failed', 'info', { caller_did: req.identity && req.identity.did, capability: 'ssh_exec', target: host, ip: req.ip, context: { secret: secret.name, path: p.path, approval_id: req._approvalId || null } });
+    return { status: 409, body: { error, preflight: 'failed', path: p.path, refunded_dd: refunded,
+      ...(req._approvalId ? { approval: r ? { id: req._approvalId, spent: false, approved_until: r.until, note: 'make the same call again with approval_id once the file is in place' } : { id: req._approvalId, spent: true } } : {}) } };
+  }
+}
 async function useRoute(req, res) {
   let { use_token } = req.body || {};
 
@@ -5518,6 +5582,7 @@ async function useRoute(req, res) {
         const approved = approvedBody(g.call);
         if (approved) action_params = { ...approved, ...(approved.params || {}) };
         approvedElevatedUse = Boolean(g.approval_id) && !g.peeked;
+        if (approvedElevatedUse) req._approvalId = g.approval_id;   // spent only if the call launches (settleApproval)
         if (cryptoDepth.isWrapped(secret)) {
           try { decryptedValue = cryptoDepth.plaintextFor(secret, g.approval_id); }
           catch (e) { return res.status(e.status || 409).json({ error: e.message, wrapped: true }); }
@@ -5596,6 +5661,10 @@ async function useRoute(req, res) {
             keySecret = k.secret; password = k.value;
           }
 
+          if (req._approvalId) {   // an approved call: check the script is there before the approval is spent on it
+            const pf = await sshPreflight(req, secret, { user: effectiveUser, host: target_host, password, command, sudo, values: [password, decryptedValue] });
+            if (pf) return res.status(pf.status).json(pf.body);
+          }
           try {
             // No local shell: see sshRun. With sudo, sudo -S reads the password as stdin's first line (-p '' keeps
             // its prompt out of the output) and the command gets whatever follows.
@@ -5967,6 +6036,7 @@ async function useRoute(req, res) {
     const approved = approvedBody(g.call);   // red team item 14: run what was approved, as stored
     if (approved) params = approved.params;
     var useApprovalId = g.approval_id || null;   // eslint-disable-line no-var
+    if (useApprovalId) req._approvalId = useApprovalId;   // spent only if the call launches (settleApproval)
   }
 
   let decryptedValue;
@@ -6120,6 +6190,10 @@ async function useRoute(req, res) {
           keySecret = k.secret; password = k.value;
         }
 
+        if (req._approvalId) {   // an approved call: check the script is there before the approval is spent on it
+          const pf = await sshPreflight(req, secret, { user: target_user, host: target_host, password, command, sudo, values: [password, decryptedValue] });
+          if (pf) return res.status(pf.status).json(pf.body);
+        }
         try {
           // No local shell: see sshRun.
           const remote = sudo ? sudoWrap(command, sudo) : command;

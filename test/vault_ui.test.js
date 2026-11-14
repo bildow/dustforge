@@ -2270,3 +2270,19 @@ test('an agent token request that carries a delivery key shows its fingerprint, 
   pg.el('pin-unlock').value = '2468'; await pg.ctx.submitPin(); await done; await settle();
   assert.equal(approved, 2);
 });
+
+test('an approved call\'s outcome shows on the request, and a repeat of a failed call says so (approval 59)', async () => {
+  const pg = page({ storage: signedIn, routes: fillRoutes({ requests: [] }) });
+  await settle();
+  const { outcomeLine, previousLine } = pg.ctx;
+  assert.match(outcomeLine({ ran: false, note: 'nothing ran: /opt/x.sh is not on racknerd' }), /Nothing ran: nothing ran: \/opt\/x\.sh/);
+  const failed = outcomeLine({ ran: true, http: 200, exit_code: 127, note: 'bash: /opt/x.sh: No such file or directory' });
+  assert.match(failed, /Ran, then failed: exit 127 · bash: \/opt\/x\.sh: No such file or directory/);
+  assert.match(failed, /var\(--red\)/);
+  assert.match(outcomeLine({ ran: true, http: 200, exit_code: 0 }), /var\(--green\)">Ran: exit 0/);
+  assert.match(outcomeLine({ ran: true, http: 502, note: 'upstream refused' }), /failed \(HTTP 502\)/);
+  assert.equal(outcomeLine(null), '');
+  assert.doesNotMatch(outcomeLine({ ran: true, exit_code: 1, note: '<img src=x onerror=alert(1)>' }), /<img/, 'a stderr line stays text');
+  assert.match(previousLine({ id: 59, status: 'used', outcome: { ran: true, exit_code: 127, note: 'missing' } }), /The same call, request #59 \(used\): .*exit 127/);
+  assert.equal(previousLine({ id: 59, status: 'used' }), '');
+});
