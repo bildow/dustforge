@@ -11629,7 +11629,7 @@ app.post('/api/tick/verify', (req, res) => {
 // GET /api/tick/stats — member aggregate stats
 app.get('/api/tick/stats', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const total = db.prepare('SELECT COUNT(*) as n FROM ticks WHERE did = ?').get(auth.did).n;
   const first = db.prepare('SELECT created_at FROM ticks WHERE did = ? ORDER BY id ASC LIMIT 1').get(auth.did);
@@ -11798,7 +11798,7 @@ app.get('/api/ledger', (req, res) => {
 // GET /api/ledger/summary — free summary (total entries, date range, no detail)
 app.get('/api/ledger/summary', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const total = db.prepare('SELECT COUNT(*) as n FROM auto_ledger WHERE did = ?').get(auth.did).n;
   const first = db.prepare('SELECT created_at FROM auto_ledger WHERE did = ? ORDER BY id ASC LIMIT 1').get(auth.did);
@@ -11841,7 +11841,7 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_ct_status ON chrono_triggers(statu
 // POST /api/chrono/create — schedule a trigger
 app.post('/api/chrono/create', async (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { name, payload = {}, action = 'webhook', target, fire_in, fire_at } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
@@ -11908,7 +11908,7 @@ app.post('/api/chrono/create', async (req, res) => {
 // POST /api/chrono/extend — push back the fire time (dead man's switch reset)
 app.post('/api/chrono/extend', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { trigger_id, extend_by } = req.body || {};
   if (!trigger_id) return res.status(400).json({ error: 'trigger_id required' });
@@ -11936,7 +11936,7 @@ app.post('/api/chrono/extend', (req, res) => {
 // POST /api/chrono/cancel — disarm a trigger
 app.post('/api/chrono/cancel', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { trigger_id } = req.body || {};
   if (!trigger_id) return res.status(400).json({ error: 'trigger_id required' });
@@ -11952,7 +11952,7 @@ app.post('/api/chrono/cancel', (req, res) => {
 // GET /api/chrono/list — list your triggers
 app.get('/api/chrono/list', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const status = req.query.status || null;
   let triggers;
@@ -12147,7 +12147,7 @@ setInterval(() => {
 // GET /api/buoy/probes — view probe telemetry
 app.get('/api/buoy/probes', (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const probes = [];
   for (const [host, entry] of probeCounters) {
@@ -12426,7 +12426,7 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_nt_initiator ON notarized_ticks(in
 // POST /api/buoy/notarize — create a notarized intent
 app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
   if (suspendedDids.has(auth.did)) return res.status(403).json({ error: 'account suspended — cannot create notarizations. Contact support@dustforge.com' });
 
   const { counterparty_did, claim, asset_ref, amount, unit, expires_in, prior_tick_ref } = req.body || {};
@@ -12496,7 +12496,7 @@ app.post('/api/buoy/notarize', rateLimitStandard, (req, res) => {
 // GET /api/buoy/notarized/:id — inspect a notarization before signing
 app.get('/api/buoy/notarized/:id', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const record = db.prepare('SELECT * FROM notarized_ticks WHERE id = ?').get(req.params.id);
   if (!record) return res.status(404).json({ error: 'not found' });
@@ -12529,7 +12529,7 @@ app.get('/api/buoy/notarized/:id', rateLimitStandard, (req, res) => {
 // POST /api/buoy/cosign — counterparty co-signs a notarized intent
 app.post('/api/buoy/cosign', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { notarized_id, payload_hash } = req.body || {};
   if (!notarized_id || !payload_hash) return res.status(400).json({ error: 'notarized_id and payload_hash required. Inspect the payload first via GET /api/buoy/notarized/:id' });
@@ -12574,7 +12574,7 @@ app.post('/api/buoy/cosign', rateLimitStandard, (req, res) => {
 // POST /api/buoy/reject — counterparty rejects a notarization
 app.post('/api/buoy/reject', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { notarized_id, reason } = req.body || {};
   if (!notarized_id) return res.status(400).json({ error: 'notarized_id required' });
@@ -12596,7 +12596,7 @@ app.post('/api/buoy/reject', rateLimitStandard, (req, res) => {
 // GET /api/buoy/notarized — list notarized ticks involving this DID
 app.get('/api/buoy/notarized', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { status } = req.query;
   let records;
@@ -12820,7 +12820,7 @@ function structuralHash(text) {
 // POST /api/identity/genesis — agent submits its origin refraction
 app.post('/api/identity/genesis', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { refraction } = req.body || {};
   if (!refraction || typeof refraction !== 'string') return res.status(400).json({ error: 'refraction required — your response to the ODT seed' });
@@ -12863,7 +12863,7 @@ app.get('/api/identity/genesis/seed', (_req, res) => {
 // POST /api/identity/genesis/verify — verify a refraction matches the origin
 app.post('/api/identity/genesis/verify', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { refraction } = req.body || {};
   if (!refraction) return res.status(400).json({ error: 'refraction required' });
@@ -12995,7 +12995,7 @@ function expireInsightClaims() {
 // POST /api/insights/claim — append a new claim to the ledger
 app.post('/api/insights/claim', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { claim_type, claim, source, provenance, weight, ttl_hours } = req.body || {};
   if (!claim_type || !claim) return res.status(400).json({ error: 'claim_type and claim required' });
@@ -13018,7 +13018,7 @@ app.post('/api/insights/claim', rateLimitStandard, (req, res) => {
 // GET /api/insights/score — the scorer: returns why_now, why_not, what_changed
 app.get('/api/insights/score', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   expireInsightClaims();
 
@@ -13087,7 +13087,7 @@ app.get('/api/insights/score', rateLimitStandard, (req, res) => {
 // GET /api/insights/claims — list active claims (the ledger)
 app.get('/api/insights/claims', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   expireInsightClaims();
 
@@ -13105,7 +13105,7 @@ app.get('/api/insights/claims', rateLimitStandard, (req, res) => {
 // PATCH /api/insights/claims/:id — supersede or reject a claim
 app.patch('/api/insights/claims/:id', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const { status, reason } = req.body || {};
   if (!['superseded', 'rejected'].includes(status)) {
@@ -13643,7 +13643,7 @@ console.log('[BOOT] registering cruise routes...');
 // POST /api/insights/cruise/engage — start a cruise session
 app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   // Check for existing active session
   const existing = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status = 'engaged'").get(auth.did);
@@ -13680,7 +13680,7 @@ app.post('/api/insights/cruise/engage', rateLimitStandard, (req, res) => {
 // POST /api/insights/cruise/cycle — execute one cycle of the current session
 app.post('/api/insights/cruise/cycle', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status = 'engaged'").get(auth.did);
   if (!session) return res.status(404).json({ error: 'No active cruise session. Engage first.' });
@@ -13762,7 +13762,7 @@ app.post('/api/insights/cruise/cycle', rateLimitStandard, (req, res) => {
 // POST /api/insights/cruise/outcome — report the outcome of a cycle
 app.post('/api/insights/cruise/outcome', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   // Accept outcomes for active OR recently completed sessions (outcome may arrive after final cycle auto-completes)
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND status IN ('engaged', 'paused', 'completed') ORDER BY id DESC LIMIT 1").get(auth.did);
@@ -13801,7 +13801,7 @@ app.post('/api/insights/cruise/outcome', rateLimitStandard, (req, res) => {
 // POST /api/insights/cruise/disengage — stop cruise control
 app.post('/api/insights/cruise/disengage', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? AND (status = 'engaged' OR status = 'paused')").get(auth.did);
   if (!session) return res.status(404).json({ error: 'No active cruise session' });
@@ -13821,7 +13821,7 @@ app.post('/api/insights/cruise/disengage', rateLimitStandard, (req, res) => {
 // GET /api/insights/cruise/status — check current cruise state
 app.get('/api/insights/cruise/status', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const session = db.prepare("SELECT * FROM cruise_sessions WHERE did = ? ORDER BY id DESC LIMIT 1").get(auth.did);
   if (!session) return res.json({ status: 'disengaged', message: 'No cruise sessions found' });
@@ -15414,7 +15414,7 @@ app.post('/api/blindkey/secrets/:ref/pool', rateLimitStandard, (req, res) => {
 // GET /api/demipass/dashboard — secret health dashboard for the mobile app
 app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
 
   const secrets = db.prepare(`
     SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
@@ -15555,7 +15555,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
 // POST /api/demipass/freeze — freeze/unfreeze a secret
 app.post('/api/blindkey/freeze', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
   const { name, ref, freeze } = req.body || {};
 
   let secret;
@@ -15591,7 +15591,7 @@ app.post('/api/demipass/freeze', rateLimitStandard, (req, res) => {
 // POST /api/demipass/outcome — record a use-token outcome (success/failure)
 app.post('/api/blindkey/outcome', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
-  if (!auth.ok) return res.status(401).json({ error: 'Bearer token required' });
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
   const { secret_id, action_type, outcome, error_summary } = req.body || {};
   if (!secret_id || !outcome) return res.status(400).json({ error: 'secret_id and outcome required' });
   if (!['success', 'failure'].includes(outcome)) return res.status(400).json({ error: 'outcome must be success or failure' });
