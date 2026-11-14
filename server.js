@@ -5422,11 +5422,23 @@ async function sshPreflight(req, secret, { user, host, password, command, sudo, 
   const n = crypto.randomBytes(9).toString('hex');
   egressLog(req, secret, 'ssh_exec_preflight', host, { launch: false });
   if (keySecret) egressLog(req, keySecret, 'ssh_exec_preflight', host, { launch: false });
-  let out;
+  // The check always exits 0 (both branches echo). ssh's own failure (255) or sshRun's refusal (2) means the check never
+  // ran: inconclusive, the call goes ahead. Any other ending without the marker — another exit, a timeout, other output —
+  // means something else ran in its place (a forced command): that host+user is not checked again (#111 re-review M1).
+  let out, ranElse = false;
   try { out = String(await sshRun(user, host, password, `test ${p.flag} ${p.path} && echo DPPF-ok-${n} || echo DPPF-no-${n}`, { timeout: 20000 })).trim(); }
-  catch (_) { return null; }   // the check itself failed (unreachable, refused): inconclusive, the call goes ahead
-  if (out === `DPPF-ok-${n}`) return null;
-  if (out !== `DPPF-no-${n}`) { preflightSkip.add(host + '|' + user); return null; }
+  catch (e) {
+    out = String(e.stdout || '').trim();
+    if (e.timedOut || (e.status !== 255 && e.status !== 2)) ranElse = out !== `DPPF-ok-${n}` && out !== `DPPF-no-${n}`;
+    if (!ranElse) return null;
+  }
+  if (!ranElse && out === `DPPF-ok-${n}`) return null;
+  if (ranElse || out !== `DPPF-no-${n}`) {
+    preflightSkip.add(host + '|' + user);
+    logSecurityEvent('ssh_preflight_skipped', 'warn', { caller_did: req.identity && req.identity.did, capability: 'ssh_exec', target: host, ip: req.ip,
+      context: { secret: secret.name, user, why: 'the check did not answer with its marker (a forced command?): this host+user is not checked again until restart' } });
+    return null;
+  }
   const error = `nothing ran: ${p.path} is not on ${host} or not ${p.want} for ${user}`;
   const refunded = refundUse(req, 'nothing ran: the pre-flight check found no script');
   const r = req._approvalId ? useApprovals.release(req._approvalId, req.identity && req.identity.did, error, req._approvalUsedAt) : null;

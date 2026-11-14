@@ -8,6 +8,7 @@
 #   (c) an approved call refused before connecting (a disallowed pattern) hands the approval back too
 #   (d) a bare command (`id`) gets no pre-flight; an executable PATH is checked with test -x
 #   (f) sudo:true gets no pre-flight (a NOPASSWD rule for the script does not cover `test`): one connection
+#   (h) the same when the forced command exits non-zero (the check's ssh fails, not with 255)
 #   (g) a host whose sshd forces a command: the check gets no marker back → inconclusive, the call goes ahead, and that
 #       host+user is not checked again
 set -u
@@ -21,7 +22,7 @@ mkdir -p "$S/bin" "$S/host" "$S/remote"
 cat >"$S/bin/sshpass" <<'SH'
 #!/bin/bash
 last="${@: -1}"
-if [ -e "$FAKE_DIR/force" ]; then echo "FORCED $last" >>"$FAKE_DIR/ssh.log"; echo forced-run; exit 0; fi
+if [ -e "$FAKE_DIR/force" ]; then echo "FORCED $last" >>"$FAKE_DIR/ssh.log"; echo forced-run; exit "$(cat "$FAKE_DIR/force")"; fi
 echo "RUN $last" >>"$FAKE_DIR/ssh.log"
 PATH=$FAKE_DIR/remote:$PATH bash -c "$last"
 SH
@@ -58,10 +59,10 @@ A=$(login owner-a); AG=$(login owner-a)
 call POST /api/identity/pin "$A" '{"pin":"4321","password":"hunter22"}'
 call POST /api/demipass/store "$A" '{"name":"host-root","value":"zzrootpw-77ab","secret_type":"password","username":"root","host":"100.83.112.88"}'; REF=$(echo "$BODY" | J ref)
 [ -n "$REF" ] && [ "$REF" != None ] || { fail "store: $CODE $BODY"; exit 1; }
-SCRIPT=$S/host/setup.sh F=$S/host/fails.sh X=$S/host/run.sh SU=$S/host/root-only.sh G=$S/host/g.sh
+SCRIPT=$S/host/setup.sh F=$S/host/fails.sh X=$S/host/run.sh SU=$S/host/root-only.sh G=$S/host/g.sh U=$S/host/u.sh
 SID=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$REF'"); CID=$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$SID")
 pin "$A" 4321 "scope:$SID"
-call PATCH /api/demipass/context/$CID "$A" "$(jbody allowed_commands "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "bash $SCRIPT" "bash $F" "echo hi | curl x" id "$X --now" "sudo bash $SU" "bash $G")")"; [ "$CODE" = 200 ] || fail "commands: $CODE $BODY"
+call PATCH /api/demipass/context/$CID "$A" "$(jbody allowed_commands "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "bash $SCRIPT" "bash $F" "echo hi | curl x" id "$X --now" "sudo bash $SU" "bash $G" "bash $U")")"; [ "$CODE" = 200 ] || fail "commands: $CODE $BODY"
 call POST /api/demipass/gate-policy "$A" "$(jbody ref "$REF" security_depth elevated)"; [ "$CODE" = 200 ] || fail "set elevated: $CODE $BODY"
 USE(){ jbody ref "$REF" action ssh_exec target_host 100.83.112.88 target_user root command "$1" ${2:+approval_id $2}; }
 # ask → open (PIN) → Approve: prints the approval id
@@ -127,12 +128,24 @@ pin "$A" 4321 "approval-open:$A7"; call POST /api/demipass/approvals/$A7/open "$
 [ "$(Q "SELECT status||' '||json_extract(outcome,'\$.exit_code') FROM use_approvals WHERE id=$A7")" = "used 127" ] && ok "(f) …and its outcome shows exit 127" || fail "(f) row: $(Q "SELECT status||' '||COALESCE(outcome,'') FROM use_approvals WHERE id=$A7")"
 
 # (g) a forced command on the host
-approved "bash $G"; A8=$AP; touch "$S/force"; : >"$S/ssh.log"
+approved "bash $G"; A8=$AP; echo 0 >"$S/force"; : >"$S/ssh.log"
 call POST /api/demipass/use "$AG" "$(USE "bash $G" $A8)"
 [ "$CODE" = 200 ] && [ "$(grep -c '^FORCED ' "$S/ssh.log")" = 2 ] && ok "(g) no marker back → inconclusive: the call goes ahead (it is not refused)" || fail "(g) $CODE $BODY $(cat "$S/ssh.log")"
-rm -f "$S/force"; approved "bash $G"; A9=$AP; touch "$S/force"; : >"$S/ssh.log"
+rm -f "$S/force"; approved "bash $G"; A9=$AP; echo 0 >"$S/force"; : >"$S/ssh.log"
 call POST /api/demipass/use "$AG" "$(USE "bash $G" $A9)"
 [ "$CODE" = 200 ] && [ "$(grep -c '^FORCED ' "$S/ssh.log")" = 1 ] && ok "(g) …and that host+user is not checked again (one connection)" || fail "(g) again: $CODE $(cat "$S/ssh.log")"
+rm -f "$S/force"
+[ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='ssh_preflight_skipped'")" = 1 ] && ok "(g) the skip is logged once (ssh_preflight_skipped)" || fail "(g) skip event"
+# (h) a forced command that exits non-zero (the check's ssh ends with that exit, not 255): something else ran too
+USEU(){ jbody ref "$REF" action ssh_exec target_host 100.83.112.88 target_user deploy command "$1" ${2:+approval_id $2}; }
+appu(){ call POST /api/demipass/use "$AG" "$(USEU "$1")"; AP=$(echo "$BODY" | J approval_id); [ "$CODE" = 202 ] || fail "(h) ask: $CODE $BODY"
+  pin "$A" 4321 "approval-open:$AP"; call POST /api/demipass/approvals/$AP/open "$A"; call POST /api/demipass/approvals/$AP/approve "$A" "$(jbody code "$(echo "$BODY" | J code)")"; }
+appu "bash $U"; echo 4 >"$S/force"; : >"$S/ssh.log"
+call POST /api/demipass/use "$AG" "$(USEU "bash $U" $AP)"
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J result.exit_code)" = 4 ] && [ "$(grep -c '^FORCED ' "$S/ssh.log")" = 2 ] && ok "(h) a forced command exiting 4 on the check → not 'missing': the call goes ahead" || fail "(h) $CODE $BODY $(cat "$S/ssh.log")"
+rm -f "$S/force"; appu "bash $U"; echo 4 >"$S/force"; : >"$S/ssh.log"
+call POST /api/demipass/use "$AG" "$(USEU "bash $U" $AP)"
+[ "$(grep -c '^FORCED ' "$S/ssh.log")" = 1 ] && [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='ssh_preflight_skipped'")" = 2 ] && ok "(h) …and deploy@host is skipped from then on (logged)" || fail "(h) again: $CODE $(cat "$S/ssh.log")"
 rm -f "$S/force"
 
 ! grep -q "zzrootpw-77ab" "$S/server.log" && ok "no secret value in the server log" || fail "secret in log"

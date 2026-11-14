@@ -403,6 +403,8 @@ module.exports = function registerUseApprovals(deps) {
 
   // ── routes ─────────────────────────────────────────────────────────────────────────────────────────────────────
   // The owner, acting as a person in their own session (not an agent token).
+  // A token that acts for an agent (a silicon, a worker, a fleet-owner mint), as server.js agentToken() reads it.
+  const isAgentAuth = (auth) => !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint')));
   function ownerAuth(req, res) {
     const auth = getBearerIdentity(req);
     if (!auth.ok) { res.status(auth.status || 401).json({ error: auth.error }); return null; }
@@ -427,7 +429,7 @@ module.exports = function registerUseApprovals(deps) {
     // An agent token (a silicon, a worker, a fleet-owner mint) resolves to its owner's DID: it sees neither what waits on
     // the owner nor the owner's decided history (#99 review M1). ?limit= (20–200) is for the owner's own session: the
     // app's Requests page lists decided requests so one can be found by number (Aaron 2026-11-12).
-    const agent = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint')));
+    const agent = isAgentAuth(auth);
     const lim = agent ? 0 : Math.min(200, Math.max(20, Number.parseInt(req.query.limit, 10) || 20));
     const recent = lim ? db.prepare("SELECT * FROM use_approvals WHERE owner_did = ? AND status != 'pending' ORDER BY id DESC LIMIT ?").all(auth.did, lim) : [];
     // An agent's own requests are filed under its owner's DID, so outgoing holds every agent's: without the bound call
@@ -447,7 +449,7 @@ module.exports = function registerUseApprovals(deps) {
     const row = Number.isInteger(id) && id > 0 ? db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id) : null;
     if (!row || (row.owner_did !== auth.did && row.requester_did !== auth.did)) return res.status(404).json({ error: 'approval request not found' });
     // An agent token reads what its call asked, not what an earlier one did (#111 review L2): it had its own result.
-    const agent = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'fleet_owner_mint')));
+    const agent = isAgentAuth(auth);
     const v = view(row, auth.did); if (agent) { delete v.outcome; delete v.previous; }
     res.json({ ok: true, approval: v });
   });
