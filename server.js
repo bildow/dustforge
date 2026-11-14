@@ -47,6 +47,7 @@ const BLINDKEY_HTTP_HOSTS = ['api.openai.com', 'openrouter.ai', 'api.anthropic.c
 const BLINDKEY_GIT_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
 const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.us-east-1.amazonaws.com', 'smtp.mailgun.org', 'localhost', '127.0.0.1'];
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
+const SELF_SSH_ALIAS = 'racknerd-self';   // the root lane's host name (see selfLaneRefusal)
 const BLINDKEY_SSH_HOSTS = new Set([
   '192.3.84.103',      // RackNerd
   '100.83.112.88',     // phasewhip
@@ -55,8 +56,30 @@ const BLINDKEY_SSH_HOSTS = new Set([
   '100.103.90.79',     // flimflam
   '100.73.92.12',      // skypie (Aaron's laptop, tailnet)
   // More hosts from the environment, comma-separated IPs or names (e.g. a box a person shares through DemiPass).
-  ...String(process.env.BLINDKEY_SSH_HOSTS_EXTRA || '').split(',').map(h => h.trim()).filter(h => /^[A-Za-z0-9.:-]{1,253}$/.test(h)),
+  // Never loopback or this box's own sshd by another name: see SELF_SSH_ALIAS.
+  ...String(process.env.BLINDKEY_SSH_HOSTS_EXTRA || '').split(',').map(h => h.trim()).filter(h => /^[A-Za-z0-9.:-]{1,253}$/.test(h) && !isSelfHostName(h)),
 ]);
+// The root lane (2026-11-14, root-lane adversarial review). The gateway reaches its own sshd as root over loopback
+// only, where one sshd Match allows root's password (ops/root-lane/). Loopback is never in the host set: every wallet
+// could then try passwords against this box's accounts from 127.0.0.1, which fail2ban does not ban. Only this alias
+// reaches it, only in the /use token path, and only for the root lane's owner in their own session, with the entry
+// wrapped to their phone (each call a tap) and logging in as root by password alone. SELF_SSH_ALIAS is declared above
+// the host set, which uses isSelfHostName while it is built.
+// Aaron's wallet. The environment (root-only on the host) may name another one: the smoke tests do.
+const ROOT_LANE_OWNER_DID = process.env.DUSTFORGE_ROOT_LANE_OWNER_DID || 'did:key:u7QGkcLsNaXM-_aJLhtMuNwfZT4xDl23kZFohcAfOHfwEQg';
+function isSelfHostName(h) {
+  const s = String(h).toLowerCase();
+  return s === SELF_SSH_ALIAS || s === 'localhost' || s.startsWith('127.') || s === '::1' || s === '0.0.0.0' || s === '::' || s.startsWith('::ffff:127.');
+}
+function selfLaneRefusal(secret, { owner, user, keyName, sudo }) {
+  if (!owner) return 'the root lane is used only by its owner, in their own session (no delegation, no agent token)';
+  if (secret.did !== ROOT_LANE_OWNER_DID) return 'the root lane belongs to one wallet; this secret is not its entry';
+  if (secret.wrap_state !== 'device' || !['elevated', 'critical'].includes(secret.security_depth)) return 'the root lane needs an entry wrapped to the owner\'s phone (elevated or critical depth)';
+  if (user !== 'root' || (secret.account_username && secret.account_username !== 'root')) return 'the root lane logs in as root only, with the root entry';
+  if (keyName) return 'the root lane logs in with its own password: no key_name';
+  if (sudo !== undefined && sudo !== false) return 'the root lane is root already: no sudo';
+  return null;
+}
 // ssh with a password, and no shell on this server: sshpass gets user@host and the remote command as separate
 // arguments, and the password in SSHPASS. The remote command still runs in the remote user's shell, as each
 // caller intends. User and host are checked here as well, so nothing a caller passes reaches a local shell.
@@ -5679,10 +5702,20 @@ async function useRoute(req, res) {
           // The user named in the call, else the account the secret was stored for, else the old default.
           const effectiveUser = target_user || secret.account_username || 'claude';
 
-          if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
+          // The root lane: the alias connects to loopback, for its owner alone (SELF_SSH_ALIAS). Every other path refuses
+          // the alias, since it is not in the host set.
+          const selfLane = target_host === SELF_SSH_ALIAS;
+          if (selfLane) {
+            const why = selfLaneRefusal(secret, { owner: !tokenRow.delegation_id && secret.did === req.identity.did && !agentToken(req), user: effectiveUser, keyName: key_name, sudo });
+            if (why) {
+              logSecurityEvent('root_lane_refused', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: why, ip: req.ip, context: { secret: secret.name } });
+              return res.status(403).json({ error: why });
+            }
+          } else if (!BLINDKEY_SSH_HOSTS.has(target_host)) {
             logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: 'host not in SSH whitelist', ip: req.ip });
             return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
           }
+          const connectHost = selfLane ? '127.0.0.1' : target_host;
 
           const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[;&]|&&|\|\|)\s*exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
           for (const pat of dangerousPatterns) {
@@ -5706,7 +5739,7 @@ async function useRoute(req, res) {
           }
 
           if (req._approvalId) {   // an approved call: check the script is there before the approval is spent on it
-            const pf = await sshPreflight(req, secret, { user: effectiveUser, host: target_host, password, command, sudo, keySecret });
+            const pf = await sshPreflight(req, secret, { user: effectiveUser, host: connectHost, password, command, sudo, keySecret });
             if (pf) return res.status(pf.status).json(pf.body);
           }
           try {
@@ -5716,7 +5749,7 @@ async function useRoute(req, res) {
             const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
             egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
             if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
-            const output = await sshRun(effectiveUser, target_host, password, remote, { input, timeout: callTimeoutMs });
+            const output = await sshRun(effectiveUser, connectHost, password, remote, { input, timeout: callTimeoutMs });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');
@@ -13376,6 +13409,33 @@ app.post('/api/blindkey/rotate-blind/forgejo', rateLimitStandard, async (req, re
   } catch (e) {
     res.status(502).json({ error: 'rotation failed: ' + e.message, changed: pendingId ? 'unknown — the new password is kept in the vault as a pending entry' : false });
   } finally { rotatingSecrets.delete(secret.id); forgejoRotating.delete(lockKey); fresh = null; adminToken = null; }
+});
+
+// An operator act (2026-11-14, root-lane review (d)): the infrastructure's owner approves, on the phone, one exact
+// script (its path and sha256) run as root on one of their hosts by a route named on the card, when DemiPass's own lane
+// cannot run it (the root lane is down). Nothing is decrypted, unwrapped or run here. The approved answer is the
+// consent record; the act itself is done by the operator over that route and checked against the sha256 first.
+const OPERATOR_ACT_HOSTS = Object.freeze({ '192.3.84.103': 'racknerd' });
+const OPERATOR_ACT_ROUTES = new Set(['phasewhip-mirror-key', 'console']);
+app.post('/api/blindkey/operator-act', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
+  if (isAgentAuth(auth)) return res.status(403).json({ error: 'an operator act is asked from the owner\'s own session, not an agent token' });
+  if (auth.did !== ROOT_LANE_OWNER_DID) return res.status(403).json({ error: 'operator acts belong to the infrastructure\'s owner' });
+  const { host, script_path, script_sha256, route } = req.body || {};
+  if (typeof host !== 'string' || !Object.prototype.hasOwnProperty.call(OPERATOR_ACT_HOSTS, host)) return res.status(400).json({ error: 'host: one of ' + Object.keys(OPERATOR_ACT_HOSTS).join(', ') });
+  if (typeof script_path !== 'string' || !/^\/opt\/dustforge\/(ops|scripts)\/[A-Za-z0-9._\/-]{1,160}$/.test(script_path) || script_path.includes('..') || script_path.includes('//')) return res.status(400).json({ error: 'script_path: a script under /opt/dustforge/ops/ or /opt/dustforge/scripts/' });
+  if (typeof script_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(script_sha256)) return res.status(400).json({ error: 'script_sha256: 64 lowercase hex' });
+  if (typeof route !== 'string' || !OPERATOR_ACT_ROUTES.has(route)) return res.status(400).json({ error: 'route: one of ' + [...OPERATOR_ACT_ROUTES].join(', ') });
+  const name = OPERATOR_ACT_HOSTS[host];
+  if (!ownerApproves(req, res, auth.did, 'svc:demipass:operator-act', `Root on ${name}`, 'operator-act', host, { host_name: name, script_path, script_sha256, route })) return;
+  logSecurityEvent('operator_act_approved', 'alert', { caller_did: auth.did, capability: 'operator-act', target: host, ip: req.ip, context: { script_path, script_sha256, route, approval_id: req._approvalId || (req.body && req.body.approval_id) || null } });
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(auth.did, `Operator act approved: ${script_path} (sha256 ${script_sha256}) as root on ${name} via ${route}`, req.ip || '', 'UTC', 'decision', JSON.stringify(['operator-act', 'host:' + host]));
+  } catch (_) {}
+  res.json({ ok: true, approved: true, host, host_name: name, script_path, script_sha256, route,
+    note: 'Approved once: run exactly this script, after checking its sha256, by this route; then record the outcome.' });
 });
 
 app.post('/api/blindkey/rotate-blind', rateLimitStandard, async (req, res) => {
