@@ -11,7 +11,7 @@ export IDENTITY_MASTER_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(
   STALWART_HOST=127.0.0.1 STALWART_PORT=1 SMTP_RELAY_HOST= SMTP_HOST=127.0.0.1 SMTP_PORT=9
 cd "$W"
 ( exec node server.js >"$S/server.log" 2>&1 ) & SRV=$!
-trap 'kill $SRV 2>/dev/null; [ -n "${KEEP:-}" ] && cp "$S/server.log" /tmp/claude-1000/spend-server.log; rm -rf "$S"' EXIT
+trap 'kill $SRV 2>/dev/null; rm -rf "$S"' EXIT
 for i in $(seq 1 40); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
 kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -5 "$S/server.log"; exit 1; }
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
