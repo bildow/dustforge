@@ -1,0 +1,40 @@
+#!/bin/bash
+# /usr/local/sbin/dustforge-backup-receive — the ONLY thing the gateway's backup key can run on phasewhip.
+# Installed as the forced command of one authorized key of `apple`:
+#   restrict,from="100.73.251.12",command="/usr/local/sbin/dustforge-backup-receive" ssh-ed25519 … dustforge-backup-push
+# It takes one gzip archive on stdin and files it in the prism container, keeping the newest 14. That is all.
+#   - SSH_ORIGINAL_COMMAND (whatever the client asked to run) is ignored: no argument, path or name comes from outside.
+#   - The file name is made here from the time; the destination is fixed.
+#   - Input is capped (MAX_BYTES); anything larger is refused and discarded.
+#   - The archive is never extracted or parsed here: only its first two bytes are checked (gzip magic).
+#   - Only these incus calls run: exec mkdir, file push, exec prune (fixed arguments).
+# Exit 0 on success; non-zero with one line on stderr otherwise. No input is echoed back.
+set -euo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+unset SSH_ORIGINAL_COMMAND
+
+MAX_BYTES=$((256 * 1024 * 1024))
+KEEP=14
+CONTAINER=prism
+DEST_DIR=/opt/dustforge-backups
+NAME="dustforge-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+
+TMP=$(mktemp -d /tmp/dustforge-backup-receive.XXXXXXXX)
+trap 'rm -rf "$TMP"' EXIT
+IN="$TMP/in.tar.gz"
+
+# Read at most MAX_BYTES + 1 bytes; one byte more than the cap means the input was too large.
+head -c $((MAX_BYTES + 1)) > "$IN"
+SIZE=$(stat -c %s "$IN")
+if [ "$SIZE" -eq 0 ]; then echo "receive: empty input" >&2; exit 2; fi
+if [ "$SIZE" -gt "$MAX_BYTES" ]; then echo "receive: input over ${MAX_BYTES} bytes, refused" >&2; exit 3; fi
+if [ "$(head -c 2 "$IN" | od -An -tx1 | tr -d ' \n')" != "1f8b" ]; then echo "receive: not a gzip archive, refused" >&2; exit 4; fi
+
+sudo -n /usr/bin/incus exec "$CONTAINER" -- mkdir -p "$DEST_DIR"
+sudo -n /usr/bin/incus file push --mode 0600 "$IN" "$CONTAINER$DEST_DIR/$NAME"
+sudo -n /usr/bin/incus exec "$CONTAINER" -- find "$DEST_DIR" -maxdepth 1 -type f -name 'dustforge-*.tar.gz' -printf '%T@ %p\n' \
+  | sort -rn | tail -n +$((KEEP + 1)) | cut -d' ' -f2- \
+  | while IFS= read -r old; do sudo -n /usr/bin/incus exec "$CONTAINER" -- rm -f -- "$old"; done
+
+echo "received $NAME ($SIZE bytes)"
