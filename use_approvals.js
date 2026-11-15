@@ -34,6 +34,9 @@ const MAX_WRONG = 3;
 const MAX_PENDING_PER_OWNER = 30;
 const MAIL_PER_OWNER_PER_HOUR = 20;
 const DEPTHS = new Set(['elevated', 'critical']);
+// Approval kinds that never act with the secret's value: no one-use key, no unwrap from the phone, and they survive a
+// restart whatever the secret's wrap state ('scope': a scope change; 'edit': the owner replacing the value).
+const NO_VALUE_KINDS = new Set(['scope', 'edit']);
 // Keys that steer the approval itself, never part of what it binds.
 // The raw request body is bound as sent (top level and `params` both, never a merged view — /use paths read from
 // either), minus only the per-call token and these steering fields.
@@ -82,6 +85,9 @@ module.exports = function registerUseApprovals(deps) {
   // What an approved call did (Aaron 2026-11-14, approval 59): JSON {at, ran, http, exit_code, note}. The owner's app
   // shows it on the request, and on the next request for the same call, so a second ask is never a surprise.
   try { db.exec('ALTER TABLE use_approvals ADD COLUMN outcome TEXT DEFAULT NULL'); } catch (_) {}
+  // An edit's typed value, as an HMAC (server.js POST /edit): server-only, never in the binding or any view, and
+  // compared only after the PIN is spent — so a wrong guess costs a PIN entry and the request (#124 re-audit M1).
+  try { db.exec('ALTER TABLE use_approvals ADD COLUMN value_mac TEXT DEFAULT NULL'); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_owner ON use_approvals(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_requester ON use_approvals(requester_did, status)');
   // A wrapped secret's request needs its one-use key, which lives only in this process's memory (crypto_depth.js). At
@@ -91,7 +97,7 @@ module.exports = function registerUseApprovals(deps) {
   try {
     // A scope change (kind 'scope') uses no value and no key: it survives a restart whatever the secret's wrap state.
     const dead = db.prepare(`SELECT a.id, a.requester_did, a.secret_id FROM use_approvals a JOIN blindkey_secrets s ON s.id = a.secret_id
-        WHERE a.status IN ('pending', 'approved') AND a.kind != 'scope' AND (a.eph_pub IS NOT NULL OR s.wrap_state = 'device')`).all();
+        WHERE a.status IN ('pending', 'approved') AND a.kind NOT IN ('scope', 'edit') AND (a.eph_pub IS NOT NULL OR s.wrap_state = 'device')`).all();
     const end = db.prepare("UPDATE use_approvals SET status = 'expired', decided_at = ?, unwrap_blob = NULL WHERE id = ? AND status IN ('pending', 'approved')");
     for (const r of dead) {
       end.run(new Date().toISOString(), r.id);
@@ -145,6 +151,13 @@ module.exports = function registerUseApprovals(deps) {
   // A one-line headline for the card. The owner approves the full bound call (`call`, shown as JSON), never this alone.
   function summaryOf({ kind, action, targetHost, targetUrl, params }) {
     if (kind === 'reveal') return 'reveal the value';
+    // The owner replaces the value (server.js POST /edit): typed by them, or copied from another of their entries.
+    if (kind === 'edit') {
+      const q = params || {};
+      const ends = Number(q.ends) > 0 ? `; ${Number(q.ends)} grant${Number(q.ends) === 1 ? '' : 's'} to others END` : '';
+      return cleanLabel((q.mode === 'copy' ? `replace the value with the value of ${q.from_name || q.from_ref || 'another entry'}${q.retire_source ? ', then delete that entry' : ''} (never shown)`
+        : 'replace the value with one you type now (the old one is never shown)') + ends, 160);
+    }
     if (kind === 'scope') {
       // A change to what the secret reaches (server.js scopeChangeGate): the card names the scope, the methods and
       // the agent it is handed to; the owner approves the full bound change below it.
@@ -320,8 +333,10 @@ module.exports = function registerUseApprovals(deps) {
                                   binding, code_key, created_at, expires_at, bound_call, service_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(kind, secret.id, secret.did, requesterDid, cleanLabel(label || '', 80), delegationId || null, depthOf(secret), cleanLabel(purpose || '', 200).trim(),
            summary, binding, crypto.randomBytes(32).toString('hex'), nowIso(), later(grant ? GRANT_PENDING_TTL_SEC : PENDING_TTL_SEC), callJson, secret.service_key || null).lastInsertRowid);
-    // Item 1: a wrapped secret's request gets a one-use key (private half in memory only) the phone unwraps to.
-    if (cryptoDepth) cryptoDepth.onRequestCreated({ id }, secret);
+    // Item 1: a wrapped secret's request gets a one-use key (private half in memory only) the phone unwraps to — only
+    // for a kind that acts with the value. A scope change or an edit never uses the old value: no key, so the phone is
+    // never offered an unwrap it would send for nothing.
+    if (cryptoDepth && !NO_VALUE_KINDS.has(kind)) cryptoDepth.onRequestCreated({ id }, secret);
     const row = db.prepare('SELECT * FROM use_approvals WHERE id = ?').get(id);
     event('approval_requested', requesterDid, secret.id, { approval_id: id, kind, owner_did: secret.did, depth: row.depth, summary });
     logSecurityEvent('approval_requested', 'info', { caller_did: requesterDid, capability: kind, target: secret.name, context: { approval_id: id, owner_did: secret.did } });
@@ -506,8 +521,8 @@ module.exports = function registerUseApprovals(deps) {
     // Item 1: a wrapped secret's approval carries the phone's unwrap (the data key, re-encrypted to the one-use key).
     // A scope change (kind 'scope') uses no value, so a wrapped secret's scope is approved without one.
     const sec = secretOf(row.secret_id);
-    if (cryptoDepth && row.kind !== 'scope') { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
-    if (cryptoDepth && row.kind !== 'scope' && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
+    if (cryptoDepth && !NO_VALUE_KINDS.has(row.kind)) { const r = cryptoDepth.approveRefusal(row, sec, req.body); if (r) return res.status(r.status).json(r.body); }
+    if (cryptoDepth && !NO_VALUE_KINDS.has(row.kind) && cryptoDepth.isWrapped(sec)) cryptoDepth.storeUnwrap(row.id, req.body);
     const took = db.prepare("UPDATE use_approvals SET status = 'approved', approved_at = ?, approved_via = 'app', decided_at = ?, expires_at = ? WHERE id = ? AND status = 'pending'")
       .run(nowIso(), nowIso(), later(isGrantKey(row.service_key) || row.kind === 'scope' ? GRANT_APPROVED_TTL_SEC : TTL_SEC), row.id).changes;
     if (took !== 1) return res.status(409).json({ error: 'this request was decided meanwhile' });

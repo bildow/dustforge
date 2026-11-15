@@ -889,6 +889,11 @@ try { db.exec('ALTER TABLE refresh_tokens ADD COLUMN access_jti TEXT'); } catch 
 // A session (sid) is one sign-in and every token refreshed from it: what a PIN proof, an unlock, an opened approval
 // and a device challenge belong to — and what ends as a whole (#47 review M1, M5).
 try { db.exec('ALTER TABLE refresh_tokens ADD COLUMN session_id TEXT'); } catch (_) {}
+// How the session began (the first token's auth_method: 'device' for an agent's device sign-in) and its agent label:
+// carried through every refresh, so a refreshed token still says it is an agent's session (#124 re-audit L2).
+for (const c of ['src_auth TEXT', 'agent_label TEXT']) { try { db.exec('ALTER TABLE refresh_tokens ADD COLUMN ' + c); } catch (_) {} }
+// An agent's device sign-in, or a session refreshed from one.
+const deviceSession = (d) => !!d && (d.auth_method === 'device' || d.src_auth === 'device');
 try { db.exec('ALTER TABLE issued_tokens ADD COLUMN sid TEXT'); } catch (_) {}
 function newSessionId() { return 's' + require('crypto').randomBytes(12).toString('hex'); }
 function tokenClaims(token) { try { return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString()) || {}; } catch (_) { return {}; } }
@@ -1043,8 +1048,9 @@ function issueRefreshToken(did, scope, accessToken = null) {
   const raw = 'dpr_' + require('crypto').randomBytes(32).toString('base64url');
   const exp = new Date(Date.now() + REFRESH_TTL_DAYS*24*3600*1000).toISOString();
   const claims = accessToken ? tokenClaims(accessToken) : {};
-  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at, access_jti, session_id) VALUES (?,?,?,?,?,?)')
-    .run(did, _refreshHash(raw), scope || 'read', exp, claims.jti || null, claims.sid || claims.jti || null);
+  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at, access_jti, session_id, src_auth, agent_label) VALUES (?,?,?,?,?,?,?,?)')
+    .run(did, _refreshHash(raw), scope || 'read', exp, claims.jti || null, claims.sid || claims.jti || null,
+         claims.src_auth || (claims.auth_method && claims.auth_method !== 'refresh' ? claims.auth_method : null), claims.agent_label || null);
   return { refresh_token: raw, refresh_expires_at: exp };
 }
 // Validate + single-use rotate: returns {did, scope} or null. Old token is revoked + linked to new.
@@ -1057,11 +1063,12 @@ function consumeRefreshToken(raw) {
   const row = db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?').get(_refreshHash(raw));
   if (!row) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) return null;
-  if (!row.revoked) return { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null };
+  const origin = { src_auth: row.src_auth || null, agent_label: row.agent_label || null };
+  if (!row.revoked) return { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null, ...origin };
   if (!row.rotated_to) return null;   // revoked by sign-out, not by rotation
   const next = db.prepare(`SELECT id FROM refresh_tokens WHERE token_hash = ? AND revoked = 0 AND did = ?
     AND ? >= datetime('now', '-${REFRESH_GRACE_SEC} seconds')`).get(row.rotated_to, row.did, row.last_used_at || '');
-  return next ? { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null, successorId: next.id } : null;
+  return next ? { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null, ...origin, successorId: next.id } : null;
 }
 function revokeRefreshToken(id, rotatedToRaw) {
   db.prepare('UPDATE refresh_tokens SET revoked = 1, last_used_at = datetime(\'now\'), rotated_to = ? WHERE id = ?')
@@ -3235,6 +3242,12 @@ try { db.exec("CREATE INDEX IF NOT EXISTS idx_sv_did ON blindkey_secrets(did)");
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN version INTEGER DEFAULT 1"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN replaced_by INTEGER DEFAULT NULL"); } catch(_) {}
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN rotate_expires_at TEXT DEFAULT ''"); } catch(_) {}
+// When a person last had this version's value in front of them: they typed it (POST /edit), revealed it, or it was
+// copied from a version a person had seen. NULL: no person is known to have seen it (generated, rotated blind, or
+// stored before this column existed). The vault shows it, so a blind rotation is the natural next step.
+try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN seen_by_person_at TEXT DEFAULT NULL"); } catch(_) {}
+// A value that came in from outside the vault (stored, deposited, ingested, typed) was in front of someone: mark it.
+function markSeen(did, name) { try { db.prepare('UPDATE blindkey_secrets SET seen_by_person_at = CURRENT_TIMESTAMP WHERE did = ? AND name = ?').run(did, name); } catch (_) {} }
 
 // Secret metadata: expiration + Buoy timestamps
 try { db.exec("ALTER TABLE blindkey_secrets ADD COLUMN expires_at TEXT DEFAULT NULL"); } catch(_) {}
@@ -4301,6 +4314,7 @@ app.post('/api/blindkey/store', rateLimitStandard, billing.billingMiddleware(db,
         updated_at = CURRENT_TIMESTAMP
     `).run(req.identity.did, name, description || '', resolvedType, encrypted, expiresAt, providerInfo.provider, resolvedOwnership, resolvedRotatable, resolvedCategory, resolvedLabels, resolvedRotationInterval);
 
+    markSeen(req.identity.did, name);
     // Generate and store ref_code if not already set
     const stored = db.prepare("SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?").get(req.identity.did, name);
     let refCode = stored?.ref_code;
@@ -4413,6 +4427,8 @@ app.post('/api/blindkey/reveal', rateLimitStandard, (req, res) => {
     return res.status(500).json({ error: 'decryption failed' });
   }
 
+  // A person has now seen this version's value (the vault offers a blind rotation for it).
+  try { db.prepare('UPDATE blindkey_secrets SET seen_by_person_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id); } catch (_) {}
   // Log CRITICAL security event — someone is viewing a raw secret
   logSecurityEvent('secret_revealed', 'critical', {
     caller_did: actor.did,
@@ -6444,14 +6460,240 @@ app.post('/api/blindkey/rotate', rateLimitStandard, (req, res) => {
     if (!g.ok) return res.status(g.status || 403).json(g);
   }
 
-  const r = rotateSecretValue(ownerDid, existing, new_value, graceMins, req.ip);
+  // The caller supplied this value: someone outside the vault knows it.
+  const r = rotateSecretValue(ownerDid, existing, new_value, graceMins, req.ip, { seenByPersonAt: new Date().toISOString().replace('T', ' ').slice(0, 19) });
   return res.status(r.status).json(r.body);
 });
 
-// A new version of `existing` holding `newValue`: the ref moves to it, active contexts are copied, the old version
-// retires after `graceMins` (value erased). Shared by POST /api/blindkey/rotate and the blind account-password rotation.
+// POST /api/blindkey/edit {ref, new_value | from_ref, retire_source?, confirm_left?, approval_id?} — the owner replaces
+// a secret's value from the vault (Aaron 2026-11-15: "a way to edit a secret … on the GUI"). The old value is never
+// shown. It is a new version of the same entry, as a rotation is: the ref stays, scopes carry over, the owner's own
+// agents' delegations move. The old version retires at once (an edit replaces; no grace). The new version is marked as
+// seen by a person, so the vault offers a blind rotation next.
+// - new_value: typed by the person. from_ref: copied server-side from another entry the same owner holds (never
+//   revealed); retire_source deletes that entry afterwards (refused while anything is delegated from it).
+// - Who: the owner, signed in as a person in the app: no agent, worker, fleet-mint or device-login (an agent's sign-in)
+//   token, no admin key, a session that holds gate proofs. The PIN always, plus the entry's own rotate factors
+//   (elevated: the email code; critical: PIN + code) and for critical an approved request on top, as critical reveal
+//   takes one. With from_ref the source's rotate factors count too, and the entry's reveal and use factors must include
+//   every one of the source's, its approval depth no lower (#124 review H1: a custom policy is compared as a policy).
+// - Grants that would not follow (a person's share, an outside agent's delegation, one of the owner's own agents'
+//   delegations that is suspended or whose scope is no longer active) end with the old version: the call says so first
+//   (409 left, with left_token) and goes ahead only with confirm_left = that token, re-checked when it runs.
+// - Everything that changes state — the PIN and approval spends, the new version, its wrap, the old version's
+//   retirement, the source's deletion, the grants that end — is one transaction: a wrapped entry whose new version
+//   could not be wrapped is rolled back whole (#124 review M2).
+const DEPTH_RANK = { standard: 0, elevated: 1, critical: 2 };
+const depthName = (s) => useApprovals.depthOf(s);   // 'standard' | 'elevated' | 'critical' (a custom policy has no approval depth)
+// Binding a typed value and a set of grants into an approval and a confirmation without storing either: HMAC under a key
+// derived from the identity master key (a bare hash of a short password would be guessable from the approval row).
+const EDIT_BIND_KEY = crypto.createHash('sha256').update('dp-edit-bind:v1:' + (process.env.IDENTITY_MASTER_KEY || crypto.randomBytes(32).toString('hex'))).digest();
+const editMac = (...parts) => crypto.createHmac('sha256', EDIT_BIND_KEY).update(parts.map(String).join('\u0000')).digest('base64url').slice(0, 32);
+class EditAbort extends Error { constructor(status, body) { super(body && body.error); this.status = status; this.body = body; } }
+app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'sign in', ...(auth.code ? { code: auth.code } : {}) });
+  const d0 = auth.decoded || {};
+  if (auth.silicon || d0.wrk || d0.auth_method === 'worker' || d0.auth_method === 'fleet_owner_mint' || deviceSession(d0)) {
+    logSecurityEvent('edit_blocked_agent', 'alert', { caller_did: auth.did, agent_name: auth.agent_name || d0.agent_label, capability: 'edit', ip: req.ip, error: deviceSession(d0) ? 'device-login session' : 'agent token' });
+    return res.status(403).json({ error: 'a secret is edited by its owner in the DemiPass app, not by an agent token or an agent\'s device sign-in' });
+  }
+  // A token refreshed from a session that began before sessions carried their origin cannot say whether a person or an
+  // agent signed in: it signs in again (once) before it may edit (fails closed).
+  if (d0.auth_method === 'refresh' && !d0.src_auth) return res.status(403).json({ error: 'sign in again in the DemiPass app to edit a secret (this session cannot show it began as a person\'s sign-in)', sign_in_again: true });
+  if (!gateSession(auth)) return res.status(403).json({ error: 'this token cannot hold a PIN proof — sign in again' });
+  const ownerDid = auth.did;
+  const b = req.body || {};
+  const { ref, new_value, from_ref } = b;
+  if (typeof ref !== 'string' || !ref || ref.length > 100) return res.status(400).json({ error: 'ref: the entry to edit' });
+  const typed = new_value !== undefined && new_value !== null;
+  if (typed === (from_ref !== undefined && from_ref !== null)) return res.status(400).json({ error: 'give exactly one of new_value (typed) or from_ref (copied from another of your entries)' });
+  if (typed && (typeof new_value !== 'string' || !new_value.trim())) return res.status(400).json({ error: 'new_value: the new value, not empty' });
+  if (typed && new_value.length > 10000) return res.status(400).json({ error: 'new_value must be 10000 chars or less' });
+  if (!typed && (typeof from_ref !== 'string' || !from_ref || from_ref.length > 100)) return res.status(400).json({ error: 'from_ref: the ref of the entry to copy from' });
+  if (b.retire_source !== undefined && typeof b.retire_source !== 'boolean') return res.status(400).json({ error: 'retire_source: true or false' });
+  if (b.confirm_left !== undefined && b.confirm_left !== null && typeof b.confirm_left !== 'string') return res.status(400).json({ error: 'confirm_left: the left_token a 409 gave' });
+  const retireSource = !typed && b.retire_source === true;
+
+  const target = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'").get(ownerDid, ref);
+  if (!target) return res.status(404).json({ error: 'no active secret of yours has that ref' });
+  if (rotatingSecrets.has(target.id)) return res.status(409).json({ error: 'this secret is being rotated right now — try again in a minute' });
+  const targetWrapped = cryptoDepth.isWrapped(target);
+  if (targetWrapped && !cryptoDepth.activeWrapKeys(ownerDid).length) {
+    return res.status(409).json({ error: 'this secret is wrapped to a phone, and no linked phone has a wrap key now — link one (app 1.5+) before editing it', wrapped: true });
+  }
+  let source = null;
+  if (!typed) {
+    source = db.prepare("SELECT * FROM blindkey_secrets WHERE did = ? AND ref_code = ? AND status = 'active'").get(ownerDid, from_ref);
+    if (!source) return res.status(404).json({ error: 'no active secret of yours has from_ref' });
+    if (source.id === target.id || source.name.replace(/_v\d+$/, '') === target.name.replace(/_v\d+$/, '')) return res.status(400).json({ error: 'from_ref is this same entry' });
+    if (rotatingSecrets.has(source.id)) return res.status(409).json({ error: 'the source is being rotated right now — try again in a minute' });
+    if (cryptoDepth.isWrapped(source)) return res.status(409).json({ error: 'the source is wrapped to your phone, so the server cannot read it to copy — lower it to standard first (your phone unwraps it), or type the value', wrapped: true });
+    if (githubAppLib.isAppKey(source)) return res.status(403).json({ error: 'a GitHub App key is never copied — it only mints installation tokens' });
+    if ((source.secret_type || '') !== (target.secret_type || '')) return res.status(409).json({ error: `the source is a ${source.secret_type} and the entry a ${target.secret_type} — copy only between entries of the same type` });
+    if (source.frozen) return res.status(409).json({ error: 'the source is frozen — unfreeze it first (a copy would carry its value past the breaker)' });
+    // A copy never makes its value easier to reach: the approval depth may not drop, and for reveal and use the entry
+    // must ask for every factor the source asks for (a custom policy included).
+    if (DEPTH_RANK[depthName(source)] > DEPTH_RANK[depthName(target)]) {
+      return res.status(409).json({ error: `the source is ${depthName(source)} and the entry is ${depthName(target)}: a copy would lower the value's depth — raise the entry to ${depthName(source)} first` });
+    }
+    const ps = resolveGatePolicy(source), pt = resolveGatePolicy(target);
+    for (const act of ['reveal', 'use']) {
+      const short = ps[act].filter(g => !pt[act].includes(g));
+      if (short.length) return res.status(409).json({ error: `the source's ${act} asks for ${ps[act].join(' + ')}, and the entry's ${act} lacks ${short.join(' + ')}: a copy would make the value easier to ${act} — give the entry at least the source's policy first`, weaker: act, missing: short });
+    }
+    if (source.account_username && target.account_username && source.account_username !== target.account_username) {
+      return res.status(409).json({ error: `the source belongs to account '${source.account_username}' and the entry to '${target.account_username}' — copy only between entries for the same login` });
+    }
+    // A value whose leak was logged after it was written is a leaked value: copying it would carry it under a new
+    // version without the flag (#124 review L3). Rotate it instead.
+    if (leakedAfterWrite(leakHitTimes(ownerDid), source)) return res.status(409).json({ error: 'the source\'s value was leaked (a leak of it was logged after it was written) — copying it would carry a leaked value past the warning; rotate it instead', leaked: true });
+    if (retireSource && db.prepare("SELECT COUNT(*) AS n FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended')").get(source.id).n) {
+      return res.status(409).json({ error: 'the source is delegated or shared — end those grants before retiring it, or copy without retire_source' });
+    }
+  }
+  if (typed && secretTextGuard.valueInText(new_value, target.description || '', '')) return res.status(400).json({ error: secretTextGuard.OWN_VALUE_ERROR, field: 'description' });
+  // Everything that can refuse is checked before a PIN proof or an approval is spent (#124 review L6).
+  if (githubAppLib.isAppKey(target)) {
+    if (!typed) return res.status(400).json({ error: 'a GitHub App key is replaced only by the new .pem GitHub generates — paste it' });
+    const why = githubAppLib.pemRefusal(new_value); if (why) return res.status(400).json({ error: why });
+  }
+  { const nv = nextVersionName(ownerDid, target.name.replace(/_v\d+$/, ''), target.version); if (nv.conflict) return res.status(409).json({ error: nv.conflict }); }
+
+  // The grants: those that move with the new version (the owner's own agents' active delegations whose scope carries
+  // over — exactly what rotateSecretValue moves) and those that end (every other active or offered one).
+  const activeCtx = new Set(db.prepare("SELECT id FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(target.id).map(r => r.id));
+  const grants = db.prepare("SELECT id, status, COALESCE(delegate_kind, 'agent') AS kind, delegate_did, context_id FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended') ORDER BY id").all(target.id)
+    .map(d => ({ ...d, own: d.kind === 'agent' && ownFleetAgent(ownerDid, d.delegate_did) }));
+  const moves = (d) => d.status === 'active' && d.own && (d.context_id == null || activeCtx.has(d.context_id));
+  const moving = grants.filter(moves), ending = grants.filter(d => !moves(d));
+  const leftToken = ending.length ? editMac('left', target.id, ...ending.map(d => d.id)) : null;
+  if (ending.length && b.confirm_left !== leftToken) {
+    const n = (f) => ending.filter(f).length;
+    const parts = [[n(d => d.kind === 'person'), "a person's share", "people's shares"], [n(d => d.kind !== 'person' && !d.own), "an outside agent's delegation", "outside agents' delegations"],
+      [n(d => d.own && d.status !== 'active'), 'a suspended delegation of your own agent', 'suspended delegations of your own agents'],
+      [n(d => d.own && d.status === 'active' && !moves(d)), 'a delegation of your own agent whose scope is no longer active', 'delegations of your own agents whose scope is no longer active']]
+      .filter(([k]) => k).map(([k, one, many]) => k === 1 ? one : `${k} ${many}`);
+    return res.status(409).json({ error: `${ending.length} grant${ending.length === 1 ? '' : 's'} will end with this edit (${parts.join('; ')}) — they stay with the old value, which retires; send confirm_left with this left_token to go ahead`,
+      left: ending.length, left_token: leftToken, left_kinds: [...new Set(ending.map(d => d.kind))] });
+  }
+
+  // Factors: the PIN always, plus each entry's rotate factors (and the source's delete factors when it is retired).
+  const req1 = new Set(['pin', ...resolveGatePolicy(target).rotate]);
+  if (source) { for (const g of resolveGatePolicy(source).rotate) req1.add(g); if (retireSource) for (const g of resolveGatePolicy(source).delete) req1.add(g); }
+  const required = [...req1];
+  const critical = depthName(target) === 'critical' || (source && depthName(source) === 'critical');
+  // The approval binds the whole edit: the mode, the source and the grants that end (#124 review L4). A typed value is
+  // NOT in the binding: the peek below compares the binding before any factor is checked, so a value in it would answer
+  // "a different call" to wrong guesses without the PIN (#124 re-audit M1). Its HMAC sits in a server-only column,
+  // written when the request is filed, and is compared inside the transaction after the PIN is spent.
+  // The request also belongs to the session that filed it (an HMAC of its sid): with the value out of the binding,
+  // another session of the owner's could otherwise file first and have this Save handed its request (#124 final
+  // re-audit). A different session gets a request of its own, and cannot redeem this one.
+  const use = { kind: 'edit', action: 'edit', params: { mode: typed ? 'typed' : 'copy', ...(source ? { from_ref: source.ref_code, from_name: source.name } : {}), ...(retireSource ? { retire_source: true } : {}),
+    ends: ending.length, ...(ending.length ? { ends_token: leftToken } : {}), session_tag: editMac('session', gateSession(auth)).slice(0, 16) } };
+  const valueMac = typed ? editMac('value', target.id, new_value) : null;
+  const caller = { did: ownerDid, label: cleanLabel(d0.agent_label || d0.username || 'owner', 40) };
+  if (critical) {
+    const g = useApprovals.gate(target, caller, use, b, { peek: true });
+    if (!g.ok) {
+      // A request just filed for a typed value remembers which value (first writer wins: a pending request handed back
+      // to a later call keeps the value it was filed with).
+      if (typed && g.status === 202 && g.body && g.body.approval_id) {
+        try { db.prepare("UPDATE use_approvals SET value_mac = ? WHERE id = ? AND kind = 'edit' AND value_mac IS NULL").run(valueMac, Number(g.body.approval_id)); } catch (_) {}
+      }
+      return res.status(g.status).json(g.body);
+    }
+  }
+  const intent = `edit:${target.id}`;
+  const missing = required.filter(g => !gateFresh(ownerDid, g, auth, intent));
+  if (missing.length) return res.status(403).json(gateMissing('edit', required, missing, intent));
+
+  let value = null, out;
+  const seenAt = source ? (source.seen_by_person_at || null) : new Date().toISOString().replace('T', ' ').slice(0, 19);   // a copy is as seen as its source
+  try {
+    out = db.transaction(() => {
+      const refused = spendSingleUse(ownerDid, 'edit', required, auth, intent);
+      if (refused) throw new EditAbort(refused.status || 403, refused);
+      if (critical) {
+        const g = useApprovals.gate(target, caller, use, b); if (!g.ok) throw new EditAbort(g.status, g.body);
+        // The typed value must be the one the request was filed (and approved) for. Checked only now, after the PIN.
+        if (typed) {
+          const row = db.prepare('SELECT value_mac FROM use_approvals WHERE id = ?').get(Number(g.approval_id)) || {};
+          const a = Buffer.from(String(row.value_mac || '')), c = Buffer.from(valueMac);
+          if (!(a.length === c.length && crypto.timingSafeEqual(a, c))) throw Object.assign(new EditAbort(410, { error: 'this approval request is cancelled', approval_id: Number(g.approval_id) }), { valueMismatch: Number(g.approval_id) });
+        }
+      }
+      if (source) { try { value = blindkeyDecrypt(source.encrypted_value); } catch (_) { throw new EditAbort(500, { error: 'the source could not be read' }); } }
+      else value = new_value;
+      const r = rotateSecretValue(ownerDid, target, value, 60, req.ip, { method: typed ? 'edit' : 'edit_copy', seenByPersonAt: seenAt, armRetire: false });
+      value = null;
+      if (r.status !== 200) throw new EditAbort(r.status, r.body);
+      // A wrapped entry stays wrapped: a new version the host can read is not kept (rolled back with everything else).
+      if (targetWrapped && r.body.wrapped !== true) throw new EditAbort(409, { error: 'the new value could not be wrapped to your phone, so nothing was changed (the entry would have become readable by the host): ' + (r.body.wrap_note || 'wrap failed'), wrapped: false });
+      if (r.body.delegations_transferred !== moving.length) throw new EditAbort(409, { error: 'the entry\'s grants changed meanwhile — try again' });
+      // An edit replaces: the old version retires now, its value erased (the 60-minute timer then finds nothing to do).
+      db.prepare(`UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'`).run(target.id);
+      db.prepare("UPDATE blindkey_contexts SET status = 'revoked' WHERE secret_id = ? AND status = 'active'").run(target.id);
+      // The grants that end (counted and confirmed above — the same set) are revoked as a revoke would: each with its event.
+      const endedIds = [];
+      for (const d of ending) {
+        if (db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = datetime('now') WHERE id = ? AND status IN ('active', 'suspended')").run(d.id).changes !== 1) throw new EditAbort(409, { error: 'the entry\'s grants changed meanwhile — try again' });
+        db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, context_name, detail) VALUES (?, ?, ?, ?, ?)').run(
+          'delegation_revoked', ownerDid, target.id, null, JSON.stringify({ delegation_id: d.id, owner_did: ownerDid, delegate_did: d.delegate_did, via: 'edit' }));
+        endedIds.push(d.id);
+      }
+      if (db.prepare("SELECT COUNT(*) AS n FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended')").get(target.id).n) throw new EditAbort(409, { error: 'the entry\'s grants changed meanwhile — try again' });
+      let retired = false;
+      if (retireSource) {
+        if (db.prepare("SELECT COUNT(*) AS n FROM demipass_delegations WHERE secret_id = ? AND status IN ('active', 'suspended')").get(source.id).n) throw new EditAbort(409, { error: 'the source is delegated or shared — end those grants before retiring it' });
+        if (db.prepare(`UPDATE blindkey_secrets SET status = 'deleted', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`).run(source.id).changes !== 1) throw new EditAbort(409, { error: 'the source changed meanwhile — try again' });
+        db.prepare("UPDATE blindkey_contexts SET status = 'revoked' WHERE secret_id = ? AND status = 'active'").run(source.id);
+        retired = true;
+      }
+      return { r, endedIds, retired };
+    })();
+  } catch (e) {
+    value = null;
+    // After the rollback: a typed value that is not the approved one costs the guess its PIN entry and its request — the
+    // PIN proof is spent and the approval cancelled here, outside the rolled-back transaction, so each guess needs a new
+    // PIN (the PIN lockout caps them) and a new approval on the phone.
+    if (e.valueMismatch) {
+      try { spendSingleUse(ownerDid, 'edit', required, auth, intent); } catch (_) {}
+      try { db.prepare("UPDATE use_approvals SET status = 'cancelled', decided_at = ? WHERE id = ? AND status IN ('approved', 'pending')").run(new Date().toISOString(), e.valueMismatch); } catch (_) {}
+    }
+    // A refused edit leaves a trail too (the events written inside the transaction rolled back with it).
+    try {
+      logSecurityEvent(e.valueMismatch ? 'secret_edit_value_mismatch' : 'secret_edit_refused', e.valueMismatch ? 'alert' : 'warn', { caller_did: ownerDid, capability: 'edit', target: target.name, ip: req.ip,
+        error: String((e.body && e.body.error) || e.message || 'failed').slice(0, 200), context: { ref: target.ref_code, status: e instanceof EditAbort ? e.status : 500, mode: typed ? 'typed' : 'copy', ...(e.valueMismatch ? { approval_id: e.valueMismatch } : {}) } });
+    } catch (_) {}
+    if (e instanceof EditAbort) return res.status(e.status).json(e.body);
+    return res.status(500).json({ error: 'the edit failed and nothing was changed' });
+  }
+  const { r, endedIds, retired } = out;
+  // After the commit: live GitHub tokens minted under an ended grant die now (as POST /delegations/revoke does).
+  for (const id of endedIds) { try { githubApp.revokeFor({ delegationId: id }, 'delegation ended by an edit'); } catch (_) {} }
+  const detail = { ref: target.ref_code, old_name: target.name, new_name: r.body.new_name, mode: typed ? 'typed' : 'copy', ...(source ? { from_ref: source.ref_code, from_name: source.name, source_retired: retired } : {}),
+    contexts_transferred: r.body.contexts_transferred, delegations_transferred: r.body.delegations_transferred, delegations_ended: endedIds.length, factors: required };
+  db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, detail) VALUES (?, ?, ?, ?)').run('secret_edited', ownerDid, r.body.new_secret_id, JSON.stringify(detail));
+  logSecurityEvent('secret_value_edited', 'alert', { caller_did: ownerDid, capability: 'edit', target: r.body.new_name, ip: req.ip, context: detail });
+  try {
+    db.prepare('INSERT INTO ticks (did, note, ip, tz, tick_type, tags) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(ownerDid, `Value ${typed ? 'edited' : 'copied from ' + source.name} by the owner: ${target.name.replace(/_v\d+$/, '')}`, req.ip || '', 'UTC', 'decision', JSON.stringify(['demipass:edit', `secret:${target.ref_code}`]));
+  } catch (_) {}
+  res.json({ ok: true, ref: target.ref_code, new_name: r.body.new_name, new_version: r.body.new_version, contexts_transferred: r.body.contexts_transferred,
+    delegations_transferred: r.body.delegations_transferred, delegations_ended: endedIds.length, ...(source ? { source_retired: retired } : {}),
+    ...(r.body.wrapped !== undefined ? { wrapped: r.body.wrapped, ...(r.body.wrap_note ? { wrap_note: r.body.wrap_note } : {}) } : {}),
+    seen_by_person: Boolean(seenAt), next: seenAt ? 'a person has seen this value: rotate it blind when the host allows (DemiPass generates one nobody sees)' : undefined });
+});
+
+// A new version of `existing` holding `newValue`: the ref moves to it, active contexts are copied, the owner's own
+// agents' delegations move with them (as /rotate-blind has done since 2026-11-11; a person's share and an outside
+// agent's delegation stay with the old version), and the old version retires after `graceMins` (value erased).
+// Shared by POST /api/blindkey/rotate, POST /api/blindkey/edit and the blind account-password rotation.
+// `method` is what secret_rotations records; `seenByPersonAt` is the new version's seen_by_person_at.
 // Returns { status, body }.
-function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
+function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null, { method = 'rotate', seenByPersonAt = null, armRetire = true } = {}) {
   // A GitHub App key is replaced by another GitHub App key (the .pem GitHub generates); its App ID and scopes carry over.
   if (githubAppLib.isAppKey(existing)) { const why = githubAppLib.pemRefusal(newValue); if (why) return { status: 400, body: { error: why } }; }
   const baseName = existing.name.replace(/_v\d+$/, '');
@@ -6469,11 +6711,12 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version,
                                     provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
-                                    security_depth, gate_policy, fill_origins, fill_username, account_username)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)
+                                    security_depth, gate_policy, fill_origins, fill_username, account_username, seen_by_person_at, frozen)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
     `).run(ownerDid, newName, descriptionWithout(existing.description, existing.encrypted_value), existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
            existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days,
-           existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null, existing.account_username ?? null);
+           existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null, existing.account_username ?? null, seenByPersonAt,
+           existing.frozen ? 1 : 0);   // a tripped breaker stays tripped on the new version (it used to come back unfrozen)
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 
@@ -6487,18 +6730,32 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
     // Rotation telemetry
     try {
       db.prepare('INSERT INTO secret_rotations (secret_id, did, method, old_version, new_version, note) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(newSecret.id, ownerDid, 'rotate', existing.version || 1, newVersion, baseName);
+        .run(newSecret.id, ownerDid, method, existing.version || 1, newVersion, baseName);
     } catch(_) {}
 
     // Copy only ACTIVE contexts from old secret to new (skip revoked/suspended)
     const oldContexts = db.prepare("SELECT * FROM blindkey_contexts WHERE secret_id = ? AND status = 'active'").all(existing.id);
     let contextsTransferred = 0;
+    const ctxMap = new Map();
     for (const ctx of oldContexts) {
-      db.prepare(`
+      const ins = db.prepare(`
         INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by, max_uses, use_count, command_allowlist, allowed_methods, github_app)
         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
       `).run(newSecret.id, ctx.context_name, ctx.action_type, ctx.target_url_pattern, ctx.target_host_pattern, ctx.allowed_by, ctx.max_uses, ctx.command_allowlist ?? null, ctx.allowed_methods ?? null, ctx.github_app ?? null);
+      ctxMap.set(ctx.id, Number(ins.lastInsertRowid));
       contextsTransferred++;
+    }
+    // The owner's own agents keep the entry on the new version, like its contexts — the same rule /rotate-blind applies.
+    // Before this, a /rotate left every delegation on the old version, which lost its value when the grace ended.
+    let delegationsMoved = 0, delegationsLeft = 0;
+    for (const d of db.prepare("SELECT * FROM demipass_delegations WHERE secret_id = ? AND status = 'active'").all(existing.id)) {
+      const ownAgent = (d.delegate_kind || 'agent') === 'agent' && ownFleetAgent(ownerDid, d.delegate_did);
+      const scopeCarried = d.context_id == null || ctxMap.has(d.context_id);
+      if (!ownAgent || !scopeCarried) { delegationsLeft++; continue; }
+      try {
+        db.prepare('UPDATE demipass_delegations SET secret_id = ?, context_id = ? WHERE id = ?').run(newSecret.id, d.context_id == null ? null : ctxMap.get(d.context_id), d.id);
+        delegationsMoved++;
+      } catch (_) { delegationsLeft++; }
     }
 
     // Mark old secret as rotating with expiry
@@ -6508,10 +6765,14 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
 
     // Schedule retirement of old secret after grace period. A grace past setTimeout's 24.8-day limit would fire at
     // once and erase the old value early; eraseDeadValues retires those when the grace really ends.
-    if (graceMins * 60 * 1000 <= 2 ** 31 - 1) setTimeout(() => {
+    // The timer retires the row only if its grace has really ended: a timer armed by a call that was then rolled back
+    // (an /edit's transaction), or a row whose grace a later rotation set longer, is left alone (#124 re-audit L3).
+    // An edit retires the old version itself and arms none.
+    if (armRetire && graceMins * 60 * 1000 <= 2 ** 31 - 1) setTimeout(() => {
       try {
         db.prepare(
-          `UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'`
+          `UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'
+             AND rotate_expires_at != '' AND datetime(rotate_expires_at) <= datetime('now', '+2 seconds')`
         ).run(existing.id);
       } catch (_) {}
     }, graceMins * 60 * 1000);
@@ -6519,7 +6780,8 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
     // Audit log
     db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, detail) VALUES (?, ?, ?, ?)').run(
       'secret_rotated', ownerDid, existing.id,
-      JSON.stringify({ old_name: existing.name, new_name: newName, new_secret_id: newSecret.id, new_version: newVersion, grace_period_minutes: graceMins, contexts_transferred: contextsTransferred })
+      JSON.stringify({ old_name: existing.name, new_name: newName, new_secret_id: newSecret.id, new_version: newVersion, grace_period_minutes: graceMins, contexts_transferred: contextsTransferred,
+        delegations_transferred: delegationsMoved, delegations_left: delegationsLeft, method })
     );
 
     // Item 1: an elevated/critical new version is wrapped like the old — after the ref has moved to it (the wrap seals
@@ -6531,7 +6793,8 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null) {
       wrapped = Boolean(w.ok);
       if (!w.ok) logSecurityEvent('rotation_not_wrapped', 'alert', { caller_did: ownerDid, target: newName, ip, error: w.error });
     }
-    return { status: 200, body: { ok: true, new_secret_id: newSecret.id, new_name: newName, contexts_transferred: contextsTransferred, grace_period_minutes: graceMins,
+    return { status: 200, body: { ok: true, new_secret_id: newSecret.id, new_name: newName, new_version: newVersion, contexts_transferred: contextsTransferred,
+      delegations_transferred: delegationsMoved, delegations_left: delegationsLeft, grace_period_minutes: graceMins,
       ...(wrapped !== undefined ? { wrapped, ...(wrapped ? {} : { wrap_note: 'the new version is NOT wrapped — the host can read it; link a phone (app 1.5+) and wrap it' }) } : {}) } };
   } catch (e) {
     return { status: 500, body: { error: e.message } };
@@ -6644,6 +6907,7 @@ app.post('/api/blindkey/deposit', rateLimitStandard, (req, res) => {
         metadata = excluded.metadata,
         updated_at = CURRENT_TIMESTAMP
     `).run(resolvedTargetDid, name, description || '', resolvedType, encrypted, metaJson);
+    markSeen(resolvedTargetDid, name);
 
     const inserted = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(resolvedTargetDid, name);
     let refCode = inserted.ref_code;
@@ -6707,6 +6971,7 @@ app.post('/api/blindkey/deposit/batch', rateLimitStandard, (req, res) => {
         const nameRefused = appKeyOverwriteRefusal(s.target_did, s.name) || clearNameForStore(s.target_did, s.name);
         if (nameRefused) { errors.push({ index: i, status: 409, error: nameRefused }); continue; }
         insertStmt.run(s.target_did, s.name, s.description || '', resolvedType, encrypted, metaJson);
+        markSeen(s.target_did, s.name);
         const inserted = db.prepare('SELECT id, ref_code FROM blindkey_secrets WHERE did = ? AND name = ?').get(s.target_did, s.name);
         let refCode = inserted.ref_code;
         if (!refCode) { refCode = generateRefCode(resolvedType, s.name); db.prepare('UPDATE blindkey_secrets SET ref_code = ? WHERE id = ?').run(refCode, inserted.id); }
@@ -7015,6 +7280,7 @@ function handleRowenIngest(req, res) {
         secret_type = excluded.secret_type,
         updated_at = CURRENT_TIMESTAMP
     `).run(target_did, name, description || '', resolvedType, encrypted, JSON.stringify({ depositor_type, depositor_id, via: 'rowen' }));
+    markSeen(target_did, name);
 
     const inserted = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(target_did, name);
 
@@ -8003,7 +8269,8 @@ app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
   try {
     token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
       scope: rec.scope, expiresIn: expires_in,
-      metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh', ...(rec.session_id ? { sid: rec.session_id } : {}) },
+      metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh', ...(rec.session_id ? { sid: rec.session_id } : {}),
+        ...(rec.src_auth ? { src_auth: rec.src_auth } : {}), ...(rec.agent_label ? { agent_label: rec.agent_label } : {}) },
     });
   } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
   // Rotate: issue new refresh token, revoke the consumed one (linked for audit)
@@ -15111,7 +15378,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|edit|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
@@ -15525,6 +15792,26 @@ app.post('/api/blindkey/secrets/:ref/pool', rateLimitStandard, (req, res) => {
 });
 
 // GET /api/demipass/dashboard — secret health dashboard for the mobile app
+// Leak hits (leak_scan.js) name a ref and a name, never a value. leakHitTimes: ref or name → latest hit time (ms) for
+// one owner. leakedAfterWrite: the hit time when a leak of this version was logged after it was written — the leaked
+// value is still the live one — else 0. Used by the dashboard's "needs attention" and by /edit (a leaked source).
+const sqlTimeMs = (s) => { const v = String(s || ''); const t = Date.parse(v.replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(v) ? '' : 'Z')); return Number.isNaN(t) ? null : t; };
+function leakHitTimes(did) {
+  const m = new Map();
+  try {
+    for (const h of db.prepare('SELECT found, created_at FROM leak_scan_hits WHERE owner_did = ?').all(did)) {
+      const t = sqlTimeMs(h.created_at); if (t === null) continue;
+      let f = []; try { f = JSON.parse(h.found) || []; } catch (_) {}
+      for (const x of f) for (const k of [x && x.ref, x && x.name]) if (k && !(m.get(k) >= t)) m.set(k, t);
+    }
+  } catch (_) { /* no leak scan tables yet */ }
+  return m;
+}
+function leakedAfterWrite(times, s) {
+  const written = sqlTimeMs(s.created_at);
+  const at = Math.max(times.get(s.ref_code) || 0, times.get(s.name) || 0, times.get(String(s.name).replace(/_v\d+$/, '')) || 0);
+  return at && written !== null && at >= written ? at : 0;
+}
 app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return auth.code ? res.status(503).json({ error: auth.error, code: auth.code }) : res.status(401).json({ error: 'Bearer token required' });
@@ -15533,10 +15820,15 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
     SELECT id, name, secret_type, status, ref_code, use_count, last_used_at,
            ownership, rotatable, frozen, created_at, updated_at, expires_at, provider,
            COALESCE(category, '') AS category, COALESCE(labels, '[]') AS labels,
-           last_rotated_at, rotation_interval_days, security_depth, gate_policy
+           last_rotated_at, rotation_interval_days, security_depth, gate_policy, account_username, wrap_state, seen_by_person_at
     FROM blindkey_secrets WHERE did = ? AND status IN ('active', 'rotating')
     ORDER BY updated_at DESC
   `).all(auth.did);
+  // "Needs attention" (Aaron 2026-11-15, search): see leakHitTimes / leakedAfterWrite.
+  const leakTimes = leakHitTimes(auth.did);
+  // What a person sees about their own vault — which values were seen or leaked, which are wrapped — is not shown to an
+  // agent or worker token reading the dashboard.
+  const agentReader = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint' || deviceSession(auth.decoded))));
 
   // Get last 3 outcomes per secret + compute health
   const enriched = secrets.map(s => {
@@ -15598,6 +15890,11 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
     let parsedLabels = [];
     try { parsedLabels = JSON.parse(s.labels || '[]'); } catch(_) {}
 
+    const attention = [];
+    const leakedAt = leakedAfterWrite(leakTimes, s);
+    if (leakedAt) attention.push({ reason: 'leaked', at: new Date(leakedAt).toISOString(), note: 'a leak of this value was logged after it was written: the leaked value is still the live one' });
+    if (outcomes[0] && outcomes[0].outcome === 'failure') attention.push({ reason: 'last_use_failed', at: outcomes[0].created_at, note: 'its last use failed' });
+
     return {
       id: s.id,
       name: s.name,
@@ -15611,6 +15908,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
       labels: parsedLabels,
       note: s.note || '',
       username: s.account_username || null,
+      ...(agentReader ? {} : { wrapped: s.wrap_state === 'device', written_at: s.created_at, seen_by_person_at: s.seen_by_person_at || null, attention }),
       security_depth: s.security_depth || 'standard',
       gate_policy: resolveGatePolicy(s),
       use_count: s.use_count,

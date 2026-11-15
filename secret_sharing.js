@@ -395,6 +395,8 @@ module.exports = function registerSecretSharing(deps) {
     if (spent !== 1) return res.status(409).json({ error: 'no reveal left on this share' });
     let value;
     try { value = blindkeyDecrypt(secret.encrypted_value); } catch (_) { return res.status(500).json({ error: 'decryption failed' }); }
+    // A person has now seen this version's value (server.js seen_by_person_at).
+    try { db.prepare('UPDATE blindkey_secrets SET seen_by_person_at = CURRENT_TIMESTAMP WHERE id = ?').run(secret.id); } catch (_) {}
     event('share_revealed', me.did, secret.id, { delegation_id: row.id, owner_did: row.owner_did, delegate_did: me.did });
     logSecurityEvent('secret_revealed', 'critical', { caller_did: me.did, capability: 'share-reveal', target: secret.name, ip: req.ip,
       context: { ref: secret.ref_code, owner_did: row.owner_did, share_id: row.id, fingerprint: me.auth.fingerprint_hash } });
