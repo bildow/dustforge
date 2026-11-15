@@ -95,9 +95,20 @@ call POST /api/demipass/edit "$SIL" "$(EDIT '{"ref":"'$REF1'","new_value":"'$NEW
 [ "$CODE" = 403 ] && ok "an agent (silicon) token → 403" || fail "silicon: $CODE $BODY"
 call POST /api/identity/device/code "" '{"agent_label":"some-pane","scope":"transact"}'; DC=$(echo "$BODY" | J device_code)
 X "UPDATE device_auth SET status='approved', approved_did='$DA' WHERE device_code='$DC'"
-call POST /api/identity/device/token "" '{"device_code":"'$DC'"}'; DEVT=$(echo "$BODY" | J access_token); [ "$DEVT" = None ] && DEVT=$(echo "$BODY" | J token)
+call POST /api/identity/device/token "" '{"device_code":"'$DC'"}'; DEVT=$(echo "$BODY" | J token); DEVR=$(echo "$BODY" | J refresh_token)
 call POST /api/demipass/edit "$DEVT" "$(EDIT '{"ref":"'$REF1'","new_value":"'$NEWV'"}')"
 [ "$DEVT" != None ] && [ "$CODE" = 403 ] && echo "$BODY" | grep -q "device sign-in" && ok "the owner's wallet through a device-login (an agent's sign-in) → 403: an edit is a person's act" || fail "device: $DEVT $CODE $BODY"
+call POST /api/identity/refresh "" '{"refresh_token":"'$DEVR'"}'; DEVT2=$(echo "$BODY" | J token)
+call POST /api/demipass/edit "$DEVT2" "$(EDIT '{"ref":"'$REF1'","new_value":"'$NEWV'"}')"
+[ "$DEVT2" != None ] && [ "$CODE" = 403 ] && echo "$BODY" | grep -q "device sign-in" && ok "…and after a refresh the token still says it is a device sign-in → 403 (#124 re-audit L2)" || fail "refreshed device: $CODE $BODY"
+call POST /api/identity/auth-fingerprint "" '{"username":"ve-owner","password":"hunter22","scope":"transact","expires_in":"1h"}'; PR=$(echo "$BODY" | J refresh_token)
+call POST /api/identity/refresh "" '{"refresh_token":"'$PR'"}'; PT2=$(echo "$BODY" | J token); PR2=$(echo "$BODY" | J refresh_token)
+call POST /api/demipass/edit "$PT2" "$(EDIT '{"ref":"'$REF1'","new_value":"'$NEWV'"}')"
+[ "$CODE" = 409 ] && ok "…a person's refreshed session is not refused as an agent's (it reaches the grant check)" || fail "person refresh: $CODE $BODY"
+X "UPDATE refresh_tokens SET src_auth=NULL WHERE token_hash='$(printf '%s' "$PR2" | sha256sum | cut -d' ' -f1)'"
+call POST /api/identity/refresh "" '{"refresh_token":"'$PR2'"}'; PT3=$(echo "$BODY" | J token)
+call POST /api/demipass/edit "$PT3" "$(EDIT '{"ref":"'$REF1'","new_value":"'$NEWV'"}')"
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J sign_in_again)" = True ] && ok "…a refresh chain from before sessions carried their origin must sign in again (fails closed)" || fail "legacy refresh: $CODE $BODY"
 call POST /api/demipass/edit "$N" "$(EDIT '{"ref":"'$REF1'","new_value":"'$NEWV'"}')"
 [ "$CODE" = 404 ] && ok "another wallet → 404 (not its entry)" || fail "other: $CODE $BODY"
 call POST /api/demipass/edit "$A" "$(EDIT '{"ref":"'$REF1'","new_value":"'$NEWV'","from_ref":"'$REF1'"}')"
@@ -216,6 +227,7 @@ twofa "$A"; call POST /api/demipass/edit "$A" "$(EDIT '{"ref":"'$EREF'","new_val
 [ "$CODE" = 409 ] && [ "$(echo "$BODY" | J wrapped)" = False ] && [ "$(Q "SELECT status FROM blindkey_secrets WHERE id=$EL")" = active ] && [ "$(Q "SELECT wrap_state FROM blindkey_secrets WHERE id=$EL")" = device ] \
   && [ "$(Q "SELECT COUNT(*) FROM blindkey_secrets WHERE name LIKE 've-elev%'")" = "$n0" ] && ok "a wrap failure after the pre-check → 409; the old wrapped version stays, no host-readable new version" || fail "wrap fail: $CODE $BODY"
 [ "$(Q "SELECT COUNT(*) FROM gate_verifications WHERE gate_type='pin' AND intent='edit:$EL'")" = "$pv" ] && ok "…and the PIN proof is not spent by the refused edit (rolled back with it)" || fail "pin spent on rollback"
+[ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='secret_edit_refused' AND target='ve-elev' AND error_detail LIKE '%could not be wrapped%'")" = 1 ] && ok "…and the refusal is logged with its reason, after the rollback (#124 re-audit L4)" || fail "refusal not logged"
 X "UPDATE device_wrap_keys SET public_key='$KW' WHERE did='$DA'"
 twofa "$A"; call POST /api/demipass/edit "$A" "$(EDIT '{"ref":"'$EREF'","new_value":"'$EV'"}')"
 [ "$CODE" = 403 ] && { pin "$A" "edit:$EL"; call POST /api/demipass/edit "$A" "$(EDIT '{"ref":"'$EREF'","new_value":"'$EV'"}')"; }
@@ -229,17 +241,37 @@ call POST /api/demipass/edit "$A" "$(EDIT '{"ref":"'$CREF'","new_value":"'$CV'"}
 [ "$CODE" = 202 ] && [ "$(Q "SELECT kind FROM use_approvals WHERE id=$AP")" = edit ] && ok "critical: an approval request (kind edit) is filed first" || fail "crit park: $CODE $BODY"
 sleep 0.5
 [ -z "$(Q "SELECT COALESCE(eph_pub,'') FROM use_approvals WHERE id=$AP")" ] && ! grep -qF -- "$CV" <(Q "SELECT bound_call FROM use_approvals WHERE id=$AP") && ok "…no one-use key: the phone is never asked to unwrap the old value; the new value is not in the request" || fail "eph on edit"
+! Q "SELECT binding || ' ' || bound_call FROM use_approvals WHERE id=$AP" | grep -q value_mac && [ -n "$(Q "SELECT value_mac FROM use_approvals WHERE id=$AP")" ] && ok "…the typed value's HMAC is in a server-only column, not in the binding or the bound call" || fail "value_mac placement"
+same(){ local b1=$1 b2=$2; call POST /api/demipass/edit "$A" "$b1"; local c1=$CODE r1=$BODY; call POST /api/demipass/edit "$A" "$b2"; [ "$c1" = "$CODE" ] && [ "$r1" = "$BODY" ]; }
+same '{"ref":"'$CREF'","new_value":"'$CV'","approval_id":'$AP'}' '{"ref":"'$CREF'","new_value":"a-wrong-guess-zz87","approval_id":'$AP'}' \
+  && ok "…while pending, a wrong value and the right one get the very same reply (no value oracle)" || fail "pending oracle: $CODE $BODY"
 BIND=$(Q "SELECT binding FROM use_approvals WHERE id=$AP")
 pin "$A" "approval-open:$AP"; devsign "$A" "approval-open:$AP" "$BIND"; call POST /api/demipass/approvals/$AP/open "$A" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'; CODEV=$(echo "$BODY" | J code)
 devsign "$A" "approval:$AP" "$BIND"; call POST /api/demipass/approvals/$AP/approve "$A" '{"code":"'$CODEV'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'
 [ "$CODE" = 200 ] && ok "…the owner approves it on the phone without an unwrap" || fail "approve: $CODE $BODY"
-call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"another-value-zz81","approval_id":'$AP'}'
-[ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP")" = approved ] && ok "…an approval for one typed value cannot be redeemed with another (an HMAC of the value is bound)" || fail "value bind: $CODE $BODY"
+same '{"ref":"'$CREF'","new_value":"'$CV'","approval_id":'$AP'}' '{"ref":"'$CREF'","new_value":"a-wrong-guess-zz88","approval_id":'$AP'}' && [ "$CODE" = 403 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP")" = approved ] \
+  && ok "…approved, without the PIN: a wrong value looks exactly like the right one (403, same body; #124 re-audit M1)" || fail "approved oracle: $CODE $BODY"
 B='{"ref":"'$CREF'","new_value":"'$CV'","approval_id":'$AP'}'
 call POST /api/demipass/edit "$A" "$B"
 [ "$CODE" = 403 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP")" = approved ] && ok "…then the PIN and code are still asked, and the approval is not spent by asking" || fail "crit gates: $CODE $BODY"
 twofa "$A"; pin "$A" "edit:$CR"; call POST /api/demipass/edit "$A" "$B"
 [ "$CODE" = 200 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP")" = used ] && ok "…approved + PIN + code → 200; the approval is used" || fail "crit edit: $CODE $BODY"
+# a wrong value WITH the PIN: costs the PIN entry and the request
+CR2=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$CREF'"); CV2=$(python3 -c 'import secrets;print("vecrit2-" + secrets.token_urlsafe(16))')
+approve_edit(){ local ap=$1 bind; bind=$(Q "SELECT binding FROM use_approvals WHERE id=$ap"); pin "$A" "approval-open:$ap"; devsign "$A" "approval-open:$ap" "$bind"
+  call POST /api/demipass/approvals/$ap/open "$A" '{"device_challenge_id":'$CH',"device_signature":"'$SG'"}'; local cv; cv=$(echo "$BODY" | J code)
+  devsign "$A" "approval:$ap" "$bind"; call POST /api/demipass/approvals/$ap/approve "$A" '{"code":"'$cv'","device_challenge_id":'$CH',"device_signature":"'$SG'"}'; [ "$CODE" = 200 ] || fail "approve $ap: $CODE $BODY"; }
+call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$CV2'"}'; AP2=$(echo "$BODY" | J approval_id); approve_edit "$AP2"
+twofa "$A"; pin "$A" "edit:$CR2"; call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"a-wrong-guess-zz89","approval_id":'$AP2'}'
+[ "$CODE" = 410 ] && [ "$(echo "$BODY" | J error)" = "this approval request is cancelled" ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$AP2")" = cancelled ] && [ "$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$CREF'")" = "$CR2" ] \
+  && ok "a wrong value with the PIN → the approval is cancelled (410, the reply any cancelled request gets); nothing changed" || fail "mismatch: $CODE $BODY"
+[ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='secret_edit_value_mismatch'")" = 1 ] && ok "…logged as secret_edit_value_mismatch" || fail "mismatch log"
+call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$CV2'"}'; AP3=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$AP3" != "$AP2" ] && approve_edit "$AP3"
+twofa "$A"; call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$CV2'","approval_id":'$AP3'}'
+[ "$CODE" = 403 ] && echo "$BODY" | J missing | grep -q pin && ok "…and the guess spent its PIN entry: the next try asks for the PIN again" || fail "pin not spent by guess: $CODE $BODY"
+pin "$A" "edit:$CR2"; call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$CV2'","approval_id":'$AP3'}'
+[ "$CODE" = 200 ] && ok "…a new request, approved, with the PIN and the right value → 200" || fail "after mismatch: $CODE $BODY"
 
 # ── /rotate now carries the owner's own agents' delegations ──
 store "$A" ve-rot rot-old-zz75; RO=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-rot'"); deleg "$DAG" $RO
@@ -247,6 +279,16 @@ call POST /api/demipass/rotate "$A" '{"name":"ve-rot","new_value":"rot-new-zz76"
 ROB=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-rot_v2'")
 [ -n "$(Q "SELECT seen_by_person_at FROM blindkey_secrets WHERE id=${ROB:-0}")" ] && [ "$(Q "SELECT seen_by_person_at FROM blindkey_secrets WHERE id=${ROB:-0}")" != None ] && ok "/rotate with a value the caller typed marks the new version seen" || fail "rotate seen"
 [ "$CODE" = 200 ] && [ "$(Q "SELECT secret_id FROM demipass_delegations WHERE secret_id IN ($RO, ${ROB:-0}) AND delegate_did='$DAG'")" = "$ROB" ] && [ "$(echo "$BODY" | J delegations_transferred)" = 1 ] && ok "/rotate moves the owner's own agent's delegation to the new version" || fail "rotate deleg: $CODE $BODY"
+
+# ── the retire timer checks the grace really ended (#124 re-audit L3) ──
+store "$A" ve-tm tm-old-zz90; TM=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-tm'")
+call POST /api/demipass/rotate "$A" '{"name":"ve-tm","new_value":"tm-new-zz91","grace_period_minutes":0.05}'
+X "UPDATE blindkey_secrets SET rotate_expires_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','+1 hour') WHERE id=$TM"
+store "$A" ve-tn tn-old-zz92; TN=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-tn'")
+call POST /api/demipass/rotate "$A" '{"name":"ve-tn","new_value":"tn-new-zz93","grace_period_minutes":0.05}'
+sleep 5
+[ "$(Q "SELECT status FROM blindkey_secrets WHERE id=$TM")" = rotating ] && [ -n "$(Q "SELECT encrypted_value FROM blindkey_secrets WHERE id=$TM")" ] && ok "a retire timer whose row's grace now ends later leaves it alone" || fail "timer guard: $(Q "SELECT status FROM blindkey_secrets WHERE id=$TM")"
+[ "$(Q "SELECT status FROM blindkey_secrets WHERE id=$TN")" = retired ] && ok "…while a grace that did end still retires on time" || fail "timer normal: $(Q "SELECT status FROM blindkey_secrets WHERE id=$TN")"
 
 # ── dashboard: username, seen, attention ──
 store "$A" ve-leaky leaky-zz77; LK=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-leaky'"); LREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$LK")
@@ -259,6 +301,9 @@ DASH=$BODY
 call GET /api/demipass/dashboard "$SIL"
 echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("secrets") or []; sys.exit(0 if s and not any(k in x for x in s for k in ("attention","seen_by_person_at","wrapped")) else 1)' \
   && ok "an agent token reading the dashboard gets no attention, seen_by_person_at or wrapped" || fail "agent dashboard: $(echo "$BODY" | head -c 200)"
+call GET /api/demipass/dashboard "$DEVT2"
+echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("secrets") or []; sys.exit(0 if s and not any(k in x for x in s for k in ("attention","seen_by_person_at","wrapped")) else 1)' \
+  && ok "…nor does a (refreshed) device-login session" || fail "device dashboard: $(echo "$BODY" | head -c 200)"
 att(){ echo "$DASH" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=[x for x in d["secrets"] if x["ref"]==sys.argv[1]][0]; print(",".join(a["reason"] for a in s.get("attention",[])) or "-"); ' "$1"; }
 fld(){ echo "$DASH" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=[x for x in d["secrets"] if x["ref"]==sys.argv[1]][0]; print(s.get(sys.argv[2]))' "$1" "$2"; }
 [ "$(att "$LREF")" = leaked ] && ok "attention: a value written before its logged leak → leaked" || fail "leaked: $(att "$LREF")"

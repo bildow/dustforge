@@ -889,6 +889,11 @@ try { db.exec('ALTER TABLE refresh_tokens ADD COLUMN access_jti TEXT'); } catch 
 // A session (sid) is one sign-in and every token refreshed from it: what a PIN proof, an unlock, an opened approval
 // and a device challenge belong to — and what ends as a whole (#47 review M1, M5).
 try { db.exec('ALTER TABLE refresh_tokens ADD COLUMN session_id TEXT'); } catch (_) {}
+// How the session began (the first token's auth_method: 'device' for an agent's device sign-in) and its agent label:
+// carried through every refresh, so a refreshed token still says it is an agent's session (#124 re-audit L2).
+for (const c of ['src_auth TEXT', 'agent_label TEXT']) { try { db.exec('ALTER TABLE refresh_tokens ADD COLUMN ' + c); } catch (_) {} }
+// An agent's device sign-in, or a session refreshed from one.
+const deviceSession = (d) => !!d && (d.auth_method === 'device' || d.src_auth === 'device');
 try { db.exec('ALTER TABLE issued_tokens ADD COLUMN sid TEXT'); } catch (_) {}
 function newSessionId() { return 's' + require('crypto').randomBytes(12).toString('hex'); }
 function tokenClaims(token) { try { return JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString()) || {}; } catch (_) { return {}; } }
@@ -1043,8 +1048,9 @@ function issueRefreshToken(did, scope, accessToken = null) {
   const raw = 'dpr_' + require('crypto').randomBytes(32).toString('base64url');
   const exp = new Date(Date.now() + REFRESH_TTL_DAYS*24*3600*1000).toISOString();
   const claims = accessToken ? tokenClaims(accessToken) : {};
-  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at, access_jti, session_id) VALUES (?,?,?,?,?,?)')
-    .run(did, _refreshHash(raw), scope || 'read', exp, claims.jti || null, claims.sid || claims.jti || null);
+  db.prepare('INSERT INTO refresh_tokens (did, token_hash, scope, expires_at, access_jti, session_id, src_auth, agent_label) VALUES (?,?,?,?,?,?,?,?)')
+    .run(did, _refreshHash(raw), scope || 'read', exp, claims.jti || null, claims.sid || claims.jti || null,
+         claims.src_auth || (claims.auth_method && claims.auth_method !== 'refresh' ? claims.auth_method : null), claims.agent_label || null);
   return { refresh_token: raw, refresh_expires_at: exp };
 }
 // Validate + single-use rotate: returns {did, scope} or null. Old token is revoked + linked to new.
@@ -1057,11 +1063,12 @@ function consumeRefreshToken(raw) {
   const row = db.prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?').get(_refreshHash(raw));
   if (!row) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) return null;
-  if (!row.revoked) return { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null };
+  const origin = { src_auth: row.src_auth || null, agent_label: row.agent_label || null };
+  if (!row.revoked) return { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null, ...origin };
   if (!row.rotated_to) return null;   // revoked by sign-out, not by rotation
   const next = db.prepare(`SELECT id FROM refresh_tokens WHERE token_hash = ? AND revoked = 0 AND did = ?
     AND ? >= datetime('now', '-${REFRESH_GRACE_SEC} seconds')`).get(row.rotated_to, row.did, row.last_used_at || '');
-  return next ? { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null, successorId: next.id } : null;
+  return next ? { id: row.id, did: row.did, scope: row.scope, session_id: row.session_id || null, ...origin, successorId: next.id } : null;
 }
 function revokeRefreshToken(id, rotatedToRaw) {
   db.prepare('UPDATE refresh_tokens SET revoked = 1, last_used_at = datetime(\'now\'), rotated_to = ? WHERE id = ?')
@@ -6487,10 +6494,13 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'sign in', ...(auth.code ? { code: auth.code } : {}) });
   const d0 = auth.decoded || {};
-  if (auth.silicon || d0.wrk || d0.auth_method === 'worker' || d0.auth_method === 'fleet_owner_mint' || d0.auth_method === 'device') {
-    logSecurityEvent('edit_blocked_agent', 'alert', { caller_did: auth.did, agent_name: auth.agent_name || d0.agent_label, capability: 'edit', ip: req.ip, error: d0.auth_method === 'device' ? 'device-login session' : 'agent token' });
+  if (auth.silicon || d0.wrk || d0.auth_method === 'worker' || d0.auth_method === 'fleet_owner_mint' || deviceSession(d0)) {
+    logSecurityEvent('edit_blocked_agent', 'alert', { caller_did: auth.did, agent_name: auth.agent_name || d0.agent_label, capability: 'edit', ip: req.ip, error: deviceSession(d0) ? 'device-login session' : 'agent token' });
     return res.status(403).json({ error: 'a secret is edited by its owner in the DemiPass app, not by an agent token or an agent\'s device sign-in' });
   }
+  // A token refreshed from a session that began before sessions carried their origin cannot say whether a person or an
+  // agent signed in: it signs in again (once) before it may edit (fails closed).
+  if (d0.auth_method === 'refresh' && !d0.src_auth) return res.status(403).json({ error: 'sign in again in the DemiPass app to edit a secret (this session cannot show it began as a person\'s sign-in)', sign_in_again: true });
   if (!gateSession(auth)) return res.status(403).json({ error: 'this token cannot hold a PIN proof — sign in again' });
   const ownerDid = auth.did;
   const b = req.body || {};
@@ -6573,14 +6583,24 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
   if (source) { for (const g of resolveGatePolicy(source).rotate) req1.add(g); if (retireSource) for (const g of resolveGatePolicy(source).delete) req1.add(g); }
   const required = [...req1];
   const critical = depthName(target) === 'critical' || (source && depthName(source) === 'critical');
-  // The approval binds the whole edit: the mode, the source, the grants that end, and (typed) an HMAC of the value — so
-  // an approved request cannot be redeemed with another value or after other grants appeared (#124 review L4).
+  // The approval binds the whole edit: the mode, the source and the grants that end (#124 review L4). A typed value is
+  // NOT in the binding: the peek below compares the binding before any factor is checked, so a value in it would answer
+  // "a different call" to wrong guesses without the PIN (#124 re-audit M1). Its HMAC sits in a server-only column,
+  // written when the request is filed, and is compared inside the transaction after the PIN is spent.
   const use = { kind: 'edit', action: 'edit', params: { mode: typed ? 'typed' : 'copy', ...(source ? { from_ref: source.ref_code, from_name: source.name } : {}), ...(retireSource ? { retire_source: true } : {}),
-    ends: ending.length, ...(ending.length ? { ends_token: leftToken } : {}), ...(typed ? { value_mac: editMac('value', target.id, new_value) } : {}) } };
+    ends: ending.length, ...(ending.length ? { ends_token: leftToken } : {}) } };
+  const valueMac = typed ? editMac('value', target.id, new_value) : null;
   const caller = { did: ownerDid, label: cleanLabel(d0.agent_label || d0.username || 'owner', 40) };
   if (critical) {
     const g = useApprovals.gate(target, caller, use, b, { peek: true });
-    if (!g.ok) return res.status(g.status).json(g.body);
+    if (!g.ok) {
+      // A request just filed for a typed value remembers which value (first writer wins: a pending request handed back
+      // to a later call keeps the value it was filed with).
+      if (typed && g.status === 202 && g.body && g.body.approval_id) {
+        try { db.prepare("UPDATE use_approvals SET value_mac = ? WHERE id = ? AND kind = 'edit' AND value_mac IS NULL").run(valueMac, Number(g.body.approval_id)); } catch (_) {}
+      }
+      return res.status(g.status).json(g.body);
+    }
   }
   const intent = `edit:${target.id}`;
   const missing = required.filter(g => !gateFresh(ownerDid, g, auth, intent));
@@ -6592,10 +6612,18 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
     out = db.transaction(() => {
       const refused = spendSingleUse(ownerDid, 'edit', required, auth, intent);
       if (refused) throw new EditAbort(refused.status || 403, refused);
-      if (critical) { const g = useApprovals.gate(target, caller, use, b); if (!g.ok) throw new EditAbort(g.status, g.body); }
+      if (critical) {
+        const g = useApprovals.gate(target, caller, use, b); if (!g.ok) throw new EditAbort(g.status, g.body);
+        // The typed value must be the one the request was filed (and approved) for. Checked only now, after the PIN.
+        if (typed) {
+          const row = db.prepare('SELECT value_mac FROM use_approvals WHERE id = ?').get(Number(g.approval_id)) || {};
+          const a = Buffer.from(String(row.value_mac || '')), c = Buffer.from(valueMac);
+          if (!(a.length === c.length && crypto.timingSafeEqual(a, c))) throw Object.assign(new EditAbort(410, { error: 'this approval request is cancelled', approval_id: Number(g.approval_id) }), { valueMismatch: Number(g.approval_id) });
+        }
+      }
       if (source) { try { value = blindkeyDecrypt(source.encrypted_value); } catch (_) { throw new EditAbort(500, { error: 'the source could not be read' }); } }
       else value = new_value;
-      const r = rotateSecretValue(ownerDid, target, value, 60, req.ip, { method: typed ? 'edit' : 'edit_copy', seenByPersonAt: seenAt });
+      const r = rotateSecretValue(ownerDid, target, value, 60, req.ip, { method: typed ? 'edit' : 'edit_copy', seenByPersonAt: seenAt, armRetire: false });
       value = null;
       if (r.status !== 200) throw new EditAbort(r.status, r.body);
       // A wrapped entry stays wrapped: a new version the host can read is not kept (rolled back with everything else).
@@ -6624,6 +6652,18 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
     })();
   } catch (e) {
     value = null;
+    // After the rollback: a typed value that is not the approved one costs the guess its PIN entry and its request — the
+    // PIN proof is spent and the approval cancelled here, outside the rolled-back transaction, so each guess needs a new
+    // PIN (the PIN lockout caps them) and a new approval on the phone.
+    if (e.valueMismatch) {
+      try { spendSingleUse(ownerDid, 'edit', required, auth, intent); } catch (_) {}
+      try { db.prepare("UPDATE use_approvals SET status = 'cancelled', decided_at = ? WHERE id = ? AND status IN ('approved', 'pending')").run(new Date().toISOString(), e.valueMismatch); } catch (_) {}
+    }
+    // A refused edit leaves a trail too (the events written inside the transaction rolled back with it).
+    try {
+      logSecurityEvent(e.valueMismatch ? 'secret_edit_value_mismatch' : 'secret_edit_refused', e.valueMismatch ? 'alert' : 'warn', { caller_did: ownerDid, capability: 'edit', target: target.name, ip: req.ip,
+        error: String((e.body && e.body.error) || e.message || 'failed').slice(0, 200), context: { ref: target.ref_code, status: e instanceof EditAbort ? e.status : 500, mode: typed ? 'typed' : 'copy', ...(e.valueMismatch ? { approval_id: e.valueMismatch } : {}) } });
+    } catch (_) {}
     if (e instanceof EditAbort) return res.status(e.status).json(e.body);
     return res.status(500).json({ error: 'the edit failed and nothing was changed' });
   }
@@ -6650,7 +6690,7 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
 // Shared by POST /api/blindkey/rotate, POST /api/blindkey/edit and the blind account-password rotation.
 // `method` is what secret_rotations records; `seenByPersonAt` is the new version's seen_by_person_at.
 // Returns { status, body }.
-function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null, { method = 'rotate', seenByPersonAt = null } = {}) {
+function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null, { method = 'rotate', seenByPersonAt = null, armRetire = true } = {}) {
   // A GitHub App key is replaced by another GitHub App key (the .pem GitHub generates); its App ID and scopes carry over.
   if (githubAppLib.isAppKey(existing)) { const why = githubAppLib.pemRefusal(newValue); if (why) return { status: 400, body: { error: why } }; }
   const baseName = existing.name.replace(/_v\d+$/, '');
@@ -6722,10 +6762,14 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null, {
 
     // Schedule retirement of old secret after grace period. A grace past setTimeout's 24.8-day limit would fire at
     // once and erase the old value early; eraseDeadValues retires those when the grace really ends.
-    if (graceMins * 60 * 1000 <= 2 ** 31 - 1) setTimeout(() => {
+    // The timer retires the row only if its grace has really ended: a timer armed by a call that was then rolled back
+    // (an /edit's transaction), or a row whose grace a later rotation set longer, is left alone (#124 re-audit L3).
+    // An edit retires the old version itself and arms none.
+    if (armRetire && graceMins * 60 * 1000 <= 2 ** 31 - 1) setTimeout(() => {
       try {
         db.prepare(
-          `UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'`
+          `UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'
+             AND rotate_expires_at != '' AND datetime(rotate_expires_at) <= datetime('now', '+2 seconds')`
         ).run(existing.id);
       } catch (_) {}
     }, graceMins * 60 * 1000);
@@ -8222,7 +8266,8 @@ app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
   try {
     token = identity.createTokenForIdentity(wallet.encrypted_private_key, wallet.did, {
       scope: rec.scope, expiresIn: expires_in,
-      metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh', ...(rec.session_id ? { sid: rec.session_id } : {}) },
+      metadata: { email: wallet.email, username: wallet.username, auth_method: 'refresh', ...(rec.session_id ? { sid: rec.session_id } : {}),
+        ...(rec.src_auth ? { src_auth: rec.src_auth } : {}), ...(rec.agent_label ? { agent_label: rec.agent_label } : {}) },
     });
   } catch (e) { return res.status(500).json({ error: 'token mint failed' }); }
   // Rotate: issue new refresh token, revoke the consumed one (linked for audit)
@@ -15780,7 +15825,7 @@ app.get('/api/blindkey/dashboard', rateLimitStandard, (req, res) => {
   const leakTimes = leakHitTimes(auth.did);
   // What a person sees about their own vault — which values were seen or leaked, which are wrapped — is not shown to an
   // agent or worker token reading the dashboard.
-  const agentReader = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint')));
+  const agentReader = !!(auth.silicon || (auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint' || deviceSession(auth.decoded))));
 
   // Get last 3 outcomes per secret + compute health
   const enriched = secrets.map(s => {

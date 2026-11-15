@@ -85,6 +85,9 @@ module.exports = function registerUseApprovals(deps) {
   // What an approved call did (Aaron 2026-11-14, approval 59): JSON {at, ran, http, exit_code, note}. The owner's app
   // shows it on the request, and on the next request for the same call, so a second ask is never a surprise.
   try { db.exec('ALTER TABLE use_approvals ADD COLUMN outcome TEXT DEFAULT NULL'); } catch (_) {}
+  // An edit's typed value, as an HMAC (server.js POST /edit): server-only, never in the binding or any view, and
+  // compared only after the PIN is spent — so a wrong guess costs a PIN entry and the request (#124 re-audit M1).
+  try { db.exec('ALTER TABLE use_approvals ADD COLUMN value_mac TEXT DEFAULT NULL'); } catch (_) {}
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_owner ON use_approvals(owner_did, status)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_ua_requester ON use_approvals(requester_did, status)');
   // A wrapped secret's request needs its one-use key, which lives only in this process's memory (crypto_depth.js). At
