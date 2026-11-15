@@ -8298,7 +8298,7 @@ app.post('/api/identity/rate-limit/reset', async (req, res) => {
   // Counted only once the caller is the owner as a person, so an agent's refused calls can't use up the owner's resets
   // (rate-reset review M2).
   { let passed = false; await new Promise((resolve) => rateLimitReset(req, res, (e) => { passed = !e; resolve(); }).then(() => resolve(), resolve));
-    if (!passed || res.headersSent) return; }
+    if (!passed) { if (!res.headersSent) res.status(503).json({ error: 'rate limit check failed; try again' }); return; } }
   const intent = 'rate-reset:0';
   if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('rate-reset', ['pin'], ['pin'], intent));
   const refused = spendSingleUse(auth.did, 'rate-reset', ['pin'], auth, intent);
