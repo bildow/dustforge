@@ -5,7 +5,7 @@
 set -u
 for u in dp-backup-key-swap dp-audit-operators; do
   inv=$(cat "/run/dp-sitting-$u.inv" 2>/dev/null || true)
-  echo "== $u (state $(systemctl show -p ActiveState --value "$u.service" 2>/dev/null), invocation ${inv:-unknown})"
+  echo "== $u ($(systemctl show -p SubState --value "$u.service" 2>/dev/null): running = not finished yet, exited = done; invocation ${inv:-unknown})"
   if [[ "$inv" =~ ^[0-9a-f]{32}$ ]]; then journalctl _SYSTEMD_INVOCATION_ID="$inv" --no-pager -o cat 2>/dev/null | tail -200
   else echo "no invocation id recorded (call A not run?)"; fi
 done

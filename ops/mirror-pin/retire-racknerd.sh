@@ -22,34 +22,47 @@ LINE="restrict,from=\"$FROM\",command=\"$DST\" $NEWKEY"
 grep -qxF -- "$LINE" "$AK" || { echo "the restricted line is not there (run install-racknerd.sh): nothing changed"; exit 3; }
 [[ -f "$STAMP" && "$(cat "$STAMP")" =~ ^[0-9]+$ ]] || { echo "no phase-A stamp: nothing changed"; exit 3; }
 SINCE=$(cat "$STAMP")
-esc() { printf '%s' "$1" | sed 's/[.[\*^$()+?{}|/]/\\&/g'; }
-# Whole log messages from sshd itself (not journal text a client can shape), counted, never `grep -q` (review M1, M2).
-sshlog() { journalctl _COMM=sshd-session + _COMM=sshd --since "@$SINCE" --no-pager -o cat 2>/dev/null; }
-accepted() { sshlog | grep -cE "^Accepted publickey for root from $(esc "$1") port [0-9]+ ssh2: ED25519 $(esc "$2")\$" || true; }
-nnew=$(accepted "$FROM" "$NEWFP")
-nold=$(sshlog | grep -cE "^Accepted publickey for root from [0-9a-fA-F.:]+ port [0-9]+ ssh2: ED25519 $(esc "$OLDFP")\$" || true)
+esc() { printf '%s' "$1" | sed 's/[.[\*^$()+?{}|]/\\&/g'; }
+# sshd's own log lines (root-run sshd-session/sshd only: _UID=0, so a local user's fake "sshd-session" can't add one),
+# as "<unix time> <message>", counted, never `grep -q` under pipefail (review M1, M2; re-review check 1). The ^…$
+# anchors keep client-chosen text (a username in a [preauth] line) from ever matching.
+sshlog() { journalctl _COMM=sshd-session _UID=0 + _COMM=sshd _UID=0 --since "@$SINCE" --no-pager -o short-unix 2>/dev/null \
+  | sed -nE 's/^([0-9]+(\.[0-9]+)?) [^ ]+ [^:]+: (.*)$/\1 \3/p'; }
+NEWRE="^[0-9.]+ Accepted publickey for root from $(esc "$FROM") port [0-9]+ ssh2: ED25519 $(esc "$NEWFP")\$"
+OLDRE="^[0-9.]+ Accepted publickey for root from [0-9a-fA-F.:]+ port [0-9]+ ssh2: ED25519 $(esc "$OLDFP")\$"
+LOG=$(sshlog)
+nnew=$(printf '%s\n' "$LOG" | grep -cE "$NEWRE" || true)
+FIRST=$(printf '%s\n' "$LOG" | grep -E "$NEWRE" | sed -n 1p | cut -d' ' -f1)
+# Old-key logins count only after the new key's first login: the last mirror on the old key, before phasewhip
+# switched, must not block retire forever (re-review F1).
+if [ -n "$FIRST" ]; then nold=$(printf '%s\n' "$LOG" | awk -v t="$FIRST" '$1+0 > t+0' | grep -cE "$OLDRE" || true); else nold=0; fi
 ok() { journalctl -t dustforge-mirror-send _UID=0 --since "@$SINCE" --no-pager -o cat 2>/dev/null | grep -cxF "$1" || true; }
 ntar=$(journalctl -t dustforge-mirror-send _UID=0 --since "@$SINCE" --no-pager -o cat 2>/dev/null | grep -c '^ok dustforge-tar ' || true)
 nrs=$(ok "ok rsync git-bundles")
-echo "since phase A ($(date -u -d "@$SINCE" +%FT%TZ)): new-key logins $nnew, mirror tar ok $ntar, rsync ok $nrs, old-key logins $nold"
+echo "since phase A ($(date -u -d "@$SINCE" +%FT%TZ)): new-key logins $nnew, mirror tar ok $ntar, rsync ok $nrs, old-key logins after the new key's first $nold"
 if [ "$nnew" -lt 1 ] || [ "$ntar" -lt 1 ] || [ "$nrs" -lt 1 ]; then echo "the mirror has not yet run through the new key: the old key stays; nothing changed"; exit 4; fi
-if [ "$nold" -gt 0 ]; then echo "the old key still logs in: something else depends on it; the old key stays; nothing changed"; exit 5; fi
+if [ "$nold" -gt 0 ]; then echo "the old key still logs in after the switch: something else depends on it; the old key stays; nothing changed"; exit 5; fi
 # Every file sshd reads for root (review M4: Debian's default includes .ssh/authorized_keys2).
-mapfile -t FILES < <(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | awk '$1=="authorizedkeysfile"{for(i=2;i<=NF;i++) print $i}' \
-  | sed -e 's#%h#/root#g' -e 's#%u#root#g' -e 's#%%#%#g' | awk '{ if ($0 !~ "^/") print "/root/" $0; else print }')
-[ "${#FILES[@]}" -gt 0 ] || FILES=("$AK")
+T=$(sshd -T -C "user=root,host=localhost,addr=$FROM" 2>/dev/null) || { echo "sshd -T failed: cannot know which key files sshd reads; nothing changed"; exit 1; }
+mapfile -t FILES < <(printf '%s\n' "$T" | awk '$1=="authorizedkeysfile"{for(i=2;i<=NF;i++) print $i}' | grep -vx none \
+  | sed -e 's#%h#/root#g' -e 's#%u#root#g' -e 's#%U#0#g' -e 's#%%#%#g' -e 's#^~/#/root/#' | awk '{ if ($0 !~ "^/") print "/root/" $0; else print }')
+[ "${#FILES[@]}" -gt 0 ] || { echo "sshd -T names no authorized-keys file for root: nothing changed"; exit 1; }
+echo "key files sshd reads for root: ${FILES[*]}"
 total=0
 for f in "${FILES[@]}"; do
   [ -f "$f" ] || continue
-  TMP=$(mktemp "$f.XXXXXX"); removed=0
+  TMP=$(mktemp "$f.XXXXXX") || exit 7; removed=0
   while IFS= read -r l || [ -n "$l" ]; do
     fp=$(printf '%s\n' "$l" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)
     if [ "$fp" = "$OLDFP" ]; then removed=$((removed+1)); continue; fi
-    printf '%s\n' "$l" >> "$TMP"
+    printf '%s\n' "$l" >> "$TMP" || { echo "write to $TMP failed: $f unchanged"; rm -f "$TMP"; exit 7; }
   done < "$f"
   if [ "$removed" -gt 0 ]; then
-    cp --preserve=mode,ownership "$f" "$f.bak-mirrorretire-$TS"
-    chmod 600 "$TMP"; chown root:root "$TMP"; mv "$TMP" "$f"
+    # Nothing is moved over a key file unless the copy holds every other line (re-review F2: a full disk).
+    want=$(( $(grep -c '' "$f") - removed )); got=$(grep -c '' "$TMP")
+    [ "$got" = "$want" ] || { echo "$TMP has $got lines, expected $want: $f unchanged"; rm -f "$TMP"; exit 7; }
+    cp --preserve=mode,ownership "$f" "$f.bak-mirrorretire-$TS" || { echo "backup of $f failed: unchanged"; rm -f "$TMP"; exit 7; }
+    { chmod 600 "$TMP" && chown root:root "$TMP" && mv "$TMP" "$f"; } || { echo "replacing $f failed: unchanged"; rm -f "$TMP"; exit 7; }
     echo "removed $removed line(s) with $OLDFP from $f (backup $f.bak-mirrorretire-$TS)"
   else rm -f "$TMP"; fi
   total=$((total+removed))
