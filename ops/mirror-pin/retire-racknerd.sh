@@ -1,39 +1,69 @@
 #!/bin/bash
-# I2 phase B, root on racknerd (through the root lane): remove phasewhip root's old UNRESTRICTED key from root's
-# authorized_keys, but only once the new restricted mirror key is present and has logged in since phase A.
-# Otherwise it changes nothing. Prints fingerprints only.
-set -euo pipefail
+# I2 phase B, root on racknerd (through the root lane): remove phasewhip root's old UNRESTRICTED key from every
+# authorized-keys file sshd reads for root. Only when, since phase A's stamp:
+#   - the new restricted key has logged in from phasewhip (an anchored sshd line, not just any text in the journal);
+#   - the mirror succeeded through it: dustforge-mirror-send logged both "ok dustforge-tar" and "ok rsync";
+#   - the old key has NOT logged in (nothing else still depends on it).
+# Otherwise it changes nothing and exits non-zero. It also exits non-zero if it removed nothing. Prints fingerprints.
+set -uo pipefail
 umask 077
 OLDFP=${MIRROR_PIN_OLDFP:-SHA256:RHV3C6w9XsqjIQ1LsPzHJh2cad6EDDy8ZUpOBW5W2E0}
 NEWKEY=${MIRROR_PIN_NEWKEY:-'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINNjghjs4+P5TciChPqbgO3Di64XX976VWSN8ZbfZm43 phasewhip-mirror-racknerd'}
 FROM=${MIRROR_PIN_FROM:-100.83.112.88}
+[[ "$NEWKEY" =~ ^ssh-ed25519\ [A-Za-z0-9+/]+={0,2}\ [a-z0-9-]+$ ]] || { echo "the new key is not one ed25519 key line: stop"; exit 1; }
+[[ "$FROM" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "from is not one IPv4 address: stop"; exit 1; }
+[[ "$OLDFP" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] || { echo "the old fingerprint is malformed: stop"; exit 1; }
 AK=/root/.ssh/authorized_keys
 DST=/usr/local/sbin/dustforge-mirror-send
+STAMP=/root/.ssh/mirrorpin-phase-a.stamp
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 NEWFP=$(printf '%s\n' "$NEWKEY" | ssh-keygen -lf - | awk '{print $2}')
 LINE="restrict,from=\"$FROM\",command=\"$DST\" $NEWKEY"
-grep -qxF "$LINE" "$AK" || { echo "the restricted line is not there (run install-racknerd.sh): nothing changed"; exit 3; }
-BAK=$(ls -1t "$AK".bak-mirrorpin-* 2>/dev/null | tail -1)
-[ -n "$BAK" ] || { echo "no phase-A backup found: nothing changed"; exit 3; }
-SINCE=$(stat -c %Y "$BAK")
-if ! journalctl -u ssh.service -u sshd.service --since "@$SINCE" --no-pager -o cat 2>/dev/null \
-     | grep -qE "Accepted publickey for root from $FROM port [0-9]+ ssh2: ED25519 $NEWFP"; then
-  echo "the new key ($NEWFP) has not logged in from $FROM since phase A: the old key stays; nothing changed"; exit 4
-fi
-echo "ok   the new key has logged in from $FROM since phase A"
-cp -a "$AK" "$AK.bak-mirrorretire-$TS"; echo "ok   backup $AK.bak-mirrorretire-$TS"
-TMP=$(mktemp "$AK.XXXXXX"); removed=0
-while IFS= read -r l || [ -n "$l" ]; do
-  fp=$(printf '%s\n' "$l" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)
-  if [ "$fp" = "$OLDFP" ]; then removed=$((removed+1)); continue; fi
-  printf '%s\n' "$l" >> "$TMP"
-done < "$AK"
-chmod 600 "$TMP"; mv "$TMP" "$AK"
-echo "removed $removed line(s) with $OLDFP"
+grep -qxF -- "$LINE" "$AK" || { echo "the restricted line is not there (run install-racknerd.sh): nothing changed"; exit 3; }
+[[ -f "$STAMP" && "$(cat "$STAMP")" =~ ^[0-9]+$ ]] || { echo "no phase-A stamp: nothing changed"; exit 3; }
+SINCE=$(cat "$STAMP")
+esc() { printf '%s' "$1" | sed 's/[.[\*^$()+?{}|/]/\\&/g'; }
+# Whole log messages from sshd itself (not journal text a client can shape), counted, never `grep -q` (review M1, M2).
+sshlog() { journalctl _COMM=sshd-session + _COMM=sshd --since "@$SINCE" --no-pager -o cat 2>/dev/null; }
+accepted() { sshlog | grep -cE "^Accepted publickey for root from $(esc "$1") port [0-9]+ ssh2: ED25519 $(esc "$2")\$" || true; }
+nnew=$(accepted "$FROM" "$NEWFP")
+nold=$(sshlog | grep -cE "^Accepted publickey for root from [0-9a-fA-F.:]+ port [0-9]+ ssh2: ED25519 $(esc "$OLDFP")\$" || true)
+ok() { journalctl -t dustforge-mirror-send _UID=0 --since "@$SINCE" --no-pager -o cat 2>/dev/null | grep -cxF "$1" || true; }
+ntar=$(journalctl -t dustforge-mirror-send _UID=0 --since "@$SINCE" --no-pager -o cat 2>/dev/null | grep -c '^ok dustforge-tar ' || true)
+nrs=$(ok "ok rsync git-bundles")
+echo "since phase A ($(date -u -d "@$SINCE" +%FT%TZ)): new-key logins $nnew, mirror tar ok $ntar, rsync ok $nrs, old-key logins $nold"
+if [ "$nnew" -lt 1 ] || [ "$ntar" -lt 1 ] || [ "$nrs" -lt 1 ]; then echo "the mirror has not yet run through the new key: the old key stays; nothing changed"; exit 4; fi
+if [ "$nold" -gt 0 ]; then echo "the old key still logs in: something else depends on it; the old key stays; nothing changed"; exit 5; fi
+# Every file sshd reads for root (review M4: Debian's default includes .ssh/authorized_keys2).
+mapfile -t FILES < <(sshd -T -C user=root,host=localhost,addr=127.0.0.1 2>/dev/null | awk '$1=="authorizedkeysfile"{for(i=2;i<=NF;i++) print $i}' \
+  | sed -e 's#%h#/root#g' -e 's#%u#root#g' -e 's#%%#%#g' | awk '{ if ($0 !~ "^/") print "/root/" $0; else print }')
+[ "${#FILES[@]}" -gt 0 ] || FILES=("$AK")
+total=0
+for f in "${FILES[@]}"; do
+  [ -f "$f" ] || continue
+  TMP=$(mktemp "$f.XXXXXX"); removed=0
+  while IFS= read -r l || [ -n "$l" ]; do
+    fp=$(printf '%s\n' "$l" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)
+    if [ "$fp" = "$OLDFP" ]; then removed=$((removed+1)); continue; fi
+    printf '%s\n' "$l" >> "$TMP"
+  done < "$f"
+  if [ "$removed" -gt 0 ]; then
+    cp --preserve=mode,ownership "$f" "$f.bak-mirrorretire-$TS"
+    chmod 600 "$TMP"; chown root:root "$TMP"; mv "$TMP" "$f"
+    echo "removed $removed line(s) with $OLDFP from $f (backup $f.bak-mirrorretire-$TS)"
+  else rm -f "$TMP"; fi
+  total=$((total+removed))
+done
 echo "== root's authorized keys now (fingerprint | comment | restricted?)"
-while IFS= read -r l; do
-  [ -n "$l" ] || continue; case "$l" in \#*) continue;; esac
-  fp=$(printf '%s\n' "$l" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
-  case "$l" in restrict,*|command=*|from=*) r=restricted;; *) r=UNRESTRICTED;; esac
-  echo "${fp:-unparsed} | ${l##* } | $r"
-done < "$AK"
+for f in "${FILES[@]}"; do
+  [ -f "$f" ] || continue; echo "-- $f"
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue; case "$l" in \#*) continue;; esac
+    fp=$(printf '%s\n' "$l" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)
+    opts=${l%%ssh-*}
+    case "$opts" in *restrict*command=*|*command=*restrict*) r=restricted;; *) r=UNRESTRICTED;; esac
+    echo "${fp:-unparsed} | ${l##* } | $r"
+  done < "$f"
+done
+[ "$total" -gt 0 ] || { echo "the old key was on no line: nothing removed"; exit 6; }
+echo "I2 racknerd half: the unrestricted phasewhip key is gone"
