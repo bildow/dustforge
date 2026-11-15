@@ -769,43 +769,93 @@ function operatorGrantAllowed(did, opts = {}) {
   return env.includes(did);
 }
 
-function runOwnerRefills(db, billing, { now = Date.now(), grantDids } = {}) {
+function runOwnerRefills(db, billing, { now = Date.now(), grantDids, notices = null, mailer = null } = {}) {
   const due = db.prepare("SELECT * FROM wallet_refill_rules WHERE enabled = 1 AND amount_cents > 0 AND next_run_at IS NOT NULL AND next_run_at <= ?")
     .all(new Date(now).toISOString());
   const out = [];
   for (const rule of due) {
     let result;
-    if (rule.funding === 'operator_grant') {
-      if (!operatorGrantAllowed(rule.did, { grantDids })) {
-        result = { ok: false, error: 'operator grant not permitted for this wallet (OPERATOR_GRANT_DIDS)' };
-      } else {
-        const key = `auto_refill_${rule.id}_${rule.next_run_at}`;
-        // Clamped at run time too: a rule saved before the cap (#83) never credits more than OWNER_REFILL_MAX a run.
-        result = billing.creditBalance(db, rule.did, Math.min(rule.amount_cents, OWNER_REFILL_MAX), 'auto_refill_grant', `Scheduled ${rule.cadence} refill (operator grant)`, key);
-      }
-    } else {
-      result = { ok: false, error: 'stripe-funded auto refill is not available yet' };
-    }
+    const amt = Math.min(rule.amount_cents, OWNER_REFILL_MAX);
     const next = nextRunAfter(rule.cadence, rule.next_run_at, now);
+    if (rule.funding === 'stripe') {
+      // Stub (Aaron 2026-11-15): no card is stored, so a card-funded refill cannot charge by itself. When it is due it
+      // asks the owner for a deposit of the rule's amount (a notice with a Deposit button) and the schedule moves on;
+      // the deposit, when made, is the refill.
+      const asked = notices ? notices.raise(db, rule.did, { kind: 'deposit_due', key: `owner_rule:${rule.id}:due:${rule.next_run_at}`,
+        title: `Your ${rule.cadence} refill of ${amt} DD is due`,
+        text: `Your ${rule.cadence} refill of ${amt} DD is paid by card. No card is stored, so it waits for you: deposit ${amt} DD to make it.`,
+        data: { deposit: { amount_dd: amt, to_did: rule.did, why: 'scheduled refill' } } }, { now, mailer }) : null;
+      db.prepare("UPDATE wallet_refill_rules SET last_run_at = ?, next_run_at = ?, last_error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .run(new Date(now).toISOString(), next, rule.id);
+      out.push({ did: rule.did, ok: false, deposit_requested: true, noticed: Boolean(asked), next_run_at: next });
+      continue;
+    }
+    if (!operatorGrantAllowed(rule.did, { grantDids })) {
+      result = { ok: false, error: 'operator grant not permitted for this wallet (OPERATOR_GRANT_DIDS)' };
+    } else {
+      const key = `auto_refill_${rule.id}_${rule.next_run_at}`;
+      // Clamped at run time too: a rule saved before the cap (#83) never credits more than OWNER_REFILL_MAX a run.
+      result = billing.creditBalance(db, rule.did, amt, 'auto_refill_grant', `Scheduled ${rule.cadence} refill (operator grant)`, key);
+    }
+    let noticed = false;
     if (result.ok) {
       db.prepare("UPDATE wallet_refill_rules SET last_run_at = ?, next_run_at = ?, last_error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .run(new Date(now).toISOString(), next, rule.id);
+      if (notices) notices.clear(db, rule.did, `owner_rule:${rule.id}:fail`, 'refill ran', { now });
     } else {
-      // Keep the rule due but record why; retried every scheduler pass until fixed.
+      // Keep the rule due but record why; retried every scheduler pass until fixed. The owner hears once (Aaron
+      // 2026-11-15: a refill that fails says so, and that the wallet needs a deposit).
       db.prepare("UPDATE wallet_refill_rules SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(String(result.error).slice(0, 200), rule.id);
+      if (notices) {
+        const bal = billing.getDerivedBalance(db, rule.did);
+        noticed = Boolean(notices.raise(db, rule.did, { kind: 'refill_failed', key: `owner_rule:${rule.id}:fail`,
+          title: `Your ${rule.cadence} refill failed`,
+          text: `Your ${rule.cadence} refill of ${amt} DD did not run: ${result.error}. Your wallet holds ${bal} DD. Deposit DD to keep it funded, or change the rule.`,
+          data: { deposit: { amount_dd: amt, to_did: rule.did, why: 'refill failed' } } }, { now, mailer }));
+      }
     }
-    out.push({ did: rule.did, ...result, next_run_at: result.ok ? next : rule.next_run_at });
+    out.push({ did: rule.did, ...result, ...(noticed ? { noticed } : {}), next_run_at: result.ok ? next : rule.next_run_at });
   }
   return out;
 }
 
-function runSiliconRefills(db, billing, { now = Date.now(), ledger = null, mailer = null } = {}) {
+function runSiliconRefills(db, billing, { now = Date.now(), ledger = null, mailer = null, notices = null } = {}) {
   const rows = db.prepare("SELECT * FROM fleet_silicons WHERE refill_enabled = 1 AND status = 'active' AND refill_threshold_cents > 0 AND refill_amount_cents > 0").all();
   return rows.map(s => {
     const r = thresholdRefill(db, billing, s, { now, ledger });
     const alerted = (r.skipped === 'daily cap reached' || (!r.ok && r.error)) ? refillAlert(db, billing, s, r, { now, mailer }) : false;
-    return { handle: s.handle, did: s.member_did, ...r, ...(alerted ? { alerted: s.refill_alert_email } : {}) };
+    const noticed = notices ? siliconRefillNotice(db, billing, notices, s, r, { now, mailer }) : false;
+    return { handle: s.handle, did: s.member_did, ...r, ...(alerted ? { alerted: s.refill_alert_email } : {}), ...(noticed ? { noticed } : {}) };
   });
+}
+
+// The fleet owner hears when an agent's auto-refill cannot run (Aaron 2026-11-15): once per failure while it lasts,
+// with how much the paying wallet is short when that is the reason. A refill that runs, or an agent back above its
+// threshold, closes it.
+function siliconRefillNotice(db, billing, notices, s, r, { now = Date.now(), mailer = null } = {}) {
+  const f = db.prepare('SELECT owner_did, wallet_did, slug FROM fleets WHERE id = ?').get(s.fleet_id);
+  if (!f || !f.owner_did) return false;
+  const prefix = `silicon:${s.id}:`;
+  if (r.ok || r.skipped === 'above threshold') { notices.clear(db, f.owner_did, prefix, r.ok ? 'refill ran' : 'above threshold', { now }); return false; }
+  const bal = billing.getDerivedBalance(db, s.member_did);
+  if (r.skipped === 'daily cap reached') {
+    return Boolean(notices.raise(db, f.owner_did, { kind: 'refill_capped', key: prefix + 'cap',
+      title: `@${s.handle} hit its daily refill cap`,
+      text: `@${s.handle} has ${bal} DD, below its refill threshold of ${s.refill_threshold_cents} DD, and its automatic refills already moved ${s.refill_daily_cap_cents} DD in the last 24 hours. Refill it by hand from the Fleet tab, or raise the cap.` }, { now, mailer }));
+  }
+  if (r.ok || !r.error) return false;
+  const from = r.from_did || refillSourceDid(db, s);
+  const fromBal = from ? billing.getDerivedBalance(db, from) : 0;
+  const amt = Number(s.refill_amount_cents) || 0;
+  const short = from && fromBal < amt;
+  const payer = from === f.owner_did ? 'your wallet' : (from && from === f.wallet_did ? `the ${f.slug} fleet wallet` : 'its refill source');
+  const text = short
+    ? `@${s.handle}'s auto-refill of ${amt} DD failed: ${payer} holds ${fromBal} DD. @${s.handle} has ${bal} DD and its calls stop at 0. Deposit at least ${amt - fromBal} DD${from === f.owner_did ? '' : ` and move it to ${payer}`} to resume refills.`
+    : `@${s.handle}'s auto-refill of ${amt} DD failed: ${r.error}. @${s.handle} has ${bal} DD.`;
+  return Boolean(notices.raise(db, f.owner_did, { kind: 'refill_failed', key: prefix + 'fail',
+    title: short ? `Refill of @${s.handle} failed: deposit needed` : `Refill of @${s.handle} failed`,
+    text,
+    data: short ? { deposit: { amount_dd: amt - fromBal, to_did: f.owner_did, why: `refill of @${s.handle}` } } : {} }, { now, mailer }));
 }
 
 // A silicon below its threshold whose refill can't run: tell refill_alert_email, once per 24 h.
@@ -863,8 +913,8 @@ function runTokenWarnings(db, { now = Date.now(), mailer = null } = {}) {
 function runRefills(db, billing, opts = {}) {
   const now = opts.now || Date.now();
   return {
-    owner: runOwnerRefills(db, billing, { now, grantDids: opts.grantDids }),
-    silicons: runSiliconRefills(db, billing, { now, ledger: opts.ledger, mailer: opts.mailer }),
+    owner: runOwnerRefills(db, billing, { now, grantDids: opts.grantDids, notices: opts.notices, mailer: opts.mailer }),
+    silicons: runSiliconRefills(db, billing, { now, ledger: opts.ledger, mailer: opts.mailer, notices: opts.notices }),
     token_warnings: runTokenWarnings(db, { now, mailer: opts.mailer }),
     work_links_expired: expireWorkLinks(db, { now }),
   };
@@ -1235,7 +1285,7 @@ module.exports = {
   initSchema, siliconId, currentTick, parseAttribution, findProjectForCaller, resolvePayer, chargeAttributed,
   getSilicon, upsertSilicon, updateSiliconSettings, siliconView, tokenStatus, latestToken, awaitingPickup, deliveryKeyFingerprint, deliveryKeyView, setAskRevokedCheck,
   thresholdRefill, maybeThresholdRefill, autoRefilledLast24h, agentFleetOwner, answerTopups, fromItsFleet, transferRefill, projectWalletOwned, removeProject, setOwnerRefillRule, getOwnerRefillRule, nextRunAfter,
-  runOwnerRefills, runSiliconRefills, runTokenWarnings, runRefills,
+  runOwnerRefills, runSiliconRefills, siliconRefillNotice, runTokenWarnings, runRefills,
   attributionReport, recentSpend,
   createWorkLink, acceptWorkLink, declineWorkLink, revokeWorkLink, validateWorkLink, expireWorkLinks, listWorkLinks, resolveSiliconId,
   issueClaim, redeemClaim, claimEmail, hashToken,

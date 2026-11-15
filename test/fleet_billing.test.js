@@ -155,10 +155,11 @@ test('owner weekly refill: operator grant with idempotency, schedule advance, pe
   db.prepare("UPDATE wallet_refill_rules SET next_run_at = '2026-10-01T00:00:00.000Z' WHERE did = ?").run(OWNER);
   const dup = fb.runOwnerRefills(db, billing, { now: t, grantDids: [OWNER] });
   assert.equal(dup[0].credited, 0); assert.equal(bal(db, OWNER), 1000);
-  // stripe funding is explicit about not existing yet
+  // card funding (stub, 2026-11-15): nothing is charged or credited; the run asks for a deposit and the schedule moves on
   fb.setOwnerRefillRule(db, OTHER, { cadence: 'weekly', amount_cents: 500, funding: 'stripe', enabled: true, next_run_at: '2026-10-01T00:00:00.000Z' });
   const st = fb.runOwnerRefills(db, billing, { now: t, grantDids: [OTHER] });
-  assert.match(st[0].error, /stripe/);
+  assert.equal(st[0].ok, false); assert.equal(st[0].deposit_requested, true); assert.equal(bal(db, OTHER), 0);
+  assert.equal(fb.getOwnerRefillRule(db, OTHER).next_run_at, '2026-10-08T00:00:00.000Z');
 });
 
 test('nextRunAfter skips forward past now', () => {
@@ -448,4 +449,100 @@ test('owner refill: legacy rule above the cap is clamped at start and at run tim
   assert.equal(billing.getDerivedBalance(db, 'did:key:big'), fb.OWNER_REFILL_MAX);
   fb.initSchema(db);
   assert.equal(db.prepare("SELECT amount_cents FROM wallet_refill_rules WHERE did = 'did:key:big'").get().amount_cents, fb.OWNER_REFILL_MAX);
+});
+
+// ── Wallet notices (Aaron 2026-11-15): a refill that cannot run tells the wallet that pays, once, with what it needs ──
+const notices = require('../wallet_notices');
+function mailbox() { const sent = []; const mailer = (m) => { sent.push(m); return Promise.resolve(true); }; return { sent, mailer }; }
+
+test('silicon refill fails because the owner is short: one notice + one mail to the owner, with the deposit needed; a refill that runs closes it', () => {
+  const db = mkdb(); notices.init(db);
+  db.prepare("UPDATE identity_wallets SET recovery_email = 'aaron-recovery@dustforge.com' WHERE did = ?").run(OWNER);
+  fund(db, OWNER, 100); fund(db, BRAIN, 10);
+  fb.upsertSilicon(db, { fleetId: 1, memberDid: BRAIN, handle: 'brain', displayName: 'Brain', refill: { enabled: true, threshold_cents: 50, amount_cents: 500 } });
+  const { sent, mailer } = mailbox();
+  const t = Date.parse('2026-11-15T12:00:00Z');
+  const r1 = fb.runSiliconRefills(db, billing, { now: t, mailer, notices });
+  assert.equal(r1[0].ok, false); assert.match(r1[0].error, /insufficient/); assert.equal(r1[0].noticed, true);
+  const open = notices.list(db, OWNER, { now: t });
+  assert.equal(open.length, 1);
+  assert.equal(open[0].kind, 'refill_failed');
+  assert.match(open[0].title, /Refill of @brain failed: deposit needed/);
+  assert.match(open[0].text, /your wallet holds 100 DD/);
+  assert.deepEqual(open[0].deposit, { amount_dd: 400, to_did: OWNER, why: 'refill of @brain' });
+  assert.deepEqual(sent.map(m => m.to).sort(), ['aaron-recovery@dustforge.com', 'aaron@dustforge.com']);
+  assert.match(sent[0].subject, /deposit needed/);
+  // the next passes (every 5 min) do not repeat it
+  const r2 = fb.runSiliconRefills(db, billing, { now: t + 5 * 60000, mailer, notices });
+  assert.equal(r2[0].noticed, undefined); assert.equal(sent.length, 2); assert.equal(notices.list(db, OWNER, { now: t }).length, 1);
+  // the agent is not notified about its owner's wallet
+  assert.equal(notices.list(db, BRAIN, { now: t }).length, 0);
+  // a deposit lands; the next pass refills and closes the notice
+  fund(db, OWNER, 1000);
+  const r3 = fb.runSiliconRefills(db, billing, { now: t + 20 * 60000, mailer, notices });
+  assert.equal(r3[0].ok, true); assert.equal(bal(db, BRAIN), 510);
+  assert.equal(notices.list(db, OWNER, { now: t }).length, 0);
+  assert.equal(db.prepare('SELECT closed_why FROM wallet_notices').get().closed_why, 'refill ran');
+});
+
+test('silicon refill from the fleet wallet: the owner is told the fleet wallet is short; the daily cap is its own notice, no deposit', () => {
+  const db = mkdb(); notices.init(db);
+  db.prepare("INSERT INTO identity_wallets (did, username, email) VALUES ('did:key:fleetw', 'fleetw', 'fleetw@dustforge.com')").run();
+  db.prepare("UPDATE fleets SET wallet_did = 'did:key:fleetw' WHERE id = 1").run();
+  fund(db, OWNER, 5000); fund(db, BRAIN, 10);
+  const s = fb.upsertSilicon(db, { fleetId: 1, memberDid: BRAIN, handle: 'brain', displayName: 'Brain', refill: { enabled: true, threshold_cents: 50, amount_cents: 500 } });
+  fb.updateSiliconSettings(db, s, { refill_source: 'fleet' });
+  const t = Date.parse('2026-11-15T12:00:00Z');
+  fb.runSiliconRefills(db, billing, { now: t, notices });
+  const n = notices.list(db, OWNER, { now: t })[0];
+  assert.match(n.text, /the aaron-agents fleet wallet holds 0 DD/);
+  assert.match(n.text, /move it to the aaron-agents fleet wallet/);
+  // cap: back to the owner's wallet, cap 100 already spent
+  const db2 = mkdb(); notices.init(db2);
+  fund(db2, OWNER, 5000); fund(db2, BRAIN, 10);
+  const s2 = fb.upsertSilicon(db2, { fleetId: 1, memberDid: BRAIN, handle: 'brain', displayName: 'Brain', refill: { enabled: true, threshold_cents: 50, amount_cents: 100 } });
+  fb.updateSiliconSettings(db2, s2, { refill_daily_cap_cents: 100 });
+  const t2 = Date.now();   // last_refill_at and the cap window are stamped with the real clock
+  fb.runSiliconRefills(db2, billing, { now: t2, notices });                        // refills 100 (cap used up)
+  billing.deductBalance(db2, BRAIN, 100, 'api_call_compute', 'burn');
+  fb.runSiliconRefills(db2, billing, { now: t2 + 20 * 60000, notices });
+  const capped = notices.list(db2, OWNER, { now: t2 });
+  assert.equal(capped.length, 1); assert.equal(capped[0].kind, 'refill_capped'); assert.equal(capped[0].deposit, undefined);
+});
+
+test('owner rule: a failed refill notices the owner once with a deposit; a card-funded rule asks for a deposit each run', () => {
+  const db = mkdb(); notices.init(db);
+  const { sent, mailer } = mailbox();
+  fb.setOwnerRefillRule(db, OTHER, { cadence: 'weekly', amount_cents: 700, enabled: true, next_run_at: '2026-10-01T00:00:00.000Z' });
+  const t = Date.parse('2026-10-03T12:00:00Z');
+  const r = fb.runOwnerRefills(db, billing, { now: t, grantDids: [], notices, mailer });
+  assert.equal(r[0].noticed, true);
+  const n = notices.list(db, OTHER, { now: t });
+  assert.equal(n.length, 1); assert.match(n[0].title, /weekly refill failed/); assert.match(n[0].text, /not permitted/);
+  assert.equal(n[0].deposit.amount_dd, 700);
+  fb.runOwnerRefills(db, billing, { now: t + 300000, grantDids: [], notices, mailer });
+  assert.equal(notices.list(db, OTHER, { now: t }).length, 1); assert.equal(sent.length, 1, 'one mail, not one per pass');
+  // granted now: the refill runs and the notice closes
+  fb.runOwnerRefills(db, billing, { now: t + 600000, grantDids: [OTHER], notices, mailer });
+  assert.equal(notices.list(db, OTHER, { now: t }).length, 0);
+  // card funding: a deposit_due notice per due run, nothing credited
+  fb.setOwnerRefillRule(db, OWNER, { cadence: 'weekly', amount_cents: 300, funding: 'stripe', enabled: true, next_run_at: '2026-10-01T00:00:00.000Z' });
+  const c = fb.runOwnerRefills(db, billing, { now: t, notices, mailer });
+  assert.equal(c.find(x => x.did === OWNER).deposit_requested, true);
+  const due = notices.list(db, OWNER, { now: t });
+  assert.equal(due[0].kind, 'deposit_due'); assert.equal(due[0].deposit.amount_dd, 300); assert.equal(bal(db, OWNER), 0);
+});
+
+test('notices: dismiss only your own; list hides closed and stale ones', () => {
+  const db = mkdb(); notices.init(db);
+  const t = Date.parse('2026-11-15T12:00:00Z');
+  const a = notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:1', title: 't', text: 'x' }, { now: t });
+  assert.ok(a); assert.equal(notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:1', title: 't', text: 'x' }, { now: t }), null);
+  assert.equal(notices.raise(db, OWNER, { kind: 'nope', key: 'x:2', title: 't', text: 'x' }, { now: t }), null, 'unknown kind');
+  assert.equal(notices.dismiss(db, BRAIN, a.id, { now: t }), false);
+  assert.equal(notices.dismiss(db, OWNER, a.id, { now: t }), true);
+  assert.equal(notices.list(db, OWNER, { now: t }).length, 0);
+  notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:3', title: 't', text: 'x' }, { now: t });
+  assert.equal(notices.list(db, OWNER, { now: t + 8 * 86400000 }).length, 0, 'older than 7 days is not shown');
+  assert.ok(notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:3', title: 't', text: 'x' }, { now: t + 8 * 86400000 }), 'and may be raised again');
 });

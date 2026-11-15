@@ -209,12 +209,15 @@
   <div id="scan-requests"></div>
   <div id="agent-token-requests"></div>
   <div id="approval-requests"></div>
+  <!-- Wallet notices: a refill that failed, a deposit due (wallet_notices.js) -->
+  <div id="wallet-notices"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
   <div id="page-vault" class="page active">
     <div class="balance-hero">
       <div class="balance-amount" id="bal">--</div>
       <div class="balance-label">Diamond Dust</div>
+      <button class="btn-ghost" id="deposit-open" onclick="openDeposit()" style="margin-top:0.5rem;font-size:0.75rem;padding:0.3rem 0.8rem">+ Deposit DD</button>
     </div>
     <!-- Health summary strip -->
     <div style="display:flex;justify-content:center;gap:1rem;padding:0.5rem 1rem;font-size:0.75rem">
@@ -619,6 +622,18 @@
     <div id="proj-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" id="proj-fund" onclick="fundOpenProject()">Add DD</button></div>
     <button class="btn-ghost" id="proj-remove" onclick="removeOpenProject()" style="width:100%;margin-top:0.75rem;color:var(--red);border-color:var(--red)">Remove this project</button>
+  </div>
+</div>
+
+<!-- Deposit DD by card (Stripe Checkout; behind the server's DEPOSITS switch) -->
+<div id="modal-deposit" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Deposit DD</h3>
+    <div id="deposit-why" style="font-size:0.78rem;color:var(--text2);margin-bottom:0.5rem"></div>
+    <div id="deposit-amounts" style="display:flex;gap:0.4rem;flex-wrap:wrap"></div>
+    <div id="deposit-note" style="font-size:0.72rem;color:var(--text3);margin-top:0.5rem"></div>
+    <div id="deposit-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" id="deposit-go" onclick="startDeposit()">Pay by card</button></div>
   </div>
 </div>
 
@@ -1079,6 +1094,8 @@ async function loadFleet(){
       h+='<input type="checkbox" id="own-refill-enabled" '+(rule&&rule.enabled?'checked':'')+' style="width:auto;margin:0"> <span>every</span>';
       h+='<select id="own-refill-cadence" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.75rem;margin:0">'+['daily','weekly','monthly'].map(c=>'<option value="'+c+'"'+((rule?rule.cadence:'weekly')===c?' selected':'')+'>'+c+'</option>').join('')+'</select>';
       h+='<span>add</span><input type="number" id="own-refill-amount" value="'+(rule?rule.amount_cents:1000)+'" min="0" style="width:5.5rem;margin:0;padding:0.3rem"><span>DD</span>';
+      // Card: no card is stored, so when it is due the app asks for a deposit (stub, wallet_notices deposit_due).
+      h+='<select id="own-refill-funding" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.72rem;margin:0"><option value="operator_grant"'+((rule?rule.funding:'operator_grant')==='operator_grant'?' selected':'')+'>operator grant</option><option value="stripe"'+(rule&&rule.funding==='stripe'?' selected':'')+'>by card (asks me to deposit)</option></select>';
       h+='<button class="btn-primary" onclick="saveOwnerRefill()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Save</button></div>';
       h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.35rem">'+(rule&&rule.enabled?('next: '+new Date(rule.next_run_at).toLocaleString()+(rule.last_error?' · <span style="color:var(--red)">'+esc(rule.last_error)+'</span>':'')):'off')+' · funding: operator grant</div>';
       h+='</div>';
@@ -1168,7 +1185,7 @@ function workLinkRow(l,tick){
 // says so; once approved (Requests, above), Save again carries the approval and applies it.
 var ownRefillApproval=null;
 async function saveOwnerRefill(){
-  const body={cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:'operator_grant'};
+  const body={cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:(document.getElementById('own-refill-funding')||{}).value||'operator_grant'};
   if(ownRefillApproval&&ownRefillApproval.key===JSON.stringify(body)) body.approval_id=ownRefillApproval.id;
   try{
     const r=await api('PUT','/api/fleet/'+encodeURIComponent(fleetSlug)+'/owner-refill',body);
@@ -1547,7 +1564,7 @@ async function showApp(){
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
-  loadFillRequests(); loadShares(); loadApprovals();
+  loadFillRequests(); loadShares(); loadApprovals(); loadWalletNotices();
   loadNetwork();
   // Item 9: a waiting change to the wallet shows in Settings; opened from the alert notification, go there.
   if(location.hash==='#holds'){ goPage('settings'); loadDevices(); loadHolds(); } else loadHolds();
@@ -3245,9 +3262,51 @@ async function letPhoneIn(id){
   }catch(e){ if(!/cancelled/.test(e.message)) alert(e.message+(e.status===404?' (only a phone linked for 48 hours or more can let a new one in)':'')); }
   loadHolds(); loadDevices();
 }
+// Wallet notices (wallet_notices.js): a refill that failed, a deposit due. Cards on the vault home, with Deposit when
+// the wallet is short and Dismiss. The phone's alerts poll notifies about the same notices.
+function walletNoticeCards(ns){
+  return (ns||[]).filter(n=>n&&n.notice_id&&n.kind!=='forward').map(n=>'<div class="fill-req" style="border-color:var(--orange)"><div><b>'+esc(n.title)+'</b></div>'
+    +'<div style="font-size:0.75rem">'+esc(n.text)+'</div>'
+    +'<div style="color:var(--text3);font-size:0.72rem">'+esc(fmtWhen(n.since))+'</div>'
+    +'<div class="fr-row">'+(n.deposit?'<button class="btn-primary" onclick="openDeposit('+esc(JSON.stringify(n.deposit))+')">Deposit</button> ':'')
+    +'<button class="btn-ghost" onclick="dismissNotice('+Number(n.notice_id)+')">Dismiss</button></div></div>').join('');
+}
+async function loadWalletNotices(){
+  if(lockState.locked) return;
+  const el=document.getElementById('wallet-notices'); if(!el||!tk) return;
+  try{ const r=await api('GET','/api/billing/notices'); el.innerHTML=walletNoticeCards(r.notices); }catch(e){ if(!sessionEnded(e)) el.innerHTML=''; }
+}
+async function dismissNotice(id){ try{ await api('POST','/api/billing/notices/'+Number(id)+'/dismiss'); }catch(e){ if(!sessionEnded(e)) alert(e.message); } loadWalletNotices(); }
+
+// Deposit DD by card: the amounts and whether deposits are on come from GET /api/billing/deposit; Pay opens Stripe
+// Checkout. A test-mode server says so: the checkout works and credits no DD.
+let depositCfg=null, depositPick=null;
+async function openDeposit(hint){
+  const m=document.getElementById('deposit-msg'); m.textContent=''; m.className='modal-msg';
+  document.getElementById('deposit-why').textContent=hint&&hint.amount_dd?('Needed: '+dd(hint.amount_dd)+' DD'+(hint.why?' ('+hint.why+')':'')+'.'):'';
+  openModal('deposit');
+  try{ depositCfg=await api('GET','/api/billing/deposit'); }catch(e){ depositCfg=null; m.className='modal-msg err'; m.textContent=e.message; return; }
+  const per=Number(depositCfg.dd_per_usd)||0, amts=depositCfg.amounts_usd_cents||[];
+  // Preselect the smallest amount that covers what is needed.
+  depositPick=amts.find(c=>hint&&hint.amount_dd&&c/100*per>=hint.amount_dd)||amts[0]||null;
+  document.getElementById('deposit-amounts').innerHTML=amts.map(c=>'<button class="'+(c===depositPick?'btn-primary':'btn-ghost')+'" style="font-size:0.75rem" onclick="pickDeposit('+Number(c)+')">$'+(c/100)+' · '+dd(c/100*per)+' DD</button>').join('');
+  const note=document.getElementById('deposit-note'), go=document.getElementById('deposit-go');
+  go.disabled=!depositCfg.enabled;
+  note.textContent=depositCfg.enabled?(depositCfg.credits_dd?'Paid by card through Stripe. The DD lands when the payment completes.':'Test mode: Stripe test cards work, and no DD is credited.'):(depositCfg.reason||'Card deposits are not on yet.')+' Until then, ask whoever runs your fleet to send DD.';
+}
+function pickDeposit(c){ depositPick=c; for(const b of document.getElementById('deposit-amounts').children) b.className=b.textContent.startsWith('$'+(c/100)+' ')?'btn-primary':'btn-ghost'; }
+async function startDeposit(){
+  const m=document.getElementById('deposit-msg');
+  if(!depositCfg||!depositCfg.enabled||!depositPick) return;
+  try{
+    const r=await api('POST','/api/billing/deposit',{amount_usd_cents:depositPick});
+    if(r&&r.url){ m.className='modal-msg ok'; m.textContent='Opening Stripe…'; window.open(r.url,'_blank'); }
+  }catch(e){ m.className='modal-msg err'; m.textContent=e.message; }
+}
+
 // Item 6b: a mail forwarding rule turned on in the last 48 hours (codes and reset links do not go through it meanwhile).
 function noticeCards(ns){
-  return (ns||[]).map(n=>'<div class="fill-req" style="border-color:var(--orange)"><div><b>Mail forwarding turned on</b></div>'
+  return (ns||[]).filter(n=>n&&n.kind==='forward').map(n=>'<div class="fill-req" style="border-color:var(--orange)"><div><b>Mail forwarding turned on</b></div>'
     +'<div style="font-size:0.75rem">Your DemiPass mail is copied to '+esc(n.forward_to||'')+(n.filter_from&&n.filter_from!=='*'?' (mail from '+esc(n.filter_from)+')':'')+' since '+esc(fmtWhen(n.since))+'.</div>'
     +'<div style="color:var(--text3);font-size:0.75rem">Not you? Sign in and remove it in the Dustforge tab, then rotate your password. For 48 hours no sign-in code or reset link goes through it.</div></div>').join('');
 }
@@ -3267,7 +3326,7 @@ async function loadHolds(){
   const wrap=document.getElementById('holds-wrap'), el=document.getElementById('holds'); if(!wrap||!el||!tk) return;
   try{
     const r=await api('GET','/api/identity/holds');
-    const hs=r.holds||[], ns=r.notices||[]; wrap.style.display=(hs.length||ns.length)?'block':'none'; el.innerHTML=holdCards(hs)+noticeCards(ns);
+    const hs=r.holds||[], ns=(r.notices||[]).filter(n=>n&&n.kind==='forward'); wrap.style.display=(hs.length||ns.length)?'block':'none'; el.innerHTML=holdCards(hs)+noticeCards(ns);
     if(hs.length&&location.hash==='#holds') wrap.scrollIntoView({behavior:'smooth'});
   }catch(e){ if(!sessionEnded(e)){ wrap.style.display='none'; } }
 }
@@ -3464,7 +3523,7 @@ async function unlockTry(usePin){
     if(!ok) ok=await unlockWithPin('Unlock DemiPass','unlock:0');
     if(!ok){ m.textContent='Still locked.'; return; }
     lockState.locked=false; document.getElementById('lock-screen').style.display='none'; document.getElementById('app').style.display='block';
-    noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadNetwork();
+    noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadWalletNotices(); loadNetwork();
     loadHolds(); if(location.hash==='#holds') loadDevices();   // opened from an alert: what it was about, once unlocked
   }catch(e){ if(!sessionEnded(e)) m.textContent=e.message; }
 }
@@ -3988,7 +4047,7 @@ document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.vis
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
 let pollN=0;
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0){loadShares();loadScanRequests();loadAgentTokenRequests();}}},4000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0){loadShares();loadScanRequests();loadAgentTokenRequests();}if(pollN%15===0)loadWalletNotices();}},4000);
 
 // ── Pair in person (QR): a contact confirmed face to face; only these can be shared with (red team item 6) ──────
 // One side shows a QR, the other scans it in this app. Only the shower's screen gets the 6-digit code; the scanner
