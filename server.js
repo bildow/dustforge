@@ -312,11 +312,16 @@ const rateIdentity = (req) => {
 };
 // A limiter keyed by wallet when signed in, by address otherwise. Each limiter has its own store, so the budgets of the
 // route groups stay separate, as before.
-const rateLimitByWallet = (max, error, windowMs = 15*60*1000, which = 'wallet') => rateLimit({ windowMs, max,
+// `tag` names the limiter in its 429, so the app offers its owner's reset only for the limits that reset clears.
+const rateLimitByWallet = (max, error, windowMs = 15*60*1000, which = 'wallet', tag = null) => rateLimit({ windowMs, max,
   keyGenerator: (req) => { const w = rateIdentity(req); return w ? 'wallet:' + w[which] : 'ip:' + rateIpKey(req); },
-  handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: `${error} (${rateIdentity(req) ? 'this wallet' : 'this address, not signed in'}: per ${windowMs >= 3600000 ? windowMs / 3600000 + ' hour' : windowMs / 60000 + ' minutes'})` }) });
+  handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: `${error} (${rateIdentity(req) ? 'this wallet' : 'this address, not signed in'}: per ${windowMs >= 3600000 ? windowMs / 3600000 + ' hour' : windowMs / 60000 + ' minutes'})`, ...(tag ? { limiter: tag } : {}) }) });
 const rateLimitStrict = rateLimitByWallet(Number(process.env.RATE_STRICT_MAX) || 50, 'Too many requests');   // maxima lowered only by tests
-const rateLimitStandard = rateLimitByWallet(Number(process.env.RATE_STANDARD_MAX) || 500, 'Rate limit exceeded');
+const rateLimitStandard = rateLimitByWallet(Number(process.env.RATE_STANDARD_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'wallet', 'standard');
+// Password sign-in: by address only, whatever Bearer token rides along (a token used to put the guesses on the caller's
+// own wallet budget, which its owner can reset), and never reset (rate-reset review M1). Not signed in by definition.
+const rateLimitLogin = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.RATE_LOGIN_MAX) || 500, keyGenerator: (req) => 'login:' + rateIpKey(req),
+  message: { error: 'Too many sign-in attempts (this address: per 15 minutes)' } });
 // /request-token and /use: their own budget (both maxima can be lowered for tests).
 const rateLimitUseWallet = rateLimitByWallet(Number(process.env.USE_RATE_LIMIT_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'use');
 // …and a total for the whole wallet behind those per-agent budgets: workers are free to make, so without it one wallet
@@ -328,7 +333,18 @@ const rateLimitUseWalletTotal = rateLimitByWallet(Number(process.env.USE_RATE_WA
 const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_IP_CEILING) || 5000,
   skip: (req) => Boolean(rateIdentity(req)), keyGenerator: rateIpKey, message: { error: 'Rate limit exceeded (this address, not signed in: per 15 minutes)' } });
 // Browser fill polls (the wallet every 4 s, a waiting fill every 2 s): its own budget, so polling never starves /use.
-const rateLimitFill = rateLimitByWallet(3000, 'Rate limit exceeded');
+const rateLimitFill = rateLimitByWallet(3000, 'Rate limit exceeded', 15*60*1000, 'wallet', 'fill');
+// The way back in must not share the budget it would restore: verifying the PIN, reading the gate status and refreshing
+// a session each have their own budget, so a wallet that used up rateLimitStandard can still prove its PIN and reset it
+// (and a 429 on refresh no longer forces a fresh sign-in). Wrong PINs stay bounded by the PIN lockout itself.
+// Keyed per agent ('use': a silicon or worker has its own bucket), so an agent's junk can't lock the owner out of their
+// own PIN (rate-reset review M2). An agent's device sign-in shares the owner's sub and so the owner's bucket.
+const rateLimitGate = rateLimitByWallet(Number(process.env.RATE_GATE_MAX) || 300, 'Too many verification requests', 15*60*1000, 'use');
+const rateLimitRefresh = rateLimitByWallet(Number(process.env.RATE_REFRESH_MAX) || 500, 'Too many session refreshes');
+// The owner's reset of their own wallet's limits (POST /api/identity/rate-limit/reset): a person's act behind a fresh
+// PIN, and itself capped so it can't turn the limits off.
+// Each reset is two calls from the app (the 403 asking for the PIN, then the retry), so 10 is about five resets an hour.
+const rateLimitReset = rateLimitByWallet(Number(process.env.RATE_RESET_MAX) || 10, 'Too many rate-limit resets', 60*60*1000);
 const rateLimitInvite = rateLimitByWallet(10, 'Too many invite requests. Try again later');
 
 function createEmailTransport() {
@@ -1551,7 +1567,7 @@ app.post('/api/identity/login-code/verify', rateLimitStrict, (req, res) => {
 
 // GET /api/identity/gate/status — which gates are currently fresh for the caller,
 // plus what the SMS/phone situation is. Drives the vault app's gate UI.
-app.get('/api/identity/gate/status', rateLimitStandard, (req, res) => {
+app.get('/api/identity/gate/status', rateLimitGate, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const wallet = db.prepare('SELECT phone, pin_hash, pin_locked_until FROM identity_wallets WHERE did = ?').get(auth.did);
@@ -1629,7 +1645,7 @@ app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => 
 //                                            e.g. 'reveal:42'; attempt = a random id the caller can cancel it by)
 //   { gate:'fingerprint' }  (legacy: proven by presenting a fingerprint-authed token; policies now read it as 'pin')
 // Wrong answers are 403, never 401: the vault app reads 401 as an expired session and signs out.
-app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
+app.post('/api/identity/gate/verify', rateLimitGate, async (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const { gate } = req.body || {};
@@ -1637,6 +1653,13 @@ app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
   if (gate === 'device') return deviceKeys.verifyDeviceGate(req, res, auth);
   if (!GATE_TYPES.includes(gate)) return res.status(400).json({ error: `gate must be one of ${GATE_TYPES.join(', ')}, or device` });
   const did = auth.did;
+  // The account password and the genesis fingerprint are a person's gates, and neither has a lockout of its own: an
+  // agent token (silicon, worker, fleet-minted) never proves them, so a fleet of agents — each with its own gate budget —
+  // can't turn this route into a password-guessing oracle against its owner (rate-reset re-review).
+  if ((gate === 'password' || gate === 'genesis') && isAgentAuth(auth)) {
+    logSecurityEvent('gate_blocked_agent', 'alert', { caller_did: did, agent_name: auth.agent_name || (auth.decoded && auth.decoded.agent_label), capability: 'gate:' + gate, ip: req.ip, error: 'agent token' });
+    return res.status(403).json({ error: `the ${gate} gate is a person's: an agent token can't prove it` });
+  }
 
   if (gate === 'twofa' || gate === 'sms') {
     const { code } = req.body || {};
@@ -8089,7 +8112,7 @@ function fingerprintMiddleware() {
 }
 
 // POST /api/identity/auth-fingerprint — authenticate via fingerprint (no email 2FA)
-app.post('/api/identity/auth-fingerprint', rateLimitStandard, fingerprintMiddleware(), async (req, res) => {
+app.post('/api/identity/auth-fingerprint', rateLimitLogin, fingerprintMiddleware(), async (req, res) => {
   const { did, username, password, scope = 'read', expires_in = '24h' } = req.body || {};
   if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
   if (did && typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
@@ -8258,7 +8281,40 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
 
 // POST /api/identity/refresh — swap a valid refresh token for a fresh access token.
 // Single-use rotation: each refresh returns a NEW refresh token and revokes the old one.
-app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
+// POST /api/identity/rate-limit/reset — the owner clears their own wallet's standard (and fill) request counters.
+// A person's act: not an agent, worker or fleet-minted token, not an agent's device sign-in; behind a fresh PIN
+// (pattern/biometric in the app) for intent `rate-reset`. Its own limiter caps it at a few an hour, and every reset is
+// logged, so it can't quietly switch the limits off. Agents' /use budgets are not touched.
+app.post('/api/identity/rate-limit/reset', async (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'sign in', ...(auth.code ? { code: auth.code } : {}) });
+  const d0 = auth.decoded || {};
+  if (auth.silicon || d0.wrk || d0.auth_method === 'worker' || d0.auth_method === 'fleet_owner_mint' || deviceSession(d0)) {
+    logSecurityEvent('rate_reset_blocked_agent', 'alert', { caller_did: auth.did, agent_name: auth.agent_name || d0.agent_label, capability: 'rate-reset', ip: req.ip, error: deviceSession(d0) ? 'device-login session' : 'agent token' });
+    return res.status(403).json({ error: 'the rate limit is reset by its owner in the DemiPass app, not by an agent token or an agent\'s device sign-in' });
+  }
+  if (d0.auth_method === 'refresh' && !d0.src_auth) return res.status(403).json({ error: 'sign in again in the DemiPass app to reset the rate limit (this session cannot show it began as a person\'s sign-in)', sign_in_again: true });
+  if (!gateSession(auth)) return res.status(403).json({ error: 'this token cannot hold a PIN proof — sign in again' });
+  // Counted only once the caller is the owner as a person, so an agent's refused calls can't use up the owner's resets
+  // (rate-reset review M2).
+  { let passed = false; await new Promise((resolve) => rateLimitReset(req, res, (e) => { passed = !e; resolve(); }).then(() => resolve(), resolve));
+    if (!passed) { if (!res.headersSent) res.status(503).json({ error: 'rate limit check failed; try again' }); return; } }
+  const intent = 'rate-reset:0';
+  if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('rate-reset', ['pin'], ['pin'], intent));
+  const refused = spendSingleUse(auth.did, 'rate-reset', ['pin'], auth, intent);
+  if (refused) return res.status(refused.status || 403).json(refused);
+  const key = 'wallet:' + auth.did;
+  const reset = [];
+  for (const [name, lim] of [['standard', rateLimitStandard], ['fill', rateLimitFill]]) {
+    try { await lim.resetKey(key); reset.push(name); }
+    catch (e) { console.error(`[rate-reset] ${name}:`, e.message); }
+  }
+  logSecurityEvent('rate_limit_reset', 'info', { caller_did: auth.did, capability: 'rate-reset', ip: req.ip, context: { reset } });
+  if (!reset.length) return res.status(503).json({ ok: false, error: 'the limits could not be reset — try again', reset });
+  res.json({ ok: true, reset });
+});
+
+app.post('/api/identity/refresh', rateLimitRefresh, (req, res) => {
   const { refresh_token, expires_in = '24h' } = req.body || {};
   if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
   const rec = consumeRefreshToken(refresh_token);
@@ -9609,7 +9665,7 @@ const accountHolds = require('./account_holds')({
 const deviceKeys = require('./device_keys')({
   app, db, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   logSecurityEvent, cleanLabel, sendMail: fleetRoutes.sendMail, recordGate, pinIntentOk: (s) => PIN_INTENT_RE.test(s),
-  holds: () => accountHolds,
+  holds: () => accountHolds, rateLimitGate,
 });
 // Agent token requests (silicon_token_requests.js): asked for by a fleet member, approved in the owner's app (PIN +
 // phone), claimed once with a claim secret. Aaron 2026-11-08, for Conduit's tenant token.
@@ -10361,7 +10417,7 @@ app.get('/api/fleet/:slug/analytics', (req, res) => {
 
 // ── Auth Channel (D3) — fingerprint auth with channel encryption ──
 
-app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, fingerprintMiddleware(), async (req, res) => {
+app.post('/api/identity/auth-fingerprint/barrel', rateLimitLogin, fingerprintMiddleware(), async (req, res) => {
   const { did, username, password, scope = 'read', expires_in = '24h', channel } = req.body || {};
   if ((!did && !username) || !password) return res.status(400).json({ error: 'did/username and password required' });
   if (did && typeof did !== 'string') return res.status(400).json({ error: 'did: must be a string' });
@@ -10440,7 +10496,7 @@ app.post('/api/identity/auth-fingerprint/barrel', rateLimitStandard, fingerprint
 
 try { db.exec("ALTER TABLE identity_wallets ADD COLUMN last_critical_auth TEXT DEFAULT ''"); } catch(_) {}
 
-app.post('/api/identity/auth-critical', rateLimitStandard, async (req, res) => {
+app.post('/api/identity/auth-critical', rateLimitLogin, async (req, res) => {
   const { username, password, scope } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'username and password required' });
   if (typeof username !== 'string') return res.status(400).json({ error: 'username: must be a string' });
@@ -15378,7 +15434,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|edit|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|edit|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward|rate-reset):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

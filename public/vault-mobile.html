@@ -403,6 +403,9 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Account password</div>
         <button class="btn-ghost" onclick="rotatePasswordBlind()" style="width:100%;text-align:left;padding:0.6rem">Rotate my password (blind)</button>
         <div id="pw-rotate-out" style="font-size:0.72rem;margin-top:0.25rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Request limit (your wallet: 500 requests per 15 minutes, shared by this app and your agents)</div>
+        <button class="btn-ghost" onclick="resetRateLimit()" style="width:100%;text-align:left;padding:0.6rem">Reset my rate limit</button>
+        <div id="rate-reset-out" style="font-size:0.72rem;margin-top:0.25rem"></div>
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Recovery guardians (three people you paired with in person; two of them can let you back in if you lose every phone)</div>
         <div id="guardians-box" style="margin-top:0.3rem;font-size:0.8rem"></div>
         <div id="holds-wrap" style="display:none;margin-top:0.9rem"><div style="font-size:0.8rem;color:var(--red)">Waiting changes to your wallet</div><div id="holds" style="margin-top:0.3rem"></div></div>
@@ -860,7 +863,7 @@ if(typeof document!=='undefined'&&document.addEventListener) document.addEventLi
 if(tk&&!isTokenExpired())showApp();
 else if(tk){ensureSession().then(ok=>{if(ok)showApp();else checkLoginHolds()},()=>{document.getElementById('auth-err').textContent='No connection — reopen to continue'})}
 else setTimeout(()=>{ try{ checkLoginHolds(); if(recState()) renderRecover(); }catch(_){} },0);   // item 9: signed out, the linked phone still asks what is waiting; a recovery in progress resumes
-async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&hadToken&&!(await ensureSession()))throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){const rr=hadToken&&!(opt&&opt.renewed)&&epoch===sessionEpoch?await renewSession():null;if(rr==='ok')return api(m,p,b,{...(opt||{}),renewed:true});if(rr==='offline')throw dropped(m);if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>null);if(epoch!==sessionEpoch)throw new Error('session ended');if(!d&&r.status<400)throw dropped(m);if(r.status>=400&&!d)throw Object.assign(new Error('failed'),{status:r.status});if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
+async function api(m,p,b,opt){const isLogin=p.startsWith('/api/identity/auth-fingerprint');const hadToken=!!tk;if(!isLogin&&hadToken&&!(await ensureSession()))throw new Error('session expired');const o={method:m,headers:{'Content-Type':'application/json'}};if(tk&&!isLogin)o.headers.Authorization='Bearer '+tk;if(b)o.body=JSON.stringify(b);if(opt&&opt.timeoutMs){if(typeof AbortSignal!=='undefined'&&AbortSignal.timeout)o.signal=AbortSignal.timeout(opt.timeoutMs);else if(typeof AbortController!=='undefined'){const c=new AbortController();setTimeout(()=>c.abort(),opt.timeoutMs);o.signal=c.signal}}const epoch=sessionEpoch;const r=await fetch(API+p,o);if(epoch!==sessionEpoch)throw new Error('session ended');if(r.status===401&&!isLogin){const rr=hadToken&&!(opt&&opt.renewed)&&epoch===sessionEpoch?await renewSession():null;if(rr==='ok')return api(m,p,b,{...(opt||{}),renewed:true});if(rr==='offline')throw dropped(m);if(hadToken){logout();document.getElementById('auth-err').textContent='Session expired — please sign in again'}throw new Error('session expired')}const d=await r.json().catch(()=>null);if(epoch!==sessionEpoch)throw new Error('session ended');if(!d&&r.status<400)throw dropped(m);if(r.status>=400&&!d)throw Object.assign(new Error('failed'),{status:r.status});if(r.status===429&&(d.limiter==='standard'||d.limiter==='fill'))showRateBanner();if(r.status>=400)throw Object.assign(new Error(d.error||(r.status===401?'wrong username or password':'failed')),{status:r.status});return d}
 // A reply cut off by a network change: say so, and never show it as an empty vault or zero balance.
 function dropped(m){return Object.assign(new Error(!m||m==='GET'?'Connection dropped — retrying':'Connection dropped — check whether it went through before trying again'),{dropped:true})}
 // A reply from a session that has since ended (signed out, or replaced by another sign-in): handlers stop here.
@@ -3986,9 +3989,9 @@ document.addEventListener('keydown',e=>{if(e.key==='Escape'){stopScan();closeMod
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadVault()},30000);
 document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadVault()});
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},30000);   // never behind a closed PIN gate
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},60000);   // never behind a closed PIN gate
 let pollN=0;
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%4===0){loadShares();loadScanRequests();loadAgentTokenRequests();}}},4000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%15===0){loadShares();loadScanRequests();loadAgentTokenRequests();}}},4000);
 
 // ── Pair in person (QR): a contact confirmed face to face; only these can be shared with (red team item 6) ──────
 // One side shows a QR, the other scans it in this app. Only the shower's screen gets the 6-digit code; the scanner
@@ -4144,6 +4147,29 @@ async function handleScannedData(raw) {
     msg.textContent = e.message; msg.className = 'modal-msg err';
   }
 }
+// The wallet's request limit: a 429 for "this wallet" offers a reset, which asks for the PIN (pattern/biometric) first.
+let rateBannerDismissedAt=0;
+const RATE_BANNER_TEXT='Your wallet hit its request limit (500 per 15 minutes).';
+function showRateBanner(){ if(Date.now()-rateBannerDismissedAt<60000) return; const b=document.getElementById('rate-banner'), bt=document.getElementById('rate-banner-text'); if(bt&&b&&b.style.display!=='block'){bt.textContent=RATE_BANNER_TEXT;bt.style.color='var(--orange)';} if(b) b.style.display='block'; }
+function hideRateBanner(){ rateBannerDismissedAt=Date.now(); const b=document.getElementById('rate-banner'); if(b) b.style.display='none'; }
+async function resetRateLimit(){
+  const out=document.getElementById('rate-reset-out'), bt=document.getElementById('rate-banner-text');
+  const say=(m,c)=>{ if(out){out.textContent=m;out.style.color=c;} if(bt){bt.textContent=m;bt.style.color=c;} };
+  say('Resetting…','var(--text3)');
+  try{
+    const d=await apiGated('POST','/api/identity/rate-limit/reset',{},'Reset your request limit');
+    if(!d||!d.ok){ say('Not reset: '+((d&&d.error)||'unknown'),'var(--red)'); return; }
+    say('Request limit reset ✓','var(--green)');
+    setTimeout(()=>{ const b=document.getElementById('rate-banner'); if(b) b.style.display='none'; if(bt){bt.textContent=RATE_BANNER_TEXT;bt.style.color='var(--orange)';} },1500);
+    if(typeof loadVault==='function') loadVault();
+  }catch(e){ if(typeof sessionEnded==='function'&&sessionEnded(e)) return; say('Not reset: '+e.message,'var(--red)'); }
+}
 </script>
+<div id="rate-banner" style="display:none;position:fixed;left:0.75rem;right:0.75rem;top:0.75rem;z-index:9999;background:var(--card);border:1px solid var(--orange);border-radius:10px;padding:0.7rem 0.8rem;font-size:0.82rem;box-shadow:0 4px 18px rgba(0,0,0,0.45)">
+  <div style="display:flex;gap:0.6rem;align-items:center;justify-content:space-between">
+    <span id="rate-banner-text" style="color:var(--orange)">Your wallet hit its request limit (500 per 15 minutes).</span>
+    <span style="display:flex;gap:0.4rem;flex-shrink:0"><button class="btn-ghost" onclick="resetRateLimit()" style="padding:0.35rem 0.7rem">Reset</button><button class="btn-ghost" onclick="hideRateBanner()" style="padding:0.35rem 0.6rem" aria-label="Dismiss">✕</button></span>
+  </div>
+</div>
 </body>
 </html>
