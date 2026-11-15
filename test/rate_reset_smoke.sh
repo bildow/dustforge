@@ -65,6 +65,8 @@ call POST /api/identity/rate-limit/reset "$A" '{}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = rate-reset:0 ] && ok "without a fresh PIN: 403 asking for it (intent rate-reset:0)" || fail "no pin: $CODE $BODY"
 call POST /api/identity/rate-limit/reset "$SIL" '{}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q 'not by an agent token' && ok "an agent token is refused" || fail "silicon: $CODE $BODY"
+call POST /api/identity/gate/verify "$SIL" '{"gate":"password","password":"guess"}'
+[ "$CODE" = 403 ] && echo "$BODY" | grep -q "a person's" && ok "an agent token can't try the owner's password through the gate (no per-agent guessing budget)" || fail "agent password gate: $CODE $BODY"
 for i in 1 2 3 4 5 6; do call POST /api/identity/rate-limit/reset "$SIL" '{}'; done
 [ "$CODE" = 403 ] && ok "an agent's refused calls don't count against the owner's resets (still 403, never 429; review M2)" || fail "agent burns budget: $CODE"
 

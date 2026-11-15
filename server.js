@@ -1653,6 +1653,13 @@ app.post('/api/identity/gate/verify', rateLimitGate, async (req, res) => {
   if (gate === 'device') return deviceKeys.verifyDeviceGate(req, res, auth);
   if (!GATE_TYPES.includes(gate)) return res.status(400).json({ error: `gate must be one of ${GATE_TYPES.join(', ')}, or device` });
   const did = auth.did;
+  // The account password and the genesis fingerprint are a person's gates, and neither has a lockout of its own: an
+  // agent token (silicon, worker, fleet-minted) never proves them, so a fleet of agents — each with its own gate budget —
+  // can't turn this route into a password-guessing oracle against its owner (rate-reset re-review).
+  if ((gate === 'password' || gate === 'genesis') && isAgentAuth(auth)) {
+    logSecurityEvent('gate_blocked_agent', 'alert', { caller_did: did, agent_name: auth.agent_name || (auth.decoded && auth.decoded.agent_label), capability: 'gate:' + gate, ip: req.ip, error: 'agent token' });
+    return res.status(403).json({ error: `the ${gate} gate is a person's: an agent token can't prove it` });
+  }
 
   if (gate === 'twofa' || gate === 'sms') {
     const { code } = req.body || {};
@@ -8290,7 +8297,7 @@ app.post('/api/identity/rate-limit/reset', async (req, res) => {
   if (!gateSession(auth)) return res.status(403).json({ error: 'this token cannot hold a PIN proof — sign in again' });
   // Counted only once the caller is the owner as a person, so an agent's refused calls can't use up the owner's resets
   // (rate-reset review M2).
-  { let passed = false; await new Promise((resolve) => rateLimitReset(req, res, () => { passed = true; resolve(); }).then(() => resolve(), resolve));
+  { let passed = false; await new Promise((resolve) => rateLimitReset(req, res, (e) => { passed = !e; resolve(); }).then(() => resolve(), resolve));
     if (!passed || res.headersSent) return; }
   const intent = 'rate-reset:0';
   if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('rate-reset', ['pin'], ['pin'], intent));
