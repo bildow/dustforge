@@ -25,6 +25,10 @@ const PURPOSES = new Set(['enrol', 'gate', 'approve']);
 module.exports = function registerDeviceKeys(deps) {
   const { app, db, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
           logSecurityEvent, cleanLabel, sendMail, recordGate, pinIntentOk } = deps;
+  // A biometric/pattern gate challenge is part of proving the PIN, so it rides on the gate budget: a wallet that used up
+  // its standard budget can still use its biometric to reset it (rate-reset review L3). Other purposes stay standard.
+  const rateLimitGate = deps.rateLimitGate || rateLimitStandard;
+  const challengeLimit = (req, res, next) => ((req.body && req.body.purpose === 'gate') ? rateLimitGate : rateLimitStandard)(req, res, next);
 
   db.exec(`CREATE TABLE IF NOT EXISTS device_keys (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -210,7 +214,7 @@ module.exports = function registerDeviceKeys(deps) {
 
   // ── routes ─────────────────────────────────────────────────────────────────────────────────────────────────────
   // POST /api/identity/device/challenge {purpose: 'enrol'|'gate'|'approve', intent}
-  app.post('/api/identity/device/challenge', rateLimitStandard, (req, res) => {
+  app.post('/api/identity/device/challenge', challengeLimit, (req, res) => {
     const auth = personAuth(req, res); if (!auth) return;
     const { purpose, intent } = req.body || {};
     const bind = String((req.body || {}).bind ?? '');

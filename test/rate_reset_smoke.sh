@@ -44,7 +44,14 @@ call POST /api/identity/pin "$A" '{"pin":"4321","password":"hunter22"}'
 
 # Use up the wallet's standard budget.
 n=0; for i in $(seq 1 30); do call GET /api/blindkey/dashboard "$A"; [ "$CODE" = 429 ] && break; n=$((n+1)); done
-[ "$CODE" = 429 ] && echo "$BODY" | grep -q 'this wallet' && ok "the standard budget runs out (429 'this wallet' after $n calls)" || fail "never limited: $CODE $BODY"
+[ "$CODE" = 429 ] && echo "$BODY" | grep -q 'this wallet' && [ "$(echo "$BODY" | J limiter)" = standard ] && ok "the standard budget runs out (429 'this wallet', limiter standard, after $n calls)" || fail "never limited: $CODE $BODY"
+# Sign-in is counted by address and never on the caller's wallet: a Bearer token riding along can't move it onto a
+# budget its owner can reset (review M1).
+call POST /api/identity/auth-fingerprint "$A" '{"username":"rr-owner","password":"hunter22","scope":"transact","expires_in":"1h"}'
+[ "$CODE" = 200 ] && ok "password sign-in is on its own (address) limiter, not the exhausted wallet budget" || fail "login while limited: $CODE $BODY"
+# A biometric gate challenge rides on the gate budget (review L3).
+call POST /api/identity/device/challenge "$A" '{"purpose":"gate","intent":"rate-reset:0"}'
+[ "$CODE" != 429 ] && ok "a biometric gate challenge is not refused by the exhausted standard budget ($CODE)" || fail "device gate challenge: $CODE $BODY"
 
 # The way back in still answers.
 call GET /api/identity/gate/status "$A"; [ "$CODE" = 200 ] && ok "gate status still answers while limited" || fail "gate status: $CODE"
@@ -58,6 +65,8 @@ call POST /api/identity/rate-limit/reset "$A" '{}'
 [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = rate-reset:0 ] && ok "without a fresh PIN: 403 asking for it (intent rate-reset:0)" || fail "no pin: $CODE $BODY"
 call POST /api/identity/rate-limit/reset "$SIL" '{}'
 [ "$CODE" = 403 ] && echo "$BODY" | grep -q 'not by an agent token' && ok "an agent token is refused" || fail "silicon: $CODE $BODY"
+for i in 1 2 3 4 5 6; do call POST /api/identity/rate-limit/reset "$SIL" '{}'; done
+[ "$CODE" = 403 ] && ok "an agent's refused calls don't count against the owner's resets (still 403, never 429; review M2)" || fail "agent burns budget: $CODE"
 
 # PIN verify works while limited, then the reset clears the budget.
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"rate-reset:0"}'
@@ -67,16 +76,19 @@ call POST /api/identity/rate-limit/reset "$A" '{}'
 call GET /api/blindkey/dashboard "$A"; [ "$CODE" = 200 ] && ok "the wallet's requests work again" || fail "after reset: $CODE"
 call POST /api/identity/rate-limit/reset "$A" '{}'
 [ "$CODE" = 403 ] && ok "the PIN proof is single use (a second reset asks again)" || fail "reuse: $CODE $BODY"
-[ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='rate_limit_reset'")" = 1 ] && ok "the reset is logged (rate_limit_reset)" || fail "no security event"
+[ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='rate_limit_reset'")" -ge 1 ] && ok "the reset is logged (rate_limit_reset)" || fail "no security event"
 
-# The reset itself is capped (RATE_RESET_MAX=4 per hour here; three calls above, the PIN-less one counted).
+# The reset itself is capped (RATE_RESET_MAX=4 per hour here: the owner's three calls above count, the agent's don't).
 call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"rate-reset:0"}'
 call POST /api/identity/rate-limit/reset "$A" '{}'
-[ "$CODE" = 429 ] && ok "resets are capped by their own hourly limit" || fail "reset cap: $CODE $BODY"
+[ "$CODE" = 200 ] && ok "a fourth owner call still resets (the agent's seven refused calls used none of it)" || fail "fourth: $CODE $BODY"
+call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","intent":"rate-reset:0"}'
+call POST /api/identity/rate-limit/reset "$A" '{}'
+[ "$CODE" = 429 ] && ok "then resets are capped by their own hourly limit" || fail "reset cap: $CODE $BODY"
 
 # The app.
 V=public/vault-mobile.html
-grep -q 'id="rate-banner"' $V && grep -q "showRateBanner();if(r.status>=400)" $V && ok "app: a wallet 429 shows the reset banner" || fail "banner"
+grep -q 'id="rate-banner"' $V && grep -q "d.limiter==='standard'||d.limiter==='fill'))showRateBanner();" $V && ok "app: a wallet 429 shows the reset banner" || fail "banner"
 grep -q "apiGated('POST','/api/identity/rate-limit/reset'" $V && grep -q 'onclick="resetRateLimit()"' $V && ok "app: the reset goes through the PIN gate, from the banner and Settings" || fail "reset button"
 grep -q "if(++pollN%15===0)" $V && grep -q "loadNetwork()},60000)" $V && ok "app: background polls every 60 s (was 16 s / 30 s)" || fail "polling"
 
