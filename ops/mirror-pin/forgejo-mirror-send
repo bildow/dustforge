@@ -1,0 +1,10 @@
+#!/bin/bash
+# /usr/local/sbin/forgejo-mirror-send on forge: the forced command for phasewhip's mirror key (finding I2, forge half).
+#   restrict,from="100.83.112.88",command="/usr/local/sbin/forgejo-mirror-send" <key> phasewhip-mirror-forge
+# The one thing backup-mirror.sh needs from forge: a Forgejo dump (zip) on stdout. The request text is ignored.
+set -u
+umask 077
+T=$(sudo -u git mktemp -d) || exit 1
+trap 'rm -rf "$T"' EXIT
+sudo -u git /usr/local/bin/forgejo --config /etc/forgejo/app.ini dump --file "$T/d.zip" --type zip >/dev/null 2>&1 || exit 1
+cat "$T/d.zip"

@@ -1,0 +1,27 @@
+#!/bin/bash
+# /usr/local/sbin/dustforge-mirror-send on racknerd: the forced command for phasewhip's mirror key (finding I2).
+# The key's authorized_keys line is
+#   restrict,from="100.83.112.88",command="/usr/local/sbin/dustforge-mirror-send" <key> phasewhip-mirror-racknerd
+# so phasewhip gets exactly what backup-mirror.sh used to take with an unrestricted root shell, and nothing else:
+#   dustforge-tar                 the DB (sqlite .backup), env, relay-poller.env and the deployed commit, as tar.gz
+#   rsync --server --sender …     a read-only rsync of /opt/backups/git-bundles/ (rrsync -ro)
+# Anything else is refused. The tarball still carries env (IDENTITY_MASTER_KEY): that is finding I3, not closed here.
+set -u
+umask 077
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  dustforge-tar)
+    W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+    sqlite3 /opt/dustforge/data/dustforge.db ".backup '$W/dustforge.db'" || exit 1
+    cp /opt/dustforge/.env "$W/env" 2>/dev/null || true
+    cp /opt/dustforge/scripts/relay-poller.env "$W/relay-poller.env" 2>/dev/null || true
+    ( cd /opt/dustforge && git rev-parse HEAD; git status -sb | head -1 ) > "$W/deployed-commit.txt" 2>/dev/null || true
+    tar czf - -C "$W" dustforge.db env relay-poller.env deployed-commit.txt 2>/dev/null
+    ;;
+  "rsync --server --sender "*)
+    exec /usr/bin/rrsync -ro /opt/backups/git-bundles/
+    ;;
+  *)
+    echo "dustforge-mirror-send: not an allowed request" >&2
+    exit 2
+    ;;
+esac
