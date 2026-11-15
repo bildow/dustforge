@@ -2344,3 +2344,29 @@ test('edit value: the field takes no autofill or copy, two entries must match, a
   assert.equal(sent[0].ref, 'DP-PWD-phasewh-00000001');
   assert.equal(pg.el('edit-v1').value, '', 'emptied after saving');
 });
+
+test('edit value: grants that would end are confirmed with the server\'s left_token, never a bare true', async () => {
+  const sent = [];
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p, body) => {
+    if (p === '/api/demipass/dashboard') return searchVault();
+    if (p === '/api/demipass/edit') {
+      sent.push(body);
+      if (body.confirm_left !== 'tok-abc') return { status: 409, json: { error: "1 grant will end with this edit (an outside agent's delegation) — they stay with the old value, which retires; send confirm_left with this left_token to go ahead", left: 1, left_token: 'tok-abc' } };
+      return { json: { ok: true, ref: body.ref, new_name: 'phasewhip-ssh_v2', new_version: 2, delegations_ended: 1 } };
+    }
+    return null;
+  }) });
+  await settle();
+  await pg.ctx.__realLoadVault();
+  pg.ctx.showDetail('phasewhip-ssh'); pg.ctx.openEdit('phasewhip-ssh');
+  pg.qsa['input[name="edit-mode"]:checked'] = [{ value: 'typed' }];
+  pg.ctx.document.querySelector = (sel) => (pg.qsa[sel] || [])[0] || null;
+  let asked = '';
+  pg.ctx.confirm = (m) => { asked = m; return true; };
+  pg.el('edit-v1').value = 'typed-new-value-1'; pg.el('edit-v2').value = 'typed-new-value-1';
+  await pg.ctx.saveEdit('phasewhip-ssh');
+  assert.equal(sent.length, 2);
+  assert.equal(sent[0].confirm_left, undefined);
+  assert.equal(sent[1].confirm_left, 'tok-abc', 'the token the server gave');
+  assert.match(asked, /outside agent's delegation/);
+});

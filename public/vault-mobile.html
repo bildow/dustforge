@@ -2850,16 +2850,17 @@ async function saveEdit(name, confirmLeft){
     if(v1 !== v2){ note.textContent = 'The two entries differ — type the same value twice.'; clearEditFields(); return; }
     body.new_value = v1;
   }
-  if(confirmLeft) body.confirm_left = true;
+  if(confirmLeft) body.confirm_left = String(confirmLeft);
   if(editApproval[name]) body.approval_id = editApproval[name];
   note.textContent = 'Saving…';
   let d;
   try{ d = await apiGated('POST','/api/demipass/edit', body, 'Replace the value of '+name+'?'); }
   catch(e){
     if(sessionEnded(e)) return;
-    if(/stay with the old value and end with this edit/.test(e.message) && !confirmLeft){
+    if(e.status===409 && e.data && e.data.left_token && !confirmLeft){
       note.textContent = '';
-      if(confirm(e.message.replace(/ — send confirm_left.*$/, '')+'.\n\nGo ahead?')) return saveEdit(name, true);
+      // The confirmation names exactly these grants (the token): if they change before the save, it is asked again.
+      if(confirm(e.message.replace(/ — they stay with the old value.*$/, '')+'. They stay with the old value, which retires.\n\nGo ahead?')) return saveEdit(name, e.data.left_token);
       return;
     }
     if(/approval/i.test(e.message)) delete editApproval[name];
@@ -3757,7 +3758,7 @@ async function apiGatedInner(method, path, body, what){
       ({status,d}=await call());
     } else break;
   }
-  if(status>=400) throw new Error(d.error||'failed');
+  if(status>=400) throw Object.assign(new Error(d.error||'failed'), {status, data:d});   // the reply's fields (an edit's left_token)
   return d;
 }
 

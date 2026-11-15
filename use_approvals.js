@@ -151,8 +151,9 @@ module.exports = function registerUseApprovals(deps) {
     // The owner replaces the value (server.js POST /edit): typed by them, or copied from another of their entries.
     if (kind === 'edit') {
       const q = params || {};
-      return cleanLabel(q.mode === 'copy' ? `replace the value with the value of ${q.from_name || q.from_ref || 'another entry'}${q.retire_source ? ', then delete that entry' : ''} (never shown)`
-        : 'replace the value with one you type now (the old one is never shown)', 120);
+      const ends = Number(q.ends) > 0 ? `; ${Number(q.ends)} grant${Number(q.ends) === 1 ? '' : 's'} to others END` : '';
+      return cleanLabel((q.mode === 'copy' ? `replace the value with the value of ${q.from_name || q.from_ref || 'another entry'}${q.retire_source ? ', then delete that entry' : ''} (never shown)`
+        : 'replace the value with one you type now (the old one is never shown)') + ends, 160);
     }
     if (kind === 'scope') {
       // A change to what the secret reaches (server.js scopeChangeGate): the card names the scope, the methods and
