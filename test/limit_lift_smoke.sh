@@ -21,13 +21,15 @@ kill -0 $SRV 2>/dev/null || { echo "server died:"; tail -5 "$S/server.log"; exit
 trap 'kill $SRV 2>/dev/null; [ -n "${KEEP:-}" ] || rm -rf "$S"' EXIT
 H=$(printf '%s' hunter22 | sha256sum | cut -d' ' -f1)
 SIL='silicon:limit-lift-smoke-token-0123456789'; SIL2='silicon:limit-lift-smoke-other-0123456789'
+SIL3='silicon:limit-lift-smoke-third-0123456789'; SIL4='silicon:limit-lift-smoke-forth-0123456789'; SIL5='silicon:limit-lift-smoke-fifth-0123456789'
 node -e '
 const identity = require("./identity"), crypto = require("crypto"); const Database = require("better-sqlite3"); const db = new Database(process.env.DB_PATH);
 const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
 db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, 100000, ?)").run(id.did, "ll-owner", "ll-owner@dustforge.com", enc, process.argv[1]);
 const h = (t) => crypto.createHash("sha256").update(t).digest("hex");
 db.prepare("INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)").run("indexer", "did:silicon:llidx", id.did, h(process.argv[2]));
-db.prepare("INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)").run("other", "did:silicon:llother", id.did, h(process.argv[3]));' "$H" "$SIL" "$SIL2"
+db.prepare("INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)").run("other", "did:silicon:llother", id.did, h(process.argv[3]));
+for (const [i, n] of [[4, "third"], [5, "forth"], [6, "fifth"]]) db.prepare("INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)").run(n, "did:silicon:ll" + n, id.did, h(process.argv[i]));' "$H" "$SIL" "$SIL2" "$SIL3" "$SIL4" "$SIL5"
 
 fails=0; ok(){ echo "ok   $*"; }; fail(){ echo "FAIL $*"; fails=$((fails+1)); }
 J(){ python3 -c 'import json,sys; d=json.load(sys.stdin); v=d
@@ -67,6 +69,9 @@ AP=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$AP" != None ] && ok "the agent's ask files approval $AP in the owner's app" || fail "ask: $CODE $BODY"
 SUM=$(Q "SELECT summary FROM use_approvals WHERE id=$AP"); [ -z "$SUM" ] && SUM=$(Q "SELECT params FROM use_approvals WHERE id=$AP")
 echo "$SUM" | grep -q "branch feat/reindex" && ok "the card names the agent's label: $(echo "$SUM" | cut -c1-110)" || fail "summary: $SUM"
+call POST /api/identity/limits/lift "$SIL" "$LIFT"; [ "$CODE" = 202 ] && [ "$(echo "$BODY" | J approval_id)" = "$AP" ] && ok "the same ask again gets the same waiting request" || fail "same ask: $CODE $BODY"
+call POST /api/identity/limits/lift "$SIL" "$(echo "$LIFT" | sed 's/"extra":20/"extra":21/')"
+[ "$CODE" = 409 ] && [ "$(echo "$BODY" | J approval_id)" = "$AP" ] && ok "a different ask while one waits: 409 naming the waiting one (one per requester)" || fail "second ask: $CODE $BODY"
 call POST /api/identity/limits/lift "$SIL" "$(echo "$LIFT" | sed 's/"extra":20/"extra":20,"approval_id":'$AP'/')"
 [ "$CODE" = 202 ] || [ "$CODE" = 403 ] && ok "not usable before the owner approves ($CODE)" || fail "early redeem: $CODE $BODY"
 approve "$AP"; [ "$CODE" = 200 ] && ok "the owner approves (PIN to open, code to approve)" || fail "approve: $CODE $BODY"
@@ -92,6 +97,17 @@ call GET /api/identity/limits/lifts "$SIL2"; [ "$(echo "$BODY" | J lifts)" = "[]
 call POST /api/identity/limits/lifts/$LID/end "$SIL2"; [ "$CODE" = 404 ] && ok "another agent can't end it" || fail "other end: $CODE"
 call POST /api/identity/limits/lifts/$LID/end "$A"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J lift.ended_by)" = owner ] && ok "the owner ends it early" || fail "end: $CODE $BODY"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type IN ('limit_lift_granted','limit_lift_ended')")" = 2 ] && ok "granted and ended are logged" || fail "events"
+
+# The wallet-wide ceiling: summed active extras per limiter, whoever asked.
+X "INSERT INTO limit_lifts (owner_did, holder_key, holder_label, requester_key, limiter, extra, label, created_at, expires_at) SELECT owner_did, 'wallet:' || owner_did, 'x', 'wallet:silicon:did:silicon:llother', 'standard', 4990, 'big', '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z' FROM limit_lifts WHERE id=$LID"
+call POST /api/identity/limits/lift "$SIL" '{"limiter":"standard","extra":20,"minutes":30,"label":"batch: more"}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "at most 5000 in all" && ok "the wallet's summed standard lifts can't pass 5000, whoever asks (409)" || fail "ceiling: $CODE $BODY"
+X "UPDATE limit_lifts SET ended_at='2026-01-01T00:00:00Z' WHERE label='big'"
+# Lift asks can't fill the owner's queue: at most three wait per wallet.
+for s in "$SIL2" "$SIL3" "$SIL4"; do call POST /api/identity/limits/lift "$s" '{"limiter":"use","extra":5,"minutes":30,"label":"batch: q"}'; done
+[ "$CODE" = 202 ] && ok "three agents' asks wait" || fail "queue fill: $CODE $BODY"
+call POST /api/identity/limits/lift "$SIL5" '{"limiter":"use","extra":5,"minutes":30,"label":"batch: q"}'
+[ "$CODE" = 429 ] && ok "a fourth waits nowhere (429): lift asks never take the whole grant queue" || fail "fourth ask: $CODE $BODY"
 
 # An expired lift lifts nothing.
 X "INSERT INTO limit_lifts (owner_did, holder_key, holder_label, requester_key, limiter, extra, label, created_at, expires_at) SELECT owner_did, holder_key, holder_label, requester_key, 'use', 500, 'old', '2020-01-01T00:00:00Z', '2020-01-01T01:00:00Z' FROM limit_lifts WHERE id=$LID"
