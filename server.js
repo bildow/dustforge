@@ -329,6 +329,15 @@ const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(proc
   skip: (req) => Boolean(rateIdentity(req)), keyGenerator: rateIpKey, message: { error: 'Rate limit exceeded (this address, not signed in: per 15 minutes)' } });
 // Browser fill polls (the wallet every 4 s, a waiting fill every 2 s): its own budget, so polling never starves /use.
 const rateLimitFill = rateLimitByWallet(3000, 'Rate limit exceeded');
+// The way back in must not share the budget it would restore: verifying the PIN, reading the gate status and refreshing
+// a session each have their own budget, so a wallet that used up rateLimitStandard can still prove its PIN and reset it
+// (and a 429 on refresh no longer forces a fresh sign-in). Wrong PINs stay bounded by the PIN lockout itself.
+const rateLimitGate = rateLimitByWallet(Number(process.env.RATE_GATE_MAX) || 300, 'Too many verification requests');
+const rateLimitRefresh = rateLimitByWallet(Number(process.env.RATE_REFRESH_MAX) || 500, 'Too many session refreshes');
+// The owner's reset of their own wallet's limits (POST /api/identity/rate-limit/reset): a person's act behind a fresh
+// PIN, and itself capped so it can't turn the limits off.
+// Each reset is two calls from the app (the 403 asking for the PIN, then the retry), so 10 is about five resets an hour.
+const rateLimitReset = rateLimitByWallet(Number(process.env.RATE_RESET_MAX) || 10, 'Too many rate-limit resets', 60*60*1000);
 const rateLimitInvite = rateLimitByWallet(10, 'Too many invite requests. Try again later');
 
 function createEmailTransport() {
@@ -1551,7 +1560,7 @@ app.post('/api/identity/login-code/verify', rateLimitStrict, (req, res) => {
 
 // GET /api/identity/gate/status — which gates are currently fresh for the caller,
 // plus what the SMS/phone situation is. Drives the vault app's gate UI.
-app.get('/api/identity/gate/status', rateLimitStandard, (req, res) => {
+app.get('/api/identity/gate/status', rateLimitGate, (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const wallet = db.prepare('SELECT phone, pin_hash, pin_locked_until FROM identity_wallets WHERE did = ?').get(auth.did);
@@ -1629,7 +1638,7 @@ app.post('/api/identity/gate/sms/request', rateLimitStrict, async (req, res) => 
 //                                            e.g. 'reveal:42'; attempt = a random id the caller can cancel it by)
 //   { gate:'fingerprint' }  (legacy: proven by presenting a fingerprint-authed token; policies now read it as 'pin')
 // Wrong answers are 403, never 401: the vault app reads 401 as an expired session and signs out.
-app.post('/api/identity/gate/verify', rateLimitStandard, async (req, res) => {
+app.post('/api/identity/gate/verify', rateLimitGate, async (req, res) => {
   const auth = getBearerIdentity(req);
   if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error, ...(auth.code ? { code: auth.code } : {}) });
   const { gate } = req.body || {};
@@ -8258,7 +8267,35 @@ app.post('/api/identity/device/approve', rateLimitStandard, (req, res) => {
 
 // POST /api/identity/refresh — swap a valid refresh token for a fresh access token.
 // Single-use rotation: each refresh returns a NEW refresh token and revokes the old one.
-app.post('/api/identity/refresh', rateLimitStandard, (req, res) => {
+// POST /api/identity/rate-limit/reset — the owner clears their own wallet's standard (and fill) request counters.
+// A person's act: not an agent, worker or fleet-minted token, not an agent's device sign-in; behind a fresh PIN
+// (pattern/biometric in the app) for intent `rate-reset`. Its own limiter caps it at a few an hour, and every reset is
+// logged, so it can't quietly switch the limits off. Agents' /use budgets are not touched.
+app.post('/api/identity/rate-limit/reset', rateLimitReset, async (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'sign in', ...(auth.code ? { code: auth.code } : {}) });
+  const d0 = auth.decoded || {};
+  if (auth.silicon || d0.wrk || d0.auth_method === 'worker' || d0.auth_method === 'fleet_owner_mint' || deviceSession(d0)) {
+    logSecurityEvent('rate_reset_blocked_agent', 'alert', { caller_did: auth.did, agent_name: auth.agent_name || d0.agent_label, capability: 'rate-reset', ip: req.ip, error: deviceSession(d0) ? 'device-login session' : 'agent token' });
+    return res.status(403).json({ error: 'the rate limit is reset by its owner in the DemiPass app, not by an agent token or an agent\'s device sign-in' });
+  }
+  if (d0.auth_method === 'refresh' && !d0.src_auth) return res.status(403).json({ error: 'sign in again in the DemiPass app to reset the rate limit (this session cannot show it began as a person\'s sign-in)', sign_in_again: true });
+  if (!gateSession(auth)) return res.status(403).json({ error: 'this token cannot hold a PIN proof — sign in again' });
+  const intent = 'rate-reset:0';
+  if (!gateFresh(auth.did, 'pin', auth, intent)) return res.status(403).json(gateMissing('rate-reset', ['pin'], ['pin'], intent));
+  const refused = spendSingleUse(auth.did, 'rate-reset', ['pin'], auth, intent);
+  if (refused) return res.status(refused.status || 403).json(refused);
+  const key = 'wallet:' + auth.did;
+  const reset = [];
+  for (const [name, lim] of [['standard', rateLimitStandard], ['fill', rateLimitFill]]) {
+    try { await lim.resetKey(key); reset.push(name); }
+    catch (e) { console.error(`[rate-reset] ${name}:`, e.message); }
+  }
+  logSecurityEvent('rate_limit_reset', 'info', { caller_did: auth.did, capability: 'rate-reset', ip: req.ip, context: { reset } });
+  res.json({ ok: true, reset });
+});
+
+app.post('/api/identity/refresh', rateLimitRefresh, (req, res) => {
   const { refresh_token, expires_in = '24h' } = req.body || {};
   if (!refresh_token || typeof refresh_token !== 'string') return res.status(400).json({ error: 'refresh_token required' });
   const rec = consumeRefreshToken(refresh_token);
@@ -15378,7 +15415,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|edit|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|edit|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward|rate-reset):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 
