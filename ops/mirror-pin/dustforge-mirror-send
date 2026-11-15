@@ -1,0 +1,45 @@
+#!/bin/bash
+# /usr/local/sbin/dustforge-mirror-send on racknerd: the forced command for phasewhip's mirror key (finding I2).
+# The key's authorized_keys line is
+#   restrict,from="100.83.112.88",command="/usr/local/sbin/dustforge-mirror-send" <key> phasewhip-mirror-racknerd
+# so phasewhip gets exactly what backup-mirror.sh used to take with an unrestricted root shell, and nothing else:
+#   dustforge-tar                 the DB (sqlite .backup), env, relay-poller.env and the deployed commit, as tar.gz
+#   rsync --server --sender …     a read-only rsync of /opt/backups/git-bundles/ (rrsync -ro)
+# Anything else is refused. Each success is logged (tag dustforge-mirror-send), and retire-racknerd.sh requires both.
+# The tarball still carries env (IDENTITY_MASTER_KEY): that is finding I3, not closed here.
+set -u
+umask 077
+TAG=dustforge-mirror-send
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  dustforge-tar)
+    W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+    sqlite3 -init /dev/null /opt/dustforge/data/dustforge.db ".backup '$W/dustforge.db'" || exit 1
+    files=(dustforge.db)
+    cp /opt/dustforge/.env "$W/env" 2>/dev/null && files+=(env)
+    cp /opt/dustforge/scripts/relay-poller.env "$W/relay-poller.env" 2>/dev/null && files+=(relay-poller.env)
+    # The deployed commit, read from .git directly: no git command runs here as root (review L7).
+    h=$(cat /opt/dustforge/.git/HEAD 2>/dev/null || true)
+    c=
+    case "$h" in
+      "ref: "*) r=${h#ref: }
+        # Only a plain ref name is followed, so HEAD can't point root at another file (re-review F3).
+        if [[ "$r" =~ ^refs/[A-Za-z0-9._/-]+$ && "$r" != *..* ]]; then
+          c=$(cat "/opt/dustforge/.git/$r" 2>/dev/null || awk -v r="$r" '$2==r{print $1}' /opt/dustforge/.git/packed-refs 2>/dev/null)
+        fi ;;
+      *) c=$h ;;
+    esac
+    [[ "$c" =~ ^[0-9a-f]{40}$ ]] || c=unknown
+    printf '%s\n' "$c" > "$W/deployed-commit.txt"; files+=(deployed-commit.txt)
+    tar czf - -C "$W" "${files[@]}" || exit 1
+    logger -t "$TAG" "ok dustforge-tar (${files[*]})"
+    ;;
+  "rsync --server --sender "*)
+    /usr/bin/rrsync -ro /opt/backups/git-bundles/; rc=$?
+    [ "$rc" = 0 ] && logger -t "$TAG" "ok rsync git-bundles"
+    exit "$rc"
+    ;;
+  *)
+    echo "$TAG: not an allowed request" >&2
+    exit 2
+    ;;
+esac
