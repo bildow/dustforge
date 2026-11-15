@@ -197,7 +197,8 @@ module.exports = function registerUseApprovals(deps) {
         : action === 'rotate-blind' ? `rotate the password of ${q.target_user}@${targetHost || ''} blind (a new random one, stored in your vault)`
         : action === 'delegation-widen' ? `widen agent delegation #${q.delegation_id}: ${[q.may_rotate === true ? 'it may rotate the password' : '', q.timeout_seconds ? `calls may wait up to ${q.timeout_seconds} s` : ''].filter(Boolean).join('; ')}`
         : action === 'operator-act' ? `run ${String(q.script_path || '').replace(/^\/opt\/dustforge\//, '')} as root on ${q.host_name} via ${q.route} (commit ${String(q.commit || '').slice(0, 10)}, sha256 ${String(q.script_sha256 || '').slice(0, 12)}…)`
-        : action === 'rotate-forgejo' ? `rotate the Forgejo login of ${q.username} blind (a new random one, stored in your vault)`
+        : action === 'limit-lift' ? `let ${targetHost || 'an agent'} make ${q.extra} more ${q.limiter === 'use' ? '/use calls (its own budget)' : q.limiter === 'use_total' ? '/use calls (all agents of this wallet)' : 'requests (the wallet\'s general budget, shared with this app)'} per 15 minutes for ${q.minutes} min — for "${String(q.label || '').slice(0, 80)}"${q.reason ? `: ${String(q.reason).slice(0, 120)}` : ''}`
+        : action === 'rotate-forgejo' ?`rotate the Forgejo login of ${q.username} blind (a new random one, stored in your vault)`
         : action === 'margin' ? `${q.service}: margin ${q.was}% → ${q.margin_pct}% over cost on every call`
         : action === 'connect' ? `point callers of ${q.service} at ${q.endpoint || '(nothing)'}; agents run ${q.mcp_server || '(no MCP server)'}`
         : `${targetHost || ''}: ${action}`;
