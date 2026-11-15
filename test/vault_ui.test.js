@@ -2286,3 +2286,61 @@ test('an approved call\'s outcome shows on the request, and a repeat of a failed
   assert.match(previousLine({ id: 59, status: 'used', outcome: { ran: true, exit_code: 127, note: 'missing' } }), /The same call, request #59 \(used\): .*exit 127/);
   assert.equal(previousLine({ id: 59, status: 'used' }), '');
 });
+
+// ── Search and edit (Aaron 2026-11-15) ──
+const searchVault = (extra = {}) => ({ json: { balance_dd: 1, health_summary: {}, secrets: [
+  { name: 'phasewhip-ssh', ref: 'DP-PWD-phasewh-00000001', type: 'password', use_count: 4338, health: 'red', username: 'apple', category: 'infrastructure', labels: ['brain'],
+    context_list: [{ id: 1, context_name: 'phasewhip', action_type: 'ssh_exec', target_host_pattern: '100.83.112.88', allowed_commands: ['true'] }], attention: [{ reason: 'last_use_failed', at: '2026-11-14T20:20:00Z' }], recent_outcomes: [], ...extra },
+  { name: 'skypie-sudo', ref: 'DP-PWD-skypie-00000002', type: 'password', use_count: 3, health: 'green', username: 'skypie', category: '', labels: [],
+    context_list: [], attention: [{ reason: 'leaked', at: '2026-11-07T00:00:00Z' }], recent_outcomes: [] },
+  { name: 'openai-key', ref: 'DP-API-openai-00000003', type: 'api_key', use_count: 9, health: 'green', category: 'services', labels: ['llm'],
+    context_list: [{ id: 2, context_name: 'oa', action_type: 'http_header', target_url_pattern: 'https://api.openai.com/*' }], attention: [], recent_outcomes: [] },
+] } });
+
+test('vault search matches name, host, account, label and URL — and "needs attention" lists the two that need it', async () => {
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p) => (p === '/api/demipass/dashboard' ? searchVault() : null)) });
+  await settle();
+  await pg.ctx.__realLoadVault();
+  const find = (q, attention = false) => { pg.ctx.vaultSearch.q = q; pg.ctx.vaultSearch.attention = attention; pg.ctx.lastSecretsSig = ''; pg.ctx.renderSecrets(); return pg.el('secret-list').innerHTML; };
+  for (const [q, hit, miss] of [['100.83', 'phasewhip-ssh', 'openai-key'], ['apple', 'phasewhip-ssh', 'skypie-sudo'], ['llm', 'openai-key', 'phasewhip-ssh'],
+                               ['api.openai', 'openai-key', 'skypie-sudo'], ['skypie', 'skypie-sudo', 'openai-key'], ['infra brain', 'phasewhip-ssh', 'openai-key']]) {
+    const h = find(q); assert.match(h, new RegExp(hit), q); assert.doesNotMatch(h, new RegExp(miss), q);
+  }
+  assert.match(find('nothing-like-this'), /Nothing matches/);
+  const attn = find('', true);
+  assert.match(attn, /phasewhip-ssh/); assert.match(attn, /skypie-sudo/); assert.doesNotMatch(attn, /openai-key/);
+  assert.match(attn, /last use failed/); assert.match(attn, /leaked/);
+  assert.match(pg.el('vault-attn').textContent, /\(2\)/, 'the button counts them');
+  const pools = find('', false);
+  assert.doesNotMatch(pools, /Nothing matches/, 'an empty search goes back to the pools');
+});
+
+test('edit value: the field takes no autofill or copy, two entries must match, and the call never carries the old value', async () => {
+  const sent = [];
+  const pg = page({ storage: signedIn, routes: vaultRoutes((p, body) => {
+    if (p === '/api/demipass/dashboard') return searchVault();
+    if (p === '/api/demipass/edit') { sent.push(body); return { json: { ok: true, ref: body.ref, new_name: 'phasewhip-ssh_v2', new_version: 2, contexts_transferred: 1, delegations_transferred: 1, delegations_ended: 0 } }; }
+    return null;
+  }) });
+  await settle();
+  await pg.ctx.__realLoadVault();
+  pg.ctx.showDetail('phasewhip-ssh');
+  assert.match(pg.el('detail-content').innerHTML, /Edit value/);
+  assert.match(pg.el('detail-content').innerHTML, /its last use failed|last_use_failed/);
+  pg.ctx.openEdit('phasewhip-ssh');
+  const form = pg.el('edit-box').innerHTML;
+  for (const a of ['type="password"', 'autocomplete="new-password"', 'autocapitalize="off"', 'spellcheck="false"', 'oncopy="return false"', 'oncut="return false"']) assert.ok(form.includes(a), a);
+  pg.qsa['input[name="edit-mode"]:checked'] = [{ value: 'typed' }];
+  pg.ctx.document.querySelector = (sel) => (pg.qsa[sel] || [])[0] || null;
+  pg.el('edit-v1').value = 'typed-new-value-1'; pg.el('edit-v2').value = 'typed-new-value-2';
+  await pg.ctx.saveEdit('phasewhip-ssh');
+  assert.equal(sent.length, 0, 'two different entries are not sent');
+  assert.match(pg.el('edit-note').textContent, /differ/);
+  assert.equal(pg.el('edit-v1').value, '', 'and the fields are emptied');
+  pg.el('edit-v1').value = 'typed-new-value-1'; pg.el('edit-v2').value = 'typed-new-value-1';
+  await pg.ctx.saveEdit('phasewhip-ssh');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(Object.keys(sent[0]).sort(), ['new_value', 'ref']);
+  assert.equal(sent[0].ref, 'DP-PWD-phasewh-00000001');
+  assert.equal(pg.el('edit-v1').value, '', 'emptied after saving');
+});

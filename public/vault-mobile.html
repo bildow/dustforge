@@ -233,6 +233,15 @@
         </div>
       </div>
       <div id="vault-note" style="font-size:0.7rem;color:var(--yellow);text-align:center"></div>
+      <!-- Search (Aaron 2026-11-15): by name, ref, host, account, scope, pool, label or type — never by value (the vault
+           never has values on screen). "Needs attention": the live value was written before a logged leak of it, or its
+           last use failed. -->
+      <input id="vault-q" type="search" placeholder="Search: name, host, account, scope, label" autocomplete="off" autocapitalize="off" spellcheck="false"
+        oninput="vaultSearch.q=this.value;lastSecretsSig='';renderSecrets()" style="width:100%;margin:0.2rem 0 0.4rem;padding:0.55rem 0.7rem;background:var(--card);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:0.85rem">
+      <div style="display:flex;gap:0.4rem;align-items:center;margin-bottom:0.4rem;font-size:0.72rem">
+        <button id="vault-attn" class="btn-ghost" style="font-size:0.72rem" onclick="vaultSearch.attention=!vaultSearch.attention;lastSecretsSig='';renderSecrets()">⚠ Needs attention</button>
+        <span id="vault-search-note" style="color:var(--text3)"></span>
+      </div>
       <div style="font-size:0.65rem;color:var(--text3);text-align:center;margin-bottom:0.4rem">Hold a secret, then drag it onto another pool to move it.</div>
       <div id="secret-list"><div class="empty">Loading...</div></div>
     </div>
@@ -2328,14 +2337,51 @@ var vaultPools = { pools: [], uncategorized: 0 };
 const poolKey = (s) => (s.category ? String(s.category).toLowerCase() : 'uncategorized');
 const poolLabel = (k) => titleCase(String(k).replace(/-/g, ' '));
 var lastSecretsSig = '';
+// Search over what the vault shows about a secret — never its value, which is never on the phone.
+var vaultSearch = { q:'', attention:false };
+function secretHaystack(s){
+  const ctx = (s.context_list || []).map(c => [c.context_name, c.action_type, c.target_host_pattern, c.target_url_pattern].join(' '));
+  return [s.name, s.ref, s.category, (s.labels || []).join(' '), s.username, s.provider, s.type, ...ctx].filter(Boolean).join(' ').toLowerCase();
+}
+const needsAttention = (s) => Array.isArray(s.attention) && s.attention.length > 0;
+function attentionLine(s){
+  return (s.attention || []).map(a => a.reason === 'leaked' ? 'leaked '+new Date(a.at).toLocaleDateString()+', value unchanged since' : a.reason === 'last_use_failed' ? 'last use failed' : a.reason).join(' · ');
+}
+function renderSearch(){
+  const q = vaultSearch.q.trim().toLowerCase(), words = q.split(/\s+/).filter(Boolean);
+  const rows = secrets.filter(s => (!vaultSearch.attention || needsAttention(s)) && words.every(w => secretHaystack(s).includes(w)));
+  const nAttn = secrets.filter(needsAttention).length;
+  const note = document.getElementById('vault-search-note');
+  if(note) note.innerHTML = rows.length+' of '+secrets.length+(q?' · <a href="#" style="color:var(--accent)" onclick="searchRequests();return false">search requests too</a>':'');
+  let h = '';
+  if(!rows.length) h = '<div class="empty">'+(vaultSearch.attention&&!q?'Nothing needs attention.':'Nothing matches.')+'</div>';
+  for(const s of rows){
+    const healthColor = s.health==='red'?'var(--red)':s.health==='yellow'?'var(--yellow)':s.health==='green'?'var(--green)':'var(--text3)';
+    const where = [...new Set((s.context_list||[]).map(c => (c.action_type==='http_header'||c.action_type==='http_body') ? c.target_url_pattern : c.target_host_pattern).filter(x => x && x !== '*'))].slice(0,3).join(', ');
+    h += '<div data-ref="'+esc(s.ref||'')+'" onclick="showDetail('+jsArg(s.name)+')" class="secret-row" style="display:flex;align-items:center;gap:0.6rem;padding:0.45rem 0.5rem;cursor:pointer;border-radius:8px;background:var(--card);margin-bottom:0.3rem">';
+    h += '<div style="width:10px;height:10px;border-radius:50%;flex-shrink:0;background:'+healthColor+'"></div>';
+    h += '<div style="flex:1;min-width:0"><div style="font-size:0.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(s.name)+'</div>';
+    h += '<div style="font-size:0.65rem;color:var(--text3)">'+esc(poolLabel(poolKey(s)))+(s.username?' · '+esc(s.username):'')+(where?' · '+esc(where):'')+'</div>';
+    if(needsAttention(s)) h += '<div style="font-size:0.65rem;color:var(--red)">⚠ '+esc(attentionLine(s))+'</div>';
+    h += '</div></div>';
+  }
+  document.getElementById('secret-list').innerHTML = h;
+}
+function searchRequests(){
+  reqFilter.q = vaultSearch.q; const el = document.getElementById('req-q'); if(el) el.value = vaultSearch.q; openRequests('');
+}
 function renderSecrets(){
   // A refresh never pulls the row out from under a finger: it waits for the hold or drag to end (#91 review M2).
   if(poolDrag.active || poolDrag.holding){ poolDrag.pendingRender = true; return; }
   // A poll that brings nothing new changes nothing on screen (Aaron 2026-11-12: pools folded and the view jumped while
   // he read): same data, same pools → no redraw.
-  const sig = JSON.stringify([secrets.map(s => [s.name, s.ref, s.category, s.health, s.frozen, s.use_count, s.type, s.recommendation, (s.recent_outcomes || []).slice(0, 3).map(o => o.outcome)]), vaultPools]);
+  const sig = JSON.stringify([secrets.map(s => [s.name, s.ref, s.category, s.health, s.frozen, s.use_count, s.type, s.recommendation, (s.recent_outcomes || []).slice(0, 3).map(o => o.outcome), (s.attention || []).map(a => a.reason)]), vaultPools, vaultSearch]);
   if(sig === lastSecretsSig) return;   // every other writer of the list resets lastSecretsSig (#99 review M5)
   lastSecretsSig = sig;
+  const attnBtn = document.getElementById('vault-attn'), nAttn = secrets.filter(needsAttention).length;
+  if(attnBtn){ attnBtn.textContent = '⚠ Needs attention'+(nAttn?' ('+nAttn+')':''); attnBtn.style.borderColor = vaultSearch.attention ? 'var(--red)' : ''; attnBtn.style.color = nAttn ? 'var(--red)' : ''; }
+  if(vaultSearch.q.trim() || vaultSearch.attention) return renderSearch();
+  { const note = document.getElementById('vault-search-note'); if(note) note.textContent = ''; }
   const groups = {};
   for(const s of secrets){ const k = poolKey(s); (groups[k] = groups[k] || []).push(s); }
   for(const p of (vaultPools.pools || [])) if(!groups[p.name]) groups[p.name] = [];
@@ -2601,6 +2647,7 @@ function showDetail(name) {
   h += `<div><div style="font-size:1.1rem;font-weight:700">${esc(s.name)}</div>`;
   h += `<div style="font-size:0.75rem;color:${healthColor};font-weight:600">${healthLabel}${s.frozen?' — FROZEN':''}</div></div>`;
   h += `</div>`;
+  if(needsAttention(s)) h += `<div style="border:1px solid var(--red);border-radius:10px;padding:0.6rem 0.8rem;margin-bottom:1rem;font-size:0.78rem;color:var(--red)">⚠ ${(s.attention||[]).map(a=>esc(a.note||a.reason)).join('<br>⚠ ')}</div>`;
 
   // Info grid
   h += `<div style="background:var(--card);border-radius:10px;padding:1rem;margin-bottom:1rem;font-size:0.8rem">`;
@@ -2733,6 +2780,15 @@ function showDetail(name) {
   h += `<button onclick="revealSecret(${jsArg(s.name)})" id="reveal-btn" style="padding:0.6rem 1.5rem;border:1px solid var(--orange);background:none;border-radius:8px;color:var(--orange);font-weight:600;font-size:0.8rem;cursor:pointer">${esc(revLabel)}</button>`;
   h += `</div></div>`;
 
+  // Edit value (Aaron 2026-11-15): replace the value without ever seeing the old one — typed here, or copied from
+  // another of your entries for the same login. Same entry (the ref stays), scopes and your own agents' grants carry over.
+  h += `<div style="margin-bottom:1rem"><div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem">Edit value</div>`;
+  h += `<div style="background:var(--card);border:1px solid var(--border);border-radius:10px;padding:0.8rem;font-size:0.75rem">`;
+  if(s.seen_by_person_at) h += `<div style="color:var(--yellow);margin-bottom:0.4rem">A person has seen this value (${esc(new Date(String(s.seen_by_person_at).replace(' ','T')+'Z').toLocaleDateString())}). When the host allows it, rotate it blind so nobody knows the next one.</div>`;
+  if(s.ref && s.status !== 'rotating') h += `<div id="edit-box"><button class="btn-ghost" style="font-size:0.75rem" onclick="openEdit(${jsArg(s.name)})">Edit value…</button></div>`;
+  else h += `<div style="color:var(--text3)">${s.ref ? 'This version is on its way out; edit the current one.' : 'This entry has no ref, so it cannot be edited here.'}</div>`;
+  h += `</div></div>`;
+
   // Action buttons
   h += `<div style="display:flex;gap:0.5rem;flex-wrap:wrap">`;
   h += `<button onclick="toggleFreeze(${jsArg(s.name)},${!s.frozen})" style="flex:1;padding:0.7rem;border:1px solid ${s.frozen?'var(--green)':'var(--accent)'};background:none;border-radius:8px;color:${s.frozen?'var(--green)':'var(--accent)'};font-weight:600;font-size:0.8rem;cursor:pointer">${s.frozen?'Unfreeze':'Freeze'}</button>`;
@@ -2744,7 +2800,92 @@ function showDetail(name) {
   document.getElementById('page-detail').classList.add('active');
 }
 
+// ── Edit value ──────────────────────────────────────────────────────────────────────────────────────────────────
+// The field takes no autofill, no suggestions or learning (type=password), no copy, cut, drag or context menu, and is
+// emptied on save, cancel and leaving the page. An app that knows setSecure blocks screenshots while it is open.
+var editApproval = {};   // entry name → the approval id a critical edit is waiting on
+function secureWindow(on){ try{ if(typeof window!=='undefined' && window.DemiPassDevice && typeof window.DemiPassDevice.setSecure==='function') window.DemiPassDevice.setSecure(!!on); }catch(_){} }
+const EDIT_FIELD = 'type="password" autocomplete="new-password" autocorrect="off" autocapitalize="off" spellcheck="false" data-lpignore="true" data-1p-ignore="true" maxlength="10000" oncopy="return false" oncut="return false" ondragstart="return false" oncontextmenu="return false" style="width:100%;margin:0.25rem 0;padding:0.5rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:monospace"';
+function openEdit(name){
+  const s = secrets.find(x => x.name === name); if(!s) return;
+  const base = (n) => String(n).replace(/_v\d+$/, '');
+  const others = secrets.filter(x => x.ref && x.status !== 'rotating' && base(x.name) !== base(s.name) && !x.wrapped && (!s.username || !x.username || x.username === s.username));
+  let h = '<div style="display:flex;gap:0.8rem;margin-bottom:0.4rem"><label><input type="radio" name="edit-mode" value="typed" checked onchange="editMode()"> Type it</label>'
+    + (others.length ? '<label><input type="radio" name="edit-mode" value="copy" onchange="editMode()"> Copy from another entry</label>' : '') + '</div>';
+  h += '<div id="edit-typed"><input id="edit-v1" '+EDIT_FIELD+' placeholder="New value"><input id="edit-v2" '+EDIT_FIELD+' placeholder="Same value again"></div>';
+  if(others.length){
+    h += '<div id="edit-copy" style="display:none"><select id="edit-from" style="width:100%;padding:0.4rem;margin:0.25rem 0">'
+      + others.map(x => '<option value="'+esc(x.ref)+'">'+esc(x.name)+(x.username?' ('+esc(x.username)+')':'')+'</option>').join('') + '</select>'
+      + '<label style="display:block;margin-top:0.2rem"><input type="checkbox" id="edit-retire"> Delete that entry afterwards</label>'
+      + '<div style="color:var(--text3);margin-top:0.2rem">The value is copied inside the vault; neither you nor anyone else sees it. Entries wrapped to your phone cannot be copied.</div></div>';
+  }
+  h += '<div style="color:var(--text3);margin:0.3rem 0">'+(s.security_depth==='critical'?'Needs your PIN, the email code, and an approval.':s.security_depth==='elevated'?'Needs your PIN and the email code.':'Needs your PIN.')
+    + ' The old value is never shown. Scopes and your own agents\' grants move to the new value.</div>';
+  h += '<div style="display:flex;gap:0.5rem"><button class="btn-primary" onclick="saveEdit('+jsArg(name)+')">Save</button><button class="btn-ghost" onclick="closeEdit('+jsArg(name)+')">Cancel</button></div><div id="edit-note" style="margin-top:0.4rem"></div>';
+  document.getElementById('edit-box').innerHTML = h;
+  secureWindow(true);
+}
+function editMode(){
+  const copy = (document.querySelector('input[name="edit-mode"]:checked') || {}).value === 'copy';
+  document.getElementById('edit-typed').style.display = copy ? 'none' : '';
+  const c = document.getElementById('edit-copy'); if(c) c.style.display = copy ? '' : 'none';
+}
+function clearEditFields(){ for(const id of ['edit-v1','edit-v2']){ const el = document.getElementById(id); if(el) el.value = ''; } }
+function closeEdit(name){
+  clearEditFields(); secureWindow(false);
+  const box = document.getElementById('edit-box');
+  if(box) box.innerHTML = '<button class="btn-ghost" style="font-size:0.75rem" onclick="openEdit('+jsArg(name)+')">Edit value…</button>';
+}
+async function saveEdit(name, confirmLeft){
+  const s = secrets.find(x => x.name === name); if(!s) return;
+  const note = document.getElementById('edit-note');
+  const copy = (document.querySelector('input[name="edit-mode"]:checked') || {}).value === 'copy';
+  const body = { ref: s.ref };
+  if(copy){
+    body.from_ref = document.getElementById('edit-from').value;
+    body.retire_source = !!document.getElementById('edit-retire').checked;
+  } else {
+    const v1 = document.getElementById('edit-v1').value, v2 = document.getElementById('edit-v2').value;
+    if(!v1.trim()){ note.textContent = 'Type the new value.'; return; }
+    if(v1 !== v2){ note.textContent = 'The two entries differ — type the same value twice.'; clearEditFields(); return; }
+    body.new_value = v1;
+  }
+  if(confirmLeft) body.confirm_left = true;
+  if(editApproval[name]) body.approval_id = editApproval[name];
+  note.textContent = 'Saving…';
+  let d;
+  try{ d = await apiGated('POST','/api/demipass/edit', body, 'Replace the value of '+name+'?'); }
+  catch(e){
+    if(sessionEnded(e)) return;
+    if(/stay with the old value and end with this edit/.test(e.message) && !confirmLeft){
+      note.textContent = '';
+      if(confirm(e.message.replace(/ — send confirm_left.*$/, '')+'.\n\nGo ahead?')) return saveEdit(name, true);
+      return;
+    }
+    if(/approval/i.test(e.message)) delete editApproval[name];
+    note.textContent = e.message; return;
+  }
+  if(d && d.status === 'approval_pending'){
+    editApproval[name] = d.approval_id;
+    note.innerHTML = 'Critical: approve request #'+Number(d.approval_id)+' (it is waiting at the top), then tap Save again.';
+    return;
+  }
+  delete editApproval[name];
+  clearEditFields(); secureWindow(false);
+  const parts = ['Saved as '+d.new_name+'.'];
+  if(d.contexts_transferred) parts.push(d.contexts_transferred+' scope'+(d.contexts_transferred===1?'':'s')+' kept.');
+  if(d.delegations_transferred) parts.push(d.delegations_transferred+' agent grant'+(d.delegations_transferred===1?'':'s')+' moved.');
+  if(d.delegations_ended) parts.push(d.delegations_ended+' other grant'+(d.delegations_ended===1?'':'s')+' ended.');
+  if(d.source_retired) parts.push('The source entry was deleted.');
+  if(d.wrapped === false) parts.push('Not wrapped to your phone: '+(d.wrap_note||''));
+  alert(parts.join(' '));
+  lastSecretsSig = '';
+  await loadVault();
+  if(secrets.find(x => x.name === d.new_name)) showDetail(d.new_name);
+}
+
 function closeDetail(){
+  clearEditFields(); secureWindow(false);
   document.getElementById('page-detail').classList.remove('active');
   document.getElementById('page-vault').classList.add('active');
   loadVault();
