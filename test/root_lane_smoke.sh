@@ -150,7 +150,7 @@ call POST /api/demipass/use "$N" "$(USE "$OREF" self racknerd-self root)"
 
 # ── loopback is not a host otherwise ──
 bad=0
-for h in 127.0.0.1 0 2130706433 0x7f000001 0177.0.0.1 localhost. ip6-localhost localtest.me 127.0.1.1 100.73.251.12 010.0.0.9 ::1 [::1] 0:0:0:0:0:0:0:1 ::ffff:127.0.0.1; do
+for h in 127.0.0.1 0 2130706433 0x7f000001 0177.0.0.1 localhost. ip6-localhost localtest.me 127.0.1.1 100.73.251.12 010.0.0.9 ::1 '[::1]' 0:0:0:0:0:0:0:1 ::ffff:127.0.0.1; do
   X "INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES ($PID, 'h-$h', 'ssh_exec', '*', '$h', 'smoke')"
   : > "$S/ssh.log"; call POST /api/demipass/use "$A" "$(USE "$PREF" "h-$h" "$h" root)"
   { [ "$CODE" = 200 ] || [ -s "$S/ssh.log" ]; } && { bad=1; echo "  $h → $CODE connected=$([ -s "$S/ssh.log" ] && echo yes || echo no)"; }

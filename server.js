@@ -52,7 +52,8 @@ const SELF_ADDRESSES = new Set(['192.3.84.103', '100.73.251.12']);   // this box
 // Where the root lane connects. IPv6 loopback, not 127.0.0.1: racknerd's ip nat table ends in an unconditional
 // `POSTROUTING -j MASQUERADE`, which rewrites a local connect to 127.0.0.1 so sshd sees it from 192.3.84.103 (and
 // the root Match on 127.0.0.1,::1 never applies). The ip6 nat table has no such rule, so ::1 arrives as ::1.
-// Only the self lane ever passes this to sshRun; no caller-supplied host can be it (SSH_HOST_RE has no ':').
+// sshRun accepts it only with selfLane:true, which only the /use token path's self lane passes (after
+// selfLaneRefusal); without the flag SSH_HOST_RE applies, and it has no ':'.
 const SELF_CONNECT_HOST = '::1';
 const BLINDKEY_SSH_HOSTS = new Set([
   '192.3.84.103',      // RackNerd
