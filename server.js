@@ -49,6 +49,12 @@ const BLINDKEY_SMTP_HOSTS = ['smtp.gmail.com', 'smtp.sendgrid.net', 'email-smtp.
 const BLINDKEY_DB_HOSTS = ['supabase.co', 'api.planetscale.com', 'data.mongodb-api.com', 'api.turso.tech'];
 const SELF_SSH_ALIAS = 'racknerd-self';   // the root lane's host name (see selfLaneRefusal)
 const SELF_ADDRESSES = new Set(['192.3.84.103', '100.73.251.12']);   // this box's own addresses: never an extra host
+// Where the root lane connects. IPv6 loopback, not 127.0.0.1: racknerd's ip nat table ends in an unconditional
+// `POSTROUTING -j MASQUERADE`, which rewrites a local connect to 127.0.0.1 so sshd sees it from 192.3.84.103 (and
+// the root Match on 127.0.0.1,::1 never applies). The ip6 nat table has no such rule, so ::1 arrives as ::1.
+// sshRun accepts it only with selfLane:true, which only the /use token path's self lane passes (after
+// selfLaneRefusal); without the flag SSH_HOST_RE applies, and it has no ':'.
+const SELF_CONNECT_HOST = '::1';
 const BLINDKEY_SSH_HOSTS = new Set([
   '192.3.84.103',      // RackNerd
   '100.83.112.88',     // phasewhip
@@ -217,9 +223,12 @@ function ownFleetAgent(ownerDid, agentDid) {
 function isAgentAuth(auth) {
   return !auth || !auth.ok || !!auth.silicon || !!(auth.decoded && (auth.decoded.wrk || auth.decoded.auth_method === 'worker' || auth.decoded.auth_method === 'fleet_owner_mint'));
 }
-function sshRun(user, host, password, remoteCommand, { input, timeout = 30000 } = {}) {
+function sshRun(user, host, password, remoteCommand, { input, timeout = 30000, selfLane = false } = {}) {
   const refuse = (why) => { throw Object.assign(new Error(why), { stdout: '', stderr: why, status: 2 }); };
-  if (!SSH_USER_RE.test(String(user)) || !SSH_HOST_RE.test(String(host))) refuse('invalid ssh user or host');
+  // SELF_CONNECT_HOST is accepted only when the caller says this is the self lane (after selfLaneRefusal), and the
+  // self lane connects nowhere else: a future call site that skips the host set still cannot reach ::1.
+  const hostOk = selfLane ? host === SELF_CONNECT_HOST : SSH_HOST_RE.test(String(host));
+  if (!SSH_USER_RE.test(String(user)) || !hostOk) refuse('invalid ssh user or host');
   if (typeof remoteCommand !== 'string' || /^\s*-/.test(remoteCommand) || remoteCommand.includes('\0')) refuse('invalid ssh command');
   // sshpass types the password and a newline, and ssh stops at the first one: a stored password ending in one line
   // break has always logged in without it. A NUL or a line break inside is refused.
@@ -5480,7 +5489,7 @@ function preflightOf(command) {
   if (!m || !m[2].includes('/')) return null;   // a bare name is found on PATH (bash, too, searches PATH): not checked
   return { path: m[2], flag: m[1] ? '-r' : '-x', want: m[1] ? 'readable' : 'executable' };
 }
-async function sshPreflight(req, secret, { user, host, password, command, sudo, keySecret = null, values = [] }) {
+async function sshPreflight(req, secret, { user, host, password, command, sudo, keySecret = null, values = [], selfLane = false }) {
   const p = preflightOf(command);
   if (!p || sudo || preflightSkip.has(host + '|' + user)) return null;
   const n = crypto.randomBytes(9).toString('hex');
@@ -5490,7 +5499,7 @@ async function sshPreflight(req, secret, { user, host, password, command, sudo, 
   // ran: inconclusive, the call goes ahead. Any other ending without the marker — another exit, a timeout, other output —
   // means something else ran in its place (a forced command): that host+user is not checked again (#111 re-review M1).
   let out, ranElse = false;
-  try { out = String(await sshRun(user, host, password, `test ${p.flag} ${p.path} && echo DPPF-ok-${n} || echo DPPF-no-${n}`, { timeout: 20000 })).trim(); }
+  try { out = String(await sshRun(user, host, password, `test ${p.flag} ${p.path} && echo DPPF-ok-${n} || echo DPPF-no-${n}`, { timeout: 20000, selfLane })).trim(); }
   catch (e) {
     out = String(e.stdout || '').trim();
     if (e.timedOut || (e.status !== 255 && e.status !== 2)) ranElse = out !== `DPPF-ok-${n}` && out !== `DPPF-no-${n}`;
@@ -5739,7 +5748,7 @@ async function useRoute(req, res) {
             logSecurityEvent('host_whitelist_denied', 'critical', { caller_did: req.identity?.did, agent_name: getBearerIdentity(req)?.agent_name, capability: 'ssh_exec', target: target_host, error: 'host not in SSH whitelist', ip: req.ip });
             return res.status(403).json({ error: `host ${target_host} not in SSH whitelist` });
           }
-          const connectHost = selfLane ? '127.0.0.1' : target_host;
+          const connectHost = selfLane ? SELF_CONNECT_HOST : target_host;
 
           const dangerousPatterns = [/`/, /\$\(/, /\|\s*(curl|wget|nc|ncat)/i, />\s*\/dev\/tcp/, /\beval\b/, /(?:^|[;&]|&&|\|\|)\s*exec\s/, /\bsource\b/, /\b(curl|wget)\b.*\|/i];
           for (const pat of dangerousPatterns) {
@@ -5763,7 +5772,7 @@ async function useRoute(req, res) {
           }
 
           if (req._approvalId) {   // an approved call: check the script is there before the approval is spent on it
-            const pf = await sshPreflight(req, secret, { user: effectiveUser, host: connectHost, password, command, sudo, keySecret });
+            const pf = await sshPreflight(req, secret, { user: effectiveUser, host: connectHost, password, command, sudo, keySecret, selfLane });
             if (pf) return res.status(pf.status).json(pf.body);
           }
           try {
@@ -5773,7 +5782,7 @@ async function useRoute(req, res) {
             const input = sudo === 'password' ? String(password).replace(/\r?\n$/, '') + '\n' + (stdin || '') : (stdin === undefined ? undefined : stdin);
             egressLog(req, secret, 'ssh_exec', target_host);   // written before the connection: the outbound log
             if (keySecret) egressLog(req, keySecret, 'ssh_exec', target_host);
-            const output = await sshRun(effectiveUser, connectHost, password, remote, { input, timeout: callTimeoutMs });
+            const output = await sshRun(effectiveUser, connectHost, password, remote, { input, timeout: callTimeoutMs, selfLane });
             const redactedOutput = output
               .replace(new RegExp(password.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]')
               .replace(new RegExp(decryptedValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '[REDACTED]');

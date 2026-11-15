@@ -1,6 +1,6 @@
 #!/bin/bash
 # The root lane and the operator act (2026-11-14 root-lane adversarial review; ops/root-lane/).
-#   - /use ssh_exec on the alias `racknerd-self` connects to 127.0.0.1, and only for the root lane's owner, in their own
+#   - /use ssh_exec on the alias `racknerd-self` connects to ::1 (IPv6 loopback; racknerd masquerades IPv4 loopback), and only for the root lane's owner, in their own
 #     session, with the entry wrapped to their phone (each call a tap), as root, with no key_name and no sudo;
 #   - the alias is not a host anywhere else (rotate-blind), and loopback cannot be added to the host set by the
 #     environment (BLINDKEY_SSH_HOSTS_EXTRA);
@@ -125,8 +125,8 @@ B=$(USE "$RREF" self racknerd-self root); call POST /api/demipass/use "$A" "$B";
 [ "$CODE" = 202 ] && [ "$AP" != None ] && ok "the owner's root-lane call parks for the phone (wrapped entry)" || fail "park: $CODE $BODY"
 approve "$AP" "$RREF" rootlane
 call POST /api/demipass/use "$A" "$(WITH "$B" "$AP")"
-[ "$CODE" = 200 ] && grep -q -- "-- root@127.0.0.1 id -u" "$S/ssh.log" && grep -qxF "PW $RV" "$S/ssh.pw" && ! echo "$BODY" | grep -qF -- "$RV" \
-  && ok "…approved with the phone's unwrap: it logs in to root@127.0.0.1 with the stored password, never shown" || fail "lane: $CODE $BODY $(cat $S/ssh.log)"
+[ "$CODE" = 200 ] && grep -q -- "-- root@::1 id -u" "$S/ssh.log" && grep -qxF "PW $RV" "$S/ssh.pw" && ! echo "$BODY" | grep -qF -- "$RV" \
+  && ok "…approved with the phone's unwrap: it logs in to root@::1 with the stored password, never shown" || fail "lane: $CODE $BODY $(cat $S/ssh.log)"
 grep -q -- "-o PubkeyAuthentication=no" "$S/ssh.log" && ok "…by password alone (no key is offered)" || fail "pubkey: $(cat $S/ssh.log)"
 
 # refusals BEFORE the phone is asked (#119 review M5): a call that could never run pages nobody and unwraps nothing
@@ -150,12 +150,12 @@ call POST /api/demipass/use "$N" "$(USE "$OREF" self racknerd-self root)"
 
 # ── loopback is not a host otherwise ──
 bad=0
-for h in 127.0.0.1 0 2130706433 0x7f000001 0177.0.0.1 localhost. ip6-localhost localtest.me 127.0.1.1 100.73.251.12 010.0.0.9; do
+for h in 127.0.0.1 0 2130706433 0x7f000001 0177.0.0.1 localhost. ip6-localhost localtest.me 127.0.1.1 100.73.251.12 010.0.0.9 ::1 '[::1]' 0:0:0:0:0:0:0:1 ::ffff:127.0.0.1; do
   X "INSERT INTO blindkey_contexts (secret_id, context_name, action_type, target_url_pattern, target_host_pattern, allowed_by) VALUES ($PID, 'h-$h', 'ssh_exec', '*', '$h', 'smoke')"
   : > "$S/ssh.log"; call POST /api/demipass/use "$A" "$(USE "$PREF" "h-$h" "$h" root)"
   { [ "$CODE" = 200 ] || [ -s "$S/ssh.log" ]; } && { bad=1; echo "  $h → $CODE connected=$([ -s "$S/ssh.log" ] && echo yes || echo no)"; }
 done
-[ $bad = 0 ] && ok "loopback in any spelling (0, 2130706433, 0x7f000001, 0177.0.0.1, localhost., ip6-localhost, a name), the box's own tailnet IP, an octal-looking IP: refused although named in BLINDKEY_SSH_HOSTS_EXTRA" || fail "loopback extra"
+[ $bad = 0 ] && ok "loopback in any spelling (0, 2130706433, 0x7f000001, 0177.0.0.1, localhost., ip6-localhost, ::1 in four spellings, a name), the box's own tailnet IP, an octal-looking IP: refused although named in BLINDKEY_SSH_HOSTS_EXTRA" || fail "loopback extra"
 [ "$(grep -c "BLINDKEY_SSH_HOSTS_EXTRA: '" "$S/server.log")" -ge 26 ] && ok "…each ignored entry is named in the server log at start" || fail "boot warnings: $(grep -c "BLINDKEY_SSH_HOSTS_EXTRA: '" "$S/server.log")"
 : > "$S/ssh.log"; call POST /api/demipass/use "$A" "$(USE "$PREF" lan 10.0.0.9 root)"
 [ "$CODE" = 200 ] && grep -q -- "-- root@10.0.0.9" "$S/ssh.log" && ok "…while a plain public-or-private IPv4 in it is accepted" || fail "extra host: $CODE $BODY"
