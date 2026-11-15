@@ -6503,6 +6503,8 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
     if (rotatingSecrets.has(source.id)) return res.status(409).json({ error: 'the source is being rotated right now — try again in a minute' });
     if (cryptoDepth.isWrapped(source)) return res.status(409).json({ error: 'the source is wrapped to your phone, so the server cannot read it to copy — lower it to standard first (your phone unwraps it), or type the value', wrapped: true });
     if (githubAppLib.isAppKey(source)) return res.status(403).json({ error: 'a GitHub App key is never copied — it only mints installation tokens' });
+    if ((source.secret_type || '') !== (target.secret_type || '')) return res.status(409).json({ error: `the source is a ${source.secret_type} and the entry a ${target.secret_type} — copy only between entries of the same type` });
+    if (source.frozen) return res.status(409).json({ error: 'the source is frozen — unfreeze it first (a copy would carry its value past the breaker)' });
     if (DEPTH_RANK[depthName(source)] > DEPTH_RANK[depthName(target)]) {
       return res.status(409).json({ error: `the source is ${depthName(source)} and the entry is ${depthName(target)}: a copy would lower the value's depth — raise the entry to ${depthName(source)} first` });
     }
@@ -6517,8 +6519,9 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
   if (githubAppLib.isAppKey(target) && !typed) return res.status(400).json({ error: 'a GitHub App key is replaced only by the new .pem GitHub generates — paste it' });
 
   // Grants that would not follow the new version end with the old one: say so before any factor is asked.
-  const left = db.prepare("SELECT d.id, COALESCE(d.delegate_kind, 'agent') AS kind, d.delegate_did FROM demipass_delegations d WHERE d.secret_id = ? AND d.status = 'active'").all(target.id)
-    .filter(d => !(d.kind === 'agent' && ownFleetAgent(ownerDid, d.delegate_did)));
+  // (A person's share still on offer — status 'suspended' — ends too: it would point at a retired version.)
+  const left = db.prepare("SELECT d.id, d.status, COALESCE(d.delegate_kind, 'agent') AS kind, d.delegate_did FROM demipass_delegations d WHERE d.secret_id = ? AND d.status IN ('active', 'suspended')").all(target.id)
+    .filter(d => !(d.status === 'active' && d.kind === 'agent' && ownFleetAgent(ownerDid, d.delegate_did)));
   if (left.length && b.confirm_left !== true) {
     return res.status(409).json({ error: `${left.length} grant${left.length === 1 ? '' : 's'} (a person's share or an outside agent's delegation) stay with the old value and end with this edit — send confirm_left: true to go ahead`,
       left: left.length, left_kinds: [...new Set(left.map(d => d.kind))] });
@@ -6556,6 +6559,8 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
   // An edit replaces: the old version retires now, its value erased (the 60-minute timer then finds nothing to do).
   db.prepare(`UPDATE blindkey_secrets SET status = 'retired', ${ERASE_VALUE_SQL}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'rotating'`).run(target.id);
   db.prepare("UPDATE blindkey_contexts SET status = 'revoked' WHERE secret_id = ? AND status = 'active'").run(target.id);
+  // The grants that did not follow (confirmed above) end now, visibly, instead of pointing at a retired version.
+  const ended = db.prepare("UPDATE demipass_delegations SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP WHERE secret_id = ? AND status IN ('active', 'suspended')").run(target.id).changes;
   let retired = false;
   if (retireSource) {
     const s2 = db.prepare("SELECT id FROM blindkey_secrets WHERE id = ? AND status = 'active'").get(source.id);
@@ -6566,7 +6571,7 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
     }
   }
   const detail = { ref: target.ref_code, old_name: target.name, new_name: r.body.new_name, mode: typed ? 'typed' : 'copy', ...(source ? { from_ref: source.ref_code, from_name: source.name, source_retired: retired } : {}),
-    contexts_transferred: r.body.contexts_transferred, delegations_transferred: r.body.delegations_transferred, delegations_ended: r.body.delegations_left, factors: required };
+    contexts_transferred: r.body.contexts_transferred, delegations_transferred: r.body.delegations_transferred, delegations_ended: ended, factors: required };
   db.prepare('INSERT INTO blindkey_events (event_type, actor, secret_id, detail) VALUES (?, ?, ?, ?)').run('secret_edited', ownerDid, r.body.new_secret_id, JSON.stringify(detail));
   logSecurityEvent('secret_value_edited', 'alert', { caller_did: ownerDid, capability: 'edit', target: r.body.new_name, ip: req.ip, context: detail });
   try {
@@ -6574,7 +6579,7 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
       .run(ownerDid, `Value ${typed ? 'edited' : 'copied from ' + source.name} by the owner: ${target.name.replace(/_v\d+$/, '')}`, req.ip || '', 'UTC', 'decision', JSON.stringify(['demipass:edit', `secret:${target.ref_code}`]));
   } catch (_) {}
   res.json({ ok: true, ref: target.ref_code, new_name: r.body.new_name, new_version: r.body.new_version, contexts_transferred: r.body.contexts_transferred,
-    delegations_transferred: r.body.delegations_transferred, delegations_ended: r.body.delegations_left, ...(source ? { source_retired: retired } : {}),
+    delegations_transferred: r.body.delegations_transferred, delegations_ended: ended, ...(source ? { source_retired: retired } : {}),
     ...(r.body.wrapped !== undefined ? { wrapped: r.body.wrapped, ...(r.body.wrap_note ? { wrap_note: r.body.wrap_note } : {}) } : {}),
     seen_by_person: Boolean(seenAt), next: seenAt ? 'a person has seen this value: rotate it blind when the host allows (DemiPass generates one nobody sees)' : undefined });
 });
@@ -6603,11 +6608,12 @@ function rotateSecretValue(ownerDid, existing, newValue, graceMins, ip = null, {
     db.prepare(`
       INSERT INTO blindkey_secrets (did, name, description, secret_type, encrypted_value, metadata, status, version,
                                     provider, ownership, rotatable, category, labels, rotation_interval_days, last_rotated_at,
-                                    security_depth, gate_policy, fill_origins, fill_username, account_username, seen_by_person_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?)
+                                    security_depth, gate_policy, fill_origins, fill_username, account_username, seen_by_person_at, frozen)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)
     `).run(ownerDid, newName, descriptionWithout(existing.description, existing.encrypted_value), existing.secret_type, encrypted, existing.metadata || '{}', newVersion,
            existing.provider || '', existing.ownership || 'sole', existing.rotatable ?? 1, existing.category, existing.labels, existing.rotation_interval_days,
-           existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null, existing.account_username ?? null, seenByPersonAt);
+           existing.security_depth, existing.gate_policy, existing.fill_origins ?? null, existing.fill_username ?? null, existing.account_username ?? null, seenByPersonAt,
+           existing.frozen ? 1 : 0);   // a tripped breaker stays tripped on the new version (it used to come back unfrozen)
 
     const newSecret = db.prepare('SELECT id FROM blindkey_secrets WHERE did = ? AND name = ?').get(ownerDid, newName);
 

@@ -2809,7 +2809,7 @@ const EDIT_FIELD = 'type="password" autocomplete="new-password" autocorrect="off
 function openEdit(name){
   const s = secrets.find(x => x.name === name); if(!s) return;
   const base = (n) => String(n).replace(/_v\d+$/, '');
-  const others = secrets.filter(x => x.ref && x.status !== 'rotating' && base(x.name) !== base(s.name) && !x.wrapped && (!s.username || !x.username || x.username === s.username));
+  const others = secrets.filter(x => x.ref && x.status !== 'rotating' && base(x.name) !== base(s.name) && !x.wrapped && !x.frozen && x.type === s.type && (!s.username || !x.username || x.username === s.username));
   let h = '<div style="display:flex;gap:0.8rem;margin-bottom:0.4rem"><label><input type="radio" name="edit-mode" value="typed" checked onchange="editMode()"> Type it</label>'
     + (others.length ? '<label><input type="radio" name="edit-mode" value="copy" onchange="editMode()"> Copy from another entry</label>' : '') + '</div>';
   h += '<div id="edit-typed"><input id="edit-v1" '+EDIT_FIELD+' placeholder="New value"><input id="edit-v2" '+EDIT_FIELD+' placeholder="Same value again"></div>';

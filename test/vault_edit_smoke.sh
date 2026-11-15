@@ -110,7 +110,7 @@ NEWNAME=$(echo "$BODY" | J new_name); T1B=$(Q "SELECT id FROM blindkey_secrets W
 [ "$(Q "SELECT status FROM blindkey_secrets WHERE id=$T1")" = retired ] && [ -z "$(Q "SELECT encrypted_value FROM blindkey_secrets WHERE id=$T1")" ] && ok "…the old version is retired at once, its value erased" || fail "old: $(Q "SELECT status FROM blindkey_secrets WHERE id=$T1")"
 [ "$(Q "SELECT COUNT(*) FROM blindkey_contexts WHERE secret_id=$T1B AND status='active' AND target_host_pattern='192.3.84.103'")" = 1 ] && ok "…the scope carried over" || fail "scope"
 [ "$(Q "SELECT secret_id FROM demipass_delegations WHERE id=$DG_OWN")" = "$T1B" ] && [ "$(Q "SELECT context_id FROM demipass_delegations WHERE id=$DG_OWN")" = "$(Q "SELECT id FROM blindkey_contexts WHERE secret_id=$T1B")" ] && ok "…the owner's own agent's delegation moved to the new version and its scope" || fail "own deleg: $(Q "SELECT secret_id FROM demipass_delegations WHERE id=$DG_OWN")"
-[ "$(Q "SELECT secret_id FROM demipass_delegations WHERE id=$DG_OUT")" = "$T1" ] && [ "$(echo "$BODY" | J delegations_ended)" = 1 ] && ok "…the outside agent's stayed with the old (retired) version: ended, as confirmed" || fail "outside deleg"
+[ "$(Q "SELECT secret_id FROM demipass_delegations WHERE id=$DG_OUT")" = "$T1" ] && [ "$(Q "SELECT status FROM demipass_delegations WHERE id=$DG_OUT")" = revoked ] && [ "$(echo "$BODY" | J delegations_ended)" = 1 ] && ok "…the outside agent's stayed with the old version and is revoked: ended, as confirmed" || fail "outside deleg: $(Q "SELECT status FROM demipass_delegations WHERE id=$DG_OUT")"
 [ -n "$(Q "SELECT seen_by_person_at FROM blindkey_secrets WHERE id=$T1B")" ] && [ "$(echo "$BODY" | J seen_by_person)" = True ] && ok "…the new version is marked as seen by a person (a blind rotation is offered next)" || fail "seen"
 [ "$(Q "SELECT COUNT(*) FROM blindkey_events WHERE event_type='secret_edited' AND secret_id=$T1B")" = 1 ] && [ "$(Q "SELECT COUNT(*) FROM ticks WHERE did='$DA' AND tags LIKE '%demipass:edit%'")" = 1 ] && ok "…a ledger event and a tick record the edit" || fail "ledger"
 pin "$A" "reveal:$T1B"; call POST /api/demipass/reveal "$A" '{"ref":"'$REF1'"}'
@@ -142,6 +142,15 @@ TGB=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$TREF'")
 [ "$(Q "SELECT seen_by_person_at FROM blindkey_secrets WHERE id=$TGB")" = None ] && ok "…a copy is as seen as its source (here: never seen)" || fail "copy seen: $(Q "SELECT seen_by_person_at FROM blindkey_secrets WHERE id=$TGB")"
 pin "$A" "reveal:$TGB"; call POST /api/demipass/reveal "$A" '{"ref":"'$TREF'"}'
 [ "$(echo "$BODY" | J value)" = "$SRCV" ] && ok "…and the entry holds the source's value" || fail "copied value"
+# a source of another type, or a frozen one, is refused
+call POST /api/demipass/store "$A" '{"name":"ve-key","value":"key-zz78","secret_type":"api_key"}'; KREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE name='ve-key'")
+call POST /api/demipass/edit "$A" "$(EDIT '{"ref":"'$TREF'","from_ref":"'$KREF'"}')"
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "same type" && ok "copying an api_key into a password entry → 409" || fail "type: $CODE $BODY"
+store "$A" ve-fz fz-zz79; FZ=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-fz'"); FZREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$FZ"); X "UPDATE blindkey_secrets SET frozen=1 WHERE id=$FZ"
+call POST /api/demipass/edit "$A" "$(EDIT '{"ref":"'$TREF'","from_ref":"'$FZREF'"}')"
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q frozen && ok "copying from a frozen entry → 409 (no way past the breaker)" || fail "frozen src: $CODE $BODY"
+call POST /api/demipass/rotate "$A" '{"name":"ve-fz","new_value":"fz-new-zz80"}'
+[ "$CODE" = 200 ] && [ "$(Q "SELECT frozen FROM blindkey_secrets WHERE name='ve-fz_v2'")" = 1 ] && ok "a frozen entry's new version stays frozen (/rotate used to unfreeze it)" || fail "frozen carry: $CODE $(Q "SELECT frozen FROM blindkey_secrets WHERE name='ve-fz_v2'")"
 # a wrapped source cannot be read by the server
 store "$A" ve-wsrc wrapped-src-zz72; WS=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-wsrc'"); WSREF=$(Q "SELECT ref_code FROM blindkey_secrets WHERE id=$WS")
 call POST /api/demipass/gate-policy "$A" '{"name":"ve-wsrc","security_depth":"elevated"}'
