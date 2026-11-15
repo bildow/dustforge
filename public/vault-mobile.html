@@ -406,6 +406,9 @@
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Request limit (your wallet: 500 requests per 15 minutes, shared by this app and your agents)</div>
         <button class="btn-ghost" onclick="resetRateLimit()" style="width:100%;text-align:left;padding:0.6rem">Reset my rate limit</button>
         <div id="rate-reset-out" style="font-size:0.72rem;margin-top:0.25rem"></div>
+        <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Limit lifts (an agent asked for more calls for a batch or a branch; you approved it)</div>
+        <button class="btn-ghost" onclick="loadLifts()" style="width:100%;text-align:left;padding:0.6rem">Show limit lifts</button>
+        <div id="lifts-box" style="font-size:0.75rem;margin-top:0.3rem"></div>
         <div style="font-size:0.8rem;color:var(--text3);margin-top:0.9rem">Recovery guardians (three people you paired with in person; two of them can let you back in if you lose every phone)</div>
         <div id="guardians-box" style="margin-top:0.3rem;font-size:0.8rem"></div>
         <div id="holds-wrap" style="display:none;margin-top:0.9rem"><div style="font-size:0.8rem;color:var(--red)">Waiting changes to your wallet</div><div id="holds" style="margin-top:0.3rem"></div></div>
@@ -4152,6 +4155,23 @@ let rateBannerDismissedAt=0;
 const RATE_BANNER_TEXT='Your wallet hit its request limit (500 per 15 minutes).';
 function showRateBanner(){ if(Date.now()-rateBannerDismissedAt<60000) return; const b=document.getElementById('rate-banner'), bt=document.getElementById('rate-banner-text'); if(bt&&b&&b.style.display!=='block'){bt.textContent=RATE_BANNER_TEXT;bt.style.color='var(--orange)';} if(b) b.style.display='block'; }
 function hideRateBanner(){ rateBannerDismissedAt=Date.now(); const b=document.getElementById('rate-banner'); if(b) b.style.display='none'; }
+// Limit lifts: list the wallet's lifts, end one early (ending only narrows, so no PIN).
+async function loadLifts(){
+  const box=document.getElementById('lifts-box'); if(!box) return;
+  box.textContent='Loading…';
+  try{
+    const d=await api('GET','/api/identity/limits/lifts');
+    const ls=(d.lifts||[]).slice(0,20);
+    if(!ls.length){ box.textContent='No limit lifts.'; return; }
+    box.innerHTML=ls.map(l=>`<div style="display:flex;justify-content:space-between;gap:0.5rem;padding:0.3rem 0;border-bottom:1px solid var(--border)">
+      <span><b>${esc(l.holder||'?')}</b> +${esc(String(l.extra))} ${esc(l.limiter)} · ${esc(l.label)}<br><span style="color:var(--text3)">${l.active?'until '+esc(new Date(l.expires_at).toLocaleTimeString()):(l.ended_at?'ended ('+esc(l.ended_by||'')+')':'expired')}</span></span>
+      ${l.active?`<button class="btn-ghost" style="padding:0.25rem 0.6rem;font-size:0.72rem" onclick="endLift(${Number(l.id)})">End</button>`:''}</div>`).join('');
+  }catch(e){ if(typeof sessionEnded==='function'&&sessionEnded(e)) return; box.textContent='Could not load: '+e.message; }
+}
+async function endLift(id){
+  try{ await api('POST','/api/identity/limits/lifts/'+Number(id)+'/end',{}); }catch(e){ if(typeof sessionEnded==='function'&&sessionEnded(e)) return; }
+  loadLifts();
+}
 async function resetRateLimit(){
   const out=document.getElementById('rate-reset-out'), bt=document.getElementById('rate-banner-text');
   const say=(m,c)=>{ if(out){out.textContent=m;out.style.color=c;} if(bt){bt.textContent=m;bt.style.color=c;} };

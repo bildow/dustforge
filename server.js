@@ -313,21 +313,29 @@ const rateIdentity = (req) => {
 // A limiter keyed by wallet when signed in, by address otherwise. Each limiter has its own store, so the budgets of the
 // route groups stay separate, as before.
 // `tag` names the limiter in its 429, so the app offers its owner's reset only for the limits that reset clears.
-const rateLimitByWallet = (max, error, windowMs = 15*60*1000, which = 'wallet', tag = null) => rateLimit({ windowMs, max,
-  keyGenerator: (req) => { const w = rateIdentity(req); return w ? 'wallet:' + w[which] : 'ip:' + rateIpKey(req); },
-  handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: `${error} (${rateIdentity(req) ? 'this wallet' : 'this address, not signed in'}: per ${windowMs >= 3600000 ? windowMs / 3600000 + ' hour' : windowMs / 60000 + ' minutes'})`, ...(tag ? { limiter: tag } : {}) }) });
+// `lift` makes the limiter liftable: an agent asks its owner (POST /api/identity/limits/lift), the owner approves in the
+// app, and the limit for exactly that key is raised by the approved number of calls until the lift expires
+// (limitLiftExtra, below). Signed-out traffic is never lifted.
+const rateLimitByWallet = (max, error, windowMs = 15*60*1000, which = 'wallet', tag = null, lift = null) => {
+  const keyOf = (req) => { const w = rateIdentity(req); return w ? 'wallet:' + w[which] : 'ip:' + rateIpKey(req); };
+  return rateLimit({ windowMs,
+    limit: lift ? (req) => max + limitLiftExtra(lift, keyOf(req)) : max,
+    keyGenerator: keyOf,
+    handler: (req, res, next, opts) => res.status(opts.statusCode).json({ error: `${error} (${rateIdentity(req) ? 'this wallet' : 'this address, not signed in'}: per ${windowMs >= 3600000 ? windowMs / 3600000 + ' hour' : windowMs / 60000 + ' minutes'})`,
+      ...(tag ? { limiter: tag } : {}), ...(lift && rateIdentity(req) ? { lift: { limiter: lift, request: 'POST /api/identity/limits/lift' } } : {}) }) });
+};
 const rateLimitStrict = rateLimitByWallet(Number(process.env.RATE_STRICT_MAX) || 50, 'Too many requests');   // maxima lowered only by tests
-const rateLimitStandard = rateLimitByWallet(Number(process.env.RATE_STANDARD_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'wallet', 'standard');
+const rateLimitStandard = rateLimitByWallet(Number(process.env.RATE_STANDARD_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'wallet', 'standard', 'standard');
 // Password sign-in: by address only, whatever Bearer token rides along (a token used to put the guesses on the caller's
 // own wallet budget, which its owner can reset), and never reset (rate-reset review M1). Not signed in by definition.
 const rateLimitLogin = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.RATE_LOGIN_MAX) || 500, keyGenerator: (req) => 'login:' + rateIpKey(req),
   message: { error: 'Too many sign-in attempts (this address: per 15 minutes)' } });
 // /request-token and /use: their own budget (both maxima can be lowered for tests).
-const rateLimitUseWallet = rateLimitByWallet(Number(process.env.USE_RATE_LIMIT_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'use');
+const rateLimitUseWallet = rateLimitByWallet(Number(process.env.USE_RATE_LIMIT_MAX) || 500, 'Rate limit exceeded', 15*60*1000, 'use', null, 'use');
 // …and a total for the whole wallet behind those per-agent budgets: workers are free to make, so without it one wallet
 // could fan out past the old per-address ceiling (#107 re-review M). Checked after the agent's own limiter, so an agent's
 // refused retries never use up the wallet's total.
-const rateLimitUseWalletTotal = rateLimitByWallet(Number(process.env.USE_RATE_WALLET_TOTAL) || 5000, 'Rate limit exceeded (all agents of this wallet)');
+const rateLimitUseWalletTotal = rateLimitByWallet(Number(process.env.USE_RATE_WALLET_TOTAL) || 5000, 'Rate limit exceeded (all agents of this wallet)', 15*60*1000, 'wallet', null, 'use_total');
 // The per-address floor: only traffic that is not signed in (one address cannot flood /use with forged tokens).
 // Signed-in traffic skips it, so many wallets behind one NAT never share it.
 const rateLimitUseIpCeiling = rateLimit({ windowMs: 15*60*1000, max: Number(process.env.USE_RATE_IP_CEILING) || 5000,
@@ -646,6 +654,26 @@ try { db.exec(`CREATE TABLE IF NOT EXISTS use_inflight (
   started_at TEXT NOT NULL,
   pid INTEGER
 )`); } catch (e) {}
+// Limit lifts (Aaron 2026-11-15: "a way for a worker / agent / pane to dynamically request a limit lift on a battery of
+// calls or project branch it's working on"). One row per approved lift: which limiter, whose key, how many extra calls
+// per window, for what (a label: the branch or batch), until when. Ended early by the owner or the holder.
+try { db.exec(`CREATE TABLE IF NOT EXISTS limit_lifts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_did TEXT NOT NULL,
+  holder_key TEXT NOT NULL,
+  holder_label TEXT,
+  requester_key TEXT,
+  limiter TEXT NOT NULL,
+  extra INTEGER NOT NULL,
+  label TEXT NOT NULL,
+  reason TEXT,
+  approval_id INTEGER,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  ended_at TEXT,
+  ended_by TEXT
+)`); db.exec('CREATE INDEX IF NOT EXISTS idx_limit_lifts_key ON limit_lifts (limiter, holder_key, expires_at)'); } catch (e) {}
+try { db.exec('ALTER TABLE limit_lifts ADD COLUMN requester_key TEXT'); } catch (_) {}   // tables made before the column
 identity.setTokenRecorder((p) => {
   if (!p.jti) return;
   db.prepare('INSERT OR IGNORE INTO issued_tokens (jti, did, scope, issued_at, expires_at, sid) VALUES (?, ?, ?, ?, ?, ?)')
@@ -8312,6 +8340,123 @@ app.post('/api/identity/rate-limit/reset', async (req, res) => {
   logSecurityEvent('rate_limit_reset', 'info', { caller_did: auth.did, capability: 'rate-reset', ip: req.ip, context: { reset } });
   if (!reset.length) return res.status(503).json({ ok: false, error: 'the limits could not be reset — try again', reset });
   res.json({ ok: true, reset });
+});
+
+// ── Limit lifts: an agent asks, its owner approves in the app, the limit rises for that agent only, for a while ──────
+// Liftable limiters and the key part each one counts by: `use` is the agent's own /use + /request-token budget,
+// `use_total` the whole wallet's /use total, `standard` the wallet's general budget (shared with the owner's app).
+const LIFT_LIMITERS = { use: 'use', use_total: 'wallet', standard: 'wallet' };
+const LIFT_MAX_EXTRA = { use: 5000, use_total: 50000, standard: 5000 };   // extra calls per 15-minute window, one lift
+// A ceiling on the summed active extras per wallet and limiter, whatever the number of requesters: workers are free to
+// make, so per-requester caps alone don't bound a wallet (limit-lift review M1). The server's own protection.
+const LIFT_WALLET_CEILING = { use: 20000, use_total: 50000, standard: 5000 };
+const LIFT_MAX_MINUTES = 480, LIFT_MAX_ACTIVE = 3, LIFT_WALLET_MAX_ACTIVE = 10;   // active lifts per requester / per wallet
+const LIFT_PENDING_PER_WALLET = 3;   // lift asks waiting on the owner at once (one per requester): never the whole grant queue
+const LIFT_LABEL_RE = /^[A-Za-z0-9 ._:\/#@+()-]{1,80}$/;
+const liftCache = new Map(); let liftCacheAt = 0;
+// The extra calls an active, unexpired, un-ended lift adds for (limiter, key). Read on every limited request, so cached
+// for a few seconds; granting or ending a lift clears the cache. A database error lifts nothing.
+function limitLiftExtra(limiter, key) {
+  if (!key || !key.startsWith('wallet:')) return 0;
+  const now = Date.now();
+  if (now - liftCacheAt > 5000) { liftCache.clear(); liftCacheAt = now; }
+  const ck = limiter + '|' + key;
+  if (liftCache.has(ck)) return liftCache.get(ck);
+  let extra = 0;
+  try { extra = Number(db.prepare('SELECT COALESCE(SUM(extra), 0) AS n FROM limit_lifts WHERE limiter = ? AND holder_key = ? AND ended_at IS NULL AND expires_at > ?')
+    .get(limiter, key, new Date().toISOString()).n) || 0; } catch (_) { extra = 0; }
+  liftCache.set(ck, extra);
+  return extra;
+}
+const liftCacheClear = () => { liftCache.clear(); liftCacheAt = 0; };
+const liftView = (r) => ({ id: r.id, limiter: r.limiter, holder: r.holder_label, extra: r.extra, label: r.label, reason: r.reason,
+  created_at: r.created_at, expires_at: r.expires_at, ended_at: r.ended_at, ended_by: r.ended_by,
+  active: !r.ended_at && r.expires_at > new Date().toISOString() });
+const rateLimitLiftAsk = rateLimitByWallet(Number(process.env.RATE_LIFT_ASK_MAX) || 20, 'Too many limit-lift requests', 60*60*1000, 'use');
+
+// POST /api/identity/limits/lift {limiter: use|use_total|standard, extra, minutes, label, reason}
+// Any signed-in caller (an agent, a worker, a pane, the owner) asks; the owner approves in the DemiPass app (an approval
+// of kind limit-lift that binds all five fields and the holder); the same call again with approval_id grants it.
+app.post('/api/identity/limits/lift', rateLimitLiftAsk, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'sign in', ...(auth.code ? { code: auth.code } : {}) });
+  const rid = rateIdentity(req);
+  if (!rid) return res.status(401).json({ error: 'sign in' });
+  const b = req.body || {};
+  const limiter = String(b.limiter || 'use');
+  if (!LIFT_LIMITERS[limiter]) return res.status(400).json({ error: `limiter: one of ${Object.keys(LIFT_LIMITERS).join(', ')}` });
+  const extra = Number(b.extra), minutes = Number(b.minutes === undefined ? 60 : b.minutes);
+  if (!Number.isInteger(extra) || extra < 1 || extra > LIFT_MAX_EXTRA[limiter]) return res.status(400).json({ error: `extra: whole calls per 15 minutes, 1 to ${LIFT_MAX_EXTRA[limiter]} for ${limiter}` });
+  if (!Number.isInteger(minutes) || minutes < 5 || minutes > LIFT_MAX_MINUTES) return res.status(400).json({ error: `minutes: 5 to ${LIFT_MAX_MINUTES}` });
+  const label = String(b.label || '').trim();
+  if (!LIFT_LABEL_RE.test(label)) return res.status(400).json({ error: 'label: what the lift is for, e.g. "branch feat/x" or "batch: reindex 40k" (letters, digits, space . _ : / # @ + ( ) -; up to 80)' });
+  const reason = String(b.reason || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 200);
+  const holderKey = 'wallet:' + rid[LIFT_LIMITERS[limiter]];
+  const d0 = auth.decoded || {};
+  // Who would get it, by name: an agent's name, a worker's name (each worker its own, not a shared 'session'), the pane's
+  // label, or the person (review L3).
+  const holderLabel = cleanLabel(auth.agent_name || d0.agent_label || d0.wname || (d0.wrk ? 'worker ' + d0.wrk : '') || d0.username || 'session', 40) || 'session';
+  const nowIso = new Date().toISOString();
+  const requesterKey = 'wallet:' + rid.use;
+  const live = (sql, ...a) => db.prepare(sql).get(...a, nowIso);
+  const active = live('SELECT COUNT(*) AS n FROM limit_lifts WHERE requester_key = ? AND ended_at IS NULL AND expires_at > ?', requesterKey).n;
+  if (active >= LIFT_MAX_ACTIVE) return res.status(409).json({ error: `${active} lifts are already active for this caller (at most ${LIFT_MAX_ACTIVE}); end one first` });
+  const walletActive = live('SELECT COUNT(*) AS n FROM limit_lifts WHERE owner_did = ? AND ended_at IS NULL AND expires_at > ?', rid.wallet).n;
+  if (walletActive >= LIFT_WALLET_MAX_ACTIVE) return res.status(409).json({ error: `${walletActive} lifts are already active on this wallet (at most ${LIFT_WALLET_MAX_ACTIVE})` });
+  const summed = Number(live('SELECT COALESCE(SUM(extra), 0) AS n FROM limit_lifts WHERE owner_did = ? AND limiter = ? AND ended_at IS NULL AND expires_at > ?', rid.wallet, limiter).n) || 0;
+  if (summed + extra > LIFT_WALLET_CEILING[limiter]) return res.status(409).json({ error: `this wallet's active ${limiter} lifts already add ${summed} calls; at most ${LIFT_WALLET_CEILING[limiter]} in all — ask for ${Math.max(0, LIFT_WALLET_CEILING[limiter] - summed)} or fewer, or end one` });
+  // One ask may wait per requester (a different one is refused, the same one is answered with its existing request), and
+  // at most a few per wallet, so lift asks can't fill the owner's queue of grants (review M2).
+  if (!b.approval_id) {
+    const waiting = db.prepare(`SELECT id, bound_call FROM use_approvals WHERE owner_did = ? AND status = 'pending' AND service_key = 'svc:demipass:limit-lift' AND expires_at > ?`).all(rid.wallet, nowIso);
+    const mine = waiting.filter((w) => { try { return JSON.parse(w.bound_call).body.requester_key === requesterKey; } catch (_) { return false; } });
+    const same = mine.find((w) => { try { const q = JSON.parse(w.bound_call).body; return q.limiter === limiter && q.extra === extra && q.minutes === minutes && q.label === label && q.reason === reason; } catch (_) { return false; } });
+    if (mine.length && !same) return res.status(409).json({ error: `your lift ask ${mine[0].id} is still waiting on the owner; wait for it (or its expiry) before asking for another`, approval_id: mine[0].id });
+    if (!same && waiting.length >= LIFT_PENDING_PER_WALLET) return res.status(429).json({ error: `${waiting.length} lift asks are already waiting on this owner; try again later` });
+  }
+  if (!ownerApproves(req, res, rid.wallet, 'svc:demipass:limit-lift', 'Limit lift', 'limit-lift', holderLabel,
+      { limiter, extra, minutes, label, reason, holder_key: holderKey, requester_key: requesterKey,
+        shared: holderKey === 'wallet:' + rid.wallet })) return;
+  const expires = new Date(Date.now() + minutes * 60000).toISOString();
+  const id = db.prepare(`INSERT INTO limit_lifts (owner_did, holder_key, holder_label, requester_key, limiter, extra, label, reason, approval_id, created_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(rid.wallet, holderKey, holderLabel, requesterKey, limiter, extra, label, reason || null, Number(b.approval_id) || null, nowIso, expires).lastInsertRowid;
+  liftCacheClear();
+  logSecurityEvent('limit_lift_granted', 'info', { caller_did: auth.did, agent_name: holderLabel, capability: 'limit-lift', ip: req.ip,
+    context: { id, limiter, extra, minutes, label, approval_id: Number(b.approval_id) || null } });
+  res.status(201).json({ ok: true, lift: liftView(db.prepare('SELECT * FROM limit_lifts WHERE id = ?').get(id)),
+    note: 'calls refused while over the limit still count in this 15-minute window; the lift adds room on top of that count, so a caller that kept retrying may need the window to roll over first' });
+});
+
+// GET /api/identity/limits/lifts — the wallet's lifts (an agent token sees only its own). Its own budget, so a limited
+// caller can still look.
+app.get('/api/identity/limits/lifts', rateLimitFill, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'sign in' });
+  const rid = rateIdentity(req);
+  if (!rid) return res.status(401).json({ error: 'sign in' });
+  const rows = (isAgentAuth(auth) || deviceSession(auth.decoded))   // an agent's device sign-in sees only its own (review L5)
+    ? db.prepare('SELECT * FROM limit_lifts WHERE owner_did = ? AND requester_key = ? ORDER BY id DESC LIMIT 50').all(rid.wallet, 'wallet:' + rid.use)
+    : db.prepare('SELECT * FROM limit_lifts WHERE owner_did = ? ORDER BY id DESC LIMIT 50').all(rid.wallet);
+  res.json({ ok: true, lifts: rows.map(liftView) });
+});
+
+// POST /api/identity/limits/lifts/:id/end — ending only narrows, so the owner's sessions and the holder itself may.
+app.post('/api/identity/limits/lifts/:id/end', rateLimitFill, (req, res) => {
+  const auth = getBearerIdentity(req);
+  if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error || 'sign in' });
+  const rid = rateIdentity(req);
+  if (!rid) return res.status(401).json({ error: 'sign in' });
+  const row = db.prepare('SELECT * FROM limit_lifts WHERE id = ? AND owner_did = ?').get(Number(req.params.id), rid.wallet);
+  if (!row) return res.status(404).json({ error: 'no such lift' });
+  const d0 = auth.decoded || {};
+  const agentish = isAgentAuth(auth) || deviceSession(d0);
+  if (agentish && row.requester_key !== 'wallet:' + rid.use) return res.status(404).json({ error: 'no such lift' });
+  if (row.ended_at) return res.json({ ok: true, lift: liftView(row) });
+  const by = agentish ? 'holder' : 'owner';
+  db.prepare('UPDATE limit_lifts SET ended_at = ?, ended_by = ? WHERE id = ? AND ended_at IS NULL').run(new Date().toISOString(), by, row.id);
+  liftCacheClear();
+  logSecurityEvent('limit_lift_ended', 'info', { caller_did: auth.did, agent_name: auth.agent_name || d0.agent_label, capability: 'limit-lift', ip: req.ip, context: { id: row.id, by } });
+  res.json({ ok: true, lift: liftView(db.prepare('SELECT * FROM limit_lifts WHERE id = ?').get(row.id)) });
 });
 
 app.post('/api/identity/refresh', rateLimitRefresh, (req, res) => {
