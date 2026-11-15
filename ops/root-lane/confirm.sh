@@ -8,7 +8,7 @@ TS=${1:-}
 systemctl stop "sshd-deadman-$TS.timer" 2>/dev/null || true
 systemctl is-active --quiet "sshd-deadman-$TS.timer" && { echo "confirm: the dead-man timer is still active" >&2; exit 1; }
 echo "dead-man sshd-deadman-$TS cancelled"
-for a in 127.0.0.1 192.3.84.103; do
+for a in 127.0.0.1 ::1 192.3.84.103; do
   echo "root from $a: $(sshd -T -C "user=root,host=x,addr=$a" | grep -iE '^(permitrootlogin|passwordauthentication|authenticationmethods) ' | tr '\n' ' ')"
 done
 logger -t dustforge-root-lane "confirmed $TS"
