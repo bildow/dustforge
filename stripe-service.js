@@ -84,7 +84,7 @@ async function createAccountCheckout(options) {
 /**
  * Create Stripe Checkout session for wallet topup
  */
-async function createTopupCheckout(did, amount_cents) {
+async function createTopupCheckout(did, amount_cents, username = '') {
   if (!PRICES[`topup_${amount_cents}`] && ![500, 1000, 5000, 10000].includes(amount_cents)) {
     throw new Error('Invalid topup amount. Options: $5, $10, $50, $100');
   }
@@ -107,6 +107,7 @@ async function createTopupCheckout(did, amount_cents) {
       type: 'wallet_topup',
       did,
       amount_cents: String(amount_cents),
+      ...(username ? { username: String(username) } : {}),   // the top-up page names the wallet
     },
   });
 

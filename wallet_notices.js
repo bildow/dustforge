@@ -34,11 +34,18 @@ function init(db) {
 const nowIso = (now = Date.now()) => new Date(now).toISOString();
 const cutoff = (now = Date.now()) => new Date(now - OPEN_DAYS * 86400000).toISOString();
 
-// → the new notice row, or null when one with this key is already open (nothing to send again).
+const DISMISS_QUIET_MS = 24 * 3600 * 1000;   // a dismissed notice stays quiet this long while its condition lasts
+
+// → the new notice row, or null when one with this key is already open, or was dismissed in the last 24 hours (the
+// scheduler retries every 5 minutes; a Dismiss must not come back on the next pass — #126 review M3).
 function raise(db, did, { kind, key, title, text, data = {} }, { now = Date.now(), mailer = null } = {}) {
   if (!did || !KINDS.has(kind) || !key) return null;
   const open = db.prepare('SELECT id FROM wallet_notices WHERE did = ? AND nkey = ? AND closed_at IS NULL AND created_at > ?').get(did, key, cutoff(now));
   if (open) return null;
+  const quiet = db.prepare("SELECT id FROM wallet_notices WHERE did = ? AND nkey = ? AND closed_why = 'dismissed' AND closed_at > ?").get(did, key, nowIso(now - DISMISS_QUIET_MS));
+  if (quiet) return null;
+  // An open one past the 7-day window is replaced, not left open forever (#126 review L4).
+  db.prepare("UPDATE wallet_notices SET closed_at = ?, closed_why = 'superseded' WHERE did = ? AND nkey = ? AND closed_at IS NULL").run(nowIso(now), did, key);
   const id = Number(db.prepare('INSERT INTO wallet_notices (did, kind, nkey, title, text, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(did, kind, String(key).slice(0, 200), String(title).slice(0, 120), String(text).slice(0, 1000), JSON.stringify(data || {}), nowIso(now)).lastInsertRowid);
   if (mailer) {

@@ -781,10 +781,18 @@ function runOwnerRefills(db, billing, { now = Date.now(), grantDids, notices = n
       // Stub (Aaron 2026-11-15): no card is stored, so a card-funded refill cannot charge by itself. When it is due it
       // asks the owner for a deposit of the rule's amount (a notice with a Deposit button) and the schedule moves on;
       // the deposit, when made, is the refill.
-      const asked = notices ? notices.raise(db, rule.did, { kind: 'deposit_due', key: `owner_rule:${rule.id}:due:${rule.next_run_at}`,
-        title: `Your ${rule.cadence} refill of ${amt} DD is due`,
-        text: `Your ${rule.cadence} refill of ${amt} DD is paid by card. No card is stored, so it waits for you: deposit ${amt} DD to make it.`,
-        data: { deposit: { amount_dd: amt, to_did: rule.did, why: 'scheduled refill' } } }, { now, mailer }) : null;
+      // A new due run replaces the last one's notice (one card, not one per run — #126 review L4). A notice that
+      // cannot be raised never stops the schedule or the other refills (#126 review L5).
+      let asked = null;
+      if (notices) {
+        try {
+          notices.clear(db, rule.did, `owner_rule:${rule.id}:due:`, 'superseded', { now });
+          asked = notices.raise(db, rule.did, { kind: 'deposit_due', key: `owner_rule:${rule.id}:due:${rule.next_run_at}`,
+            title: `Your ${rule.cadence} refill of ${amt} DD is due`,
+            text: `Your ${rule.cadence} refill of ${amt} DD is paid by card. No card is stored, so it waits for you: deposit ${amt} DD to make it.`,
+            data: { deposit: { amount_dd: amt, to_did: rule.did, why: 'scheduled refill' } } }, { now, mailer });
+        } catch (e) { console.error('[refill] deposit_due notice failed:', e.message); }
+      }
       db.prepare("UPDATE wallet_refill_rules SET last_run_at = ?, next_run_at = ?, last_error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .run(new Date(now).toISOString(), next, rule.id);
       out.push({ did: rule.did, ok: false, deposit_requested: true, noticed: Boolean(asked), next_run_at: next });
@@ -801,17 +809,19 @@ function runOwnerRefills(db, billing, { now = Date.now(), grantDids, notices = n
     if (result.ok) {
       db.prepare("UPDATE wallet_refill_rules SET last_run_at = ?, next_run_at = ?, last_error = '', updated_at = CURRENT_TIMESTAMP WHERE id = ?")
         .run(new Date(now).toISOString(), next, rule.id);
-      if (notices) notices.clear(db, rule.did, `owner_rule:${rule.id}:fail`, 'refill ran', { now });
+      if (notices) { try { notices.clear(db, rule.did, `owner_rule:${rule.id}:fail`, 'refill ran', { now }); } catch (_) {} }
     } else {
       // Keep the rule due but record why; retried every scheduler pass until fixed. The owner hears once (Aaron
       // 2026-11-15: a refill that fails says so, and that the wallet needs a deposit).
       db.prepare("UPDATE wallet_refill_rules SET last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").run(String(result.error).slice(0, 200), rule.id);
       if (notices) {
-        const bal = billing.getDerivedBalance(db, rule.did);
-        noticed = Boolean(notices.raise(db, rule.did, { kind: 'refill_failed', key: `owner_rule:${rule.id}:fail`,
-          title: `Your ${rule.cadence} refill failed`,
-          text: `Your ${rule.cadence} refill of ${amt} DD did not run: ${result.error}. Your wallet holds ${bal} DD. Deposit DD to keep it funded, or change the rule.`,
-          data: { deposit: { amount_dd: amt, to_did: rule.did, why: 'refill failed' } } }, { now, mailer }));
+        try {
+          const bal = billing.getDerivedBalance(db, rule.did);
+          noticed = Boolean(notices.raise(db, rule.did, { kind: 'refill_failed', key: `owner_rule:${rule.id}:fail`,
+            title: `Your ${rule.cadence} refill failed`,
+            text: `Your ${rule.cadence} refill of ${amt} DD did not run: ${result.error}. Your wallet holds ${bal} DD. Deposit DD to keep it funded, or change the rule.`,
+            data: { deposit: { amount_dd: amt, to_did: rule.did, why: 'refill failed' } } }, { now, mailer }));
+        } catch (e) { console.error('[refill] notice failed:', e.message); }
       }
     }
     out.push({ did: rule.did, ...result, ...(noticed ? { noticed } : {}), next_run_at: result.ok ? next : rule.next_run_at });
@@ -824,7 +834,8 @@ function runSiliconRefills(db, billing, { now = Date.now(), ledger = null, maile
   return rows.map(s => {
     const r = thresholdRefill(db, billing, s, { now, ledger });
     const alerted = (r.skipped === 'daily cap reached' || (!r.ok && r.error)) ? refillAlert(db, billing, s, r, { now, mailer }) : false;
-    const noticed = notices ? siliconRefillNotice(db, billing, notices, s, r, { now, mailer }) : false;
+    let noticed = false;
+    if (notices) { try { noticed = siliconRefillNotice(db, billing, notices, s, r, { now, mailer }); } catch (e) { console.error('[refill] notice failed:', e.message); } }
     return { handle: s.handle, did: s.member_did, ...r, ...(alerted ? { alerted: s.refill_alert_email } : {}), ...(noticed ? { noticed } : {}) };
   });
 }

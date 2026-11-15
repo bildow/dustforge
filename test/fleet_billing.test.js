@@ -531,6 +531,11 @@ test('owner rule: a failed refill notices the owner once with a deposit; a card-
   assert.equal(c.find(x => x.did === OWNER).deposit_requested, true);
   const due = notices.list(db, OWNER, { now: t });
   assert.equal(due[0].kind, 'deposit_due'); assert.equal(due[0].deposit.amount_dd, 300); assert.equal(bal(db, OWNER), 0);
+  // the next due run replaces it: one card, not one per run (#126 review L4)
+  const t2 = Date.parse('2026-10-09T12:00:00Z');
+  fb.runOwnerRefills(db, billing, { now: t2, notices, mailer });
+  const due2 = notices.list(db, OWNER, { now: t2 });
+  assert.equal(due2.length, 1); assert.notEqual(due2[0].notice_id, due[0].notice_id);
 });
 
 test('notices: dismiss only your own; list hides closed and stale ones', () => {
@@ -542,7 +547,13 @@ test('notices: dismiss only your own; list hides closed and stale ones', () => {
   assert.equal(notices.dismiss(db, BRAIN, a.id, { now: t }), false);
   assert.equal(notices.dismiss(db, OWNER, a.id, { now: t }), true);
   assert.equal(notices.list(db, OWNER, { now: t }).length, 0);
+  // #126 review M3: the next pass must not bring a dismissed notice straight back (nor mail again)
+  const { sent, mailer } = mailbox();
+  assert.equal(notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:1', title: 't', text: 'x' }, { now: t + 5 * 60000, mailer }), null);
+  assert.equal(sent.length, 0);
+  assert.ok(notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:1', title: 't', text: 'x' }, { now: t + 25 * 3600000, mailer }), 'still failing a day later: told again');
+  assert.equal(sent.length, 1);
   notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:3', title: 't', text: 'x' }, { now: t });
-  assert.equal(notices.list(db, OWNER, { now: t + 8 * 86400000 }).length, 0, 'older than 7 days is not shown');
-  assert.ok(notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:3', title: 't', text: 'x' }, { now: t + 8 * 86400000 }), 'and may be raised again');
+  assert.equal(notices.list(db, OWNER, { now: t + 9 * 86400000 }).length, 0, 'older than 7 days is not shown');
+  assert.ok(notices.raise(db, OWNER, { kind: 'refill_failed', key: 'x:3', title: 't', text: 'x' }, { now: t + 9 * 86400000 }), 'and may be raised again');
 });

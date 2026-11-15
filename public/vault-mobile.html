@@ -1097,7 +1097,7 @@ async function loadFleet(){
       // Card: no card is stored, so when it is due the app asks for a deposit (stub, wallet_notices deposit_due).
       h+='<select id="own-refill-funding" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.72rem;margin:0"><option value="operator_grant"'+((rule?rule.funding:'operator_grant')==='operator_grant'?' selected':'')+'>operator grant</option><option value="stripe"'+(rule&&rule.funding==='stripe'?' selected':'')+'>by card (asks me to deposit)</option></select>';
       h+='<button class="btn-primary" onclick="saveOwnerRefill()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Save</button></div>';
-      h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.35rem">'+(rule&&rule.enabled?('next: '+new Date(rule.next_run_at).toLocaleString()+(rule.last_error?' · <span style="color:var(--red)">'+esc(rule.last_error)+'</span>':'')):'off')+' · funding: operator grant</div>';
+      h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.35rem">'+(rule&&rule.enabled?('next: '+new Date(rule.next_run_at).toLocaleString()+(rule.last_error?' · <span style="color:var(--red)">'+esc(rule.last_error)+'</span>':'')):'off')+' · funding: '+(rule&&rule.funding==='stripe'?'by card (asks you to deposit)':'operator grant')+'</div>';
       h+='</div>';
     }
     // Silicons

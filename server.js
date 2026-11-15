@@ -2995,15 +2995,20 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             // (100 DD) comes out of it and the new user nets 850 DD. If NOT referred,
             // the user keeps the full 950 DD. Idempotent on the Stripe session so a
             // webhook replay can't double-grant.
+            // A test-mode payment (Stripe's public test cards) creates the account and mailbox but credits no DD: no
+            // grant, no referral payout, no lightweight-referral accrual or deposit (#126 review H1). Signups keep
+            // working while the server's key is a test key; they just start at 0 DD.
+            const _paid = stripeService.creditsAllowed(session);
+            if (!_paid) console.warn(`[stripe-webhook] account ${pending.username} ${session.id}: test-mode payment, created with no DD`);
             const _grant = ddUnits.ddForUsdCents(stripeService.PRICES.account_single) - (referredBy ? referral.REFERRAL_PAYOUT_CENTS : 0);
-            billing.creditBalance(db, id.did, _grant, 'onboarding_grant', `Onboarding: ${_grant} DD ($1 signup)`, 'onboard_' + session.id);
-            try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: _grant, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {}
-            if (referredBy) {
+            if (_paid) billing.creditBalance(db, id.did, _grant, 'onboarding_grant', `Onboarding: ${_grant} DD ($1 signup)`, 'onboard_' + session.id);
+            if (_paid) { try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: _grant, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {} }
+            if (_paid && referredBy) {
               // FUNDED referral payout to an existing account, tied to this funding event
               // so a chargeback claws back both the grant and this 100 DD payout.
               const _rp = referral.processReferralPayout(db, referredBy, id.did, pending.username);
               if (_rp && _rp.ok && _rp.credited > 0) { try { require('./dd_ledger').recordCredit(db, { did: referredBy, amount_cents: referral.REFERRAL_PAYOUT_CENTS, source: 'referral_payout', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {} }
-            } else if (_refToken) {
+            } else if (_paid && _refToken) {
               // Invite hash with NO account = lightweight sponsor: accrue 100 DD (capped)
               // against their email hash, tied to THIS funding event for clawback. They
               // collect it when they mint their own account (POST /api/referral/claim).
@@ -3012,7 +3017,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             // AUTO-CLAIM: if the minter came through their own claim link
             // (/signup?claim=…), deposit the lightweight referral DD they earned
             // inviting others — one-time, on mint, no separate call. (+100 → 950/1050.)
-            if (pending.claim_hash) {
+            if (_paid && pending.claim_hash) {   // a test-mode mint collects later, via POST /api/referral/claim
               try {
                 const _dep = require('./onboarding').depositLightweightReferral(db, pending.claim_hash, id.did, billing, require('./dd_ledger'));
                 if (_dep > 0) console.log(`[referral] auto-deposited ${_dep} DD to ${pending.username} on mint`);
@@ -9637,7 +9642,8 @@ app.post('/api/billing/deposit', rateLimitStandard, async (req, res) => {
   const usd = Number((req.body || {}).amount_usd_cents);
   if (!cfg.amounts_usd_cents.includes(usd)) return res.status(400).json({ error: `amount_usd_cents: one of ${cfg.amounts_usd_cents.join(', ')}` });
   try {
-    const c = await stripeService.createTopupCheckout(auth.did, usd);
+    const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(auth.did) || {};
+    const c = await stripeService.createTopupCheckout(auth.did, usd, w.username || '');
     res.json({ ok: true, url: c.url, dd: ddUnits.ddForUsdCents(usd), mode: cfg.mode, credits_dd: cfg.credits_dd });
   } catch (e) { res.status(502).json({ error: 'the checkout could not be opened: ' + e.message }); }
 });

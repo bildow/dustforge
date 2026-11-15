@@ -64,8 +64,17 @@ call POST /api/billing/notices/$NID/dismiss "$OWN"; [ "$(echo "$BODY" | J ok)" =
 call GET /api/billing/deposit ""; [ "$(echo "$BODY" | J enabled)" = False ] && [ "$(echo "$BODY" | J mode)" = off ] && ok "GET /api/billing/deposit: off by default, amounts listed" || fail "cfg: $BODY"
 call POST /api/billing/deposit "$OWN" '{"amount_usd_cents":1000}'; [ "$CODE" = 503 ] && echo "$BODY" | grep -q "not switched on" && ok "POST while off → 503 'not switched on yet'" || fail "off: $CODE $BODY"
 call POST /api/billing/deposit "" '{"amount_usd_cents":1000}'; [ "$CODE" = 401 ] && ok "no token → 401" || fail "noauth: $CODE"
-kill $SRV; wait $SRV 2>/dev/null; export DEPOSITS=test STRIPE_SECRET_KEY=sk_test_smoke_not_a_key; start; OWN=$(login owner)
+kill $SRV; wait $SRV 2>/dev/null; export DEPOSITS=test STRIPE_SECRET_KEY=sk_test_smoke_not_a_key STRIPE_WEBHOOK_SECRET=whsec_smoke_secret; start; OWN=$(login owner)
 call GET /api/billing/deposit ""; [ "$(echo "$BODY" | J enabled)" = True ] && [ "$(echo "$BODY" | J credits_dd)" = False ] && ok "DEPOSITS=test with a test key: on, and says it credits no DD" || fail "test cfg: $BODY"
 call POST /api/billing/deposit "$OWN" '{"amount_usd_cents":777}'; [ "$CODE" = 400 ] && ok "an amount outside the list → 400" || fail "amount: $CODE $BODY"
-grep -q "sk_test_smoke" "$S/server.log" && fail "the key reached the log" || ok "no key in the server log"
+# 5. a signed checkout.session.completed top-up: test mode credits nothing; live mode credits (#126)
+hook(){ local live=$1 sid=$2
+  local payload; payload=$(python3 -c 'import json,sys; print(json.dumps({"id":"evt_"+sys.argv[2],"type":"checkout.session.completed","livemode":sys.argv[1]=="1","data":{"object":{"id":sys.argv[2],"livemode":sys.argv[1]=="1","payment_status":"paid","metadata":{"type":"wallet_topup","did":sys.argv[3],"amount_cents":"500"}}}}))' "$live" "$sid" "$(did owner)")
+  local sig; sig=$(node -e 'const S=require("stripe")("sk_test_x"); process.stdout.write(S.webhooks.generateTestHeaderString({payload: process.argv[1], secret: process.env.STRIPE_WEBHOOK_SECRET}))' "$payload")
+  CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/stripe/webhook" -H 'Content-Type: application/json' -H "Stripe-Signature: $sig" --data-binary "$payload"); }
+B0=$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner'")
+hook 0 cs_test_smoke1; [ "$CODE" = 200 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner'")" = "$B0" ] && ok "a test-mode top-up (test card) credits no DD" || fail "test-mode credit: $CODE bal $(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner'") was $B0"
+hook 1 cs_live_smoke2; [ "$CODE" = 200 ] && [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner'")" = "$((B0 + 4750))" ] && ok "a live-mode top-up credits 4750 DD for \$5" || fail "live credit: $CODE bal $(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner'") was $B0"
+hook 1 cs_live_smoke2; [ "$(Q "SELECT balance_cents FROM identity_wallets WHERE username='owner'")" = "$((B0 + 4750))" ] && ok "a replayed event credits once" || fail "replay"
+grep -q "sk_test_smoke\|whsec_smoke" "$S/server.log" && fail "a key reached the log" || ok "no key in the server log"
 echo "$fails failure(s)"; exit $(( fails > 0 ))
