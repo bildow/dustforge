@@ -272,6 +272,15 @@ twofa "$A"; call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$C
 [ "$CODE" = 403 ] && echo "$BODY" | J missing | grep -q pin && ok "…and the guess spent its PIN entry: the next try asks for the PIN again" || fail "pin not spent by guess: $CODE $BODY"
 pin "$A" "edit:$CR2"; call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$CV2'","approval_id":'$AP3'}'
 [ "$CODE" = 200 ] && ok "…a new request, approved, with the PIN and the right value → 200" || fail "after mismatch: $CODE $BODY"
+# an edit request belongs to the session that filed it (#124 final re-audit): another session of the owner's gets its own
+A2=$(login ve-owner); V3=$(python3 -c 'import secrets;print("vecrit3-" + secrets.token_urlsafe(16))')
+call POST /api/demipass/edit "$A2" '{"ref":"'$CREF'","new_value":"'$V3'"}'; APB=$(echo "$BODY" | J approval_id)
+call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$V3'"}'; APA=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$APB" != None ] && [ "$APA" != None ] && [ "$APA" != "$APB" ] && ok "a second owner session's request is not handed to this session's Save: each gets its own (#$APB, #$APA)" || fail "session merge: $APB $APA $CODE $BODY"
+approve_edit "$APB"
+call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$V3'","approval_id":'$APB'}'
+[ "$CODE" = 409 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$APB")" = approved ] && ok "…and this session cannot redeem the other session's approved request (409, a different call)" || fail "cross-session redeem: $CODE $BODY"
+X "UPDATE use_approvals SET status='cancelled' WHERE id IN ($APA, $APB)"
 
 # ── /rotate now carries the owner's own agents' delegations ──
 store "$A" ve-rot rot-old-zz75; RO=$(Q "SELECT id FROM blindkey_secrets WHERE name='ve-rot'"); deleg "$DAG" $RO
@@ -317,17 +326,43 @@ sleep 1
 leak=0; for f in "$DB_PATH" "$DB_PATH-wal"; do [ -f "$f" ] || continue; for v in "$NEWV" "$SRCV" "$EV" "$CV"; do grep -qaF -- "$v" "$f" && leak=1; done; done
 [ $leak = 0 ] && ok "no edited or copied value is in the database file in the clear (events, ticks, approvals included)" || fail "plaintext value in the database"
 
-# ── legacy fixture: a database from before seen_by_person_at ──
+# ── legacy fixture: a database from before seen_by_person_at, use_approvals.value_mac and refresh_tokens.src_auth/agent_label ──
+# Pre-seeded rows: an approved edit request (its value HMAC goes with the column) and an existing refresh chain.
+VL=$(python3 -c 'import secrets;print("velegacy-" + secrets.token_urlsafe(16))'); CRL=$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$CREF'")
+call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$VL'"}'; APL=$(echo "$BODY" | J approval_id); [ "$CODE" = 202 ] || fail "legacy request: $CODE $BODY"
+approve_edit "$APL"
+LRAW="dpr_legacy-chain-$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
 stop
-python3 - "$DB_PATH" <<'PY'
-import sqlite3, sys
+python3 - "$DB_PATH" "$LRAW" "$DA" <<'PY'
+import sqlite3, sys, hashlib
 c = sqlite3.connect(sys.argv[1])
 c.execute("ALTER TABLE blindkey_secrets DROP COLUMN seen_by_person_at")
+c.execute("ALTER TABLE use_approvals DROP COLUMN value_mac")
+c.execute("ALTER TABLE refresh_tokens DROP COLUMN src_auth")
+c.execute("ALTER TABLE refresh_tokens DROP COLUMN agent_label")
+c.execute("INSERT INTO refresh_tokens (did, token_hash, scope, expires_at, session_id) VALUES (?, ?, 'transact', '2999-01-01T00:00:00.000Z', 'slegacychain0001')",
+          (sys.argv[3], hashlib.sha256(sys.argv[2].encode()).hexdigest()))
 c.execute("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, status, version, ref_code) VALUES ((SELECT did FROM identity_wallets WHERE username='ve-owner'), 've-legacy', 'password', '', 'active', 1, 'DP-PWD-legacy-00000001')")
 c.commit()
 PY
-[ "$(Q "SELECT COUNT(*) FROM pragma_table_info('blindkey_secrets') WHERE name='seen_by_person_at'")" = 0 ] || fail "legacy fixture did not drop the column"
+[ "$(Q "SELECT COUNT(*) FROM pragma_table_info('blindkey_secrets') WHERE name='seen_by_person_at'")" = 0 ] && [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('use_approvals') WHERE name='value_mac'")" = 0 ] \
+  && [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('refresh_tokens') WHERE name IN ('src_auth','agent_label')")" = 0 ] || fail "legacy fixture did not drop the columns"
 start
+[ "$(Q "SELECT COUNT(*) FROM pragma_table_info('use_approvals') WHERE name='value_mac'")" = 1 ] && [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('refresh_tokens') WHERE name IN ('src_auth','agent_label')")" = 2 ] \
+  && ok "legacy fixture: the server starts and gains use_approvals.value_mac and refresh_tokens.src_auth/agent_label" || fail "legacy columns"
+call POST /api/identity/refresh "" '{"refresh_token":"'$LRAW'"}'; LT1=$(echo "$BODY" | J token); LR1=$(echo "$BODY" | J refresh_token)
+[ "$CODE" = 200 ] && [ "$LT1" != None ] && [ "$(Q "SELECT COUNT(*) FROM refresh_tokens WHERE token_hash='$(printf '%s' "$LR1" | sha256sum | cut -d' ' -f1)' AND src_auth IS NULL")" = 1 ] \
+  && ok "…the old refresh chain still refreshes (the refresh writes the new columns), and stays a chain of unknown origin" || fail "legacy refresh: $CODE $BODY"
+call POST /api/identity/refresh "" '{"refresh_token":"'$LR1'"}'; LT2=$(echo "$BODY" | J token)
+[ "$CODE" = 200 ] && ok "…and refreshes again" || fail "legacy refresh 2: $CODE $BODY"
+call GET /api/demipass/dashboard "$LT2"
+[ "$CODE" = 200 ] && ok "…its tokens still work elsewhere (dashboard 200)" || fail "legacy chain dashboard: $CODE"
+call POST /api/demipass/edit "$LT2" "$(EDIT '{"ref":"'$REF1'","new_value":"x-zz94"}')"
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J sign_in_again)" = True ] && ok "…only /edit asks that chain to sign in again" || fail "legacy chain edit: $CODE $BODY"
+[ "$(Q "SELECT COALESCE(value_mac,'NULL') FROM use_approvals WHERE id=$APL")" = NULL ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$APL")" = approved ] && ok "…the old approval row reads value_mac NULL" || fail "legacy approval row"
+twofa "$A"; pin "$A" "edit:$CRL"; call POST /api/demipass/edit "$A" '{"ref":"'$CREF'","new_value":"'$VL'","approval_id":'$APL'}'
+[ "$CODE" = 410 ] && [ "$(Q "SELECT status FROM use_approvals WHERE id=$APL")" = cancelled ] && [ "$(Q "SELECT id FROM blindkey_secrets WHERE ref_code='$CREF'")" = "$CRL" ] \
+  && ok "…and fails closed: redeemed with the right value and every factor, it is cancelled (no HMAC to match) and nothing changes" || fail "legacy approval closed: $CODE $BODY"
 [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('blindkey_secrets') WHERE name='seen_by_person_at'")" = 1 ] && [ "$(Q "SELECT COALESCE(seen_by_person_at,'NULL') FROM blindkey_secrets WHERE name='ve-legacy'")" = NULL ] \
   && ok "legacy fixture: a database without seen_by_person_at starts, gains the column, and old rows read NULL" || fail "legacy column"
 A=$(login ve-owner); call GET /api/demipass/dashboard "$A"

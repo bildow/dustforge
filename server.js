@@ -6587,8 +6587,11 @@ app.post('/api/blindkey/edit', rateLimitStandard, (req, res) => {
   // NOT in the binding: the peek below compares the binding before any factor is checked, so a value in it would answer
   // "a different call" to wrong guesses without the PIN (#124 re-audit M1). Its HMAC sits in a server-only column,
   // written when the request is filed, and is compared inside the transaction after the PIN is spent.
+  // The request also belongs to the session that filed it (an HMAC of its sid): with the value out of the binding,
+  // another session of the owner's could otherwise file first and have this Save handed its request (#124 final
+  // re-audit). A different session gets a request of its own, and cannot redeem this one.
   const use = { kind: 'edit', action: 'edit', params: { mode: typed ? 'typed' : 'copy', ...(source ? { from_ref: source.ref_code, from_name: source.name } : {}), ...(retireSource ? { retire_source: true } : {}),
-    ends: ending.length, ...(ending.length ? { ends_token: leftToken } : {}) } };
+    ends: ending.length, ...(ending.length ? { ends_token: leftToken } : {}), session_tag: editMac('session', gateSession(auth)).slice(0, 16) } };
   const valueMac = typed ? editMac('value', target.id, new_value) : null;
   const caller = { did: ownerDid, label: cleanLabel(d0.agent_label || d0.username || 'owner', 40) };
   if (critical) {
