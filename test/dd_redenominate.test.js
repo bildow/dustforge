@@ -14,7 +14,8 @@ test('deposits buy 950 DD per dollar; prices are the old prices ×10', () => {
   assert.equal(units.ddForUsdCents('1000'), 9500);           // Stripe metadata is a string
   assert.equal(units.usdLabel(10), '$0.010');
   assert.equal(billing.RATE_TABLE.api_call_compute, 1);       // DemiPass /use: 1 DD since 2026-11-14 (RATE_CHANGES)
-  assert.equal(billing.RATE_TABLE.email_send, 10);
+  assert.equal(billing.RATE_TABLE.email_send, 1);             // per recipient since 2026-11-16 (RATE_CHANGES, ruling 7)
+  assert.equal(billing.RATE_TABLE.mail_forward, 10);          // the forwarding surcharge is unchanged
   assert.equal(billing.RATE_TABLE.identity_create, 1000);
   assert.equal(require('../referral').REFERRAL_PAYOUT_CENTS, 100);
 });
@@ -106,4 +107,11 @@ test('the price table is dated: /use went 10 → 1 DD on 2026-11-14, and the cha
   for (const c of billing.RATE_CHANGES) assert.match(c.effective, /^\d{4}-\d{2}-\d{2}$/);
   assert.equal(units.DD_PER_USD, 1000);                          // not re-denominated: 1 DD is still $0.001
   assert.equal(billing.RATE_TABLE.api_call_read, 0);             // request-token stays free (Aaron 2026-11-14)
+});
+
+test('email_send went 10 per email → 1 per recipient on 2026-11-16 (pane-mailbox ruling 7), and matches today\'s rate', () => {
+  const c = billing.RATE_CHANGES.filter((x) => x.action === 'email_send').slice(-1)[0];
+  assert.deepEqual([c.from_dd, c.to_dd, c.unit_from, c.unit, c.effective], [10, 1, 'per email', 'per recipient', '2026-11-16']);
+  assert.equal(c.ruling, 'Aaron 2026-11-16: 1dd for an email sent per recipient');
+  assert.equal(billing.RATE_TABLE.email_send, c.to_dd);
 });

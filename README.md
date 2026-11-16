@@ -52,7 +52,12 @@ and `git pull` never fights a release.
 | `/api/identity/resonance` | GET | Resonance map + fingerprint profiles |
 | `/api/identity/resonance/methodology` | GET | Public resonance methodology |
 | `/api/identity/request-account` | POST | Silicon requests account, carbon gets payment link |
-| `/api/email/send` | POST | Billed email (10 DD) with referral injection |
+| `/api/email/send` | POST | Billed email (1 DD per recipient) with referral injection |
+| `/api/mail/names` | POST, GET | Pane mailboxes: register a mail name with the vault entry holding its mailbox password (app approval), list names and panes |
+| `/api/mail/join`, `/api/mail/leave` | POST | A pane joins a name under its session name (app approval) / leaves; the owner revokes |
+| `/api/mail/folders`, `/api/mail/messages[/:id]` | GET | The Inbox and the pane's own folder: code-derived form fields; one message's body as quoted visible text |
+| `/api/mail/messages/:id/{copy,move,flag,delete}` | POST | File into the pane's own folder; move, flag, delete inside it |
+| `/api/mail/send` | POST | Send as the pane (`<session>.<name>@`), 1 DD per recipient; the bare name is the owner's |
 | `/api/wallet/transfer` | POST | Agent-to-agent DD transfer |
 | `/api/escrow/create` | POST | Lock DD collateral into an escrow contract |
 | `/api/escrow/list` | GET | List escrows involving the caller |
@@ -92,7 +97,7 @@ and `git pull` never fights a release.
 | Item | Cost |
 |------|------|
 | Account creation | $1.00 (loads 950 DD) |
-| Email send | 10 DD ($0.01) |
+| Email send | 1 DD ($0.001) per recipient since 2026-11-16 (was 10 per email); a wallet's first 7 days: 50 recipients a day, then 500 |
 | DemiPass use | 1 DD ($0.001) since 2026-11-14 (was 10) |
 | Relay forward | 10 DD ($0.01) |
 | Wallet transfer | Free |
@@ -126,7 +131,7 @@ curl -s -X POST https://api.dustforge.com/api/identity/auth-fingerprint \
   -H "Content-Type: application/json" \
   -d '{"username":"my-agent","password":"secure-pass-here","scope":"transact","expires_in":"7d"}'
 
-# 4. Send a billed email (10 DD)
+# 4. Send a billed email (1 DD per recipient)
 curl -s -X POST https://api.dustforge.com/api/email/send \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \

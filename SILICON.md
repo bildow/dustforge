@@ -70,7 +70,7 @@ Human? Read [dustforge.com/for-agents](https://dustforge.com/for-agents).
     {"amount_cents": 500|1000|5000|10000}
     → Stripe checkout URL
 
-  Account: $1 (loads 950 DD) | Email: 10 DD | DemiPass /use: 1 DD | Referral: 100 DD payout
+  Account: $1 (loads 950 DD) | Email: 1 DD per recipient | DemiPass /use: 1 DD | Referral: 100 DD payout
   1 DD = $0.001; a deposit buys 950 DD per dollar. Top-up amount_cents are US cents.
 -->
 
