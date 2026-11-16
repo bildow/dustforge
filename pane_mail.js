@@ -779,7 +779,9 @@ module.exports = function registerPaneMail(deps) {
       // the form only (#129 round-3). The owner still gets the body.
       if (!ctx.owner && vis.hidden_unresolved) {
         return res.json({ ok: true, name: ctx.nameRow.name, message: form, body: null,
-          withheld: 'hidden_unresolved: styled mail (any style, stylesheet or presentational markup) could hide text from a person; a pane gets the form only until the phase-2 reader',
+          withheld: vis.unresolved_why === 'parts differ'
+            ? 'hidden_unresolved: the plain and HTML parts say different things and a client may show either; a pane gets the form only'
+            : 'hidden_unresolved: styled mail (any style, stylesheet or presentational markup) could hide text from a person; a pane gets the form only until the phase-2 reader',
           why: vis.unresolved_why || null, styled_by: vis.styled_by || null, ...(vis.parts_differ ? { parts_differ: true } : {}) });
       }
       const text = unmasked ? vis.text : mailForm.maskSecrets(vis.text);

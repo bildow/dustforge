@@ -59,7 +59,8 @@ function decodeEntities(s) {
 const mailCss = require('./mail_css');
 
 // ── the scanner ─────────────────────────────────────────────────────────────────────────────────────────────────
-const SKIP_TAGS = new Set(['script', 'style', 'head', 'title', 'template', 'noscript', 'svg', 'math', 'iframe', 'object', 'embed', 'canvas', 'select', 'option', 'textarea', 'button', 'audio', 'video', 'map', 'frameset', 'xml', 'datalist', 'dialog']);
+const SKIP_TAGS = new Set(['script', 'style', 'head', 'title', 'template', 'noscript', 'svg', 'math', 'iframe', 'object', 'embed', 'canvas', 'select', 'option', 'textarea', 'button', 'audio', 'video', 'map', 'frameset', 'xml', 'datalist', 'dialog',
+  'noembed', 'noframes', 'rp', 'progress', 'meter']);   // #129 r10: rp, progress and meter content is not shown either
 const RAW_TAGS = new Set(['script', 'style', 'title', 'textarea', 'xmp', 'iframe', 'noembed', 'noframes']);
 const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr', 'basefont', 'frame', 'keygen']);
 const BLOCK_TAGS = new Set(['p', 'div', 'br', 'tr', 'li', 'ul', 'ol', 'table', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'pre', 'hr', 'section', 'article', 'header', 'footer', 'center', 'dd', 'dt', 'dl', 'address', 'form', 'fieldset', 'summary', 'details']);
@@ -84,7 +85,11 @@ function scan(s, on) {
     }
     if (c1 === 63 /* ? */) { const e = s.indexOf('>', lt + 2); if (e < 0) return 'cut'; i = e + 1; continue; }
     let j = lt + 1, closing = false;
-    if (c1 === 47 /* / */) { closing = true; j++; }
+    if (c1 === 47 /* / */) {
+      closing = true; j++;
+      // "</" not followed by a letter is a bogus comment up to the next ">" ("</>" is nothing at all), as browsers read it.
+      if (!isAlpha(s.charCodeAt(j))) { const e = s.indexOf('>', j); if (e < 0) return 'cut'; i = e + 1; continue; }
+    }
     if (!isAlpha(s.charCodeAt(j))) { on.text('<'); i = lt + 1; continue; }
     let k = j;
     while (k < n && isNameCh(s.charCodeAt(k))) k++;
@@ -115,7 +120,8 @@ function scan(s, on) {
     i = q;
     if (closing) { on.close(name); continue; }
     on.open(name, attrs, selfClosing);
-    if (RAW_TAGS.has(name) && !selfClosing) {
+    // "/>" does not close a raw-text element in HTML: <script/>…</script> and <title/>…</title> still hold their text.
+    if (RAW_TAGS.has(name)) {
       const re = new RegExp('</' + name + '[\\s/>]', 'ig'); re.lastIndex = i;
       const m = re.exec(s);
       on.raw(name, m ? s.slice(i, m.index) : s.slice(i));
@@ -134,7 +140,7 @@ function scan(s, on) {
 // the body of an HTML message only when it carries NO styling construct at all; everything else is form-only until the
 // phase-2 reader. mail_css.js still shapes the owner's text, but no longer gates panes.
 const STYLED_REASON = 'styled mail: form only until the reader (phase 2)';
-const STYLED_TAGS = new Set(['style', 'link', 'font', 'small', 'sub', 'sup', 'big', 'center', 'marquee', 'blink', 'basefont', 'details', 'dialog']);
+const STYLED_TAGS = new Set(['style', 'link', 'font', 'small', 'sub', 'sup', 'big', 'center', 'marquee', 'blink', 'basefont', 'details', 'dialog', 'bdo']);
 const STYLED_ATTRS = ['style', 'bgcolor', 'background', 'color', 'text', 'size', 'face', 'link', 'vlink', 'alink', 'hidden', 'aria-hidden',
   'cellpadding', 'cellspacing', 'hspace', 'vspace', 'nowrap', 'clear', 'leftmargin', 'topmargin', 'marginwidth', 'marginheight'];
 const SIZED_OK = new Set(['img', 'table', 'td', 'th', 'tr', 'col', 'colgroup']);   // width/height that cannot clip text
@@ -142,6 +148,12 @@ function styledBy(name, attrs) {
   if (STYLED_TAGS.has(name)) return `<${name}>`;
   for (const a of STYLED_ATTRS) if (a in attrs) return `a ${a} attribute on <${name}>`;
   if (('width' in attrs || 'height' in attrs) && !SIZED_OK.has(name)) return `width/height on <${name}>`;
+  // On the elements where they are allowed, sizes are capped (#129 r10: a 100000px spacer pushes the rest out of view).
+  for (const [k, max] of [['width', 1200], ['height', 2000]]) {
+    if (!(k in attrs)) continue;
+    const m = /^\s*(\d{1,7}(?:\.\d+)?)\s*(px|%)?\s*$/i.exec(String(attrs[k]));
+    if (!m || (m[2] === '%' ? Number(m[1]) > 100 : Number(m[1]) > max)) return `${k}="${String(attrs[k]).slice(0, 20)}" on <${name}>`;
+  }
   if (String(attrs.type || '').toLowerCase() === 'hidden') return `a hidden <${name}>`;
   return null;
 }
@@ -190,7 +202,9 @@ function reduceHtml(html) {
       for (const k of ['href', 'src', 'action', 'background']) if (attrs[k]) links.push(attrs[k]);
       if (name === 'link' && /stylesheet/i.test(String(attrs.rel || ''))) flag('an external stylesheet (<link rel=stylesheet>)');
       if (!hiddenDepth && !overflow && BLOCK_TAGS.has(name)) out.push('\n');
-      if (VOID_TAGS.has(name) || selfClosing) return;
+      // "/>" closes only void elements in HTML (and inside <svg>/<math>, whose content is never shown here anyway): a
+      // <template/> or <select/> still opens, and hides what follows until it closes (#129 r10).
+      if (VOID_TAGS.has(name)) return;
       if (stack.length >= MAX_DEPTH) { overflow = true; return; }
       const node = { tag: name, classes: attrs.class ? String(attrs.class).toLowerCase().split(/[\s]+/).filter(Boolean) : [], id: attrs.id ? String(attrs.id).toLowerCase() : null, attrs };
       const parent = stack.length ? stack[stack.length - 1].computed : mailCss.ROOT;
@@ -253,7 +267,11 @@ function visibleText(email) {
     const r = reduceHtml(html);
     const t = tidy(stripInvisible(r.text));
     if (!t && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: 'empty', hidden_unresolved: r.unresolved, unresolved_why: r.why, styled_by: r.styled_by, parts_differ: false };
-    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut, hidden_unresolved: r.unresolved, unresolved_why: r.why, styled_by: r.styled_by, parts_differ: Boolean(plain) && partsDiffer(t, plain) };
+    // Plain and HTML parts that say materially different things: a client may show either, so a pane gets the form only
+    // (#129 r10).
+    const differ = Boolean(plain) && partsDiffer(t, plain);
+    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut, hidden_unresolved: r.unresolved || differ,
+      unresolved_why: r.why || (differ ? 'parts differ' : null), styled_by: r.styled_by, parts_differ: differ };
   }
   return { source: 'text', text: plain, hidden_elements: 0, cut: false, hidden_unresolved: false, parts_differ: false };
 }
