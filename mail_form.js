@@ -141,12 +141,14 @@ function scan(s, on) {
 // phase-2 reader. mail_css.js still shapes the owner's text, but no longer gates panes.
 const STYLED_REASON = 'styled mail: form only until the reader (phase 2)';
 const STYLED_TAGS = new Set(['style', 'link', 'font', 'small', 'sub', 'sup', 'big', 'center', 'marquee', 'blink', 'basefont', 'details', 'dialog', 'bdo']);
-const STYLED_ATTRS = ['style', 'bgcolor', 'background', 'color', 'text', 'size', 'face', 'link', 'vlink', 'alink', 'hidden', 'aria-hidden',
+const STYLED_ATTRS = ['style', 'dir', 'bgcolor', 'background', 'color', 'text', 'size', 'face', 'link', 'vlink', 'alink', 'hidden', 'aria-hidden',
   'cellpadding', 'cellspacing', 'hspace', 'vspace', 'nowrap', 'clear', 'leftmargin', 'topmargin', 'marginwidth', 'marginheight'];
 const SIZED_OK = new Set(['img', 'table', 'td', 'th', 'tr', 'col', 'colgroup']);   // width/height that cannot clip text
 function styledBy(name, attrs) {
   if (STYLED_TAGS.has(name)) return `<${name}>`;
   for (const a of STYLED_ATTRS) if (a in attrs) return `a ${a} attribute on <${name}>`;
+  // A zero size (some clients collapse it) is styling too (#129 r10 follow-up).
+  for (const k of ['width', 'height']) if (k in attrs && /^\s*0+(\.0+)?\s*(px|%)?\s*$/i.test(String(attrs[k]))) return `${k}="0" on <${name}>`;
   if (('width' in attrs || 'height' in attrs) && !SIZED_OK.has(name)) return `width/height on <${name}>`;
   // On the elements where they are allowed, sizes are capped (#129 r10: a 100000px spacer pushes the rest out of view).
   for (const [k, max] of [['width', 1200], ['height', 2000]]) {
@@ -248,13 +250,13 @@ function partsOf(email) {
 }
 
 // Do the two parts say materially different things? Share of the plain part's words (3+ letters) the HTML text lacks.
+// Symmetric (#129 r10 follow-up): either side carrying words the other lacks — more than 20% of its own words, and at
+// least 3 — is a difference. HTML = a harmless plain part plus an injected sentence is caught, as is the reverse.
 function partsDiffer(htmlText, plainText) {
   const words = (t) => new Set((String(t).toLowerCase().slice(0, MAX_TEXT).match(/[\p{L}\p{N}]{3,}/gu) || []));
   const a = words(htmlText), b = words(plainText);
-  if (!b.size) return false;
-  let missing = 0;
-  for (const w of b) if (!a.has(w)) missing++;
-  return missing / b.size > 0.2 && missing >= 3;
+  const extra = (x, y) => { if (!x.size) return false; let m = 0; for (const w of x) if (!y.has(w)) m++; return m / x.size > 0.2 && m >= 3; };
+  return extra(b, a) || extra(a, b);
 }
 // The visible body: the HTML part reduced (what a person sees, so text hidden from them is gone), else the plain part.
 // The plain part stands in only when the HTML reduces to nothing; HTML that was cut short still gives its own text,
