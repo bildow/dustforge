@@ -2702,6 +2702,10 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
   if (!subject || !body || typeof subject !== 'string' || typeof body !== 'string') return res.status(400).json({ error: 'subject and body required' });
   if (subject.length > 900 || /[\r\n]/.test(subject)) return res.status(400).json({ error: 'subject: one line, at most 900 characters' });
   if (!db.prepare('SELECT 1 FROM forward_relays WHERE did = ? AND status = ?').get(req.identity.did, 'active')) return res.status(404).json({ error: 'no active forwarding rules' });
+  // A forward goes out From the wallet's own address: when that is a registered mail name, only its owner's own session
+  // forwards as it (pane_mail.js; #129 review).
+  const why = paneMail ? paneMail.directSendRefusal({ ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false }, directFromAddr(req.identity.did)) : null;
+  if (why) return res.status(403).json({ error: why });
   next();
 }, async (req, res) => {
   const { subject, body, original_from } = req.body || {};
@@ -2799,9 +2803,17 @@ app.post('/api/mail/mta-hook', (req, res) => {
       for (const rule of rules) {
         if (rule.filter_from !== '*' && fromAddr && !fromAddr.includes(String(rule.filter_from).toLowerCase())) continue;
         // COD: charge 10 DD against the existing balance BEFORE forwarding.
-        // The forwarding surcharge (RATE_TABLE.mail_forward, 10 DD), unchanged by the per-recipient send price.
-        const debit = billing.deductBalance(db, wallet.did, billing.RATE_TABLE.mail_forward, 'email_send', `mail forward -> ${rule.forward_to}`);
+        // The forwarding surcharge (RATE_TABLE.mail_forward, 10 DD), unchanged by the per-recipient send price, logged as
+        // mail_forward. A forward is one outbound recipient of the wallet: it counts against the outbound cap.
+        const oslot = mailOutboundCap.reserve(db, wallet.did, 1, { liftExtra: limitLiftExtra('mail_out', 'wallet:' + wallet.did) });
+        if (!oslot.ok) {
+          try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject, detail) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(wallet.did, 'blocked_outbound_cap', rule.forward_to, fromAddr, subject.slice(0, 120), String(oslot.body && oslot.body.error || 'outbound cap').slice(0, 200)); } catch(_) {}
+          continue;
+        }
+        const debit = billing.deductBalance(db, wallet.did, billing.RATE_TABLE.mail_forward, 'mail_forward', `mail forward -> ${rule.forward_to}`);
         if (!debit.ok) {
+          oslot.release();
           try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject, detail) VALUES (?, ?, ?, ?, ?, ?)')
             .run(wallet.did, 'blocked_insufficient_balance', rule.forward_to, fromAddr, subject.slice(0, 120),
                  `balance ${debit.balance_cents ?? 0} DD — top up to resume forwarding`); } catch(_) {}
@@ -2823,6 +2835,7 @@ app.post('/api/mail/mta-hook', (req, res) => {
               subject: subject || '(no subject)',
               text: `Forwarded by DemiPass from ${_u}@dustforge.com\nOriginal sender: ${fromAddr || 'unknown'}\n\n${body}`,
             }).then(() => {}).catch((e) => {
+              oslot.release();   // it never went out: it takes no room in the outbound cap
               try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject, detail) VALUES (?, ?, ?, ?, ?, ?)')
                 .run(_did, 'send_failed', _to, fromAddr, subject.slice(0, 120), String(e && e.message || e).slice(0, 120)); } catch(_) {}
             });
@@ -9898,7 +9911,8 @@ mailReceiptsApi = require('./mail_receipts')({ app, db, rateLimitStandard, getBe
 // as the pane at 1 DD per recipient. The mailbox password stays in the owner's vault and is used here only.
 paneMail = require('./pane_mail')({ app, db, billing, getBearerIdentity, isAgentAuth, deviceSession, ownerApproves, logSecurityEvent, cleanLabel,
   blindkeyDecrypt, rateLimitStandard, mailHeaders, reserveMailSlot, mailRecipientCap, outboundCap: mailOutboundCap, limitLiftExtra,
-  mailReceipts: () => mailReceiptsApi, referral, stalwartAdmin: dustforge.stalwartRequest, emailAddrRe: EMAIL_ADDR_RE });
+  mailReceipts: () => mailReceiptsApi, referral, stalwartAdmin: dustforge.stalwartRequest, emailAddrRe: EMAIL_ADDR_RE,
+  creatorOf: (did) => fleetBilling.creatorOf(db, did) });
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
 require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
   approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });

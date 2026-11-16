@@ -66,3 +66,54 @@ test('the form: internal only for our domain with DKIM or DMARC pass; auth resul
   // A form never carries the body.
   assert.ok(!JSON.stringify(real).includes('verification code is'));
 });
+
+// ── #129 review H1: linear time on adversarial HTML ──
+test('a 256 KB adversarial message is reduced in under 200 ms (no quadratic scan)', () => {
+  const inputs = {
+    'repeated <a': '<a'.repeat(131072),
+    'repeated href="': '<a href="'.repeat(30000),
+    'repeated <!': '<!'.repeat(131072),
+    'unterminated quotes': '<a b="'.repeat(40000),
+    'deep nesting then stray closers': '<b>'.repeat(60000) + '</i>'.repeat(30000),
+    'a long space run': ' '.repeat(262143) + 'x',
+    'style comments never closed': '<p style="' + '/*'.repeat(120000) + '">',
+    'css escapes': '<p style="' + '\\6e '.repeat(60000) + '">x</p>',
+    'many hiding classes': '<style>' + '.a{display:none}'.repeat(16000) + '</style>' + '<p class=a>x</p>'.repeat(1000),
+    'digit runs': '1 '.repeat(130000),
+    'letters and digits': 'a1'.repeat(130000) + '_',
+  };
+  for (const [what, v] of Object.entries(inputs)) {
+    const body = v.slice(0, 262144);
+    const e = { id: 'x', subject: body.slice(0, 2000), from: [{ email: 'a@b.example' }], htmlBody: [{ partId: '1', type: 'text/html' }], textBody: [{ partId: '2', type: 'text/plain' }],
+      bodyValues: { 1: { value: body }, 2: { value: body } }, 'header:Authentication-Results:asText:all': [' '.repeat(1999) + 'x'] };
+    const t0 = process.hrtime.bigint();
+    f.formOf(e); f.maskSecrets(f.visibleText(e).text);
+    const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.ok(ms < 200, `${what}: ${ms.toFixed(0)} ms`);
+  }
+});
+
+// ── #129 review LOW: hidden-text gaps ──
+test('text hidden by a <style> class, id or tag rule, closed <details>, white or 1px text, CSS escapes is dropped', () => {
+  const t = f.htmlToVisibleText('<style>.x{display:none} #y{visibility:hidden} .z{font-size:1px} @media screen{.m{display:none}}</style>' +
+    '<p>seen</p><p class="a x">by class</p><p id=y>by id</p><span class=z>tiny class</span><p class=m>in media</p>' +
+    '<details><summary>sum</summary>inside closed details</details><details open><summary>opened</summary>shown</details>' +
+    '<p style="color:#ffffff">white</p><p style="color:rgb(255,255,255)">white rgb</p><p style="font-size:1px">one px</p>' +
+    '<p style="display:\\6e one">escaped</p><p style="dis/**/play:none">commented</p><font color="#fff">font white</font>' +
+    '<p style="font:0/0 a">font zero</p><p style="position:absolute;left:-9999px">off screen</p>');
+  assert.match(t, /seen/); assert.match(t, /opened/); assert.match(t, /shown/);
+  for (const bad of ['by class', 'by id', 'tiny class', 'in media', 'inside closed details', 'sum\n', 'white', 'one px', 'escaped', 'commented', 'font zero', 'off screen']) assert.ok(!t.includes(bad), bad + ' in ' + JSON.stringify(t));
+});
+
+test('an unterminated quote in a style attribute drops the rest (fails closed)', () => {
+  assert.equal(f.htmlToVisibleText('<p>seen</p><p style="display:none>leak</p><p>more</p>'), 'seen');
+});
+
+// ── #129 review H2: what a pane is handed ──
+test('maskSecrets: codes, tokens and link paths are masked; a year and the link host stay', () => {
+  const m = f.maskSecrets('Your code is 482913 (or 123-456). Reset: https://api.dustforge.com/reset?token=abcDEF123456 — token Xk9Q2m7Z. Since 2026.');
+  assert.ok(!/482913|123-456|abcDEF|token=|Xk9Q2m7Z/.test(m), m);
+  assert.match(m, /https:\/\/api\.dustforge\.com\/…/);
+  assert.match(m, /••••••/); assert.match(m, /2026/);
+  assert.equal(f.formOf({ id: 'x', subject: 'Your DemiPass sign-in code is 482913' }).subject, 'Your DemiPass sign-in code is ••••••');
+});
