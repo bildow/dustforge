@@ -525,6 +525,7 @@ kill $SRV; wait $SRV 2>/dev/null
 node server.js >>"$S/server.log" 2>&1 & SRV=$!
 for i in $(seq 1 40); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
 call POST /api/mail/names "$P1" "$NAMEB"; [ "$CODE" = 429 ] && ok "…and still after a restart (the failures are kept in the database)" || fail "probe limit after restart: $CODE $BODY"
+[ "$(Q "SELECT COUNT(*) FROM mail_owner_challenges WHERE exp > strftime('%s','now')*1000")" -gt 0 ] && ok "owner-act challenges outlive a restart" || fail "challenges after restart"
 
 # ── no mailbox secret anywhere ──
 B64=$(printf 'claude:%s' "$PW1" | base64 -w0)
@@ -533,11 +534,12 @@ if grep -q -F -e "$PW1" -e "$PW2" -e "$B64" -e "$ADMINPW" "$S/bodies" "$S/server
 
 # ── legacy fixture: a database from before pane mailboxes gains the tables at start ──
 kill $SRV; wait $SRV 2>/dev/null
-for t in mail_names mail_panes mail_pane_flags mail_outbound_daily mail_probe_failures; do X "DROP TABLE $t"; done
+[ "$(Q "SELECT COUNT(*) FROM mail_owner_challenges")" -gt 0 ] && ok "owner-act challenges are kept in the database (mail_owner_challenges)" || fail "challenges table"
+for t in mail_names mail_panes mail_pane_flags mail_outbound_daily mail_probe_failures mail_owner_challenges; do X "DROP TABLE $t"; done
 X "ALTER TABLE email_receipts DROP COLUMN sender"
 node server.js >>"$S/server.log" 2>&1 & SRV=$!
 for i in $(seq 1 40); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
-[ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('mail_names','mail_panes','mail_pane_flags','mail_outbound_daily','mail_probe_failures')")" = 5 ] && ok "legacy: a database without the tables gains mail_names, mail_panes, mail_pane_flags, mail_outbound_daily, mail_probe_failures at start" || fail "legacy tables"
+[ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('mail_names','mail_panes','mail_pane_flags','mail_outbound_daily','mail_probe_failures','mail_owner_challenges')")" = 6 ] && ok "legacy: a database without the tables gains mail_names, mail_panes, mail_pane_flags, mail_outbound_daily, mail_probe_failures, mail_owner_challenges at start" || fail "legacy tables"
 [ "$(Q "SELECT COUNT(*) FROM pragma_table_info('email_receipts') WHERE name='sender'")" = 1 ] && ok "legacy: an email_receipts table from before sender gains the column" || fail "legacy sender column"
 [ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_mail_names_live','idx_mail_panes_session','idx_mail_panes_holder')")" = 3 ] && ok "legacy: …and their unique indexes" || fail "legacy indexes"
 call GET /api/mail/names "$A"; [ "$CODE" = 200 ] && ok "legacy: the names list answers" || fail "legacy names: $CODE"

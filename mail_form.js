@@ -6,8 +6,10 @@
 //                        the SPF/DKIM/DMARC results Stalwart wrote, codes found (length only), link hosts (checked
 //                        against the sender's domain), attachment names and types.
 //   visibleText(email) → the body as a person would see it: HTML reduced to visible text (comments, script/style/head,
-//                        closed <details>, elements hidden by attribute, inline style or a <style> rule dropped), then
-//                        zero-width, bidi and control characters stripped.
+//                        closed <details>, elements hidden by attribute, inline style or a <style> rule dropped, text
+//                        under 8px or below 1.5:1 contrast dropped), then zero-width, bidi and control characters
+//                        stripped. `hidden_unresolved`: the message's CSS goes beyond the allowlist in mail_css.js, so a
+//                        pane gets the form only (fails closed; the owner's view is unchanged).
 //   maskSecrets(text)  → the text with code-like runs masked and links cut to their host: what a pane is given.
 //   quoted(text)       → that text as a quotation ("> " on every line), capped: it is handed over as data.
 // Nothing here fetches remote content, follows links or renders.
@@ -52,158 +54,8 @@ function decodeEntities(s) {
   });
 }
 
-// ── CSS: is this declaration block hiding its text? ─────────────────────────────────────────────────────────────────
-// Comments are removed and escapes (\6e, \:) decoded first, so "display:\6e one" reads as "display:none".
-function cssClean(raw) {
-  const s = String(raw || '');
-  let out = '', i = 0;
-  while (i < s.length) {
-    const a = s.indexOf('/*', i);
-    if (a < 0) { out += s.slice(i); break; }
-    out += s.slice(i, a);
-    const b = s.indexOf('*/', a + 2);
-    if (b < 0) break;
-    i = b + 2;
-  }
-  return out.replace(/\\([0-9a-fA-F]{1,6})\s?/g, (m, h) => { const n = parseInt(h, 16); return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : ''; })
-    .replace(/\\(.)/g, '$1').toLowerCase();
-}
-function cssDecls(clean) {
-  const d = {};
-  for (const part of clean.split(';')) {
-    const c = part.indexOf(':');
-    if (c < 0) continue;
-    const k = part.slice(0, c).replace(/\s+/g, '');
-    const v = part.slice(c + 1).replace(/!important/g, '').replace(/\s+/g, ' ').trim();
-    if (k) d[k] = v;
-  }
-  return d;
-}
-const num = (v) => { const m = /^(-?\d*\.?\d+)\s*([a-z%]*)/.exec(String(v || '').trim()); return m ? { n: parseFloat(m[1]), u: m[2] || '' } : null; };
-function lightColour(v) {
-  const s = String(v || '').replace(/\s+/g, '');
-  if (!s) return false;
-  if (/^(transparent|white|snow|ivory|ghostwhite|whitesmoke|floralwhite|azure|mintcream|honeydew|seashell|aliceblue)$/.test(s)) return true;
-  let r, g, b, a = 1, m;
-  if ((m = /^#([0-9a-f]{3,4})$/.exec(s))) { [r, g, b] = [...m[1].slice(0, 3)].map((x) => parseInt(x + x, 16)); if (m[1].length === 4) a = parseInt(m[1][3] + m[1][3], 16) / 255; }
-  else if ((m = /^#([0-9a-f]{6})([0-9a-f]{2})?$/.exec(s))) { r = parseInt(m[1].slice(0, 2), 16); g = parseInt(m[1].slice(2, 4), 16); b = parseInt(m[1].slice(4, 6), 16); if (m[2]) a = parseInt(m[2], 16) / 255; }
-  else if ((m = /^rgba?\(([\d.]+)%?,([\d.]+)%?,([\d.]+)%?(?:,([\d.]+))?\)$/.exec(s))) { [r, g, b] = [m[1], m[2], m[3]].map(Number); if (m[4] !== undefined) a = Number(m[4]); }
-  else return false;
-  return a < 0.2 || (r >= 235 && g >= 235 && b >= 235);
-}
-// A background that is not light (a coloured button, a dark band): light text on it is readable.
-function coversBg(v) {
-  const x = String(v || '').replace(/\s+/g, ' ').trim();
-  if (!x || /^(none|transparent|inherit|initial|unset|currentcolor)$/.test(x)) return false;
-  if (/url\(|gradient\(/.test(x)) return true;
-  const first = x.split(' ')[0];
-  return !lightColour(first) && /^(#|rgb|hsl|[a-z]+$)/.test(first) && first !== 'white';
-}
-// What a declaration block does to its text: 'hard' (gone whatever the background: display:none, zero size, off
-// screen, colour equal to its own background…), 'colour' (light or transparent text: unreadable only on a light
-// background, decided per element against the backgrounds around it), or null.
-function cssHideKind(raw) {
-  const d = cssDecls(cssClean(raw));
-  const small = (v) => { const x = num(v); if (!x) return false; if (x.n <= 0) return true;
-    return (x.u === 'px' && x.n <= 4) || (x.u === 'pt' && x.n <= 3) || ((x.u === 'em' || x.u === 'rem') && x.n <= 0.35) || (x.u === '%' && x.n <= 35) || (x.u === '' && x.n <= 0); };
-  const tiny = (v) => { const x = num(v); return Boolean(x) && x.n <= 1; };
-  const far = (v) => { const x = num(v); return Boolean(x) && x.n <= -50; };
-  if (d.display === 'none' || /^(hidden|collapse)/.test(d.visibility || '')) return 'hard';
-  if (d['mso-hide'] === 'all' || d['content-visibility'] === 'hidden') return 'hard';
-  if (d.opacity !== undefined && (num(d.opacity) || { n: 1 }).n < 0.3) return 'hard';
-  if (d['font-size'] !== undefined && small(d['font-size'])) return 'hard';
-  if (d.font !== undefined && /^0(\D|$)/.test(d.font.replace(/^(italic|bold|normal|oblique|small-caps|\d00)\s+/g, ''))) return 'hard';
-  const bg = d['background-color'] || d.background;
-  if (d.color !== undefined && bg && d.color.replace(/\s+/g, '') === String(bg).split(' ')[0].replace(/\s+/g, '')) return 'hard';
-  if (['height', 'max-height', 'width', 'max-width', 'line-height'].some((k) => d[k] !== undefined && tiny(d[k])) && /hidden|clip/.test(d.overflow || d['overflow-x'] || d['overflow-y'] || '')) return 'hard';
-  if (['text-indent', 'left', 'top', 'margin-left', 'margin-top', 'right'].some((k) => d[k] !== undefined && far(d[k]))) return 'hard';
-  if (/rect\(0/.test(d.clip || '') || /inset\(50%|circle\(0/.test(d['clip-path'] || '')) return 'hard';
-  if (/scale\(0[,)]|scale\(0\.0|scalex\(0\)|scaley\(0\)/.test((d.transform || '').replace(/\s+/g, ''))) return 'hard';
-  if (d.color !== undefined && lightColour(d.color) && !coversBg(bg)) return 'colour';
-  return null;
-}
-const cssHides = (raw) => cssHideKind(raw) !== null;
-const ownBackground = (raw) => { const d = cssDecls(cssClean(raw)); return coversBg(d['background-color'] || d.background); };
-// <style> blocks → the rules that hide (#129 round-3 re-audit). Each hiding rule is resolved by its selector's
-// RIGHTMOST compound — the element the rule lands on: its last class, else its id, else its bare type (html/body never).
-// [class=…]/[class~=…] count as a class and [id=…] as an id; pseudo-classes are set aside (:not(.y) hides nothing
-// itself); a pseudo-element rule (::before…) hides no element text. Rules inside @media, @supports, @layer, @container
-// apply. A hiding rule that cannot be resolved this way (`*`, [data-x], [class*=x], body > …) marks the document
-// `unresolved`: a pane then gets the form only, no body. Linear: one pass over the braces, bounded work per selector.
-const APPLYING_AT = /^@(media|supports|layer|container|document|-moz-document|scope)\b/;
-function topLevelSplit(s, ch) {
-  const out = []; let depth = 0, start = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '(') depth++; else if (c === ')') depth = Math.max(0, depth - 1);
-    else if (c === ch && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
-  }
-  out.push(s.slice(start));
-  return out;
-}
-// One selector → { cls } | { id } | { tag } | { pseudoElement: true } | { unresolved: true }.
-function resolveSelector(sel0, attrs) {
-  let sel = sel0.trim();
-  if (!sel) return { unresolved: true };
-  if (/::|:(before|after|first-line|first-letter|marker|placeholder|selection|backdrop)\b/.test(sel)) return { pseudoElement: true };
-  // A state the reader brings about (hovering, focusing) is not how the mail reads at rest.
-  if (/:(hover|focus|focus-within|focus-visible|active|visited)\b/.test(sel)) return { pseudoElement: true };
-  for (let pass = 0; pass < 6 && /:[a-z-]+\(/.test(sel); pass++) sel = sel.replace(/:[a-z-]+\([^()]*\)/g, ':_');
-  if (/[()]/.test(sel)) return { unresolved: true };
-  const parts = sel.split(/[\s>+~]+/).filter(Boolean);
-  const raw = parts[parts.length - 1] || '';
-  const pseudo = /:[a-z_-]/.test(raw);                       // the rightmost compound applies to a subset (:nth-child…)
-  const comp = raw.replace(/:[a-z_-]+/g, '');
-  const classes = [], ids = [];
-  let unknownAttr = false;
-  for (const m of comp.matchAll(/([.#])([a-z0-9_-]+)|\u0001(\d+)\u0001/g)) {
-    if (m[1] === '.') classes.push(m[2]);
-    else if (m[1] === '#') ids.push(m[2]);
-    else {
-      const a = /^\s*(class|id)\s*(~?=)\s*["']?([^"'\]]*?)["']?\s*(i|s)?\s*$/.exec(attrs[Number(m[3])] || '');
-      if (!a) { unknownAttr = true; continue; }
-      const words = a[3].trim().split(/\s+/).filter(Boolean);
-      if (!words.length) { unknownAttr = true; continue; }
-      if (a[1] === 'class') classes.push(words[words.length - 1]); else ids.push(words[0]);
-    }
-  }
-  if (classes.length) return { cls: classes[classes.length - 1] };
-  if (ids.length) return { id: ids[ids.length - 1] };
-  const tag = /^[a-z][a-z0-9]*/.exec(comp);
-  // A bare type only: "p:nth-child(2)" or "p[data-x]" is some p's, not every p, so it cannot be placed.
-  if (tag && !unknownAttr && !pseudo && comp === tag[0] && tag[0] !== 'html' && tag[0] !== 'body') return { tag: tag[0] };
-  return { unresolved: true };
-}
-function hidingRules(css) {
-  const s = cssClean(css);
-  const out = { tags: new Map(), byClass: new Map(), byId: new Map(), unresolved: false };
-  const put = (map, key, kind) => { if (map.get(key) !== 'hard') map.set(key, kind); };
-  const stack = [];
-  let start = 0, i = 0;
-  while (i < s.length) {
-    const o = s.indexOf('{', i), c = s.indexOf('}', i);
-    if (o < 0 && c < 0) break;
-    if (c >= 0 && (o < 0 || c < o)) { stack.pop(); i = start = c + 1; continue; }
-    let prelude = s.slice(start, o);
-    prelude = prelude.slice(prelude.lastIndexOf(';') + 1).trim();     // statement at-rules (@import …; @layer a;) end at ';'
-    if (prelude.startsWith('@')) { stack.push(APPLYING_AT.test(prelude)); i = start = o + 1; continue; }
-    const close = s.indexOf('}', o + 1);
-    const body = close < 0 ? s.slice(o + 1) : s.slice(o + 1, close);
-    i = start = close < 0 ? s.length : close + 1;
-    if (stack.some((applies) => !applies)) continue;       // inside @font-face, @keyframes, @page…: not element rules
-    const kind = cssHideKind(body);
-    if (!kind) continue;
-    const attrs = [];
-    const sels = prelude.replace(/\[[^\]]*\]/g, (m) => { attrs.push(m.slice(1, -1)); return '\u0001' + (attrs.length - 1) + '\u0001'; });
-    for (const sel of topLevelSplit(sels, ',')) {
-      const r = resolveSelector(sel, attrs);
-      if (r.pseudoElement) continue;
-      if (r.unresolved) { out.unresolved = true; continue; }
-      if (r.cls) put(out.byClass, r.cls, kind); else if (r.id) put(out.byId, r.id, kind); else put(out.tags, r.tag, kind);
-    }
-  }
-  return out;
-}
+// ── CSS: mail_css.js decides, failing closed (#129 round-4): what it cannot account for marks the message unresolved.
+const mailCss = require('./mail_css');
 
 // ── the scanner ─────────────────────────────────────────────────────────────────────────────────────────────────
 const SKIP_TAGS = new Set(['script', 'style', 'head', 'title', 'template', 'noscript', 'svg', 'math', 'iframe', 'object', 'embed', 'canvas', 'select', 'option', 'textarea', 'button', 'audio', 'video', 'map', 'frameset', 'xml', 'datalist', 'dialog']);
@@ -273,71 +125,78 @@ function scan(s, on) {
   return 'end';
 }
 
-// How an element hides its text: 'hard', 'colour' (light text: hidden unless a background is under it), or null.
-function hideKindOf(name, a, css) {
-  if ('hidden' in a) return 'hard';
-  if (String(a['aria-hidden'] || '').toLowerCase() === 'true') return 'hard';
-  if (String(a.type || '').toLowerCase() === 'hidden') return 'hard';
-  if (name === 'details' && !('open' in a)) return 'hard';       // closed <details>: its content is not shown
-  let kind = a.style ? cssHideKind(a.style) : null;
-  if (kind === 'hard') return 'hard';
-  if (!kind && name === 'font' && a.color && lightColour(String(a.color).toLowerCase())) kind = 'colour';
-  if (css) {
-    const t = css.tags.get(name);
-    if (t === 'hard') return 'hard'; if (t) kind = kind || t;
-    const id = a.id ? String(a.id).toLowerCase() : null;
-    const it = id ? css.byId.get(id) : null;
-    if (it === 'hard') return 'hard'; if (it) kind = kind || it;
-    for (const c of a.class ? String(a.class).toLowerCase().split(/\s+/) : []) {
-      const k = c ? css.byClass.get(c) : null;
-      if (k === 'hard') return 'hard'; if (k) kind = kind || k;
-    }
-  }
-  return kind;
-}
-const hasBackground = (name, a) => Boolean((a.bgcolor && coversBg(String(a.bgcolor).toLowerCase())) || (a.style && ownBackground(a.style)));
-
-// HTML → { text, links, hidden, cut }: the visible text, every link target (href/src/action), how many elements were
-// dropped as hidden, and whether the scan stopped at an unterminated construct.
+// HTML → { text, links, hidden, cut, unresolved, why }: the visible text, every link target (href/src/action), how
+// many elements were dropped as hidden, whether the scan stopped at an unterminated construct, and whether anything in
+// the message's CSS falls outside what mail_css.js accounts for (`why` says what, first).
 function reduceHtml(html) {
   const s = String(html == null ? '' : html).slice(0, MAX_HTML);
-  // Pass 1: the <style> blocks (they apply to the whole document, wherever they sit).
-  let styles = '';
-  scan(s, { text() {}, open() {}, close() {}, raw(name, content) { if (name === 'style') styles += content + '\n'; } });
-  const css = styles ? hidingRules(styles) : null;
+  let unresolved = false, why = null;
+  const flag = (w) => { if (!unresolved) { unresolved = true; why = w; } };
+  // Pass 1: the <style> blocks (they apply to the whole document, wherever they sit); a media attribute other than
+  // all/screen makes its block conditional.
+  let styles = '', pendingMedia = null;
+  scan(s, { text() {}, close() {},
+    open(name, attrs) {
+      if (name === 'style') pendingMedia = attrs.media ? String(attrs.media).toLowerCase().trim() : null;
+      if (name === 'link' && /stylesheet/i.test(String(attrs.rel || ''))) flag('an external stylesheet (<link rel=stylesheet>)');
+    },
+    raw(name, content) {
+      if (name !== 'style') return;
+      const plain = !pendingMedia || /^(only\s+)?(all|screen)$/.test(pendingMedia);
+      styles += plain ? content + '\n' : `@media ${pendingMedia.replace(/[{}]/g, '')}{${content}}\n`;
+    } });
+  const sheet = styles.trim() ? mailCss.compileSheet(styles) : null;
+  if (sheet && sheet.bad) flag(sheet.why);
   // Pass 2: the visible text.
   const out = [], links = [], stack = [], openCount = new Map();
-  let hiddenDepth = 0, hidden = 0, overflow = false, bgDepth = 0;
+  const budget = { left: mailCss.MATCH_BUDGET };
+  let hiddenDepth = 0, hidden = 0, overflow = false;
   const scanned = scan(s, {
-    text(t) { if (!hiddenDepth && !overflow) out.push(t); },
+    text(t) {
+      if (hiddenDepth || overflow) return;
+      if (t.trim()) {
+        const c = stack.length ? stack[stack.length - 1].computed : mailCss.ROOT;
+        const v = mailCss.textVerdict(c);
+        if (v === 'hide') { hidden++; return; }
+        if (v === 'unresolved') flag('a text colour over a background that cannot be determined');
+      }
+      out.push(t);
+    },
     raw() {},
     open(name, attrs, selfClosing) {
       for (const k of ['href', 'src', 'action', 'background']) if (attrs[k]) links.push(attrs[k]);
+      if (name === 'link' && /stylesheet/i.test(String(attrs.rel || ''))) flag('an external stylesheet (<link rel=stylesheet>)');
       if (!hiddenDepth && !overflow && BLOCK_TAGS.has(name)) out.push('\n');
       if (VOID_TAGS.has(name) || selfClosing) return;
       if (stack.length >= MAX_DEPTH) { overflow = true; return; }
-      const bg = hasBackground(name, attrs);
-      const kind = SKIP_TAGS.has(name) ? 'skip' : hideKindOf(name, attrs, css);
-      // Light text is hidden only with no background under it (its own, or an enclosing element's).
-      const h = kind === 'skip' || kind === 'hard' || (kind === 'colour' && !bg && !bgDepth);
-      if (h) { hiddenDepth++; if (kind !== 'skip') hidden++; }
-      if (bg) bgDepth++;
-      stack.push({ name, h, bg });
+      const node = { tag: name, classes: attrs.class ? String(attrs.class).toLowerCase().split(/[\s]+/).filter(Boolean) : [], id: attrs.id ? String(attrs.id).toLowerCase() : null, attrs };
+      const parent = stack.length ? stack[stack.length - 1].computed : mailCss.ROOT;
+      stack.push(node);                                                  // the element, after its ancestors
+      let st;
+      if (hiddenDepth) st = { hide: false, computed: parent };          // inside something hidden already: no work
+      else {
+        st = mailCss.styleOf(sheet, stack, parent, budget);
+        if (st.bad) flag(st.why);
+      }
+      const attrHidden = 'hidden' in attrs || String(attrs['aria-hidden'] || '').toLowerCase() === 'true' || String(attrs.type || '').toLowerCase() === 'hidden'
+        || (name === 'details' && !('open' in attrs));
+      const h = SKIP_TAGS.has(name) || attrHidden || st.hide;
+      if (h) { hiddenDepth++; if (!SKIP_TAGS.has(name)) hidden++; }
+      node.h = h; node.computed = st.computed;
       openCount.set(name, (openCount.get(name) || 0) + 1);
     },
     close(name) {
       if (!openCount.get(name)) return;               // nothing of that name is open: ignored (no stack walk)
       while (stack.length) {
         const top = stack.pop();
-        openCount.set(top.name, openCount.get(top.name) - 1);
+        openCount.set(top.tag, openCount.get(top.tag) - 1);
         if (top.h) hiddenDepth--;
-        if (top.bg) bgDepth--;
-        if (top.name === name) break;
+        if (top.tag === name) break;
       }
       if (!hiddenDepth && !overflow && BLOCK_TAGS.has(name)) out.push('\n');
     },
   });
-  return { text: tidy(decodeEntities(out.join(''))), links, hidden, unresolved: Boolean(css && css.unresolved),
+  return { text: tidy(decodeEntities(out.join(''))), links, hidden, unresolved, why,
     cut: scanned === 'cut' || overflow || String(html || '').length > MAX_HTML };
 }
 const htmlToVisibleText = (html) => reduceHtml(html).text;
@@ -370,8 +229,8 @@ function visibleText(email) {
   if (html.trim()) {
     const r = reduceHtml(html);
     const t = tidy(stripInvisible(r.text));
-    if (!t && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: 'empty', hidden_unresolved: r.unresolved, parts_differ: false };
-    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut, hidden_unresolved: r.unresolved, parts_differ: Boolean(plain) && partsDiffer(t, plain) };
+    if (!t && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: 'empty', hidden_unresolved: r.unresolved, unresolved_why: r.why, parts_differ: false };
+    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut, hidden_unresolved: r.unresolved, unresolved_why: r.why, parts_differ: Boolean(plain) && partsDiffer(t, plain) };
   }
   return { source: 'text', text: plain, hidden_elements: 0, cut: false, hidden_unresolved: false, parts_differ: false };
 }
@@ -560,5 +419,5 @@ function formOf(email, { inFolders = [] } = {}) {
 const FORM_PROPERTIES = ['id', 'mailboxIds', 'keywords', 'from', 'to', 'cc', 'subject', 'receivedAt', 'sentAt', 'size', 'attachments',
   'textBody', 'htmlBody', 'bodyValues', 'header:Authentication-Results:asText:all', 'header:Received-SPF:asText:all'];
 
-module.exports = { formOf, visibleText, quoted, maskSecrets, normDigits, htmlToVisibleText, reduceHtml, stripInvisible, codesIn, linkHosts, authResults, cssHides, hidingRules,
+module.exports = { formOf, visibleText, quoted, maskSecrets, normDigits, htmlToVisibleText, reduceHtml, stripInvisible, codesIn, linkHosts, authResults,
   FORM_PROPERTIES, INTERNAL_DOMAINS, MAX_HTML };

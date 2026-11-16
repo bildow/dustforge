@@ -137,6 +137,8 @@ module.exports = function registerPaneMail(deps) {
   // Failed mailbox checks at registration, per wallet (#129 re-audit: kept across restarts).
   db.exec('CREATE TABLE IF NOT EXISTS mail_probe_failures (id INTEGER PRIMARY KEY AUTOINCREMENT, did TEXT NOT NULL, at TEXT NOT NULL)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_mail_probe_failures ON mail_probe_failures(did, at)');
+  // Owner-act PIN challenges (#129 round-4: persisted): key = sha256(wallet | sign-in session | act).
+  db.exec('CREATE TABLE IF NOT EXISTS mail_owner_challenges (key TEXT PRIMARY KEY, did TEXT NOT NULL, n TEXT NOT NULL, exp INTEGER NOT NULL)');
   outboundCap.ensureTable(db);   // the outbound cap's table, at start (it is also made on first use)
 
   const nowIso = () => new Date().toISOString();
@@ -175,23 +177,27 @@ module.exports = function registerPaneMail(deps) {
   // The proof is tied to the act (#129 round-3 a): the first call gets a 403 naming a numeric challenge for exactly this
   // act — intent mail-owner:<n> — and the PIN typed for that intent (POST /api/identity/gate/verify) opens only that
   // act, once, within the minute. A PIN typed for "read X" cannot be spent by a send. Challenges live 5 minutes.
+  // The challenges are kept in the database (mail_owner_challenges), so they survive a restart and hold across
+  // processes sharing it; the key is a hash of wallet, sign-in session and act.
   const CHALLENGE_TTL_MS = 5 * 60 * 1000;
-  const challenges = new Map();   // `${did}|${session}|${act}` → { n, exp }
   const sha = (x) => crypto.createHash('sha256').update(String(x == null ? '' : x)).digest('hex');
   function ownerPinRefusal(auth, act) {
     const now = Date.now();
-    if (challenges.size > 500) for (const [k, c] of challenges) if (c.exp <= now) challenges.delete(k);
-    const key = `${auth.did}|${(auth.decoded && (auth.decoded.sid || auth.decoded.jti)) || ''}|${act}`;
-    let c = challenges.get(key);
+    try { db.prepare('DELETE FROM mail_owner_challenges WHERE exp <= ?').run(now); } catch (_) {}
+    const key = sha(`${auth.did}|${(auth.decoded && (auth.decoded.sid || auth.decoded.jti)) || ''}|${act}`);
+    let c = db.prepare('SELECT n, exp FROM mail_owner_challenges WHERE key = ?').get(key);
     if (c && c.exp > now && gateFresh(auth.did, 'pin', auth, 'mail-owner:' + c.n)) {
       const refused = spendSingleUse(auth.did, 'mail-owner', ['pin'], auth, 'mail-owner:' + c.n);
       if (refused) return { status: refused.status || 403, body: refused };
-      challenges.delete(key);
+      db.prepare('DELETE FROM mail_owner_challenges WHERE key = ?').run(key);
       return null;
     }
-    if (!c || c.exp <= now) { c = { n: String(crypto.randomInt(1, 999999999999)), exp: now + CHALLENGE_TTL_MS }; challenges.set(key, c); }
+    if (!c || c.exp <= now) {
+      c = { n: String(crypto.randomInt(1, 999999999999)), exp: now + CHALLENGE_TTL_MS };
+      db.prepare('INSERT INTO mail_owner_challenges (key, did, n, exp) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET n = excluded.n, exp = excluded.exp').run(key, auth.did, c.n, c.exp);
+    }
     const intent = 'mail-owner:' + c.n;
-    return { status: 403, body: { ...gateMissing('mail-owner', ['pin'], ['pin'], intent), need: 'pin', act: act.replace(/:[0-9a-f]{64}$/, ''),
+    return { status: 403, body: { ...gateMissing('mail-owner', ['pin'], ['pin'], intent), need: 'pin', act: act.replace(/:[0-9a-f]{64}/g, ''),
       error: `an owner-only mail act: enter your PIN for this act (POST /api/identity/gate/verify {gate:"pin", pin, intent:"${intent}"}), then repeat this same call within a minute` } };
   }
   const ownerPin = (ctx, res, act) => { const r = ownerPinRefusal(ctx.auth, act); if (r) { res.status(r.status).json(r.body); return false; } return true; };
@@ -695,7 +701,7 @@ module.exports = function registerPaneMail(deps) {
       const j = await jmap(ctx.nameRow, useOf(ctx, 'list')); const v = await viewOf(ctx, j);
       const box = await folderId(ctx, j, v, req.query.folder, 'read');
       // The owner reads the Inbox at the session level; any other folder (a pane's, Sent, …) is an owner-only act.
-      if (ctx.owner && !(v.inbox && box === v.inbox.id) && !ownerPin(ctx, res, `list:${req.query.folder || ''}`)) return;
+      if (ctx.owner && !(v.inbox && box === v.inbox.id) && !ownerPin(ctx, res, `list:${sha(String(req.query.folder || ''))}`)) return;
       const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), MAX_LIST);
       const unreadOnly = String(req.query.unread_only) === 'true' || req.query.unread_only === '1';
       const sort = [{ property: 'receivedAt', isAscending: false }];
@@ -772,7 +778,8 @@ module.exports = function registerPaneMail(deps) {
       // the form only (#129 round-3). The owner still gets the body.
       if (!ctx.owner && vis.hidden_unresolved) {
         return res.json({ ok: true, name: ctx.nameRow.name, message: form, body: null,
-          withheld: 'hidden_unresolved: the message hides text with a style rule that could not be placed; the form only', ...(vis.parts_differ ? { parts_differ: true } : {}) });
+          withheld: 'hidden_unresolved: the message uses CSS outside what the reader can account for, so text a person would not see could be in it; the form only',
+          why: vis.unresolved_why || null, ...(vis.parts_differ ? { parts_differ: true } : {}) });
       }
       const text = unmasked ? vis.text : mailForm.maskSecrets(vis.text);
       const q = mailForm.quoted(text);
@@ -805,7 +812,7 @@ module.exports = function registerPaneMail(deps) {
   app.post('/api/mail/messages/:id/move', rateLimitStandard, async (req, res) => {
     const ctx = resolve(req, res, nameArgOf(req)); if (!ctx) return;
     const b = req.body || {};
-    if (ctx.owner && !ownerPin(ctx, res, `move:${req.params.id}:${b.from || ''}:${b.to || ''}`)) return;
+    if (ctx.owner && !ownerPin(ctx, res, `move:${req.params.id}:${sha(String(b.from || ''))}:${sha(String(b.to || ''))}`)) return;
     try {
       const j = await jmap(ctx.nameRow, useOf(ctx, 'move')); const v = await viewOf(ctx, j);
       const { e, state } = await getEmail(j, req.params.id, ['id', 'mailboxIds']);
@@ -864,7 +871,7 @@ module.exports = function registerPaneMail(deps) {
   app.post('/api/mail/messages/:id/delete', rateLimitStandard, async (req, res) => {
     const ctx = resolve(req, res, nameArgOf(req)); if (!ctx) return;
     const b = req.body || {};
-    if (ctx.owner && !ownerPin(ctx, res, `delete:${req.params.id}:${b.from || ''}`)) return;
+    if (ctx.owner && !ownerPin(ctx, res, `delete:${req.params.id}:${sha(String(b.from || ''))}`)) return;
     try {
       const j = await jmap(ctx.nameRow, useOf(ctx, 'delete')); const v = await viewOf(ctx, j);
       const { e, state } = await getEmail(j, req.params.id, ['id', 'mailboxIds']);
