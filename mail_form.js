@@ -91,38 +91,73 @@ function lightColour(v) {
   else return false;
   return a < 0.2 || (r >= 235 && g >= 235 && b >= 235);
 }
-// Conservative: a declaration block that could make its text unreadable to a person hides it.
-function cssHides(raw) {
+// A background that is not light (a coloured button, a dark band): light text on it is readable.
+function coversBg(v) {
+  const x = String(v || '').replace(/\s+/g, ' ').trim();
+  if (!x || /^(none|transparent|inherit|initial|unset|currentcolor)$/.test(x)) return false;
+  if (/url\(|gradient\(/.test(x)) return true;
+  const first = x.split(' ')[0];
+  return !lightColour(first) && /^(#|rgb|hsl|[a-z]+$)/.test(first) && first !== 'white';
+}
+// What a declaration block does to its text: 'hard' (gone whatever the background: display:none, zero size, off
+// screen, colour equal to its own background…), 'colour' (light or transparent text: unreadable only on a light
+// background, decided per element against the backgrounds around it), or null.
+function cssHideKind(raw) {
   const d = cssDecls(cssClean(raw));
   const small = (v) => { const x = num(v); if (!x) return false; if (x.n <= 0) return true;
     return (x.u === 'px' && x.n <= 4) || (x.u === 'pt' && x.n <= 3) || ((x.u === 'em' || x.u === 'rem') && x.n <= 0.35) || (x.u === '%' && x.n <= 35) || (x.u === '' && x.n <= 0); };
   const tiny = (v) => { const x = num(v); return Boolean(x) && x.n <= 1; };
   const far = (v) => { const x = num(v); return Boolean(x) && x.n <= -50; };
-  if (d.display === 'none' || /^(hidden|collapse)/.test(d.visibility || '')) return true;
-  if (d['mso-hide'] === 'all' || d['content-visibility'] === 'hidden') return true;
-  if (d.opacity !== undefined && (num(d.opacity) || { n: 1 }).n < 0.3) return true;
-  if (d['font-size'] !== undefined && small(d['font-size'])) return true;
-  if (d.font !== undefined && /^0(\D|$)/.test(d.font.replace(/^(italic|bold|normal|oblique|small-caps|\d00)\s+/g, ''))) return true;
-  if (d.color !== undefined && lightColour(d.color)) return true;
-  if (d.color !== undefined && (d['background-color'] || d.background) && d.color.replace(/\s+/g, '') === String(d['background-color'] || d.background).replace(/\s+/g, '')) return true;
-  if (['height', 'max-height', 'width', 'max-width', 'line-height'].some((k) => d[k] !== undefined && tiny(d[k])) && /hidden|clip/.test(d.overflow || d['overflow-x'] || d['overflow-y'] || '')) return true;
-  if (['text-indent', 'left', 'top', 'margin-left', 'margin-top', 'right'].some((k) => d[k] !== undefined && far(d[k]))) return true;
-  if (/rect\(0/.test(d.clip || '') || /inset\(50%|circle\(0/.test(d['clip-path'] || '')) return true;
-  if (/scale\(0[,)]|scale\(0\.0|scalex\(0\)|scaley\(0\)/.test((d.transform || '').replace(/\s+/g, ''))) return true;
-  return false;
+  if (d.display === 'none' || /^(hidden|collapse)/.test(d.visibility || '')) return 'hard';
+  if (d['mso-hide'] === 'all' || d['content-visibility'] === 'hidden') return 'hard';
+  if (d.opacity !== undefined && (num(d.opacity) || { n: 1 }).n < 0.3) return 'hard';
+  if (d['font-size'] !== undefined && small(d['font-size'])) return 'hard';
+  if (d.font !== undefined && /^0(\D|$)/.test(d.font.replace(/^(italic|bold|normal|oblique|small-caps|\d00)\s+/g, ''))) return 'hard';
+  const bg = d['background-color'] || d.background;
+  if (d.color !== undefined && bg && d.color.replace(/\s+/g, '') === String(bg).split(' ')[0].replace(/\s+/g, '')) return 'hard';
+  if (['height', 'max-height', 'width', 'max-width', 'line-height'].some((k) => d[k] !== undefined && tiny(d[k])) && /hidden|clip/.test(d.overflow || d['overflow-x'] || d['overflow-y'] || '')) return 'hard';
+  if (['text-indent', 'left', 'top', 'margin-left', 'margin-top', 'right'].some((k) => d[k] !== undefined && far(d[k]))) return 'hard';
+  if (/rect\(0/.test(d.clip || '') || /inset\(50%|circle\(0/.test(d['clip-path'] || '')) return 'hard';
+  if (/scale\(0[,)]|scale\(0\.0|scalex\(0\)|scaley\(0\)/.test((d.transform || '').replace(/\s+/g, ''))) return 'hard';
+  if (d.color !== undefined && lightColour(d.color) && !coversBg(bg)) return 'colour';
+  return null;
 }
-// <style> blocks: selectors whose rules hide → the classes, ids and tag names they name. Linear: split on braces.
-function hidingSelectors(css) {
-  const out = { classes: new Set(), ids: new Set(), tags: new Set(), all: false };
-  const clean = cssClean(css);
-  for (const chunk of clean.split('}')) {
-    const open = chunk.lastIndexOf('{');
-    if (open < 0) continue;
-    if (!cssHides(chunk.slice(open + 1))) continue;
-    const sel = chunk.slice(0, open);
-    for (const m of sel.matchAll(/([.#])([a-z0-9_-]+)/g)) (m[1] === '.' ? out.classes : out.ids).add(m[2]);
-    for (const m of sel.matchAll(/(?:^|[\s,>+~{(])([a-z][a-z0-9]*)/g)) out.tags.add(m[1]);
-    if (/(^|[\s,{])\*/.test(sel)) out.all = true;
+const cssHides = (raw) => cssHideKind(raw) !== null;
+const ownBackground = (raw) => { const d = cssDecls(cssClean(raw)); return coversBg(d['background-color'] || d.background); };
+// <style> blocks → the rules that hide, narrowly (#129 re-audit): a bare type selector hides that tag (never html or
+// body); a simple selector of classes and/or an id (optionally with a tag: span.preheader) hides only elements carrying
+// exactly those; anything with a combinator, pseudo-class, attribute or * is ignored, and so is every rule inside a
+// conditional at-rule (@media (max-width…), @supports…), which may not apply when the mail is read. Linear: one pass
+// over the braces.
+function hidingRules(css) {
+  const s = cssClean(css);
+  const out = { tags: new Map(), byClass: new Map(), byId: new Map() };
+  const add = (map, key, rule) => { const l = map.get(key) || []; if (l.length < 64 && !l.some((r) => r.k === rule.k)) l.push(rule); map.set(key, l); };
+  const stack = [];
+  let start = 0, i = 0;
+  while (i < s.length) {
+    const o = s.indexOf('{', i), c = s.indexOf('}', i);
+    if (o < 0 && c < 0) break;
+    if (c >= 0 && (o < 0 || c < o)) { stack.pop(); i = start = c + 1; continue; }
+    const prelude = s.slice(start, o).trim();
+    if (prelude.startsWith('@')) { stack.push(!/^@media\s+(all|screen)\s*$/.test(prelude)); i = start = o + 1; continue; }
+    const close = s.indexOf('}', o + 1);
+    const body = close < 0 ? s.slice(o + 1) : s.slice(o + 1, close);
+    i = start = close < 0 ? s.length : close + 1;
+    if (stack.some(Boolean)) continue;                       // inside a conditional at-rule (or an unknown one)
+    const kind = cssHideKind(body);
+    if (!kind) continue;
+    for (const sel0 of prelude.split(',')) {
+      const sel = sel0.trim();
+      if (/^[a-z][a-z0-9]*$/.test(sel)) { if (sel !== 'html' && sel !== 'body') { const prev = out.tags.get(sel); out.tags.set(sel, prev === 'hard' ? 'hard' : kind); } continue; }
+      const m = /^([a-z][a-z0-9]*)?((?:[.#][a-z0-9_-]+)+)$/.exec(sel);
+      if (!m) continue;                                      // combinators, pseudo-classes, attributes, *: ignored
+      const parts = m[2].match(/[.#][a-z0-9_-]+/g);
+      const classes = parts.filter((x) => x[0] === '.').map((x) => x.slice(1)), ids = parts.filter((x) => x[0] === '#').map((x) => x.slice(1));
+      if (ids.length > 1) continue;
+      const rule = { tag: m[1] || null, classes, id: ids[0] || null, kind, k: `${m[1] || ''}|${classes.join('.')}|${ids[0] || ''}|${kind}` };
+      if (rule.id) add(out.byId, rule.id, rule); else add(out.byClass, classes[0], rule);
+    }
   }
   return out;
 }
@@ -195,20 +230,27 @@ function scan(s, on) {
   return 'end';
 }
 
-function hiddenByAttrs(name, a, css) {
-  if ('hidden' in a) return true;
-  if (String(a['aria-hidden'] || '').toLowerCase() === 'true') return true;
-  if (String(a.type || '').toLowerCase() === 'hidden') return true;
-  if (name === 'details' && !('open' in a)) return true;       // closed <details>: its content is not shown
-  if (name === 'font' && a.color && lightColour(String(a.color).toLowerCase())) return true;
-  if (a.style && cssHides(a.style)) return true;
+// How an element hides its text: 'hard', 'colour' (light text: hidden unless a background is under it), or null.
+function hideKindOf(name, a, css) {
+  if ('hidden' in a) return 'hard';
+  if (String(a['aria-hidden'] || '').toLowerCase() === 'true') return 'hard';
+  if (String(a.type || '').toLowerCase() === 'hidden') return 'hard';
+  if (name === 'details' && !('open' in a)) return 'hard';       // closed <details>: its content is not shown
+  let kind = a.style ? cssHideKind(a.style) : null;
+  if (kind === 'hard') return 'hard';
+  if (!kind && name === 'font' && a.color && lightColour(String(a.color).toLowerCase())) kind = 'colour';
   if (css) {
-    if (css.all || css.tags.has(name)) return true;
-    if (a.id && css.ids.has(String(a.id).toLowerCase())) return true;
-    if (a.class) for (const c of String(a.class).toLowerCase().split(/\s+/)) if (c && css.classes.has(c)) return true;
+    const t = css.tags.get(name);
+    if (t === 'hard') return 'hard'; if (t) kind = kind || t;
+    const cls = a.class ? String(a.class).toLowerCase().split(/\s+/).filter(Boolean) : [];
+    const id = a.id ? String(a.id).toLowerCase() : null;
+    const fits = (r) => (!r.tag || r.tag === name) && (!r.id || r.id === id) && r.classes.every((c) => cls.includes(c));
+    const cands = [].concat(id ? css.byId.get(id) || [] : [], ...cls.map((c) => css.byClass.get(c) || []));
+    for (const r of cands) { if (!fits(r)) continue; if (r.kind === 'hard') return 'hard'; kind = kind || r.kind; }
   }
-  return false;
+  return kind;
 }
+const hasBackground = (name, a) => Boolean((a.bgcolor && coversBg(String(a.bgcolor).toLowerCase())) || (a.style && ownBackground(a.style)));
 
 // HTML → { text, links, hidden, cut }: the visible text, every link target (href/src/action), how many elements were
 // dropped as hidden, and whether the scan stopped at an unterminated construct.
@@ -216,11 +258,11 @@ function reduceHtml(html) {
   const s = String(html == null ? '' : html).slice(0, MAX_HTML);
   // Pass 1: the <style> blocks (they apply to the whole document, wherever they sit).
   let styles = '';
-  scan(s, { text() {}, open() {}, close() {}, raw(name, content) { if (name === 'style') styles += content + '}'; } });
-  const css = styles ? hidingSelectors(styles) : null;
+  scan(s, { text() {}, open() {}, close() {}, raw(name, content) { if (name === 'style') styles += content + '\n'; } });
+  const css = styles ? hidingRules(styles) : null;
   // Pass 2: the visible text.
   const out = [], links = [], stack = [], openCount = new Map();
-  let hiddenDepth = 0, hidden = 0, overflow = false;
+  let hiddenDepth = 0, hidden = 0, overflow = false, bgDepth = 0;
   const scanned = scan(s, {
     text(t) { if (!hiddenDepth && !overflow) out.push(t); },
     raw() {},
@@ -229,9 +271,13 @@ function reduceHtml(html) {
       if (!hiddenDepth && !overflow && BLOCK_TAGS.has(name)) out.push('\n');
       if (VOID_TAGS.has(name) || selfClosing) return;
       if (stack.length >= MAX_DEPTH) { overflow = true; return; }
-      const h = SKIP_TAGS.has(name) || hiddenByAttrs(name, attrs, css);
-      if (h) { hiddenDepth++; if (!SKIP_TAGS.has(name)) hidden++; }
-      stack.push({ name, h });
+      const bg = hasBackground(name, attrs);
+      const kind = SKIP_TAGS.has(name) ? 'skip' : hideKindOf(name, attrs, css);
+      // Light text is hidden only with no background under it (its own, or an enclosing element's).
+      const h = kind === 'skip' || kind === 'hard' || (kind === 'colour' && !bg && !bgDepth);
+      if (h) { hiddenDepth++; if (kind !== 'skip') hidden++; }
+      if (bg) bgDepth++;
+      stack.push({ name, h, bg });
       openCount.set(name, (openCount.get(name) || 0) + 1);
     },
     close(name) {
@@ -240,6 +286,7 @@ function reduceHtml(html) {
         const top = stack.pop();
         openCount.set(top.name, openCount.get(top.name) - 1);
         if (top.h) hiddenDepth--;
+        if (top.bg) bgDepth--;
         if (top.name === name) break;
       }
       if (!hiddenDepth && !overflow && BLOCK_TAGS.has(name)) out.push('\n');
@@ -259,27 +306,81 @@ function partsOf(email) {
 }
 
 // The visible body: the HTML part reduced (what a person sees, so text hidden from them is gone), else the plain part.
+// When the HTML reduces to nothing or was cut short, the plain part is used instead (#129 re-audit), if there is one.
 function visibleText(email) {
   const { html, text } = partsOf(email || {});
+  const plain = tidy(stripInvisible(text));
   if (html.trim()) {
     const r = reduceHtml(html);
-    return { source: 'html', text: tidy(stripInvisible(r.text)), hidden_elements: r.hidden, cut: r.cut };
+    const t = tidy(stripInvisible(r.text));
+    if ((r.cut || !t) && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: r.cut ? 'cut' : 'empty' };
+    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut };
   }
-  return { source: 'text', text: tidy(stripInvisible(text)), hidden_elements: 0, cut: false };
+  return { source: 'text', text: plain, hidden_elements: 0, cut: false };
 }
 
-// What a pane is handed of a body or subject (#129 review H2): links cut to scheme and host, code-like runs masked —
-// digit runs of 4–10 (spaces or dashes between), letter-and-digit tokens of 6+, and any token of 20+ (a reset or
-// sign-in token). A year alone (19xx/20xx) is kept.
+// Digits as ASCII: NFKC (fullwidth and other compatibility forms), then any remaining decimal digit (Arabic-Indic,
+// Devanagari, …) by its place in its run of ten.
+function normDigits(s) {
+  return String(s || '').normalize('NFKC').replace(/\p{Nd}/gu, (d) => {
+    if (d >= '0' && d <= '9') return d;
+    const cp = d.codePointAt(0);
+    let v = 0;
+    while (v < 9 && /\p{Nd}/u.test(String.fromCodePoint(cp - v - 1))) v++;
+    return String(v % 10);
+  });
+}
+const CODE_WORDS_RE = /\b(codes?|verification|verify|otp|pin|passcode|one[- ]time|sign[- ]?in|log[- ]?in|reset|confirm(?:ation)?|2fa)\b/gi;
+const KEEP_WORD = /^(codes?|verification|verify|passcode|signin|login|reset|confirm(ation)?|password)$/i;
+// Links, whether or not they say https://: a token that is a host followed by a path or query keeps only the host.
+function cutLinks(t) {
+  return t.replace(/\S+/g, (tok) => {
+    const lead = /^[("'<\[{]*/.exec(tok)[0];
+    let rest = tok.slice(lead.length);
+    let e = rest.length;
+    while (e > 0 && ')]}>"\'.,;:!'.includes(rest[e - 1])) e--;      // a loop, not a pattern: no backtracking
+    const trail = rest.slice(e);
+    rest = rest.slice(0, e);
+    const m = /^(https?):\/\/([^\/?#]+)(.*)$/i.exec(rest);
+    if (m) { const host = m[2].replace(/^[^@]*@/, ''); return lead + m[1].toLowerCase() + '://' + host + (m[3] && m[3] !== '/' ? '/…' : '') + trail; }
+    const at = rest.search(/[\/?#]/);
+    if (at > 0 && at < rest.length - 1) {
+      const host = rest.slice(0, at);
+      if (/^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,24}$/i.test(host) && !host.includes('@')) return lead + host + '/…' + trail;
+    }
+    return tok;
+  });
+}
+// Near a code word (code, verification, OTP, PIN, passcode, one-time, sign-in, login, reset, confirm): every digit,
+// and every run of 6+ capitals and digits (a letters-only code too), masked — so a code split across lines or by
+// dots or spaces is masked whole.
+function maskNearCodeWords(t) {
+  const ranges = [];
+  CODE_WORDS_RE.lastIndex = 0;
+  let m;
+  while ((m = CODE_WORDS_RE.exec(t))) {
+    const a = Math.max(0, m.index - 60), b = Math.min(t.length, m.index + m[0].length + 120);
+    const last = ranges[ranges.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b); else ranges.push([a, b]);
+  }
+  if (!ranges.length) return t;
+  let out = '', pos = 0;
+  for (const [a, b] of ranges) {
+    out += t.slice(pos, a) + t.slice(a, b).replace(/\b[A-Z0-9]{6,}\b/g, (x) => (KEEP_WORD.test(x) ? x : '•'.repeat(x.length)))
+      .replace(/\b[A-Za-z0-9]*[0-9][A-Za-z0-9]*\b/g, (x) => '•'.repeat(x.length));
+    pos = b;
+  }
+  return out + t.slice(pos);
+}
+// What a pane is handed of a body or subject (#129 review H2, re-audit): digits normalised; links cut to their host;
+// near code words every digit and capital-letter code masked; anywhere, digit runs of 4–10 (spaces, line breaks, dots
+// or dashes between), letter-and-digit tokens of 6+, and any token of 20+ (a reset or sign-in token) masked. A year
+// alone (19xx/20xx) is kept.
 function maskSecrets(text) {
-  return String(text || '')
-    .replace(/\b(https?):\/\/([^\s\/?#<>"'()\[\]{}]+)[^\s<>"'()\[\]{}]*/gi, (m, sch, host) => {
-      const h = host.replace(/^[^@]*@/, '');
-      return m.length > sch.length + 3 + host.length ? `${sch.toLowerCase()}://${h}/…` : `${sch.toLowerCase()}://${h}`;
-    })
+  return maskNearCodeWords(cutLinks(normDigits(text)))
     .replace(/[A-Za-z0-9_-]{20,}/g, (m) => '•'.repeat(Math.min(m.length, 24)))
     .replace(/\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{6,}\b/g, (m) => '•'.repeat(m.length))
-    .replace(/(?<![\w•])\d(?:[ -]?\d){3,9}(?![\w•])/g, (m) => (/^(19|20)\d\d$/.test(m) ? m : m.replace(/\d/g, '•')));
+    .replace(/(?<![\w•])\d(?:[\s.\-]?\d){3,9}(?![\w•])/g, (m) => (/^(19|20)\d\d$/.test(m) ? m : m.replace(/\d/g, '•')));
 }
 
 function quoted(text, max = MAX_QUOTED) {
@@ -312,9 +413,9 @@ function authResults(email) {
 // length is returned.
 const CODE_WORD = /(code|otp|one[- ]time|passcode|pin|verif|confirm|security|token|2fa|two[- ]factor|sign[- ]?in|log[- ]?in|password|reset|kod|c[oó]digo)/i;
 function codesIn(text) {
-  const t = String(text || '').slice(0, MAX_TEXT);
+  const t = normDigits(String(text || '').slice(0, MAX_TEXT));
   const out = [];
-  const re = /(?<![\d\w])(\d{3,4}[ -]\d{3,4}|\d{4,8})(?![\d\w])/g;
+  const re = /(?<![\d\w])(\d(?:[\s.\-]?\d){3,9})(?![\d\w])/g;
   let m;
   while ((m = re.exec(t)) && out.length < 5) {
     const digits = m[1].replace(/\D/g, '');
@@ -381,5 +482,5 @@ function formOf(email, { inFolders = [] } = {}) {
 const FORM_PROPERTIES = ['id', 'mailboxIds', 'keywords', 'from', 'to', 'cc', 'subject', 'receivedAt', 'sentAt', 'size', 'attachments',
   'textBody', 'htmlBody', 'bodyValues', 'header:Authentication-Results:asText:all', 'header:Received-SPF:asText:all'];
 
-module.exports = { formOf, visibleText, quoted, maskSecrets, htmlToVisibleText, reduceHtml, stripInvisible, codesIn, linkHosts, authResults, cssHides,
+module.exports = { formOf, visibleText, quoted, maskSecrets, normDigits, htmlToVisibleText, reduceHtml, stripInvisible, codesIn, linkHosts, authResults, cssHides, hidingRules,
   FORM_PROPERTIES, INTERNAL_DOMAINS, MAX_HTML };

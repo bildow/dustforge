@@ -73,6 +73,8 @@ http.createServer((req, res) => {
     if (req.url === '/__state') return send(res, 200, { auth: authLog, lastSet, principals: Object.fromEntries(Object.entries(A).map(([k, a]) => [k, a.addrs])),
       mailboxes: A.claude.mailboxes, emails: Object.fromEntries(Object.entries(A.claude.emails).map(([k, e]) => [k, { mailboxIds: e.mailboxIds, keywords: e.keywords, subject: e.subject, raw: e.raw || null }])) });
     if (req.url === '/__stale') { staleNext = true; return send(res, 200, {}); }
+    if (req.url === '/__stale_change') { staleNext = 'change'; return send(res, 200, {}); }
+    if (req.url === '/__clean') { for (const e of Object.values(A.claude.emails)) delete e.mailboxIds['mb-tmp']; A.claude.state++; return send(res, 200, {}); }
     if (req.url.startsWith('/api/principal/')) {
       if (!c || c.user !== 'admin' || c.pass !== adminpw) return send(res, 401, { error: 'unauthorized' });
       const name = decodeURIComponent(req.url.slice('/api/principal/'.length));
@@ -116,6 +118,7 @@ http.createServer((req, res) => {
         r = { state: String(acct.state), list: (ids || []).filter((id) => acct.emails[id]).map((id) => project(acct.emails[id], args.properties)), notFound: (ids || []).filter((id) => !acct.emails[id]) };
       } else if (name === 'Email/set') {
         lastSet = { ifInState: args.ifInState || null, update: args.update || null, destroy: args.destroy || null };
+        if (args.ifInState && staleNext === 'change') { for (const id of Object.keys(args.update || {})) if (acct.emails[id]) acct.emails[id].mailboxIds['mb-tmp'] = true; acct.state++; }
         if (args.ifInState && (staleNext || args.ifInState !== String(acct.state))) { staleNext = false; out.push(['error', { type: 'stateMismatch' }, tag]); continue; }
         r = { updated: {}, notUpdated: {}, destroyed: [] };
         for (const [id, patch] of Object.entries(args.update || {})) {
@@ -173,8 +176,10 @@ const mkw = (u) => { const id = identity.createIdentity();
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, 100000, ?, ?, 100000)").run(id.did, "topup", "smoke");
   db.prepare("UPDATE identity_wallets SET balance_cents = 100000 WHERE did = ?").run(id.did); return id.did; };
 const owner = mkw("pm-owner"), stranger = mkw("pm-stranger"), agent = mkw("pm-agent");
-db.exec("CREATE TABLE IF NOT EXISTS wallet_creators (did TEXT PRIMARY KEY, owner_did TEXT NOT NULL, fleet_id INTEGER NOT NULL, recorded_at TEXT NOT NULL)");
-db.prepare("INSERT INTO wallet_creators (did, owner_did, fleet_id, recorded_at) VALUES (?, ?, 1, ?)").run(agent, owner, "2026-11-16");
+const linked = mkw("pm-linked");
+const fid = db.prepare("INSERT INTO fleets (owner_did, name, slug) VALUES (?, ?, ?)").run(owner, "smoke fleet", "smoke-fleet").lastInsertRowid;
+db.prepare("INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet) VALUES (?, ?, ?, ?, ?, 1)").run(fid, agent, "pm-agent", "sil-pm-agent", "active");
+db.prepare("INSERT INTO fleet_silicons (fleet_id, member_did, handle, silicon_id, status, created_by_fleet) VALUES (?, ?, ?, ?, ?, 0)").run(fid, linked, "pm-linked", "sil-pm-linked", "active");
 const sec = (did, name, ref, value, extra = {}) => db.prepare("INSERT INTO blindkey_secrets (did, name, secret_type, encrypted_value, ref_code, account_username, security_depth) VALUES (?, ?, ?, ?, ?, ?, ?)")
   .run(did, name, extra.type || "password", enc(value), ref, extra.user || null, extra.depth || null);
 sec(owner, "claude-mailbox", "DP-PWD-claude-1a2b3c4d", process.argv[2], { user: "claude" });
@@ -184,7 +189,7 @@ sec(owner, "claude-ssh-root", "DP-PWD-claudessh-0f0f0f0f", process.argv[2], { us
 sec(owner, "claude-api-mail", "DP-API-claudeapi-1f1f1f1f", process.argv[2], { user: "claude", type: "api_key" });
 sec(owner, "claudia-mailbox", "DP-PWD-claudia-2a2a2a2a", process.argv[2], { user: "claude" });
 sec(owner, "pm-owner-mailbox", "DP-PWD-pmowner-2b2b2b2b", process.argv[3], { user: "pm-owner" });
-for (const n of ["noreply", "n0reply", "adm1n", "pm-stranger", "pm-5tranger", "kyle", "pm-agent", "nobody"]) sec(owner, n + "-mailbox", "DP-PWD-" + n.replace(/-/g, "").slice(0, 12) + "-" + crypto.createHash("sha256").update(n).digest("hex").slice(0, 8), "x", { user: n });
+for (const n of ["noreply", "n0reply", "adm1n", "pm-stranger", "pm-5tranger", "kyle", "pm-agent", "pm-linked", "nobody"]) sec(owner, n + "-mailbox", "DP-PWD-" + n.replace(/-/g, "").slice(0, 12) + "-" + crypto.createHash("sha256").update(n).digest("hex").slice(0, 8), "x", { user: n });
 sec(stranger, "claude-mailbox", "DP-PWD-claude-3c3c3c3c", process.argv[2], { user: "claude" });
 db.prepare("INSERT INTO silicon_agents (agent_name, did, carbon_did, token_hash) VALUES (?, ?, ?, ?)").run("indexer", "did:silicon:pmidx", owner, crypto.createHash("sha256").update(process.argv[4]).digest("hex"));
 console.log(owner);' "$H" "$PW1" "$PW2" "$SIL" >"$S/owner"
@@ -209,6 +214,7 @@ pin(){ call POST /api/identity/gate/verify "$A" '{"gate":"pin","pin":"4321","int
 approve(){ pin "approval-open:$1"; call POST /api/demipass/approvals/$1/open "$A"; local C; C=$(echo "$BODY" | J code)
   call POST /api/demipass/approvals/$1/approve "$A" '{"code":"'$C'"}'; }
 bal(){ Q "SELECT balance_cents FROM identity_wallets WHERE did='$OWNER'"; }
+opin(){ pin "mail-owner:0"; }   # the owner's PIN for one owner-only mail act
 device(){ call POST /api/identity/device/code "" '{"agent_label":"'$1'","scope":"transact"}'; local DC; DC=$(echo "$BODY" | J device_code)
   X "UPDATE device_auth SET status='approved', approved_did='$OWNER' WHERE device_code='$DC'"
   call POST /api/identity/device/token "" '{"device_code":"'$DC'"}'; }
@@ -253,14 +259,15 @@ call POST /api/mail/names "$P1" "$(echo "$NAMEB" | sed 's/}$/,"approval_id":'$AP
 call POST /api/mail/names "$P2" "$NAMEB"; [ "$CODE" = 409 ] && ok "registering it again: 409" || fail "again: $CODE"
 call POST /api/mail/names "$ST" '{"name":"claude","secret_ref":"DP-PWD-claude-3c3c3c3c"}'; [ "$CODE" = 409 ] && echo "$BODY" | grep -q "another wallet" && ok "another wallet cannot register a name already owned (409)" || fail "stranger register: $CODE $BODY"
 call POST /api/mail/names "$P1" '{"name":"pm-agent","secret_ref":"'$(REFOF pm-agent)'"}'; APA=$(echo "$BODY" | J approval_id)
-[ "$CODE" = 202 ] && ok "the username of an agent wallet the owner's fleet created passes the name checks (202)" || fail "own agent: $CODE $BODY"
+[ "$CODE" = 202 ] && ok "the username of an agent wallet the owner's fleet created and owns outright passes the name checks (202)" || fail "own agent: $CODE $BODY"
 X "UPDATE use_approvals SET status='cancelled' WHERE id=$APA"
+call POST /api/mail/names "$P1" '{"name":"pm-linked","secret_ref":"'$(REFOF pm-linked)'"}'; [ "$CODE" = 409 ] && echo "$BODY" | grep -q "another wallet's username" && ok "…but not a wallet merely linked into the fleet (not created by it)" || fail "linked member: $CODE $BODY"
 
 # ── who the owner is: an allowlist of person sign-ins (H2) ──
 call POST /api/identity/login-code/request "" '{"username":"pm-owner"}'; sleep 1
 call POST /api/identity/login-code/verify "" '{"username":"pm-owner","code":"'$(lastcode)'"}'; EC=$(echo "$BODY" | J token)
 [ "$EC" != None ] && [ "$(echo "$BODY" | J auth_method)" = email_code ] || fail "email-code token: $CODE $BODY"
-call GET "/api/mail/messages?name=claude&folder=inbox" "$EC"; [ "$CODE" = 403 ] && ok "an emailed-code sign-in of the owner's wallet is not the owner (403: join first)" || fail "email_code as owner: $CODE $BODY"
+call GET "/api/mail/messages?name=claude&folder=inbox" "$EC"; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "not a password sign-in" && echo "$BODY" | grep -q "sign in with your password" && ok "an emailed-code sign-in of the owner's wallet is not the owner (403, and it says to sign in with the password)" || fail "email_code as owner: $CODE $BODY"
 call POST /api/mail/send "$EC" '{"name":"claude","to":"a@example.com","subject":"s","body":"b"}'; [ "$CODE" = 403 ] && ok "…and cannot send as the bare name" || fail "email_code send: $CODE"
 call POST /api/identity/request-2fa "" '{"did":"'$OWNER'"}'; sleep 1
 call POST /api/identity/verify "" '{"did":"'$OWNER'","code":"'$(lastcode)'","scope":"transact"}'; TF=$(echo "$BODY" | J token)
@@ -273,7 +280,16 @@ call GET "/api/mail/messages?name=claude" "$ST"; [ "$CODE" = 404 ] && ok "anothe
 call POST /api/mail/join "$ST" '{"name":"claude","session":"thief","vendor":"openai"}'; [ "$CODE" = 404 ] && ok "another wallet cannot ask to join (404)" || fail "stranger join: $CODE"
 call POST /api/mail/join "$A" '{"name":"claude","session":"owner-pane","vendor":"claude"}'; [ "$CODE" = 400 ] && ok "the owner's person session does not join (it has the name already)" || fail "owner join: $CODE"
 call POST /api/mail/join "$P1" '{"name":"claude","session":"Bad Name!","vendor":"claude"}'; [ "$CODE" = 400 ] && ok "a session name outside [a-z0-9-]: 400" || fail "slug: $CODE"
-call POST /api/mail/join "$P1" '{"name":"claude","session":"other","vendor":"claude"}'; [ "$CODE" = 409 ] && echo "$BODY" | grep -q "already exists" && ok "a session whose folder already exists is not joinable: a folder is never adopted (M2)" || fail "adopt: $CODE $BODY"
+M0=$(MS auth.ok)
+call POST /api/mail/join "$P1" '{"name":"claude","session":"other","vendor":"claude"}'; APO=$(echo "$BODY" | J approval_id)
+[ "$CODE" = 202 ] && [ "$(MS auth.ok)" = "$M0" ] && ok "a join ask opens nothing in the mailbox before the owner approves (no folder probing)" || fail "join ask probe: $CODE $(MS auth.ok) vs $M0"
+call POST /api/mail/join "$P1" '{"name":"claude","session":"another","vendor":"claude"}'; [ "$CODE" = 409 ] && echo "$BODY" | grep -q "still waiting" && ok "one join ask waits per requester (409 naming the waiting one)" || fail "second ask: $CODE $BODY"
+device pane-three; P3=$(echo "$BODY" | J token); device pane-four; P4=$(echo "$BODY" | J token)
+call POST /api/mail/join "$P3" '{"name":"claude","session":"three","vendor":"claude"}'; call POST /api/mail/join "$SIL" '{"name":"claude","session":"four","vendor":"claude"}'
+call POST /api/mail/join "$P4" '{"name":"claude","session":"five","vendor":"claude"}'; [ "$CODE" = 429 ] && ok "at most 3 join asks wait per wallet (a fourth: 429)" || fail "wallet queue: $CODE $BODY"
+X "UPDATE use_approvals SET status='cancelled' WHERE service_key='svc:demipass:mail-join' AND id != $APO"
+approve "$APO"; call POST /api/mail/join "$P1" '{"name":"claude","session":"other","vendor":"claude","approval_id":'$APO'}'
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "already exists" && [ "$(Q "SELECT COUNT(*) FROM mail_panes WHERE session='other'")" = 0 ] && ok "after the approval, a session whose folder already exists is refused: a folder is never adopted (M2)" || fail "adopt: $CODE $BODY"
 JOIN1='{"name":"claude","session":"dustforge-demipass","vendor":"claude"}'
 call POST /api/mail/join "$P1" "$JOIN1"; AP1=$(echo "$BODY" | J approval_id)
 [ "$CODE" = 202 ] && [ "$AP1" != None ] && ok "pane one asks to join as dustforge-demipass: approval $AP1" || fail "join ask: $CODE $BODY"
@@ -335,7 +351,12 @@ python3 -c 'import sys; t=sys.argv[1]; sys.exit(1 if any(c in t for c in "​‮
 echo "$BODY" | grep -q "UNTRUSTED" && ok "…marked untrusted data" || fail "no untrusted note"
 [ "$(MS emails.e1.keywords)" = '{}' ] && ok "reading did not mark the Inbox message seen (no write to the Inbox)" || fail "seen: $(MS emails.e1.keywords)"
 call GET "/api/mail/messages/e4?name=claude" "$P1"; [ "$CODE" = 403 ] && ! echo "$BODY" | grep -q 771204 && ok "a pane cannot read this service's own mail (a sign-in code from noreply@): 403" || fail "system read: $CODE $BODY"
-call GET "/api/mail/messages/e4?name=claude" "$A"; [ "$CODE" = 200 ] && echo "$BODY" | J body.quoted | grep -q 771204 && ok "…the owner's own session reads it, unmasked" || fail "owner system read: $CODE $BODY"
+call GET "/api/mail/messages/e4?name=claude" "$A"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J intent)" = mail-owner:0 ] && ok "…the owner's password session alone does not read it either: the PIN is asked for (a long-lived token is not enough)" || fail "owner system read no pin: $CODE $BODY"
+opin; call GET "/api/mail/messages/e4?name=claude" "$A"; [ "$CODE" = 200 ] && echo "$BODY" | J body.quoted | grep -q 771204 && ok "…with the PIN, the owner reads it unmasked" || fail "owner system read: $CODE $BODY"
+call GET "/api/mail/messages/e4?name=claude" "$A"; [ "$CODE" = 403 ] && ok "…and the PIN opened that one read only" || fail "pin reuse: $CODE"
+call GET "/api/mail/messages/e1?name=claude" "$A"; [ "$CODE" = 200 ] && echo "$BODY" | J body.quoted | grep -q "code is ••••••" && ok "the owner reads an Inbox message at the session level, masked" || fail "owner inbox read: $CODE $BODY"
+call GET "/api/mail/messages/e1?name=claude&full=1" "$A"; [ "$CODE" = 403 ] && ok "…unmasked (?full=1) takes the PIN" || fail "owner full: $CODE"
+call GET "/api/mail/messages?name=claude&folder=panes/other" "$A"; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J need)" = pin ] && ok "the owner lists another pane's folder only with the PIN" || fail "owner list other: $CODE $BODY"
 
 # ── filing: copy, move, flag, delete ──
 call POST /api/mail/messages/e1/copy "$P1" '{"name":"claude"}'
@@ -350,6 +371,8 @@ call POST /api/mail/messages/e1/flag "$P1" '{"name":"claude","flagged":true,"see
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J pane_flags.flagged)" = True ] && [ "$(MS emails.e1.keywords)" = '{}' ] && ok "a pane's flag and seen are its own: the message's shared keywords are untouched (M4)" || fail "pane flag: $CODE $BODY $(MS emails.e1.keywords)"
 call GET "/api/mail/messages?name=claude" "$P1"; [ "$(echo "$BODY" | J messages.0.pane_flags.flagged)" = True ] && [ "$(echo "$BODY" | J messages.0.unread)" = True ] && ok "…its own list shows its flag; the Inbox state stays unread" || fail "pane flags list: $BODY"
 call GET "/api/mail/messages?name=claude" "$P2"; [ "$(echo "$BODY" | J messages.0.pane_flags.flagged)" = False ] && ok "…and another pane does not see it" || fail "P2 flags: $BODY"
+call GET "/api/mail/messages?name=claude&unread_only=1" "$P1"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J count)" = 0 ] && ok "a pane's unread_only uses its own seen flags (e1 marked seen by it: gone)" || fail "P1 unread: $BODY"
+call GET "/api/mail/messages?name=claude&unread_only=1" "$P2"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J messages.0.id)" = e1 ] && ok "…while another pane still sees it unread" || fail "P2 unread: $BODY"
 call POST /api/mail/messages/e3/flag "$P1" '{"name":"claude","flagged":true}'; [ "$CODE" = 403 ] && ok "flag an Inbox-only message: 403" || fail "flag e3: $CODE"
 call POST /api/mail/messages/e1/move "$P1" '{"name":"claude","to":"own/archive"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J to)" = own/archive ] && ! echo "$(MS emails.e1.mailboxIds)" | grep -q "$OWN1\"" && echo "$(MS emails.e1.mailboxIds)" | grep -q mb-inbox && ok "move inside its own folder (own → own/archive); the Inbox copy stays" || fail "move: $CODE $BODY $(MS emails.e1.mailboxIds)"
@@ -357,14 +380,16 @@ call POST /api/mail/messages/e1/move "$P1" '{"name":"claude","from":"inbox","to"
 call POST /api/mail/messages/e1/move "$P1" '{"name":"claude","to":"inbox"}'; [ "$CODE" = 403 ] && ok "move into the Inbox: 403" || fail "move to inbox: $CODE"
 call POST /api/mail/messages/e3/move "$P1" '{"name":"claude","to":"own"}'; [ "$CODE" = 403 ] && ok "move a message that is only in the Inbox: 403 (copy first)" || fail "move e3: $CODE $BODY"
 call POST /api/mail/messages/e3/delete "$P1" '{"name":"claude"}'; [ "$CODE" = 403 ] && [ "$(MS emails.e3.mailboxIds)" = '{"mb-inbox": true}' ] && ok "delete from the Inbox: 403, still there" || fail "delete e3: $CODE"
-curl -s "http://127.0.0.1:$JPORT/__stale" >/dev/null
+curl -s "http://127.0.0.1:$JPORT/__stale_change" >/dev/null
 call POST /api/mail/messages/e1/delete "$P1" '{"name":"claude"}'
-[ "$CODE" = 409 ] && [ "$(MS emails.e1.mailboxIds | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" = 3 ] && ok "a delete on a stale view is refused by the mail server's state check (409), nothing changed" || fail "stale delete: $CODE $BODY $(MS emails.e1.mailboxIds)"
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "filed or moved meanwhile" && [ "$(MS emails.e1.mailboxIds | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" = 4 ] && ok "a delete whose message was filed elsewhere meanwhile is refused (409), nothing removed" || fail "stale delete: $CODE $BODY $(MS emails.e1.mailboxIds)"
+curl -s "http://127.0.0.1:$JPORT/__clean" >/dev/null; curl -s "http://127.0.0.1:$JPORT/__stale" >/dev/null
 call POST /api/mail/messages/e1/delete "$P1" '{"name":"claude"}'
 [ "$CODE" = 200 ] && [ "$(MS lastSet.ifInState)" != None ] && [ "$(MS lastSet.update | grep -c '"mailboxIds"')" = 0 ] && echo "$(MS emails.e1.mailboxIds)" | grep -q mb-inbox && echo "$(MS emails.e1.mailboxIds)" | grep -q "$OWN2" && [ "$(MS emails.e1.mailboxIds | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')" = 2 ] \
-  && ok "delete takes it out of the pane's own folders only, by patch paths under ifInState" || fail "delete e1: $CODE $BODY $(MS emails.e1.mailboxIds) $(MS lastSet)"
-call GET "/api/mail/messages/e2?name=claude" "$A"; [ "$CODE" = 200 ] && ok "the owner's person session reads every folder" || fail "owner read: $CODE"
-call POST /api/mail/messages/e2/delete "$A" '{"name":"claude","from":"panes/other"}'
+  && ok "a state change elsewhere (a busy Inbox) is retried once when the message is unchanged; the delete takes it out of the pane's own folders only, by patch paths under ifInState" || fail "delete e1: $CODE $BODY $(MS emails.e1.mailboxIds) $(MS lastSet)"
+opin; call GET "/api/mail/messages/e2?name=claude" "$A"; [ "$CODE" = 200 ] && ok "the owner (with the PIN) reads every folder" || fail "owner read: $CODE"
+call POST /api/mail/messages/e2/delete "$A" '{"name":"claude","from":"panes/other"}'; [ "$CODE" = 403 ] && [ "$(MS emails.e2.mailboxIds)" = '{"mb-other": true}' ] && ok "the owner's delete without the PIN: 403, nothing moved" || fail "owner delete no pin: $CODE"
+opin; call POST /api/mail/messages/e2/delete "$A" '{"name":"claude","from":"panes/other"}'
 [ "$CODE" = 200 ] && [ "$(MS emails.e2.mailboxIds)" = '{"mb-trash": true}' ] && ok "the owner deletes from another pane's folder (in no other folder → Trash, by patch)" || fail "owner delete: $CODE $BODY $(MS emails.e2.mailboxIds)"
 
 # ── sending ──
@@ -387,11 +412,26 @@ call POST /api/mail/send "$P1" '{"name":"claude","to":"a@example.com, b@example.
 call POST /api/mail/send "$P1" '{"name":"claude","to":"a@example.com, b@example.com","subject":"pane hello","body":"changed"}' -H 'Idempotency-Key: pane-hello-0001'; [ "$CODE" = 422 ] && ok "…the same key with a different message: 422" || fail "replay 422: $CODE"
 call POST /api/mail/send "$P2" '{"name":"claude","to":"c@example.com","subject":"pane hello","body":"from the pane"}' -H 'Idempotency-Key: pane-hello-0001'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = None ] && ok "…another pane's key is its own (no replay across panes)" || fail "cross-pane key: $CODE $BODY"
 call POST /api/mail/send "$A" '{"name":"claude","to":"c2@example.com","subject":"owner hello","body":"from the owner"}'
-[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J from)" = claude@dustforge.com ] && [ "$(echo "$BODY" | J billed)" = 1 ] && ok "the owner's person session sends as the bare name, 1 DD" || fail "owner send: $CODE $BODY"
+[ "$CODE" = 403 ] && [ "$(echo "$BODY" | J need)" = pin ] && ok "the owner's password session alone cannot send as the bare name: the PIN is asked for" || fail "owner send no pin: $CODE $BODY"
+opin; call POST /api/mail/send "$A" '{"name":"claude","to":"c2@example.com","subject":"owner hello","body":"from the owner"}'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J from)" = claude@dustforge.com ] && [ "$(echo "$BODY" | J billed)" = 1 ] && ok "with the PIN, the owner sends as the bare name, 1 DD" || fail "owner send: $CODE $BODY"
 B2=$(bal)
 call POST /api/email/send "$A" '{"to":"d@example.com, e@example.com, f@example.com","subject":"direct","body":"b"}'
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J billed)" = 3 ] && [ "$(bal)" = $((B2 - 3)) ] && ok "POST /api/email/send: 1 DD per recipient (3 recipients, 3 DD)" || fail "direct: $CODE $BODY"
 Q "SELECT description FROM identity_transactions WHERE type='email_send' ORDER BY id DESC LIMIT 1" | grep -q "3 recipients" && ok "…its ledger row counts the recipients" || fail "direct ledger"
+# Receipts: a pane lists only its own sends; the owner lists all (#129 re-audit).
+P1ID=$(Q "SELECT id FROM mail_panes WHERE session='dustforge-demipass'"); P2ID=$(Q "SELECT id FROM mail_panes WHERE session='dustforge' AND ended_at IS NULL")
+call GET "/api/email/sends?limit=100" "$P1"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | python3 -c 'import json,sys; s=json.load(sys.stdin)["sends"]; print(len(s), sorted(set(x["from"] for x in s)))')" = "1 ['dustforge-demipass.claude@dustforge.com']" ] && ok "a pane lists only its own sends (GET /api/email/sends)" || fail "pane sends: $BODY"
+P2SEND=$(Q "SELECT send_id FROM email_receipts WHERE sender='pane:$P2ID' LIMIT 1")
+call GET "/api/email/sends/$P2SEND" "$P1"; [ "$CODE" = 404 ] && ok "…and cannot open another pane's send by id (404)" || fail "pane send by id: $CODE"
+call GET "/api/email/sends/$P2SEND" "$P2"; [ "$CODE" = 200 ] && ok "…its own, it can" || fail "own send by id: $CODE"
+call GET "/api/email/sends?limit=100" "$A"; [ "$(echo "$BODY" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["sends"]))')" = 4 ] && ok "the owner lists every send of the wallet (4)" || fail "owner sends: $BODY"
+[ "$(Q "SELECT sender FROM email_receipts WHERE from_addr='pm-owner@dustforge.com' LIMIT 1")" = owner ] && ok "…each receipt records its sender (owner, pane:<id>, holder:<session>)" || fail "sender column: $(Q "SELECT group_concat(sender) FROM email_receipts")"
+B2b=$(bal)
+call POST /api/email/send "$A" '{"to":"a@example.com, b@example.com","subject":"pane hello","body":"from the pane"}' -H 'Idempotency-Key: pane-hello-0001'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = None ] && [ "$(bal)" = $((B2b - 2)) ] && ok "a direct-route Idempotency-Key never meets a pane's key of the same text (direct: prefix): it sends" || fail "key spaces: $CODE $BODY"
+call POST /api/email/send "$A" '{"to":"a@example.com, b@example.com","subject":"pane hello","body":"from the pane"}' -H 'Idempotency-Key: pane-hello-0001'
+[ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && ok "…and replays itself under its own key" || fail "direct replay: $CODE $BODY"
 # A name equal to the owner's username: the direct routes then refuse panes (and allow only the owner's own session).
 X "INSERT INTO mail_names (owner_did, name, tier, secret_ref, login, created_at) VALUES ('$OWNER', 'pm-owner', 2, 'DP-PWD-pmowner-2b2b2b2b', 'pm-owner', '2026-11-16T00:00:00Z')"
 B3=$(bal)
@@ -401,13 +441,15 @@ call POST /api/email/send "$P1" '{"to":"g@example.com","subject":"around","body"
 call POST /api/email/send "$EC" '{"to":"g@example.com","subject":"around","body":"b"}'; [ "$CODE" = 403 ] && ok "…nor with an emailed-code sign-in of the owner's wallet" || fail "email_code direct: $CODE"
 X "INSERT INTO forward_relays (did, forward_to, filter_from, label, status, activated_at) VALUES ('$OWNER', 'fwd@example.com', '*', 'smoke', 'active', '2026-01-01 00:00:00')"
 call POST /api/relay/forward "$P1" '{"subject":"s","body":"b"}'; [ "$CODE" = 403 ] && [ "$(bal)" = "$B3" ] && ok "…nor through /api/relay/forward (403, nothing charged)" || fail "relay guard: $CODE $BODY"
-call POST /api/email/send "$A" '{"to":"g@example.com","subject":"owner direct","body":"b"}'; [ "$CODE" = 200 ] && ok "…the owner's own session still sends there" || fail "owner direct: $CODE $BODY"
+call POST /api/email/send "$A" '{"to":"g@example.com","subject":"owner direct","body":"b"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J need)" = pin ] && ok "…the owner's own session sends there only with the PIN" || fail "owner direct no pin: $CODE $BODY"
+opin; call POST /api/email/send "$A" '{"to":"g@example.com","subject":"owner direct","body":"b"}'; [ "$CODE" = 200 ] && ok "…and does, with it" || fail "owner direct: $CODE $BODY"
 X "UPDATE mail_names SET ended_at='2026-11-16T00:00:01Z' WHERE name='pm-owner'"
 
 # ── the per-wallet outbound cap: 50 recipients/day for a new wallet ──
 SENT=$(Q "SELECT recipients FROM mail_outbound_daily WHERE did='$OWNER'")
-[ "$SENT" = 8 ] && ok "the outbound count is per wallet, across routes and panes (8 so far)" || fail "count: $SENT"
-for i in 1 2 3 4; do call POST /api/mail/send "$P2" '{"name":"claude","to":"'$(rcpts b$i 10)'","subject":"batch '$i'","body":"b"}'; [ "$CODE" = 200 ] || fail "batch $i: $CODE $BODY"; done
+[ "$SENT" = 10 ] && ok "the outbound count is per wallet, across routes and panes (10 so far)" || fail "count: $SENT"
+for i in 1 2 3; do call POST /api/mail/send "$P2" '{"name":"claude","to":"'$(rcpts b$i 10)'","subject":"batch '$i'","body":"b"}'; [ "$CODE" = 200 ] || fail "batch $i: $CODE $BODY"; done
+call POST /api/mail/send "$P2" '{"name":"claude","to":"'$(rcpts b4 8)'","subject":"batch 4","body":"b"}'; [ "$CODE" = 200 ] || fail "batch 4: $CODE $BODY"
 B4=$(bal)
 call POST /api/mail/send "$P2" '{"name":"claude","to":"'$(rcpts c 5)'","subject":"over","body":"b"}'
 [ "$CODE" = 429 ] && [ "$(echo "$BODY" | J limiter)" = mail_out ] && [ "$(echo "$BODY" | J limit)" = 50 ] && [ "$(echo "$BODY" | J lift.limiter)" = mail_out ] && [ "$(bal)" = "$B4" ] \
@@ -448,7 +490,8 @@ call POST /api/mail/join "$P2" '{"name":"claude","session":"dustforge","vendor":
 NEW2=$(folder_of Panes dustforge)
 [ "$CODE" = 201 ] && [ -n "$NEW2" ] && [ "$NEW2" != "$OWN2" ] && ok "a new pane under the same session name gets a fresh folder, not the old one" || fail "rejoin: $CODE $BODY ($NEW2 vs $OWN2)"
 call GET "/api/mail/messages?name=claude" "$P2"; [ "$(echo "$BODY" | J count)" = 0 ] && ok "…and it starts empty" || fail "rejoin own: $BODY"
-call POST /api/mail/leave "$A" '{"name":"claude","session":"dustforge-demipass"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J pane.ended_by)" = owner ] && [ "$(echo "$BODY" | J pane.folder_state)" = archived ] && ok "the owner revokes pane one (folder archived)" || fail "revoke: $CODE $BODY"
+call POST /api/mail/leave "$A" '{"name":"claude","session":"dustforge-demipass"}'; [ "$CODE" = 403 ] && ok "the owner revokes a pane only with the PIN" || fail "revoke no pin: $CODE"
+opin; call POST /api/mail/leave "$A" '{"name":"claude","session":"dustforge-demipass"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J pane.ended_by)" = owner ] && [ "$(echo "$BODY" | J pane.folder_state)" = archived ] && ok "the owner revokes pane one (folder archived)" || fail "revoke: $CODE $BODY"
 MS principals.claude | grep -q '"dustforge-demipass.claude@dustforge.com"' && fail "revoked pane's alias still there" || ok "…its alias is removed"
 call POST /api/mail/send "$P1" '{"name":"claude","to":"a@example.com","subject":"s","body":"b"}'; [ "$CODE" = 403 ] && ok "…and it can no longer send (403)" || fail "revoked send: $CODE"
 call GET /api/mail/names "$A"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J names.0.panes.0.session)" = dustforge ] && ok "the owner's list: claude@ with its one live pane" || fail "names: $CODE $BODY"
@@ -464,6 +507,10 @@ call POST /api/mail/names "$P1" '{"name":"claude","secret_ref":"DP-PWD-claudeold
 [ "$CODE" = 502 ] && echo "$BODY" | grep -q "refused the stored login" && [ "$(MS auth.refused)" = $((R0 + 1)) ] && ok "…tried once after the approval: refused (502), not registered" || fail "stale redeem: $CODE $BODY"
 for i in 1 2 3 4; do call POST /api/mail/names "$P1" '{"name":"kyle","secret_ref":"'$(REFOF kyle)'"}'; done
 call POST /api/mail/names "$P1" "$NAMEB"; [ "$CODE" = 429 ] && ok "after 5 failed mailbox checks in an hour, the wallet's asks are refused (429)" || fail "probe limit: $CODE $BODY"
+kill $SRV; wait $SRV 2>/dev/null
+node server.js >>"$S/server.log" 2>&1 & SRV=$!
+for i in $(seq 1 40); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
+call POST /api/mail/names "$P1" "$NAMEB"; [ "$CODE" = 429 ] && ok "…and still after a restart (the failures are kept in the database)" || fail "probe limit after restart: $CODE $BODY"
 
 # ── no mailbox secret anywhere ──
 B64=$(printf 'claude:%s' "$PW1" | base64 -w0)
@@ -472,10 +519,12 @@ if grep -q -F -e "$PW1" -e "$PW2" -e "$B64" -e "$ADMINPW" "$S/bodies" "$S/server
 
 # ── legacy fixture: a database from before pane mailboxes gains the tables at start ──
 kill $SRV; wait $SRV 2>/dev/null
-for t in mail_names mail_panes mail_pane_flags mail_outbound_daily; do X "DROP TABLE $t"; done
+for t in mail_names mail_panes mail_pane_flags mail_outbound_daily mail_probe_failures; do X "DROP TABLE $t"; done
+X "ALTER TABLE email_receipts DROP COLUMN sender"
 node server.js >>"$S/server.log" 2>&1 & SRV=$!
 for i in $(seq 1 40); do curl -s -o /dev/null "$API/" && break; sleep 0.5; done
-[ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('mail_names','mail_panes','mail_pane_flags','mail_outbound_daily')")" = 4 ] && ok "legacy: a database without the tables gains mail_names, mail_panes, mail_pane_flags, mail_outbound_daily at start" || fail "legacy tables"
+[ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('mail_names','mail_panes','mail_pane_flags','mail_outbound_daily','mail_probe_failures')")" = 5 ] && ok "legacy: a database without the tables gains mail_names, mail_panes, mail_pane_flags, mail_outbound_daily, mail_probe_failures at start" || fail "legacy tables"
+[ "$(Q "SELECT COUNT(*) FROM pragma_table_info('email_receipts') WHERE name='sender'")" = 1 ] && ok "legacy: an email_receipts table from before sender gains the column" || fail "legacy sender column"
 [ "$(Q "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('idx_mail_names_live','idx_mail_panes_session','idx_mail_panes_holder')")" = 3 ] && ok "legacy: …and their unique indexes" || fail "legacy indexes"
 call GET /api/mail/names "$A"; [ "$CODE" = 200 ] && ok "legacy: the names list answers" || fail "legacy names: $CODE"
 

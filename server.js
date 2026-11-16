@@ -2535,7 +2535,7 @@ function directSendNameGuard(req, res, next) {
   const fromAddr = directFromAddr(req.identity.did, (req.body || {}).from);
   const auth = { ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false };
   const why = paneMail ? paneMail.directSendRefusal(auth, fromAddr) : null;
-  if (why) return res.status(403).json({ error: why, send: 'POST /api/mail/send' });
+  if (why) return res.status(why.status).json(why.body);
   next();
 }
 // The per-wallet outbound cap (mail_outbound_cap.js), counted in recipients, liftable (limiter mail_out).
@@ -2551,7 +2551,7 @@ function outboundCapGuard(countOf) {
   };
 }
 // 1 DD per recipient (billing.js RATE_CHANGES 2026-11-16, ruling 7).
-app.post('/api/email/send', rateLimitStandard, (req, res, next) => (mailReceiptsApi ? mailReceiptsApi.replayGuard(getReadIdentity)(req, res, next) : next()), mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, directSendNameGuard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db),
+app.post('/api/email/send', rateLimitStandard, (req, res, next) => (mailReceiptsApi ? mailReceiptsApi.replayGuard(getReadIdentity, { prefix: 'direct:' })(req, res, next) : next()), mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, directSendNameGuard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db),
   outboundCapGuard((req) => emailRecipientCount(req.body.to)),
   billing.billingMiddleware(db, 'email_send', { cost: (req) => billing.RATE_TABLE.email_send * emailRecipientCount(req.body.to),
     describe: (req) => { const n = emailRecipientCount(req.body.to); return `email_send: ${n} recipient${n === 1 ? '' : 's'}`; } }), async (req, res) => {
@@ -2563,8 +2563,11 @@ app.post('/api/email/send', rateLimitStandard, (req, res, next) => (mailReceipts
     // Sent through the receipts layer: Resend's API when a Resend key is configured (its email id comes back and is
     // logged, returned and kept, so delivered/bounced/complained can be asked for later), else the SMTP transport.
     // The caller's own Idempotency-Key (a repeat was already answered by replayGuard, before any cap or charge).
-    const clientKey = typeof req.headers['idempotency-key'] === 'string' ? req.headers['idempotency-key'] : null;
-    const sent = await mailReceiptsApi.send({ did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody, clientKey,
+    // The direct route's keys are their own space ('direct:'), apart from panes' and the owner's /api/mail/send keys;
+    // the receipt records who sent it, so a pane lists only its own sends (#129 re-audit).
+    const clientKey = typeof req.headers['idempotency-key'] === 'string' ? 'direct:' + req.headers['idempotency-key'] : null;
+    const sender = paneMail ? paneMail.senderOf({ ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false }) : null;
+    const sent = await mailReceiptsApi.send({ sender, did: req.identity.did, tokenJti: req.billing.token_jti || null, from: fromAddr, to, subject, text: injectedBody, clientKey,
       bodySha: crypto.createHash('sha256').update(String(body || '')).digest('hex') });
     console.log(`[email] sent: ${fromAddr} -> ${to} token=${req.billing.token_jti || '-'} send=${sent.send_id} ${sent.provider}=${sent.provider_id || '-'} msgid=${sent.message_id || '-'}`);
     res.json({ ok: true, billed: req.billing.deducted, balance_after: req.billing.balance_after, referral_injected: Boolean(wallet?.referral_code),
@@ -2705,7 +2708,7 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
   // A forward goes out From the wallet's own address: when that is a registered mail name, only its owner's own session
   // forwards as it (pane_mail.js; #129 review).
   const why = paneMail ? paneMail.directSendRefusal({ ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false }, directFromAddr(req.identity.did)) : null;
-  if (why) return res.status(403).json({ error: why });
+  if (why) return res.status(why.status).json(why.body);
   next();
 }, async (req, res) => {
   const { subject, body, original_from } = req.body || {};
@@ -9906,13 +9909,14 @@ const useApprovals = require('./use_approvals')({
 // Mail receipts: every /api/email/send names the provider's message id; Resend's delivery events come back signed.
 mailReceiptsApi = require('./mail_receipts')({ app, db, rateLimitStandard, getBearerIdentity, getReadIdentity, logSecurityEvent, approvals: () => useApprovals,
   createEmailTransport, operatorAllowed: (did) => require('./fleet_billing').operatorGrantAllowed(did),
+  senderScope: (a) => (paneMail ? paneMail.senderScope(a) : null),
   publicApi: (process.env.PUBLIC_API_URL || 'https://api.dustforge.com').replace(/\/$/, '') });
 // Pane mailboxes, phase 1 (pane_mail.js): owned mail names, panes joined by app approval, per-pane folder rights, sends
 // as the pane at 1 DD per recipient. The mailbox password stays in the owner's vault and is used here only.
 paneMail = require('./pane_mail')({ app, db, billing, getBearerIdentity, isAgentAuth, deviceSession, ownerApproves, logSecurityEvent, cleanLabel,
   blindkeyDecrypt, rateLimitStandard, mailHeaders, reserveMailSlot, mailRecipientCap, outboundCap: mailOutboundCap, limitLiftExtra,
   mailReceipts: () => mailReceiptsApi, referral, stalwartAdmin: dustforge.stalwartRequest, emailAddrRe: EMAIL_ADDR_RE,
-  creatorOf: (did) => fleetBilling.creatorOf(db, did) });
+  ownFleetAgent, deviceSession, gateFresh, gateMissing, spendSingleUse });
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
 require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
   approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });
@@ -15636,7 +15640,7 @@ const GATE_WINDOW_SEC = 300; // a passed code/password gate stays fresh for 5 mi
 const GATE_SINGLE_USE = new Set(['pin', 'fingerprint']);
 const GATE_ACTIONS = ['reveal', 'rotate', 'delete', 'use'];
 const PIN_PROOF_SEC = 60;   // a PIN proof is spent by its action or dies within a minute
-const PIN_INTENT_RE = /^(reveal|rotate|edit|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward|rate-reset):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
+const PIN_INTENT_RE = /^(reveal|rotate|edit|delete|use|gate-policy|fill|grant|send|join|access|share|share-accept|transfer|reveal-grant|share-reveal|approval-open|scope|escrow|refill|unlock|device-enrol|device-revoke|lock-setting|pair|transfer-delay|vouch|scan-token|scan-approve|scrub-approve|scan-hits|scan-descriptions|project-fund|project-remove|project-operator|silicon-token|silicon-renew|silicon-key|silicon-key-revert|wrap-key|pin-reset|recovery-email|guardian-set|guardian-accept|recovery-approve|pw-rotate|forward|rate-reset|mail-owner):\d{1,12}$/;   // silicon-token:<silicon_token_requests id>, silicon-renew:/silicon-key:/silicon-key-revert:<fleet_silicons id>, project-fund:/project-remove:<fleet_projects id>, scan-descriptions:<0 check|1 redact>, share:/transfer:<secret id>, share-accept:/reveal-grant:/share-reveal:<delegation id>, fill:<fill request id>, grant:<grant request id>, send:<transfer id>, join:<network request id>, access:<access request id>
 const PIN_ATTEMPT_RE = /^[A-Za-z0-9_-]{8,64}$/;   // the vault's random id for one PIN check (optional for API callers)
 const gateIntent = (action, secret) => `${action}:${secret.id}`;
 

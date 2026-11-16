@@ -27,7 +27,9 @@ const REFRESH_COOLDOWN_MS = 60 * 1000, REFRESH_PER_DID_HOUR = 30;
 const STALE_CLAIM_MS = 5 * 60 * 1000;
 const SIG_TOLERANCE_SEC = 300;
 
-module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerIdentity, getReadIdentity, logSecurityEvent, approvals, createEmailTransport, operatorAllowed, publicApi }) {
+// senderScope(auth): which senders' receipts a token may see — null for all (the owner), else a list of sender keys
+// (#129 re-audit: a pane sees only its own sends, not every send of the wallet).
+module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerIdentity, getReadIdentity, logSecurityEvent, approvals, createEmailTransport, operatorAllowed, publicApi, senderScope }) {
   db.exec(`CREATE TABLE IF NOT EXISTS email_receipts (
     send_id TEXT PRIMARY KEY,
     did TEXT NOT NULL,
@@ -52,6 +54,8 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
   try { db.exec('ALTER TABLE email_receipts ADD COLUMN refreshed_at TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE email_receipts ADD COLUMN client_key TEXT'); } catch (_) {}
   try { db.exec('ALTER TABLE email_receipts ADD COLUMN body_sha256 TEXT'); } catch (_) {}
+  // Who sent it: 'owner', 'pane:<id>', 'holder:<session key>' (any other session of the wallet), NULL before this column.
+  try { db.exec('ALTER TABLE email_receipts ADD COLUMN sender TEXT'); } catch (_) {}
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_email_receipts_client_key ON email_receipts(did, client_key) WHERE client_key IS NOT NULL');
 
   const now = () => new Date().toISOString();
@@ -74,7 +78,7 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
   const sha = (x) => crypto.createHash('sha256').update(String(x || '')).digest('hex');
   // bodySha: the caller's body before anything is added to it (the referral link), what a repeat is compared with.
   // headers: extra headers this server sets (X-Dustforge-Pane on a pane's send); names and values are checked here.
-  async function send({ did, tokenJti, from, to, subject, text, clientKey, bodySha, headers }) {
+  async function send({ did, tokenJti, from, to, subject, text, clientKey, bodySha, headers, sender }) {
     const extra = {};
     for (const [k, v] of Object.entries(headers || {})) {
       if (!/^X-Dustforge-[A-Za-z-]{1,40}$/.test(k) || typeof v !== 'string' || /[\r\n]/.test(v) || v.length > 200) throw new Error('bad extra header');
@@ -93,8 +97,8 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
       // there, a crash after the relay accepted but before the receipt was written can mean a second copy.
       db.prepare("DELETE FROM email_receipts WHERE did = ? AND client_key = ? AND status = 'sending' AND created_at < ?").run(did, clientKey, new Date(Date.now() - STALE_CLAIM_MS).toISOString());
       try {
-        db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, status, events, created_at, updated_at, client_key, body_sha256)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', 'sending', '[]', ?, ?, ?, ?)`).run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, now(), now(), clientKey, bodySha || sha(text));
+        db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, status, events, created_at, updated_at, client_key, body_sha256, sender)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', 'sending', '[]', ?, ?, ?, ?, ?)`).run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, now(), now(), clientKey, bodySha || sha(text), sender || null);
       } catch (e) { throw Object.assign(new Error('a send with this Idempotency-Key is already in progress or done'), { status: 409 }); }
     }
     try { return await deliver(); }
@@ -114,12 +118,12 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     const at = now();
     // The mail has left: a receipt that fails to write must not turn into a refund and a retry (a second message).
     try {
-      db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, provider_id, message_id, status, events, created_at, updated_at, client_key, body_sha256)
-                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?)
+      db.prepare(`INSERT INTO email_receipts (send_id, did, token_jti, from_addr, to_addr, subject_sha256, provider, provider_id, message_id, status, events, created_at, updated_at, client_key, body_sha256, sender)
+                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?, ?, ?, ?, ?)
                   ON CONFLICT(send_id) DO UPDATE SET provider = excluded.provider, provider_id = excluded.provider_id, message_id = excluded.message_id,
                     status = 'accepted', events = excluded.events, updated_at = excluded.updated_at`)
         .run(sendId, did, tokenJti || null, from, toList.join(', '), subjectSha, provider, providerId, mid,
-             JSON.stringify([{ type: 'accepted', at, by: provider }]), at, at, clientKey || null, bodySha || sha(text));
+             JSON.stringify([{ type: 'accepted', at, by: provider }]), at, at, clientKey || null, bodySha || sha(text), sender || null);
     } catch (e) { console.error(`[mail-receipts] sent ${sendId} (${provider} ${providerId || '-'}) but the receipt did not write: ${e.message}`); }
     return { send_id: sendId, provider, provider_id: provider === 'resend' ? providerId : null, message_id: mid };
     }
@@ -128,14 +132,17 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
   // Express middleware for /api/email/send, mounted before every cap, reservation and charge: a request repeating an
   // earlier Idempotency-Key gets that send's receipt and reserves, charges and sends nothing (#90 re-review H). The same
   // key with a different message is refused (422); a send still in flight is 409.
-  function replayGuard(getIdentity) {
+  // prefix: the route's own key space (the direct route's keys are 'direct:<key>', so they never meet a pane's
+  // 'pane<N>:' or the owner's 'owner:' keys); a receipt from before senders were recorded still answers its raw key.
+  function replayGuard(getIdentity, { prefix = '' } = {}) {
     return (req, res, next) => {
       const key = req.headers['idempotency-key'];
       if (typeof key !== 'string') return next();
       if (!/^[A-Za-z0-9._:-]{8,100}$/.test(key)) return res.status(400).json({ error: 'Idempotency-Key: 8-100 of [A-Za-z0-9._:-]' });
       const a = getIdentity(req);
       if (!a || !a.ok) return next();                         // the auth middleware answers this
-      const r = byClientKey(a.did, key);
+      const r = byClientKey(a.did, prefix + key)
+        || (prefix ? db.prepare('SELECT * FROM email_receipts WHERE did = ? AND client_key = ? AND sender IS NULL').get(a.did, key) : null);
       if (!r) return next();
       const b = req.body || {};
       const sameTo = String(b.to || '').split(',').map(x => x.trim()).filter(Boolean).join(', ') === r.to_addr;
@@ -180,17 +187,22 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     if (!a || !a.ok) { res.status((a && a.status) || 401).json({ error: (a && a.error) || 'sign in' }); return null; }
     return a;
   }
+  const scopeOf = (a) => (typeof senderScope === 'function' ? senderScope(a) : null);
+  const inScope = (scope, r) => scope === null || (r.sender && scope.includes(r.sender));
   app.get('/api/email/sends', lim, (req, res) => {
     const a = who(req, res); if (!a) return;
     const n = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
-    res.json({ ok: true, sends: db.prepare('SELECT * FROM email_receipts WHERE did = ? ORDER BY created_at DESC LIMIT ?').all(a.did, n).map(view) });
+    const scope = scopeOf(a);
+    const rows = scope === null ? db.prepare('SELECT * FROM email_receipts WHERE did = ? ORDER BY created_at DESC LIMIT ?').all(a.did, n)
+      : scope.length ? db.prepare(`SELECT * FROM email_receipts WHERE did = ? AND sender IN (${scope.map(() => '?').join(',')}) ORDER BY created_at DESC LIMIT ?`).all(a.did, ...scope, n) : [];
+    res.json({ ok: true, sends: rows.map(view), ...(scope === null ? {} : { scope: 'this session\'s own sends' }) });
   });
   app.get('/api/email/sends/:id', lim, async (req, res) => {
     const a = who(req, res); if (!a) return;
     const id = String(req.params.id || '');
     if (!/^[A-Za-z0-9_-]{8,80}$/.test(id)) return res.status(400).json({ error: 'id: a send_id (es_…) or the provider id' });
     let r = db.prepare('SELECT * FROM email_receipts WHERE (send_id = ? OR (provider = ? AND provider_id = ?)) AND did = ?').get(id, 'resend', id, a.did);
-    if (!r) return res.status(404).json({ error: 'no send of yours with that id' });
+    if (!r || !inScope(scopeOf(a), r)) return res.status(404).json({ error: 'no send of yours with that id' });
     let refresh = null;
     if (req.query.refresh === '1' && r.provider === 'resend') {
       // Resend's own record, for when an event was missed (or before the webhook is registered). Every refresh spends
