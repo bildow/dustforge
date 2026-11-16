@@ -187,22 +187,31 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     if (!a || !a.ok) { res.status((a && a.status) || 401).json({ error: (a && a.error) || 'sign in' }); return null; }
     return a;
   }
-  const scopeOf = (a) => (typeof senderScope === 'function' ? senderScope(a) : null);
+  // { senders: null | [...], intent? }: null is every sender; intent names the PIN challenge that would open them all.
+  const scopeOf = (a, act) => (typeof senderScope === 'function' ? senderScope(a, act) : { senders: null });
   const inScope = (scope, r) => scope === null || (r.sender && scope.includes(r.sender));
   app.get('/api/email/sends', lim, (req, res) => {
     const a = who(req, res); if (!a) return;
     const n = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
-    const scope = scopeOf(a);
+    const sc = scopeOf(a, 'sends:list'), scope = sc.senders;
     const rows = scope === null ? db.prepare('SELECT * FROM email_receipts WHERE did = ? ORDER BY created_at DESC LIMIT ?').all(a.did, n)
       : scope.length ? db.prepare(`SELECT * FROM email_receipts WHERE did = ? AND sender IN (${scope.map(() => '?').join(',')}) ORDER BY created_at DESC LIMIT ?`).all(a.did, ...scope, n) : [];
-    res.json({ ok: true, sends: rows.map(view), ...(scope === null ? {} : { scope: 'this session\'s own sends' }) });
+    res.json({ ok: true, sends: rows.map(view), ...(scope === null ? {} : { scope: 'this session\'s own sends' }),
+      ...(sc.intent ? { all_sends: { intent: sc.intent, how: 'enter your PIN for this intent (POST /api/identity/gate/verify) and ask again within a minute' } } : {}) });
   });
   app.get('/api/email/sends/:id', lim, async (req, res) => {
     const a = who(req, res); if (!a) return;
     const id = String(req.params.id || '');
     if (!/^[A-Za-z0-9_-]{8,80}$/.test(id)) return res.status(400).json({ error: 'id: a send_id (es_…) or the provider id' });
     let r = db.prepare('SELECT * FROM email_receipts WHERE (send_id = ? OR (provider = ? AND provider_id = ?)) AND did = ?').get(id, 'resend', id, a.did);
-    if (!r || !inScope(scopeOf(a), r)) return res.status(404).json({ error: 'no send of yours with that id' });
+    if (!r) return res.status(404).json({ error: 'no send of yours with that id' });
+    if (!inScope(scopeOf(a, null).senders, r)) {                 // not this session's own: the owner may, with the PIN
+      const sc = scopeOf(a, 'sends:' + r.send_id);
+      if (!inScope(sc.senders, r)) {
+        if (sc.intent) return res.status(403).json({ error: 'another session\'s send: enter your PIN for this intent and ask again', need: 'pin', intent: sc.intent });
+        return res.status(404).json({ error: 'no send of yours with that id' });
+      }
+    }
     let refresh = null;
     if (req.query.refresh === '1' && r.provider === 'resend') {
       // Resend's own record, for when an event was missed (or before the webhook is registered). Every refresh spends

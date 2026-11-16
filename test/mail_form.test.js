@@ -145,30 +145,66 @@ test('maskSecrets: split, dotted, fullwidth, Arabic-Indic and letters-only codes
 // ── #129 re-audit: hiding must not destroy legitimate mail ──
 test('newsletter patterns: only the hidden parts go; the content stays', () => {
   const html = '<html><head><style>' +
-    'span.preheader{display:none!important}' +                     // a preheader: only spans with that class
-    'u + .body .gmail-hide{display:none}' +                        // Gmail-targeting combinator: ignored
-    '@media only screen and (max-width:600px){td.mobile{display:none} .desktop{display:none}}' +   // conditional: ignored
-    'td{font-family:Arial} body{display:none} *{display:none}' +   // body and * never hide
+    'span.preheader{display:none!important}' +                     // a preheader: only elements with that class
+    'u + .body .gmail-hide{display:none}' +                        // Gmail template: the rule lands on .gmail-hide, not the body
+    '@media only screen and (max-width:600px){td.mobile-hide{display:none}}' +
+    'td{font-family:Arial} a:hover{color:#ffffff} .btn::after{display:none}' +
     '.btn{color:#ffffff}' +                                        // white button text (its cell has a background)
     '</style></head><body class="body">' +
     '<span class="preheader">preheader teaser</span><span>Visible span</span>' +
-    '<div class="gmail-hide">Gmail block stays</div>' +
-    '<table><tr><td class="mobile">Mobile cell stays</td><td class="desktop">Desktop cell stays</td></tr></table>' +
+    '<div class="gmail-hide">gmail-only block</div><div>Body text stays</div>' +
+    '<table><tr><td class="mobile-hide">mobile-hidden cell</td><td>Plain cell stays</td></tr></table>' +
     '<table><tr><td bgcolor="#0055ff"><a class="btn" href="https://shop.example/x">Shop now</a></td></tr></table>' +
     '<p style="background-color:#222;color:#fff">Dark band text</p>' +
     '<p style="color:#fff">white on white</p>' +
     '</body></html>';
-  const t = f.htmlToVisibleText(html);
-  for (const keep of ['Visible span', 'Gmail block stays', 'Mobile cell stays', 'Desktop cell stays', 'Shop now', 'Dark band text']) assert.match(t, new RegExp(keep), keep + ' in ' + JSON.stringify(t));
-  for (const drop of ['preheader teaser', 'white on white']) assert.ok(!t.includes(drop), drop);
+  const r = f.reduceHtml(html);
+  for (const keep of ['Visible span', 'Body text stays', 'Plain cell stays', 'Shop now', 'Dark band text']) assert.match(r.text, new RegExp(keep), keep + ' in ' + JSON.stringify(r.text));
+  for (const drop of ['preheader teaser', 'gmail-only block', 'mobile-hidden cell', 'white on white']) assert.ok(!r.text.includes(drop), drop);
+  assert.equal(r.unresolved, false, 'nothing here needs withholding');
 });
 
-test('the plain part is used when the HTML reduces to nothing or is cut', () => {
-  const mk = (html) => ({ htmlBody: [{ partId: 'h', type: 'text/html' }], textBody: [{ partId: 't', type: 'text/plain' }], bodyValues: { h: { value: html }, t: { value: 'the plain words' } } });
+// ── #129 round-3: every hiding rule is placed by its rightmost compound, or the body is withheld from panes ──
+test('class-hidden injection through combinators, attributes, pseudo-classes and at-rules is hidden', () => {
+  const sels = ['div .x', 'body > .x', '[class=x]', '[class~=x]', '[class="a x"]', '.x:not(.y)', '*.x', 'p:nth-child(2) .x', '#y', '[id=y]', 'div > #y'];
+  for (const sel of sels) {
+    const r = f.reduceHtml(`<style>${sel}{display:none}</style><div><p>ok</p><p class="x" id="y">INJECTED</p></div>`);
+    assert.ok(!r.text.includes('INJECTED'), `${sel}: ${JSON.stringify(r.text)}`);
+    assert.match(r.text, /ok/, sel);
+  }
+  for (const wrap of ['@media all', '@media screen', '@media (max-width:600px)', '@supports (display:grid)', '@layer base']) {
+    const r = f.reduceHtml(`<style>${wrap}{.x{font-size:0}}</style><p>ok</p><p class="x">INJECTED</p>`);
+    assert.ok(!r.text.includes('INJECTED'), wrap);
+  }
+  assert.ok(!f.htmlToVisibleText('<style>@layer a, b; .x{opacity:0}</style><p class="x">INJECTED</p><p>ok</p>').includes('INJECTED'), '@layer statement');
+});
+
+test('a hiding rule that cannot be placed marks the document unresolved (panes get no body)', () => {
+  for (const sel of ['*', 'p:nth-child(2)', '[data-h]', 'body > *', '[class*=x]', 'body', 'html']) {
+    const r = f.reduceHtml(`<style>${sel}{display:none}</style><p>ok</p><p class="x" data-h>INJECTED</p>`);
+    assert.equal(r.unresolved, true, sel);
+  }
+  for (const sel of ['p', '.x', 'a:hover', '.x::before']) assert.equal(f.reduceHtml(`<style>${sel}{display:none}</style><p class="x">t</p>`).unresolved, false, sel);
+  assert.equal(f.reduceHtml('<style>td{font-family:Arial} [x-apple]{color:inherit}</style><p>t</p>').unresolved, false, 'non-hiding rules never count');
+});
+
+test('the plain part stands in only when the HTML reduces to nothing; cut HTML keeps its own text', () => {
+  const mk = (html, plain = 'the plain words, quite different') => ({ htmlBody: [{ partId: 'h', type: 'text/html' }], textBody: [{ partId: 't', type: 'text/plain' }], bodyValues: { h: { value: html }, t: { value: plain } } });
   let v = f.visibleText(mk('<div style="display:none">all hidden</div>'));
-  assert.equal(v.source, 'text'); assert.equal(v.text, 'the plain words'); assert.equal(v.html_fallback, 'empty');
-  v = f.visibleText(mk('<p>start</p><p style="x" class="'));
-  assert.equal(v.source, 'text'); assert.equal(v.html_fallback, 'cut');
-  v = f.visibleText(mk('<p>fine</p>'));
-  assert.equal(v.source, 'html'); assert.equal(v.text, 'fine');
+  assert.equal(v.source, 'text'); assert.equal(v.text, 'the plain words, quite different'); assert.equal(v.html_fallback, 'empty');
+  v = f.visibleText(mk('<p>Your invoice is attached</p><b'));                 // a bare "<b" at the end
+  assert.equal(v.source, 'html'); assert.equal(v.cut, true); assert.equal(v.text, 'Your invoice is attached');
+  assert.equal(v.parts_differ, true, 'the sender-chosen plain part says other things');
+  v = f.visibleText(mk('<p>Your invoice is attached</p>', 'Your invoice is attached'));
+  assert.equal(v.source, 'html'); assert.equal(v.parts_differ, false);
+});
+
+test('maskSecrets keeps ISO dates, clock times and currency amounts; masks lower-case codes near code words', () => {
+  const m = f.maskSecrets('Your code is 482913. It expires at 10:30 pm on 2026-11-16T03:00:00Z (or 23:59). Charged $1,299.00, €12.50 and 12.50 USD.');
+  assert.ok(!m.includes('482913'));
+  for (const keep of ['10:30 pm', '2026-11-16T03:00:00Z', '23:59', '$1,299.00', '€12.50', '12.50 USD']) assert.ok(m.includes(keep), keep + ' in ' + m);
+  assert.ok(!f.maskSecrets('Your code is 48:29:13').includes('48:29'), 'not a clock time');
+  assert.ok(!/qwxzkp|hjkmnb|abcdefg/.test(f.maskSecrets('Your login code is qwxzkp. Code: hjkmnb. Your code is abcdefg.')));
+  assert.ok(!f.maskSecrets('Your verification code:\nzqpwer\n').includes('zqpwer'));
+  assert.match(f.maskSecrets('Reset your password before 2026-11-20, thanks'), /before 2026-11-20, thanks/);
 });

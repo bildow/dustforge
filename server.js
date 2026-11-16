@@ -2534,7 +2534,10 @@ function directFromAddr(did, from) {
 function directSendNameGuard(req, res, next) {
   const fromAddr = directFromAddr(req.identity.did, (req.body || {}).from);
   const auth = { ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false };
-  const why = paneMail ? paneMail.directSendRefusal(auth, fromAddr) : null;
+  const b = req.body || {};
+  // The owner's PIN for this send only (#129 round-3 a): the act names the message.
+  const act = 'direct:' + crypto.createHash('sha256').update([fromAddr, b.to, b.subject, b.body, b.format || 'text'].join('\n')).digest('hex');
+  const why = paneMail ? paneMail.directSendRefusal(auth, fromAddr, act) : null;
   if (why) return res.status(why.status).json(why.body);
   next();
 }
@@ -2707,7 +2710,8 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
   if (!db.prepare('SELECT 1 FROM forward_relays WHERE did = ? AND status = ?').get(req.identity.did, 'active')) return res.status(404).json({ error: 'no active forwarding rules' });
   // A forward goes out From the wallet's own address: when that is a registered mail name, only its owner's own session
   // forwards as it (pane_mail.js; #129 review).
-  const why = paneMail ? paneMail.directSendRefusal({ ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false }, directFromAddr(req.identity.did)) : null;
+  const why = paneMail ? paneMail.directSendRefusal({ ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false }, directFromAddr(req.identity.did),
+    'relay:' + crypto.createHash('sha256').update([subject, body].join('\n')).digest('hex')) : null;
   if (why) return res.status(why.status).json(why.body);
   next();
 }, async (req, res) => {

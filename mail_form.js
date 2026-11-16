@@ -124,39 +124,82 @@ function cssHideKind(raw) {
 }
 const cssHides = (raw) => cssHideKind(raw) !== null;
 const ownBackground = (raw) => { const d = cssDecls(cssClean(raw)); return coversBg(d['background-color'] || d.background); };
-// <style> blocks → the rules that hide, narrowly (#129 re-audit): a bare type selector hides that tag (never html or
-// body); a simple selector of classes and/or an id (optionally with a tag: span.preheader) hides only elements carrying
-// exactly those; anything with a combinator, pseudo-class, attribute or * is ignored, and so is every rule inside a
-// conditional at-rule (@media (max-width…), @supports…), which may not apply when the mail is read. Linear: one pass
-// over the braces.
+// <style> blocks → the rules that hide (#129 round-3 re-audit). Each hiding rule is resolved by its selector's
+// RIGHTMOST compound — the element the rule lands on: its last class, else its id, else its bare type (html/body never).
+// [class=…]/[class~=…] count as a class and [id=…] as an id; pseudo-classes are set aside (:not(.y) hides nothing
+// itself); a pseudo-element rule (::before…) hides no element text. Rules inside @media, @supports, @layer, @container
+// apply. A hiding rule that cannot be resolved this way (`*`, [data-x], [class*=x], body > …) marks the document
+// `unresolved`: a pane then gets the form only, no body. Linear: one pass over the braces, bounded work per selector.
+const APPLYING_AT = /^@(media|supports|layer|container|document|-moz-document|scope)\b/;
+function topLevelSplit(s, ch) {
+  const out = []; let depth = 0, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') depth++; else if (c === ')') depth = Math.max(0, depth - 1);
+    else if (c === ch && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+// One selector → { cls } | { id } | { tag } | { pseudoElement: true } | { unresolved: true }.
+function resolveSelector(sel0, attrs) {
+  let sel = sel0.trim();
+  if (!sel) return { unresolved: true };
+  if (/::|:(before|after|first-line|first-letter|marker|placeholder|selection|backdrop)\b/.test(sel)) return { pseudoElement: true };
+  // A state the reader brings about (hovering, focusing) is not how the mail reads at rest.
+  if (/:(hover|focus|focus-within|focus-visible|active|visited)\b/.test(sel)) return { pseudoElement: true };
+  for (let pass = 0; pass < 6 && /:[a-z-]+\(/.test(sel); pass++) sel = sel.replace(/:[a-z-]+\([^()]*\)/g, ':_');
+  if (/[()]/.test(sel)) return { unresolved: true };
+  const parts = sel.split(/[\s>+~]+/).filter(Boolean);
+  const raw = parts[parts.length - 1] || '';
+  const pseudo = /:[a-z_-]/.test(raw);                       // the rightmost compound applies to a subset (:nth-child…)
+  const comp = raw.replace(/:[a-z_-]+/g, '');
+  const classes = [], ids = [];
+  let unknownAttr = false;
+  for (const m of comp.matchAll(/([.#])([a-z0-9_-]+)|\u0001(\d+)\u0001/g)) {
+    if (m[1] === '.') classes.push(m[2]);
+    else if (m[1] === '#') ids.push(m[2]);
+    else {
+      const a = /^\s*(class|id)\s*(~?=)\s*["']?([^"'\]]*?)["']?\s*(i|s)?\s*$/.exec(attrs[Number(m[3])] || '');
+      if (!a) { unknownAttr = true; continue; }
+      const words = a[3].trim().split(/\s+/).filter(Boolean);
+      if (!words.length) { unknownAttr = true; continue; }
+      if (a[1] === 'class') classes.push(words[words.length - 1]); else ids.push(words[0]);
+    }
+  }
+  if (classes.length) return { cls: classes[classes.length - 1] };
+  if (ids.length) return { id: ids[ids.length - 1] };
+  const tag = /^[a-z][a-z0-9]*/.exec(comp);
+  // A bare type only: "p:nth-child(2)" or "p[data-x]" is some p's, not every p, so it cannot be placed.
+  if (tag && !unknownAttr && !pseudo && comp === tag[0] && tag[0] !== 'html' && tag[0] !== 'body') return { tag: tag[0] };
+  return { unresolved: true };
+}
 function hidingRules(css) {
   const s = cssClean(css);
-  const out = { tags: new Map(), byClass: new Map(), byId: new Map() };
-  const add = (map, key, rule) => { const l = map.get(key) || []; if (l.length < 64 && !l.some((r) => r.k === rule.k)) l.push(rule); map.set(key, l); };
+  const out = { tags: new Map(), byClass: new Map(), byId: new Map(), unresolved: false };
+  const put = (map, key, kind) => { if (map.get(key) !== 'hard') map.set(key, kind); };
   const stack = [];
   let start = 0, i = 0;
   while (i < s.length) {
     const o = s.indexOf('{', i), c = s.indexOf('}', i);
     if (o < 0 && c < 0) break;
     if (c >= 0 && (o < 0 || c < o)) { stack.pop(); i = start = c + 1; continue; }
-    const prelude = s.slice(start, o).trim();
-    if (prelude.startsWith('@')) { stack.push(!/^@media\s+(all|screen)\s*$/.test(prelude)); i = start = o + 1; continue; }
+    let prelude = s.slice(start, o);
+    prelude = prelude.slice(prelude.lastIndexOf(';') + 1).trim();     // statement at-rules (@import …; @layer a;) end at ';'
+    if (prelude.startsWith('@')) { stack.push(APPLYING_AT.test(prelude)); i = start = o + 1; continue; }
     const close = s.indexOf('}', o + 1);
     const body = close < 0 ? s.slice(o + 1) : s.slice(o + 1, close);
     i = start = close < 0 ? s.length : close + 1;
-    if (stack.some(Boolean)) continue;                       // inside a conditional at-rule (or an unknown one)
+    if (stack.some((applies) => !applies)) continue;       // inside @font-face, @keyframes, @page…: not element rules
     const kind = cssHideKind(body);
     if (!kind) continue;
-    for (const sel0 of prelude.split(',')) {
-      const sel = sel0.trim();
-      if (/^[a-z][a-z0-9]*$/.test(sel)) { if (sel !== 'html' && sel !== 'body') { const prev = out.tags.get(sel); out.tags.set(sel, prev === 'hard' ? 'hard' : kind); } continue; }
-      const m = /^([a-z][a-z0-9]*)?((?:[.#][a-z0-9_-]+)+)$/.exec(sel);
-      if (!m) continue;                                      // combinators, pseudo-classes, attributes, *: ignored
-      const parts = m[2].match(/[.#][a-z0-9_-]+/g);
-      const classes = parts.filter((x) => x[0] === '.').map((x) => x.slice(1)), ids = parts.filter((x) => x[0] === '#').map((x) => x.slice(1));
-      if (ids.length > 1) continue;
-      const rule = { tag: m[1] || null, classes, id: ids[0] || null, kind, k: `${m[1] || ''}|${classes.join('.')}|${ids[0] || ''}|${kind}` };
-      if (rule.id) add(out.byId, rule.id, rule); else add(out.byClass, classes[0], rule);
+    const attrs = [];
+    const sels = prelude.replace(/\[[^\]]*\]/g, (m) => { attrs.push(m.slice(1, -1)); return '\u0001' + (attrs.length - 1) + '\u0001'; });
+    for (const sel of topLevelSplit(sels, ',')) {
+      const r = resolveSelector(sel, attrs);
+      if (r.pseudoElement) continue;
+      if (r.unresolved) { out.unresolved = true; continue; }
+      if (r.cls) put(out.byClass, r.cls, kind); else if (r.id) put(out.byId, r.id, kind); else put(out.tags, r.tag, kind);
     }
   }
   return out;
@@ -242,11 +285,13 @@ function hideKindOf(name, a, css) {
   if (css) {
     const t = css.tags.get(name);
     if (t === 'hard') return 'hard'; if (t) kind = kind || t;
-    const cls = a.class ? String(a.class).toLowerCase().split(/\s+/).filter(Boolean) : [];
     const id = a.id ? String(a.id).toLowerCase() : null;
-    const fits = (r) => (!r.tag || r.tag === name) && (!r.id || r.id === id) && r.classes.every((c) => cls.includes(c));
-    const cands = [].concat(id ? css.byId.get(id) || [] : [], ...cls.map((c) => css.byClass.get(c) || []));
-    for (const r of cands) { if (!fits(r)) continue; if (r.kind === 'hard') return 'hard'; kind = kind || r.kind; }
+    const it = id ? css.byId.get(id) : null;
+    if (it === 'hard') return 'hard'; if (it) kind = kind || it;
+    for (const c of a.class ? String(a.class).toLowerCase().split(/\s+/) : []) {
+      const k = c ? css.byClass.get(c) : null;
+      if (k === 'hard') return 'hard'; if (k) kind = kind || k;
+    }
   }
   return kind;
 }
@@ -292,7 +337,8 @@ function reduceHtml(html) {
       if (!hiddenDepth && !overflow && BLOCK_TAGS.has(name)) out.push('\n');
     },
   });
-  return { text: tidy(decodeEntities(out.join(''))), links, hidden, cut: scanned === 'cut' || overflow || String(html || '').length > MAX_HTML };
+  return { text: tidy(decodeEntities(out.join(''))), links, hidden, unresolved: Boolean(css && css.unresolved),
+    cut: scanned === 'cut' || overflow || String(html || '').length > MAX_HTML };
 }
 const htmlToVisibleText = (html) => reduceHtml(html).text;
 
@@ -305,18 +351,29 @@ function partsOf(email) {
   return { html: pick(htmlParts), text: pick(textParts).slice(0, MAX_TEXT) };
 }
 
+// Do the two parts say materially different things? Share of the plain part's words (3+ letters) the HTML text lacks.
+function partsDiffer(htmlText, plainText) {
+  const words = (t) => new Set((String(t).toLowerCase().slice(0, MAX_TEXT).match(/[\p{L}\p{N}]{3,}/gu) || []));
+  const a = words(htmlText), b = words(plainText);
+  if (!b.size) return false;
+  let missing = 0;
+  for (const w of b) if (!a.has(w)) missing++;
+  return missing / b.size > 0.2 && missing >= 3;
+}
 // The visible body: the HTML part reduced (what a person sees, so text hidden from them is gone), else the plain part.
-// When the HTML reduces to nothing or was cut short, the plain part is used instead (#129 re-audit), if there is one.
+// The plain part stands in only when the HTML reduces to nothing; HTML that was cut short still gives its own text,
+// marked cut (#129 round-3: a trailing "<b" must not hand the reader the sender-chosen plain part). `parts_differ`
+// says the plain part says materially different things; `hidden_unresolved` that a hiding rule could not be placed.
 function visibleText(email) {
   const { html, text } = partsOf(email || {});
   const plain = tidy(stripInvisible(text));
   if (html.trim()) {
     const r = reduceHtml(html);
     const t = tidy(stripInvisible(r.text));
-    if ((r.cut || !t) && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: r.cut ? 'cut' : 'empty' };
-    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut };
+    if (!t && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: 'empty', hidden_unresolved: r.unresolved, parts_differ: false };
+    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut, hidden_unresolved: r.unresolved, parts_differ: Boolean(plain) && partsDiffer(t, plain) };
   }
-  return { source: 'text', text: plain, hidden_elements: 0, cut: false };
+  return { source: 'text', text: plain, hidden_elements: 0, cut: false, hidden_unresolved: false, parts_differ: false };
 }
 
 // Digits as ASCII: NFKC (fullwidth and other compatibility forms), then any remaining decimal digit (Arabic-Indic,
@@ -367,7 +424,12 @@ function maskNearCodeWords(t) {
   let out = '', pos = 0;
   for (const [a, b] of ranges) {
     out += t.slice(pos, a) + t.slice(a, b).replace(/\b[A-Z0-9]{6,}\b/g, (x) => (KEEP_WORD.test(x) ? x : '•'.repeat(x.length)))
-      .replace(/\b[A-Za-z0-9]*[0-9][A-Za-z0-9]*\b/g, (x) => '•'.repeat(x.length));
+      .replace(/\b[A-Za-z0-9]*[0-9][A-Za-z0-9]*\b/g, (x) => '•'.repeat(x.length))
+      // Lower-case letter codes (#129 round-3 d): the word right after "code is" / "code:", a 6–10 letter word alone on its
+      // line, and a 6–10 letter word with no vowels. Ordinary words elsewhere in the window are left readable.
+      .replace(/\b(codes?|otp|pin|passcode)\b([ \t]*(?:is[ \t]*:?|:|=)[ \t]*)([a-z]{6,10})\b/gi, (m, w, gap, c) => (KEEP_WORD.test(c) ? m : w + gap + '•'.repeat(c.length)))
+      .replace(/^([ \t]*)([a-z]{6,10})([ \t]*)$/gm, (m, l, c, r) => (KEEP_WORD.test(c) ? m : l + '•'.repeat(c.length) + r))
+      .replace(/\b[b-df-hj-np-tv-xz]{6,10}\b/g, (x) => '•'.repeat(x.length));
     pos = b;
   }
   return out + t.slice(pos);
@@ -376,11 +438,26 @@ function maskNearCodeWords(t) {
 // near code words every digit and capital-letter code masked; anywhere, digit runs of 4–10 (spaces, line breaks, dots
 // or dashes between), letter-and-digit tokens of 6+, and any token of 20+ (a reset or sign-in token) masked. A year
 // alone (19xx/20xx) is kept.
+// ISO dates (and date-times), clock times and currency amounts are kept (#129 round-3 d): each valid one is set aside
+// under a placeholder (\uE000 + letters + \uE001, which no mask touches) and put back after masking.
+const PH = (i) => '\uE000' + String.fromCharCode(97 + Math.floor(i / 676) % 26, 97 + Math.floor(i / 26) % 26, 97 + (i % 26)) + '\uE001';
+function protectSpans(t, kept) {
+  const keep = (m) => { if (kept.length >= 17576) return m; kept.push(m); return PH(kept.length - 1); };
+  const okTime = (h, mi, se) => Number(h) < 24 && Number(mi) < 60 && (se === undefined || Number(se) < 61);
+  return t
+    .replace(/(?<![\d:.\-])(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?)?(?![\d:])/g,
+      (m, y, mo, d, h, mi, se) => (Number(mo) >= 1 && Number(mo) <= 12 && Number(d) >= 1 && Number(d) <= 31 && (h === undefined || okTime(h, mi, se)) ? keep(m) : m))
+    .replace(/(?<![\d:.])(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s?[ap]\.?m\.?)?(?![\d:])/gi, (m, h, mi, se) => (okTime(h, mi, se) ? keep(m) : m))
+    .replace(/[$€£¥₹]\s?\d{1,3}(?:[,.]\d{3})*(?:[.,]\d{1,2})?(?![\d,.]\d)/g, keep)
+    .replace(/(?<![\d.,])\d{1,3}(?:[,.]\d{3})*(?:[.,]\d{2})?\s?(?:USD|EUR|GBP|CAD|AUD|JPY|CHF|DD)\b/g, keep);
+}
 function maskSecrets(text) {
-  return maskNearCodeWords(cutLinks(normDigits(text)))
+  const kept = [];
+  const masked = maskNearCodeWords(protectSpans(cutLinks(normDigits(text)), kept))
     .replace(/[A-Za-z0-9_-]{20,}/g, (m) => '•'.repeat(Math.min(m.length, 24)))
     .replace(/\b(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{6,}\b/g, (m) => '•'.repeat(m.length))
     .replace(/(?<![\w•])\d(?:[\s.\-]?\d){3,9}(?![\w•])/g, (m) => (/^(19|20)\d\d$/.test(m) ? m : m.replace(/\d/g, '•')));
+  return kept.length ? masked.replace(/\uE000([a-z]{3})\uE001/g, (m, k) => { const i = (k.charCodeAt(0) - 97) * 676 + (k.charCodeAt(1) - 97) * 26 + (k.charCodeAt(2) - 97); return kept[i] !== undefined ? kept[i] : m; }) : masked;
 }
 
 function quoted(text, max = MAX_QUOTED) {
@@ -472,6 +549,7 @@ function formOf(email, { inFolders = [] } = {}) {
     flagged: Boolean((e.keywords || {})['$flagged']),
     codes: codesIn(stripInvisible(e.subject || '') + '\n' + vis),
     link_hosts: linkHosts(r.links, html.trim() ? vis : text, fromDomain),
+    ...(r.unresolved ? { hidden_unresolved: true } : {}),
     attachments: (e.attachments || []).slice(0, 20).map((a) => ({ name: maskSecrets(stripInvisible(a.name || '').slice(0, 120)) || null, type: String(a.type || '').slice(0, 80), size: Number(a.size) || 0 })),
     size: Number(e.size) || null,
     in: inFolders,
