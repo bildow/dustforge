@@ -15,6 +15,7 @@ function descriptionWithout(description, encryptedValue) {
   try { return secretTextGuard.cutValue(description, blindkeyDecrypt(encryptedValue)); } catch (_) { return description; }
 }
 const mailRecipientCap = require('./mail_recipient_cap');
+const mailOutboundCap = require('./mail_outbound_cap');   // recipients per wallet per day: 50 in the first 7 days, then 500
 const hexPayload = require('./hex-payload');
 const conversion = require('./conversion');
 const referral = require('./referral');
@@ -456,6 +457,7 @@ function mailHeaders(req, res, next) {
         req.rcptSlot.release();
         if (req.rcptSlot.remaining !== null && req.rcptSlot.remaining !== undefined) res.setHeader('X-Mail-Recipient-Remaining', String(req.rcptSlot.remaining + 1));
       }
+      if (res.statusCode >= 400 && req.outSlot) req.outSlot.release();
       const r = mailRemaining(req.identity && req.identity.did);
       if (r.remaining !== null && r.remaining !== undefined) res.setHeader('X-Mail-Remaining', String(r.remaining));
       if (r.limit !== null && r.limit !== undefined) res.setHeader('X-Mail-Limit', String(r.limit));
@@ -1046,7 +1048,7 @@ const siliconManifest = {
     note: "Every authenticated API call may deduct from your wallet balance. Check /api/billing/rates for per-action costs."
   },
   email: {
-    send: { method: "POST", endpoint: "/api/email/send", auth: "Bearer token required (scope: transact)", body: { to: "recipient email", subject: "email subject", body: "email body", format: "text | html" }, cost: "10 Diamond Dust ($0.01) per email" }
+    send: { method: "POST", endpoint: "/api/email/send", auth: "Bearer token required (scope: transact)", body: { to: "recipient email", subject: "email subject", body: "email body", format: "text | html" }, cost: "1 Diamond Dust ($0.001) per recipient" }
   },
   referral: {
     stats: { method: "GET", endpoint: "/api/referral/stats", auth: "Bearer token required" },
@@ -2514,19 +2516,49 @@ app.post('/api/billing/topup', (req, res) => {
 // refuses is refunded (it never became mail) and its slot given back.
 // Mail receipts (mail_receipts.js): registered below, once approvals exist; the send route uses it at request time.
 let mailReceiptsApi = null;
-app.post('/api/email/send', rateLimitStandard, (req, res, next) => (mailReceiptsApi ? mailReceiptsApi.replayGuard(getReadIdentity)(req, res, next) : next()), mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db), billing.billingMiddleware(db, 'email_send'), async (req, res) => {
+let paneMail = null;   // pane_mail.js, registered below with the other mail modules
+// The From of a direct send: the caller's own address, or (optional `from`) a lane alias of it (<username>@ or
+// <project>.<username>@dustforge.com). Prevents spoofing others.
+function directFromAddr(did, from) {
+  const senderWallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did);
+  const un = senderWallet ? senderWallet.username : null;
+  let fromAddr = un ? un + '@dustforge.com' : 'noreply@dustforge.com';
+  if (from && un && /^[^@\s]+@dustforge\.com$/.test(from)) {
+    const local = from.slice(0, from.indexOf('@'));
+    if (local === un || local.endsWith('.' + un)) fromAddr = from;
+  }
+  return fromAddr;
+}
+// Pane mailboxes (pane_mail.js): an address of a registered mail name is not sent from here except by its owner's own
+// session — panes send through POST /api/mail/send, from their pane address. Checked before any slot or charge.
+function directSendNameGuard(req, res, next) {
+  const fromAddr = directFromAddr(req.identity.did, (req.body || {}).from);
+  const auth = { ok: true, did: req.identity.did, decoded: req.identity.decoded || {}, silicon: false };
+  const why = paneMail ? paneMail.directSendRefusal(auth, fromAddr) : null;
+  if (why) return res.status(403).json({ error: why, send: 'POST /api/mail/send' });
+  next();
+}
+// The per-wallet outbound cap (mail_outbound_cap.js), counted in recipients, liftable (limiter mail_out).
+const emailRecipientCount = (to) => String(to || '').split(',').map(x => x.trim()).filter(Boolean).length;
+function outboundCapGuard(countOf) {
+  return (req, res, next) => {
+    const did = req.identity.did;
+    const slot = mailOutboundCap.reserve(db, did, countOf(req), { liftExtra: limitLiftExtra('mail_out', 'wallet:' + did) });
+    if (!slot.ok) return res.status(slot.status).json(slot.body);
+    req.outSlot = slot;
+    res.once('finish', () => { if (res.statusCode >= 400) slot.release(); });
+    next();
+  };
+}
+// 1 DD per recipient (billing.js RATE_CHANGES 2026-11-16, ruling 7).
+app.post('/api/email/send', rateLimitStandard, (req, res, next) => (mailReceiptsApi ? mailReceiptsApi.replayGuard(getReadIdentity)(req, res, next) : next()), mailHeaders, billing.billingMiddleware(db, 'email_send', { cost: 0 }), validateEmailSend, directSendNameGuard, emailWarmupGuard, mailRecipientCap.recipientCapGuard(db),
+  outboundCapGuard((req) => emailRecipientCount(req.body.to)),
+  billing.billingMiddleware(db, 'email_send', { cost: (req) => billing.RATE_TABLE.email_send * emailRecipientCount(req.body.to),
+    describe: (req) => { const n = emailRecipientCount(req.body.to); return `email_send: ${n} recipient${n === 1 ? '' : 's'}`; } }), async (req, res) => {
   const { to, subject, body, format = 'text', from } = req.body || {};
   const wallet = db.prepare('SELECT referral_code FROM identity_wallets WHERE did = ?').get(req.identity.did);
   try {
-    const senderWallet = db.prepare("SELECT username FROM identity_wallets WHERE did = ?").get(req.identity.did);
-    const un = senderWallet ? senderWallet.username : null;
-    let fromAddr = un ? un + "@dustforge.com" : "noreply@dustforge.com";
-    // Optional `from`: only the caller's OWN address or a lane alias of it
-    // (<username>@ or <project>.<username>@dustforge.com). Prevents spoofing others.
-    if (from && un && /^[^@\s]+@dustforge\.com$/.test(from)) {
-      const local = from.slice(0, from.indexOf('@'));
-      if (local === un || local.endsWith('.' + un)) fromAddr = from;
-    }
+    const fromAddr = directFromAddr(req.identity.did, from);
     const injectedBody = wallet?.referral_code ? referral.injectReferralLink(body, wallet.referral_code, format) : body;
     // Sent through the receipts layer: Resend's API when a Resend key is configured (its email id comes back and is
     // logged, returned and kept, so delivered/bounced/complained can be asked for later), else the SMTP transport.
@@ -2674,7 +2706,7 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
 }, async (req, res) => {
   const { subject, body, original_from } = req.body || {};
   const did = req.identity.did, jti = (req.identity.decoded && req.identity.decoded.jti) || null;
-  const cost = billing.RATE_TABLE.email_send;
+  const cost = billing.RATE_TABLE.mail_forward;   // 10 DD a forward: the forwarding surcharge, not the per-recipient send price
   const wallet = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(did);
   const rules = db.prepare('SELECT * FROM forward_relays WHERE did = ? AND status = ?').all(did, 'active');
   const fromAddr = wallet ? wallet.username + '@dustforge.com' : 'relay@dustforge.com';
@@ -2688,8 +2720,11 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
     // Per-recipient daily bound (5 a day to one inbox).
     const rslot = mailRecipientCap.reserveRecipients(db, did, rule.forward_to);
     if (!rslot.ok) { slot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: rslot.body.error }); continue; }
+    // The wallet's outbound cap: a forward is one recipient.
+    const oslot = mailOutboundCap.reserve(db, did, 1, { liftExtra: limitLiftExtra('mail_out', 'wallet:' + did) });
+    if (!oslot.ok) { slot.release(); rslot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: oslot.body.error }); continue; }
     const charge = billing.deductBalance(db, did, cost, 'relay_forward', `Forward to ${rule.forward_to}`, { tokenJti: jti });
-    if (!charge.ok) { slot.release(); rslot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: 'payment required' }); continue; }
+    if (!charge.ok) { slot.release(); rslot.release(); oslot.release(); results.push({ forward_to: rule.forward_to, status: 'skipped', error: 'payment required' }); continue; }
     try {
       await t.sendMail({
         from: fromAddr,
@@ -2701,7 +2736,7 @@ app.post('/api/relay/forward', rateLimitStandard, mailHeaders, billing.billingMi
       billed += cost;
       results.push({ forward_to: rule.forward_to, status: 'sent' });
     } catch (e) {
-      slot.release(); rslot.release();
+      slot.release(); rslot.release(); oslot.release();
       billing.refundCharge(db, did, cost, 'relay_forward_refund', `Refund: forward to ${rule.forward_to} not accepted`, { tokenJti: jti });
       results.push({ forward_to: rule.forward_to, status: 'failed', error: e.message });
     }
@@ -2764,7 +2799,8 @@ app.post('/api/mail/mta-hook', (req, res) => {
       for (const rule of rules) {
         if (rule.filter_from !== '*' && fromAddr && !fromAddr.includes(String(rule.filter_from).toLowerCase())) continue;
         // COD: charge 10 DD against the existing balance BEFORE forwarding.
-        const debit = billing.deductBalance(db, wallet.did, billing.RATE_TABLE.email_send, 'email_send', `mail forward -> ${rule.forward_to}`);
+        // The forwarding surcharge (RATE_TABLE.mail_forward, 10 DD), unchanged by the per-recipient send price.
+        const debit = billing.deductBalance(db, wallet.did, billing.RATE_TABLE.mail_forward, 'email_send', `mail forward -> ${rule.forward_to}`);
         if (!debit.ok) {
           try { db.prepare('INSERT INTO forward_events (did, outcome, forward_to, from_addr, subject, detail) VALUES (?, ?, ?, ?, ?, ?)')
             .run(wallet.did, 'blocked_insufficient_balance', rule.forward_to, fromAddr, subject.slice(0, 120),
@@ -3246,8 +3282,8 @@ app.get('/api/stripe/prices', (req, res) => {
     topup_options: [500, 1000, 5000, 10000].map(c => ({ amount_cents: c, dd: ddUnits.ddForUsdCents(c), usd: '$' + (c / 100).toFixed(2) })),
     referral_payout_dd: referral.REFERRAL_PAYOUT_CENTS,
     rates: {
-      email_send: `${billing.RATE_TABLE.email_send} DD`,
-      relay_forward: `${billing.RATE_TABLE.email_send} DD per forward`,
+      email_send: `${billing.RATE_TABLE.email_send} DD per recipient`,
+      relay_forward: `${billing.RATE_TABLE.mail_forward} DD per forward`,
       blindkey_use: `${billing.RATE_TABLE.api_call_compute} DD per action`,
       demipass_use: `${billing.RATE_TABLE.api_call_compute} DD per action`,
       wallet_transfer: 'free',
@@ -8345,11 +8381,13 @@ app.post('/api/identity/rate-limit/reset', async (req, res) => {
 // ── Limit lifts: an agent asks, its owner approves in the app, the limit rises for that agent only, for a while ──────
 // Liftable limiters and the key part each one counts by: `use` is the agent's own /use + /request-token budget,
 // `use_total` the whole wallet's /use total, `standard` the wallet's general budget (shared with the owner's app).
-const LIFT_LIMITERS = { use: 'use', use_total: 'wallet', standard: 'wallet' };
-const LIFT_MAX_EXTRA = { use: 5000, use_total: 50000, standard: 5000 };   // extra calls per 15-minute window, one lift
+// `mail_out` is the wallet's daily outbound mail cap (mail_outbound_cap.js): its extra is recipients added to today's
+// limit while the lift is active, not calls per 15 minutes.
+const LIFT_LIMITERS = { use: 'use', use_total: 'wallet', standard: 'wallet', mail_out: 'wallet' };
+const LIFT_MAX_EXTRA = { use: 5000, use_total: 50000, standard: 5000, mail_out: 5000 };   // extra calls per 15-minute window (mail_out: recipients a day), one lift
 // A ceiling on the summed active extras per wallet and limiter, whatever the number of requesters: workers are free to
 // make, so per-requester caps alone don't bound a wallet (limit-lift review M1). The server's own protection.
-const LIFT_WALLET_CEILING = { use: 20000, use_total: 50000, standard: 5000 };
+const LIFT_WALLET_CEILING = { use: 20000, use_total: 50000, standard: 5000, mail_out: 10000 };
 const LIFT_MAX_MINUTES = 480, LIFT_MAX_ACTIVE = 3, LIFT_WALLET_MAX_ACTIVE = 10;   // active lifts per requester / per wallet
 const LIFT_PENDING_PER_WALLET = 3;   // lift asks waiting on the owner at once (one per requester): never the whole grant queue
 const LIFT_LABEL_RE = /^[A-Za-z0-9 ._:\/#@+()-]{1,80}$/;
@@ -8386,7 +8424,7 @@ app.post('/api/identity/limits/lift', rateLimitLiftAsk, (req, res) => {
   const limiter = String(b.limiter || 'use');
   if (!LIFT_LIMITERS[limiter]) return res.status(400).json({ error: `limiter: one of ${Object.keys(LIFT_LIMITERS).join(', ')}` });
   const extra = Number(b.extra), minutes = Number(b.minutes === undefined ? 60 : b.minutes);
-  if (!Number.isInteger(extra) || extra < 1 || extra > LIFT_MAX_EXTRA[limiter]) return res.status(400).json({ error: `extra: whole calls per 15 minutes, 1 to ${LIFT_MAX_EXTRA[limiter]} for ${limiter}` });
+  if (!Number.isInteger(extra) || extra < 1 || extra > LIFT_MAX_EXTRA[limiter]) return res.status(400).json({ error: `extra: ${limiter === 'mail_out' ? 'whole recipients a day' : 'whole calls per 15 minutes'}, 1 to ${LIFT_MAX_EXTRA[limiter]} for ${limiter}` });
   if (!Number.isInteger(minutes) || minutes < 5 || minutes > LIFT_MAX_MINUTES) return res.status(400).json({ error: `minutes: 5 to ${LIFT_MAX_MINUTES}` });
   const label = String(b.label || '').trim();
   if (!LIFT_LABEL_RE.test(label)) return res.status(400).json({ error: 'label: what the lift is for, e.g. "branch feat/x" or "batch: reindex 40k" (letters, digits, space . _ : / # @ + ( ) -; up to 80)' });
@@ -9856,6 +9894,11 @@ const useApprovals = require('./use_approvals')({
 mailReceiptsApi = require('./mail_receipts')({ app, db, rateLimitStandard, getBearerIdentity, getReadIdentity, logSecurityEvent, approvals: () => useApprovals,
   createEmailTransport, operatorAllowed: (did) => require('./fleet_billing').operatorGrantAllowed(did),
   publicApi: (process.env.PUBLIC_API_URL || 'https://api.dustforge.com').replace(/\/$/, '') });
+// Pane mailboxes, phase 1 (pane_mail.js): owned mail names, panes joined by app approval, per-pane folder rights, sends
+// as the pane at 1 DD per recipient. The mailbox password stays in the owner's vault and is used here only.
+paneMail = require('./pane_mail')({ app, db, billing, getBearerIdentity, isAgentAuth, deviceSession, ownerApproves, logSecurityEvent, cleanLabel,
+  blindkeyDecrypt, rateLimitStandard, mailHeaders, reserveMailSlot, mailRecipientCap, outboundCap: mailOutboundCap, limitLiftExtra,
+  mailReceipts: () => mailReceiptsApi, referral, stalwartAdmin: dustforge.stalwartRequest, emailAddrRe: EMAIL_ADDR_RE });
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
 require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
   approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });

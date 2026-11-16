@@ -57,7 +57,7 @@ function maybeNotifyZeroBalance(db, did, actionType, required) {
       `     { "to_username": "${w.username}", "amount_cents": 5000 }`,
       `     (Bearer token, scope: transact)`,
       ``,
-      `1 Diamond Dust = $0.001; $1 buys 950 DD. Email costs 10 DD; most API calls cost less.`,
+      `1 Diamond Dust = $0.001; $1 buys 950 DD. Email costs 1 DD per recipient; most API calls cost less.`,
       `Check your balance any time: GET https://api.dustforge.com/api/identity/balance`,
       ``,
       `You will not get another one of these for 24 hours.`,
@@ -87,8 +87,9 @@ const RATE_TABLE = {
   'identity_token':         0,  // free — token verification
 
   // Email actions (via Dustforge)
-  'email_send':            10,  // 10 DD ($0.01) per email sent
-  'email_send_bulk':       10,  // 10 DD per email in bulk (per-email)
+  'email_send':             1,  // 1 DD ($0.001) per RECIPIENT of every mail sent (was 10 per email until 2026-11-16, see RATE_CHANGES)
+  'email_send_bulk':        1,  // 1 DD per recipient in bulk (was 10 per email)
+  'mail_forward':          10,  // 10 DD ($0.01) per forwarded message (forward rules: /api/relay/forward, the inbound MTA hook)
 
   // API calls (per-call billing)
   'api_call_read':          0,  // free — read operations
@@ -108,6 +109,15 @@ const RATE_TABLE = {
 const RATE_CHANGES = Object.freeze([
   Object.freeze({ action: 'api_call_compute', call: 'POST /api/blindkey/use (= /api/demipass/use)', from_dd: 10, to_dd: 1,
     effective: '2026-11-14', ruling: 'Aaron 2026-11-14: pure-traffic calls cost 1 DD (request-token and services/verify stay free); DD stays $0.001, not re-denominated' }),
+  // Ruling 7 of the pane-mailbox spec (tome decisions/2026-11-16-SPEC-pane-mailboxes-v0.1.md): every send path (the API,
+  // the MCP through it, panes, later webmail) charges per recipient. A one-recipient mail drops from 10 DD to 1 DD; a
+  // mail to 12 recipients goes from 10 DD to 12 DD. The 10 DD forwarding surcharge is its own row in RATE_TABLE
+  // (mail_forward) and is unchanged.
+  Object.freeze({ action: 'email_send', call: 'POST /api/email/send, POST /api/mail/send (every send path)', from_dd: 10, to_dd: 1,
+    unit_from: 'per email', unit: 'per recipient',
+    effective: '2026-11-16', ruling: 'Aaron 2026-11-16: 1dd for an email sent per recipient' }),
+  Object.freeze({ action: 'email_send_bulk', call: '(no route uses it today)', from_dd: 10, to_dd: 1, unit_from: 'per email', unit: 'per recipient',
+    effective: '2026-11-16', ruling: 'Aaron 2026-11-16: 1dd for an email sent per recipient' }),
 ]);
 
 /**
@@ -339,9 +349,11 @@ const revokedCode = (dead) => (dead && dead.lookup_failed ? { code: 'unavailable
 let _attribution = null;
 function setAttribution(fb, ledger) { _attribution = fb ? { fb, ledger: ledger || null } : null; }
 
+// options.cost: a number, or a function of the request (a per-recipient price: email_send). options.describe(req): the
+// ledger row's description (default "API call: <action>").
 function billingMiddleware(db, actionType, options = {}) {
   const identity = require('./identity');
-  const cost = options.cost ?? RATE_TABLE[actionType] ?? 0;
+  const fixedCost = typeof options.cost === 'function' ? null : (options.cost ?? RATE_TABLE[actionType] ?? 0);
 
   return (req, res, next) => {
     const authHeader = req.headers.authorization || '';
@@ -363,6 +375,8 @@ function billingMiddleware(db, actionType, options = {}) {
 
     const did = result.decoded.sub;
     const scope = result.decoded.scope || 'read';
+    const cost = fixedCost !== null ? fixedCost : Math.max(0, Math.floor(Number(options.cost(req)) || 0));
+    const description = typeof options.describe === 'function' ? String(options.describe(req) || '').slice(0, 300) || `API call: ${actionType}` : `API call: ${actionType}`;
 
     const isWrite = ['email_send', 'email_send_bulk', 'round_dispatch', 'round_collaboration', 'api_call_write', 'api_call_compute'].includes(actionType);
     if (isWrite && !identity.scopeAtLeast(scope, 'write')) {
@@ -379,14 +393,14 @@ function billingMiddleware(db, actionType, options = {}) {
       if (_attribution && options.attributed !== false) {
         attribution = _attribution.fb.parseAttribution(req);
         deduction = _attribution.fb.chargeAttributed(db, module.exports, {
-          callerDid: did, cost, actionType, description: `API call: ${actionType}`, attribution, ledger: _attribution.ledger,
+          callerDid: did, cost, actionType, description, attribution, ledger: _attribution.ledger,
           tokenJti: result.decoded.jti || null,
         });
         if (!deduction.ok && deduction.status && deduction.status !== 402) {
           return res.status(deduction.status).json({ error: deduction.error, action: actionType });
         }
       } else {
-        deduction = deductBalance(db, did, cost, actionType, `API call: ${actionType}`, { tokenJti: result.decoded.jti || null });
+        deduction = deductBalance(db, did, cost, actionType, description, { tokenJti: result.decoded.jti || null });
       }
       if (!deduction.ok) {
         const payer = deduction.payer_did || did;

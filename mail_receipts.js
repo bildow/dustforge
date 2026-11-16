@@ -73,7 +73,13 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
   function byClientKey(did, key) { return key ? db.prepare('SELECT * FROM email_receipts WHERE did = ? AND client_key = ?').get(did, key) : null; }
   const sha = (x) => crypto.createHash('sha256').update(String(x || '')).digest('hex');
   // bodySha: the caller's body before anything is added to it (the referral link), what a repeat is compared with.
-  async function send({ did, tokenJti, from, to, subject, text, clientKey, bodySha }) {
+  // headers: extra headers this server sets (X-Dustforge-Pane on a pane's send); names and values are checked here.
+  async function send({ did, tokenJti, from, to, subject, text, clientKey, bodySha, headers }) {
+    const extra = {};
+    for (const [k, v] of Object.entries(headers || {})) {
+      if (!/^X-Dustforge-[A-Za-z-]{1,40}$/.test(k) || typeof v !== 'string' || /[\r\n]/.test(v) || v.length > 200) throw new Error('bad extra header');
+      extra[k] = v;
+    }
     const sendId = clientKey ? 'es_' + crypto.createHash('sha256').update(`${did}\n${clientKey}`).digest('hex').slice(0, 24) : 'es_' + crypto.randomBytes(12).toString('hex');
     // `to` is the validated list ("a@x, b@y", up to 10): Resend takes an array of addresses (#90 review H1).
     const toList = String(to).split(',').map(x => x.trim()).filter(Boolean);
@@ -98,11 +104,11 @@ module.exports = function mailReceipts({ app, db, rateLimitStandard, getBearerId
     let provider, providerId = null, mid = messageId;
     if (resendKey()) {
       // The send id is the idempotency key: a retried request never becomes a second message.
-      const r = await resend('POST', '/emails', { from, to: toList, subject, text, headers: { 'X-Dustforge-Send': sendId } }, { 'Idempotency-Key': sendId });
+      const r = await resend('POST', '/emails', { from, to: toList, subject, text, headers: { ...extra, 'X-Dustforge-Send': sendId } }, { 'Idempotency-Key': sendId });
       if (r.status !== 200 || !r.data || !r.data.id) throw new Error(`Resend refused the message: HTTP ${r.status} ${(r.data && (r.data.message || r.data.name)) || ''}`.trim());
       provider = 'resend'; providerId = String(r.data.id); mid = null;   // Resend sets the Message-ID; its email id is the handle
     } else {
-      const info = await createEmailTransport().sendMail({ from, to, subject, text, messageId });
+      const info = await createEmailTransport().sendMail({ from, to, subject, text, messageId, ...(Object.keys(extra).length ? { headers: extra } : {}) });
       provider = 'smtp'; providerId = (info && info.response) ? String(info.response).slice(0, 200) : null; mid = (info && info.messageId) || messageId;
     }
     const at = now();

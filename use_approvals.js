@@ -197,7 +197,11 @@ module.exports = function registerUseApprovals(deps) {
         : action === 'rotate-blind' ? `rotate the password of ${q.target_user}@${targetHost || ''} blind (a new random one, stored in your vault)`
         : action === 'delegation-widen' ? `widen agent delegation #${q.delegation_id}: ${[q.may_rotate === true ? 'it may rotate the password' : '', q.timeout_seconds ? `calls may wait up to ${q.timeout_seconds} s` : ''].filter(Boolean).join('; ')}`
         : action === 'operator-act' ? `run ${String(q.script_path || '').replace(/^\/opt\/dustforge\//, '')} as root on ${q.host_name} via ${q.route} (commit ${String(q.commit || '').slice(0, 10)}, sha256 ${String(q.script_sha256 || '').slice(0, 12)}…)`
+        // Pane mailboxes (pane_mail.js): what the pane will read and write, and the address it will send from.
+        : action === 'mail-join' ? `join pane ${q.session} (${q.agent_label || 'agent'}, ${q.vendor || 'unknown'}): reads ${q.name}@ Inbox + own folder, sends as ${q.session}.${q.name}@`
+        : action === 'mail-name' ? `register mail name ${q.name}@ for panes; the server signs in with your entry ${q.secret_name || q.secret_ref}, never shown`
         // Short, so the card's cut never drops the size or the time; the scope says honestly whose budget rises.
+        : action === 'limit-lift' && q.limiter === 'mail_out' ? `+${q.extra} recipients a day of outbound mail (whole wallet), ${q.minutes} min, for ${targetHost || 'an agent'}: ${String(q.label || '').slice(0, 60)}${q.reason ? ` — ${String(q.reason).slice(0, 80)}` : ''}`
         : action === 'limit-lift' ? `+${q.extra} ${q.limiter === 'use' ? (q.shared ? '/use (yours, shared with this app and signed-in panes)' : '/use (its own)') : q.limiter === 'use_total' ? '/use (all agents)' : 'requests (whole wallet)'} per 15 min, ${q.minutes} min, for ${targetHost || 'an agent'}: ${String(q.label || '').slice(0, 60)}${q.reason ? ` — ${String(q.reason).slice(0, 80)}` : ''}`
         : action === 'rotate-forgejo' ?`rotate the Forgejo login of ${q.username} blind (a new random one, stored in your vault)`
         : action === 'margin' ? `${q.service}: margin ${q.was}% → ${q.margin_pct}% over cost on every call`
