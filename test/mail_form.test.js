@@ -17,7 +17,7 @@ test('hidden HTML, comments, scripts and styles never reach the visible text', (
   const t = f.htmlToVisibleText(INJECT);
   assert.match(t, /Your verification code is 482913\./);
   for (const bad of ['SYSTEM', 'ignore previous', 'evil@x.com', 'tiny hidden', 'attr hidden', 'aria hidden', 'alert(1)', 'p{}', '<']) assert.ok(!t.includes(bad), bad);
-  assert.equal(f.reduceHtml(INJECT).unresolved, false);
+  assert.equal(f.reduceHtml(INJECT).unresolved, true, 'styled mail is form-only for panes');
   assert.match(t, /& done A/);
 });
 
@@ -107,7 +107,7 @@ test('text hidden by a <style> class, id or tag rule, closed <details>, white or
     '<details><summary>sum</summary>inside closed details</details><details open><summary>opened</summary>shown</details>' +
     '<p style="color:#ffffff">white</p><p style="color:rgb(255,255,255)">white rgb</p><p style="font-size:1px">one px</p>' +
     '<font color="#fff">font white</font><p style="font:0/0 a">font zero</p>');
-  assert.equal(f.reduceHtml('<style>.x{display:none}</style><p class="x">x</p><font color="#fff">w</font><p style="font:0/0 a">z</p>').unresolved, false);
+  assert.equal(f.reduceHtml('<style>.x{display:none}</style><p class="x">x</p>').why, 'styled mail: form only until the reader (phase 2)');
   assert.match(t, /seen/); assert.match(t, /opened/); assert.match(t, /shown/);
   for (const bad of ['by class', 'by id', 'tiny class', 'in media', 'inside closed details', 'sum\n', 'white', 'one px', 'font zero']) assert.ok(!t.includes(bad), bad + ' in ' + JSON.stringify(t));
   // Escapes, comments in declarations and positioning are outside the allowlist: the whole message is unresolved.
@@ -169,7 +169,7 @@ test('newsletter patterns: only the hidden parts go; the content stays', () => {
   const r = f.reduceHtml(html);
   for (const keep of ['Visible span', 'Body text stays', 'Plain cell stays', 'Shop now', 'Dark band text']) assert.match(r.text, new RegExp(keep), keep + ' in ' + JSON.stringify(r.text));
   for (const drop of ['preheader teaser', 'gmail-only block', 'mobile-hidden cell', 'white on white']) assert.ok(!r.text.includes(drop), drop);
-  assert.equal(r.unresolved, false, r.why);
+  assert.equal(r.unresolved, true, 'styled: the owner reads it this way; a pane gets the form');
 });
 
 // ── #129 round-4: the pane filter is an allowlist and fails closed ──
@@ -240,18 +240,41 @@ test('every probe is hidden from a pane or marks the message unresolved (zero le
   assert.ok(!v.text.includes('INJECT')); assert.equal(v.parts_differ, true);
 });
 
-test('newsletters: the common simple shapes stay readable for panes; web fonts, dark mode and image backgrounds are form-only', () => {
+test('newsletters: every styled shape is form-only for panes in phase 1 (the owner still reads them)', () => {
   const nl = require('./fixtures/newsletters');
-  const readable = { 'litmus-style boilerplate': ['Welcome aboard', 'Get started', 'Unsubscribe'], 'hybrid columns (font-size:0 wrapper)': ['Left column news', 'Right column offers'],
-    'plain transactional': ['Your order #1234 has shipped'], 'class-styled with descendant rules': ['Weekly digest', 'Read more', 'Unsubscribe any time'],
-    'outlook conditional + preheader class': ['Main content here'] };
-  for (const [k, words] of Object.entries(readable)) {
-    const r = f.reduceHtml(nl[k]);
-    assert.equal(r.unresolved, false, `${k}: ${r.why}`);
-    for (const w of words) assert.match(r.text, new RegExp(w), `${k}: ${w}`);
-    assert.ok(!/Preheader teaser|Hidden teaser|Outlook only/.test(r.text), k);
+  for (const [k, html] of Object.entries(nl)) {
+    const r = f.reduceHtml(html);
+    assert.equal(r.unresolved, true, k);
+    assert.equal(r.why, 'styled mail: form only until the reader (phase 2)');
   }
-  for (const k of ['google fonts link', 'dark-mode media query', 'hero image with white text']) assert.equal(f.reduceHtml(nl[k]).unresolved, true, k);
+  // The owner's text is still shaped (preheaders and Outlook-only blocks dropped).
+  assert.match(f.reduceHtml(nl['litmus-style boilerplate']).text, /Welcome aboard/);
+  assert.ok(!/Preheader teaser/.test(f.reduceHtml(nl['litmus-style boilerplate']).text));
+});
+
+// ── #129 round-5: the strict pane gate ──
+test('plain mail and unstyled HTML give a pane its body; any styling construct makes it form-only', () => {
+  const v = (html, plain) => f.visibleText({ htmlBody: html ? [{ partId: 'h', type: 'text/html' }] : [], textBody: plain ? [{ partId: 't', type: 'text/plain' }] : [],
+    bodyValues: { ...(html ? { h: { value: html } } : {}), ...(plain ? { t: { value: plain } } : {}) } });
+  let r = v(null, 'Pane to pane: the build is green.');
+  assert.equal(r.hidden_unresolved, false); assert.equal(r.text, 'Pane to pane: the build is green.');
+  r = v('<html><body><h1 id="t" class="title">Report</h1><p align="center">The build is <b>green</b>, see <a href="https://ci.example/1">run 1</a>.</p>' +
+    '<ul><li>one</li><li>two</li></ul><table width="100%" border="1"><tr><td width="50%">cell</td></tr></table><img src="https://x.example/a.png" width="10" alt="x"></body></html>');
+  assert.equal(r.hidden_unresolved, false, r.styled_by);
+  assert.match(r.text, /The build is green, see run 1\./); assert.match(r.text, /cell/);
+  const styled = {
+    'style attribute': '<p style="color:#000">x</p>', '<style>': '<style>p{}</style><p>x</p>', '<link>': '<link rel="stylesheet" href="https://e.x/s.css"><p>x</p>',
+    'bgcolor': '<table bgcolor="#000"><tr><td>x</td></tr></table>', 'background': '<td background="a.png">x</td>', 'color': '<body text="#fff"><p>x</p></body>',
+    '<font>': '<font size="1">x</font>', '<small>': '<small>x</small>', '<sub>': '<sub>x</sub>', '<sup>': '<sup>x</sup>', '<big>': '<big>x</big>',
+    '<center>': '<center>x</center>', '<marquee>': '<marquee>x</marquee>', 'hidden': '<p hidden>x</p>', 'aria-hidden': '<p aria-hidden="true">x</p>',
+    'width on a text container': '<div width="1">x</div>', 'cellpadding': '<table cellpadding="99999"><tr><td>x</td></tr></table>', 'face': '<p face="x">x</p>',
+    'hidden input': '<input type="hidden" value="x">', 'closed details': '<details><summary>s</summary>x</details>',
+  };
+  for (const [what, html] of Object.entries(styled)) {
+    const s2 = v(html);
+    assert.equal(s2.hidden_unresolved, true, what);
+    assert.equal(s2.unresolved_why, 'styled mail: form only until the reader (phase 2)', what);
+  }
 });
 
 test('the plain part stands in only when the HTML reduces to nothing; cut HTML keeps its own text', () => {

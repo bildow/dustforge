@@ -37,8 +37,9 @@
 //     or anything unmasked; moving, flagging or deleting; sending as the bare name (here and on the direct routes);
 //     revoking panes; retiring names. Registering a name is an app approval at critical depth (the PIN on the phone).
 //   Reading (mail_form.js): lists return code-derived form fields only; the body comes only on an explicit read, as
-//     quoted visible text (hidden HTML, comments, zero-width and bidi characters stripped). A message with a hiding rule
-//     that could not be placed gives a pane the form only (hidden_unresolved). For a pane the body also has
+//     quoted visible text (hidden HTML, comments, zero-width and bidi characters stripped). Phase 1's strict gate: a pane
+//     gets the body only of plain-text mail or of HTML with no styling construct at all; styled mail is form-only for
+//     panes (hidden_unresolved) until the phase-2 reader. For a pane the body also has
 //     its codes, tokens and link paths masked, and mail from this service's own senders (sign-in codes, resets) is not
 //     shown at all (review H2). Reading never marks Inbox mail seen.
 //   Sending: 1 DD per recipient (billing.js RATE_CHANGES, ruling 7), the warmup ramp, the per-recipient bound and the
@@ -778,8 +779,8 @@ module.exports = function registerPaneMail(deps) {
       // the form only (#129 round-3). The owner still gets the body.
       if (!ctx.owner && vis.hidden_unresolved) {
         return res.json({ ok: true, name: ctx.nameRow.name, message: form, body: null,
-          withheld: 'hidden_unresolved: the message uses CSS outside what the reader can account for, so text a person would not see could be in it; the form only',
-          why: vis.unresolved_why || null, ...(vis.parts_differ ? { parts_differ: true } : {}) });
+          withheld: 'hidden_unresolved: styled mail (any style, stylesheet or presentational markup) could hide text from a person; a pane gets the form only until the phase-2 reader',
+          why: vis.unresolved_why || null, styled_by: vis.styled_by || null, ...(vis.parts_differ ? { parts_differ: true } : {}) });
       }
       const text = unmasked ? vis.text : mailForm.maskSecrets(vis.text);
       const q = mailForm.quoted(text);

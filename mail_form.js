@@ -8,8 +8,9 @@
 //   visibleText(email) → the body as a person would see it: HTML reduced to visible text (comments, script/style/head,
 //                        closed <details>, elements hidden by attribute, inline style or a <style> rule dropped, text
 //                        under 8px or below 1.5:1 contrast dropped), then zero-width, bidi and control characters
-//                        stripped. `hidden_unresolved`: the message's CSS goes beyond the allowlist in mail_css.js, so a
-//                        pane gets the form only (fails closed; the owner's view is unchanged).
+//                        stripped. `hidden_unresolved`: the HTML carries a styling construct (phase 1's strict pane gate:
+//                        a pane gets the body only of plain-text mail or of HTML with no styling at all; the owner's view
+//                        is unchanged).
 //   maskSecrets(text)  → the text with code-like runs masked and links cut to their host: what a pane is given.
 //   quoted(text)       → that text as a quotation ("> " on every line), capped: it is handed over as data.
 // Nothing here fetches remote content, follows links or renders.
@@ -128,15 +129,37 @@ function scan(s, on) {
 // HTML → { text, links, hidden, cut, unresolved, why }: the visible text, every link target (href/src/action), how
 // many elements were dropped as hidden, whether the scan stopped at an unterminated construct, and whether anything in
 // the message's CSS falls outside what mail_css.js accounts for (`why` says what, first).
+// ── The pane gate (#129 round-5: strict for phase 1) ────────────────────────────────────────────────────────────────
+// Modelling a browser is an arms race (round after round found another way to hide text), so in phase 1 a pane gets
+// the body of an HTML message only when it carries NO styling construct at all; everything else is form-only until the
+// phase-2 reader. mail_css.js still shapes the owner's text, but no longer gates panes.
+const STYLED_REASON = 'styled mail: form only until the reader (phase 2)';
+const STYLED_TAGS = new Set(['style', 'link', 'font', 'small', 'sub', 'sup', 'big', 'center', 'marquee', 'blink', 'basefont', 'details', 'dialog']);
+const STYLED_ATTRS = ['style', 'bgcolor', 'background', 'color', 'text', 'size', 'face', 'link', 'vlink', 'alink', 'hidden', 'aria-hidden',
+  'cellpadding', 'cellspacing', 'hspace', 'vspace', 'nowrap', 'clear', 'leftmargin', 'topmargin', 'marginwidth', 'marginheight'];
+const SIZED_OK = new Set(['img', 'table', 'td', 'th', 'tr', 'col', 'colgroup']);   // width/height that cannot clip text
+function styledBy(name, attrs) {
+  if (STYLED_TAGS.has(name)) return `<${name}>`;
+  for (const a of STYLED_ATTRS) if (a in attrs) return `a ${a} attribute on <${name}>`;
+  if (('width' in attrs || 'height' in attrs) && !SIZED_OK.has(name)) return `width/height on <${name}>`;
+  if (String(attrs.type || '').toLowerCase() === 'hidden') return `a hidden <${name}>`;
+  return null;
+}
+
 function reduceHtml(html) {
   const s = String(html == null ? '' : html).slice(0, MAX_HTML);
-  let unresolved = false, why = null;
-  const flag = (w) => { if (!unresolved) { unresolved = true; why = w; } };
+  // unresolved: the pane gate (any styling construct). cssWhy: what mail_css.js could not account for (information for
+  // the phase-2 reader; it no longer gates panes).
+  let unresolved = false, why = null, styledDetail = null, cssWhy = null;
+  const styled = (detail) => { if (!unresolved) { unresolved = true; why = STYLED_REASON; styledDetail = detail; } };
+  const flag = (w) => { if (!cssWhy) cssWhy = w; };
   // Pass 1: the <style> blocks (they apply to the whole document, wherever they sit); a media attribute other than
   // all/screen makes its block conditional.
   let styles = '', pendingMedia = null;
   scan(s, { text() {}, close() {},
     open(name, attrs) {
+      const st = styledBy(name, attrs);
+      if (st) styled(st);
       if (name === 'style') pendingMedia = attrs.media ? String(attrs.media).toLowerCase().trim() : null;
       if (name === 'link' && /stylesheet/i.test(String(attrs.rel || ''))) flag('an external stylesheet (<link rel=stylesheet>)');
     },
@@ -196,7 +219,7 @@ function reduceHtml(html) {
       if (!hiddenDepth && !overflow && BLOCK_TAGS.has(name)) out.push('\n');
     },
   });
-  return { text: tidy(decodeEntities(out.join(''))), links, hidden, unresolved, why,
+  return { text: tidy(decodeEntities(out.join(''))), links, hidden, unresolved, why, styled_by: styledDetail, css_why: cssWhy,
     cut: scanned === 'cut' || overflow || String(html || '').length > MAX_HTML };
 }
 const htmlToVisibleText = (html) => reduceHtml(html).text;
@@ -229,8 +252,8 @@ function visibleText(email) {
   if (html.trim()) {
     const r = reduceHtml(html);
     const t = tidy(stripInvisible(r.text));
-    if (!t && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: 'empty', hidden_unresolved: r.unresolved, unresolved_why: r.why, parts_differ: false };
-    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut, hidden_unresolved: r.unresolved, unresolved_why: r.why, parts_differ: Boolean(plain) && partsDiffer(t, plain) };
+    if (!t && plain) return { source: 'text', text: plain, hidden_elements: r.hidden, cut: false, html_fallback: 'empty', hidden_unresolved: r.unresolved, unresolved_why: r.why, styled_by: r.styled_by, parts_differ: false };
+    return { source: 'html', text: t, hidden_elements: r.hidden, cut: r.cut, hidden_unresolved: r.unresolved, unresolved_why: r.why, styled_by: r.styled_by, parts_differ: Boolean(plain) && partsDiffer(t, plain) };
   }
   return { source: 'text', text: plain, hidden_elements: 0, cut: false, hidden_unresolved: false, parts_differ: false };
 }

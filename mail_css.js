@@ -1,4 +1,27 @@
 'use strict';
+// ── STATUS (#129 round-5): NOT A PANE GATE. ─────────────────────────────────────────────────────────────────────────────
+// Phase 1 gives a pane the body only of plain-text mail or of HTML with no styling construct at all (mail_form.js,
+// styledBy). This module still shapes the owner's reduced text and is kept as the starting point for the phase-2
+// reader's preprocessing. Its known gaps, from the round-5 probes (tome scratch r7/r8/r9), each a way text it judged
+// visible was in fact hidden (or the reverse):
+//   Cascade / specificity
+//     - attribute selectors are scored as classes but [class="x y z"] matches exactly, and [class=x] does not match
+//       class="x y"; repeated ids (#a#a) add specificity that is not counted; :link is dropped, losing its specificity;
+//     - "none + later block !important": a display:none moot-ing other properties ignores a later !important override.
+//   Browser defaults not modelled
+//     - the UA link colour (#0000ee) against a matching background; nested <small>/<sub>/<sup> (×10) and <font size=1>
+//       inside <small> shrinking text; heading em nesting (h6 inside h6).
+//   Backgrounds
+//     - bgcolor attribute vs a CSS background on the same element; bg-image with white text; a dark background with an
+//       image and the DEFAULT text colour (no colour set, so not treated as unresolved); td background="…" (image) dark.
+//   Clipping and pushing geometry
+//     - overflow:hidden with ANY width (2px, 0.1%), not only ≤1px; huge padding/margin/border (100000px) pushing text out
+//       of view; vertical-align:-99999px; large positive letter-spacing; line-height:0 with height:0; max-width:0 with
+//       white-space:nowrap (no overflow).
+//   Elements
+//     - svg <text>, foreignObject, template, noscript, object content, img alt and title attributes are dropped (safe),
+//       and a hidden <input> value; the selector budget (deep descendant chains) must stay bounded.
+// The phase-2 reader should treat these as open, not solved.
 // ── The CSS a pane's body read may carry: an ALLOWLIST, failing closed (#129 round-4 re-audit) ─────────────────────────
 // Every round of review found another way to hide text from the person while a reader still sees it. So instead of
 // chasing hiding tricks, a message's CSS is checked against what this module can account for; anything else marks the
