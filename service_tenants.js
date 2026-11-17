@@ -76,6 +76,24 @@ const MAX_COST_DD = 100000;            // one call, before margin ($100)
 const TOKEN_TTL_MAX_SEC = 24 * 3600;
 const TOKEN_CAP_DEFAULT_DD = 500;
 const CONSENT_CAP_MAX_DD = 100000;     // a day, per tenant ($100)
+// What lets a refused payer go on (Aaron 2026-11-17: "I can't have agents and panes block on this; it would be
+// considered a bug / design flaw"). Every payment refusal (dry run or real charge) names its raise, sized, so a
+// caller's tools can file it for the payer: one approval in the payer's DemiPass app (consent), a deposit (fund), or a
+// fresh token (token). Never a grant by itself: a consent raise is still filed and approved like any consent.
+function raiseFor(why, { slug, cap, today, dd, bal } = {}) {
+  const r500 = (n) => Math.ceil(n / 500) * 500;
+  if (why === 'daily_cap') {
+    const want = Math.min(CONSENT_CAP_MAX_DD, Math.max(r500((today || 0) + dd), (cap || 0) + 500));
+    return want > (cap || 0) ? { kind: 'consent', request: 'POST /api/services/consent', service: slug, daily_cap_dd: want,
+      approved_in: "the payer's DemiPass app" } : { kind: 'wait', until: 'the 24 h window moves on', why: `the consent is already at the most (${CONSENT_CAP_MAX_DD} DD)` };
+  }
+  if (why === 'insufficient') return { kind: 'fund', ...(Number.isFinite(bal) ? { short_dd: Math.max(0, dd - bal) } : {}),
+    how: 'fund the wallet in the DemiPass app, or let its refill rule top it up' };
+  if (why === 'follow_up_budget' || why === 'token_cap') return { kind: 'token', request: 'POST /api/services/token', service: slug,
+    how: 'mint a new service token (its follow-up budget comes from the daily consent, raised first if that is the limit)' };
+  if (why === 'wallet_inactive') return { kind: 'reactivate', how: 'the payer reactivates the wallet in the DemiPass app' };
+  return null;
+}
 const RECEIPT_VERSION = 1;
 
 const priceOf = (costDd, marginPct = SERVICE_MARGIN_PCT) => costDd + Math.ceil(costDd * marginPct / 100);
@@ -516,14 +534,17 @@ module.exports = function registerServiceTenants(deps) {
       // bills in ≤250 DD portions), up to what the token's follow-up budget could ever pay; an ordinary one, one portion.
       // (#57 review: surveying only one portion let a 250 DD wallet start a 1,000 DD call.)
       if (!followUp && cost > MAX_PORTION_DD) return { status: 400, body: { error: `a dry run asks about one portion: at most ${MAX_PORTION_DD} DD (cost)` } };
-      if (followUp && dd > fuBudget) return { status: 402, body: { ok: false, dry_run: true, would_charge_dd: dd, margin_pct: margin, refused: 'follow_up_budget' } };
+      if (followUp && dd > fuBudget) return { status: 402, body: { ok: false, dry_run: true, would_charge_dd: dd, margin_pct: margin, refused: 'follow_up_budget',
+        follow_up_dd: fuBudget, raise: raiseFor('follow_up_budget', { slug: tenant.slug }) } };
       const w = db.prepare('SELECT status FROM identity_wallets WHERE did = ?').get(v.did);
       const today = spentToday(v.did, tenant);
       const bal = billing.getDerivedBalance(db, v.did);
       const why = (!w || w.status !== 'active') ? 'wallet_inactive' : (!followUp && ordinary() + chargeDd > v.cap_dd) ? 'token_cap'
         : (today + chargeDd > consent.daily_cap_dd) ? 'daily_cap' : (followUp && followed() + chargeDd > fuBudget) ? 'follow_up_budget'
         : (bal < chargeDd) ? 'insufficient' : null;
-      return { status: why ? 402 : 200, body: { ok: !why, dry_run: true, would_charge_dd: chargeDd, margin_pct: chargeMargin, ...(why ? { refused: why } : {}) } };
+      return { status: why ? 402 : 200, body: { ok: !why, dry_run: true, would_charge_dd: chargeDd, margin_pct: chargeMargin, ...(why ? { refused: why,
+        ...(why === 'daily_cap' ? { daily_cap_dd: consent.daily_cap_dd, spent_today_dd: today } : {}), ...(why === 'insufficient' ? { short_dd: Math.max(0, chargeDd - bal) } : {}),
+        raise: raiseFor(why, { slug: tenant.slug, cap: consent.daily_cap_dd, today, dd: chargeDd, bal }) } : {}) } };
     }
 
     const run = db.transaction(() => {
@@ -554,12 +575,16 @@ module.exports = function registerServiceTenants(deps) {
     let out;
     try { out = run.immediate(); }
     catch (e) {
-      if (e.cap && e.cap.kind === 'token') return { status: 402, body: { error: `this charge would pass the caller token's spend cap (${e.cap.spent} + ${dd} > ${e.cap.cap} DD); the caller mints a token with a higher cap_dd`, required_dd: dd, cap_dd: e.cap.cap, spent_dd: e.cap.spent, cap_exceeded: true } };
-      if (e.cap && e.cap.kind === 'follow_up') return { status: 402, body: { error: `this would pass the follow-up budget the caller's token carried (${e.cap.spent} + ${dd} > ${e.cap.cap} DD)`, follow_up_budget_exceeded: true, spent_dd: e.cap.spent, follow_up_dd: e.cap.cap } };
-      if (e.cap) return { status: 402, body: { error: `this charge would pass the caller's daily consent for ${tenant.slug} (${e.cap.spent} + ${dd} > ${e.cap.cap} DD in 24 h)`, required_dd: dd, daily_cap_dd: e.cap.cap, spent_today_dd: e.cap.spent, daily_cap_exceeded: true } };
+      if (e.cap && e.cap.kind === 'token') return { status: 402, body: { error: `this charge would pass the caller token's spend cap (${e.cap.spent} + ${dd} > ${e.cap.cap} DD); the caller mints a token with a higher cap_dd`, required_dd: dd, cap_dd: e.cap.cap, spent_dd: e.cap.spent, cap_exceeded: true,
+        raise: raiseFor('token_cap', { slug: tenant.slug }) } };
+      if (e.cap && e.cap.kind === 'follow_up') return { status: 402, body: { error: `this would pass the follow-up budget the caller's token carried (${e.cap.spent} + ${dd} > ${e.cap.cap} DD)`, follow_up_budget_exceeded: true, spent_dd: e.cap.spent, follow_up_dd: e.cap.cap,
+        raise: raiseFor('follow_up_budget', { slug: tenant.slug }) } };
+      if (e.cap) return { status: 402, body: { error: `this charge would pass the caller's daily consent for ${tenant.slug} (${e.cap.spent} + ${dd} > ${e.cap.cap} DD in 24 h)`, required_dd: dd, daily_cap_dd: e.cap.cap, spent_today_dd: e.cap.spent, daily_cap_exceeded: true,
+        raise: raiseFor('daily_cap', { slug: tenant.slug, cap: e.cap.cap, today: e.cap.spent, dd }) } };
       if (e.debit) {
         const insufficient = /insufficient/.test(e.debit.error || '');
         return { status: insufficient ? 402 : 403, body: { error: insufficient ? 'the caller\'s wallet cannot cover this call' : e.debit.error, required_dd: dd,
+          ...(insufficient ? { raise: raiseFor('insufficient', { slug: tenant.slug, dd }) } : {}),
           ...(insufficient ? { balance_dd: e.debit.balance_cents, top_up: 'https://demipass.com/app' } : {}) } };
       }
       if (/UNIQUE/.test(e.message || '')) return { status: 409, body: { error: 'a concurrent charge used this idempotency_key; retry to get it' } };
@@ -649,7 +674,9 @@ module.exports = function registerServiceTenants(deps) {
       const today = spentToday(payer, tenant);
       const bal = billing.getDerivedBalance(db, payer);
       const why = (!w || w.status !== 'active') ? 'wallet_inactive' : (today + dd > consent.daily_cap_dd) ? 'daily_cap' : (bal < dd) ? 'insufficient' : null;
-      return { status: why ? 402 : 200, body: { ok: !why, dry_run: true, would_charge_dd: dd, margin_pct: margin, payer, follow_up_dd: fuDd, ...(why ? { refused: why } : {}) } };
+      return { status: why ? 402 : 200, body: { ok: !why, dry_run: true, would_charge_dd: dd, margin_pct: margin, payer, follow_up_dd: fuDd, ...(why ? { refused: why,
+        ...(why === 'daily_cap' ? { daily_cap_dd: consent.daily_cap_dd, spent_today_dd: today } : {}), ...(why === 'insufficient' ? { short_dd: Math.max(0, dd - bal) } : {}),
+        raise: raiseFor(why, { slug: tenant.slug, cap: consent.daily_cap_dd, today, dd, bal }) } : {}) } };
     }
 
     // The per-request verification row the follow-ups bill against: its own id (one per request), parent = the
@@ -681,10 +708,12 @@ module.exports = function registerServiceTenants(deps) {
     let out;
     try { out = run.immediate(); }
     catch (e) {
-      if (e.cap) return { status: 402, body: { error: `this charge would pass the payer's daily consent for ${tenant.slug} (${e.cap.spent} + ${dd} > ${e.cap.cap} DD in 24 h)`, required_dd: dd, daily_cap_dd: e.cap.cap, spent_today_dd: e.cap.spent, daily_cap_exceeded: true } };
+      if (e.cap) return { status: 402, body: { error: `this charge would pass the payer's daily consent for ${tenant.slug} (${e.cap.spent} + ${dd} > ${e.cap.cap} DD in 24 h)`, required_dd: dd, daily_cap_dd: e.cap.cap, spent_today_dd: e.cap.spent, daily_cap_exceeded: true,
+        raise: raiseFor('daily_cap', { slug: tenant.slug, cap: e.cap.cap, today: e.cap.spent, dd }) } };
       if (e.debit) {
         const insufficient = /insufficient/.test(e.debit.error || '');
-        return { status: insufficient ? 402 : 403, body: { error: insufficient ? 'the payer\'s wallet cannot cover this call' : e.debit.error, required_dd: dd } };
+        return { status: insufficient ? 402 : 403, body: { error: insufficient ? 'the payer\'s wallet cannot cover this call' : e.debit.error, required_dd: dd,
+          ...(insufficient ? { raise: raiseFor('insufficient', { slug: tenant.slug, dd }) } : {}) } };
       }
       if (/UNIQUE/.test(e.message || '')) return { status: 409, body: { error: 'a concurrent charge used this idempotency_key or this Conduit request; retry to get it' } };
       throw e;
@@ -1098,3 +1127,4 @@ module.exports.RECEIPT_DOMAIN = RECEIPT_DOMAIN;
 module.exports.requestKey = requestKey;
 module.exports.REQUEST_MAX_AGE_MS = REQUEST_MAX_AGE_MS;
 module.exports.REQUEST_KEY_DOMAIN = REQUEST_KEY_DOMAIN;
+module.exports.raiseFor = raiseFor;
