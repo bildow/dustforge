@@ -237,8 +237,8 @@ C "$FG" "$(jbody action review cost_dd 301 token_id "$TID" idempotency_key pr-re
 C "$FG" "$(jbody action review cost_dd 250 token_id "$TID" idempotency_key pr-review-0001)"; [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J dd)" = 300 ] && ok "a variable-cost review: 250 measured → 300 billed" || fail "review: $CODE $BODY"
 C "$FG" "$(jbody action review cost_dd 200 token_id "$TID" idempotency_key pr-review-0002)"
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J cap_exceeded)" = True ] && ok "the token's spend cap (500 DD) → 402 cap_exceeded" || fail "cap: $CODE $BODY"
-R=$(echo "$BODY" | python3 -c "import json,sys; r=json.load(sys.stdin).get('raise') or {}; print(r.get('kind'), sorted(k for k in r if k in ('cap_dd','follow_up_dd','scopes')), r.get('cap_dd_at_most') is not None)")
-[ "$R" = "token [] True" ] && ok "…its raise is a token hint that proposes no cap, budget or scopes to copy (#131 r2, 1)" || fail "token cap raise: $R $BODY"
+R=$(echo "$BODY" | python3 -c "import json,sys; r=json.load(sys.stdin).get('raise') or {}; print(r.get('kind'), sorted(k for k in r if k not in ('kind','request','service','how')))")
+[ "$R" = "token []" ] && ok "…its raise is a plain token instruction: no number from the payer's consent, nothing to copy (#131 r2/r3)" || fail "token cap raise: $R $BODY"
 call POST /api/services/token "$EXT" '{"service":"fleetgate","cap_dd":1000}'; ST3=$(echo "$BODY" | J token); TID3=$(echo "$BODY" | J token_id)
 V "$FG" "$(jbody token "$ST3" action review)"; C "$FG" "$(jbody action review cost_dd 300 token_id "$TID3" idempotency_key pr-review-0003)"; A1=$CODE
 C "$FG" "$(jbody action review cost_dd 300 token_id "$TID3" idempotency_key pr-review-0004)"
@@ -327,7 +327,7 @@ C "$FG" "$(jbody action review cost_dd 250 follow_up_of "$ORG" idempotency_key f
 C "$FG" "$(jbody action review cost_dd 200 follow_up_of "$ORG" idempotency_key fu-review-0006)"; A2=$CODE      # + 240 > 600
 [ "$A1" = 201 ] && [ "$A2" = 402 ] && [ "$(echo "$BODY" | J follow_up_budget_exceeded)" = True ] && ok "follow-ups stop at the token's follow-up budget (600 DD)" || fail "fu budget: $A1 $A2 $BODY"
 [ "$(echo "$BODY" | python3 -c "import json,sys; print((json.load(sys.stdin).get('raise') or {}).get('kind'))")" = new_request ] && ok "…a real 402 names the same raise (a new request)" || fail "fu 402 raise: $BODY"
-[ "$(echo "$BODY" | python3 -c "import json,sys; r=json.load(sys.stdin).get('raise') or {}; print(sorted(k for k in r if k in ('cap_dd','follow_up_dd','scopes')))")" = "[]" ] && ok "…and proposes no follow_up_dd or scopes to copy (#131 r2, 1)" || fail "fu raise params: $BODY"
+[ "$(echo "$BODY" | python3 -c "import json,sys; r=json.load(sys.stdin).get('raise') or {}; print(sorted(k for k in r if k not in ('kind','request','service','how')))")" = "[]" ] && ok "…and carries no number from the payer's consent (#131 r3, 2)" || fail "fu raise params: $BODY"
 # per-tenant margin: the owner asks from their own session, approves in the app; at most 33%
 call PUT /api/services/fleetgate/margin "$FG" '{"margin_pct":33}'; A1=$CODE
 call PUT /api/services/fleetgate/margin "$OWN" '{"margin_pct":34}'; A2=$CODE

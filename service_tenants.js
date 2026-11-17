@@ -106,13 +106,13 @@ function raiseFor(why, { slug, cap, today, dd, bal, onRequestCap, followUpMax, t
   // a NEW request, paid with a token minted with a larger follow-up budget, at most the daily consent (#131 review 3).
   // Token hints propose no numbers and no scopes (#131 r2, 1, 2): a mint request built from them could widen what the
   // token may do, or ask for a cap the consent refuses. They say what to change, keeping everything else as it was.
+  // No number from the payer's consent in a token hint: the caller here is the service, and those are the payer's
+  // (#131 r3, 2). Plain instructions that keep every other limit as it was (#131 r3, 1, 3).
   if (why === 'follow_up_budget') return { kind: 'new_request', request: 'POST /api/services/token', service: slug,
-    ...(Number.isInteger(followUpMax) ? { follow_up_dd_at_most: followUpMax } : {}),
-    how: "this request's follow-up budget is spent and stays with its token: mint a token with the same scopes and a larger follow_up_dd (at most the daily consent; raise that first if it is the limit), then start a new request" };
+    how: "this request's follow-up budget is spent and stays with its token: the payer mints a token with the same scopes and cap_dd and a larger follow_up_dd (raising the daily consent first if that is the limit), then a new request starts" };
   // Ordinary charges draw on the token's own cap: the next one can be paid with a fresh token with a larger cap_dd.
   if (why === 'token_cap') return { kind: 'token', request: 'POST /api/services/token', service: slug,
-    ...(Number.isInteger(cap) ? { cap_dd_at_most: cap } : {}),
-    how: `mint a service token with the same scopes and follow-up budget and a cap_dd of at least ${dd} DD (at most the daily consent) for the next charge` };
+    how: `the payer mints a token with the same scopes and follow-up budget and a cap_dd that covers ${dd} DD more (raising the daily consent first if that is the limit), and the next charge uses it` };
   if (why === 'wallet_inactive') return { kind: 'reactivate', how: 'the payer reactivates the wallet in the DemiPass app' };
   // The ceiling is part of what the sender signed: it can't be raised on this request (#131 r2, 3).
   if (why === 'request_max') return { kind: 'new_message', request_max_dd_at_least: dd,
