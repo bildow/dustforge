@@ -69,7 +69,11 @@ echo "ok   live tree holds no symlink"
 # Previous tree: a root-private copy (0700), the newest $KEEP_PREV kept. A rollback from it must skip $LANE_DIR.
 STAMP=$(date -u +%Y%m%dT%H%M%SZ); P=$(mktemp -d "$D.prev-$STAMP-XXXX")
 cp -a "$D/." "$P/"; chown root:root "$P"; chmod 0700 "$P"; echo "ok   previous tree copied to $P (root-only)"
-ls -1dt "$D".prev-* 2>/dev/null | tail -n +$((KEEP_PREV+1)) | while IFS= read -r old; do rm -rf -- "$old"; done
+# Prune only this script's own copies: root-owned directories with exactly its name shape (never a symlink, never a
+# name another account planted; older .prev trees from other tools are left alone).
+find "$(dirname "$D")" -mindepth 1 -maxdepth 1 -type d -user root -regextype posix-extended \
+  -regex "$D\.prev-[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]{4}" -printf '%T@ %p\n' | sort -rn | tail -n +$((KEEP_PREV+1)) \
+  | cut -d' ' -f2- | while IFS= read -r old; do rm -rf -- "$old"; done
 
 # The extraction, as the web root's owner, reading the private copy on stdin (files 0644, dirs 0755 for the web server).
 umask 022
