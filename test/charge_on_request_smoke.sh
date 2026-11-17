@@ -243,6 +243,8 @@ COR "$EXT" "$(jbody action job cost_dd 10 idempotency_key cor-adv-0011 request_c
 ctok "$NOC"; post "$M2" nonce-0007 "$(did fe)"; RC7=$RC
 COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-adv-0012 request_charge_id "$RC7" message_sha256 "$MS2" request_nonce nonce-0007)"
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J consent_required)" = True ] && [ "$(bal nocon)" -ge 997 ] && ok "a payer with no consent to the tenant: 402" || fail "no consent: $CODE $BODY"
+R=$(echo "$BODY" | python3 -c "import json,sys; r=json.load(sys.stdin).get('raise') or {}; print(r.get('kind'), r.get('service'), r.get('request'))")
+[ "$R" = "consent fleetengine POST /api/services/consent" ] && ok "…and names its raise: a consent for the payer to approve (#131)" || fail "no-consent raise: $R $BODY"
 
 # ── withdrawal: consent revoked, opt-in dropped, Conduit token revoked ─────────────────────────────────────────
 ctok "$EXT"; post "$M2" nonce-0008 "$(did fe)"; RC8=$RC

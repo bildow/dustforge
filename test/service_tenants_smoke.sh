@@ -312,19 +312,19 @@ C "$FG" "$(jbody action review cost_dd 400 follow_up_of "$ORG" dry_run true)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J would_charge_dd)" = 480 ] && ok "a follow-up's dry run surveys a whole step (400 DD) before it runs" || fail "dry whole: $CODE $BODY"
 C "$FG" "$(jbody action review cost_dd 600 follow_up_of "$ORG" dry_run true)"
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J refused)" = follow_up_budget ] && ok "…but never more than the token's follow-up budget could pay" || fail "dry over budget: $CODE $BODY"
-[ "$(echo "$BODY" | python3 -c "import json,sys; print((json.load(sys.stdin).get('raise') or {}).get('kind'))")" = token ] && ok "…and its raise is a new token" || fail "fu raise: $BODY"
+[ "$(echo "$BODY" | python3 -c "import json,sys; print((json.load(sys.stdin).get('raise') or {}).get('kind'))")" = new_request ] && ok "…and its raise is a new request (follow-ups stay with their token: #131 review 3)" || fail "fu raise: $BODY"
 N1=$(Q "SELECT COUNT(*) FROM service_charges")
 C "$FG" '{"action":"review","cost_dd":400,"follow_up_of":"'"$ORG"'","dry_run":"true","idempotency_key":"fu-truthy-0001"}'
 [ "$CODE" = 400 ] && [ "$(Q "SELECT COUNT(*) FROM service_charges")" = "$N1" ] && ok "only dry_run: true is a dry run (\"true\" is a real charge, held to 250 DD; nothing written)" || fail "truthy dry: $CODE $BODY"
 C "$FG" "$(jbody action submit cost_dd 251 token_id "$TID4" dry_run true)"; [ "$CODE" = 400 ] && ok "an ordinary dry run asks about one portion (≤250 DD)" || fail "dry big: $CODE"
 C "$FG" "$(jbody action submit cost_dd 20 token_id "$PTID" dry_run true)"
 [ "$CODE" = 402 ] && [ "$(echo "$BODY" | J refused)" = insufficient ] && ok "a dry run on a wallet that can't pay → 402 refused: insufficient" || fail "dry poor: $CODE $BODY"
-R=$(echo "$BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('raise') or {}; print(r.get('kind'), r.get('short_dd') == d.get('short_dd') and d.get('short_dd', 0) > 0)")
-[ "$R" = "fund True" ] && ok "…and its raise is to fund the wallet, by the shortfall" || fail "insufficient raise: $R $BODY"
+R=$(echo "$BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); r=d.get('raise') or {}; print(r.get('kind'), r.get('short_dd'), d.get('short_dd'))")
+[ "$R" = "fund 19 19" ] && ok "…and its raise is to fund the wallet, by exactly the shortfall (19 DD)" || fail "insufficient raise: $R $BODY"
 C "$FG" "$(jbody action review cost_dd 250 follow_up_of "$ORG" idempotency_key fu-review-0005)"; A1=$CODE      # 120 + 300 = 420 of 600
 C "$FG" "$(jbody action review cost_dd 200 follow_up_of "$ORG" idempotency_key fu-review-0006)"; A2=$CODE      # + 240 > 600
 [ "$A1" = 201 ] && [ "$A2" = 402 ] && [ "$(echo "$BODY" | J follow_up_budget_exceeded)" = True ] && ok "follow-ups stop at the token's follow-up budget (600 DD)" || fail "fu budget: $A1 $A2 $BODY"
-[ "$(echo "$BODY" | python3 -c "import json,sys; print((json.load(sys.stdin).get('raise') or {}).get('kind'))")" = token ] && ok "…a real 402 names the same raise (token)" || fail "fu 402 raise: $BODY"
+[ "$(echo "$BODY" | python3 -c "import json,sys; print((json.load(sys.stdin).get('raise') or {}).get('kind'))")" = new_request ] && ok "…a real 402 names the same raise (a new request)" || fail "fu 402 raise: $BODY"
 # per-tenant margin: the owner asks from their own session, approves in the app; at most 33%
 call PUT /api/services/fleetgate/margin "$FG" '{"margin_pct":33}'; A1=$CODE
 call PUT /api/services/fleetgate/margin "$OWN" '{"margin_pct":34}'; A2=$CODE
