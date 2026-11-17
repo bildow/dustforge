@@ -170,8 +170,9 @@ COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-h1-0002 request_cha
   && ok "an unflagged post (Conduit's ordinary key) or an old cr1 key never authorizes a charge" || fail "H1 unflagged/cr1: $A1 $A2"
 post "$MH" nonce-h1c "$(did fe)" 50; RCM=$RC; E1=$(bal ext)
 COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-h1-0003 request_charge_id "$RCM" message_sha256 "$MSH" request_nonce nonce-h1c request_max_dd 500)"; A1=$CODE
-COR "$FE" "$(jbody action job cost_dd 50 idempotency_key cor-h1-0004 request_charge_id "$RCM" message_sha256 "$MSH" request_nonce nonce-h1c request_max_dd 50)"; A2=$CODE; R2=$(echo "$BODY" | J request_max_exceeded)
+COR "$FE" "$(jbody action job cost_dd 50 idempotency_key cor-h1-0004 request_charge_id "$RCM" message_sha256 "$MSH" request_nonce nonce-h1c request_max_dd 50)"; A2=$CODE; R2=$(echo "$BODY" | J request_max_exceeded); RK=$(echo "$BODY" | python3 -c "import json,sys; r=json.load(sys.stdin).get('raise') or {}; print(r.get('kind'), r.get('request_max_dd_at_least'))")
 [ "$A1" = 403 ] && [ "$A2" = 402 ] && [ "$R2" = True ] && [ "$(bal ext)" = "$E1" ] && ok "a claimed ceiling other than the posted one: 403; a charge over the sender's ceiling (60 > 50): 402" || fail "H1 max: $A1 $A2"
+[ "$RK" = "new_message 60" ] && ok "…and its raise is a new message with a ceiling of at least 60 DD (#131 r2, 3)" || fail "request_max raise: $RK"
 COR "$FE" "$(jbody action job cost_dd 10 idempotency_key cor-h1-0005 request_charge_id "$RCM" message_sha256 "$MSH" request_nonce nonce-h1c request_max_dd 50)"; OM=$(echo "$BODY" | J charge_id)
 [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J follow_up_dd)" = 38 ] || fail "H1 budget origin: $CODE $BODY"
 call POST /api/services/charge "$FE" "$(jbody action step cost_dd 35 follow_up_of "$OM" idempotency_key cor-h1-0006)"
