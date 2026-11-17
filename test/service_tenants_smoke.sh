@@ -213,7 +213,34 @@ C "$FG" "$(jbody action review cost_dd 300 token_id "$TID" idempotency_key k-not
 C "$FG" "$(jbody action sign-charter cost_dd 5 token_id "$TID" idempotency_key k-notverified-sign)"
 [ "$A1" = 403 ] && [ "$CODE" = 403 ] && ok "a charge only for an action verified on that token (review, sign-charter → 403)" || fail "unverified action: $A1 $CODE"
 E0=$(bal ext); F0=$(bal fg)
-C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" idempotency_key pr-submit-0001)"; echo "$BODY" > "$S/first"; CID=$(echo "$BODY" | J charge_id)
+# Wave 5: ceiling is total including margin; refusal is before debit/credit.
+for cap in 23 0 -1 null true '"24"' 9007199254740992; do
+  C "$FG" "{\"action\":\"submit\",\"cost_dd\":20,\"token_id\":\"$TID\",\"idempotency_key\":\"ceiling-refuse-01\",\"max_total_dd\":$cap}"
+  [ "$CODE" = 400 ] || [ "$CODE" = 409 ] || fail "invalid/low total ceiling accepted: $cap $CODE"
+done
+[ "$(bal ext)" = "$E0" ] && [ "$(bal fg)" = "$F0" ] && ok "all low/malformed ceiling requests leave both balances unchanged" || fail "ceiling moved money"
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" max_total_dd 24 dry_run true)"
+[ "$CODE" = 200 ] && ok "ceiling equality dry run accepted" || fail "ceiling equality dry run"
+# Simulate a price change AFTER the accepted preflight.
+python3 - "$DB_PATH" <<'PRICE'
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]);c.execute("UPDATE service_tenants SET margin_pct=33 WHERE slug='fleetgate'");c.commit()
+PRICE
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" max_total_dd 24 idempotency_key ceiling-refuse-01)"
+[ "$CODE" = 409 ] && [ "$(bal ext)" = "$E0" ] && [ "$(bal fg)" = "$F0" ] && ok "post-preflight margin rise refuses before debit" || fail "price race: $CODE"
+python3 - "$DB_PATH" <<'PRICE'
+import sqlite3,sys
+c=sqlite3.connect(sys.argv[1]);c.execute("UPDATE service_tenants SET margin_pct=NULL WHERE slug='fleetgate'");c.commit()
+PRICE
+
+# Two clients race a fresh key through the real gateway/SQLite transaction.
+(C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" max_total_dd 24 idempotency_key pr-submit-0001)"; echo "$CODE" > "$S/race-a-code"; echo "$BODY" > "$S/race-a") & RA=$!
+(C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" max_total_dd 24 idempotency_key pr-submit-0001)"; echo "$CODE" > "$S/race-b-code"; echo "$BODY" > "$S/race-b") & RB=$!
+wait "$RA"; wait "$RB"
+if [ "$(cat "$S/race-a-code")" = 201 ]; then cp "$S/race-a" "$S/first"; OTHER=$(cat "$S/race-b-code"); else cp "$S/race-b" "$S/first"; OTHER=$(cat "$S/race-a-code"); fi
+[ "$OTHER" = 200 ] || [ "$OTHER" = 409 ] || fail "concurrent duplicate unexpected status: $OTHER"
+[ "$(Q "SELECT COUNT(*) FROM service_charges WHERE idempotency_key='pr-submit-0001'")" = 1 ] && ok "concurrent fresh-key clients produce one charge row" || fail "duplicate debit"
+BODY=$(cat "$S/first"); CODE=201; CID=$(echo "$BODY" | J charge_id)
 [ "$CODE" = 201 ] && [ "$(echo "$BODY" | J dd)" = 24 ] && [ "$(bal ext)" = $((E0 - 24)) ] && [ "$(bal fg)" = $((F0 + 24)) ] \
   && ok "charge: 20 + 20% = 24 DD, ext −24, FLEETGATE +24 (201 $CID)" || fail "charge: $CODE $BODY"
 [ "$(Q "SELECT COUNT(*) FROM identity_transactions WHERE token_jti='$TID' AND type IN ('service_transfer_out','service_transfer_in')")" = 2 ] \
@@ -229,8 +256,16 @@ process.exit(ok && !bare && rc.token_id === process.argv[2] ? 0 : 1);' "$S/first
 VB=$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps({"receipt":r["receipt"],"sig":r["sig"]}))' "$S/first")
 call POST /api/services/receipts/verify "" "$VB"; A1=$(echo "$BODY" | J on_record)
 call POST /api/meter/verify "" "$VB"; [ "$A1" = True ] && [ "$(echo "$BODY" | J valid)" = False ] && ok "receipts/verify: on record; the meter's verify refuses it (no cross-type receipts)" || fail "receipt domains: $A1 $BODY"
-C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" idempotency_key pr-submit-0001)"
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" max_total_dd 24 idempotency_key pr-submit-0001)"
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J replayed)" = True ] && [ "$(bal ext)" = $((E0 - 24)) ] && ok "a retry (same key) → 200 replayed, no second debit" || fail "replay: $CODE $BODY"
+C "$FG" "$(jbody action submit cost_dd 20 token_id "$TID" max_total_dd 23 idempotency_key pr-submit-0001)"
+[ "$CODE" = 409 ] && [ "$(bal ext)" = $((E0 - 24)) ] && ok "paid replay cannot misrepresent a lower total ceiling" || fail "replay ceiling"
+call GET '/api/services/charges?idempotency_key=pr-submit-0001' "$FG"
+echo "$BODY" > "$S/lookup"
+node -e 'const fs=require("fs"),crypto=require("crypto"),identity=require("./identity");
+const row=JSON.parse(fs.readFileSync(process.argv[1])).received[0], body=JSON.parse(row.receipt);
+const pub=crypto.createPublicKey({key:identity.didToPublicKey(body.issuer),format:"der",type:"spki"});
+process.exit(body.max_total_dd===24 && body.idempotency_key==="pr-submit-0001" && crypto.verify(null,Buffer.from("dustforge-service-charge:v1\n"+row.receipt),pub,Buffer.from(row.sig,"base64url")) ? 0 : 1);' "$S/lookup" && ok "exact-key recovery returns original signed ceiling receipt" || fail "signed lookup"
 C "$FG" "$(jbody action submit cost_dd 19 token_id "$TID" idempotency_key pr-submit-0001)"; [ "$CODE" = 409 ] && ok "same key, other cost → 409" || fail "409: $CODE"
 V "$FG" "$(jbody token "$ST" action review)"
 C "$FG" "$(jbody action review cost_dd 301 token_id "$TID" idempotency_key pr-review-0001)"; [ "$CODE" = 400 ] && ok "cost above the action's max_cost_dd → 400" || fail "max cost: $CODE"
