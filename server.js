@@ -822,10 +822,15 @@ app.use((req, res, next) => {
 });
 
 // ── CORS ──
+// The app page is served from demipass.com and calls api.dustforge.com, so the browser preflights every call that is
+// not a simple GET/POST and refuses any method missing here before the server sees it ("Failed to fetch", no log line).
+// PUT was missing: the owner's scheduled refill (PUT /api/fleet/:slug/owner-refill, the app's one PUT) could never be
+// saved from the phone (Aaron 2026-11-18). Every method the app uses is listed; test/cors_smoke.sh keeps them so.
+const CORS_METHODS = 'GET, POST, PUT, PATCH, DELETE, OPTIONS';
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-admin-key');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Methods', CORS_METHODS);
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
