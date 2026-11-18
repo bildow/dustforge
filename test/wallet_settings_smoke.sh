@@ -49,6 +49,11 @@ const db = new Database(process.env.DB_PATH); const w = db.prepare("SELECT did, 
 process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: "transact", expiresIn: "2h", metadata: { auth_method: "device", username: "owner" } }));')
 call POST /api/identity/settings/agent-rules-write "$DEV" '{"enabled":true}'; [ "$CODE" = 403 ] && ok "a pane's device-flow session of the owner cannot enable it for itself (403)" || fail "device set: $CODE $BODY"
 call GET /api/identity/settings "$DEV"; [ "$(echo "$BODY" | J settings.agent_rules_write.enabled)" = False ] && ok "…and it stays off" || fail "device read: $BODY"
+RF=$(node -e '
+const identity = require("./identity"); const Database = require("better-sqlite3");
+const db = new Database(process.env.DB_PATH); const w = db.prepare("SELECT did, encrypted_private_key FROM identity_wallets WHERE username = ?").get("owner");
+process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: "transact", expiresIn: "2h", metadata: { auth_method: "refresh", username: "owner" } }));')
+call POST /api/identity/settings/agent-rules-write "$RF" '{"enabled":true}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J sign_in_again)" = True ] && ok "a refresh lineage without a recorded origin is sent to sign in again (403)" || fail "legacy refresh: $CODE $BODY"
 call POST /api/identity/settings/agent-rules-write "$OWN" '{"enabled":"yes"}'; [ "$CODE" = 400 ] && ok "enabled must be a boolean" || fail "bad body: $CODE"
 call POST /api/identity/settings/agent-rules-write "$OWN" '{"enabled":true}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J agent_rules_write.enabled)" = True ] && ok "the person enables it" || fail "enable: $CODE $BODY"
 call GET /api/identity/pane-rules "$AG"; [ "$(echo "$BODY" | J enabled)" = True ] && ok "…and the agent wallet now reads enabled" || fail "agent after: $BODY"

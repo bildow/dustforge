@@ -39,6 +39,10 @@ module.exports = function registerWalletSettings({ app, db, rateLimitStandard, g
   app.post('/api/identity/settings/agent-rules-write', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     if (agentToken(auth)) return res.status(403).json({ error: 'the person sets this in the DemiPass app, not an agent token' });
+    // A refresh lineage from before origin tracking cannot show it began as the person's own sign-in: as the
+    // rate-reset and secret-edit routes, it fails closed (#136 re-review).
+    const d0 = auth.decoded || {};
+    if (d0.auth_method === 'refresh' && !d0.src_auth) return res.status(403).json({ error: 'sign in again in the DemiPass app to change this (this session cannot show it began as a person\'s sign-in)', sign_in_again: true });
     const on = (req.body || {}).enabled;
     if (typeof on !== 'boolean') return res.status(400).json({ error: 'enabled: true or false' });
     set(db, auth.did, 'agent_rules_write', on ? '1' : '0');
