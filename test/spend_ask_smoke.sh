@@ -56,7 +56,7 @@ NAP=$(Q "SELECT COUNT(*) FROM use_approvals")
 call POST /api/billing/spend-asks "$OWN" "$PLAN"
 [ "$CODE" = 202 ] && A=$(echo "$BODY" | J approval_id) && [ "$(echo "$BODY" | J depth)" = critical ] && echo "$BODY" | J next | grep -q "Do not ask in chat" && ok "a plan files ONE critical card (approval $A); the reply says not to ask in chat" || fail "file: $CODE $BODY"
 [ "$(Q "SELECT COUNT(*) FROM spend_asks")" = 0 ] && ok "nothing recorded before the approval" || fail "recorded early"
-Q "SELECT summary FROM use_approvals WHERE id=$A" | grep -q '^spend plan 1002 DD for "Wave 5 real-payment acceptance": create agent conduit-keys 1000; consent' && ok "the card's summary leads with the total and lists the steps with their cost (cut at 120)" || fail "summary: $(Q "SELECT summary FROM use_approvals WHERE id=$A")"
+Q "SELECT summary FROM use_approvals WHERE id=$A" | grep -q '^spend plan 1002 DD + consents up to 2 DD/day (3 steps) for "Wave 5 real-payment acc' && ok "the card's summary leads with the total, the consent caps and the step count; a consent step is named from its checked fields" || fail "summary: $(Q "SELECT summary FROM use_approvals WHERE id=$A")"
 call GET /api/blindkey/approvals/$A "$OWN"; [ "$(echo "$BODY" | J approval.call.body.steps.0.handle)" = conduit-keys ] && [ "$(echo "$BODY" | J approval.call.body.total_dd)" = 1002 ] && ok "the bound call carries the full step list (what the PIN signs)" || fail "bound: $BODY"
 call POST /api/billing/spend-asks "$OWN" "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["approval_id"]=int(sys.argv[2]); print(json.dumps(d))' "$PLAN" "$A")"; [ "$CODE" = 202 ] && ok "before the approval: still pending (202)" || fail "early: $CODE"
 # 2. approve → the plan
@@ -90,5 +90,8 @@ call POST /api/billing/spend-asks "$AG" '{"purpose":"agent plan","steps":[{"kind
 for b in '{"purpose":"x","steps":[]}' '{"purpose":"x","steps":[{"kind":"wire","dd":1,"label":"a"}]}' '{"purpose":"x","steps":[{"kind":"consent","dd":0,"label":"a","service":"fleetgate"}]}' '{"purpose":"<b>","steps":[{"kind":"charge","dd":1,"label":"a"}]}' '{"purpose":"x","steps":[{"kind":"charge","dd":1,"label":"a"}],"valid_days":99}'; do
   call POST /api/billing/spend-asks "$OWN" "$b"; [ "$CODE" = 400 ] || fail "bad plan accepted: $b → $CODE $BODY"; done; ok "bad purpose, kind, consent step, steps or valid_days → 400"
 call POST /api/billing/spend-asks "" '{"purpose":"x","steps":[{"kind":"charge","dd":1,"label":"a"}]}'; [ "$CODE" = 401 ] && ok "no token → 401" || fail "noauth: $CODE"
+call POST /api/identity/auth-fingerprint "" '{"username":"owner","password":"hunter22","scope":"read","expires_in":"1h"}'; RD=$(echo "$BODY" | J token)
+call POST /api/billing/spend-asks "$RD" '{"purpose":"x","steps":[{"kind":"charge","dd":1,"label":"a"}]}'; [ "$CODE" = 403 ] && ok "a read-scope token cannot file a plan (403)" || fail "read scope: $CODE $BODY"
+call POST /api/billing/spend-asks "$OWN" '{"purpose":"x","steps":[{"kind":"consent","dd":0,"label":"a","service":"fleetgate","daily_cap_dd":500000}]}'; [ "$CODE" = 400 ] && ok "a consent step above a consent's own cap (100000) → 400" || fail "consent cap: $CODE $BODY"
 grep -q -i "TypeError\|ReferenceError" "$S/server.log" && { fail "server errors"; grep -i -m5 "TypeError\|ReferenceError" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))

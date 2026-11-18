@@ -9995,7 +9995,7 @@ const svcTenants = require('./service_tenants')({ app, db, identity, billing, ge
 // Spend plans (spend_asks.js, Aaron 2026-11-18): a pane's multi-step spend asked once, one card with every step and the
 // total; approved with the PIN it is an allowance the listed consent steps draw on without a second card.
 const spendAsks = require('./spend_asks')({ app, db, rateLimitStandard, getBearerIdentity, approvals: () => useApprovals,
-  approverFor: (did) => svcTenants.personFor(did), isAgentAuth });
+  approverFor: (did) => svcTenants.personFor(did), scopeAtLeast: (s, m) => identity.scopeAtLeast(s, m) });
 // DemiPass as a GitHub App (github_app.js): installation tokens minted from a custody key, their expiry and revocation.
 // A minted token's grant still stands — the same rules request-token and /use apply (#104 review L4, L6): the key
 // redeemable, unfrozen and still the minting owner's (not transferred); the scope active; for an agent, its delegation

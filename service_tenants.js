@@ -1022,7 +1022,7 @@ module.exports = function registerServiceTenants(deps) {
       const c = S.cover(auth.did, b.spend_ask_id, { kind: 'consent', service: t.slug, daily_cap_dd: cap, on_request_cap_dd: orc });
       if (!c.ok) return res.status(409).json({ error: c.error, spend_ask_id: b.spend_ask_id });
       if (c.approver !== approver) return res.status(409).json({ error: 'the spend plan was approved by someone else than the person who answers for this wallet now' });
-      g = { ok: true, approval_id: c.approval_id };
+      g = { ok: true, approval_id: c.approval_id, plan: c };
     } else {
       g = personApproval('svc:demipass:consent', `let a wallet pay ${t.slug}`, approver, 'elevated', { did: auth.did, label: '' }, 'consent', 'demipass',
         { service: t.slug, wallet: auth.did, daily_cap_dd: cap, ...(orc !== null ? { on_request_cap_dd: orc } : {}) }, b, null);
@@ -1031,8 +1031,11 @@ module.exports = function registerServiceTenants(deps) {
     const at = nowIso();
     const id = db.transaction(() => {
       db.prepare("UPDATE service_consents SET status = 'replaced', revoked_at = ? WHERE payer_did = ? AND tenant_id = ? AND status = 'active'").run(at, auth.did, t.id);
-      return Number(db.prepare('INSERT INTO service_consents (payer_did, tenant_id, daily_cap_dd, approved_by, approval_id, created_at, on_request_cap_dd) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      const cid = Number(db.prepare('INSERT INTO service_consents (payer_did, tenant_id, daily_cap_dd, approved_by, approval_id, created_at, on_request_cap_dd) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(auth.did, t.id, cap, approver, g.approval_id, at, orc).lastInsertRowid);
+      // The plan's step is used in the same transaction as the grant (throws → nothing granted, step kept).
+      if (g.plan) deps.spendAsks().markCovered(g.plan.spend_ask_id, g.plan.step, `consent ${t.slug} ${cap} DD/day → consent ${cid}`);
+      return cid;
     })();
     event('service_consent', auth.did, { consent_id: id, service: t.slug, daily_cap_dd: cap, on_request_cap_dd: orc, approval_id: g.approval_id });
     res.status(201).json({ ok: true, consent_id: id, service: t.slug, daily_cap_dd: cap, on_request_cap_dd: orc });

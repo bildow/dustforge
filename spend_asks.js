@@ -15,6 +15,7 @@
 const KINDS = new Set(['provision', 'consent', 'charge', 'grant', 'other']);
 const STEPS_MAX = 12;
 const TOTAL_MAX = 1000000;           // DD
+const CONSENT_CAP_MAX_DD = 100000;    // as service_tenants.js: a consent step never lists more than a consent may hold (#135 review)
 const LABEL_RE = /^[A-Za-z0-9][A-Za-z0-9 _#+@().,:/-]{0,79}$/;
 const PURPOSE_RE = /^[A-Za-z0-9][A-Za-z0-9 _#+@().,:/-]{0,119}$/;
 const SERVICE_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
@@ -61,7 +62,7 @@ function checkStep(s, i) {
   if (kind === 'consent') {
     if (!SERVICE_RE.test(String(s.service || ''))) return { error: `steps[${i}].service: the service slug the consent is for` };
     const cap = Number(s.daily_cap_dd);
-    if (!Number.isInteger(cap) || cap < 1 || cap > TOTAL_MAX) return { error: `steps[${i}].daily_cap_dd: 1 to ${TOTAL_MAX}` };
+    if (!Number.isInteger(cap) || cap < 1 || cap > CONSENT_CAP_MAX_DD) return { error: `steps[${i}].daily_cap_dd: 1 to ${CONSENT_CAP_MAX_DD}` };
     out.service = String(s.service); out.daily_cap_dd = cap;
     if (s.on_request_cap_dd !== undefined && s.on_request_cap_dd !== null) {
       const orc = Number(s.on_request_cap_dd);
@@ -79,7 +80,7 @@ function checkStep(s, i) {
   return { step: out };
 }
 
-module.exports = function registerSpendAsks({ app, db, rateLimitStandard, getBearerIdentity, approvals, approverFor, isAgentAuth }) {
+module.exports = function registerSpendAsks({ app, db, rateLimitStandard, getBearerIdentity, approvals, approverFor, scopeAtLeast }) {
   init(db);
   const sweep = () => db.prepare("UPDATE spend_asks SET status = 'expired', closed_at = ?, closed_why = 'expired' WHERE status = 'approved' AND expires_at <= ?").run(nowIso(), nowIso());
   const view = (r) => ({ spend_ask_id: r.id, status: r.status, purpose: r.purpose, total_dd: r.total_dd, approval_id: r.approval_id,
@@ -105,6 +106,7 @@ module.exports = function registerSpendAsks({ app, db, rateLimitStandard, getBea
   app.post('/api/billing/spend-asks', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     if (refuseAgentToken(auth, res)) return;
+    if (scopeAtLeast && !scopeAtLeast(auth.scope, 'transact')) return res.status(403).json({ error: 'transact scope required to file a spend plan' });
     const b = req.body || {};
     const purpose = String(b.purpose || '');
     if (!PURPOSE_RE.test(purpose)) return res.status(400).json({ error: 'purpose: what the spend is for, 1-120 plain characters' });
@@ -172,8 +174,9 @@ module.exports = function registerSpendAsks({ app, db, rateLimitStandard, getBea
   });
 
   // A listed step drawing on the plan (service_tenants.js consent): the payer's own token, an approved unexpired plan,
-  // a step of that kind for that service not yet used, and figures no higher than the step's. Marks the step covered.
-  // → {ok, approval_id, approver} or {error}.
+  // a step of that kind for that service not yet used, and figures no higher than the step's. Checks only: the caller
+  // marks the step with markCovered() inside the same transaction that grants the consent (#135 review: a step must
+  // not be burned when the grant then fails). → {ok, approval_id, approver, spend_ask_id, step} or {error}.
   function cover(did, spendAskId, { kind, service, daily_cap_dd, on_request_cap_dd }) {
     if (!/^\d{1,12}$/.test(String(spendAskId))) return { error: 'spend_ask_id' };
     sweep();
@@ -188,11 +191,17 @@ module.exports = function registerSpendAsks({ app, db, rateLimitStandard, getBea
       if (Number(daily_cap_dd) > s.daily_cap_dd) return { error: `the plan's consent step for ${service} allows at most ${s.daily_cap_dd} DD a day` };
       if (on_request_cap_dd !== null && on_request_cap_dd !== undefined && !(s.on_request_cap_dd >= Number(on_request_cap_dd))) return { error: `the plan's consent step for ${service} ${s.on_request_cap_dd ? `allows at most ${s.on_request_cap_dd} DD per Conduit request` : 'has no Conduit request opt-in'}` };
     }
-    p[i + 1] = { ...(p[i + 1] || {}), covered_at: nowIso(), note: `${kind} ${service} ${daily_cap_dd} DD/day` };
-    db.prepare('UPDATE spend_asks SET progress = ? WHERE id = ?').run(JSON.stringify(p), r.id);
     return { ok: true, approval_id: r.approval_id, approver: r.approver_did, spend_ask_id: r.id, step: i + 1 };
   }
-  return { cover, view, KINDS };
+  function markCovered(spendAskId, step, note) {
+    const r = db.prepare("SELECT progress FROM spend_asks WHERE id = ? AND status = 'approved'").get(Number(spendAskId));
+    if (!r) throw new Error('spend plan no longer approved');
+    const p = parse(r.progress, {});
+    if (p[step] && p[step].covered_at) throw new Error('spend plan step already used');
+    p[step] = { ...(p[step] || {}), covered_at: nowIso(), note: String(note || '').slice(0, 160) };
+    db.prepare('UPDATE spend_asks SET progress = ? WHERE id = ?').run(JSON.stringify(p), Number(spendAskId));
+  }
+  return { cover, markCovered, view, KINDS };
 };
 module.exports.init = init;
 module.exports.checkStep = checkStep;
