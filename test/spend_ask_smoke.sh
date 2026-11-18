@@ -92,6 +92,6 @@ for b in '{"purpose":"x","steps":[]}' '{"purpose":"x","steps":[{"kind":"wire","d
 call POST /api/billing/spend-asks "" '{"purpose":"x","steps":[{"kind":"charge","dd":1,"label":"a"}]}'; [ "$CODE" = 401 ] && ok "no token → 401" || fail "noauth: $CODE"
 call POST /api/identity/auth-fingerprint "" '{"username":"owner","password":"hunter22","scope":"read","expires_in":"1h"}'; RD=$(echo "$BODY" | J token)
 call POST /api/billing/spend-asks "$RD" '{"purpose":"x","steps":[{"kind":"charge","dd":1,"label":"a"}]}'; [ "$CODE" = 403 ] && ok "a read-scope token cannot file a plan (403)" || fail "read scope: $CODE $BODY"
-call POST /api/billing/spend-asks "$OWN" '{"purpose":"x","steps":[{"kind":"consent","dd":0,"label":"a","service":"fleetgate","daily_cap_dd":500000}]}'; [ "$CODE" = 400 ] && ok "a consent step above a consent's own cap (100000) → 400" || fail "consent cap: $CODE $BODY"
+call POST /api/billing/spend-asks "$OWN" '{"purpose":"x","steps":[{"kind":"consent","dd":1,"label":"a","service":"fleetgate","daily_cap_dd":500000}]}'; [ "$CODE" = 400 ] && echo "$BODY" | grep -q "daily_cap_dd: 1 to 100000" && ok "a consent step above a consent's own cap (100000) → 400" || fail "consent cap: $CODE $BODY"
 grep -q -i "TypeError\|ReferenceError" "$S/server.log" && { fail "server errors"; grep -i -m5 "TypeError\|ReferenceError" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))

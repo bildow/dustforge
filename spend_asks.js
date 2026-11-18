@@ -106,6 +106,7 @@ module.exports = function registerSpendAsks({ app, db, rateLimitStandard, getBea
   app.post('/api/billing/spend-asks', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     if (refuseAgentToken(auth, res)) return;
+    // getBearerIdentity already floors a JWT at transact; kept as defence in depth for any future read-scope identity.
     if (scopeAtLeast && !scopeAtLeast(auth.scope, 'transact')) return res.status(403).json({ error: 'transact scope required to file a spend plan' });
     const b = req.body || {};
     const purpose = String(b.purpose || '');
