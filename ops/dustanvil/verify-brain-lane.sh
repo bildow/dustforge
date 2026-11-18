@@ -18,6 +18,10 @@ for p in "$D" "$D/index.html" "$D/verify.html" "$D/registry" "$D/registry/index.
   if runuser -u "$OLD" -- /bin/sh -c "test -w '$p'"; then echo "WRITABLE     $p"; else echo "not writable $p"; fi; done
 runuser -u "$OLD" -- /bin/sh -c "test -w /tmp" && echo "positive control ok: $OLD can write /tmp (the probe is alive)" || echo "PROBE BROKEN: $OLD cannot write /tmp"
 echo "== sshd key sources for $OLD"; sshd -T -C "user=$OLD,host=x,addr=127.0.0.1,laddr=127.0.0.1,lport=22" 2>/dev/null | grep -i -E '^authorizedkeys(file|command)' || echo "(sshd -T unavailable)"; chage -l "$OLD" 2>/dev/null | grep -i 'account expires'
+echo "== mci-publish still writes its lane (a real write: a probe file created and removed inside evals/MCI-1; seat 2026-11-18)"
+PROBE="$D/evals/MCI-1/.verify-probe-$(date -u +%Y%m%dT%H%M%SZ)"
+if runuser -u mci-publish -- /bin/sh -c "touch '$PROBE' && rm -f '$PROBE'"; then echo "ok   mci-publish wrote and removed $(basename "$PROBE") at $(date -u +%FT%TZ)"; else echo "FAIL mci-publish cannot write evals/MCI-1"; fi
+runuser -u mci-publish -- /bin/sh -c "test -w '$D/registry'" && echo "WRITABLE     registry by mci-publish (unexpected)" || echo "ok   mci-publish cannot write registry"
 echo "== $NEW: account"; getent passwd "$NEW" | cut -d: -f1,6,7; id "$NEW" 2>&1
 echo "== sshd: $OLD since $SINCE"
 journalctl -u ssh -u sshd --since "$SINCE" --no-pager -o short-iso 2>/dev/null | grep -E "$OLD" | tail -20
