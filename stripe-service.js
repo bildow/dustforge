@@ -84,7 +84,7 @@ async function createAccountCheckout(options) {
 /**
  * Create Stripe Checkout session for wallet topup
  */
-async function createTopupCheckout(did, amount_cents) {
+async function createTopupCheckout(did, amount_cents, username = '') {
   if (!PRICES[`topup_${amount_cents}`] && ![500, 1000, 5000, 10000].includes(amount_cents)) {
     throw new Error('Invalid topup amount. Options: $5, $10, $50, $100');
   }
@@ -100,12 +100,14 @@ async function createTopupCheckout(did, amount_cents) {
       quantity: 1,
     }],
     mode: 'payment',
-    success_url: `${BASE_URL}/api/stripe/success?session_id={CHECKOUT_SESSION_ID}`,
+    // The top-up page (it shows the new balance), not the account-creation status page.
+    success_url: `${BASE_URL}/api/stripe/topup-success?session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${BASE_URL}/api/stripe/cancel`,
     metadata: {
       type: 'wallet_topup',
       did,
       amount_cents: String(amount_cents),
+      ...(username ? { username: String(username) } : {}),   // the top-up page names the wallet
     },
   });
 
@@ -126,6 +128,35 @@ async function constructWebhookEvent(rawBody, signature) {
   return getStripe().events.retrieve(claimed.id);
 }
 
+// The server's Stripe key mode: 'live' (sk_live_/rk_live_), 'test' (sk_test_/rk_test_), or 'none'.
+function stripeMode() {
+  const k = String(process.env.STRIPE_SECRET_KEY || '');
+  if (/^(sk|rk)_live_/.test(k)) return 'live';
+  if (/^(sk|rk)_test_/.test(k)) return 'test';
+  return 'none';
+}
+
+// May a paid Checkout session (or its event) credit DD? Only a live-mode payment: a test-mode one is paid with
+// Stripe's public test cards, so it would mint DD for nothing (found 2026-11-15: the server's key is a test key and
+// /api/stripe/topup-success credited any test payment). STRIPE_TEST_CREDITS=1 allows it, for a staging box only.
+function creditsAllowed(obj) {
+  if (obj && obj.livemode === true) return true;
+  return process.env.STRIPE_TEST_CREDITS === '1';
+}
+
+// Card deposits from the app (stub, Aaron 2026-11-15). DEPOSITS=off|test|live; on only when the key's mode matches.
+const DEPOSIT_AMOUNTS_USD_CENTS = [500, 1000, 5000, 10000];
+function depositConfig() {
+  const want = String(process.env.DEPOSITS || 'off').toLowerCase();
+  const mode = stripeMode();
+  const base = { mode: want === 'test' || want === 'live' ? want : 'off', stripe_key: mode,
+    amounts_usd_cents: DEPOSIT_AMOUNTS_USD_CENTS, dd_per_usd: DEPOSIT_DD_PER_USD,
+    credits_dd: mode === 'live' || process.env.STRIPE_TEST_CREDITS === '1' };
+  if (base.mode === 'off') return { ...base, enabled: false, reason: 'card deposits are not switched on yet (DEPOSITS=off)' };
+  if (mode !== base.mode) return { ...base, enabled: false, reason: `card deposits are set to ${base.mode}, but the server's Stripe key is ${mode}` };
+  return { ...base, enabled: true, reason: base.credits_dd ? '' : 'test mode: Stripe test cards work, and no DD is credited' };
+}
+
 module.exports = {
   getStripe,
   PRICES,
@@ -133,4 +164,8 @@ module.exports = {
   createAccountCheckout,
   createTopupCheckout,
   constructWebhookEvent,
+  stripeMode,
+  creditsAllowed,
+  depositConfig,
+  DEPOSIT_AMOUNTS_USD_CENTS,
 };

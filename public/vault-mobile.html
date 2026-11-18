@@ -209,12 +209,15 @@
   <div id="scan-requests"></div>
   <div id="agent-token-requests"></div>
   <div id="approval-requests"></div>
+  <!-- Wallet notices: a refill that failed, a deposit due (wallet_notices.js) -->
+  <div id="wallet-notices"></div>
 
   <!-- Page: Vault (home) — Health Dashboard -->
   <div id="page-vault" class="page active">
     <div class="balance-hero">
       <div class="balance-amount" id="bal">--</div>
       <div class="balance-label">Diamond Dust</div>
+      <button class="btn-ghost" id="deposit-open" onclick="openDeposit()" style="margin-top:0.5rem;font-size:0.75rem;padding:0.3rem 0.8rem">+ Deposit DD</button>
     </div>
     <!-- Health summary strip -->
     <div style="display:flex;justify-content:center;gap:1rem;padding:0.5rem 1rem;font-size:0.75rem">
@@ -261,7 +264,7 @@
       <div class="req-chips" id="req-status"></div>
       <div style="display:flex;gap:0.5rem">
         <select id="req-kind" onchange="reqFilter.kind=this.value;renderRequests()" style="flex:1;padding:0.35rem;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.75rem">
-          <option value="">All kinds</option><option value="use">Use approvals</option><option value="scan">Scan tokens</option><option value="agent">Agent tokens</option></select>
+          <option value="">All kinds</option><option value="use">Use approvals</option><option value="scan">Scan tokens</option><option value="agent">Agent tokens</option><option value="notice">Wallet notices</option></select>
         <select id="req-who" onchange="reqFilter.who=this.value;renderRequests()" style="flex:1;padding:0.35rem;background:var(--card);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.75rem"><option value="">Anyone</option></select>
       </div>
       <div id="req-note" style="font-size:0.7rem;color:var(--text3);margin:0.4rem 0"></div>
@@ -628,6 +631,18 @@
   </div>
 </div>
 
+<!-- Deposit DD by card (Stripe Checkout; behind the server's DEPOSITS switch) -->
+<div id="modal-deposit" class="modal-bg" onclick="if(event.target===this)closeModal()">
+  <div class="modal-sheet">
+    <h3>Deposit DD</h3>
+    <div id="deposit-why" style="font-size:0.78rem;color:var(--text2);margin-bottom:0.5rem"></div>
+    <div id="deposit-amounts" style="display:flex;gap:0.4rem;flex-wrap:wrap"></div>
+    <div id="deposit-note" style="font-size:0.72rem;color:var(--text3);margin-top:0.5rem"></div>
+    <div id="deposit-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" id="deposit-go" onclick="startDeposit()">Pay by card</button></div>
+  </div>
+</div>
+
 <!-- Send DD to a connection -->
 <div id="modal-send" class="modal-bg" onclick="if(event.target===this)closeModal()">
   <div class="modal-sheet">
@@ -949,7 +964,7 @@ function logout(){
   // Nothing of this session stays on screen for whoever signs in next: revealed values, the detail and fleet
   // pages, minted tokens, lists, typed inputs (back to the page defaults; only the sign-in username stays).
   if(revealTimer){clearTimeout(revealTimer);revealTimer=null}
-  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests','share-requests','approval-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];accessReqs=[];accessPick={};fillBusy.clear();shareData=null;shareBusy.clear();shareMode=null;detailName=null;approvals=[];clearInterval(apTimer);apTimer=null;apOpen=null;if(apResolve){const r=apResolve;apResolve=null;r(false);}netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
+  for(const i of ['detail-content','silicon-content','fleet-content','secret-list','activity-list','tick-list','trigger-list','df-rules','df-activity','df-dust-summary','df-dust-ledger','df-fwd-banner','security-banner','settings-output','silicon-agents','sms-status','pin-status','fill-requests','net-requests','share-requests','approval-requests','wallet-notices']){const e=document.getElementById(i);if(e)e.innerHTML=''}fillReqs=[];grantReqs=[];accessReqs=[];walletNoticesNow=[];fundGrantAp={};accessPick={};fillBusy.clear();shareData=null;shareBusy.clear();shareMode=null;detailName=null;approvals=[];clearInterval(apTimer);apTimer=null;apOpen=null;if(apResolve){const r=apResolve;apResolve=null;r(false);}netData=null;netBusy.clear();sendTo=null;sendBusy=false;topupBusy=false;for(const i of ['topup-owner','topup-msg'])document.getElementById(i).textContent='';for(const i of ['topup-amount','topup-note'])document.getElementById(i).value='';document.getElementById('net-badge').textContent='Fleet ›';
   for(const i of ['bal','app-user','ns-id','set-did','set-email','df-email','df-did','df-balance','fleet-title','health-red','health-yellow','health-green','health-frozen',
                   's-msg','sil-msg','t-msg','c-msg','scan-msg','phone-msg','recovery-msg','device-msg','wizard-msg','pin-setup-msg','pin-unlock-msg','pin-change-msg','pin-error-why','net-msg','send-msg','send-to-name','send-balance']){const e=document.getElementById(i);if(e)e.textContent=''}
   for(const e of document.querySelectorAll('input, textarea, select')){ if(e.id==='auth-user')continue; if(e.type==='checkbox')e.checked=e.defaultChecked; else if(e.tagName==='SELECT'){for(const o of e.options)o.selected=o.defaultSelected} else e.value=e.defaultValue||'' }
@@ -1085,8 +1100,10 @@ async function loadFleet(){
       h+='<input type="checkbox" id="own-refill-enabled" '+(rule&&rule.enabled?'checked':'')+' style="width:auto;margin:0"> <span>every</span>';
       h+='<select id="own-refill-cadence" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.75rem;margin:0">'+['daily','weekly','monthly'].map(c=>'<option value="'+c+'"'+((rule?rule.cadence:'weekly')===c?' selected':'')+'>'+c+'</option>').join('')+'</select>';
       h+='<span>add</span><input type="number" id="own-refill-amount" value="'+(rule?rule.amount_cents:1000)+'" min="0" style="width:5.5rem;margin:0;padding:0.3rem"><span>DD</span>';
+      // Card: no card is stored, so when it is due the app asks for a deposit (stub, wallet_notices deposit_due).
+      h+='<select id="own-refill-funding" style="padding:0.3rem;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:0.72rem;margin:0"><option value="operator_grant"'+((rule?rule.funding:'operator_grant')==='operator_grant'?' selected':'')+'>operator grant</option><option value="stripe"'+(rule&&rule.funding==='stripe'?' selected':'')+'>by card (asks me to deposit)</option></select>';
       h+='<button class="btn-primary" onclick="saveOwnerRefill()" style="font-size:0.72rem;padding:0.35rem 0.6rem">Save</button></div>';
-      h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.35rem">'+(rule&&rule.enabled?('next: '+new Date(rule.next_run_at).toLocaleString()+(rule.last_error?' · <span style="color:var(--red)">'+esc(rule.last_error)+'</span>':'')):'off')+' · funding: operator grant</div>';
+      h+='<div style="font-size:0.68rem;color:var(--text3);margin-top:0.35rem">'+(rule&&rule.enabled?('next: '+new Date(rule.next_run_at).toLocaleString()+(rule.last_error?' · <span style="color:var(--red)">'+esc(rule.last_error)+'</span>':'')):'off')+' · funding: '+(rule&&rule.funding==='stripe'?'by card (asks you to deposit)':'operator grant')+'</div>';
       h+='</div>';
     }
     // Silicons
@@ -1174,7 +1191,7 @@ function workLinkRow(l,tick){
 // says so; once approved (Requests, above), Save again carries the approval and applies it.
 var ownRefillApproval=null;
 async function saveOwnerRefill(){
-  const body={cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:'operator_grant'};
+  const body={cadence:document.getElementById('own-refill-cadence').value,amount_cents:Number(document.getElementById('own-refill-amount').value||0),enabled:document.getElementById('own-refill-enabled').checked,funding:(document.getElementById('own-refill-funding')||{}).value||'operator_grant'};
   if(ownRefillApproval&&ownRefillApproval.key===JSON.stringify(body)) body.approval_id=ownRefillApproval.id;
   try{
     const r=await api('PUT','/api/fleet/'+encodeURIComponent(fleetSlug)+'/owner-refill',body);
@@ -1553,7 +1570,7 @@ async function showApp(){
   document.getElementById('ns-id').textContent=user;
   await loadVault();
   loadSiliconAgents();
-  loadFillRequests(); loadShares(); loadApprovals();
+  loadFillRequests(); loadShares(); loadApprovals(); loadWalletNotices();
   loadNetwork();
   // Item 9: a waiting change to the wallet shows in Settings; opened from the alert notification, go there.
   if(location.hash==='#holds'){ goPage('settings'); loadDevices(); loadHolds(); } else loadHolds();
@@ -2552,7 +2569,7 @@ function toggleGroup(k){
 // Pending ones also show as cards above every page; this is where any of them can be found again, decided or not.
 let reqAll=[], reqFilter={q:'',status:'pending',kind:'',who:''}, reqLoadedAt=0, reqLoading=null;
 // The kinds the Requests page lists (fill, share and network requests keep their own cards above every page).
-function pendingCount(){ return (approvals||[]).length+(scanReqs||[]).length+(agentTokReqs||[]).length; }
+function pendingCount(){ return (approvals||[]).length+(scanReqs||[]).length+(agentTokReqs||[]).length+(walletNoticesNow||[]).filter(n=>n&&n.kind==='fund_ask').length; }
 function updateReqBadge(){
   const b=document.getElementById('req-badge'); if(!b) return;
   const n=pendingCount();
@@ -2575,7 +2592,8 @@ function openRequests(status){
   reqFilter.status=status||reqFilter.status; goPage('requests'); if(typeof window!=='undefined'&&window.scrollTo) window.scrollTo(0,0); loadRequestsAll();
 }
 // Agent-token states: creating (approved, the agent is being made) counts as approved; failed with denied.
-const reqStatusOf=(s)=>{ s=String(s||''); return s==='pending'?'pending':/^(approved|used|claimed|active|creating)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed|undone)$/.test(s)?'denied':s==='expired'?'expired':s; };
+// Wallet notices: open waits; covered/resolved count as approved, dismissed/superseded as denied, lapsed as expired.
+const reqStatusOf=(s)=>{ s=String(s||''); return /^(pending|open)$/.test(s)?'pending':/^(approved|used|claimed|active|creating|covered|resolved|refill ran|above threshold)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed|undone|dismissed|superseded)$/.test(s)?'denied':/^(expired|lapsed)$/.test(s)?'expired':s; };
 // One load at a time; a load asked for while one runs runs once more after it, so a decision is never shown stale
 // (#99 re-review L2), and a finished load clears only its own flag (L3: not the next account's).
 let reqAgain=false;
@@ -2589,10 +2607,11 @@ async function loadRequestsOnce(){
   const epoch=sessionEpoch;   // a reply that lands after a sign-out writes nothing (#99 review M4)
   reqLoadedAt=Date.now();
   const note=document.getElementById('req-note'); note.textContent='Loading…';
-  const [ap,sc,ag]=await Promise.all([
+  const [ap,sc,ag,wn]=await Promise.all([
     api('GET','/api/blindkey/approvals?limit=200').catch(e=>({error:e})),
     api('GET','/api/blindkey/leak-scan/token-requests?all=1').catch(e=>({error:e})),
-    api('GET','/api/silicon-token-requests?all=1').catch(e=>({error:e}))]);
+    api('GET','/api/silicon-token-requests?all=1').catch(e=>({error:e})),
+    api('GET','/api/billing/notices?all=1').catch(e=>({error:e}))]);
   if(epoch!==sessionEpoch||!vaultOpen) return;
   const items=[], seen=new Set();
   for(const a of [...(ap.incoming||[]),...(ap.recent||[]),...(ap.outgoing||[])]){
@@ -2603,9 +2622,12 @@ async function loadRequestsOnce(){
   for(const q of (sc.requests||[])) items.push({kind:'scan',sub:q.kind==='scrub'?'scrub':'',id:q.id,status:q.status,who:q.requested_by||'',label:'',
     what:q.kind==='scrub'&&q.scrub?'scrub '+q.scrub.name+' ('+q.scrub.ref+') from the files a scrubber reads':'scan token'+(q.labels.length===1?'':'s')+': '+q.labels.join(', '),why:'',created:q.created_at,expires:q.expires_at,raw:q});
   for(const q of (ag.requests||[])) items.push({kind:'agent',id:q.id,status:q.status,who:q.requested_by||'',label:q.says_it_is||'',what:(q.creates?'create @':'token for @')+q.handle+' ('+q.fleet+'), '+q.scope+', '+q.expires_in,why:'',created:q.created_at,expires:q.expires_at,raw:q});
+  // Wallet notices (a fund ask, a failed refill): what a notification was about stays findable after it is tapped away.
+  for(const n of (wn.notices||[])) if(n&&n.notice_id&&n.kind!=='forward') items.push({kind:'notice',id:n.notice_id,status:n.closed_why||'open',who:'',label:n.fund?String(n.fund.requester||''):'',
+    what:n.fund?'fund your wallet: '+n.fund.service+' '+n.fund.subject+' waits for a balance of '+n.fund.need_dd+' DD':n.title,why:'',created:n.since,expires:n.fund?n.fund.lapses_at:'',raw:n});
   items.sort((x,y)=>(reqStatusOf(x.status)==='pending'?0:1)-(reqStatusOf(y.status)==='pending'?0:1)||String(y.created).localeCompare(String(x.created)));
   reqAll=items;
-  const failed=[ap,sc,ag].filter(x=>x&&x.error&&!sessionEnded(x.error)).length;
+  const failed=[ap,sc,ag,wn].filter(x=>x&&x.error&&!sessionEnded(x.error)).length;
   note.textContent=(failed?failed+' list'+(failed===1?'':'s')+' could not be loaded. ':'')+'Last 30 days; decided use approvals: the latest 200.';
   const who=document.getElementById('req-who'), cur=reqFilter.who;
   who.innerHTML='<option value="">Anyone</option>'+[...new Set(items.map(i=>i.who).filter(Boolean))].sort().map(w=>'<option value="'+esc(w)+'"'+(w===cur?' selected':'')+'>@'+esc(w)+'</option>').join('');
@@ -2619,16 +2641,16 @@ function renderRequests(){
   // A number is one request: found in whatever state it is in (#99 review M2: "14" from the badge's Pending view).
   const rows=reqAll.filter(i=>(byNum||!reqFilter.status||reqStatusOf(i.status)===reqFilter.status)&&(!reqFilter.kind||i.kind===reqFilter.kind)&&(!reqFilter.who||i.who===reqFilter.who)
     &&(!q||(byNum?Number(i.id)===Number(num):(i.kind+' '+i.who+' '+i.label+' '+i.what+' '+i.why+' '+i.status).toLowerCase().includes(q))));
-  const kindName={use:'Use approval',scan:'Scan token',agent:'Agent token'}, col={pending:'var(--orange)',approved:'var(--green)',denied:'var(--red)',expired:'var(--text3)'};
+  const kindName={use:'Use approval',scan:'Scan token',agent:'Agent token',notice:'Wallet notice'}, col={pending:'var(--orange)',approved:'var(--green)',denied:'var(--red)',expired:'var(--text3)'};
   const el=document.getElementById('req-list');
   if(!rows.length){ el.innerHTML='<div class="empty">'+(reqAll.length?'Nothing matches.':'No requests in the last 30 days.')+'</div>'; return; }
   el.innerHTML=rows.map(i=>{ const st=reqStatusOf(i.status), pend=st==='pending'&&!i.mine;
-    const act=!pend?'':i.kind==='use'?'<button class="btn-primary" onclick="openApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Open</button><button class="btn-ghost" onclick="denyApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Deny</button>'
+    const act=!pend?'':i.kind==='notice'?'<button class="btn-ghost" onclick="dismissNotice('+Number(i.id)+').then(()=>loadRequestsAll())">Dismiss</button>':i.kind==='use'?'<button class="btn-primary" onclick="openApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Open</button><button class="btn-ghost" onclick="denyApproval('+Number(i.id)+').then(()=>loadRequestsAll())">Deny</button>'
       :i.kind==='scan'?'<button class="btn-primary" onclick="reqScanDecide('+Number(i.id)+',true)">Approve</button><button class="btn-ghost" onclick="reqScanDecide('+Number(i.id)+',false)">Deny</button>'
       :'<button class="btn-primary" onclick="reqAgentDecide('+Number(i.id)+',true)">Approve</button><button class="btn-ghost" onclick="reqAgentDecide('+Number(i.id)+',false)">Deny</button>';
     const r=i.raw||{}, warn=i.sub==='scrub'&&st==='pending'?'<div style="color:var(--red);margin-top:0.2rem">The scrubber learns where this value is in its files: in effect, the value. Approve only if you started it.</div>':i.kind!=='agent'?'':r.requester_role==='other_agent'?'<div style="color:var(--red);margin-top:0.2rem">Another agent, @'+esc(r.requested_by||'?')+', asks for @'+esc(r.handle||'?')+'\'s token. If approved, @'+esc(r.requested_by||'?')+' can act as @'+esc(r.handle||'?')+'.</div>'
       :r.requester_role==='outside_agent'?'<div style="color:var(--red);margin-top:0.2rem">@'+esc(r.requested_by||'?')+' is a wallet your fleet did not create. If approved, it can act as @'+esc(r.handle||'?')+'.</div>':'';
-    return '<div class="req-row"><div class="rr-top"><span><b>'+(i.sub==='scrub'?'Scrub token':kindName[i.kind])+' #'+Number(i.id)+'</b>'+(i.mine?' <span style="color:var(--text3)">(yours, waiting on someone else)</span>':'')+'</span><span class="rr-st" style="color:'+(col[st]||'var(--text3)')+'">'+esc(i.status)+'</span></div>'
+    return '<div class="req-row"><div class="rr-top"><span><b>'+(i.sub==='scrub'?'Scrub token':i.kind==='notice'&&i.raw&&i.raw.kind==='fund_ask'?'Fund ask':kindName[i.kind])+' #'+Number(i.id)+'</b>'+(i.mine?' <span style="color:var(--text3)">(yours, waiting on someone else)</span>':'')+'</span><span class="rr-st" style="color:'+(col[st]||'var(--text3)')+'">'+esc(i.status)+'</span></div>'
       +'<div style="margin-top:0.2rem">'+esc(i.what)+'</div>'+warn
       +(i.outcome?'<div style="margin-top:0.2rem">'+outcomeLine(i.outcome)+'</div>':'')+(st==='pending'?previousLine(i.previous):'')
       // A request that also sets the agent's delivery key says so here too, as its card does (#100 merge review).
@@ -3251,9 +3273,79 @@ async function letPhoneIn(id){
   }catch(e){ if(!/cancelled/.test(e.message)) alert(e.message+(e.status===404?' (only a phone linked for 48 hours or more can let a new one in)':'')); }
   loadHolds(); loadDevices();
 }
+// Wallet notices (wallet_notices.js): a refill that failed, a deposit due. Cards on the vault home, with Deposit when
+// the wallet is short and Dismiss. The phone's alerts poll notifies about the same notices.
+// A fund ask (fund_asks.js): work waits on this wallet's balance. A wallet allowed operator grants gets Grant: it files
+// the grant (a request approved here with the PIN), then Collect credits it; the card closes by itself once the
+// balance covers the need. Any other wallet gets Deposit, prefilled with what is short.
+var walletNoticesNow=[];
+var fundGrantAp={};   // notice id → {id: approval id, amount}
+function fundAskCard(n){
+  const f=n.fund||{}, ap=fundGrantAp[n.notice_id];
+  // Grant only when the server names the fleet it goes through (an owned, active fleet: #133 review M2).
+  const grant=f.grant_dd&&f.grant_fleet?(ap?'<button class="btn-primary" onclick="fundGrant('+Number(n.notice_id)+')">Collect '+dd(ap.amount)+' DD</button> '
+      :'<button class="btn-primary" onclick="fundGrant('+Number(n.notice_id)+','+Number(f.grant_dd)+','+jsArg(f.grant_fleet)+')">Grant '+dd(f.grant_dd)+' DD</button> ')
+    :(n.deposit?'<button class="btn-primary" onclick="openDeposit('+esc(JSON.stringify(n.deposit))+')">Deposit</button> ':'');
+  return '<div class="fill-req fund-ask" style="border-color:var(--orange)"><div><b>Fund your wallet: '+dd(f.short_dd)+' DD short</b></div>'
+    +'<div style="font-size:0.75rem">'+esc(f.service||'')+' <b>'+esc(f.subject||'')+'</b> waits for a balance of '+dd(f.need_dd)+' DD; you hold '+dd(f.balance_dd)+' DD. It resumes by itself once the wallet is funded.</div>'
+    +'<div style="color:var(--text3);font-size:0.72rem">asked by '+esc(f.requester||'?')+' · '+esc(fmtWhen(n.since))+(f.lapses_at?' · waits until '+esc(new Date(f.lapses_at).toLocaleString()):'')+'</div>'
+    +(ap?'<div style="font-size:0.72rem;color:var(--yellow)">Approve request #'+Number(ap.id)+' (above) with your PIN, then tap Collect.</div>':'')
+    +'<div class="fr-row">'+grant+'<button class="btn-ghost" onclick="dismissNotice('+Number(n.notice_id)+')">Dismiss</button></div></div>';
+}
+async function fundGrant(nid, amount, fleet){
+  const ap=fundGrantAp[nid], body={amount_cents:Number(ap?ap.amount:amount)}, slug=ap?ap.fleet:fleet;
+  if(ap) body.approval_id=ap.id;
+  if(!slug){ alert('No fleet of yours to grant through.'); return; }
+  try{
+    const r=await api('POST','/api/fleet/'+encodeURIComponent(slug)+'/owner-grant',body);
+    if(r&&r.status==='approval_pending'){ fundGrantAp[nid]={id:r.approval_id,amount:body.amount_cents,fleet:slug}; loadApprovals&&loadApprovals(); loadWalletNotices(); return; }
+    delete fundGrantAp[nid]; loadVault();
+  }catch(e){ if(sessionEnded(e)) return; if(ap&&(e.status===403||e.status===410)) delete fundGrantAp[nid]; alert(e.message); }
+  loadWalletNotices();
+}
+function walletNoticeCards(ns){
+  return (ns||[]).filter(n=>n&&n.notice_id&&n.kind!=='forward').map(n=>n.kind==='fund_ask'?fundAskCard(n):'<div class="fill-req" style="border-color:var(--orange)"><div><b>'+esc(n.title)+'</b></div>'
+    +'<div style="font-size:0.75rem">'+esc(n.text)+'</div>'
+    +'<div style="color:var(--text3);font-size:0.72rem">'+esc(fmtWhen(n.since))+'</div>'
+    +'<div class="fr-row">'+(n.deposit?'<button class="btn-primary" onclick="openDeposit('+esc(JSON.stringify(n.deposit))+')">Deposit</button> ':'')
+    +'<button class="btn-ghost" onclick="dismissNotice('+Number(n.notice_id)+')">Dismiss</button></div></div>').join('');
+}
+async function loadWalletNotices(){
+  if(lockState.locked) return;
+  const el=document.getElementById('wallet-notices'); if(!el||!tk) return;
+  try{ const r=await api('GET','/api/billing/notices'); walletNoticesNow=r.notices||[]; el.innerHTML=walletNoticeCards(walletNoticesNow); updateReqBadge(); }catch(e){ if(!sessionEnded(e)){ el.innerHTML=''; walletNoticesNow=[]; } }
+}
+async function dismissNotice(id){ try{ await api('POST','/api/billing/notices/'+Number(id)+'/dismiss'); }catch(e){ if(!sessionEnded(e)) alert(e.message); } loadWalletNotices(); }
+
+// Deposit DD by card: the amounts and whether deposits are on come from GET /api/billing/deposit; Pay opens Stripe
+// Checkout. A test-mode server says so: the checkout works and credits no DD.
+let depositCfg=null, depositPick=null;
+async function openDeposit(hint){
+  const m=document.getElementById('deposit-msg'); m.textContent=''; m.className='modal-msg';
+  document.getElementById('deposit-why').textContent=hint&&hint.amount_dd?('Needed: '+dd(hint.amount_dd)+' DD'+(hint.why?' ('+hint.why+')':'')+'.'):'';
+  openModal('deposit');
+  try{ depositCfg=await api('GET','/api/billing/deposit'); }catch(e){ depositCfg=null; m.className='modal-msg err'; m.textContent=e.message; return; }
+  const per=Number(depositCfg.dd_per_usd)||0, amts=depositCfg.amounts_usd_cents||[];
+  // Preselect the smallest amount that covers what is needed.
+  depositPick=amts.find(c=>hint&&hint.amount_dd&&c/100*per>=hint.amount_dd)||amts[0]||null;
+  document.getElementById('deposit-amounts').innerHTML=amts.map(c=>'<button class="'+(c===depositPick?'btn-primary':'btn-ghost')+'" style="font-size:0.75rem" onclick="pickDeposit('+Number(c)+')">$'+(c/100)+' · '+dd(c/100*per)+' DD</button>').join('');
+  const note=document.getElementById('deposit-note'), go=document.getElementById('deposit-go');
+  go.disabled=!depositCfg.enabled;
+  note.textContent=depositCfg.enabled?(depositCfg.credits_dd?'Paid by card through Stripe. The DD lands when the payment completes.':'Test mode: Stripe test cards work, and no DD is credited.'):(depositCfg.reason||'Card deposits are not on yet.')+' Until then, ask whoever runs your fleet to send DD.';
+}
+function pickDeposit(c){ depositPick=c; for(const b of document.getElementById('deposit-amounts').children) b.className=b.textContent.startsWith('$'+(c/100)+' ')?'btn-primary':'btn-ghost'; }
+async function startDeposit(){
+  const m=document.getElementById('deposit-msg');
+  if(!depositCfg||!depositCfg.enabled||!depositPick) return;
+  try{
+    const r=await api('POST','/api/billing/deposit',{amount_usd_cents:depositPick});
+    if(r&&r.url){ m.className='modal-msg ok'; m.textContent='Opening Stripe…'; window.open(r.url,'_blank'); }
+  }catch(e){ m.className='modal-msg err'; m.textContent=e.message; }
+}
+
 // Item 6b: a mail forwarding rule turned on in the last 48 hours (codes and reset links do not go through it meanwhile).
 function noticeCards(ns){
-  return (ns||[]).map(n=>'<div class="fill-req" style="border-color:var(--orange)"><div><b>Mail forwarding turned on</b></div>'
+  return (ns||[]).filter(n=>n&&n.kind==='forward').map(n=>'<div class="fill-req" style="border-color:var(--orange)"><div><b>Mail forwarding turned on</b></div>'
     +'<div style="font-size:0.75rem">Your DemiPass mail is copied to '+esc(n.forward_to||'')+(n.filter_from&&n.filter_from!=='*'?' (mail from '+esc(n.filter_from)+')':'')+' since '+esc(fmtWhen(n.since))+'.</div>'
     +'<div style="color:var(--text3);font-size:0.75rem">Not you? Sign in and remove it in the Dustforge tab, then rotate your password. For 48 hours no sign-in code or reset link goes through it.</div></div>').join('');
 }
@@ -3273,7 +3365,7 @@ async function loadHolds(){
   const wrap=document.getElementById('holds-wrap'), el=document.getElementById('holds'); if(!wrap||!el||!tk) return;
   try{
     const r=await api('GET','/api/identity/holds');
-    const hs=r.holds||[], ns=r.notices||[]; wrap.style.display=(hs.length||ns.length)?'block':'none'; el.innerHTML=holdCards(hs)+noticeCards(ns);
+    const hs=r.holds||[], ns=(r.notices||[]).filter(n=>n&&n.kind==='forward'); wrap.style.display=(hs.length||ns.length)?'block':'none'; el.innerHTML=holdCards(hs)+noticeCards(ns);
     if(hs.length&&location.hash==='#holds') wrap.scrollIntoView({behavior:'smooth'});
   }catch(e){ if(!sessionEnded(e)){ wrap.style.display='none'; } }
 }
@@ -3470,7 +3562,7 @@ async function unlockTry(usePin){
     if(!ok) ok=await unlockWithPin('Unlock DemiPass','unlock:0');
     if(!ok){ m.textContent='Still locked.'; return; }
     lockState.locked=false; document.getElementById('lock-screen').style.display='none'; document.getElementById('app').style.display='block';
-    noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadNetwork();
+    noteActive(true); loadVault(); loadSiliconAgents(); loadFillRequests(); loadShares(); loadApprovals(); loadWalletNotices(); loadNetwork();
     loadHolds(); if(location.hash==='#holds') loadDevices();   // opened from an alert: what it was about, once unlocked
   }catch(e){ if(!sessionEnded(e)) m.textContent=e.message; }
 }
@@ -3994,7 +4086,7 @@ document.addEventListener('visibilitychange',()=>{if(tk&&vaultOpen&&document.vis
 if(typeof window!=='undefined'&&window.addEventListener)window.addEventListener('online',()=>{if(tk&&vaultOpen)loadVault()});
 setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden')loadNetwork()},60000);   // never behind a closed PIN gate
 let pollN=0;
-setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%15===0){loadShares();loadScanRequests();loadAgentTokenRequests();}}},4000);
+setInterval(()=>{if(tk&&vaultOpen&&document.visibilityState!=='hidden'){loadFillRequests();loadApprovals();if(++pollN%15===0){loadShares();loadScanRequests();loadAgentTokenRequests();loadWalletNotices();}}},4000);
 
 // ── Pair in person (QR): a contact confirmed face to face; only these can be shared with (red team item 6) ──────
 // One side shows a QR, the other scans it in this app. Only the shower's screen gets the 6-digit code; the scanner
