@@ -271,3 +271,28 @@ That case has one written exception path, modelled on Brain's declared pre-push-
 Until Aaron signs a release-controller charter lane naming these repos, they ship as they do today: a PR, an
 adversarial reviewer agent, merge, then a deploy through `dustforge-deploy`. The rule takes effect with that
 signature. The lane draft is in the tome.
+
+## Per-charge total ceiling and signed recovery (Conduit Wave 5)
+
+A tenant may pass `max_total_dd`, a positive safe integer, to ordinary
+`POST /api/services/charge` (including its dry run). This bounds the entire charge,
+including margin. It does not increase the caller's token or daily consent cap.
+An excessive price returns 409 before debit; malformed ceilings return 400. A
+replay above the requested ceiling also refuses without another debit. Without
+the field legacy behavior is preserved. `charge-on-request` retains its separate
+request budget contract; this field is not advertised for that endpoint.
+
+The transaction re-reads the active tenant/action and margin under its write lock
+and refuses changed configuration. The signed receipt includes `max_total_dd`
+when supplied. A dry run is not a price reservation. Public tenant metadata
+advertises `charge_contract: {version:1,max_total_dd:true,signed_lookup:true}`.
+Consumers requiring a ceiling must refuse older gateways, rather than trust an
+unknown ignored field. An exact-key tenant charge lookup includes the original
+`receipt` and `sig`; general history responses are unchanged. Verify issuer,
+signature, service, payer, idempotency key and amount before using recovery data.
+
+This implements payment primitives, not Conduit guardian enrollment, live release,
+refund authorization or a live 2-DD surcharge. A paid package may still fail at
+recipient decryption. Manual dispute intake in the Conduit SDK does not credit a
+wallet. The real `conduit-keys` tenant/consent and operator refund process remain
+separate acceptance gates.

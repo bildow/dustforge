@@ -286,7 +286,7 @@ module.exports = function registerServiceTenants(deps) {
   function tenantView(t) {
     const actions = db.prepare("SELECT * FROM service_actions WHERE tenant_id = ? AND status = 'active' ORDER BY action").all(t.id);
     const m = marginOf(t);
-    return { slug: t.slug, name: t.name, service_did: t.service_did, audience: 'svc:' + t.slug, margin_pct: m,
+    return { charge_contract: { version: 1, max_total_dd: true, signed_lookup: true }, slug: t.slug, name: t.name, service_did: t.service_did, audience: 'svc:' + t.slug, margin_pct: m,
       endpoint: t.endpoint || null, mcp_server: t.mcp_server || null, actions: actions.map(a => actionView(a, m)),
       follow_ups: { days: FOLLOW_UP_DAYS, max_portion_dd: MAX_PORTION_DD, budget: 'the caller\'s token (follow_up_dd at mint)' } };
   }
@@ -464,6 +464,10 @@ module.exports = function registerServiceTenants(deps) {
     const wholeStep = b.dry_run === true && b.follow_up_of !== undefined;
     const costMax = wholeStep ? CONSENT_CAP_MAX_DD : action.max_cost_dd;
     if (!Number.isInteger(cost) || cost < 1 || cost > costMax) return { status: 400, body: { error: wholeStep ? `cost_dd: an integer from 1 to ${costMax} (a whole step)` : `cost_dd: an integer from 1 to ${costMax} (this action's max_cost_dd)` } };
+    if (b.max_total_dd !== undefined && (!Number.isSafeInteger(b.max_total_dd) || b.max_total_dd < 1))
+      return { status: 400, body: { error: 'max_total_dd: a positive safe integer' } };
+    const ceilingRefusal = total => b.max_total_dd !== undefined && total > b.max_total_dd
+      ? { status: 409, body: { error: 'total price exceeds requested ceiling', refused: 'max_total_dd', max_total_dd: b.max_total_dd, required_dd: total } } : null;
     const dry = b.dry_run === true;
     const followUp = b.follow_up_of !== undefined;
     if (!dry && (typeof b.idempotency_key !== 'string' || !IDEM_RE.test(b.idempotency_key))) return { status: 400, body: { error: 'idempotency_key: 8-100 of [A-Za-z0-9._:-] (one per billed call; a retry sends the same key)' } };
@@ -498,7 +502,7 @@ module.exports = function registerServiceTenants(deps) {
           || (origin.request_charge_id && (requestStopped(origin) || requestConsentRevoked(origin) || !onRequestConsent(ov.did, tenant)))) {
         return { status: 409, body: { error: 'this follow-up was charged, but its token or consent has since been withdrawn: stop the work', charge_id: prior.charge_id } };
       }
-      return { status: 200, body: chargeView(prior, true) };
+      return ceilingRefusal(prior.dd) || { status: 200, body: chargeView(prior, true) };
     }
 
     if (prior) {
@@ -518,7 +522,7 @@ module.exports = function registerServiceTenants(deps) {
       if (!samePayer || prior.action !== action.action || prior.cost_dd !== cost) {
         return { status: 409, body: { error: 'this idempotency_key was already used for a different charge', charge_id: prior.charge_id } };
       }
-      return { status: 200, body: chargeView(prior, true) };
+      return ceilingRefusal(prior.dd) || { status: 200, body: chargeView(prior, true) };
     }
     const v = db.prepare('SELECT * FROM service_verifications WHERE tenant_id = ? AND token_jti = ?').get(tenant.id, followUp ? origin.token_jti : b.token_id);
     if (!v) return { status: 403, body: { error: 'verify this token first (POST /api/services/verify): a tenant charges only callers it verified' } };
@@ -553,6 +557,8 @@ module.exports = function registerServiceTenants(deps) {
     const followed = () => db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ? AND follows_charge_id IS NOT NULL').get(v.token_jti, tenant.id).s;
     const ordinary = () => db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ? AND follows_charge_id IS NULL').get(v.token_jti, tenant.id).s;
 
+    if (ceilingRefusal(chargeDd)) return ceilingRefusal(chargeDd);
+
     // A dry run ("survey the wallet" before a portion of work): every check a charge makes, nothing written.
     if (dry) {
       // A follow-up's dry run may ask about a whole step before it runs (the meter surveys one model call, which it then
@@ -574,6 +580,13 @@ module.exports = function registerServiceTenants(deps) {
     }
 
     const run = db.transaction(() => {
+      // Re-read price configuration under the write lock. Never debit a stale quote.
+      const current = tenantBySlug(tenant.slug), currentAction = current && actionOf(current, action.action);
+      const currentMargin = current && (followUp ? Math.min(origin.margin_pct, marginOf(current)) : marginOf(current));
+      if (!current || !currentAction || cost > currentAction.max_cost_dd || currentMargin !== chargeMargin) {
+        const e = new Error('price changed; retry with fresh configuration'); e.priceChanged = true; throw e;
+      }
+      if (ceilingRefusal(priceOf(cost, currentMargin))) { const e = new Error('total price ceiling'); e.priceChanged = true; throw e; }
       if (!followUp) { const spent = ordinary(); if (spent + dd > v.cap_dd) { const e = new Error('cap'); e.cap = { kind: 'token', spent, cap: v.cap_dd }; throw e; } }
       if (followUp) { const f = followed(); if (f + chargeDd > fuBudget) { const e = new Error('cap'); e.cap = { kind: 'follow_up', spent: f, cap: fuBudget }; throw e; } }
       const today = spentToday(v.did, tenant);
@@ -589,6 +602,7 @@ module.exports = function registerServiceTenants(deps) {
       if (!credit.ok) throw new Error('credit to the tenant wallet failed: ' + credit.error);
       const receipt = JSON.stringify({ v: RECEIPT_VERSION, type: 'dustforge_service_charge', charge_id, issuer, service: tenant.slug,
         payer: v.did, payee: tenant.service_did, action: action.action, cost_dd: cost, margin_pct: margin, dd,
+        ...(b.max_total_dd !== undefined ? { max_total_dd: b.max_total_dd } : {}),
         token_id: v.token_jti, idempotency_key: b.idempotency_key, ...(followUp ? { follows: origin.charge_id } : {}), at });
       const sig = crypto.sign(null, Buffer.from(RECEIPT_DOMAIN + receipt, 'utf8'), meterKey.privateKey).toString('base64url');
       db.prepare(`INSERT INTO service_charges (charge_id, tenant_id, payer_did, payee_did, action, cost_dd, margin_pct, dd, token_jti, delegation_id,
@@ -601,6 +615,7 @@ module.exports = function registerServiceTenants(deps) {
     let out;
     try { out = run.immediate(); }
     catch (e) {
+      if (e.priceChanged) return { status: 409, body: { error: e.message, refused: 'price_changed' } };
       if (e.cap && e.cap.kind === 'token') return { status: 402, body: { error: `this charge would pass the caller token's spend cap (${e.cap.spent} + ${dd} > ${e.cap.cap} DD); the caller mints a token with a higher cap_dd`, required_dd: dd, cap_dd: e.cap.cap, spent_dd: e.cap.spent, cap_exceeded: true,
         raise: raiseFor('token_cap', { slug: tenant.slug, cap: consent.daily_cap_dd, dd }) } };
       if (e.cap && e.cap.kind === 'follow_up') return { status: 402, body: { error: `this would pass the follow-up budget the caller's token carried (${e.cap.spent} + ${dd} > ${e.cap.cap} DD)`, follow_up_budget_exceeded: true, spent_dd: e.cap.spent, follow_up_dd: e.cap.cap,
@@ -775,7 +790,7 @@ module.exports = function registerServiceTenants(deps) {
     const key = typeof req.query.idempotency_key === 'string' ? req.query.idempotency_key : null;
     if (key !== null && (!tenant || !IDEM_RE.test(key))) return res.status(tenant ? 400 : 403).json({ error: tenant ? 'idempotency_key: 8-100 of [A-Za-z0-9._:-]' : 'only a tenant looks up its charges by key' });
     const received = !tenant ? [] : key !== null
-      ? db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? AND c.idempotency_key = ?`).all(tenant.id, key)
+      ? db.prepare(`SELECT ${cols}, c.payer_did AS payer, c.receipt, c.sig FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? AND c.idempotency_key = ?`).all(tenant.id, key)
       : db.prepare(`SELECT ${cols}, c.payer_did AS payer FROM service_charges c JOIN service_tenants t ON t.id = c.tenant_id WHERE c.tenant_id = ? ORDER BY c.id DESC LIMIT ?`).all(tenant.id, n);
     res.json({ ok: true, paid, ...(tenant ? { received } : {}) });
   });
