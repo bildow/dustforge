@@ -9992,6 +9992,9 @@ paneMail = require('./pane_mail')({ app, db, billing, getBearerIdentity, isAgent
 const svcTenants = require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
   approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd),
   spendAsks: () => spendAsks });
+// Per-wallet settings (wallet_settings.js, Aaron 2026-11-18): "Write agent instruction files" must be on before a pane or
+// agent is onboarded; the app asks the first time Fleet is opened or a pane/agent request shows.
+require('./wallet_settings')({ app, db, rateLimitStandard, getBearerIdentity, logSecurityEvent, personFor: (did) => svcTenants.personFor(did) });
 // Spend plans (spend_asks.js, Aaron 2026-11-18): a pane's multi-step spend asked once, one card with every step and the
 // total; approved with the PIN it is an allowance the listed consent steps draw on without a second card.
 const spendAsks = require('./spend_asks')({ app, db, rateLimitStandard, getBearerIdentity, approvals: () => useApprovals,
