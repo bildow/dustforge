@@ -5,9 +5,9 @@
 # The tarball arrives in /opt/backups/git-bundles/site-deploy/ through the git-bundles rrsync lane. Another account can
 # write there, so root only COPIES it (size-capped, no symlink followed, regular file only) into a root-private
 # directory, checks its sha256 there, and checks its members. The extraction itself runs WITHOUT root, as the web
-# root's owner (brain-deploy), reading the private copy on stdin: the kernel then enforces the lane. That user cannot
-# write evals/MCI-1 (mci-publish's) or outside its own trees, whatever a member name or a planted symlink says, and it
-# gains nothing it does not already have (it owns the web root today).
+# root's owner (dustanvil-site; brain-deploy until the 2026-11-18 revoke), reading the private copy on stdin: the
+# kernel then enforces the lane. That user cannot write evals/MCI-1 (mci-publish's) or outside its own trees, whatever
+# a member name or a planted symlink says, and it gains nothing it does not already have (it owns the web root).
 # Member rules, on the raw names as listed: one strict whole-name pattern (plain characters, no empty, '.' or '..'
 # component, no leading '/'); only regular files and directories; nothing under evals/MCI-1. Hardened from the EVAL
 # pane's deploy-root.sh (2026-11-16 review; re-review: `.//evals/...` slipped a prefix check, now impossible twice over).
@@ -18,7 +18,7 @@ umask 077
 export LC_ALL=C
 SRC_DIR=/opt/backups/git-bundles/site-deploy
 D=/var/www/dustanvil
-OWNER=brain-deploy; GROUP=www-data
+OWNER=dustanvil-site; GROUP=www-data   # since the Brain-lane revoke (2026-11-18): the site tree's own owner, no key lane
 LANE_DIR=evals/MCI-1
 MAX_BYTES=$((256*1024*1024))
 KEEP_PREV=3
