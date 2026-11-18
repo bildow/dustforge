@@ -191,6 +191,8 @@ module.exports = function registerUseApprovals(deps) {
         : action === 'register' ? `register service ${q.slug} (${q.name})`
         : action === 'owner-refill' ? `scheduled refill of ${q.amount_cents} DD ${q.cadence} to your own wallet`
         : action === 'owner-grant' ? `operator grant of ${q.amount_cents} DD to your own wallet`
+        // A spend plan (spend_asks.js): the total and every step with its cost; the full list is in the bound call.
+        : action === 'spend-plan' ? `spend plan ${q.total_dd} DD for "${String(q.purpose || '').slice(0, 40)}": ${(q.steps || []).map(s => `${s.label} ${s.dd}`).join('; ')}`
         : action === 'weaken' ? `weaken ${q.service}: ${(q.changes || []).map(c => c.action + (c.follow_ups ? ` (then bills ${c.follow_ups.join('/')} later)` : '')).join(', ')}`
         : action === 'mail-webhook' ? `let Resend report delivered/bounced/complained to ${q.endpoint}`
         : action === 'outside-ask' ? `your agent asks @${q.person} (your in-person contact) for ${q.secret || 'a secret'}: "${String(q.reason || '').slice(0, 60)}"`

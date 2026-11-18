@@ -9989,8 +9989,13 @@ paneMail = require('./pane_mail')({ app, db, billing, getBearerIdentity, isAgent
   mailReceipts: () => mailReceiptsApi, referral, stalwartAdmin: dustforge.stalwartRequest, emailAddrRe: EMAIL_ADDR_RE,
   ownFleetAgent, deviceSession, gateFresh, gateMissing, spendSingleUse });
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
-require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
-  approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd) });
+const svcTenants = require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
+  approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd),
+  spendAsks: () => spendAsks });
+// Spend plans (spend_asks.js, Aaron 2026-11-18): a pane's multi-step spend asked once, one card with every step and the
+// total; approved with the PIN it is an allowance the listed consent steps draw on without a second card.
+const spendAsks = require('./spend_asks')({ app, db, rateLimitStandard, getBearerIdentity, approvals: () => useApprovals,
+  approverFor: (did) => svcTenants.personFor(did), isAgentAuth });
 // DemiPass as a GitHub App (github_app.js): installation tokens minted from a custody key, their expiry and revocation.
 // A minted token's grant still stands — the same rules request-token and /use apply (#104 review L4, L6): the key
 // redeemable, unfrozen and still the minting owner's (not transferred); the scope active; for an agent, its delegation
