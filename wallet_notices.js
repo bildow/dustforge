@@ -10,8 +10,10 @@
 //   refill_failed    a refill rule could not run; when the paying wallet is short, `deposit` says how much it needs
 //   refill_capped    a silicon's automatic refills reached their daily cap
 //   deposit_due      a card-funded scheduled refill is due: the owner pays it with a deposit (no stored card yet)
+//   fund_ask         work waits on this wallet's balance (a service's payment refused as insufficient): fund_asks.js
+//                    files it for the pane that met the refusal, and closes it once the balance covers the need
 
-const KINDS = new Set(['refill_failed', 'refill_capped', 'deposit_due']);
+const KINDS = new Set(['refill_failed', 'refill_capped', 'deposit_due', 'fund_ask']);
 const OPEN_DAYS = 7;          // an open notice older than this is no longer shown (the scheduler raises it again if it still applies)
 const LIST_MAX = 10;
 
@@ -78,7 +80,9 @@ function dismiss(db, did, id, { now = Date.now() } = {}) {
 
 function view(r) {
   let data = {}; try { data = JSON.parse(r.data || '{}'); } catch (_) {}
-  return { kind: r.kind, notice_id: r.id, title: r.title, text: r.text, since: r.created_at, ...(data.deposit ? { deposit: data.deposit } : {}) };
+  return { kind: r.kind, notice_id: r.id, title: r.title, text: r.text, since: r.created_at, ...(data.deposit ? { deposit: data.deposit } : {}),
+    ...(r.kind === 'fund_ask' && data.fund ? { fund: data.fund } : {}),
+    ...(r.closed_at ? { closed_at: r.closed_at, closed_why: r.closed_why } : {}) };
 }
 
 function list(db, did, { now = Date.now() } = {}) {
@@ -87,4 +91,13 @@ function list(db, did, { now = Date.now() } = {}) {
   } catch (_) { return []; }
 }
 
-module.exports = { init, raise, clear, dismiss, list, addresses, KINDS };
+// Every notice of the last `days` days, closed ones included, newest first: the app's Requests page lists them so a
+// notification that was tapped away can be found again, with what became of it (Aaron 2026-11-18).
+function history(db, did, { days = 30, now = Date.now(), limit = 100 } = {}) {
+  try {
+    return db.prepare('SELECT * FROM wallet_notices WHERE did = ? AND created_at > ? ORDER BY id DESC LIMIT ?')
+      .all(did, new Date(now - days * 86400000).toISOString(), limit).map(view);
+  } catch (_) { return []; }
+}
+
+module.exports = { init, raise, clear, dismiss, list, history, addresses, view, KINDS };

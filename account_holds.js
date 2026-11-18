@@ -117,7 +117,8 @@ module.exports = function registerAccountHolds(deps) {
           text: `Mail forwarding to ${r.forward_to} was turned on. If this was not you, remove it in the Dustforge tab.` }));
     } catch (_) {}
     let wallet = [];
-    try { const W = deps.walletNotices && deps.walletNotices(); if (W) wallet = W.list(db, did); } catch (_) {}
+    // Fund asks ride in `approvals` instead (fund_asks.js alertsFor): one notification per ask, not two.
+    try { const W = deps.walletNotices && deps.walletNotices(); if (W) wallet = W.list(db, did).filter(n => n.kind !== 'fund_ask'); } catch (_) {}
     return fwd.concat(wallet);
   }
 
@@ -239,6 +240,9 @@ module.exports = function registerAccountHolds(deps) {
         }
       } catch (_) {}
     }
+    // Fund asks (fund_asks.js): work waiting on this wallet's balance. The app (1.12+) notifies about them like any
+    // request and opens on the vault, where their card is; their ids are in their own range (3e11+).
+    if (!key.revoked_at) { try { const F = deps.fundAsks && deps.fundAsks(); if (F) approvals.push(...F.alertsFor(ch.did)); } catch (_) {} }
     res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did), approvals });
   });
 

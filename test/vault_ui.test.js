@@ -2372,6 +2372,28 @@ test('edit value: grants that would end are confirmed with the server\'s left_to
 });
 
 // ── Wallet notices and card deposits (Aaron 2026-11-15) ──
+test('a fund ask is a card above every page: Grant (then Collect) for an operator-grant wallet, else Deposit; its text stays text; it counts as waiting', async () => {
+  const pg = page({ storage: signedIn, routes: fillRoutes({ requests: [] }) });
+  await settle();
+  const { walletNoticeCards, pendingCount } = pg.ctx;
+  const n = { kind: 'fund_ask', notice_id: 9, title: 'Fund your wallet: 18 DD short', text: 'x', since: '2026-11-18T03:35:30Z',
+    fund: { need_dd: 1483, balance_dd: 1465, short_dd: 18, grant_dd: 500, service: 'fleetgate', subject: 'review<img src=x onerror=alert(1)>', requester: 'a session of yours (says: <b>astra</b>)', lapses_at: '2026-11-19T03:35:30Z' },
+    deposit: { amount_dd: 18, why: 'fleetgate review' } };
+  const html = walletNoticeCards([n]);
+  assert.match(html, /Fund your wallet: 18 DD short/); assert.match(html, /fundGrant\(9,500\)/); assert.match(html, /Grant 500 DD/);
+  assert.doesNotMatch(html, /openDeposit/, 'an operator-grant wallet is offered Grant, not Deposit');
+  assert.match(html, /dismissNotice\(9\)/);
+  assert.doesNotMatch(html, /<img|<b>astra/, 'subject and requester are escaped');
+  const dep = walletNoticeCards([{ ...n, fund: { ...n.fund, grant_dd: undefined } }]);
+  assert.match(dep, /openDeposit\(/); assert.doesNotMatch(dep, /fundGrant/, 'any other wallet gets Deposit');
+  pg.ctx.fundGrantAp[9] = { id: 41, amount: 500 };
+  const col = walletNoticeCards([n]);
+  assert.match(col, /fundGrant\(9\)/); assert.match(col, /Collect 500 DD/); assert.match(col, /Approve request #41/);
+  pg.ctx.walletNoticesNow = [n, { kind: 'refill_failed', notice_id: 3 }];
+  const before = pendingCount(); pg.ctx.walletNoticesNow = [];
+  assert.equal(before - pendingCount(), 1, 'an open fund ask counts on the Requests badge; other notices do not');
+});
+
 test('a refill that failed shows as a card with Deposit and Dismiss; its text stays text; Settings shows only forwarding notices', async () => {
   const pg = page({ storage: signedIn, routes: fillRoutes({ requests: [] }) });
   await settle();

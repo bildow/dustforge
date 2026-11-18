@@ -9874,10 +9874,20 @@ const secretSharing = require('./secret_sharing')({
 // a card on the app's home, the phone's alerts poll (account_holds `notices`), and an email.
 const walletNotices = require('./wallet_notices');
 walletNotices.init(db);
-// GET /api/billing/notices — the signed-in wallet's open notices. POST /api/billing/notices/:id/dismiss closes one.
+// Fund asks (fund_asks.js, Aaron 2026-11-18): work waiting on this wallet's balance files a card the owner acts on;
+// it closes by itself once the balance covers the need.
+const fundAsks = require('./fund_asks')({
+  app, db, rateLimitStandard, getBearerIdentity, sendMail: fleetRoutes.sendMail,
+  balanceOf: (did) => billing.getDerivedBalance(db, did),
+  grantAllowed: (did) => fleetBilling.operatorGrantAllowed(did),
+});
+// GET /api/billing/notices — the signed-in wallet's open notices; ?all=1: the last 30 days, closed ones included (the
+// app's Requests page). POST /api/billing/notices/:id/dismiss closes one.
 app.get('/api/billing/notices', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-  res.json({ ok: true, notices: walletNotices.list(db, auth.did) });
+  fundAsks.sweep(auth.did);
+  const rows = req.query.all === '1' ? walletNotices.history(db, auth.did) : walletNotices.list(db, auth.did);
+  res.json({ ok: true, notices: fundAsks.decorate(auth.did, rows) });
 });
 app.post('/api/billing/notices/:id/dismiss', rateLimitStandard, (req, res) => {
   const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
@@ -9914,7 +9924,7 @@ const accountHolds = require('./account_holds')({
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
   guardians: () => recoveryGuardians, recovery: () => guardianRecovery, approvals: () => useApprovals,
-  walletNotices: () => walletNotices,
+  walletNotices: () => walletNotices, fundAsks: () => fundAsks,
 });
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({
