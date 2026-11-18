@@ -13,7 +13,7 @@ echo "== symlinks in the web root: $(find "$D" -type l 2>/dev/null | wc -l)"
 echo "== brain-deploy: account and groups"
 getent passwd brain-deploy | cut -d: -f1,6,7
 id brain-deploy 2>&1
-for f in /home/brain-deploy/.ssh/authorized_keys /etc/ssh/authorized_keys/brain-deploy; do
+for f in /var/lib/brain-deploy/.ssh/authorized_keys /home/brain-deploy/.ssh/authorized_keys /etc/ssh/authorized_keys/brain-deploy; do
   [ -e "$f" ] || continue
   echo "-- $f $(stat -c '%U:%G %a' "$f"): option NAMES and command= only (values of other options withheld)"
   while IFS= read -r l; do

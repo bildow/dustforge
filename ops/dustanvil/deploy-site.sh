@@ -5,20 +5,20 @@
 # The tarball arrives in /opt/backups/git-bundles/site-deploy/ through the git-bundles rrsync lane. Another account can
 # write there, so root only COPIES it (size-capped, no symlink followed, regular file only) into a root-private
 # directory, checks its sha256 there, and checks its members. The extraction itself runs WITHOUT root, as the web
-# root's owner (brain-deploy), reading the private copy on stdin: the kernel then enforces the lane. That user cannot
-# write evals/MCI-1 (mci-publish's) or outside its own trees, whatever a member name or a planted symlink says, and it
-# gains nothing it does not already have (it owns the web root today).
+# root's owner (dustanvil-site; brain-deploy until the 2026-11-18 revoke), reading the private copy on stdin: the
+# kernel then enforces the lane. That user cannot write evals/MCI-1 (mci-publish's) or outside its own trees, whatever
+# a member name or a planted symlink says, and it gains nothing it does not already have (it owns the web root).
 # Member rules, on the raw names as listed: one strict whole-name pattern (plain characters, no empty, '.' or '..'
 # component, no leading '/'); only regular files and directories; nothing under evals/MCI-1. Hardened from the EVAL
 # pane's deploy-root.sh (2026-11-16 review; re-review: `.//evals/...` slipped a prefix check, now impossible twice over).
-# Extracted files are new inodes owned by brain-deploy (tar unlinks and recreates); directories keep their metadata.
+# Extracted files are new inodes owned by the tree's owner (tar unlinks and recreates); directories keep their metadata.
 # Exit codes: 2 usage/source/hash, 3 refused member, 4 live tree unsafe, 5 extract failed.
 set -euo pipefail
 umask 077
 export LC_ALL=C
 SRC_DIR=/opt/backups/git-bundles/site-deploy
 D=/var/www/dustanvil
-OWNER=brain-deploy; GROUP=www-data
+OWNER=dustanvil-site; GROUP=www-data   # since the Brain-lane revoke (2026-11-18): the site tree's own owner, no key lane
 LANE_DIR=evals/MCI-1
 MAX_BYTES=$((256*1024*1024))
 KEEP_PREV=3
@@ -61,7 +61,7 @@ while IFS= read -r m; do
 done < "$W/list.n"
 echo "ok   $n members: regular files and directories only, strict names, nothing under $LANE_DIR"
 
-# Defence in depth: the live tree holds no symlink outside the lane (brain-deploy's rsync munges any it sends).
+# Defence in depth: the live tree holds no symlink outside the lane (the lanes' rsync munges any they send).
 links=$(find "$D" -path "$D/$LANE_DIR" -prune -o -type l -print | wc -l)
 [ "$links" = 0 ] || { echo "refused: the live tree holds $links symlink(s); remove them first"; exit 4; }
 echo "ok   live tree holds no symlink"
