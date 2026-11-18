@@ -1012,14 +1012,30 @@ module.exports = function registerServiceTenants(deps) {
     // charge (re-review L). An agent's consent is its creator's to approve, with the creator's PIN and phone.
     const barrel = approver === auth.did ? barrelRefusal(auth.did, cap) : null;
     if (barrel) return res.status(barrel.statusCode || 403).json(barrel.body || { error: barrel.message });
-    const g = personApproval('svc:demipass:consent', `let a wallet pay ${t.slug}`, approver, 'elevated', { did: auth.did, label: '' }, 'consent', 'demipass',
-      { service: t.slug, wallet: auth.did, daily_cap_dd: cap, ...(orc !== null ? { on_request_cap_dd: orc } : {}) }, b, null);
-    if (!g.ok) return res.status(g.status).json(g.body);
+    // A consent step of an approved spend plan (spend_asks.js): the owner's PIN approved a card naming this service and
+    // a cap at least this high, so the plan's approval stands for the consent and no second card is filed. The figures
+    // may be lower than the step's, never higher, and a step is used once.
+    let g;
+    if (b.spend_ask_id !== undefined && b.spend_ask_id !== null) {
+      const S = deps.spendAsks && deps.spendAsks();
+      if (!S) return res.status(503).json({ error: 'spend plans unavailable' });
+      const c = S.cover(auth.did, b.spend_ask_id, { kind: 'consent', service: t.slug, daily_cap_dd: cap, on_request_cap_dd: orc });
+      if (!c.ok) return res.status(409).json({ error: c.error, spend_ask_id: b.spend_ask_id });
+      if (c.approver !== approver) return res.status(409).json({ error: 'the spend plan was approved by someone else than the person who answers for this wallet now' });
+      g = { ok: true, approval_id: c.approval_id, plan: c };
+    } else {
+      g = personApproval('svc:demipass:consent', `let a wallet pay ${t.slug}`, approver, 'elevated', { did: auth.did, label: '' }, 'consent', 'demipass',
+        { service: t.slug, wallet: auth.did, daily_cap_dd: cap, ...(orc !== null ? { on_request_cap_dd: orc } : {}) }, b, null);
+      if (!g.ok) return res.status(g.status).json(g.body);
+    }
     const at = nowIso();
     const id = db.transaction(() => {
       db.prepare("UPDATE service_consents SET status = 'replaced', revoked_at = ? WHERE payer_did = ? AND tenant_id = ? AND status = 'active'").run(at, auth.did, t.id);
-      return Number(db.prepare('INSERT INTO service_consents (payer_did, tenant_id, daily_cap_dd, approved_by, approval_id, created_at, on_request_cap_dd) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      const cid = Number(db.prepare('INSERT INTO service_consents (payer_did, tenant_id, daily_cap_dd, approved_by, approval_id, created_at, on_request_cap_dd) VALUES (?, ?, ?, ?, ?, ?, ?)')
         .run(auth.did, t.id, cap, approver, g.approval_id, at, orc).lastInsertRowid);
+      // The plan's step is used in the same transaction as the grant (throws → nothing granted, step kept).
+      if (g.plan) deps.spendAsks().markCovered(g.plan.spend_ask_id, g.plan.step, `consent ${t.slug} ${cap} DD/day → consent ${cid}`);
+      return cid;
     })();
     event('service_consent', auth.did, { consent_id: id, service: t.slug, daily_cap_dd: cap, on_request_cap_dd: orc, approval_id: g.approval_id });
     res.status(201).json({ ok: true, consent_id: id, service: t.slug, daily_cap_dd: cap, on_request_cap_dd: orc });
@@ -1160,7 +1176,7 @@ module.exports = function registerServiceTenants(deps) {
     res.json({ valid: true, on_record: !!row && row.receipt === receipt, charge: p });
   });
 
-  return { verify, charge, chargeOnRequest, verifyServiceToken, priceOf, tenantBySlug, SERVICE_MARGIN_PCT, issuer };
+  return { verify, charge, chargeOnRequest, verifyServiceToken, priceOf, tenantBySlug, SERVICE_MARGIN_PCT, issuer, personFor };
 };
 
 module.exports.SERVICE_MARGIN_PCT = SERVICE_MARGIN_PCT;
