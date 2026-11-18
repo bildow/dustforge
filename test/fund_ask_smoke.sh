@@ -59,8 +59,8 @@ call POST /api/billing/fund-asks "$OWN" "$(jbody need_dd 1000 service fleetgate 
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J covered)" = True ] && ok "a need the balance already covers files nothing (200 covered)" || fail "covered: $CODE $BODY"
 call POST /api/billing/fund-asks "$AG" "$(jbody need_dd 500 service fleetgate subject x1)"
 [ "$CODE" = 409 ] && echo "$BODY" | grep -q "network/topups" && ok "an agent wallet is pointed to its fleet owner's top-up ask (409)" || fail "agent: $CODE $BODY"
-for b in '{"need_dd":0,"service":"fleetgate","subject":"x"}' '{"need_dd":5000,"service":"Fleet Gate","subject":"x"}' '{"need_dd":5000,"service":"fleetgate","subject":"<img src=x>"}' '{"need_dd":5000,"service":"fleetgate","subject":"https://evil.example/pay"}' '{"need_dd":5000,"service":"fleetgate","subject":"x","lapses_at":"2001-01-01T00:00:00Z"}'; do
-  call POST /api/billing/fund-asks "$OWN" "$b"; [ "$CODE" = 400 ] || fail "bad body accepted: $b → $CODE"; done; ok "bad need, service, subject (markup or a link) or lapse → 400"
+for b in '{"need_dd":0,"service":"fleetgate","subject":"x"}' '{"need_dd":5000,"service":"Fleet Gate","subject":"x"}' '{"need_dd":5000,"service":"fleetgate","subject":"<img src=x>"}' '{"need_dd":5000,"service":"fleetgate","subject":"https://evil.example/pay"}' '{"need_dd":5000,"service":"fleetgate","subject":"pay-now.evil.com"}' '{"need_dd":5000,"service":"fleetgate","subject":"x@evil.com"}' '{"need_dd":5000,"service":"fleetgate","subject":"x","lapses_at":"2001-01-01T00:00:00Z"}'; do
+  call POST /api/billing/fund-asks "$OWN" "$b"; [ "$CODE" = 400 ] || fail "bad body accepted: $b → $CODE"; done; ok "bad need, service, subject (markup, a link, a domain or an address) or lapse → 400"
 call POST /api/billing/fund-asks "" "$(jbody need_dd 5000 service fleetgate subject x)"; [ "$CODE" = 401 ] && ok "no token → 401" || fail "noauth: $CODE"
 
 # 2. the card: what is short now, Grant for an operator-grant wallet, Deposit for any other

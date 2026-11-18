@@ -26,8 +26,9 @@ const LAPSE_DEFAULT_SEC = 24 * 3600;
 const LAPSE_MAX_SEC = 7 * 86400;
 const GRANT_STEP = 500, GRANT_MAX = 100000;
 const SERVICE_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
-// No ':' or '/': a subject never reads as a link in the owner's mail or on the phone (#133 review L2).
-const SUBJECT_RE = /^[A-Za-z0-9][A-Za-z0-9._#@+-]{0,79}$/;
+// No ':', '/', '.' or '@': a subject never reads as a link, a domain or an address in the owner's mail or on the phone
+// (#133 review L2, r2).
+const SUBJECT_RE = /^[A-Za-z0-9][A-Za-z0-9_#+-]{0,79}$/;
 const OPEN_DAYS = 7;                     // as wallet_notices: an ask is never open longer than the app shows it (#133 review M1)
 const DISMISS_WALLET_QUIET = 2;          // two dismissed in 24 h: the wallet takes no more fund asks that day (#133 review L1)
 
@@ -105,15 +106,18 @@ module.exports = function registerFundAsks({ app, db, rateLimitStandard, getBear
     if (!Number.isInteger(need) || need < 1 || need > NEED_MAX) return res.status(400).json({ error: `need_dd: a whole number of DD, 1 to ${NEED_MAX} (the balance the work needs)` });
     const service = String(b.service || ''), subject = String(b.subject || '');
     if (!SERVICE_RE.test(service)) return res.status(400).json({ error: 'service: lowercase letters, digits and hyphens (e.g. fleetgate)' });
-    if (!SUBJECT_RE.test(subject)) return res.status(400).json({ error: 'subject: what waits, e.g. a review id (letters, digits and . _ : / # @ + -, at most 80)' });
+    if (!SUBJECT_RE.test(subject)) return res.status(400).json({ error: 'subject: what waits, e.g. a review id (letters, digits and _ # + -, at most 80)' });
     let lapses = iso(now() + LAPSE_DEFAULT_SEC * 1000);
     if (b.lapses_at !== undefined) {
       const t = Date.parse(String(b.lapses_at));
       if (!Number.isFinite(t) || t <= now()) return res.status(400).json({ error: 'lapses_at: a time in the future (ISO 8601)' });
       lapses = iso(Math.min(t, now() + LAPSE_MAX_SEC * 1000));
     }
+    // Filing needs the real balance: an unreadable one would mail "the wallet holds 0 DD" and size the Grant to the
+    // whole need (#133 r2). Reads elsewhere fall back to 0; this one refuses.
+    let bal; try { bal = Number(balanceRaw(did)); } catch (_) { bal = NaN; }
+    if (!Number.isFinite(bal)) return res.status(503).json({ error: 'the wallet balance could not be read; nothing was filed. Try again shortly.' });
     sweep(did);
-    const bal = balanceOf(did);
     if (bal >= need) return res.json({ ok: true, covered: true, balance_dd: bal, need_dd: need });
     const said = cleanLabel(b.from);
     const who = cleanLabel((auth.decoded && (auth.decoded.agent_label || auth.decoded.label)) || auth.agent_name || '') || 'a session of yours';
