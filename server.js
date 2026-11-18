@@ -3031,6 +3031,10 @@ app.get('/api/stripe/topup-success', async (req, res) => {
     if (meta.type !== 'wallet_topup' || session.payment_status !== 'paid') {
       return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Payment not confirmed</h1></body></html>');
     }
+    // A test-mode payment (Stripe's public test cards) credits nothing (stripe-service creditsAllowed).
+    if (!stripeService.creditsAllowed(session)) {
+      return res.send('<html><body style="background:#08111a;color:#e7f1fb;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center"><div><h1>Test payment</h1><p style="color:#9cb4c9">Stripe is in test mode: the checkout worked, and no DD was credited.</p></div></body></html>');
+    }
 
     const amount = ddUnits.ddForUsdCents(meta.amount_cents);
     // Same key as the webhook, so the page and the webhook credit a top-up once between them.
@@ -3098,15 +3102,20 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             // (100 DD) comes out of it and the new user nets 850 DD. If NOT referred,
             // the user keeps the full 950 DD. Idempotent on the Stripe session so a
             // webhook replay can't double-grant.
+            // A test-mode payment (Stripe's public test cards) creates the account and mailbox but credits no DD: no
+            // grant, no referral payout, no lightweight-referral accrual or deposit (#126 review H1). Signups keep
+            // working while the server's key is a test key; they just start at 0 DD.
+            const _paid = stripeService.creditsAllowed(session);
+            if (!_paid) console.warn(`[stripe-webhook] account ${pending.username} ${session.id}: test-mode payment, created with no DD`);
             const _grant = ddUnits.ddForUsdCents(stripeService.PRICES.account_single) - (referredBy ? referral.REFERRAL_PAYOUT_CENTS : 0);
-            billing.creditBalance(db, id.did, _grant, 'onboarding_grant', `Onboarding: ${_grant} DD ($1 signup)`, 'onboard_' + session.id);
-            try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: _grant, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {}
-            if (referredBy) {
+            if (_paid) billing.creditBalance(db, id.did, _grant, 'onboarding_grant', `Onboarding: ${_grant} DD ($1 signup)`, 'onboard_' + session.id);
+            if (_paid) { try { require('./dd_ledger').recordCredit(db, { did: id.did, amount_cents: _grant, source: 'funded_signup', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {} }
+            if (_paid && referredBy) {
               // FUNDED referral payout to an existing account, tied to this funding event
               // so a chargeback claws back both the grant and this 100 DD payout.
               const _rp = referral.processReferralPayout(db, referredBy, id.did, pending.username);
               if (_rp && _rp.ok && _rp.credited > 0) { try { require('./dd_ledger').recordCredit(db, { did: referredBy, amount_cents: referral.REFERRAL_PAYOUT_CENTS, source: 'referral_payout', origin_event_id: session.id, chargebackable: 1 }); } catch (_) {} }
-            } else if (_refToken) {
+            } else if (_paid && _refToken) {
               // Invite hash with NO account = lightweight sponsor: accrue 100 DD (capped)
               // against their email hash, tied to THIS funding event for clawback. They
               // collect it when they mint their own account (POST /api/referral/claim).
@@ -3115,7 +3124,7 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
             // AUTO-CLAIM: if the minter came through their own claim link
             // (/signup?claim=…), deposit the lightweight referral DD they earned
             // inviting others — one-time, on mint, no separate call. (+100 → 950/1050.)
-            if (pending.claim_hash) {
+            if (_paid && pending.claim_hash) {   // a test-mode mint collects later, via POST /api/referral/claim
               try {
                 const _dep = require('./onboarding').depositLightweightReferral(db, pending.claim_hash, id.did, billing, require('./dd_ledger'));
                 if (_dep > 0) console.log(`[referral] auto-deposited ${_dep} DD to ${pending.username} on mint`);
@@ -3126,6 +3135,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           }
         }
       } catch (e) { console.error('[stripe-webhook] error:', e.message); }
+    } else if (['wallet_topup', 'fleet_topup', 'founders_package'].includes(meta.type) && !stripeService.creditsAllowed(session)) {
+      // A test-mode payment credits no DD and grants no founder status (stripe-service creditsAllowed).
+      console.warn(`[stripe-webhook] ${meta.type} ${session.id}: test-mode payment, nothing credited`);
     } else if (meta.type === 'wallet_topup') {
       const idempotencyKey = `topup_${session.id}`;
       const dd = ddUnits.ddForUsdCents(meta.amount_cents);
@@ -3211,7 +3223,9 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     const subId = invoice.subscription;
     const customerEmail = invoice.customer_email || '';
 
-    if (subId) {
+    if (subId && !stripeService.creditsAllowed(invoice)) {
+      console.warn(`[stripe-webhook] invoice ${invoice.id}: test-mode renewal, nothing credited`);
+    } else if (subId) {
       const isRecurring = invoice.billing_reason === 'subscription_cycle';
       if (isRecurring) {
         // DID-bound: look up subscription metadata for the DID, fall back to email
@@ -9856,6 +9870,43 @@ const secretSharing = require('./secret_sharing')({
   sendMail: fleetRoutes.sendMail,  // pending transfers: both sides are mailed at start and end (red team item 6)
   onTransferred: (secretId) => githubApp.revokeFor({ secretId }, 'key transferred'),   // github_app.js: live installation tokens die with the old owner's grants
 });
+// Wallet notices (wallet_notices.js, Aaron 2026-11-15): a refill rule that cannot run tells the wallet that pays for it —
+// a card on the app's home, the phone's alerts poll (account_holds `notices`), and an email.
+const walletNotices = require('./wallet_notices');
+walletNotices.init(db);
+// GET /api/billing/notices — the signed-in wallet's open notices. POST /api/billing/notices/:id/dismiss closes one.
+app.get('/api/billing/notices', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  res.json({ ok: true, notices: walletNotices.list(db, auth.did) });
+});
+app.post('/api/billing/notices/:id/dismiss', rateLimitStandard, (req, res) => {
+  const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  if (auth.silicon) return res.status(403).json({ error: 'the wallet owner dismisses notices' });
+  if (!/^\d{1,12}$/.test(String(req.params.id))) return res.status(400).json({ error: 'notice id' });
+  res.json({ ok: walletNotices.dismiss(db, auth.did, req.params.id) });
+});
+
+// Deposits by card (stub, Aaron 2026-11-15): the Stripe top-up checkout, behind a switch. DEPOSITS=off (default) shows
+// the button and says deposits are not on yet; DEPOSITS=test or DEPOSITS=live opens Stripe Checkout when the server's
+// Stripe key is of that mode. A checkout credits DD only when Stripe says the payment was live (stripe-service
+// creditsAllowed): a test-card payment credits nothing unless STRIPE_TEST_CREDITS=1 (a staging box, never prod).
+// Any wallet may ask for a link for itself, an agent included: the link is what it hands to the person who pays.
+app.get('/api/billing/deposit', rateLimitStandard, (req, res) => {
+  res.json({ ok: true, ...stripeService.depositConfig() });
+});
+app.post('/api/billing/deposit', rateLimitStandard, async (req, res) => {
+  const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
+  const cfg = stripeService.depositConfig();
+  if (!cfg.enabled) return res.status(503).json({ error: cfg.reason, deposits: cfg.mode });
+  const usd = Number((req.body || {}).amount_usd_cents);
+  if (!cfg.amounts_usd_cents.includes(usd)) return res.status(400).json({ error: `amount_usd_cents: one of ${cfg.amounts_usd_cents.join(', ')}` });
+  try {
+    const w = db.prepare('SELECT username FROM identity_wallets WHERE did = ?').get(auth.did) || {};
+    const c = await stripeService.createTopupCheckout(auth.did, usd, w.username || '');
+    res.json({ ok: true, url: c.url, dd: ddUnits.ddForUsdCents(usd), mode: cfg.mode, credits_dd: cfg.credits_dd });
+  } catch (e) { res.status(502).json({ error: 'the checkout could not be opened: ' + e.message }); }
+});
+
 // Account holds (red team item 9): PIN reset by password, a new phone, a recovery-email change and guardian recovery
 // wait 48 hours while a phone is linked, cancelable from any eligible phone without a session (account_holds.js).
 const accountHolds = require('./account_holds')({
@@ -9863,6 +9914,7 @@ const accountHolds = require('./account_holds')({
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
   guardians: () => recoveryGuardians, recovery: () => guardianRecovery, approvals: () => useApprovals,
+  walletNotices: () => walletNotices,
 });
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({
@@ -9952,14 +10004,14 @@ function approvalCaller(req) {
 // Refill / token-warning / work-link-expiry pass: every 5 minutes, first pass 30s after boot.
 function fleetRefillPass() {
   try {
-    const r = fleetBilling.runRefills(db, billing, { ledger: require('./dd_ledger'), mailer: fleetRoutes.sendMail });
+    const r = fleetBilling.runRefills(db, billing, { ledger: require('./dd_ledger'), mailer: fleetRoutes.sendMail, notices: walletNotices });
     const refilled = (r.silicons || []).filter(x => x.ok);
     if ((r.owner || []).length || refilled.length || (r.token_warnings || []).length || r.work_links_expired) {
       console.log('[fleet] pass:', JSON.stringify({ owner: r.owner, refilled, warned: r.token_warnings, expired_links: r.work_links_expired }));
     }
   } catch (e) { console.error('[fleet] refill pass failed:', e.message); }
 }
-setTimeout(fleetRefillPass, 30 * 1000);
+setTimeout(fleetRefillPass, Number(process.env.FLEET_PASS_FIRST_MS) > 0 ? Number(process.env.FLEET_PASS_FIRST_MS) : 30 * 1000);   // smokes shorten the first pass
 setInterval(fleetRefillPass, 5 * 60 * 1000);
 
 

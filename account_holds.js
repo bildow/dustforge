@@ -106,13 +106,19 @@ module.exports = function registerAccountHolds(deps) {
 
   // Things the phone should show that are not holds (item 6b): mail forwarding rules turned on in the last 48 hours —
   // the window in which codes and reset links do not go through them, and the one to notice a stranger's rule in.
+  // Wallet notices (wallet_notices.js: a refill that failed, a deposit due) ride along, so the phone's alerts poll
+  // notifies about them too; each carries a numeric notice_id the phone keys its notification by.
   function notices(did) {
+    let fwd = [];
     try {
-      return db.prepare(`SELECT id, forward_to, filter_from, COALESCE(activated_at, created_at) AS since FROM forward_relays
+      fwd = db.prepare(`SELECT id, forward_to, filter_from, COALESCE(activated_at, created_at) AS since FROM forward_relays
           WHERE did = ? AND status = 'active' AND julianday(COALESCE(activated_at, created_at)) > julianday('now', '-2 days') ORDER BY id DESC LIMIT 10`).all(did)
         .map(r => ({ kind: 'forward', rule_id: r.id, forward_to: r.forward_to, filter_from: r.filter_from, since: r.since,
           text: `Mail forwarding to ${r.forward_to} was turned on. If this was not you, remove it in the Dustforge tab.` }));
-    } catch (_) { return []; }
+    } catch (_) {}
+    let wallet = [];
+    try { const W = deps.walletNotices && deps.walletNotices(); if (W) wallet = W.list(db, did); } catch (_) {}
+    return fwd.concat(wallet);
   }
 
   // ── eligibility ────────────────────────────────────────────────────────────────────────────────────────────────
