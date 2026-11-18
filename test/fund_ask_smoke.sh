@@ -59,14 +59,15 @@ call POST /api/billing/fund-asks "$OWN" "$(jbody need_dd 1000 service fleetgate 
 [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J covered)" = True ] && ok "a need the balance already covers files nothing (200 covered)" || fail "covered: $CODE $BODY"
 call POST /api/billing/fund-asks "$AG" "$(jbody need_dd 500 service fleetgate subject x1)"
 [ "$CODE" = 409 ] && echo "$BODY" | grep -q "network/topups" && ok "an agent wallet is pointed to its fleet owner's top-up ask (409)" || fail "agent: $CODE $BODY"
-for b in '{"need_dd":0,"service":"fleetgate","subject":"x"}' '{"need_dd":5000,"service":"Fleet Gate","subject":"x"}' '{"need_dd":5000,"service":"fleetgate","subject":"<img src=x>"}' '{"need_dd":5000,"service":"fleetgate","subject":"x","lapses_at":"2001-01-01T00:00:00Z"}'; do
-  call POST /api/billing/fund-asks "$OWN" "$b"; [ "$CODE" = 400 ] || fail "bad body accepted: $b → $CODE"; done; ok "bad need, service, subject or lapse → 400"
+for b in '{"need_dd":0,"service":"fleetgate","subject":"x"}' '{"need_dd":5000,"service":"Fleet Gate","subject":"x"}' '{"need_dd":5000,"service":"fleetgate","subject":"<img src=x>"}' '{"need_dd":5000,"service":"fleetgate","subject":"https://evil.example/pay"}' '{"need_dd":5000,"service":"fleetgate","subject":"x","lapses_at":"2001-01-01T00:00:00Z"}'; do
+  call POST /api/billing/fund-asks "$OWN" "$b"; [ "$CODE" = 400 ] || fail "bad body accepted: $b → $CODE"; done; ok "bad need, service, subject (markup or a link) or lapse → 400"
 call POST /api/billing/fund-asks "" "$(jbody need_dd 5000 service fleetgate subject x)"; [ "$CODE" = 401 ] && ok "no token → 401" || fail "noauth: $CODE"
 
 # 2. the card: what is short now, Grant for an operator-grant wallet, Deposit for any other
 call GET /api/billing/notices "$OWN"
 [ "$(echo "$BODY" | J notices.0.kind)" = fund_ask ] && [ "$(echo "$BODY" | J notices.0.fund.short_dd)" = 35 ] && [ "$(echo "$BODY" | J notices.0.fund.grant_dd)" = 500 ] \
-  && [ "$(echo "$BODY" | J notices.0.fund.subject)" = "$REV" ] && ok "the app's card: fleetgate $REV, 35 DD short, Grant 500 DD offered" || fail "card: $BODY"
+  && [ "$(echo "$BODY" | J notices.0.fund.subject)" = "$REV" ] && [ "$(echo "$BODY" | J notices.0.fund.grant_fleet)" = owner-agents ] \
+  && ok "the app's card: fleetgate $REV, 35 DD short, Grant 500 DD through the owner's fleet" || fail "card: $BODY"
 echo "$BODY" | J notices.0.fund.requester | grep -q "says: astra" && ok "the pane's own label is shown as what it says, not as who it is" || fail "requester: $BODY"
 call POST /api/billing/fund-asks "$STR" "$(jbody need_dd 400 service fleetgate subject s-1)"; call GET /api/billing/notices "$STR"
 [ "$(echo "$BODY" | J notices.0.fund.grant_dd)" = None ] && [ "$(echo "$BODY" | J notices.0.deposit.amount_dd)" = 300 ] && ok "a wallet without operator grants gets Deposit 300 DD, no Grant" || fail "stranger card: $BODY"
@@ -99,6 +100,10 @@ call POST /api/billing/fund-asks "$OWN" "$(jbody need_dd 90000 service fleetgate
 python3 -c "import sqlite3,sys,json; c=sqlite3.connect(sys.argv[1]); r=c.execute(\"SELECT id,data FROM wallet_notices WHERE nkey='fund:fleetgate:cap-2'\").fetchone(); d=json.loads(r[1]); d['fund']['lapses_at']='2026-01-01T00:00:00.000Z'; c.execute('UPDATE wallet_notices SET data=? WHERE id=?',(json.dumps(d),r[0])); c.commit()" "$DB_PATH"
 call GET /api/billing/fund-asks/$(Q "SELECT id FROM wallet_notices WHERE nkey='fund:fleetgate:cap-2'") "$OWN"
 [ "$(echo "$BODY" | J fund_ask.status)" = lapsed ] && ok "an ask past its lapse closes as 'lapsed'" || fail "lapse: $BODY"
+call POST /api/billing/fund-asks "$OWN" "$(jbody need_dd 90000 service fleetgate subject cap-5)"; C5=$(echo "$BODY" | J notice_id)
+call POST /api/billing/notices/$C5/dismiss "$OWN"
+call POST /api/billing/fund-asks "$OWN" "$(jbody need_dd 90000 service fleetgate subject cap-6)"
+[ "$CODE" = 409 ] && echo "$BODY" | grep -q "twice" && ok "two dismissed in a day: the wallet takes no new fund ask under any subject (409)" || fail "wallet quiet: $CODE $BODY"
 
 # 6. the phone: the D-signed alerts poll lists the open ask beside the approvals (id 3e11+), and not twice
 node -e 'const c=require("crypto"),fs=require("fs");for(const n of ["d","p"]){const {privateKey,publicKey}=c.generateKeyPairSync("ec",{namedCurve:"prime256v1"});
@@ -119,5 +124,9 @@ sys.exit(0 if len(a)==1 and a[0]["title"].startswith("fund your wallet:") and le
 echo "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if not [x for x in d.get("approvals",[]) if x["id"] in (300000000000+int(sys.argv[1]),)] else 1)' "$FA" \
   && ok "a covered ask is not on the phone" || fail "covered on phone"
 
+# an ask filed more than 7 days ago is closed, so the phone never alerts about a card the app no longer shows
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE wallet_notices SET created_at='2026-01-01T00:00:00.000Z' WHERE id=?\", (int(sys.argv[2]),)); c.commit()" "$DB_PATH" "$C3"
+call POST /api/billing/fund-asks "$OWN" "$(jbody need_dd 90000 service fleetgate subject cap-3)"
+call GET /api/billing/fund-asks/$C3 "$OWN"; [ "$(echo "$BODY" | J fund_ask.status)" = lapsed ] && ok "an ask older than 7 days closes (lapsed), even when its work files again" || fail "old ask: $BODY"
 grep -q -i "unhandled\|TypeError\|ReferenceError" "$S/server.log" && { fail "server errors"; grep -i -m5 "TypeError\|ReferenceError" "$S/server.log"; }
 echo "$fails failure(s)"; exit $(( fails > 0 ))

@@ -2593,7 +2593,7 @@ function openRequests(status){
 }
 // Agent-token states: creating (approved, the agent is being made) counts as approved; failed with denied.
 // Wallet notices: open waits; covered/resolved count as approved, dismissed/superseded as denied, lapsed as expired.
-const reqStatusOf=(s)=>{ s=String(s||''); return /^(pending|open)$/.test(s)?'pending':/^(approved|used|claimed|active|creating|covered|resolved)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed|undone|dismissed|superseded)$/.test(s)?'denied':/^(expired|lapsed)$/.test(s)?'expired':s; };
+const reqStatusOf=(s)=>{ s=String(s||''); return /^(pending|open)$/.test(s)?'pending':/^(approved|used|claimed|active|creating|covered|resolved|refill ran|above threshold)$/.test(s)?'approved':/^(denied|cancelled|revoked|failed|undone|dismissed|superseded)$/.test(s)?'denied':/^(expired|lapsed)$/.test(s)?'expired':s; };
 // One load at a time; a load asked for while one runs runs once more after it, so a decision is never shown stale
 // (#99 re-review L2), and a finished load clears only its own flag (L3: not the next account's).
 let reqAgain=false;
@@ -3282,8 +3282,9 @@ var walletNoticesNow=[];
 var fundGrantAp={};   // notice id → {id: approval id, amount}
 function fundAskCard(n){
   const f=n.fund||{}, ap=fundGrantAp[n.notice_id];
-  const grant=f.grant_dd?(ap?'<button class="btn-primary" onclick="fundGrant('+Number(n.notice_id)+')">Collect '+dd(ap.amount)+' DD</button> '
-      :'<button class="btn-primary" onclick="fundGrant('+Number(n.notice_id)+','+Number(f.grant_dd)+')">Grant '+dd(f.grant_dd)+' DD</button> ')
+  // Grant only when the server names the fleet it goes through (an owned, active fleet: #133 review M2).
+  const grant=f.grant_dd&&f.grant_fleet?(ap?'<button class="btn-primary" onclick="fundGrant('+Number(n.notice_id)+')">Collect '+dd(ap.amount)+' DD</button> '
+      :'<button class="btn-primary" onclick="fundGrant('+Number(n.notice_id)+','+Number(f.grant_dd)+','+jsArg(f.grant_fleet)+')">Grant '+dd(f.grant_dd)+' DD</button> ')
     :(n.deposit?'<button class="btn-primary" onclick="openDeposit('+esc(JSON.stringify(n.deposit))+')">Deposit</button> ':'');
   return '<div class="fill-req fund-ask" style="border-color:var(--orange)"><div><b>Fund your wallet: '+dd(f.short_dd)+' DD short</b></div>'
     +'<div style="font-size:0.75rem">'+esc(f.service||'')+' <b>'+esc(f.subject||'')+'</b> waits for a balance of '+dd(f.need_dd)+' DD; you hold '+dd(f.balance_dd)+' DD. It resumes by itself once the wallet is funded.</div>'
@@ -3291,12 +3292,13 @@ function fundAskCard(n){
     +(ap?'<div style="font-size:0.72rem;color:var(--yellow)">Approve request #'+Number(ap.id)+' (above) with your PIN, then tap Collect.</div>':'')
     +'<div class="fr-row">'+grant+'<button class="btn-ghost" onclick="dismissNotice('+Number(n.notice_id)+')">Dismiss</button></div></div>';
 }
-async function fundGrant(nid, amount){
-  const ap=fundGrantAp[nid], body={amount_cents:Number(ap?ap.amount:amount)};
+async function fundGrant(nid, amount, fleet){
+  const ap=fundGrantAp[nid], body={amount_cents:Number(ap?ap.amount:amount)}, slug=ap?ap.fleet:fleet;
   if(ap) body.approval_id=ap.id;
+  if(!slug){ alert('No fleet of yours to grant through.'); return; }
   try{
-    const r=await api('POST','/api/fleet/'+encodeURIComponent(fleetSlug)+'/owner-grant',body);
-    if(r&&r.status==='approval_pending'){ fundGrantAp[nid]={id:r.approval_id,amount:body.amount_cents}; loadApprovals&&loadApprovals(); loadWalletNotices(); return; }
+    const r=await api('POST','/api/fleet/'+encodeURIComponent(slug)+'/owner-grant',body);
+    if(r&&r.status==='approval_pending'){ fundGrantAp[nid]={id:r.approval_id,amount:body.amount_cents,fleet:slug}; loadApprovals&&loadApprovals(); loadWalletNotices(); return; }
     delete fundGrantAp[nid]; loadVault();
   }catch(e){ if(sessionEnded(e)) return; if(ap&&(e.status===403||e.status===410)) delete fundGrantAp[nid]; alert(e.message); }
   loadWalletNotices();
