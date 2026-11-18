@@ -17,7 +17,7 @@ echo "== write tests as $OLD"
 for p in "$D" "$D/index.html" "$D/verify.html" "$D/registry" "$D/registry/index.html" "$D/evals" "$D/ledger" "$D/evals/MCI-1"; do [ -e "$p" ] || continue
   if runuser -u "$OLD" -- /bin/sh -c "test -w '$p'"; then echo "WRITABLE     $p"; else echo "not writable $p"; fi; done
 runuser -u "$OLD" -- /bin/sh -c "test -w /tmp" && echo "positive control ok: $OLD can write /tmp (the probe is alive)" || echo "PROBE BROKEN: $OLD cannot write /tmp"
-echo "== sshd key sources for $OLD"; sshd -T -C user="$OLD" 2>/dev/null | grep -i -E '^authorizedkeys(file|command)'; chage -l "$OLD" 2>/dev/null | grep -i 'account expires'
+echo "== sshd key sources for $OLD"; sshd -T -C "user=$OLD,host=x,addr=127.0.0.1,laddr=127.0.0.1,lport=22" 2>/dev/null | grep -i -E '^authorizedkeys(file|command)' || echo "(sshd -T unavailable)"; chage -l "$OLD" 2>/dev/null | grep -i 'account expires'
 echo "== $NEW: account"; getent passwd "$NEW" | cut -d: -f1,6,7; id "$NEW" 2>&1
 echo "== sshd: $OLD since $SINCE"
 journalctl -u ssh -u sshd --since "$SINCE" --no-pager -o short-iso 2>/dev/null | grep -E "$OLD" | tail -20
