@@ -25,9 +25,11 @@ function set(db, did, key, value) {
 }
 const view = (r) => ({ enabled: !!r && r.value === '1', set_at: r ? r.set_at : null });
 
-module.exports = function registerWalletSettings({ app, db, rateLimitStandard, getBearerIdentity, logSecurityEvent, personFor }) {
+module.exports = function registerWalletSettings({ app, db, rateLimitStandard, getBearerIdentity, logSecurityEvent, personFor, isAgentAuth, deviceSession }) {
   init(db);
-  const agentToken = (auth) => auth.silicon || (auth.decoded && (auth.decoded.wrk || ['worker', 'fleet_owner_mint'].includes(auth.decoded.auth_method)));
+  // Only the person's own sign-in sets it: never an agent token, and never a device-flow session (that is how a pane
+  // holds the person's wallet, so a pane could otherwise grant the permission to itself; #136 review H1).
+  const agentToken = (auth) => (isAgentAuth ? isAgentAuth(auth) : !!auth.silicon) || !!(deviceSession && deviceSession(auth.decoded || {}));
 
   // The person's own settings (the app's Settings page).
   app.get('/api/identity/settings', rateLimitStandard, (req, res) => {
@@ -48,7 +50,9 @@ module.exports = function registerWalletSettings({ app, db, rateLimitStandard, g
   // wallet itself, or its creator for an agent wallet) consenting? Any live token of the wallet may ask.
   app.get('/api/identity/pane-rules', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
-    const person = (personFor && personFor(auth.did)) || auth.did;
+    // An agent wallet nobody created has no person to answer for it: not enabled, and not its own row (#136 review M1).
+    const person = personFor ? personFor(auth.did) : auth.did;
+    if (!person) return res.json({ ok: true, enabled: false, set_at: null, person: null, next: 'this wallet has no person to answer for it; a fleet owner must adopt it first' });
     const r = get(db, person, 'agent_rules_write');
     res.json({ ok: true, ...view(r), person: person === auth.did ? 'you' : 'your fleet owner',
       ...(r && r.value === '1' ? {} : { next: 'Enable "Write agent instruction files" in the DemiPass app (it is asked when Fleet is first opened, or in Settings); onboarding panes and agents needs it.' }) });

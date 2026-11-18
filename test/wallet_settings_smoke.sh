@@ -43,10 +43,19 @@ call GET /api/identity/settings "$OWN"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" |
 call GET /api/identity/pane-rules "$OWN"; [ "$(echo "$BODY" | J enabled)" = False ] && echo "$BODY" | J next | grep -q "Enable" && ok "a pane's onboarding is told to have it enabled in the app" || fail "pane-rules off: $BODY"
 call GET /api/identity/pane-rules "$AG"; [ "$(echo "$BODY" | J enabled)" = False ] && [ "$(echo "$BODY" | J person)" = "your fleet owner" ] && ok "an agent wallet reads its fleet owner's answer (off)" || fail "agent pane-rules: $BODY"
 call POST /api/identity/settings/agent-rules-write "$AG" '{"enabled":true}'; [ "$CODE" = 403 ] && ok "an agent token cannot enable it (403)" || fail "agent set: $CODE $BODY"
+DEV=$(node -e '
+const identity = require("./identity"); const Database = require("better-sqlite3");
+const db = new Database(process.env.DB_PATH); const w = db.prepare("SELECT did, encrypted_private_key FROM identity_wallets WHERE username = ?").get("owner");
+process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: "transact", expiresIn: "2h", metadata: { auth_method: "device", username: "owner" } }));')
+call POST /api/identity/settings/agent-rules-write "$DEV" '{"enabled":true}'; [ "$CODE" = 403 ] && ok "a pane's device-flow session of the owner cannot enable it for itself (403)" || fail "device set: $CODE $BODY"
+call GET /api/identity/settings "$DEV"; [ "$(echo "$BODY" | J settings.agent_rules_write.enabled)" = False ] && ok "…and it stays off" || fail "device read: $BODY"
 call POST /api/identity/settings/agent-rules-write "$OWN" '{"enabled":"yes"}'; [ "$CODE" = 400 ] && ok "enabled must be a boolean" || fail "bad body: $CODE"
 call POST /api/identity/settings/agent-rules-write "$OWN" '{"enabled":true}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J agent_rules_write.enabled)" = True ] && ok "the person enables it" || fail "enable: $CODE $BODY"
 call GET /api/identity/pane-rules "$AG"; [ "$(echo "$BODY" | J enabled)" = True ] && ok "…and the agent wallet now reads enabled" || fail "agent after: $BODY"
 call GET /api/identity/pane-rules "$STR"; [ "$(echo "$BODY" | J enabled)" = False ] && ok "another person's wallet is still off" || fail "stranger: $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET created_by_fleet=0, joined_via='network' WHERE handle='agent'\"); c.execute(\"DELETE FROM wallet_creators WHERE did=(SELECT did FROM identity_wallets WHERE username='agent')\"); c.commit()" "$DB_PATH"
+call GET /api/identity/pane-rules "$AG"; [ "$(echo "$BODY" | J enabled)" = False ] && [ "$(echo "$BODY" | J person)" = None ] && ok "an agent nobody created has no person to answer: not enabled, never its own row" || fail "orphan: $BODY"
+python3 -c "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"UPDATE fleet_silicons SET created_by_fleet=1, joined_via='owner' WHERE handle='agent'\"); c.commit()" "$DB_PATH"
 [ "$(Q "SELECT COUNT(*) FROM demipass_security_events WHERE event_type='agent_rules_write_enabled'")" = 1 ] && ok "the change is a security event" || fail "no event"
 call POST /api/identity/settings/agent-rules-write "$OWN" '{"enabled":false}'; [ "$(echo "$BODY" | J agent_rules_write.enabled)" = False ] && ok "…and can be turned off" || fail "disable: $BODY"
 call GET /api/identity/settings ""; [ "$CODE" = 401 ] && ok "no token → 401" || fail "noauth: $CODE"

@@ -2412,13 +2412,13 @@ test('a refill that failed shows as a card with Deposit and Dismiss; its text st
 });
 
 test('agent instruction files: the permission window opens the first time Fleet is opened while it is off, Enable posts it, Settings shows it', async () => {
-  let enabled = false;
+  let enabled = false, reqs = [], settingsFail = false;
   const pg = page({ storage: signedIn, routes: async (p, body) => {
     if (p.startsWith('/api/identity/trust')) return { json: trustOk };
     if (p === '/api/identity/gate/status') return { json: { pin_set: true } };
-    if (p === '/api/identity/settings') return { json: { ok: true, settings: { agent_rules_write: { enabled, set_at: enabled ? 'x' : null } } } };
+    if (p === '/api/identity/settings') { if (settingsFail) return { status: 429, json: { error: 'Rate limit exceeded' } }; return { json: { ok: true, settings: { agent_rules_write: { enabled, set_at: enabled ? 'x' : null } } } }; }
     if (p === '/api/identity/settings/agent-rules-write') { assert.equal(typeof body.enabled, 'boolean'); enabled = body.enabled; return { json: { ok: true, agent_rules_write: { enabled } } }; }
-    if (p === '/api/silicon-token-requests') return { json: { ok: true, requests: [] } };
+    if (p === '/api/silicon-token-requests') return { json: { ok: true, requests: reqs } };
     if (p === '/api/blindkey/approvals') return { json: { ok: true, incoming: [], outgoing: [], recent: [] } };
     return { json: { ok: true, requests: [], grants: [], fleets: [], silicons: [], projects: [] } };
   } });
@@ -2436,8 +2436,11 @@ test('agent instruction files: the permission window opens the first time Fleet 
   pg.ctx.renderAgentRules();
   assert.match(pg.el('agent-rules-state').textContent, /^On/); assert.equal(pg.el('agent-rules-toggle').textContent, 'Turn off');
   pg.ctx.agentRules.asked = false; await pg.ctx.askAgentRules(); assert.equal(pg.shown('modal-agent-rules'), false, 'never asked once on');
-  // a waiting agent-token request asks too (a pane or agent being onboarded)
-  enabled = false; pg.ctx.agentRules = { enabled: null, asked: false };
-  pg.ctx.agentTokReqs = [];
-  const r = await pg.ctx.api('GET', '/api/silicon-token-requests'); assert.ok(r.ok);
+  // a waiting agent-token request asks too (a pane or agent being onboarded); nothing is asked when the setting cannot be read
+  enabled = false; pg.ctx.agentRules = { enabled: null, asked: false }; reqs = [{ id: 3, handle: 'x', fleet: 'f', scope: 'read', expires_in: '1d', creates: false }];
+  await pg.ctx.loadAgentTokenRequests(); await settle();
+  assert.equal(pg.shown('modal-agent-rules'), true, 'an agent-token request asks');
+  pg.ctx.agentRulesLater(); pg.ctx.agentRules = { enabled: null, asked: false }; settingsFail = true;
+  await pg.ctx.askAgentRules(); await settle();
+  assert.equal(pg.shown('modal-agent-rules'), false, 'unreadable setting: not asked on a guess');
 });
