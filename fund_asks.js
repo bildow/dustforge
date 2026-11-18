@@ -115,7 +115,7 @@ module.exports = function registerFundAsks({ app, db, rateLimitStandard, getBear
     }
     // Filing needs the real balance: an unreadable one would mail "the wallet holds 0 DD" and size the Grant to the
     // whole need (#133 r2). Reads elsewhere fall back to 0; this one refuses.
-    let bal; try { bal = Number(balanceRaw(did)); } catch (_) { bal = NaN; }
+    let bal; try { const v = balanceRaw(did); bal = typeof v === 'number' ? v : NaN; } catch (_) { bal = NaN; }
     if (!Number.isFinite(bal)) return res.status(503).json({ error: 'the wallet balance could not be read; nothing was filed. Try again shortly.' });
     sweep(did);
     if (bal >= need) return res.json({ ok: true, covered: true, balance_dd: bal, need_dd: need });
