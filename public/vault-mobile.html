@@ -380,6 +380,14 @@
   <!-- Page: Settings -->
   <div id="page-settings" class="page">
     <div class="section" style="padding-top:1rem">
+      <div class="section-title" style="padding:0.75rem 0">Agents</div>
+      <div style="background:var(--card);border-radius:12px;padding:1rem;margin-bottom:1rem">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:0.5rem">
+          <div><div style="font-size:0.85rem">Write agent instruction files</div><div id="agent-rules-state" style="font-size:0.72rem;color:var(--text3)">—</div></div>
+          <button class="btn-ghost" id="agent-rules-toggle" style="font-size:0.75rem" onclick="toggleAgentRules()">…</button>
+        </div>
+        <div style="font-size:0.7rem;color:var(--text3);margin-top:0.4rem">Needed to use Fleet and to onboard panes or agents: DemiPass writes one block of rules into AGENTS.md and CLAUDE.md of each project a pane or agent is onboarded into.</div>
+      </div>
       <div class="section-title" style="padding:0.75rem 0">Account</div>
       <div style="background:var(--card);border-radius:12px;padding:1rem">
         <div style="font-size:0.8rem;color:var(--text3)">DID</div>
@@ -640,6 +648,18 @@
     <div id="deposit-note" style="font-size:0.72rem;color:var(--text3);margin-top:0.5rem"></div>
     <div id="deposit-msg" class="modal-msg"></div>
     <div class="modal-actions"><button class="btn-ghost" onclick="closeModal()">Close</button><button class="btn-primary" id="deposit-go" onclick="startDeposit()">Pay by card</button></div>
+  </div>
+</div>
+
+<!-- Permission window (Aaron 2026-11-18): DemiPass writes agent instruction files in onboarded projects; must be on
+     to use Fleet / onboard a pane or an agent. Asked the first time, and in Settings. -->
+<div id="modal-agent-rules" class="modal-bg" onclick="if(event.target===this)agentRulesLater()">
+  <div class="modal-sheet">
+    <h3>Write to your agent instruction files?</h3>
+    <div style="font-size:0.8rem;color:var(--text2)">To use Fleet and onboard panes or agents, DemiPass writes a short block of DemiPass rules into the agent instruction files (<b>AGENTS.md</b> and <b>CLAUDE.md</b>) of each project you onboard a pane or agent into. The rules tell your agents to file money and access questions as DemiPass requests you approve here, instead of asking in chat.</div>
+    <div style="font-size:0.75rem;color:var(--text3);margin-top:0.5rem">One marked block per file, never your home directory, never a file tracked by git unless you say so, and you can turn this off in Settings. <b>This must be enabled to use this feature.</b></div>
+    <div id="agent-rules-msg" class="modal-msg"></div>
+    <div class="modal-actions"><button class="btn-ghost" onclick="agentRulesLater()">Not now</button><button class="btn-primary" id="agent-rules-go" onclick="setAgentRules(true)">Enable</button></div>
   </div>
 </div>
 
@@ -972,7 +992,7 @@ function logout(){
   updateStoreFields(); updateSiliconFields(); updateNetFields();   // the sheets' field sets follow their reset dropdowns
   secrets=[]; dashboardData=null; document.getElementById('vault-note').textContent='';
   // Requests and pools are this account's: none of it survives a sign-out (#99 review M4).
-  approvals=[]; scanReqs=[]; agentTokReqs=[]; reqAll=[]; reqFilter={q:'',status:'pending',kind:'',who:''}; reqLoading=null; reqAgain=false; reqLoadedAt=0; lastSecretsSig=''; poolOpenFor=null;
+  agentRules={enabled:null,asked:false}; approvals=[]; scanReqs=[]; agentTokReqs=[]; reqAll=[]; reqFilter={q:'',status:'pending',kind:'',who:''}; reqLoading=null; reqAgain=false; reqLoadedAt=0; lastSecretsSig=''; poolOpenFor=null;
   for(const i of ['req-list','req-status','scan-requests','agent-token-requests','approval-requests']){const e=document.getElementById(i);if(e)e.innerHTML=''}
   { const w=document.getElementById('req-who'); if(w) w.innerHTML='<option value="">Anyone</option>'; const q=document.getElementById('req-q'); if(q) q.value=''; updateReqBadge(); } fleetSlug=null; fleetData=null; siliconHandle=null; fleetNote=null; renewBusy.clear(); panic=false;
   goPage('vault');
@@ -1389,7 +1409,8 @@ document.querySelectorAll('.bn-item').forEach(n=>n.addEventListener('click',()=>
   n.classList.add('active');document.getElementById('page-'+n.dataset.page).classList.add('active');
   if(n.dataset.page==='activity')loadActivity();
   if(n.dataset.page==='buoy')loadBuoy();
-  if(n.dataset.page==='settings'){initAppUpdate();loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();loadHolds();loadGuardians();}
+  if(n.dataset.page==='fleet')askAgentRules();
+  if(n.dataset.page==='settings'){initAppUpdate();loadAgentRules();loadSiliconAgents();loadSmsStatus();loadDevices();loadLockSetting();loadTransferDelay();loadScanTokens();loadHolds();loadGuardians();}
   if(n.dataset.page==='dustforge')loadDustforge();
   if(n.dataset.page==='fleet')loadFleet();
 }));
@@ -2103,6 +2124,8 @@ async function loadApprovals(){
   try{ const r=await api('GET','/api/blindkey/approvals'); if(epoch!==sessionEpoch||!vaultOpen) return; approvals=r.incoming||[]; }
   catch(e){ if(sessionEnded(e)||e.status===429) return; }
   renderApprovals();
+  // A pane onboarding itself (a service consent, a pane mailbox): the permission to write its instruction files is asked first.
+  if(approvals.some(a=>a&&a.kind==='service'&&/svc:demipass:(consent|pane-mail|register)/.test(String(a.service||'')))) askAgentRules();
 }
 // What an approved call did (Aaron 2026-11-14, approval 59: a request repeating one whose command failed must not be a surprise).
 function outcomeLine(o){
@@ -3590,6 +3613,7 @@ async function loadAgentTokenRequests(){
   if(lockState.locked) return;
   try{ const r=await api('GET','/api/silicon-token-requests'); agentTokReqs=r.requests||[]; }catch(e){ if(sessionEnded(e)) return; }
   updateReqBadge();
+  if(agentTokReqs.length) askAgentRules();   // a pane or agent being onboarded: the permission is asked first
   const el=document.getElementById('agent-token-requests'); if(!el) return;
   el.innerHTML=agentTokReqs.map(q=>'<div class="fill-req">'+(q.creates
       ?'<div><b>Create a new agent @'+esc(q.handle)+'</b> in fleet '+esc(q.fleet)+' (wallet and mailbox '+esc(q.username||q.handle)+'@dustforge.com'+(q.cost_dd?', '+esc(String(q.cost_dd))+' DD from the fleet, like a provision':'')+'), with a <b>'+esc(q.scope)+'</b> token lasting '+esc(q.expires_in)+'</div>'
@@ -4041,6 +4065,17 @@ async function loadSiliconAgents(){
   }catch(e){if(!sessionEnded(e))document.getElementById('silicon-agents').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}
 }
 
+// Agent instruction files (wallet_settings.js): asked once per session the first time Fleet is opened or a pane/agent
+// request shows, until enabled; Settings shows and changes it.
+var agentRules={enabled:null,asked:false};
+async function loadAgentRules(){ if(!tk) return; try{ const r=await api('GET','/api/identity/settings'); agentRules.enabled=!!(r.settings&&r.settings.agent_rules_write&&r.settings.agent_rules_write.enabled); }catch(e){ if(sessionEnded(e)) return; } renderAgentRules(); }
+function renderAgentRules(){ const st=document.getElementById('agent-rules-state'), b=document.getElementById('agent-rules-toggle'); if(!st||!b) return;
+  st.textContent=agentRules.enabled===null?'—':agentRules.enabled?'On: AGENTS.md and CLAUDE.md of onboarded projects get the DemiPass rules':'Off: panes and agents cannot be onboarded until this is on'; b.textContent=agentRules.enabled?'Turn off':'Enable'; }
+// An unreadable setting (offline, 429) is not asked about on a guess.
+async function askAgentRules(){ if(agentRules.enabled===null) await loadAgentRules(); if(agentRules.enabled===null||agentRules.enabled||agentRules.asked||lockState.locked) return; agentRules.asked=true; document.getElementById('agent-rules-msg').textContent=''; openModal('agent-rules'); }
+function agentRulesLater(){ closeSheet('agent-rules'); }
+async function setAgentRules(on){ const m=document.getElementById('agent-rules-msg'); try{ const r=await api('POST','/api/identity/settings/agent-rules-write',{enabled:!!on}); agentRules.enabled=!!(r.agent_rules_write&&r.agent_rules_write.enabled); closeSheet('agent-rules'); renderAgentRules(); }catch(e){ if(sessionEnded(e)) return; m.className='modal-msg err'; m.textContent=e.message; } }
+function toggleAgentRules(){ if(agentRules.enabled){ if(confirm('Turn off? Panes and agents can no longer be onboarded until it is on again.')) setAgentRules(false); } else setAgentRules(true); }
 function openModal(id){document.getElementById('modal-'+id).classList.add('show')}
 function closeSheet(id){document.getElementById('modal-'+id).classList.remove('show')}
 // Cancel / Escape / backdrop. The blocking PIN sheets (setup, status error) stay: only their own buttons or
