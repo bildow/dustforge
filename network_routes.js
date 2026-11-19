@@ -205,7 +205,7 @@ module.exports = function registerNetworkRoutes(deps) {
     // role for good (it holds the password); otherwise the owner of the fleet it joins. The card says which.
     const creator = sides ? ((fb.creatorOf(db, sides.member) || {}).owner_did || null) : null;
     const answersOwner = sides && (!creator || creator === sides.owner);
-    const creatorName = creator && creator !== sides.owner ? walletName(creator) : null;
+    const creatorName = creator && creator !== sides.owner ? (walletName(creator) || 'its creator') : null;
     return {
       id: r.id, kind: r.kind, direction: r.requester_did === me ? 'outgoing' : 'incoming',
       from: walletName(r.requester_did), from_did: r.requester_did, to: walletName(r.target_did), to_did: r.target_did,
