@@ -33,7 +33,7 @@ const identity = require("./identity"); const Database = require("better-sqlite3
 const mk = (u, bal) => { const id = identity.createIdentity(); const enc = id.encrypted_private_key || id.encryptedPrivateKey;
   db.prepare("INSERT INTO identity_wallets (did, username, email, encrypted_private_key, balance_cents, password_hash) VALUES (?, ?, ?, ?, ?, ?)").run(id.did, u, u + "@smoke.invalid", enc, bal, process.argv[1]);
   db.prepare("INSERT INTO identity_transactions (did, amount_cents, type, description, balance_after) VALUES (?, ?, ?, ?, ?)").run(id.did, bal, "topup", "smoke", bal); return id.did; };
-const aaron = mk("aaron", 10000); mk("kyle", 10000); mk("felix", 500);
+const aaron = mk("aaron", 10000); mk("kyle", 10000); mk("felix", 500); mk("pinned", 500);
 const f1 = db.prepare("INSERT INTO fleets (owner_did, name, slug) VALUES (?, ?, ?)").run(aaron, "Aaron agents", "aaron-agents").lastInsertRowid;
 let n = 0;
 for (const [u, made, via] of [["fg", 1, "owner"], ["made", 1, "owner"], ["oldnet", 0, "network"]]) { const did = mk(u, 500);
@@ -46,8 +46,8 @@ mint(){ node -e '
 const identity = require("./identity"); const Database = require("better-sqlite3");
 const db = new Database(process.env.DB_PATH); const w = db.prepare("SELECT did, encrypted_private_key FROM identity_wallets WHERE username = ?").get(process.argv[1]);
 process.stdout.write(identity.createTokenForIdentity(w.encrypted_private_key, w.did, { scope: "transact", expiresIn: "2h", metadata: { auth_method: "fleet_owner_mint", fleet: process.argv[2], username: process.argv[1] } }));' "$1" "$2"; }
-AA=$(login aaron); KY=$(login kyle); FX=$(login felix); ON=$(login oldnet); FG=$(mint fg aaron-agents); MD=$(mint made aaron-agents)
-for t in "$AA" "$KY"; do call POST /api/identity/pin "$t" '{"pin":"4321","password":"hunter22"}'; [ "$CODE" = 200 ] || fail "pin set: $CODE $BODY"; done
+AA=$(login aaron); KY=$(login kyle); FX=$(login felix); ON=$(login oldnet); PN=$(login pinned); FG=$(mint fg aaron-agents); MD=$(mint made aaron-agents); FXM=$(mint felix kyle)
+for t in "$AA" "$KY" "$PN"; do call POST /api/identity/pin "$t" '{"pin":"4321","password":"hunter22"}'; [ "$CODE" = 200 ] || fail "pin set: $CODE $BODY"; done
 pin(){ call POST /api/identity/gate/verify "$1" "$(jbody gate pin pin "$2" intent "$3")"; [ "$CODE" = 200 ] || fail "pin $3: $CODE $BODY"; }
 approve(){ pin "$1" 4321 "approval-open:$2"; call POST /api/demipass/approvals/$2/open "$1"; local k; k=$(echo "$BODY" | J code)
   call POST /api/demipass/approvals/$2/approve "$1" "$(jbody code "$k")"; [ "$CODE" = 200 ] || fail "approve $2: $CODE $BODY"; }
@@ -58,10 +58,10 @@ call POST /api/services/register "$FG" "$(jbody slug conduit name Conduit approv
 
 echo "== 1. a self-made wallet in no fleet answers for itself; one in a fleet it joined through the network has that fleet's owner"
 call POST /api/services/consent "$FX" '{"service":"conduit","daily_cap_dd":30}'
-[ "$CODE" = 202 ] && A0=$(echo "$BODY" | J approval_id) && [ "$(owner_of "$A0")" = felix ] && [ "$(echo "$BODY" | J owner)" = felix ] && [ "$(echo "$BODY" | J approver)" = felix ] && ok "felix (no fleet, no creator) consents for itself: card $A0 is addressed to felix and the reply says so" || fail "felix alone: $CODE $BODY"
+[ "$CODE" = 202 ] && A0=$(echo "$BODY" | J approval_id) && [ "$(owner_of "$A0")" = felix ] && [ "$(echo "$BODY" | J approver)" = felix ] && [ "$(echo "$BODY" | J owner)" = None ] && ok "felix (no fleet, no creator) consents for itself: card $A0 is addressed to felix; the reply says so in \`approver\` (no \`owner\` field: #68 M1)" || fail "felix alone: $CODE $BODY"
 echo "$BODY" | J next | grep -q "^Park this call. felix approves it in their DemiPass app (Requests); then" && ok "the pending reply names whose app approves" || fail "next: $(echo "$BODY" | J next)"
 call POST /api/services/consent "$ON" '{"service":"conduit","daily_cap_dd":5}'
-[ "$CODE" = 202 ] && A1=$(echo "$BODY" | J approval_id) && [ "$(owner_of "$A1")" = aaron ] && [ "$(echo "$BODY" | J owner)" = aaron ] && ok "legacy: oldnet (joined aaron's fleet through the network, no creator row) → its card $A1 goes to aaron (was 403 'no person')" || fail "oldnet: $CODE $BODY"
+[ "$CODE" = 202 ] && A1=$(echo "$BODY" | J approval_id) && [ "$(owner_of "$A1")" = aaron ] && [ "$(echo "$BODY" | J approver)" = aaron ] && ok "legacy: oldnet (joined aaron's fleet through the network, no creator row) → its card $A1 goes to aaron (was 403 'no person')" || fail "oldnet: $CODE $BODY"
 call POST /api/services/consent "$MD" '{"service":"conduit","daily_cap_dd":5}'
 [ "$CODE" = 202 ] && A2=$(echo "$BODY" | J approval_id) && [ "$(owner_of "$A2")" = aaron ] && ok "a silicon the fleet created still answers to its creator (card $A2 → aaron)" || fail "made: $CODE $BODY"
 
@@ -69,6 +69,9 @@ echo "== 2. felix asks to join kyle's fleet by name; the request reaches kyle's 
 call POST /api/network/requests "$FX" '{"to":"kyle","as":"join","handle":"felix"}'
 [ "$CODE" = 201 ] || [ "$CODE" = 200 ] && RID=$(echo "$BODY" | J request.id) && [ -n "$RID" ] && [ "$RID" != None ] && ok "join request $RID filed by username" || { fail "join: $CODE $BODY"; RID=$(Q "SELECT id FROM network_requests ORDER BY id DESC LIMIT 1"); }
 call POST /api/network/requests "$FX" '{"to":"kyle@smoke.invalid","as":"join"}'; [ "$CODE" = 409 ] && echo "$BODY" | grep -q "already asked" && ok "asking again by email: 409, the first request waits" || fail "re-ask: $CODE $BODY"
+call POST /api/network/requests "$PN" '{"to":"kyle","as":"join"}'; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "this wallet has a PIN" && ok "a wallet with a PIN cannot ask to join (403: the owner invites it instead)" || fail "pinned join: $CODE $BODY"
+call POST /api/network/requests "$FXM" '{"to":"kyle","as":"join"}'; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "fleet-minted token" && ok "a fleet-minted token cannot ask to join (403)" || fail "minted join: $CODE $BODY"
+call POST /api/network/requests/$RID/accept "$AA"; [ "$CODE" = 404 ] && ok "someone else cannot accept kyle's request (404: not theirs)" || fail "accept by aaron: $CODE $BODY"
 call GET /api/network "$KY"; [ "$(echo "$BODY" | J incoming.0.id)" = "$RID" ] && [ "$(echo "$BODY" | J incoming.0.from)" = felix ] && ok "kyle's network lists the incoming request from felix" || fail "incoming: $BODY"
 echo "$BODY" | J incoming.0.effect | grep -q "You answer for it: its consents to pay services (and its registrations) come to your Requests, approved with your PIN; what it spends comes from its own wallet" && ok "the accept card says what kyle takes on" || fail "effect: $(echo "$BODY" | J incoming.0.effect)"
 call GET /api/network "$FX"; echo "$BODY" | J outgoing.0.effect | grep -q "kyle answers for this wallet: its consents to pay services land in their Requests" && ok "felix's side of the card names who will answer for it" || fail "felix effect: $(echo "$BODY" | J outgoing.0.effect)"
@@ -82,7 +85,7 @@ console.log(JSON.stringify(m.alertsFor(kyle)));' 2>&1)
 echo "$AL" | python3 -c 'import json,sys; a=json.load(sys.stdin); r=a[0]; assert r["kind"]=="network" and r["id"]==400000000000+int(sys.argv[1]) and r["title"]=="agent felix asks to join your fleet" and r["requester"]=="felix" and "You answer for it" in r["summary"], a' "$RID" && ok "the phone alert list carries the join request (id 4e11+$RID, kind network, headline + effect)" || fail "alerts: $AL"
 
 echo "== 3. kyle accepts; from then on he answers for felix"
-call POST /api/network/requests/$RID/accept "$KY"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J member)" = felix ] && ok "kyle accepted: felix is an agent of fleet $(echo "$BODY" | J fleet)" || fail "accept: $CODE $BODY"
+call POST /api/network/requests/$RID/accept "$KY"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J member)" = felix ] && KF=$(echo "$BODY" | J fleet) && ok "kyle accepted: felix is an agent of fleet $KF" || fail "accept: $CODE $BODY"
 call GET /api/network "$FX"; [ "$(echo "$BODY" | J member_of.owner)" = kyle ] && ok "felix sees itself as a member of kyle's fleet (keeps its own key)" || fail "member_of: $BODY"
 call POST /api/services/consent "$FX" '{"service":"conduit","daily_cap_dd":30}'
 [ "$CODE" = 202 ] && A3=$(echo "$BODY" | J approval_id) && [ "$(owner_of "$A3")" = kyle ] && [ "$(echo "$BODY" | J approver)" = kyle ] && ok "felix's consent card $A3 is addressed to kyle; the reply says 'kyle approves it'" || fail "felix→kyle: $CODE $BODY"
@@ -91,9 +94,19 @@ approve "$KY" "$A3"
 call POST /api/services/consent "$FX" "$(jbody service conduit daily_cap_dd 30 approval_id "$A3")"; [ "$CODE" = 201 ] && CID=$(echo "$BODY" | J consent_id) && ok "kyle approved → consent $CID (approved_by kyle)" || fail "consent: $CODE $BODY"
 [ "$(Q "SELECT w.username FROM service_consents c JOIN identity_wallets w ON w.did = c.approved_by WHERE c.id = $CID")" = kyle ] || fail "approved_by is not kyle"
 call POST /api/services/token "$FX" '{"service":"conduit","ttl":"1h"}'; [ "$CODE" = 201 ] && ok "felix mints its Conduit token (the consent is live under kyle)" || fail "token: $CODE $BODY"
-call POST /api/services/consent "$FX" "$(jbody service conduit daily_cap_dd 30 approval_id "$A0")"; [ "$CODE" = 409 ] || [ "$CODE" = 403 ] && ok "the self-addressed card $A0 cannot be redeemed now that kyle answers ($CODE)" || fail "stale card: $CODE $BODY"
+call POST /api/services/consent "$FX" "$(jbody service conduit daily_cap_dd 30 approval_id "$A0")"; [ "$CODE" = 409 ] && ok "the self-addressed card $A0 cannot be redeemed now that kyle answers (409)" || fail "stale card: $CODE $BODY"
 
-echo "== 4. felix leaves the fleet: kyle no longer answers, the consent he approved is dead, felix is its own person again"
+echo "== 4a. kyle removes felix: he no longer answers, the consent he approved is dead, felix is its own person again"
+call DELETE /api/fleet/$KF/silicons/felix "$KY"; [ "$CODE" = 200 ] && ok "kyle removed felix from his fleet" || fail "remove: $CODE $BODY"
+call POST /api/services/token "$FX" '{"service":"conduit","ttl":"1h"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J consent_required)" = True ] && ok "no live consent after removal (approved under kyle)" || fail "token after remove: $CODE $BODY"
+call POST /api/services/consent "$FX" '{"service":"conduit","daily_cap_dd":30}'
+[ "$CODE" = 202 ] && A4a=$(echo "$BODY" | J approval_id) && [ "$(owner_of "$A4a")" = felix ] && ok "a new consent is felix's own again (card $A4a → felix)" || fail "after remove: $CODE $BODY"
+echo "== 4b. felix asks again, kyle accepts again; then felix leaves: the same ending"
+call POST /api/network/requests "$FX" '{"to":"kyle","as":"join","handle":"felix"}'; RID2=$(echo "$BODY" | J request.id); [ "$CODE" = 201 ] || [ "$CODE" = 200 ] && ok "re-asked (request $RID2; a removal is no decline, no cooldown)" || fail "re-ask after remove: $CODE $BODY"
+call POST /api/network/requests/$RID2/accept "$KY"; [ "$CODE" = 200 ] && ok "kyle accepted again" || fail "accept 2: $CODE $BODY"
+call POST /api/services/consent "$FX" '{"service":"conduit","daily_cap_dd":30}'; A5=$(echo "$BODY" | J approval_id); [ "$CODE" = 202 ] && [ "$(owner_of "$A5")" = kyle ] && ok "consent card $A5 → kyle again" || fail "card 2: $CODE $BODY"
+approve "$KY" "$A5"; call POST /api/services/consent "$FX" "$(jbody service conduit daily_cap_dd 30 approval_id "$A5")"; [ "$CODE" = 201 ] || fail "consent 2: $CODE $BODY"
+call POST /api/services/token "$FX" '{"service":"conduit","ttl":"1h"}'; [ "$CODE" = 201 ] || fail "token 2: $CODE $BODY"
 call POST /api/network/leave-fleet "$FX"; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J signed_out)" = False ] && ok "left (kept its key: not signed out)" || fail "leave: $CODE $BODY"
 call POST /api/services/token "$FX" '{"service":"conduit","ttl":"1h"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J consent_required)" = True ] && ok "no live consent after leaving (approved under kyle)" || fail "token after leave: $CODE $BODY"
 call POST /api/services/consent "$FX" '{"service":"conduit","daily_cap_dd":30}'
@@ -105,4 +118,13 @@ const Database = require("better-sqlite3"); const db = new Database(process.env.
 db.prepare("UPDATE fleets SET status = ? WHERE slug = ?").run("closed", "aaron-agents");'
 call POST /api/services/consent "$ON" '{"service":"conduit","daily_cap_dd":5}'
 [ "$CODE" = 403 ] && echo "$BODY" | J fix | grep -q "demipass_fleet_join" && ok "a network-joined agent of a closed fleet: 403 with the fix (ask to join a person's fleet)" || fail "closed fleet: $CODE $BODY"
+echo "== 6. following the fix: oldnet (its old fleet closed, its row still 'active' there) joins kyle's fleet"
+call POST /api/network/requests "$ON" '{"to":"kyle","as":"join"}'; RID3=$(echo "$BODY" | J request.id); [ "$CODE" = 201 ] || [ "$CODE" = 200 ] || fail "oldnet ask: $CODE $BODY"
+call POST /api/network/requests/$RID3/accept "$KY"; [ "$CODE" = 200 ] && [ "$(Q "SELECT COUNT(*) FROM fleet_silicons WHERE member_did = (SELECT did FROM identity_wallets WHERE username='oldnet')")" = 1 ] && ok "kyle accepted oldnet; the closed fleet's row gave way (one silicon row, no silicon_id collision)" || fail "oldnet accept: $CODE $BODY rows=$(Q "SELECT COUNT(*) FROM fleet_silicons WHERE member_did = (SELECT did FROM identity_wallets WHERE username='oldnet')")"
+call POST /api/services/consent "$ON" '{"service":"conduit","daily_cap_dd":5}'; A6=$(echo "$BODY" | J approval_id); [ "$CODE" = 202 ] && [ "$(owner_of "$A6")" = kyle ] && ok "oldnet's consent card $A6 → kyle" || fail "oldnet card: $CODE $BODY"
+echo "== 7. a wallet a fleet created answers to its creator even in another fleet: the accept card says so"
+call POST /api/network/requests "$MD" '{"to":"kyle","as":"join"}'; [ "$CODE" = 403 ] && echo "$BODY" | grep -q "fleet-minted" && ok "made's fleet-minted token cannot ask; its own session would" || fail "made minted: $CODE $BODY"
+MDO=$(login made); call POST /api/network/requests "$MDO" '{"to":"kyle","as":"join"}'; [ "$CODE" = 201 ] || [ "$CODE" = 200 ] || fail "made ask: $CODE $BODY"
+call GET /api/network "$KY"; echo "$BODY" | J incoming.0.effect | grep -q "aaron created this wallet and still answers for it: its consents to pay services stay in their Requests, not yours" && ok "kyle's card says aaron (the creator) still answers for made" || fail "made effect: $(echo "$BODY" | J incoming.0.effect)"
+call GET /api/network "$MDO"; echo "$BODY" | J outgoing.0.effect | grep -q "aaron created this wallet and still answers for it" && ok "made's side says the same" || fail "made own effect: $(echo "$BODY" | J outgoing.0.effect)"
 echo "== done: $fails failure(s)"; exit $(( fails > 0 ))

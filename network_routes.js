@@ -201,6 +201,11 @@ module.exports = function registerNetworkRoutes(deps) {
   function requestView(r, me) {
     const other = r.requester_did === me ? r.target_did : r.requester_did;
     const sides = fleetSides(r);
+    // Who will answer for the member once it is in (service_tenants personFor): the fleet that created it keeps that
+    // role for good (it holds the password); otherwise the owner of the fleet it joins. The card says which.
+    const creator = sides ? ((fb.creatorOf(db, sides.member) || {}).owner_did || null) : null;
+    const answersOwner = sides && (!creator || creator === sides.owner);
+    const creatorName = creator && creator !== sides.owner ? walletName(creator) : null;
     return {
       id: r.id, kind: r.kind, direction: r.requester_did === me ? 'outgoing' : 'incoming',
       from: walletName(r.requester_did), from_did: r.requester_did, to: walletName(r.target_did), to_did: r.target_did,
@@ -208,8 +213,8 @@ module.exports = function registerNetworkRoutes(deps) {
       // What accepting means for the one who decides, in plain words.
       effect: r.kind === 'person' ? 'You become contacts and can send each other DD.'
         : (sides.member === me
-          ? `You join ${walletName(sides.owner)}'s fleet as an agent. ${walletName(sides.owner)} can then see this wallet's balance and spend, refill it, give it secrets to use, and you can send each other DD. ${walletName(sides.owner)} answers for this wallet: its consents to pay services land in their Requests, approved with their PIN. Your wallet keeps its own key.`
-          : `${walletName(sides.member)} joins your fleet as an agent. You can then see its balance and spend, refill it, give it secrets to use, and send each other DD. You answer for it: its consents to pay services (and its registrations) come to your Requests, approved with your PIN; what it spends comes from its own wallet. It keeps its own key: it signs in itself.`),
+          ? `You join ${walletName(sides.owner)}'s fleet as an agent. ${walletName(sides.owner)} can then see this wallet's balance and spend, refill it, give it secrets to use, and you can send each other DD. ${answersOwner ? `${walletName(sides.owner)} answers for this wallet: its consents to pay services land in their Requests, approved with their PIN.` : `${creatorName} created this wallet and still answers for it: its consents to pay services stay in their Requests.`} Your wallet keeps its own key.`
+          : `${walletName(sides.member)} joins your fleet as an agent. You can then see its balance and spend, refill it, give it secrets to use, and send each other DD. ${answersOwner ? 'You answer for it: its consents to pay services (and its registrations) come to your Requests, approved with your PIN; what it spends comes from its own wallet.' : `${creatorName} created this wallet and still answers for it: its consents to pay services stay in their Requests, not yours.`} It keeps its own key: it signs in itself.`),
       needs_pin: r.kind !== 'person' && sides.member === r.target_did && r.target_did === me && Boolean(db.prepare('SELECT pin_hash FROM identity_wallets WHERE did = ?').get(me)?.pin_hash),
       intent: `join:${r.id}`,
       handle: r.handle || '', note: r.note || '', status: r.status, created_at: r.created_at, expires_at: r.expires_at,

@@ -220,7 +220,10 @@ function joinBlocker(db, fleet, memberDid) {
 // Removed rows always; claims never opened only when the wallet itself consents here (withPending), never when
 // some owner merely names it.
 function clearStaleSiliconRows(db, memberDid, fleetId, { withPending = false } = {}) {
-  db.prepare(`DELETE FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND status ${withPending ? "!= 'active'" : "= 'removed'"}`).run(memberDid, fleetId);
+  // A row in a fleet that is no longer active is stale too, whatever its status: memberFleet/activeFleetOf ignore it,
+  // so the wallet may join elsewhere, and the one silicon_id per wallet must not collide with it (#139 review M2).
+  db.prepare(`DELETE FROM fleet_silicons WHERE member_did = ? AND fleet_id != ? AND (status ${withPending ? "!= 'active'" : "= 'removed'"}
+              OR fleet_id IN (SELECT id FROM fleets WHERE status != 'active'))`).run(memberDid, fleetId);
 }
 // "Change the locks": every token of this wallet issued so far dies — its own, owner-minted ones, worker tokens,
 // device-flow tokens — and so do its refresh tokens and workers. Used when a wallet leaves a fleet: whatever the

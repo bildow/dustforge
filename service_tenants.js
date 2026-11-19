@@ -305,16 +305,20 @@ module.exports = function registerServiceTenants(deps) {
   }
 
   // A person's approval through use_approvals (the DemiPass app's approvals list; PIN to open; the phone signs).
-  // The reply names whose app approves (`owner`, a username): a caller that cannot say so parks forever while the wrong
-  // person looks for the card (Aaron 2026-11-19: Kyle's Felix, approval 98). The requester reads the same name on
-  // GET /api/blindkey/approvals/:id, so nothing more is disclosed than before (#68 review M1 revisited).
-  function personApproval(key, name, approverDid, depth, caller, action, target, params, body, delegationId) {
+  // The reply names nobody (#68 review M1: a tenant's verify() gets this reply too, and principalId is the pairwise
+  // handle that hides the person) — except where the wallet's own token asks for itself and the answer is the whole
+  // point (a consent, `nameApprover`): then `approver` says whose app holds the card, or the caller parks forever while
+  // the wrong person looks for it (Aaron 2026-11-19: Kyle's Felix, approval 98). That wallet reads the same name on
+  // GET /api/blindkey/approvals/:id as the requester, so nothing more is disclosed to it.
+  function personApproval(key, name, approverDid, depth, caller, action, target, params, body, delegationId, { nameApprover = false } = {}) {
     const g = approvals.gateService({ key, name, approverDid, depth }, caller, { action, targetHost: target, params, delegationId }, body || {});
     if (g.ok) return { ok: true, approval_id: g.approval_id };
     const b = { ...(g.body || {}) };
+    const who = nameApprover ? (b.owner || null) : null;
+    delete b.owner;
     if (g.status === 202) {
-      b.approver = b.owner || null;
-      b.next = `Park this call. ${b.owner ? `${b.owner} approves it in their DemiPass app (Requests)` : 'The person whose authority it uses approves it in their DemiPass app'}; then make the same call once more with approval_id. Do not retry in a loop.`;
+      if (nameApprover) b.approver = who;
+      b.next = `Park this call. ${who ? `${who} approves it in their DemiPass app (Requests)` : 'The person whose authority it uses approves it in their DemiPass app'}; then make the same call once more with approval_id. Do not retry in a loop.`;
     }
     return { ok: false, status: g.status, body: b };
   }
@@ -1039,7 +1043,7 @@ module.exports = function registerServiceTenants(deps) {
       g = { ok: true, approval_id: c.approval_id, plan: c };
     } else {
       g = personApproval('svc:demipass:consent', `let a wallet pay ${t.slug}`, approver, 'elevated', { did: auth.did, label: '' }, 'consent', 'demipass',
-        { service: t.slug, wallet: auth.did, daily_cap_dd: cap, ...(orc !== null ? { on_request_cap_dd: orc } : {}) }, b, null);
+        { service: t.slug, wallet: auth.did, daily_cap_dd: cap, ...(orc !== null ? { on_request_cap_dd: orc } : {}) }, b, null, { nameApprover: true });
       if (!g.ok) return res.status(g.status).json(g.body);
     }
     const at = nowIso();
