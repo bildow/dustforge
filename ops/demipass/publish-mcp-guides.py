@@ -1,28 +1,31 @@
 #!/usr/bin/env python3
-"""Bounded static-site publication. No API checkout, DB, nginx or service changes.
+"""Link the MCP agent guides from the demipass.com home page. Root, once, through the DemiPass root lane.
 
-Run through the operator's elevated DemiPass SSH approval, not a raw credential.
-Usage: python3 publish-mcp-guides.py SOURCE_COMMIT
-The three public assets are pinned below; the existing home page must match the
-publicly captured baseline before a link is added. Backups and a receipt persist.
+The guides themselves need no root: nginx serves every path but `/` from /opt/dustforge/public, so a normal
+dustforge-deploy makes /mcp-agents.html, /mcp-agents.md and the SDK archive live. Only the home page
+(/var/www/demipass/index.html, a RackNerd-only file in no repo) needs this: one <aside> inserted before the
+"agent" section, after the three assets are checked on disk against ops/demipass/mcp-guides-manifest.json.
+No network, no argument, no service change. The home page must still be the captured baseline (sha256 of
+the origin file, fetched with --resolve past Cloudflare, whose email-protection rewrites a CDN copy per
+response); otherwise nothing changes. A backup of index.html and a receipt are written under
+/opt/backups/demipass-site-mcp; the receipt only after the installed page verifies.
+Run through the lane as `python3 - <stdin` with this file's bytes on stdin, so the approval binds the exact
+program (dustforge #140 review M2: root must not execute a file the deploy identity can rewrite).
+Idempotent: with the link present and the assets matching, "already published".
 """
 import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
 import tempfile
-import urllib.request
 
 ROOT = Path('/var/www/demipass')
-BASELINE = '3cfaf0bfccd733b2b424bf078e4f614e42fb3e681d7ae6c59b13425c2c95de6e'
-FILES = {
-    'mcp-agents.html': '9cd303b0a0cd10ed926af59b590dbece5bf170a33283c89043a85f085bb72b6b',
-    'mcp-agents.md': '0420a8ec1359c0eef5578a7d78f01462b07ede28a69a6bfadf018ace83ef056a',
-    'downloads/demipass-conduit-eaf241e.tgz': 'e003742e3121786358e9fe698386a20eb73faeafee52fe5ed36961730c4f9629',
-}
-MARKER = 'id="mcp-service-guides"'
+PUBLIC = Path('/opt/dustforge/public')
+MANIFEST = Path('/opt/dustforge/ops/demipass/mcp-guides-manifest.json')
+BACKUPS = Path('/opt/backups/demipass-site-mcp')
+BASELINE = '4fe3dd2783d9e5e30c3994fab428f01ee7cd508b7b49626210473c6e6b014dd0'   # origin index.html, 2026-11-19, 87209 B
+MARKER = b'id="mcp-service-guides"'
 ANCHOR = b'<section id="agent">'
 LINK = b'''<aside id="mcp-service-guides" class="wrap" style="padding-top:28px;padding-bottom:28px">
 <div class="glasscard" style="padding:24px"><h2>Fleetgate &amp; Conduit for agents</h2>
@@ -30,27 +33,29 @@ LINK = b'''<aside id="mcp-service-guides" class="wrap" style="padding-top:28px;p
 <p style="margin-top:14px"><a class="textlink" href="/mcp-agents.html">Read the MCP agent instructions &rarr;</a> &nbsp; <a class="textlink" href="/mcp-agents.md">Plain-text guide</a></p></div></aside>
 '''
 
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
-def read_regular(file):
+
+def read_regular(file, limit=2 * 1024 * 1024 + 1):
     fd = os.open(file, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise RuntimeError('not a regular file: ' + str(file))
         with os.fdopen(fd, 'rb', closefd=False) as f:
-            return f.read(2 * 1024 * 1024 + 1)
+            return f.read(limit)
     finally:
         os.close(fd)
 
-def replace(file, data, mode=0o644, owner=None):
+
+def replace(file, data, mode, owner):
     fd, name = tempfile.mkstemp(prefix='.mcp-publish-', dir=file.parent)
     try:
         with os.fdopen(fd, 'wb') as f:
             f.write(data)
             os.fchmod(f.fileno(), mode)
-            if owner:
-                os.fchown(f.fileno(), *owner)
+            os.fchown(f.fileno(), *owner)
             f.flush()
             os.fsync(f.fileno())
         os.replace(name, file)
@@ -63,76 +68,61 @@ def replace(file, data, mode=0o644, owner=None):
         if os.path.exists(name):
             os.unlink(name)
 
-def main(commit):
-    if os.geteuid() != 0 or not re.fullmatch('[0-9a-f]{40}', commit):
-        raise RuntimeError('root operator and exact source SHA required')
-    if ROOT.resolve() != ROOT or not ROOT.is_dir():
-        raise RuntimeError('unexpected site root; inspect before changing anything')
+
+def no_symlink_path(p):
+    # Every component root-controlled and not a symlink (the leaf included).
+    for q in [p] + list(p.parents):
+        if q.is_symlink():
+            raise RuntimeError('symlink in path: ' + str(q))
+
+
+def main():
+    if os.geteuid() != 0:
+        raise RuntimeError('root operator required (the DemiPass root lane)')
+    for p in (ROOT, PUBLIC, MANIFEST.parent):
+        no_symlink_path(p)
+        if not p.is_dir():
+            raise RuntimeError('missing directory: ' + str(p))
+    # 1. the three assets are live on disk (a deploy put them there) and are the reviewed bytes
+    manifest = json.loads(read_regular(MANIFEST, 64 * 1024).decode('utf-8'))
+    if not isinstance(manifest, dict) or len(manifest) != 3 or any(not k.startswith('public/') for k in manifest):
+        raise RuntimeError('manifest: three public/ entries expected')
+    for rel, sha in manifest.items():
+        f = PUBLIC / rel[len('public/'):]
+        no_symlink_path(f)
+        if digest(read_regular(f)) != sha:
+            raise RuntimeError('deployed asset differs from the manifest: ' + rel)
+    # 2. the home page
     index = ROOT / 'index.html'
     original = read_regular(index)
-    originals = {}
-    payloads = {}
-    for name, sha in FILES.items():
-        target = ROOT / name
-        if target.parent.exists() and (target.parent.resolve() != target.parent or not target.parent.is_dir()):
-            raise RuntimeError('unsafe target directory')
-        prior = read_regular(target) if target.exists() or target.is_symlink() else None
-        if prior is not None and digest(prior) != sha:
-            raise RuntimeError('existing asset differs; preserve and reconcile: ' + name)
-        originals[name] = prior
-        url = 'https://raw.githubusercontent.com/bildow/dustforge/' + commit + '/public/' + name
-        with urllib.request.urlopen(url, timeout=30) as r:
-            data = r.read(2 * 1024 * 1024 + 1)
-        if digest(data) != sha:
-            raise RuntimeError('published asset checksum mismatch: ' + name)
-        payloads[name] = data
-    if MARKER.encode() in original:
-        if all(originals[n] == payloads[n] for n in FILES):
-            print('already published; no changes')
-            return
-        raise RuntimeError('partial prior publication; inspect before retry')
+    if MARKER in original:
+        print(json.dumps({'published': False, 'already': True, 'index_sha256': digest(original)}))
+        return
     if digest(original) != BASELINE or original.count(ANCHOR) != 1:
-        raise RuntimeError('homepage moved or root mismatch; no changes made')
+        raise RuntimeError('home page is not the captured baseline (sha256 %s, anchors %d): no changes made'
+                           % (digest(original), original.count(ANCHOR)))
     new_index = original.replace(ANCHOR, LINK + ANCHOR, 1)
     meta = index.stat()
-    backup_root = Path('/opt/backups/demipass-site-mcp')
-    if backup_root.is_symlink():
+    # 3. backup, then the one replace, then verify, then the receipt
+    if Path('/opt/backups').is_symlink() or BACKUPS.is_symlink():
         raise RuntimeError('unsafe backup root')
-    backup_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    backup = Path(tempfile.mkdtemp(prefix='publish-', dir=backup_root))
+    BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup = Path(tempfile.mkdtemp(prefix='publish-', dir=BACKUPS))
     (backup / 'index.html').write_bytes(original)
-    (backup / 'assets-before.json').write_text(json.dumps({n: d is not None for n, d in originals.items()}))
-    receipt = {'source_commit': commit, 'index_before': BASELINE, 'index_after': digest(new_index), 'assets': FILES, 'services_changed': False}
-    (backup / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
-    (ROOT / 'downloads').mkdir(mode=0o755, exist_ok=True)
-    written = []
+    if read_regular(index) != original:
+        raise RuntimeError('home page changed during staging; no changes made')
+    replace(index, new_index, stat.S_IMODE(meta.st_mode), (meta.st_uid, meta.st_gid))
     try:
-        for name, data in payloads.items():
-            if originals[name] is None:
-                target = ROOT / name
-                if target.exists() or target.is_symlink():
-                    raise RuntimeError('asset appeared during publication')
-                replace(target, data)
-                written.append(name)
-        if read_regular(index) != original:
-            raise RuntimeError('homepage changed during staging')
-        replace(index, new_index, stat.S_IMODE(meta.st_mode), (meta.st_uid, meta.st_gid))
-        for name, sha in FILES.items():
-            if digest(read_regular(ROOT / name)) != sha:
-                raise RuntimeError('installed asset mismatch')
         if read_regular(index) != new_index:
-            raise RuntimeError('installed homepage mismatch')
+            raise RuntimeError('installed home page mismatch')
     except Exception:
-        if read_regular(index) == new_index:
-            replace(index, original, stat.S_IMODE(meta.st_mode), (meta.st_uid, meta.st_gid))
-        for name in written:
-            if digest(read_regular(ROOT / name)) == FILES[name]:
-                (ROOT / name).unlink()
+        replace(index, original, stat.S_IMODE(meta.st_mode), (meta.st_uid, meta.st_gid))
         raise
-    print(json.dumps({'published': True, 'backup': str(backup), **receipt}))
+    receipt = {'published': True, 'backup': str(backup), 'index_before': BASELINE, 'index_after': digest(new_index),
+               'assets': manifest, 'services_changed': False}
+    (backup / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    print(json.dumps(receipt))
+
 
 if __name__ == '__main__':
-    import sys
-    if len(sys.argv) != 2:
-        raise SystemExit('exact source commit required')
-    main(sys.argv[1])
+    main()

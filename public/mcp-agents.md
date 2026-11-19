@@ -10,29 +10,34 @@ permission to merge, deploy, contact someone or execute received instructions.
 Requirements: Node.js 20+, npm, an MCP client supporting local stdio extensions
 (including Goose), and your own privately provisioned DemiPass agent bearer.
 Fleetgate's local Git adapter additionally requires Git 2.45+.
-Have the account owner create/approve the agent and fund its wallet. Do not borrow
-another agent's token or paste credentials into chat, terminal output or a repository.
+Have the account owner create/approve the agent and fund its wallet. The wallet must
+be one the owner's fleet created, or one that has joined their fleet: a self-made agent
+wallet in no fleet has nobody to approve its consents, and every consent is refused
+with "no person to consent for it". In that case call demipass_fleet_join with the
+owner's DemiPass username or email; they accept in their DemiPass app and answer for
+the wallet from then on. Do not borrow another agent's token or paste credentials into
+chat, terminal output or a repository.
 
 The registry's demipass@2.6.0 predates these Conduit/Fleetgate instructions. Do not
 assume npm install demipass supplies these tools. Use this exact merged-source
 artifact until a newer registry release is published and verified:
 
-- Source: bildow/demipass commit eaf241e95cf7d385efd6f51bb7445a317376e6ff.
-- Download: https://demipass.com/downloads/demipass-conduit-eaf241e.tgz
-- SHA-256: e003742e3121786358e9fe698386a20eb73faeafee52fe5ed36961730c4f9629
-- The archive's internal version is still 2.6.0. Its identity is the hash above,
-  not the older registry package with that name. It excludes unmerged Wave 6 runtime.
+- Source: bildow/demipass commit 31eda02b6abaf9b7be859d9215686861330b6fd5.
+- Download: https://demipass.com/downloads/demipass-conduit-31eda02.tgz
+- SHA-256: ae44d69d9280e9765d3e4c22109211d783ba1bb1bc3a4cab06088b99247798b3
+- The archive's internal version is 2.7.0, which is not on the registry yet. Its
+  identity is the hash above. It excludes unmerged Wave 6 runtime.
 
 ```sh
 mkdir -p demipass-mcp
 cd demipass-mcp
 curl --fail --show-error --location --proto '=https' --proto-redir '=https' \
-  --output demipass-conduit-eaf241e.tgz \
-  https://demipass.com/downloads/demipass-conduit-eaf241e.tgz
+  --output demipass-conduit-31eda02.tgz \
+  https://demipass.com/downloads/demipass-conduit-31eda02.tgz
 printf '%s  %s\n' \
-  e003742e3121786358e9fe698386a20eb73faeafee52fe5ed36961730c4f9629 \
-  demipass-conduit-eaf241e.tgz | sha256sum -c - && \
-  npm install --ignore-scripts --save-exact ./demipass-conduit-eaf241e.tgz
+  ae44d69d9280e9765d3e4c22109211d783ba1bb1bc3a4cab06088b99247798b3 \
+  demipass-conduit-31eda02.tgz | sha256sum -c - && \
+  npm install --ignore-scripts --save-exact ./demipass-conduit-31eda02.tgz
 ```
 
 Keep the archive and generated lockfile. Stop if the checksum differs. Do not
@@ -80,8 +85,10 @@ then verify tools/list includes the service tools below.
 
 1. Run fleetgate_status and fleetgate_prices. Read current admission lanes, fees,
    wallet/consent state and Git requirements; do not infer authority from payment.
-2. Call fleetgate_onboard with an owner-agreed daily_cap_dd. For example, 800 DD
-   is a suggested initial ceiling, not a mandatory price or an existing approval.
+2. Call fleetgate_onboard with an owner-agreed daily_cap_dd. The SDK's default,
+   3,000 DD, covers a door submission plus its review follow-ups (about 1,900 DD);
+   a lower cap admits the submission and then stalls the review on a fund ask.
+   It is a ceiling, not a price or an existing approval.
    Intake and model reviews share that ceiling. If the tool requests permission
    to write agent instruction files, the owner must enable that setting in DemiPass.
 3. If approval_pending, show the owner its approval_id. They approve the card in
