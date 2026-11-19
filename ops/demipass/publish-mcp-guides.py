@@ -25,6 +25,14 @@ PUBLIC = Path('/opt/dustforge/public')
 MANIFEST = Path('/opt/dustforge/ops/demipass/mcp-guides-manifest.json')
 BACKUPS = Path('/opt/backups/demipass-site-mcp')
 BASELINE = '4fe3dd2783d9e5e30c3994fab428f01ee7cd508b7b49626210473c6e6b014dd0'   # origin index.html, 2026-11-19, 87209 B
+# The reviewed bytes this link points at (dustforge #140 at 7194b72), pinned here so the tapped approval, which binds
+# this program, attests "link to exactly these"; the deployed manifest must say the same (it is deploy-written, so it
+# proves only that the deploy is self-consistent). Point-in-time: a later deploy changes the assets anyway.
+PINS = {
+    'public/mcp-agents.html': 'def4549adbc163c9129e2dcb3c4d3c3adc62ad3b82904434a77f83d1d4723979',
+    'public/mcp-agents.md': '7667debac153a7c24f007fe3222a41d7cd16ffe0f87dd21c6bfee9e2d9b1673c',
+    'public/downloads/demipass-conduit-31eda02.tgz': 'ae44d69d9280e9765d3e4c22109211d783ba1bb1bc3a4cab06088b99247798b3',
+}
 MARKER = b'id="mcp-service-guides"'
 ANCHOR = b'<section id="agent">'
 LINK = b'''<aside id="mcp-service-guides" class="wrap" style="padding-top:28px;padding-bottom:28px">
@@ -85,13 +93,15 @@ def main():
             raise RuntimeError('missing directory: ' + str(p))
     # 1. the three assets are live on disk (a deploy put them there) and are the reviewed bytes
     manifest = json.loads(read_regular(MANIFEST, 64 * 1024).decode('utf-8'))
-    if not isinstance(manifest, dict) or len(manifest) != 3 or any(not k.startswith('public/') for k in manifest):
-        raise RuntimeError('manifest: three public/ entries expected')
-    for rel, sha in manifest.items():
+    if manifest != PINS:
+        raise RuntimeError('deployed manifest differs from the pins in this program: deploy the reviewed commit first')
+    for rel, sha in PINS.items():
+        if not rel.startswith('public/') or '..' in rel.split('/') or rel.endswith('/'):
+            raise RuntimeError('bad pin path: ' + rel)
         f = PUBLIC / rel[len('public/'):]
         no_symlink_path(f)
         if digest(read_regular(f)) != sha:
-            raise RuntimeError('deployed asset differs from the manifest: ' + rel)
+            raise RuntimeError('deployed asset differs from the pins: ' + rel)
     # 2. the home page
     index = ROOT / 'index.html'
     original = read_regular(index)
@@ -119,7 +129,7 @@ def main():
         replace(index, original, stat.S_IMODE(meta.st_mode), (meta.st_uid, meta.st_gid))
         raise
     receipt = {'published': True, 'backup': str(backup), 'index_before': BASELINE, 'index_after': digest(new_index),
-               'assets': manifest, 'services_changed': False}
+               'assets': PINS, 'services_changed': False}
     (backup / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
     print(json.dumps(receipt))
 
