@@ -4,6 +4,7 @@ owner's Dustforge forwarding rules via POST /api/relay/forward.
 
 Config from /opt/dustforge/scripts/relay-poller.env (KEY=VALUE lines):
   IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS, API_URL, API_TOKEN
+  IMAP_CA_FILE (optional trusted CA bundle; hostname verification stays required)
 
 A message is marked \\Seen only after the API accepts it, so transient
 failures retry on the next run. A 404 (no active rules) also marks the
@@ -76,11 +77,15 @@ def forward(cfg, subject, body, original_from):
         return json.loads(resp.read())
 
 
+def imap_tls_context(cfg):
+    # Network placement is not server identity. Never send mailbox credentials
+    # until both the certificate chain and configured IMAP hostname validate.
+    return ssl.create_default_context(cafile=cfg.get('IMAP_CA_FILE') or None)
+
+
 def main():
     cfg = load_env(ENV)
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE  # Stalwart self-signed; link is tailnet-internal
+    ctx = imap_tls_context(cfg)
     M = imaplib.IMAP4_SSL(cfg['IMAP_HOST'], int(cfg.get('IMAP_PORT', 993)), ssl_context=ctx)
     M.login(cfg['IMAP_USER'], cfg['IMAP_PASS'])
     M.select('INBOX')
