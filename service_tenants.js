@@ -1,4 +1,5 @@
 'use strict';
+const { assertPublicRoute: assertPublicServiceEndpoint } = require('./public_service_endpoint');
 // ── Service tenants: DemiPass as the identity and metering layer for agent services (docs/service-tenants.md) ────────
 // A tenant is a service (FLEETGATE, Conduit, …) with its own DemiPass wallet. Callers reach it with SERVICE TOKENS:
 // ordinary DemiPass tokens locked to the caller's wallet and to one tenant (`aud: svc:<slug>`, `iss: demipass-svc`).
@@ -866,7 +867,7 @@ module.exports = function registerServiceTenants(deps) {
 
   // Where callers connect, and the MCP server agents attach with: {endpoint, mcp_server}. The tenant wallet or its owner
   // asks; every change waits on the tenant owner's approval in the app (svc:demipass:connect), because the endpoint is
-  // where callers send their service tokens. endpoint: an https URL (http only on a tailnet *.ts.net host), no
+  // where callers send their service tokens. endpoint: a public https URL, no
   // credentials, query or fragment. mcp_server: "<npm package>#<bin>", e.g. "demipass#fleetgate-mcp". '' clears either.
   const MCP_SERVER_RE = /^(@[a-z0-9][a-z0-9._-]{0,60}\/)?[a-z0-9][a-z0-9._-]{0,80}#[a-z0-9][a-z0-9._-]{0,60}$/;
   // Returns { endpoint } (normalized, the form stored and shown) or { error }. Only plain printable ASCII, and the
@@ -880,9 +881,8 @@ module.exports = function registerServiceTenants(deps) {
     if (u.username || u.password || u.search || u.hash || /[?#@]/.test(v)) return { error: 'endpoint: no credentials, query or fragment' };
     const norm = u.href.replace(/\/+$/, '');
     if (norm !== v) return { error: `endpoint: give it in normal form (${norm})` };
-    if (u.protocol === 'https:') return { endpoint: norm };
-    if (u.protocol === 'http:' && /^[a-z0-9-]+(\.[a-z0-9-]+)*\.ts\.net$/.test(u.hostname)) return { endpoint: norm };
-    return { error: 'endpoint: https (http only on a tailnet *.ts.net host)' };
+    try { assertPublicServiceEndpoint(u); } catch (_) { return { error: 'endpoint: public HTTPS only; no private or VPN addresses' }; }
+    return { endpoint: norm };
   }
   // Which MCP server callers' machines run for a tenant is code on their machines, run with their DemiPass session
   // nearby: first-party only (the demipass package's own servers) until there is a trust model for others (#87 M2).

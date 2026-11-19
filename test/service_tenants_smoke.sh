@@ -151,12 +151,12 @@ call GET /api/services/fleetgate ""
 
 # ── where callers connect (registry: endpoint + mcp_server; every change waits on the tenant owner) ─────────────
 call PUT /api/services/fleetgate/connect "$EXT" '{"endpoint":"https://evil.example/door"}'; [ "$CODE" = 403 ] && ok "only the tenant (or its owner) sets where callers connect" || fail "ext connect: $CODE"
-bad=0; for e in 'http://evil.example/door' 'https://u:p@repo.example/door' 'https://repo.example/door?x=1' 'ftp://repo.example' 'nope' \
+bad=0; for e in 'http://evil.example/door' 'https://100.83.112.88' 'https://10.1.2.3' 'https://[fd7a:115c:a1e0::1]' 'https://x.ts.net' 'https://localhost' 'https://127.0.0.1' 'https://u:p@repo.example/door' 'https://repo.example/door?x=1' 'ftp://repo.example' 'nope' \
     'http://x.ts.net\\@evil.com/door' 'HTTPS://Repo.Example/door' 'http://evil.ts.net.attacker.com/door' 'https://repo.example/a b'; do
   call PUT /api/services/fleetgate/connect "$FG" "$(jbody endpoint "$e")"; [ "$CODE" = 400 ] || { bad=1; echo "  $e → $CODE"; }; done
 call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass fleetgate"}'; [ "$CODE" = 400 ] || bad=1
 call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"evilpkg#x"}'; [ "$CODE" = 403 ] || { bad=1; echo "  third-party mcp → $CODE"; }
-[ $bad = 0 ] && ok "endpoint: https (http only on *.ts.net), plain normal-form ASCII, no credentials/query/backslash; mcp_server first-party package#bin" || fail "connect validation"
+[ $bad = 0 ] && ok "endpoint: public https only, plain normal-form ASCII, no credentials/query/backslash; mcp_server first-party package#bin" || fail "connect validation"
 call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass#fleetengine-mcp"}'; FEQ_CODE=$CODE
 call PUT /api/services/fleetgate/connect "$FG" '{"mcp_server":"demipass#fleetengine-mcpx"}'; FEX_CODE=$CODE
 [ "$FEQ_CODE" = 202 ] && [ "$FEX_CODE" = 403 ] && [ "$(Q "SELECT mcp_server FROM service_tenants WHERE slug='fleetgate'")" = "" ] \
@@ -171,7 +171,7 @@ approve "$OWN" "$CQ"; call PUT /api/services/fleetgate/connect "$FG" "$(python3 
 call GET /api/services ""; [ "$(echo "$BODY" | python3 -c 'import json,sys; print([t.get("endpoint") for t in json.load(sys.stdin)["tenants"] if t["slug"]=="fleetgate"][0])')" = https://repo.example/-/fleetgate/door ] \
   && ok "the public registry lists the endpoint (clients read it; nothing hard-codes a URL)" || fail "registry: $BODY"
 call PUT /api/services/fleetgate/connect "$FG" '{"endpoint":"https://repo.example/-/fleetgate/door"}'; [ "$CODE" = 200 ] && [ "$(echo "$BODY" | J unchanged)" = True ] && ok "the same values again: no approval asked" || fail "unchanged: $CODE $BODY"
-call PUT /api/services/conduit/connect "$OWN" '{"endpoint":"http://phasewhip.taildb5a42.ts.net:8080"}'; [ "$CODE" = 202 ] && ok "http on a tailnet *.ts.net host is allowed (and still waits on approval)" || fail "ts.net: $CODE $BODY"
+call PUT /api/services/conduit/connect "$OWN" '{"endpoint":"http://phasewhip.taildb5a42.ts.net:8080"}'; [ "$CODE" = 400 ] && ok "VPN endpoints are refused before requesting approval" || fail "ts.net: $CODE $BODY"
 
 # ── consent to pay (approved by the person who answers for the wallet) ─────────────────────────────────────────
 call POST /api/services/token "$EXT" '{"service":"fleetgate"}'; [ "$CODE" = 403 ] && [ "$(echo "$BODY" | J consent_required)" = True ] && ok "no service token without consent to pay that service" || fail "mint w/o consent: $CODE $BODY"
