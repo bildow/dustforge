@@ -26,7 +26,8 @@ function privateAddress(host) {
       a === 203 && b === 0 && c === 113 || a >= 224;
   }
   if (net.isIP(host) === 6) {
-    // Only native global-unicast space; refuse local/deprecated ranges and
+    // After classifying mapped IPv4 above, allow only native global-unicast
+    // space; refuse local/deprecated ranges and
     // translation/tunnelling prefixes rather than interpreting embedded routes.
     const sides = host.split('::');
     const left = sides[0] ? sides[0].split(':').map(x => parseInt(x,16)) : [];
@@ -43,7 +44,8 @@ function assertPublicRoute(value) {
   const u = value instanceof URL ? value : new URL(value);
   const host = hostOf(u.hostname);
   if (u.username || u.password || !['http:', 'https:'].includes(u.protocol)) throw failure();
-  if (loopback(host)) throw failure();
+  if (loopback(host) || host.endsWith('.localhost') || host.endsWith('.local') ||
+      host.endsWith('.internal') || host === 'home.arpa' || host.endsWith('.home.arpa')) throw failure();
   if (u.protocol !== 'https:' || host === 'ts.net' || host.endsWith('.ts.net') ||
       host === 'tailscale.com' || host.endsWith('.tailscale.com') ||
       !host.includes('.') && !net.isIP(host) || privateAddress(host)) throw failure();
