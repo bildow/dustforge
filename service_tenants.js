@@ -273,7 +273,17 @@ module.exports = function registerServiceTenants(deps) {
   // agent no fleet created has nobody → null (refused); anyone else answers for themselves.
   // fleet_billing.creatorOf reads wallet_creators, which survives the row deletion when a wallet joins another fleet.
   const creatorOf = (did) => (require('./fleet_billing').creatorOf(db, did) || {}).owner_did || null;
-  const personFor = (did) => creatorOf(did) || (isAgentWallet(did) ? null : did);
+  // The owner of the fleet this wallet is an active agent of, however it joined (through the network it keeps its own
+  // key; the owner accepted it, funds it and answers for its spending).
+  const memberFleetOwnerOf = (did) => (db.prepare(`SELECT f.owner_did FROM fleet_silicons s JOIN fleets f ON f.id = s.fleet_id
+      WHERE s.member_did = ? AND s.status = 'active' AND f.status = 'active' ORDER BY s.id DESC LIMIT 1`).get(did) || {}).owner_did || null;
+  // Who answers for a wallet (approves its consents, grants and registrations on their phone): the fleet that created
+  // it (it holds the password; that never changes), else the owner of the fleet it joined through the network, else —
+  // a plain person's wallet — itself. A wallet that joined no fleet and no fleet created is its own person. (Aaron
+  // 2026-11-19: a self-made agent wallet that joins a person's fleet by request is theirs to answer for; before this, a
+  // network-joined agent had nobody and every consent was refused.) Leaving the fleet changes the answer, and
+  // liveConsent() below ends every consent approved under the old one.
+  const personFor = (did) => creatorOf(did) || memberFleetOwnerOf(did) || (isAgentWallet(did) ? null : did);
   // A consent counts only while the person who approved it still answers for the wallet.
   const liveConsent = (did, tenant) => { const c = consentOf(did, tenant); return c && c.approved_by === personFor(did) ? c : null; };
   const jsonList = (s) => { try { const v = JSON.parse(s || '[]'); return Array.isArray(v) ? v : []; } catch (_) { return []; } };
@@ -295,17 +305,25 @@ module.exports = function registerServiceTenants(deps) {
   }
 
   // A person's approval through use_approvals (the DemiPass app's approvals list; PIN to open; the phone signs).
-  // The reply a caller (or a tenant) sees never names the approver (#68 review M1).
-  function personApproval(key, name, approverDid, depth, caller, action, target, params, body, delegationId) {
+  // The reply names nobody (#68 review M1: a tenant's verify() gets this reply too, and principalId is the pairwise
+  // handle that hides the person) — except where the wallet's own token asks for itself and the answer is the whole
+  // point (a consent, `nameApprover`): then `approver` says whose app holds the card, or the caller parks forever while
+  // the wrong person looks for it (Aaron 2026-11-19: Kyle's Felix, approval 98). That wallet reads the same name on
+  // GET /api/blindkey/approvals/:id as the requester, so nothing more is disclosed to it.
+  function personApproval(key, name, approverDid, depth, caller, action, target, params, body, delegationId, { nameApprover = false } = {}) {
     const g = approvals.gateService({ key, name, approverDid, depth }, caller, { action, targetHost: target, params, delegationId }, body || {});
     if (g.ok) return { ok: true, approval_id: g.approval_id };
     const b = { ...(g.body || {}) };
+    const who = nameApprover ? (b.owner || null) : null;
     delete b.owner;
     if (g.status === 202) {
-      b.next = 'Park this call. The person whose authority it uses approves it in their DemiPass app; then make the same call once more with approval_id. Do not retry in a loop.';
+      if (nameApprover) b.approver = who;
+      b.next = `Park this call. ${who ? `${who} approves it in their DemiPass app (Requests)` : 'The person whose authority it uses approves it in their DemiPass app'}; then make the same call once more with approval_id. Do not retry in a loop.`;
     }
     return { ok: false, status: g.status, body: b };
   }
+  // What a wallet with nobody to answer for it does about it (the MCP shows this to the agent).
+  const NO_PERSON_HINT = { fix: 'ask to join a person\'s fleet: POST /api/network/requests {to: <their username or email>, as: "join"} (MCP: demipass_fleet_join); they accept in their DemiPass app and answer for this wallet from then on. Or use a person\'s own session, or a silicon their fleet created.' };
 
   // The bearer as a wallet's OWN token (standard civitasvox JWT). Old `silicon:` tokens act as their carbon and worker
   // tokens share their parent's DID, so neither is locked to the wallet that would pay: refused here.
@@ -825,7 +843,7 @@ module.exports = function registerServiceTenants(deps) {
     let ownerDid;
     if (serviceDid === auth.did) {
       ownerDid = personFor(auth.did);
-      if (!ownerDid) return res.status(403).json({ error: 'an agent no fleet created has no person to approve it as a service' });
+      if (!ownerDid) return res.status(403).json({ error: 'an agent no fleet created has no person to approve it as a service', ...NO_PERSON_HINT });
     } else {
       if (isAgentToken(auth)) return res.status(403).json({ error: 'a person registers one of their silicons from their own session' });
       if (!ownAgent(auth.did, serviceDid)) return res.status(403).json({ error: 'service_did must be you or a silicon your own fleet created' });
@@ -1007,7 +1025,7 @@ module.exports = function registerServiceTenants(deps) {
     const orc = b.on_request_cap_dd === undefined || b.on_request_cap_dd === null ? null : b.on_request_cap_dd;
     if (orc !== null && (!Number.isInteger(orc) || orc < 1 || orc > cap)) return res.status(400).json({ error: `on_request_cap_dd: 1-${cap} (the most one Conduit request may run up; at most the daily cap)` });
     const approver = personFor(auth.did);
-    if (!approver) return res.status(403).json({ error: 'an agent no fleet created has no person to consent for it' });
+    if (!approver) return res.status(403).json({ error: 'an agent no fleet created has no person to consent for it', ...NO_PERSON_HINT });
     // A wallet consenting for itself: the barrel tier applies to what the consent lets out in a day, not only per
     // charge (re-review L). An agent's consent is its creator's to approve, with the creator's PIN and phone.
     const barrel = approver === auth.did ? barrelRefusal(auth.did, cap) : null;
@@ -1025,7 +1043,7 @@ module.exports = function registerServiceTenants(deps) {
       g = { ok: true, approval_id: c.approval_id, plan: c };
     } else {
       g = personApproval('svc:demipass:consent', `let a wallet pay ${t.slug}`, approver, 'elevated', { did: auth.did, label: '' }, 'consent', 'demipass',
-        { service: t.slug, wallet: auth.did, daily_cap_dd: cap, ...(orc !== null ? { on_request_cap_dd: orc } : {}) }, b, null);
+        { service: t.slug, wallet: auth.did, daily_cap_dd: cap, ...(orc !== null ? { on_request_cap_dd: orc } : {}) }, b, null, { nameApprover: true });
       if (!g.ok) return res.status(g.status).json(g.body);
     }
     const at = nowIso();
