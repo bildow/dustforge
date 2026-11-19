@@ -51,7 +51,7 @@ module.exports = function registerWalletSettings({ app, db, rateLimitStandard, g
   });
 
   // What a pane's onboarding asks before it writes instruction files: is the person behind this wallet's session (the
-  // wallet itself, or its creator for an agent wallet) consenting? Any live token of the wallet may ask.
+  // wallet itself; for an agent wallet its creator, else the owner of the fleet it joined) consenting? Any live token may ask.
   app.get('/api/identity/pane-rules', rateLimitStandard, (req, res) => {
     const auth = getBearerIdentity(req); if (!auth.ok) return res.status(auth.status || 401).json({ error: auth.error });
     // An agent wallet nobody created has no person to answer for it: not enabled, and not its own row (#136 review M1).

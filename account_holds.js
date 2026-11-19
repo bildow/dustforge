@@ -243,6 +243,9 @@ module.exports = function registerAccountHolds(deps) {
     // Fund asks (fund_asks.js): work waiting on this wallet's balance. The app (1.12+) notifies about them like any
     // request and opens on the vault, where their card is; their ids are in their own range (3e11+).
     if (!key.revoked_at) { try { const F = deps.fundAsks && deps.fundAsks(); if (F) approvals.push(...F.alertsFor(ch.did)); } catch (_) {} }
+    // Network requests (network_routes.js): a wallet asking to join this fleet, an invitation, a contact. Decided on the
+    // vault home, where their cards are; ids in their own range (4e11+).
+    if (!key.revoked_at) { try { const N = deps.network && deps.network(); if (N && N.alertsFor) approvals.push(...N.alertsFor(ch.did)); } catch (_) {} }
     res.json({ ok: true, holds: holds.map(view), notices: notices(ch.did), approvals });
   });
 

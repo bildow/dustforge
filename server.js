@@ -9849,7 +9849,7 @@ const fleetRoutes = require('./fleet_routes')({
   getBearerIdentity, gateFresh, gateMissing, spendSingleUse, approvals: () => useApprovals,
 });
 // Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
-require('./network_routes')({
+const networkRoutes = require('./network_routes')({
   app, db, billing, fleetBilling, rateLimitStandard, getBearerIdentity, gateSession, gateFresh, gateMissing, spendSingleUse,
   barrelGuardedTransfer, transferRefusal: transferBarrelRefusal, sendMail: fleetRoutes.sendMail,
   devices: () => deviceKeys,   // registered below
@@ -9929,7 +9929,7 @@ const accountHolds = require('./account_holds')({
   devices: () => deviceKeys, cutSessions: (did) => cutSessions(did),
   applyPinReset: (did, pinHash, why) => applyPinHash(did, pinHash, { unlinkWhy: why }),
   guardians: () => recoveryGuardians, recovery: () => guardianRecovery, approvals: () => useApprovals,
-  walletNotices: () => walletNotices, fundAsks: () => fundAsks,
+  walletNotices: () => walletNotices, fundAsks: () => fundAsks, network: () => networkRoutes,
 });
 // Device keys, dormancy lock, biometric PIN-equivalent; approvals bound to an enrolled phone (red team items 4b, 8).
 const deviceKeys = require('./device_keys')({
