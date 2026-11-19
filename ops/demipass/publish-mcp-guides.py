@@ -29,8 +29,8 @@ BASELINE = '4fe3dd2783d9e5e30c3994fab428f01ee7cd508b7b49626210473c6e6b014dd0'   
 # this program, attests "link to exactly these"; the deployed manifest must say the same (it is deploy-written, so it
 # proves only that the deploy is self-consistent). Point-in-time: a later deploy changes the assets anyway.
 PINS = {
-    'public/mcp-agents.html': 'def4549adbc163c9129e2dcb3c4d3c3adc62ad3b82904434a77f83d1d4723979',
-    'public/mcp-agents.md': '7667debac153a7c24f007fe3222a41d7cd16ffe0f87dd21c6bfee9e2d9b1673c',
+    'public/mcp-agents.html': 'be7b09a55d732f4eb1c58f7eb218dfd5bae3f8c90f84b61154e6bfcf595f8be7',
+    'public/mcp-agents.md': '29a4662dd2e34606551659fd7ba0cf17333ebb4228cb9ecf903a3f16b0f8c8a1',
     'public/downloads/demipass-conduit-31eda02.tgz': 'ae44d69d9280e9765d3e4c22109211d783ba1bb1bc3a4cab06088b99247798b3',
 }
 MARKER = b'id="mcp-service-guides"'
