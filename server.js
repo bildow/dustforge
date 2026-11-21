@@ -9991,7 +9991,12 @@ paneMail = require('./pane_mail')({ app, db, billing, getBearerIdentity, isAgent
 // Service tenants: DemiPass as the identity + metering layer for agent services (FLEETGATE, Conduit; service_tenants.js).
 const svcTenants = require('./service_tenants')({ app, db, identity, billing, getBearerIdentity, logSecurityEvent, rateLimitStandard,
   approvals: useApprovals, masterKey: process.env.IDENTITY_MASTER_KEY, transferBarrelRefusal: (did, dd) => transferBarrelRefusal(did, dd),
-  spendAsks: () => spendAsks });
+  spendAsks: () => spendAsks, oauthSeats: () => oauthSeat });
+// OAuth 2.1 front for human web seats (oauth_seat.js, Aaron 2026-11-21): a Claude.ai custom connector signs the fleet
+// owner in (login + PIN in the browser), names a seat-… agent of the fleet and the Conduit scopes, and receives the
+// seat's Conduit service token as its access token; refreshes re-check consent and delegation; the app's revokes end it.
+const oauthSeat = require('./oauth_seat')({ app, db, identity, express, rateLimitStandard, rateLimitStrict, rateLimitLogin, getBearerIdentity, logSecurityEvent,
+  services: svcTenants, checkPassword: verifyWalletPassword, checkPin: tryPin, pinLocked: (w) => pinGate.lockedFor(w), publicApi: process.env.PUBLIC_API_URL });
 // Per-wallet settings (wallet_settings.js, Aaron 2026-11-18): "Write agent instruction files" must be on before a pane or
 // agent is onboarded; the app asks the first time Fleet is opened or a pane/agent request shows.
 require('./wallet_settings')({ app, db, rateLimitStandard, getBearerIdentity, logSecurityEvent, personFor: (did) => svcTenants.personFor(did), isAgentAuth, deviceSession });

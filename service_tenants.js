@@ -460,8 +460,14 @@ module.exports = function registerServiceTenants(deps) {
       .run(tenant.id, d.jti, d.sub, d.iat || null, d.exp, d.src_auth || null, d.fleet ? String(d.fleet) : null, d.minted_by_jti || null,
            Array.isArray(d.svc_scopes) ? JSON.stringify(d.svc_scopes) : null, JSON.stringify(actions), cap, who.delegation ? who.delegation.id : null, at, at, fuDd);
     const spent = db.prepare('SELECT COALESCE(SUM(dd), 0) AS s FROM service_charges WHERE token_jti = ? AND tenant_id = ?').get(d.jti, tenant.id).s;
+    // How the token was minted, from the signature-checked payload (never a header): a web seat's OAuth token says so
+    // and names its seat and resource, so a relay binds the seat's name to this verified wallet and nothing else
+    // (oauth_seat.js; the Conduit MCP pane's requirement, 2026-11-21). An ordinary service token says service_token.
+    const seatClaims = d.auth_method === 'oauth_seat'
+      ? { auth_method: 'oauth_seat', seat: typeof d.seat === 'string' ? d.seat : null, resource: typeof d.resource === 'string' ? d.resource : null }
+      : { auth_method: 'service_token' };
     return { status: 200, body: {
-      ok: true, wallet: d.sub, token_id: d.jti, scope, service_scopes: Array.isArray(d.svc_scopes) ? d.svc_scopes : null,
+      ok: true, wallet: d.sub, token_id: d.jti, scope, service_scopes: Array.isArray(d.svc_scopes) ? d.svc_scopes : null, ...seatClaims,
       action: action.action, action_scope: action.scope, depth: action.depth, via: who.via,
       ...(who.delegation ? { delegation_id: who.delegation.id, principal: principalId(tenant, who.delegation.owner_did) } : {}),
       ...(approval ? { approval_id: approval } : {}),
@@ -1066,7 +1072,10 @@ module.exports = function registerServiceTenants(deps) {
     if (c.status !== 'active') return res.status(409).json({ error: `already ${c.status}` });
     db.prepare("UPDATE service_consents SET status = 'revoked', revoked_at = ? WHERE id = ? AND status = 'active'").run(nowIso(), id);
     event('service_consent_revoked', auth.did, { consent_id: id });
-    res.json({ ok: true, revoked: true, consent_id: id });
+    // Without consent to pay, a web seat's OAuth grants on this tenant end too (oauth_seat.js).
+    let grantsEnded = 0;
+    try { const o = deps.oauthSeats && deps.oauthSeats(); if (o) grantsEnded = o.revokeForConsent(c); } catch (e) { console.error('[services] oauth grants not ended:', e.message); }
+    res.json({ ok: true, revoked: true, consent_id: id, ...(grantsEnded ? { oauth_grants_revoked: grantsEnded } : {}) });
   });
 
   // A caller mints a token for one tenant it has consent to pay. Its own token (agents' fleet-minted ones included),
@@ -1162,7 +1171,10 @@ module.exports = function registerServiceTenants(deps) {
     if (d.status !== 'active') return res.status(409).json({ error: `already ${d.status}` });
     db.prepare("UPDATE service_delegations SET status = 'revoked', revoked_at = ? WHERE id = ? AND status = 'active'").run(nowIso(), id);
     event('service_delegation_revoked', auth.did, { delegation_id: id });
-    res.json({ ok: true, revoked: true, delegation_id: id });
+    // A web seat's OAuth grants rest on this delegation: they end with it, access tokens included (oauth_seat.js).
+    let grantsEnded = 0;
+    try { const o = deps.oauthSeats && deps.oauthSeats(); if (o) grantsEnded = o.revokeForDelegation(d); } catch (e) { console.error('[services] oauth grants not ended:', e.message); }
+    res.json({ ok: true, revoked: true, delegation_id: id, ...(grantsEnded ? { oauth_grants_revoked: grantsEnded } : {}) });
   });
 
   app.post('/api/services/verify', lim, (req, res) => {
@@ -1194,7 +1206,7 @@ module.exports = function registerServiceTenants(deps) {
     res.json({ valid: true, on_record: !!row && row.receipt === receipt, charge: p });
   });
 
-  return { verify, charge, chargeOnRequest, verifyServiceToken, priceOf, tenantBySlug, SERVICE_MARGIN_PCT, issuer, personFor };
+  return { verify, charge, chargeOnRequest, verifyServiceToken, priceOf, tenantBySlug, SERVICE_MARGIN_PCT, issuer, personFor, liveConsent, consentOf, ownAgent };
 };
 
 module.exports.SERVICE_MARGIN_PCT = SERVICE_MARGIN_PCT;
