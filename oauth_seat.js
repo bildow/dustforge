@@ -48,7 +48,7 @@ const MAX_CLIENTS = 200;
 const MAX_ABANDONED_PER_IP_DAY = 50;        // grant-less registrations one address may leave in 24 h (review M1/N1: Claude.ai
                                             // registers from shared egress addresses, so only abandoned ones count)
 const EVICTION_AGE_MS = 15 * 60 * 1000;     // a client this young may still be on the authorize page: never evicted (review N4)
-const BIND_COOKIE = 'dp_authz';             // binds the three authorize steps to the browser that opened the page (review N3)
+const BIND_COOKIE = 'dp_authz_';            // + request id: binds the three authorize steps to the browser that opened the page (review N3/X1)
 const CLIENT_NAME_RE = /[^A-Za-z0-9 ._,'()\-]/g;   // what a client may call itself on the authorize page (review H1)
 const DEFAULT_SCOPES = ['read', 'post', 'ack'];
 const SEAT_PREFIX = 'seat-';
@@ -378,7 +378,9 @@ module.exports = function registerOauthSeat(deps) {
     db.prepare('INSERT INTO oauth_authz (request_id, client_id, redirect_uri, scopes, state, code_challenge, resource, created_at, expires_at, ip, bind_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(requestId, client.client_id, redirect, JSON.stringify(sc.scopes), state, challenge, resource, nowIso(), later(AUTHZ_TTL_SEC), String(req.ip || ''), sha(bind));
     db.prepare('UPDATE oauth_clients SET last_used_at = ? WHERE client_id = ?').run(nowIso(), client.client_id);
-    res.cookie(BIND_COOKIE, bind, { httpOnly: true, sameSite: 'strict', secure: isSecure(req), path: '/oauth/authorize', maxAge: AUTHZ_TTL_SEC * 1000 });
+    // One cookie per request (review X1): two flows open at once in the same browser do not overwrite each other.
+    // `req.secure` honours the app's trust-proxy setting; a bare X-Forwarded-Proto from a client is not believed (review X3).
+    res.cookie(BIND_COOKIE + requestId, bind, { httpOnly: true, sameSite: 'strict', secure: req.secure, path: '/oauth/authorize', maxAge: AUTHZ_TTL_SEC * 1000 });
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(authorizePage({ requestId, clientName: client.client_name || 'a connector', scopes: sc.scopes, resource, nonce: rand(16) }, res));
   });
@@ -389,7 +391,7 @@ module.exports = function registerOauthSeat(deps) {
     if (!a || a.expires_at <= nowIso()) { res.status(410).json({ error: 'expired', error_description: 'this sign-in request has expired; start again from Claude' }); return null; }
     // The three steps belong to the browser that opened the page (its cookie): a request id seen elsewhere is useless
     // without it (review L6/N3).
-    const c = cookieOf(req, BIND_COOKIE);
+    const c = cookieOf(req, BIND_COOKIE + a.request_id);
     if (!a.bind_hash || !c || !safeEq(sha(c), a.bind_hash)) { res.status(409).json({ error: 'wrong_client', error_description: 'this sign-in request belongs to another browser; start again from Claude' }); return null; }
     if (a.step !== step) { res.status(409).json({ error: 'wrong_step', error_description: `this request is at step '${a.step}'` }); return null; }
     return a;
@@ -398,7 +400,6 @@ module.exports = function registerOauthSeat(deps) {
     for (const part of String(req.headers.cookie || '').split(';')) { const i = part.indexOf('='); if (i > 0 && part.slice(0, i).trim() === name) { const v = part.slice(i + 1).trim(); return /^[A-Za-z0-9_-]{16,64}$/.test(v) ? v : null; } }
     return null;
   }
-  const isSecure = (req) => Boolean(req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
   // The password check takes the same time whether the username exists or not (review L5): an unknown name is checked
   // against a dummy hash of the current form. The host passes it (server.js); without one the shortcut stands.
   const dummyWallet = () => { const h = typeof deps.dummyPasswordHash === 'function' ? deps.dummyPasswordHash() : null; return h ? { did: null, username: null, status: 'inactive', password_hash: h } : null; };

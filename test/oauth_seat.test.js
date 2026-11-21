@@ -74,9 +74,9 @@ async function world() {
   const jar = { bind: null };
   const call = async (method, path, { body, headers = {}, form = false, redirect = 'manual' } = {}) => {
     const h = { ...(body === undefined ? {} : { 'content-type': form ? 'application/x-www-form-urlencoded' : 'application/json' }), ...headers };
-    if (path.startsWith('/oauth/authorize/') && h.cookie === undefined && jar.bind) h.cookie = 'dp_authz=' + jar.bind;
+    if (path.startsWith('/oauth/authorize/') && h.cookie === undefined && jar.bind) h.cookie = jar.bind;
     const r = await fetch(base() + path, { method, redirect, headers: h, body: body === undefined ? undefined : form ? new URLSearchParams(body).toString() : JSON.stringify(body) });
-    const sc = r.headers.get('set-cookie') || ''; const m = /dp_authz=([A-Za-z0-9_-]+)/.exec(sc); if (m) jar.bind = m[1];
+    const sc = r.headers.get('set-cookie') || ''; const m = /(dp_authz_[A-Za-z0-9_-]+=[A-Za-z0-9_-]+)/.exec(sc); if (m) jar.bind = m[1];
     const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch (_) {}
     return { status: r.status, headers: r.headers, text, json };
   };
@@ -476,18 +476,25 @@ test('N3: the authorize steps are bound to the browser that opened the page by a
     const c = await registerClient(w);
     const { challenge } = pkce();
     const page = await w.call('GET', `/oauth/authorize?response_type=code&client_id=${c.client_id}&redirect_uri=${encodeURIComponent(CB)}&code_challenge=${challenge}`);
-    assert.match(page.headers.get('set-cookie'), /^dp_authz=[A-Za-z0-9_-]+; Max-Age=600; Path=\/oauth\/authorize; Expires=[^;]+; HttpOnly; SameSite=Strict$/);
     const id = /dpa_[A-Za-z0-9_-]+/.exec(page.text)[0];
+    assert.match(page.headers.get('set-cookie'), new RegExp('^dp_authz_' + id + '=[A-Za-z0-9_-]+; Max-Age=600; Path=\\/oauth\\/authorize; Expires=[^;]+; HttpOnly; SameSite=Strict$'));
+    const firstCookie = w.jar.bind;
     const noCookie = await w.call('POST', '/oauth/authorize/login', { headers: { cookie: '' }, body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
     assert.equal(noCookie.status, 409); assert.equal(noCookie.json.error, 'wrong_client');
-    const wrong = await w.call('POST', '/oauth/authorize/login', { headers: { cookie: 'dp_authz=' + 'x'.repeat(32) }, body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
+    const wrong = await w.call('POST', '/oauth/authorize/login', { headers: { cookie: 'dp_authz_' + id + '=' + 'x'.repeat(32) }, body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
     assert.equal(wrong.status, 409);
     assert.equal(w.db.prepare('SELECT step, login_tries FROM oauth_authz WHERE request_id = ?').get(id).login_tries, 0, 'a refused call counts no try');
-    const ok = await w.call('POST', '/oauth/authorize/login', { body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
+    const ok = await w.call('POST', '/oauth/authorize/login', { headers: { cookie: firstCookie }, body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
     assert.equal(ok.status, 200);
-    // Over HTTPS (as behind nginx) the cookie is Secure.
+    // A second flow in the same browser does not disturb the first (review X1): each request has its own cookie.
+    const second = await w.call('GET', `/oauth/authorize?response_type=code&client_id=${c.client_id}&redirect_uri=${encodeURIComponent(CB)}&code_challenge=${challenge}`);
+    const id2 = /dpa_[A-Za-z0-9_-]+/.exec(second.text)[0];
+    assert.notEqual(id2, id); assert.notEqual(w.jar.bind, firstCookie);
+    const first = await w.call('POST', '/oauth/authorize/pin', { headers: { cookie: firstCookie + '; ' + w.jar.bind }, body: { request_id: id, pin: '1234' } });
+    assert.equal(first.status, 200, first.text);
+    // A bare X-Forwarded-Proto from a client earns no Secure flag here (no trusted proxy in this world; review X3).
     const tls = await w.call('GET', `/oauth/authorize?response_type=code&client_id=${c.client_id}&redirect_uri=${encodeURIComponent(CB)}&code_challenge=${challenge}`, { headers: { 'x-forwarded-proto': 'https' } });
-    assert.match(tls.headers.get('set-cookie'), /; Secure/);
+    assert.doesNotMatch(tls.headers.get('set-cookie'), /; Secure/);
   } finally { await w.close(); }
 });
 

@@ -119,5 +119,11 @@ evicted); N5 a suspended fleet ended its seats' grants for good (a suspended fle
 sweep leaves it alone). `revokeForSeat` is called from the fleet's silicon removal route, and the smoke removes a seat
 through that API and shows its token dead at once.
 
+Third pass (dc0fa9b): N1–N5 fixed, N6 partial (the billing fleet cut and the dummy-hash path have no isolated test).
+Three low notes: X1 one cookie name for every in-flight request (fixed: the cookie is named by request id); X3 a
+client-supplied `X-Forwarded-Proto` could earn a `Secure` cookie (fixed: `req.secure` alone, which honours `trust
+proxy`); X2 four addresses × 50 abandoned registrations can fill the 200 slots and, with the 15-minute eviction floor,
+hold registration for up to 15 minutes at a time. Accepted: a bounded delay, not a lockout, visible in the events.
+
 Tests: `node --test test/oauth_seat.test.js` (module, in-memory DB, stand-in password/PIN) and
 `bash test/oauth_seat_smoke.sh` (server.js end to end, including the tenant's verify and the app's revoke).
