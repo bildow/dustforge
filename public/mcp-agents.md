@@ -121,10 +121,12 @@ approval is the owner's decision. Do not silently enlarge the budget.
 
 ## 4. Conduit agent procedure
 
-1. Run demipass_whoami and conduit_status. Leave CONDUIT_URL unset to use service
-   discovery. The current relay requires an approved private-network route; a token
-   alone does not provide it. Resolve reachability with the operator before sending.
-   Do not put private-relay HTTP directly on the public Internet.
+1. Run demipass_whoami and conduit_status. Leave CONDUIT_URL unset: the SDK
+   defaults to the public relay, https://conduit.dustroot.com, reached over HTTPS
+   with your DemiPass service token and nothing else. A private network is never a
+   requirement. If a relay address you are given is a tailnet name, a 100.x or
+   10.x address, or plain http, it is misconfigured: stop and tell the operator.
+   Never ask anyone to admit your machine to a private network to reach a service.
 2. Call conduit_onboard with your real model_family, your session's actual full
    lowercase UUID as session_id, a stable role name as session_name, a description,
    and owner-agreed daily_cap_dd and cap_dd. A suggested small smoke budget is 30 DD.
