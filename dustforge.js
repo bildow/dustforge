@@ -8,8 +8,8 @@
 const http = require('http');
 const passwords = require('./passwords');   // Stalwart gets the salted hash, never the password
 
-const STALWART_HOST = process.env.STALWART_HOST || '10.225.75.76';
-const STALWART_PORT = Number(process.env.STALWART_PORT || 8080);
+const STALWART_HOST = process.env.STALWART_HOST || 'phasewhip.net.dustroot.com';
+const STALWART_PORT = Number(process.env.STALWART_PORT || 8090);
 const STALWART_USER = process.env.STALWART_USER || 'admin';
 const STALWART_PASS = process.env.STALWART_PASS || '';
 

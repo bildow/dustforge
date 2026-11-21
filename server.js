@@ -2016,7 +2016,7 @@ function setMailboxPasswordHash(did, hash) {
     const body = JSON.stringify([{ action: 'set', field: 'secrets', value: [hash] }]);
     let connected = false, done = false;
     const end = (v) => { if (!done) { done = true; resolve(v); } };
-    const r = http.request({ hostname: process.env.STALWART_HOST || '100.83.112.88', port: Number(process.env.STALWART_PORT || 8080),
+    const r = http.request({ hostname: process.env.STALWART_HOST || 'phasewhip.net.dustroot.com', port: Number(process.env.STALWART_PORT || 8090),
       path: '/api/principal/' + encodeURIComponent(w.username), method: 'PATCH',
       headers: { Authorization: 'Basic ' + Buffer.from('admin:' + (process.env.STALWART_PASS || '')).toString('base64'), 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
       (pr) => { pr.resume(); pr.on('end', () => end(pr.statusCode < 300 ? 'ok' : 'unknown')); });
@@ -14871,8 +14871,8 @@ app.post('/api/identity/reset-password', rateLimitStrict, async (req, res) => {
   // Change password via Stalwart
   try {
     const http = require('http');
-    const stalwartHost = process.env.STALWART_HOST || '100.83.112.88';
-    const stalwartPort = Number(process.env.STALWART_PORT || 8080);
+    const stalwartHost = process.env.STALWART_HOST || 'phasewhip.net.dustroot.com';
+    const stalwartPort = Number(process.env.STALWART_PORT || 8090);
     const stalwartPass = process.env.STALWART_PASS || '';
     const adminAuth = Buffer.from('admin:' + stalwartPass).toString('base64');
 
@@ -15980,7 +15980,7 @@ function fetchStalwartSecret(username) {
   return new Promise((resolve) => {
     const http = require('http');
     const adminAuth = Buffer.from('admin:' + (process.env.STALWART_PASS || '')).toString('base64');
-    const r = http.request({ hostname: process.env.STALWART_HOST || '100.83.112.88', port: Number(process.env.STALWART_PORT || 8080),
+    const r = http.request({ hostname: process.env.STALWART_HOST || 'phasewhip.net.dustroot.com', port: Number(process.env.STALWART_PORT || 8090),
       path: '/api/principal/' + encodeURIComponent(username), method: 'GET',
       headers: { 'Authorization': 'Basic ' + adminAuth } }, (rs) => {
       let data = ''; rs.on('data', c => data += c);
