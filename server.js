@@ -9846,7 +9846,7 @@ billing.setAttribution(fleetBilling, require('./dd_ledger'));
 const fleetRoutes = require('./fleet_routes')({
   app, db, identity, billing, fleetBilling, ledger: require('./dd_ledger'), dustforge, createEmailTransport,
   rateLimitStandard, adminKey: ADMIN_API_KEY, crypto, grantAllContextsDelegation,
-  getBearerIdentity, gateFresh, gateMissing, spendSingleUse, approvals: () => useApprovals,
+  getBearerIdentity, gateFresh, gateMissing, spendSingleUse, approvals: () => useApprovals, oauthSeats: () => oauthSeat,
 });
 // Network: connect wallets (people, agents joining a fleet) and send DD to connections. docs/network.md.
 const networkRoutes = require('./network_routes')({

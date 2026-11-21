@@ -45,7 +45,10 @@ const AUTHZ_TTL_SEC = 600;                   // a browser has ten minutes to log
 const DELEGATION_TTL_SEC = REFRESH_TTL_SEC;  // the owner's delegation to the seat lasts as long as the grant can
 const LOGIN_TRIES_PER_REQUEST = 5;
 const MAX_CLIENTS = 200;
-const MAX_CLIENTS_PER_IP_DAY = 10;          // registrations one address may make in 24 h (review M1)
+const MAX_ABANDONED_PER_IP_DAY = 50;        // grant-less registrations one address may leave in 24 h (review M1/N1: Claude.ai
+                                            // registers from shared egress addresses, so only abandoned ones count)
+const EVICTION_AGE_MS = 15 * 60 * 1000;     // a client this young may still be on the authorize page: never evicted (review N4)
+const BIND_COOKIE = 'dp_authz';             // binds the three authorize steps to the browser that opened the page (review N3)
 const CLIENT_NAME_RE = /[^A-Za-z0-9 ._,'()\-]/g;   // what a client may call itself on the authorize page (review H1)
 const DEFAULT_SCOPES = ['read', 'post', 'ack'];
 const SEAT_PREFIX = 'seat-';
@@ -91,8 +94,10 @@ module.exports = function registerOauthSeat(deps) {
     login_tries INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
-    ip TEXT
+    ip TEXT,
+    bind_hash TEXT
   )`);
+  try { db.exec('ALTER TABLE oauth_authz ADD COLUMN bind_hash TEXT'); } catch (_) {}   // a table made by 6d57a6d before the cookie binding
   db.exec(`CREATE TABLE IF NOT EXISTS oauth_grants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     client_id TEXT NOT NULL,
@@ -184,6 +189,8 @@ module.exports = function registerOauthSeat(deps) {
     if (!t) return { ok: false, error: 'Conduit is not available here right now', code: 'temporarily_unavailable', status: 503 };
     if (g.status !== 'active') return { ok: false, error: 'this grant was revoked', code: 'invalid_grant' };
     if (!walletActive(g.owner_did)) return { ok: false, error: 'the owner wallet is not active', code: 'invalid_grant' };
+    // A suspended fleet is a pause, not an ending (review N5): nothing mints, nothing is revoked.
+    if (db.prepare("SELECT 1 FROM fleets WHERE slug = ? AND owner_did = ? AND status = 'suspended'").get(g.fleet_slug, g.owner_did)) return { ok: false, error: 'the fleet is suspended', code: 'temporarily_unavailable', status: 503 };
     const seat = seatRow(g.owner_did, g.seat_handle);
     if (!seat || seat.member_did !== g.seat_did) return { ok: false, error: `@${g.seat_handle} is no longer a seat of this owner's fleet`, code: 'invalid_grant' };
     const w = walletActive(g.seat_did);
@@ -255,7 +262,9 @@ module.exports = function registerOauthSeat(deps) {
     const t = nowIso();
     try {
       // A grant whose seat is no longer an active fleet-created agent of its owner ends within a minute (review M2).
+      // A suspended fleet is left alone (review N5): its seats are paused, not gone.
       for (const g of db.prepare("SELECT * FROM oauth_grants WHERE status = 'active'").all()) {
+        if (db.prepare("SELECT 1 FROM fleets WHERE slug = ? AND owner_did = ? AND status = 'suspended'").get(g.fleet_slug, g.owner_did)) continue;
         const s = seatRow(g.owner_did, g.seat_handle);
         if (!s || s.member_did !== g.seat_did) revokeGrant(g.id, `@${g.seat_handle} is no longer a seat of this owner's fleet`);
       }
@@ -305,14 +314,16 @@ module.exports = function registerOauthSeat(deps) {
     const method = b.token_endpoint_auth_method === undefined ? 'client_secret_basic' : String(b.token_endpoint_auth_method);
     if (!['none', 'client_secret_basic', 'client_secret_post'].includes(method)) return oauthError(res, 400, 'invalid_client_metadata', 'token_endpoint_auth_method: none, client_secret_basic or client_secret_post');
     const ip = String(req.ip || '');
-    if (db.prepare('SELECT COUNT(*) AS n FROM oauth_clients WHERE created_ip = ? AND created_at > ?').get(ip, new Date(Date.now() - 86400000).toISOString()).n >= MAX_CLIENTS_PER_IP_DAY) {
-      return oauthError(res, 429, 'temporarily_unavailable', `at most ${MAX_CLIENTS_PER_IP_DAY} registrations a day from one address`);
+    if (db.prepare(`SELECT COUNT(*) AS n FROM oauth_clients c WHERE c.created_ip = ? AND c.created_at > ?
+        AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id AND g.status = 'active')`).get(ip, new Date(Date.now() - 86400000).toISOString()).n >= MAX_ABANDONED_PER_IP_DAY) {
+      return oauthError(res, 429, 'temporarily_unavailable', `too many registrations without a completed connection from one address today`);
     }
     if (db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n >= MAX_CLIENTS) {
-      // Room is made from clients that hold no live grant, least recently seen first; one that merely opened the
-      // authorize page is not "in use" (review M1: otherwise 200 registrations + 200 page loads lock registration).
-      const idle = db.prepare(`SELECT c.client_id FROM oauth_clients c WHERE NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id AND g.status = 'active')
-        ORDER BY COALESCE(c.last_used_at, c.created_at) ASC LIMIT ?`).all(Math.max(1, db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n - MAX_CLIENTS + 1));
+      // Room is made from clients that hold no live grant and are not brand new, least recently seen first; one that
+      // merely opened the authorize page is not "in use" (review M1: otherwise 200 registrations + 200 page loads lock
+      // registration), and one registered minutes ago may still be mid-flow (review N4).
+      const idle = db.prepare(`SELECT c.client_id FROM oauth_clients c WHERE c.created_at < ? AND NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id AND g.status = 'active')
+        ORDER BY COALESCE(c.last_used_at, c.created_at) ASC LIMIT ?`).all(new Date(Date.now() - EVICTION_AGE_MS).toISOString(), Math.max(1, db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n - MAX_CLIENTS + 1));
       for (const c of idle) db.prepare('DELETE FROM oauth_clients WHERE client_id = ?').run(c.client_id);
       if (db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n >= MAX_CLIENTS) return oauthError(res, 429, 'temporarily_unavailable', 'too many registered clients; try later');
     }
@@ -360,9 +371,14 @@ module.exports = function registerOauthSeat(deps) {
     const sc = parseScopes(q.scope, t);
     if (!sc.ok) return back('invalid_scope', sc.error);
     const requestId = 'dpa_' + rand(24);
-    db.prepare('INSERT INTO oauth_authz (request_id, client_id, redirect_uri, scopes, state, code_challenge, resource, created_at, expires_at, ip) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(requestId, client.client_id, redirect, JSON.stringify(sc.scopes), state, challenge, resource, nowIso(), later(AUTHZ_TTL_SEC), String(req.ip || ''));
+    // The browser that opened this page is the only one that may finish it: a random cookie value, hashed on the row,
+    // HttpOnly, SameSite=Strict, scoped to the authorize path (review N3: an address can change mid-flow, a cookie
+    // cannot be read by a page on another origin, and a leaked request id alone is useless).
+    const bind = rand(24);
+    db.prepare('INSERT INTO oauth_authz (request_id, client_id, redirect_uri, scopes, state, code_challenge, resource, created_at, expires_at, ip, bind_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(requestId, client.client_id, redirect, JSON.stringify(sc.scopes), state, challenge, resource, nowIso(), later(AUTHZ_TTL_SEC), String(req.ip || ''), sha(bind));
     db.prepare('UPDATE oauth_clients SET last_used_at = ? WHERE client_id = ?').run(nowIso(), client.client_id);
+    res.cookie(BIND_COOKIE, bind, { httpOnly: true, sameSite: 'strict', secure: isSecure(req), path: '/oauth/authorize', maxAge: AUTHZ_TTL_SEC * 1000 });
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.send(authorizePage({ requestId, clientName: client.client_name || 'a connector', scopes: sc.scopes, resource, nonce: rand(16) }, res));
   });
@@ -371,12 +387,18 @@ module.exports = function registerOauthSeat(deps) {
     const id = String((req.body || {}).request_id || '');
     const a = /^dpa_[A-Za-z0-9_-]{20,}$/.test(id) ? db.prepare('SELECT * FROM oauth_authz WHERE request_id = ?').get(id) : null;
     if (!a || a.expires_at <= nowIso()) { res.status(410).json({ error: 'expired', error_description: 'this sign-in request has expired; start again from Claude' }); return null; }
-    // The three steps belong to the browser that opened the page: a request id seen elsewhere is useless from another
-    // address (review L6). A changed address within the ten minutes starts over.
-    if (a.ip && String(req.ip || '') !== a.ip) { res.status(409).json({ error: 'wrong_client', error_description: 'this sign-in request was opened from another network; start again from Claude' }); return null; }
+    // The three steps belong to the browser that opened the page (its cookie): a request id seen elsewhere is useless
+    // without it (review L6/N3).
+    const c = cookieOf(req, BIND_COOKIE);
+    if (!a.bind_hash || !c || !safeEq(sha(c), a.bind_hash)) { res.status(409).json({ error: 'wrong_client', error_description: 'this sign-in request belongs to another browser; start again from Claude' }); return null; }
     if (a.step !== step) { res.status(409).json({ error: 'wrong_step', error_description: `this request is at step '${a.step}'` }); return null; }
     return a;
   }
+  function cookieOf(req, name) {
+    for (const part of String(req.headers.cookie || '').split(';')) { const i = part.indexOf('='); if (i > 0 && part.slice(0, i).trim() === name) { const v = part.slice(i + 1).trim(); return /^[A-Za-z0-9_-]{16,64}$/.test(v) ? v : null; } }
+    return null;
+  }
+  const isSecure = (req) => Boolean(req.secure || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https');
   // The password check takes the same time whether the username exists or not (review L5): an unknown name is checked
   // against a dummy hash of the current form. The host passes it (server.js); without one the shortcut stands.
   const dummyWallet = () => { const h = typeof deps.dummyPasswordHash === 'function' ? deps.dummyPasswordHash() : null; return h ? { did: null, username: null, status: 'inactive', password_hash: h } : null; };
@@ -518,13 +540,16 @@ module.exports = function registerOauthSeat(deps) {
       if (b.redirect_uri !== undefined && String(b.redirect_uri) !== row.redirect_uri) return oauthError(res, 400, 'invalid_grant', 'redirect_uri does not match');
       const verifier = String(b.code_verifier || '');
       if (!B64URL_43_128.test(verifier) || !safeEq(crypto.createHash('sha256').update(verifier).digest('base64url'), row.code_challenge)) return oauthError(res, 400, 'invalid_grant', 'PKCE verification failed');
-      db.prepare('UPDATE oauth_codes SET used_at = ? WHERE code_hash = ?').run(nowIso(), row.code_hash);
+      // An outage (no tenant row, suspended fleet) is answered BEFORE the code is spent, so the client can retry the
+      // same code when the service is back (review N2). Only a code that will either mint or close its grant is spent.
       const g = db.prepare('SELECT * FROM oauth_grants WHERE id = ?').get(row.grant_id);
       const good = g ? grantStillGood(g) : { ok: false, error: 'no grant', code: 'invalid_grant' };
+      if (!good.ok && good.code !== 'invalid_grant') return oauthError(res, good.status || 503, good.code, good.error);
+      db.prepare('UPDATE oauth_codes SET used_at = ? WHERE code_hash = ?').run(nowIso(), row.code_hash);
       if (!good.ok) {
         // The code is spent and nothing was issued: a grant that cannot mint is closed, not left live (review M4).
-        if (g && good.code === 'invalid_grant') revokeGrant(g.id, good.error);
-        return oauthError(res, good.status || 400, good.code, good.error);
+        if (g) revokeGrant(g.id, good.error);
+        return oauthError(res, 400, good.code, good.error);
       }
       event('oauth_token_issued', g.owner_did, { grant_id: g.id, seat: g.seat_handle, via: 'code', client_id: client.client_id });
       return tokenReply(res, g, good);

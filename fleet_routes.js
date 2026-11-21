@@ -370,6 +370,8 @@ module.exports = function registerFleetRoutes(deps) {
       fb.cutFleetTokens(db, s.member_did, a.fleet.slug);   // tokens this fleet minted for it stop working
       fb.revokeOwnerWorkers(db, s.member_did, a.fleet.owner_did);   // and workers its owner made for it
     })();
+    // A web seat's OAuth grants end with its fleet row (oauth_seat.js); the fleet cut above already killed its tokens.
+    try { const o = deps.oauthSeats && deps.oauthSeats(); if (o) o.revokeForSeat(s.member_did, `@${s.handle} removed from fleet ${a.fleet.slug}`); } catch (e) { log('oauth grants not ended:', e.message); }
     log(`removed ${s.handle} from ${a.fleet.slug} by ${a.did}`);
     res.json({ ok: true });
   });

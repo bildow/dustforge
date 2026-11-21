@@ -70,15 +70,19 @@ async function world() {
     checkPin: (did, pin) => { if (pin === '1234') return { ok: true }; pinTries[did] = (pinTries[did] || 0) + 1; return { status: 403, body: { error: 'incorrect PIN', attempts_left: 5 - pinTries[did] } }; } });
   const server = app.listen(0, "127.0.0.1"); await new Promise((r) => server.once("listening", r));
   const base = () => `http://127.0.0.1:${server.address().port}`;
+  // A one-cookie jar: the authorize page sets dp_authz, the three steps send it back (a browser would).
+  const jar = { bind: null };
   const call = async (method, path, { body, headers = {}, form = false, redirect = 'manual' } = {}) => {
-    const r = await fetch(base() + path, { method, redirect, headers: { ...(body === undefined ? {} : { 'content-type': form ? 'application/x-www-form-urlencoded' : 'application/json' }), ...headers },
-      body: body === undefined ? undefined : form ? new URLSearchParams(body).toString() : JSON.stringify(body) });
+    const h = { ...(body === undefined ? {} : { 'content-type': form ? 'application/x-www-form-urlencoded' : 'application/json' }), ...headers };
+    if (path.startsWith('/oauth/authorize/') && h.cookie === undefined && jar.bind) h.cookie = 'dp_authz=' + jar.bind;
+    const r = await fetch(base() + path, { method, redirect, headers: h, body: body === undefined ? undefined : form ? new URLSearchParams(body).toString() : JSON.stringify(body) });
+    const sc = r.headers.get('set-cookie') || ''; const m = /dp_authz=([A-Za-z0-9_-]+)/.exec(sc); if (m) jar.bind = m[1];
     const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch (_) {}
     return { status: r.status, headers: r.headers, text, json };
   };
   const ownerToken = (did) => { const w = db.prepare('SELECT * FROM identity_wallets WHERE did = ?').get(did); return identity.createTokenForIdentity(w.encrypted_private_key, did, { scope: 'transact', expiresIn: '1h', metadata: { auth_method: 'fingerprint', sid: 's1' } }); };
   const close = () => new Promise((r) => server.close(r));
-  return { db, app, oauth, call, owner, seat, other, agent, nopin, tenantId, ownerToken, close };
+  return { db, app, oauth, call, jar, owner, seat, other, agent, nopin, tenantId, ownerToken, close };
 }
 
 async function registerClient(w, extra = {}) {
@@ -379,7 +383,7 @@ test('H1: a client name cannot inject markup into the authorize page; script-con
 test('M1: registrations per address are capped, and a full registry evicts clients without a live grant instead of locking', async () => {
   const w = await world();
   try {
-    for (let i = 0; i < 10; i++) await registerClient(w);
+    for (let i = 0; i < 50; i++) await registerClient(w);
     const over = await w.call('POST', '/oauth/register', { body: { redirect_uris: [CB] } });
     assert.equal(over.status, 429);
     // 200 clients from other addresses, each "used" by an authorize page load only, none with a grant.
@@ -463,5 +467,67 @@ test('L2 + narrowed refresh + L7: a missing tenant is 503 without ending the gra
     // The refused call did not consume the refresh token.
     const again = await w.call('POST', '/oauth/token', { form: true, headers: basic(c), body: { grant_type: 'refresh_token', refresh_token: narrow.json.refresh_token } });
     assert.equal(again.status, 200);
+  } finally { await w.close(); }
+});
+
+test('N3: the authorize steps are bound to the browser that opened the page by a cookie, not by its address', async () => {
+  const w = await world();
+  try {
+    const c = await registerClient(w);
+    const { challenge } = pkce();
+    const page = await w.call('GET', `/oauth/authorize?response_type=code&client_id=${c.client_id}&redirect_uri=${encodeURIComponent(CB)}&code_challenge=${challenge}`);
+    assert.match(page.headers.get('set-cookie'), /^dp_authz=[A-Za-z0-9_-]+; Max-Age=600; Path=\/oauth\/authorize; Expires=[^;]+; HttpOnly; SameSite=Strict$/);
+    const id = /dpa_[A-Za-z0-9_-]+/.exec(page.text)[0];
+    const noCookie = await w.call('POST', '/oauth/authorize/login', { headers: { cookie: '' }, body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
+    assert.equal(noCookie.status, 409); assert.equal(noCookie.json.error, 'wrong_client');
+    const wrong = await w.call('POST', '/oauth/authorize/login', { headers: { cookie: 'dp_authz=' + 'x'.repeat(32) }, body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
+    assert.equal(wrong.status, 409);
+    assert.equal(w.db.prepare('SELECT step, login_tries FROM oauth_authz WHERE request_id = ?').get(id).login_tries, 0, 'a refused call counts no try');
+    const ok = await w.call('POST', '/oauth/authorize/login', { body: { request_id: id, username: 'owner-a', password: 'pw-owner-a' } });
+    assert.equal(ok.status, 200);
+    // Over HTTPS (as behind nginx) the cookie is Secure.
+    const tls = await w.call('GET', `/oauth/authorize?response_type=code&client_id=${c.client_id}&redirect_uri=${encodeURIComponent(CB)}&code_challenge=${challenge}`, { headers: { 'x-forwarded-proto': 'https' } });
+    assert.match(tls.headers.get('set-cookie'), /; Secure/);
+  } finally { await w.close(); }
+});
+
+test('N2 + N5: an outage at code exchange leaves the code usable; a suspended fleet pauses grants without ending them', async () => {
+  const w = await world();
+  try {
+    const c = await registerClient(w);
+    const a = await authorizeToCode(w, c);
+    w.db.prepare("UPDATE service_tenants SET status = 'suspended' WHERE slug = 'conduit'").run();
+    const down = await exchange(w, a);
+    assert.equal(down.status, 503); assert.equal(down.json.error, 'temporarily_unavailable');
+    assert.equal(w.db.prepare('SELECT used_at FROM oauth_codes').get().used_at, null, 'the code is not spent by an outage');
+    w.db.prepare("UPDATE service_tenants SET status = 'active' WHERE slug = 'conduit'").run();
+    const ok = await exchange(w, a);
+    assert.equal(ok.status, 200, ok.text);
+    w.db.prepare("UPDATE fleets SET status = 'suspended' WHERE slug = 'a-fleet'").run();
+    w.oauth.sweep();
+    assert.equal(w.db.prepare('SELECT status FROM oauth_grants WHERE seat_did = ?').get(w.seat).status, 'active', 'a suspended fleet is not a removal');
+    const paused = await w.call('POST', '/oauth/token', { form: true, headers: basic(c), body: { grant_type: 'refresh_token', refresh_token: ok.json.refresh_token } });
+    assert.equal(paused.status, 503); assert.match(paused.json.error_description, /suspended/);
+    w.db.prepare("UPDATE fleets SET status = 'active' WHERE slug = 'a-fleet'").run();
+    const back = await w.call('POST', '/oauth/token', { form: true, headers: basic(c), body: { grant_type: 'refresh_token', refresh_token: ok.json.refresh_token } });
+    assert.equal(back.status, 200, back.text);
+  } finally { await w.close(); }
+});
+
+test('N1: only grant-less registrations count against an address, so a shared egress address keeps registering', async () => {
+  const w = await world();
+  try {
+    for (let i = 0; i < 50; i++) await registerClient(w);
+    const over = await w.call('POST', '/oauth/register', { body: { redirect_uris: [CB] } });
+    assert.equal(over.status, 429);
+    // Give every one of them a live grant: they are connections, not abandonment.
+    for (const c of w.db.prepare('SELECT client_id FROM oauth_clients').all()) w.db.prepare("INSERT INTO oauth_grants (client_id, owner_did, seat_did, seat_handle, fleet_slug, scopes, resource, created_at) VALUES (?, ?, ?, 'seat-fable', 'a-fleet', '[\"read\"]', ?, ?)").run(c.client_id, w.owner, w.seat, RESOURCE, new Date().toISOString());
+    const again = await w.call('POST', '/oauth/register', { body: { redirect_uris: [CB] } });
+    assert.equal(again.status, 201);
+    // Eviction never takes a client registered in the last 15 minutes.
+    for (let i = 0; i < 199; i++) w.db.prepare("INSERT INTO oauth_clients (client_id, client_name, redirect_uris, auth_method, created_at, created_ip) VALUES (?, 'x', ?, 'none', ?, '10.1.1.1')").run('dpc_old' + i, JSON.stringify([CB]), '2026-01-01T00:00:00.000Z');
+    const fresh = await registerClient(w);
+    assert.equal(w.db.prepare('SELECT 1 FROM oauth_clients WHERE client_id = ?').get(again.json.client_id) !== undefined, true, 'the minutes-old client survived');
+    assert.equal(w.db.prepare('SELECT 1 FROM oauth_clients WHERE client_id = ?').get(fresh.client_id) !== undefined, true);
   } finally { await w.close(); }
 });

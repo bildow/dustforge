@@ -108,5 +108,16 @@ The review's main question, whether any caller can put `auth_method`/`seat`/`res
 `POST /api/services/token`, was answered no: that route builds the payload itself and no route spreads caller input
 into token metadata.
 
+Re-verification of the fixes confirmed H1, M3, L1, L2, L7 fixed and found five new defects in the fixes, all fixed in
+the following commit with tests: N1 a per-address registration cap would throttle Claude.ai's shared egress addresses
+(now only grant-less registrations count, 50/day); N2 an outage during code exchange spent the code and left an
+orphan grant (the outage is answered before the code is spent; the client retries the same code); N3 binding the
+authorize steps to the client address breaks on network hand-offs and is attacker-chosen if the proxy ever passes
+`X-Forwarded-For` through (replaced by an HttpOnly, SameSite=Strict cookie whose hash is on the request row; Secure
+behind HTTPS); N4 eviction could take a client registered seconds ago (clients younger than 15 minutes are never
+evicted); N5 a suspended fleet ended its seats' grants for good (a suspended fleet now pauses minting with 503 and the
+sweep leaves it alone). `revokeForSeat` is called from the fleet's silicon removal route, and the smoke removes a seat
+through that API and shows its token dead at once.
+
 Tests: `node --test test/oauth_seat.test.js` (module, in-memory DB, stand-in password/PIN) and
 `bash test/oauth_seat_smoke.sh` (server.js end to end, including the tenant's verify and the app's revoke).

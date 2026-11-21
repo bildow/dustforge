@@ -57,18 +57,20 @@ BAD=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/oauth/register" -H 'c
 # ── authorize: owner login + PIN + consent ──────────────────────────────────────────────────────────────────────────
 VER=$(python3 -I -c 'import secrets;print(secrets.token_urlsafe(48))'); CHAL=$(printf '%s' "$VER" | python3 -I -c 'import sys,hashlib,base64;print(base64.urlsafe_b64encode(hashlib.sha256(sys.stdin.read().encode()).digest()).rstrip(b"=").decode())')
 CB=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback; RES=https%3A%2F%2Fconduit.dustroot.com%2Fmcp
-PAGE=$(curl -s "$API/oauth/authorize?response_type=code&client_id=$CID&redirect_uri=$CB&state=st9&code_challenge=$CHAL&code_challenge_method=S256&resource=$RES&scope=read%20post%20ack")
+PAGE=$(curl -s -c "$S/jar" "$API/oauth/authorize?response_type=code&client_id=$CID&redirect_uri=$CB&state=st9&code_challenge=$CHAL&code_challenge_method=S256&resource=$RES&scope=read%20post%20ack")
 RID=$(echo "$PAGE" | grep -o 'dpa_[A-Za-z0-9_-]*' | head -1)
 [ -n "$RID" ] && ok "authorize page served (request $RID)" || fail "authorize page: $(echo "$PAGE" | head -c 300)"
-R=$(curl -s -X POST "$API/oauth/authorize/login" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"username\":\"owner-a\",\"password\":\"wrong\"}")
-[ "$(echo "$R" | J error)" = "invalid_login" ] && ok "wrong password refused" || fail "wrong password: $R"
 R=$(curl -s -X POST "$API/oauth/authorize/login" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"username\":\"owner-a\",\"password\":\"hunter22\"}")
+[ "$(echo "$R" | J error)" = "wrong_client" ] && ok "a step without the page's cookie is refused" || fail "no-cookie step: $R"
+R=$(curl -s -b "$S/jar" -X POST "$API/oauth/authorize/login" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"username\":\"owner-a\",\"password\":\"wrong\"}")
+[ "$(echo "$R" | J error)" = "invalid_login" ] && ok "wrong password refused" || fail "wrong password: $R"
+R=$(curl -s -b "$S/jar" -X POST "$API/oauth/authorize/login" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"username\":\"owner-a\",\"password\":\"hunter22\"}")
 [ "$(echo "$R" | J next)" = "pin" ] && ok "owner signed in on the authorize page" || fail "login: $R"
-R=$(curl -s -X POST "$API/oauth/authorize/pin" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"pin\":\"1111\"}")
+R=$(curl -s -b "$S/jar" -X POST "$API/oauth/authorize/pin" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"pin\":\"1111\"}")
 [ "$(echo "$R" | J error)" = "wrong_pin" ] && ok "wrong PIN refused (counted by the wallet's lockout)" || fail "wrong pin: $R"
-R=$(curl -s -X POST "$API/oauth/authorize/pin" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"pin\":\"2468\"}")
+R=$(curl -s -b "$S/jar" -X POST "$API/oauth/authorize/pin" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"pin\":\"2468\"}")
 [ "$(echo "$R" | J seats.0.handle)" = "seat-fable" ] && [ "$(echo "$R" | J seats.0.consent_ok)" = "True" ] && ok "PIN accepted; seat-fable offered with its consent" || fail "pin: $R"
-R=$(curl -s -X POST "$API/oauth/authorize/decide" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"approve\":true,\"seat\":\"seat-fable\",\"scopes\":[\"read\",\"post\",\"ack\"]}")
+R=$(curl -s -b "$S/jar" -X POST "$API/oauth/authorize/decide" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"approve\":true,\"seat\":\"seat-fable\",\"scopes\":[\"read\",\"post\",\"ack\"]}")
 REDIR=$(echo "$R" | J redirect); CODE=$(printf '%s' "$REDIR" | grep -o 'code=dpz_[A-Za-z0-9_-]*' | cut -d= -f2)
 case "$REDIR" in https://claude.ai/api/mcp/auth_callback\?*state=st9*) ok "redirected to the Claude callback with the state";; *) fail "redirect: $REDIR";; esac
 [ -n "$CODE" ] && ok "authorization code issued" || fail "no code"
@@ -104,10 +106,10 @@ V=$(curl -s -X POST "$API/api/services/verify" -H "authorization: Bearer $TENANT
 
 # ── second grant: refresh, then the owner revokes the delegation in the app ─────────────────────────────────────────
 authorize(){ VER=$(python3 -I -c 'import secrets;print(secrets.token_urlsafe(48))'); CHAL=$(printf '%s' "$VER" | python3 -I -c 'import sys,hashlib,base64;print(base64.urlsafe_b64encode(hashlib.sha256(sys.stdin.read().encode()).digest()).rstrip(b"=").decode())')
-  PAGE=$(curl -s "$API/oauth/authorize?response_type=code&client_id=$CID&redirect_uri=$CB&state=s2&code_challenge=$CHAL&code_challenge_method=S256&resource=$RES"); RID=$(echo "$PAGE" | grep -o 'dpa_[A-Za-z0-9_-]*' | head -1)
-  curl -s -o /dev/null -X POST "$API/oauth/authorize/login" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"username\":\"owner-a\",\"password\":\"hunter22\"}"
-  curl -s -o /dev/null -X POST "$API/oauth/authorize/pin" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"pin\":\"2468\"}"
-  R=$(curl -s -X POST "$API/oauth/authorize/decide" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"approve\":true,\"seat\":\"seat-fable\"}")
+  PAGE=$(curl -s -c "$S/jar" "$API/oauth/authorize?response_type=code&client_id=$CID&redirect_uri=$CB&state=s2&code_challenge=$CHAL&code_challenge_method=S256&resource=$RES"); RID=$(echo "$PAGE" | grep -o 'dpa_[A-Za-z0-9_-]*' | head -1)
+  curl -s -o /dev/null -b "$S/jar" -X POST "$API/oauth/authorize/login" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"username\":\"owner-a\",\"password\":\"hunter22\"}"
+  curl -s -o /dev/null -b "$S/jar" -X POST "$API/oauth/authorize/pin" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"pin\":\"2468\"}"
+  R=$(curl -s -b "$S/jar" -X POST "$API/oauth/authorize/decide" -H 'content-type: application/json' -d "{\"request_id\":\"$RID\",\"approve\":true,\"seat\":\"seat-fable\"}")
   CODE=$(echo "$R" | J redirect | grep -o 'code=dpz_[A-Za-z0-9_-]*' | cut -d= -f2)
   curl -s -X POST "$API/oauth/token" -u "$CID:$CSEC" -d "grant_type=authorization_code&code=$CODE&redirect_uri=https://claude.ai/api/mcp/auth_callback&code_verifier=$VER"; }
 TOK=$(authorize); AT=$(echo "$TOK" | J access_token); RT=$(echo "$TOK" | J refresh_token)
@@ -127,6 +129,21 @@ V=$(curl -s -X POST "$API/api/services/verify" -H "authorization: Bearer $TENANT
 [ "$(echo "$V" | J ok)" = "False" ] && ok "its access token no longer verifies" || fail "token alive after delegation revoke: $V"
 G=$(curl -s "$API/api/oauth/grants" -H "authorization: Bearer $OWNER")
 [ "$(echo "$G" | J grants.0.status)" = "revoked" ] && ok "owner's grant list shows the revocation" || fail "grants: $G"
+
+# ── the owner removes the seat from the fleet: the fleet cut kills the token at once, the grant ends ────────────────
+TOK=$(authorize); AT=$(echo "$TOK" | J access_token)
+V=$(curl -s -X POST "$API/api/services/verify" -H "authorization: Bearer $TENANT" -H 'content-type: application/json' -d "{\"token\":\"$AT\",\"action\":\"read\"}")
+[ "$(echo "$V" | J ok)" = "True" ] && ok "third grant verifies" || fail "third grant: $V"
+sqlite3 "$DB_PATH" "UPDATE fleet_silicons SET handle='seat-renamed' WHERE member_did='$SEAT_DID'"
+V=$(curl -s -X POST "$API/api/services/verify" -H "authorization: Bearer $TENANT" -H 'content-type: application/json' -d "{\"token\":\"$AT\",\"action\":\"read\"}")
+[ "$(echo "$V" | J ok)" = "True" ] && [ "$(echo "$V" | J seat)" = "" ] && ok "a handle the wallet no longer holds is not echoed as seat" || fail "renamed seat: $V"
+sqlite3 "$DB_PATH" "UPDATE fleet_silicons SET handle='seat-fable' WHERE member_did='$SEAT_DID'"
+R=$(curl -s -X DELETE "$API/api/fleet/a-fleet/silicons/seat-fable" -H "authorization: Bearer $OWNER")
+[ "$(echo "$R" | J ok)" = "True" ] && ok "owner removed seat-fable from the fleet" || fail "remove: $R"
+V=$(curl -s -X POST "$API/api/services/verify" -H "authorization: Bearer $TENANT" -H 'content-type: application/json' -d "{\"token\":\"$AT\",\"action\":\"read\"}")
+[ "$(echo "$V" | J ok)" = "False" ] && ok "its access token is dead at once (fleet cut applies to oauth_seat)" || fail "token alive after removal: $V"
+G=$(curl -s "$API/api/oauth/grants" -H "authorization: Bearer $OWNER")
+[ "$(echo "$G" | J grants.0.status)" = "revoked" ] && ok "the grant ended with the removal" || fail "grant after removal: $G"
 
 # ── nothing secret in the log ───────────────────────────────────────────────────────────────────────────────────────
 if grep -q "$CSEC\|dpo_\|dpz_\|$(printf '%s' "$AT" | cut -c1-24)" "$S/server.log"; then fail "a secret value appears in the server log"; else ok "no client secret, code, refresh or access token in the server log"; fi
