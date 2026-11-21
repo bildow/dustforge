@@ -323,7 +323,8 @@ function checkTokenRevocation(db, decoded) {
       return { revoked: true, reason: 'token revoked by revoke-all' };
     }
     // A token a fleet owner minted for a member dies when the member leaves or is removed from that fleet.
-    if (decoded.auth_method === 'fleet_owner_mint') {
+    // A web seat's OAuth token (oauth_seat.js) is minted for a fleet-created agent the same way: it dies with the cut too.
+    if (decoded.auth_method === 'fleet_owner_mint' || decoded.auth_method === 'oauth_seat') {
       // A minted token without a fleet claim is checked against every cut of its wallet.
       const fc = decoded.fleet
         ? db.prepare('SELECT revoke_before FROM fleet_token_cuts WHERE did = ? AND fleet = ?').get(decoded.sub, String(decoded.fleet))

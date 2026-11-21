@@ -1,11 +1,12 @@
 {
   "name": "dustforge",
   "version": "1.0.0",
-  "description": "Silicon identity platform — DID:key + email + wallet",
+  "description": "Silicon identity platform \u2014 DID:key + email + wallet",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test:oauth": "node --test test/oauth_seat.test.js && bash test/oauth_seat_smoke.sh"
   },
   "keywords": [],
   "author": "",
