@@ -91,7 +91,7 @@ module.exports = function registerPaneMail(deps) {
   const { app, db, billing, getBearerIdentity, isAgentAuth, ownerApproves, logSecurityEvent, cleanLabel, blindkeyDecrypt,
     rateLimitStandard, mailHeaders, reserveMailSlot, mailRecipientCap, outboundCap, limitLiftExtra, mailReceipts, referral,
     stalwartAdmin, emailAddrRe, ownFleetAgent, deviceSession, gateFresh, gateMissing, spendSingleUse } = deps;
-  const JMAP_BASE = String(process.env.PANE_MAIL_JMAP_URL || 'http://100.83.112.88:8090').replace(/\/+$/, '');
+  const JMAP_BASE = String(process.env.PANE_MAIL_JMAP_URL || 'http://phasewhip.net.dustroot.com:8090').replace(/\/+$/, '');
   const JMAP_HOST = (() => { try { return new URL(JMAP_BASE); } catch (_) { return null; } })();
   const ALIASES_ON = process.env.PANE_MAIL_ALIASES !== '0' && Boolean(process.env.STALWART_PASS);
   const ADMIN_ON = Boolean(process.env.STALWART_PASS);

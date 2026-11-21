@@ -25,8 +25,8 @@ const passwords = require('../passwords');
 
 const EXECUTE = process.argv.includes('--execute');
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'dustforge.db');
-const HOST = process.env.STALWART_HOST || '100.83.112.88';
-const PORT = Number(process.env.STALWART_PORT || 8080);
+const HOST = process.env.STALWART_HOST || 'phasewhip.net.dustroot.com';
+const PORT = Number(process.env.STALWART_PORT || 8090);
 const AUTH = 'Basic ' + Buffer.from('admin:' + (process.env.STALWART_PASS || '')).toString('base64');
 
 function stalwart(method, p, body) {
