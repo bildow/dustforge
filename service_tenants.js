@@ -463,8 +463,11 @@ module.exports = function registerServiceTenants(deps) {
     // How the token was minted, from the signature-checked payload (never a header): a web seat's OAuth token says so
     // and names its seat and resource, so a relay binds the seat's name to this verified wallet and nothing else
     // (oauth_seat.js; the Conduit MCP pane's requirement, 2026-11-21). An ordinary service token says service_token.
+    // The seat handle is answered only while it is this very wallet's active fleet handle (review L1): a stale or
+    // re-used handle is null, never another wallet's name.
+    const seatBound = (h) => typeof h === 'string' && db.prepare("SELECT 1 FROM fleet_silicons WHERE member_did = ? AND handle = ? AND status = 'active'").get(d.sub, h) ? h : null;
     const seatClaims = d.auth_method === 'oauth_seat'
-      ? { auth_method: 'oauth_seat', seat: typeof d.seat === 'string' ? d.seat : null, resource: typeof d.resource === 'string' ? d.resource : null }
+      ? { auth_method: 'oauth_seat', seat: seatBound(d.seat), resource: typeof d.resource === 'string' ? d.resource : null }
       : { auth_method: 'service_token' };
     return { status: 200, body: {
       ok: true, wallet: d.sub, token_id: d.jti, scope, service_scopes: Array.isArray(d.svc_scopes) ? d.svc_scopes : null, ...seatClaims,

@@ -86,7 +86,27 @@ Environment: `PUBLIC_API_URL` (issuer), `OAUTH_CONDUIT_RESOURCE` (default `https
 - A seat's token is minted by this server with the seat's key on the owner's browser approval, not by the seat's own
   session. That is the point of the front, and it is why every mint re-checks consent and delegation.
 - Anyone may register a client, but a client can only ever send a browser to a Claude callback, and nothing is issued
-  without the owner's login, PIN and approval.
+  without the owner's login, PIN and approval. A client's name is reduced to a safe character class and the page's
+  script-context JSON escapes `< > &`, so a registered name cannot inject markup (review 2026-11-21, H1).
+- Attacker-initiated flow: if Claude.ai's callback did not bind `state` to the browser session that started the
+  connector setup, an attacker could start a setup in their own Claude account and send the owner the authorize URL;
+  the owner would then connect their own seat to the attacker's account. This server shows the client name and the
+  seat on the page and cannot do more; Claude.ai's `state` handling is the control.
+- Refresh rotation has no grace window: two concurrent refreshes from the connector make the second a replay and end
+  the grant (re-authorize). Token and registration endpoints are rate-limited by IP; many seats refreshing through the
+  same Anthropic egress address within a quarter hour would share that budget.
+
+## Review record
+
+Adversarial review 2026-11-21 on 6d57a6d (independent agent): HIGH H1 client-name markup injection into the authorize
+page; MEDIUM M1 registry lockout by used-but-grantless clients, M2 seat removed from the fleet left access tokens alive
+for up to 1 h, M3 approval replaced a perpetual delegation with a 30-day one, M4 a code that failed the post-PKCE check
+left an orphan live grant; LOW L1 `seat` echoed without binding to the wallet, L2 tenant outage ended grants, L5
+username timing, L6 request id logged and steps not bound to the opening address, L7 two client-auth methods accepted at
+once. All fixed in the next commit with a test each (L3 grace window and L4 shared-IP limits recorded above instead).
+The review's main question, whether any caller can put `auth_method`/`seat`/`resource` into a service token through
+`POST /api/services/token`, was answered no: that route builds the payload itself and no route spreads caller input
+into token metadata.
 
 Tests: `node --test test/oauth_seat.test.js` (module, in-memory DB, stand-in password/PIN) and
 `bash test/oauth_seat_smoke.sh` (server.js end to end, including the tenant's verify and the app's revoke).

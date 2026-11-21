@@ -9995,8 +9995,11 @@ const svcTenants = require('./service_tenants')({ app, db, identity, billing, ge
 // OAuth 2.1 front for human web seats (oauth_seat.js, Aaron 2026-11-21): a Claude.ai custom connector signs the fleet
 // owner in (login + PIN in the browser), names a seat-… agent of the fleet and the Conduit scopes, and receives the
 // seat's Conduit service token as its access token; refreshes re-check consent and delegation; the app's revokes end it.
+let _oauthDummyHash = null;   // a current-form hash an unknown username is checked against, so the sign-in takes equal time
+passwords.hashPassword(crypto.randomBytes(24).toString('base64url')).then((h) => { _oauthDummyHash = h; }).catch(() => {});
 const oauthSeat = require('./oauth_seat')({ app, db, identity, express, rateLimitStandard, rateLimitStrict, rateLimitLogin, getBearerIdentity, logSecurityEvent,
-  services: svcTenants, checkPassword: verifyWalletPassword, checkPin: tryPin, pinLocked: (w) => pinGate.lockedFor(w), publicApi: process.env.PUBLIC_API_URL });
+  services: svcTenants, checkPassword: verifyWalletPassword, checkPin: tryPin, pinLocked: (w) => pinGate.lockedFor(w), publicApi: process.env.PUBLIC_API_URL,
+  dummyPasswordHash: () => _oauthDummyHash });
 // Per-wallet settings (wallet_settings.js, Aaron 2026-11-18): "Write agent instruction files" must be on before a pane or
 // agent is onboarded; the app asks the first time Fleet is opened or a pane/agent request shows.
 require('./wallet_settings')({ app, db, rateLimitStandard, getBearerIdentity, logSecurityEvent, personFor: (did) => svcTenants.personFor(did), isAgentAuth, deviceSession });

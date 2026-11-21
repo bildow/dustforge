@@ -45,6 +45,8 @@ const AUTHZ_TTL_SEC = 600;                   // a browser has ten minutes to log
 const DELEGATION_TTL_SEC = REFRESH_TTL_SEC;  // the owner's delegation to the seat lasts as long as the grant can
 const LOGIN_TRIES_PER_REQUEST = 5;
 const MAX_CLIENTS = 200;
+const MAX_CLIENTS_PER_IP_DAY = 10;          // registrations one address may make in 24 h (review M1)
+const CLIENT_NAME_RE = /[^A-Za-z0-9 ._,'()\-]/g;   // what a client may call itself on the authorize page (review H1)
 const DEFAULT_SCOPES = ['read', 'post', 'ack'];
 const SEAT_PREFIX = 'seat-';
 const CONDUIT_SLUG = 'conduit';
@@ -178,7 +180,8 @@ module.exports = function registerOauthSeat(deps) {
   // Everything a mint needs to be true, now. Returns {ok, seat, consent, cap} or {ok:false, error, code}.
   function grantStillGood(g) {
     const t = tenant();
-    if (!t) return { ok: false, error: 'Conduit is not a registered service here', code: 'invalid_grant' };
+    // No tenant row is an outage of the service, not a fact about this grant: say so without ending anything (review L2).
+    if (!t) return { ok: false, error: 'Conduit is not available here right now', code: 'temporarily_unavailable', status: 503 };
     if (g.status !== 'active') return { ok: false, error: 'this grant was revoked', code: 'invalid_grant' };
     if (!walletActive(g.owner_did)) return { ok: false, error: 'the owner wallet is not active', code: 'invalid_grant' };
     const seat = seatRow(g.owner_did, g.seat_handle);
@@ -195,8 +198,7 @@ module.exports = function registerOauthSeat(deps) {
 
   // The access token: the seat's Conduit service token (service_tenants.js mints the same shape for a caller's own
   // session; here the OAuth front mints it for the seat after the owner's browser approval). Recorded for revocation.
-  function mintAccess(g, good) {
-    const scopes = jsonList(g.scopes);
+  function mintAccess(g, good, scopes = jsonList(g.scopes)) {
     const meta = { iss: require('./service_tenants').SVC_ISS, aud: 'svc:' + good.t.slug, auth_method: 'oauth_seat', src_auth: 'oauth_seat',
       cap_dd: good.cap, svc_scopes: scopes, seat: g.seat_handle, resource: g.resource, grant: g.id, fleet: g.fleet_slug, username: good.wallet.username || undefined };
     const token = identity.createTokenForIdentity(good.wallet.encrypted_private_key, g.seat_did, { scope: 'transact', expiresIn: `${ACCESS_TTL_SEC}s`, metadata: meta });
@@ -241,9 +243,22 @@ module.exports = function registerOauthSeat(deps) {
     for (const g of db.prepare("SELECT * FROM oauth_grants WHERE status = 'active' AND seat_did = ?").all(c.payer_did)) if (revokeGrant(g.id, 'consent to pay Conduit revoked')) n++;
     return n;
   }
+  // Every grant of a seat ends (the owner removed the agent from the fleet, say; review M2). The fleet cut already
+  // kills the minted tokens (billing.checkTokenRevocation honours fleet_token_cuts for oauth_seat); this ends the
+  // refresh chain and the owner's view agrees.
+  function revokeForSeat(seatDid, why = 'the seat left the fleet') {
+    let n = 0;
+    for (const g of db.prepare("SELECT id FROM oauth_grants WHERE status = 'active' AND seat_did = ?").all(seatDid)) if (revokeGrant(g.id, why)) n++;
+    return n;
+  }
   function sweep() {
     const t = nowIso();
     try {
+      // A grant whose seat is no longer an active fleet-created agent of its owner ends within a minute (review M2).
+      for (const g of db.prepare("SELECT * FROM oauth_grants WHERE status = 'active'").all()) {
+        const s = seatRow(g.owner_did, g.seat_handle);
+        if (!s || s.member_did !== g.seat_did) revokeGrant(g.id, `@${g.seat_handle} is no longer a seat of this owner's fleet`);
+      }
       db.prepare('DELETE FROM oauth_authz WHERE expires_at <= ?').run(t);
       db.prepare('DELETE FROM oauth_codes WHERE expires_at <= ?').run(t);
       db.prepare('DELETE FROM oauth_refresh WHERE expires_at <= ?').run(t);
@@ -289,16 +304,23 @@ module.exports = function registerOauthSeat(deps) {
     if (rts.some(r => r !== 'code')) return oauthError(res, 400, 'invalid_client_metadata', 'response_types: code');
     const method = b.token_endpoint_auth_method === undefined ? 'client_secret_basic' : String(b.token_endpoint_auth_method);
     if (!['none', 'client_secret_basic', 'client_secret_post'].includes(method)) return oauthError(res, 400, 'invalid_client_metadata', 'token_endpoint_auth_method: none, client_secret_basic or client_secret_post');
+    const ip = String(req.ip || '');
+    if (db.prepare('SELECT COUNT(*) AS n FROM oauth_clients WHERE created_ip = ? AND created_at > ?').get(ip, new Date(Date.now() - 86400000).toISOString()).n >= MAX_CLIENTS_PER_IP_DAY) {
+      return oauthError(res, 429, 'temporarily_unavailable', `at most ${MAX_CLIENTS_PER_IP_DAY} registrations a day from one address`);
+    }
     if (db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n >= MAX_CLIENTS) {
-      // Room is made from clients that never came back: registered over a day ago, never used.
-      db.prepare('DELETE FROM oauth_clients WHERE last_used_at IS NULL AND created_at < ?').run(new Date(Date.now() - 86400000).toISOString());
+      // Room is made from clients that hold no live grant, least recently seen first; one that merely opened the
+      // authorize page is not "in use" (review M1: otherwise 200 registrations + 200 page loads lock registration).
+      const idle = db.prepare(`SELECT c.client_id FROM oauth_clients c WHERE NOT EXISTS (SELECT 1 FROM oauth_grants g WHERE g.client_id = c.client_id AND g.status = 'active')
+        ORDER BY COALESCE(c.last_used_at, c.created_at) ASC LIMIT ?`).all(Math.max(1, db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n - MAX_CLIENTS + 1));
+      for (const c of idle) db.prepare('DELETE FROM oauth_clients WHERE client_id = ?').run(c.client_id);
       if (db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n >= MAX_CLIENTS) return oauthError(res, 429, 'temporarily_unavailable', 'too many registered clients; try later');
     }
     const clientId = 'dpc_' + rand(16);
     const secret = method === 'none' ? null : 'dps_' + rand(32);
-    const name = String(b.client_name || '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 80);
+    const name = String(b.client_name || '').replace(CLIENT_NAME_RE, '').replace(/\s+/g, ' ').trim().slice(0, 80);
     db.prepare('INSERT INTO oauth_clients (client_id, secret_hash, client_name, redirect_uris, auth_method, created_at, created_ip) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(clientId, secret ? sha(secret) : null, name, JSON.stringify(uris), method, nowIso(), String(req.ip || ''));
+      .run(clientId, secret ? sha(secret) : null, name, JSON.stringify(uris), method, nowIso(), ip);
     event('oauth_client_registered', null, { client_id: clientId, name, method, ip: req.ip });
     res.status(201).json({
       client_id: clientId, ...(secret ? { client_secret: secret, client_secret_expires_at: 0 } : {}), client_id_issued_at: nowSec(),
@@ -349,9 +371,15 @@ module.exports = function registerOauthSeat(deps) {
     const id = String((req.body || {}).request_id || '');
     const a = /^dpa_[A-Za-z0-9_-]{20,}$/.test(id) ? db.prepare('SELECT * FROM oauth_authz WHERE request_id = ?').get(id) : null;
     if (!a || a.expires_at <= nowIso()) { res.status(410).json({ error: 'expired', error_description: 'this sign-in request has expired; start again from Claude' }); return null; }
+    // The three steps belong to the browser that opened the page: a request id seen elsewhere is useless from another
+    // address (review L6). A changed address within the ten minutes starts over.
+    if (a.ip && String(req.ip || '') !== a.ip) { res.status(409).json({ error: 'wrong_client', error_description: 'this sign-in request was opened from another network; start again from Claude' }); return null; }
     if (a.step !== step) { res.status(409).json({ error: 'wrong_step', error_description: `this request is at step '${a.step}'` }); return null; }
     return a;
   }
+  // The password check takes the same time whether the username exists or not (review L5): an unknown name is checked
+  // against a dummy hash of the current form. The host passes it (server.js); without one the shortcut stands.
+  const dummyWallet = () => { const h = typeof deps.dummyPasswordHash === 'function' ? deps.dummyPasswordHash() : null; return h ? { did: null, username: null, status: 'inactive', password_hash: h } : null; };
   // Step 1: the owner's DemiPass login (username + password). Rate limited by IP like every login; five tries per request.
   app.post('/oauth/authorize/login', rateLimitLogin || rateLimitStrict, express.json({ limit: '8kb' }), async (req, res) => {
     noStore(res);
@@ -361,10 +389,12 @@ module.exports = function registerOauthSeat(deps) {
     if (a.login_tries >= LOGIN_TRIES_PER_REQUEST) { db.prepare('DELETE FROM oauth_authz WHERE request_id = ?').run(a.request_id); return res.status(429).json({ error: 'too_many_tries', error_description: 'too many wrong sign-ins; start again from Claude' }); }
     db.prepare('UPDATE oauth_authz SET login_tries = login_tries + 1 WHERE request_id = ?').run(a.request_id);
     const wallet = db.prepare('SELECT * FROM identity_wallets WHERE username = ?').get(username.toLowerCase().trim());
-    const okPw = wallet ? await checkPassword(wallet, password) : false;
+    let okPw = false;
+    if (wallet) okPw = await checkPassword(wallet, password);
+    else { const dw = dummyWallet(); if (dw) { try { await checkPassword(dw, password); } catch (_) {} } }
     if (okPw === null) return res.status(503).json({ error: 'temporarily_unavailable', error_description: 'password check unavailable; try again' });
     if (!okPw || wallet.status !== 'active') {
-      sec('oauth_login_failed', 'warn', { ip: req.ip, username: username.slice(0, 40), request_id: a.request_id });
+      sec('oauth_login_failed', 'warn', { ip: req.ip, username: username.slice(0, 40), client_id: a.client_id });
       return res.status(401).json({ error: 'invalid_login', error_description: 'wrong username or password', tries_left: LOGIN_TRIES_PER_REQUEST - a.login_tries - 1 });
     }
     // An agent wallet (one a fleet created or that joined one) is not a person: the seat's owner signs in, never a seat.
@@ -421,7 +451,9 @@ module.exports = function registerOauthSeat(deps) {
       // the owner's session): standard depth, renewed to the grant's horizon, the previous active row replaced.
       for (const scope of chosen) {
         const cur = liveDelegation(t, scope, owner.did, seat.member_did);
-        if (cur && cur.expires_at && new Date(cur.expires_at).getTime() > Date.now() + DELEGATION_TTL_SEC * 1000 / 2) continue;
+        // One the owner made without an expiry, or one that outlasts half the grant's horizon, stands (review M3:
+        // never shorten a perpetual delegation the owner granted in the app).
+        if (cur && (cur.expires_at === null || new Date(cur.expires_at).getTime() > Date.now() + DELEGATION_TTL_SEC * 1000 / 2)) continue;
         db.prepare("UPDATE service_delegations SET status = 'revoked', revoked_at = ? WHERE tenant_id = ? AND scope = ? AND owner_did = ? AND delegate_did = ? AND status = 'active'").run(nowIso(), t.id, scope, owner.did, seat.member_did);
         db.prepare('INSERT INTO service_delegations (tenant_id, scope, owner_did, delegate_did, granted_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)').run(t.id, scope, owner.did, seat.member_did, nowIso(), later(DELEGATION_TTL_SEC));
       }
@@ -443,9 +475,12 @@ module.exports = function registerOauthSeat(deps) {
   function authenticateClient(req) {
     let id = null, secret = null;
     const h = String(req.headers.authorization || '');
+    const body = req.body || {};
     if (/^Basic\s+/i.test(h)) {
+      if (body.client_secret !== undefined) return { ok: false };   // two authentication methods at once: refused (RFC 6749 §2.3.1; review L7)
       try { const [u, ...p] = Buffer.from(h.replace(/^Basic\s+/i, ''), 'base64').toString('utf8').split(':'); id = decodeURIComponent(u); secret = decodeURIComponent(p.join(':')); } catch (_) { return { ok: false }; }
-    } else { id = (req.body || {}).client_id; secret = (req.body || {}).client_secret; }
+      if (body.client_id !== undefined && String(body.client_id) !== id) return { ok: false };
+    } else { id = body.client_id; secret = body.client_secret; }
     const c = clientOf(id);
     if (!c) return { ok: false };
     if (c.auth_method === 'none') { if (secret) return { ok: false }; return { ok: true, client: c }; }
@@ -486,7 +521,11 @@ module.exports = function registerOauthSeat(deps) {
       db.prepare('UPDATE oauth_codes SET used_at = ? WHERE code_hash = ?').run(nowIso(), row.code_hash);
       const g = db.prepare('SELECT * FROM oauth_grants WHERE id = ?').get(row.grant_id);
       const good = g ? grantStillGood(g) : { ok: false, error: 'no grant', code: 'invalid_grant' };
-      if (!good.ok) return oauthError(res, 400, good.code, good.error);
+      if (!good.ok) {
+        // The code is spent and nothing was issued: a grant that cannot mint is closed, not left live (review M4).
+        if (g && good.code === 'invalid_grant') revokeGrant(g.id, good.error);
+        return oauthError(res, good.status || 400, good.code, good.error);
+      }
       event('oauth_token_issued', g.owner_did, { grant_id: g.id, seat: g.seat_handle, via: 'code', client_id: client.client_id });
       return tokenReply(res, g, good);
     }
@@ -503,13 +542,16 @@ module.exports = function registerOauthSeat(deps) {
         return oauthError(res, 400, 'invalid_grant', 'refresh token already used; the grant was revoked');
       }
       if (row.expires_at <= nowIso()) return oauthError(res, 400, 'invalid_grant', 'refresh token expired');
+      let want = jsonList(g.scopes);
       if (b.scope !== undefined) {
-        const want = String(b.scope).split(/[\s,]+/).filter(Boolean), have = jsonList(g.scopes);
+        // A narrower token may be asked for; never a wider one (RFC 6749 §6).
+        want = [...new Set(String(b.scope).split(/[\s,]+/).filter(Boolean))];
+        const have = jsonList(g.scopes);
         if (!want.length || want.some(s => !have.includes(s))) return oauthError(res, 400, 'invalid_scope', 'scope: a subset of what was granted');
       }
       const good = grantStillGood(g);
-      if (!good.ok) { revokeGrant(g.id, good.error); return oauthError(res, 400, good.code, good.error); }
-      const acc = mintAccess(g, good);
+      if (!good.ok) { if (good.code === 'invalid_grant') revokeGrant(g.id, good.error); return oauthError(res, good.status || 400, good.code, good.error); }
+      const acc = mintAccess(g, good, want);
       const next = mintRefresh(g.id);
       db.prepare('UPDATE oauth_refresh SET used_at = ?, rotated_to = ? WHERE token_hash = ?').run(nowIso(), sha(next), row.token_hash);
       event('oauth_token_issued', g.owner_did, { grant_id: g.id, seat: g.seat_handle, via: 'refresh', client_id: client.client_id });
@@ -573,7 +615,10 @@ button.ghost{background:transparent;color:var(--mut);border:1px solid var(--bd)}
     res.set('Content-Security-Policy', `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`);
     res.set('Referrer-Policy', 'no-referrer');
     res.set('X-Frame-Options', 'DENY');
-    const data = JSON.stringify({ requestId, clientName, scopes, resource });
+    // Script-context JSON: JSON.stringify leaves < > & and the line terminators alone, so a crafted value could close
+    // the script tag or inject markup on this origin (review H1). Every such byte becomes a \u escape.
+    const data = JSON.stringify({ requestId, clientName, scopes, resource })
+      .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
     return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect a seat — DemiPass</title>${STYLE}</head><body>
 <main class="card">
   <h1>Connect ${esc(clientName)} to Conduit</h1>
@@ -630,7 +675,7 @@ button.ghost{background:transparent;color:var(--mut);border:1px solid var(--bd)}
   }
 
   sweep();
-  return { revokeGrant, revokeForDelegation, revokeForConsent, grantStillGood, seatsOf, metadata, RESOURCE, BASE, ACCESS_TTL_SEC, REFRESH_TTL_SEC };
+  return { revokeGrant, revokeForDelegation, revokeForConsent, revokeForSeat, sweep, grantStillGood, seatsOf, metadata, RESOURCE, BASE, ACCESS_TTL_SEC, REFRESH_TTL_SEC };
 };
 module.exports.ACCESS_TTL_SEC = ACCESS_TTL_SEC;
 module.exports.REFRESH_TTL_SEC = REFRESH_TTL_SEC;

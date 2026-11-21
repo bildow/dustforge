@@ -354,3 +354,114 @@ test('a public client (auth none) exchanges with PKCE alone and is refused if it
     assert.equal(decode(ok.json.access_token).seat, 'seat-fable');
   } finally { await w.close(); }
 });
+
+// ── review 2026-11-21 (adversarial pass on 6d57a6d) ──────────────────────────────────────────────────────────────────
+test('H1: a client name cannot inject markup into the authorize page; script-context JSON is escaped', async () => {
+  const w = await world();
+  try {
+    const evil = '</script><meta http-equiv="refresh" content="0;url=https://look-alike.example/">Claude & <b>co</b>';
+    const c = await registerClient(w, { client_name: evil });
+    assert.doesNotMatch(c.client_name, /[<>&"\/=;:]/);
+    const { challenge } = pkce();
+    const page = await w.call('GET', `/oauth/authorize?response_type=code&client_id=${c.client_id}&redirect_uri=${encodeURIComponent(CB)}&code_challenge=${challenge}`);
+    assert.equal(page.status, 200);
+    assert.doesNotMatch(page.text, /<meta http-equiv/);
+    // Even if a name with such bytes were stored, the script-context JSON carries no raw < > &.
+    w.db.prepare('UPDATE oauth_clients SET client_name = ? WHERE client_id = ?').run(evil, c.client_id);
+    const page2 = await w.call('GET', `/oauth/authorize?response_type=code&client_id=${c.client_id}&redirect_uri=${encodeURIComponent(CB)}&code_challenge=${challenge}`);
+    const script = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(page2.text)[1];
+    assert.doesNotMatch(script, /<\/script>|<meta|&amp;|[<>]/);
+    assert.match(script, /\\u003c\/script\\u003e/);
+    assert.equal((page2.text.match(/<script/g) || []).length, 1);
+  } finally { await w.close(); }
+});
+
+test('M1: registrations per address are capped, and a full registry evicts clients without a live grant instead of locking', async () => {
+  const w = await world();
+  try {
+    for (let i = 0; i < 10; i++) await registerClient(w);
+    const over = await w.call('POST', '/oauth/register', { body: { redirect_uris: [CB] } });
+    assert.equal(over.status, 429);
+    // 200 clients from other addresses, each "used" by an authorize page load only, none with a grant.
+    for (let i = 0; i < 200; i++) w.db.prepare("INSERT INTO oauth_clients (client_id, client_name, redirect_uris, auth_method, created_at, created_ip, last_used_at) VALUES (?, 'x', ?, 'none', ?, ?, ?)")
+      .run('dpc_fill' + i, JSON.stringify([CB]), '2026-01-01T00:00:00.000Z', '10.9.' + (i >> 8) + '.' + (i & 255), '2026-01-02T00:00:00.000Z');
+    w.db.prepare("DELETE FROM oauth_clients WHERE created_ip = '127.0.0.1'").run();
+    const c = await registerClient(w);
+    assert.match(c.client_id, /^dpc_/);
+    assert.ok(w.db.prepare('SELECT COUNT(*) AS n FROM oauth_clients').get().n <= 200);
+    assert.equal(w.db.prepare('SELECT 1 FROM oauth_clients WHERE client_id = ?').get(c.client_id) !== undefined, true);
+  } finally { await w.close(); }
+});
+
+test('M2: a seat removed from the fleet loses its grants within a sweep, access tokens included', async () => {
+  const w = await world();
+  try {
+    const c = await registerClient(w);
+    const t = await exchange(w, await authorizeToCode(w, c));
+    w.db.prepare("UPDATE fleet_silicons SET status = 'removed' WHERE member_did = ?").run(w.seat);
+    w.oauth.sweep();
+    const g = w.db.prepare('SELECT * FROM oauth_grants WHERE seat_did = ?').get(w.seat);
+    assert.equal(g.status, 'revoked'); assert.match(g.revoked_why, /no longer a seat/);
+    assert.equal(w.db.prepare('SELECT revoked FROM issued_tokens WHERE jti = ?').get(decode(t.json.access_token).jti).revoked, 1);
+    // revokeForSeat is the hook a removal path may call directly.
+    w.db.prepare("UPDATE fleet_silicons SET status = 'active' WHERE member_did = ?").run(w.seat);
+    await exchange(w, await authorizeToCode(w, c));
+    assert.equal(w.oauth.revokeForSeat(w.seat), 1);
+  } finally { await w.close(); }
+});
+
+test('M3: a perpetual delegation the owner made in the app is kept, not replaced by a 30-day one', async () => {
+  const w = await world();
+  try {
+    const id = Number(w.db.prepare("INSERT INTO service_delegations (tenant_id, scope, owner_did, delegate_did, granted_at, expires_at) VALUES (?, 'read', ?, ?, '2026-01-01', NULL)").run(w.tenantId, w.owner, w.seat).lastInsertRowid);
+    const c = await registerClient(w);
+    await exchange(w, await authorizeToCode(w, c));
+    const rows = w.db.prepare("SELECT id, expires_at FROM service_delegations WHERE delegate_did = ? AND scope = 'read' AND status = 'active'").all(w.seat);
+    assert.deepEqual(rows, [{ id, expires_at: null }]);
+    // A short-lived one is renewed.
+    w.db.prepare("UPDATE service_delegations SET expires_at = ? WHERE id = ?").run(new Date(Date.now() + 3600 * 1000).toISOString(), id);
+    await exchange(w, await authorizeToCode(w, c));
+    const after = w.db.prepare("SELECT id, expires_at FROM service_delegations WHERE delegate_did = ? AND scope = 'read' AND status = 'active'").all(w.seat);
+    assert.equal(after.length, 1); assert.notEqual(after[0].id, id); assert.ok(new Date(after[0].expires_at).getTime() > Date.now() + 29 * 86400 * 1000);
+  } finally { await w.close(); }
+});
+
+test('M4 + code expiry + redirect mismatch: a code that cannot mint closes its grant; an old code or a wrong redirect_uri is refused', async () => {
+  const w = await world();
+  try {
+    const c = await registerClient(w);
+    const a = await authorizeToCode(w, c);
+    const wrongUri = await exchange(w, a, { redirect_uri: 'https://claude.com/api/mcp/auth_callback' });
+    assert.equal(wrongUri.status, 400); assert.match(wrongUri.json.error_description, /redirect_uri/);
+    w.db.prepare("UPDATE service_consents SET status = 'revoked' WHERE payer_did = ?").run(w.seat);
+    const r = await exchange(w, a);
+    assert.equal(r.status, 400); assert.equal(r.json.error, 'invalid_grant');
+    assert.equal(w.db.prepare('SELECT status FROM oauth_grants WHERE id = (SELECT MAX(id) FROM oauth_grants)').get().status, 'revoked', 'no orphaned live grant');
+    assert.equal(w.db.prepare("SELECT COUNT(*) AS n FROM oauth_grants WHERE status = 'active'").get().n, 0);
+    w.db.prepare("UPDATE service_consents SET status = 'active' WHERE payer_did = ?").run(w.seat);
+    const b = await authorizeToCode(w, c);
+    w.db.prepare("UPDATE oauth_codes SET expires_at = '2026-01-01T00:00:00.000Z'").run();
+    const old = await exchange(w, b);
+    assert.equal(old.status, 400); assert.match(old.json.error_description, /expired/);
+  } finally { await w.close(); }
+});
+
+test('L2 + narrowed refresh + L7: a missing tenant is 503 without ending the grant; a narrower scope is honoured; two client-auth methods at once are refused', async () => {
+  const w = await world();
+  try {
+    const c = await registerClient(w);
+    const t = await exchange(w, await authorizeToCode(w, c));
+    w.db.prepare("UPDATE service_tenants SET status = 'suspended' WHERE slug = 'conduit'").run();
+    const down = await w.call('POST', '/oauth/token', { form: true, headers: basic(c), body: { grant_type: 'refresh_token', refresh_token: t.json.refresh_token } });
+    assert.equal(down.status, 503); assert.equal(down.json.error, 'temporarily_unavailable');
+    assert.equal(w.db.prepare('SELECT status FROM oauth_grants WHERE seat_did = ?').get(w.seat).status, 'active');
+    w.db.prepare("UPDATE service_tenants SET status = 'active' WHERE slug = 'conduit'").run();
+    const narrow = await w.call('POST', '/oauth/token', { form: true, headers: basic(c), body: { grant_type: 'refresh_token', refresh_token: t.json.refresh_token, scope: 'read' } });
+    assert.equal(narrow.status, 200, narrow.text); assert.equal(narrow.json.scope, 'read'); assert.deepEqual(decode(narrow.json.access_token).svc_scopes, ['read']);
+    const both = await w.call('POST', '/oauth/token', { form: true, headers: basic(c), body: { grant_type: 'refresh_token', refresh_token: narrow.json.refresh_token, client_secret: c.client_secret } });
+    assert.equal(both.status, 401);
+    // The refused call did not consume the refresh token.
+    const again = await w.call('POST', '/oauth/token', { form: true, headers: basic(c), body: { grant_type: 'refresh_token', refresh_token: narrow.json.refresh_token } });
+    assert.equal(again.status, 200);
+  } finally { await w.close(); }
+});
